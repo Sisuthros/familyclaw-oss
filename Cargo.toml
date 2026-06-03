@@ -1,0 +1,63 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["The FamilyClaw contributors"]
+repository = "https://github.com/Sisuthros/familyclaw"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# async core
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+ractor = "0.14"
+# serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# errors
+thiserror = "2"
+anyhow = "1"
+# crypto (familyclaw-security: SHA-256 tamper-hälytys)
+sha2 = "0.10"
+# tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# http (channels, organ servers)
+axum = "0.7"
+# wasm sandbox (optional — vain familyclaw-sandboxin "wasmtime"-featuren takana)
+# v35: korjattu Windows-MSVC OutOfFuel-trapin __fastfail-bugi (v27:ssä rikki).
+wasmtime = { version = "35", default-features = false, features = ["cranelift", "runtime"] }
+# WAT→WASM kääntäjä (vain familyclaw-sandboxin testeissä wasmtime-featuren kanssa)
+wat = "1"
+# time
+chrono = { version = "0.4", features = ["serde"] }
+# ids
+uuid = { version = "1", features = ["v4", "serde"] }
+# internal
+familyclaw-core = { path = "crates/familyclaw-core" }
+familyclaw-bus = { path = "crates/familyclaw-bus" }
+familyclaw-durable = { path = "crates/familyclaw-durable" }
+familyclaw-memory = { path = "crates/familyclaw-memory" }
+familyclaw-dream = { path = "crates/familyclaw-dream" }
+familyclaw-emotion = { path = "crates/familyclaw-emotion" }
+familyclaw-latent = { path = "crates/familyclaw-latent" }
+familyclaw-sandbox = { path = "crates/familyclaw-sandbox" }
+familyclaw-security = { path = "crates/familyclaw-security" }
+familyclaw-bridge = { path = "crates/familyclaw-bridge" }
+familyclaw-agent = { path = "crates/familyclaw-agent" }
+familyclaw-channels = { path = "crates/familyclaw-channels" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
+must_use_candidate = "allow"

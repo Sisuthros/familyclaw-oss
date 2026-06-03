@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────
+# FamilyClaw .gitignore — KERROS A (OSS) / KERROS B (yksityinen) -raja
+# KRIITTINEN: mikään perheen sielusta, avaimista tai profiileista
+# EI saa koskaan päätyä julkaistavaan repoon.
+# ─────────────────────────────────────────────────────────────
+
+# --- Rust build ---
+/target
+**/target
+Cargo.lock.bak
+*.pdb
+
+# --- KERROS B: perhe-profiilit ja sielut (EI KOSKAAN julkaistavaksi) ---
+# Profiilit ladataan ajonaikaisesti FAMILYCLAW_PROFILE_DIR-envistä.
+/profiles/
+profiles/
+**/profiles/
+*.soul
+*.soul.md
+SOUL.md
+!docs/**/SOUL.md.example
+!**/SOUL.example.md
+# Perheenjäsenten todelliset identiteetit / muistit / kalibroinnit
+/hearth/
+hearth/
+*.calibration.json
+emotion-weights*.json
+!**/emotion-weights.example.json
+
+# --- Salaisuudet ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*_token*
+*api_key*
+*API_KEY*
+secrets/
+*.secret
+
+# --- Lokit, runtime, väliaikaiset ---
+*.log
+*.pid
+/data/
+/data2/
+*.lance/
+*.sqlite
+*.db
+/tmp/
+.DS_Store
+Thumbs.db
+
+# --- IDE ---
+/.idea/
+/.vscode/
+*.iml

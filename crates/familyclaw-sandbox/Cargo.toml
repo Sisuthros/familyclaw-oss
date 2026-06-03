@@ -1,0 +1,36 @@
+[package]
+name = "familyclaw-sandbox"
+description = "wasmtime-pohjainen koodisandbox (fuel + capabilities)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Oletuksena ei mitään: vain trait-rajapinta + NoopSandbox.
+default = []
+# Kytkee oikean wasmtime-pohjaisen sandbox-toteutuksen.
+# wasmtime on iso riippuvuus (Cranelift + JIT), joten se on tarkoituksella
+# optional ettei se hidasta koko workspacen buildia kun sandboxia ei tarvita.
+wasmtime = ["dep:wasmtime"]
+
+[dependencies]
+familyclaw-core = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+# Optional — vain `wasmtime`-featuren takana.
+wasmtime = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# serde_json — serde-roundtrip-testeihin (capability/fuel/output).
+serde_json = { workspace = true }
+# `wat` kääntää WAT-tekstin WASM-tavukoodiksi wasmtime-backendin testeissä.
+# Vain testikäyttö; wasmtime-featuren testit tarvitsevat tämän.
+wat = { workspace = true }

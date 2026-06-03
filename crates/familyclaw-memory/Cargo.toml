@@ -1,0 +1,28 @@
+[package]
+name = "familyclaw-memory"
+description = "Eternal Thread — Ebbinghaus-decay, VAD, identity-anchorit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+familyclaw-core = { workspace = true }
+familyclaw-emotion = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+# `fs` lisätään workspace-pohjaan: LocalJsonStore persistoi JSON-tiedostoon
+# epälohkaisevasti (tokio::fs). Muut featuret tulevat workspace-määrittelystä.
+tokio = { workspace = true, features = ["fs"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

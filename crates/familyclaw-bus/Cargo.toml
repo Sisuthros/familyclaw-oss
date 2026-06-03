@@ -1,0 +1,26 @@
+[package]
+name = "familyclaw-bus"
+description = "Resonance Bus — Ractor actor-malli + affektiivinen hermosto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+familyclaw-core = { workspace = true }
+familyclaw-emotion = { workspace = true }
+familyclaw-latent = { workspace = true }
+ractor = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

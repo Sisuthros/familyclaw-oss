@@ -1,0 +1,42 @@
+[package]
+name = "familyclaw-channels"
+description = "Discord/Telegram/WhatsApp/Signal -kanavakerros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+familyclaw-core = { workspace = true }
+# HUOM: ei riippuvuutta familyclaw-busiin. Kanavakerros on InboundEnvelope-
+# kirjekuoren TUOTTAJA; envelope → familyclaw_bus::BusMessage -muunnos tehdään
+# agent-kerroksessa (joka riippuu molemmista). Näin vältetään crate-sykli ja
+# kanavakerros pysyy bus-riippumattomana. Integraatio kulkee `pump_to`-
+# sulkeuman + agent-craten adapterin kautta, ei suorana koodiriippuvuutena.
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+# Oletuksena vain runko + MockChannel. Oikeat kanava-adapterit ovat näiden
+# feature-flagien takana, jottei alustan ydinkäyttäjän tarvitse vetää sisään
+# raskaita kanava-SDK:ita (serenity, teloxide, ...). Tässä KERROS A -repossa
+# adaptereista on vain rajapinta + dokumentaatio; SDK-riippuvuudet lisätään
+# featuren mukana vasta kun adapteri toteutetaan.
+default = []
+discord = []
+telegram = []
+whatsapp = []
+signal = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }

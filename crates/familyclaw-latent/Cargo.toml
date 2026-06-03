@@ -1,0 +1,19 @@
+[package]
+name = "familyclaw-latent"
+description = "Latent-telepatia — hidden-state-siirto + RecursiveLink + teksti-fallback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+familyclaw-core = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
