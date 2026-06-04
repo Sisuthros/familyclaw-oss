@@ -285,6 +285,27 @@ where
         //    ja agentit "palaavat loppuun" muutamassa kymmenessa vuorossa.
         self.apply_emotional_homeostasis();
 
+        // 5. LLM-ajattelu (sivuvaikutus): jos LLM-clienti on konfiguroitu,
+        //    agentti "ajattelee" viestin pohjalta. Vastausta käytetään
+        //    (a) enrichoimaan TurnOutcomen summaryä ja (b) julkaisemaan
+        //    tekstivastaus busiin. Ajattelu on sivuvaikutus joka ajetaan
+        //    durable-askeleen jälkeen — replaya ei tarvita, koska ajattelu
+        //    on idempotentti ulkoinen kutsu.
+        if let Some(thought) = self.think(message).await {
+            match thought {
+                Ok(response) => {
+                    debug!(name = self.config.name, "LLM response: {}", &response[..response.len().min(120)]);
+                    // Julkaise vastaus busiin (sisarukset voivat reagoida).
+                    if let Err(e) = self.say(&response) {
+                        warn!(name = self.config.name, "LLM response publish failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!(name = self.config.name, "LLM think failed: {e}");
+                }
+            }
+        }
+
         self.turn_counter += 1;
         Ok(recorded)
     }
