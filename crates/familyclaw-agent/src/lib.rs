@@ -51,7 +51,7 @@
 //! let durable = DurableContext::new(InMemoryJournal::new())
 //!     .map_err(|e| familyclaw_core::FamilyClawError::bus(e.to_string()))?;
 //!
-//! let mut agent = Agent::new(config, soul, memory, durable, bus.clone());
+//! let mut agent = Agent::new(config, soul, memory, durable, bus.clone(), None);
 //! let outcome = agent
 //!     .handle_turn(BeingId::new(), &BusMessage::text("hei sisarus"))
 //!     .await?;

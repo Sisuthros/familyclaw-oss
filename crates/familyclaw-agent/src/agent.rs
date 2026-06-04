@@ -29,6 +29,7 @@ use familyclaw_memory::{
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tracing::{debug, warn};
 
+use crate::llm::{LlmClient, LlmConfig, LlmMessage};
 use crate::soul::Soul;
 
 /// Yhden vuoron (turn) lopputulos, joka kirjataan durable-lokiin
@@ -86,6 +87,8 @@ where
     bus: BusHandle,
     /// Kuinka monta vuoroa on käsitelty (durable-askelten nimien sekvensointiin).
     turn_counter: u64,
+    /// LLM-clienti ajatteluun (valinnainen, jotta testit toimivat ilman LLM:ää).
+    llm: Option<LlmClient>,
 }
 
 impl<S, J> Agent<S, J>
@@ -97,6 +100,8 @@ where
     ///
     /// Tunnetila alkaa neutraalina. `being_id` johdetaan konfiguraation
     /// agenttitunnisteesta, jotta busin ja muistin identiteetit täsmäävät.
+    /// LLM-clienti on valinnainen - jos annettu, agentti voi käyttää LLM:ää
+    /// ajattelua varten (think-metodi).
     #[must_use]
     pub fn new(
         config: AgentConfig,
@@ -104,8 +109,10 @@ where
         memory: Arc<S>,
         durable: DurableContext<J>,
         bus: BusHandle,
+        llm_config: Option<LlmConfig>,
     ) -> Self {
         let being_id = BeingId::from_agent_id(config.id);
+        let llm = llm_config.map(LlmClient::new);
         Self {
             config,
             being_id,
@@ -115,6 +122,7 @@ where
             durable,
             bus,
             turn_counter: 0,
+            llm,
         }
     }
 
@@ -158,6 +166,47 @@ where
     #[must_use]
     pub const fn turns_taken(&self) -> u64 {
         self.turn_counter
+    }
+
+    /// Agentin LLM-clienti (valinnainen).
+    #[must_use]
+    pub const fn llm(&self) -> Option<&LlmClient> {
+        self.llm.as_ref()
+    }
+
+    /// Agentin ajattelu: kutsuu LLM:ää system promptin + kontekstin + viestin
+    /// perusteella ja palauttaa vastauksen.
+    ///
+    /// Tämä on sivuvaikutus (ULKOINEN API-kutsu), joten se kannattaa ajaa
+    /// deterministisen durable-askeleen JÄLKEEN. LLM-vastetta käytetään
+    /// enrichoimaan TurnOutcome summarytä ja voi haluttaessa lähettää
+    /// tekstin busiin.
+    ///
+    /// # Errors
+    /// - [`FamilyClawError::Llm`] jos LLM-kutsu epäonnistuu.
+    /// - Palauttaa `None` jos LLM-clientiä ei ole configissa (harmless no-op).
+    pub async fn think(&self, current_message: &BusMessage) -> Option<Result<String>> {
+        let llm = self.llm.as_ref()?;
+
+        // Rakennetaan viestit: system prompt -> muistit -> nykyinen viesti
+        let mut messages = Vec::new();
+
+        // 1. System prompt (Soul's essence)
+        messages.push(LlmMessage::system(self.soul.essence.clone()));
+
+        // 2. Nykyinen viesti
+        let content = match current_message {
+            BusMessage::Text { body } => body.clone(),
+            BusMessage::Latent { text_shadow, .. } => text_shadow.clone(),
+            other => format!("[{}]", other.kind_label()),
+        };
+        messages.push(LlmMessage::user(content));
+
+        Some(
+            llm.complete(&messages)
+                .await
+                .map_err(|e| FamilyClawError::llm(e.to_string())),
+        )
     }
 
     /// Käsittelee yhden vuoron **kaatumiskestävästi**.
@@ -495,7 +544,7 @@ mod tests {
         let soul = Soul::from_essence(format!("I am {name}, a generic example being."));
         let memory = Arc::new(LocalJsonStore::in_memory());
         let durable = DurableContext::new(InMemoryJournal::new()).expect("durable ctx");
-        Agent::new(config, soul, memory, durable, bus)
+        Agent::new(config, soul, memory, durable, bus, None)
     }
 
     #[tokio::test]
@@ -615,6 +664,7 @@ mod tests {
                 Arc::clone(&shared_memory),
                 durable,
                 bus.clone(),
+                None,
             );
             agent
                 .handle_turn(BeingId::new(), &BusMessage::text("a"))
@@ -640,6 +690,7 @@ mod tests {
             Arc::clone(&shared_memory),
             resumed_ctx,
             bus.clone(),
+            None,
         );
 
         // Toistetaan samat vuorot samassa järjestyksessä: outcomet tulevat

@@ -45,6 +45,10 @@ pub enum FamilyClawError {
     /// Annettu syöte oli kelvoton (validointivirhe).
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// LLM-pyyntö epäonnistui (verkko- tai API-virhe).
+    #[error("llm error: {0}")]
+    Llm(String),
 }
 
 impl FamilyClawError {
@@ -72,6 +76,11 @@ impl FamilyClawError {
     /// Rakentaa [`FamilyClawError::InvalidInput`]-variantin.
     pub fn invalid_input(msg: impl Into<String>) -> Self {
         Self::InvalidInput(msg.into())
+    }
+
+    /// Rakentaa [`FamilyClawError::Llm`]-variantin.
+    pub fn llm(msg: impl Into<String>) -> Self {
+        Self::Llm(msg.into())
     }
 }
 

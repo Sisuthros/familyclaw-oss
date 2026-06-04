@@ -51,7 +51,7 @@ fn build_agent(name: &str, bus: &BusHandle) -> Result<Agent<LocalJsonStore, InMe
     let memory = Arc::new(LocalJsonStore::in_memory());
     let durable = DurableContext::new(InMemoryJournal::new())
         .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-    Ok(Agent::new(config, soul, memory, durable, bus.clone()))
+    Ok(Agent::new(config, soul, memory, durable, bus.clone(), None))
 }
 
 /// Reports memory state for an agent.
