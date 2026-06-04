@@ -135,7 +135,8 @@ mod tests {
     #[test]
     fn snapshot_default_appends_snapshot_row() {
         let mut j = VecJournal::default();
-        j.snapshot(StepId::ZERO, json!({"acc": 5})).expect("snapshot");
+        j.snapshot(StepId::ZERO, json!({"acc": 5}))
+            .expect("snapshot");
         let all = j.replay_all().expect("all");
         assert_eq!(all.len(), 1);
         assert!(all[0].kind.is_snapshot());

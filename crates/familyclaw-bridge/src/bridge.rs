@@ -271,7 +271,10 @@ mod tests {
         bridge.heartbeat_now(id).await.expect("heartbeat");
         let event = sub.recv().await.expect("event");
         assert_eq!(event.kind, EventKind::AgentHeartbeat);
-        assert_eq!(bridge.liveness(id).await.expect("liveness"), Liveness::Online);
+        assert_eq!(
+            bridge.liveness(id).await.expect("liveness"),
+            Liveness::Online
+        );
     }
 
     #[tokio::test]
@@ -320,13 +323,19 @@ mod tests {
         let to = AgentId::new();
         let task = bridge.create_task("t", Some(from)).await.expect("create");
         let mut sub = bridge.subscribe();
-        let handed = bridge.handoff_task(task.id, from, to).await.expect("handoff");
+        let handed = bridge
+            .handoff_task(task.id, from, to)
+            .await
+            .expect("handoff");
         assert_eq!(handed.assignee, Some(to));
         assert_eq!(handed.status, TaskStatus::Handed);
 
         let event = sub.recv().await.expect("event");
         assert_eq!(event.kind, EventKind::TaskHandedOff);
-        assert_eq!(event.payload["from_agent"], serde_json::json!(from.to_string()));
+        assert_eq!(
+            event.payload["from_agent"],
+            serde_json::json!(from.to_string())
+        );
         assert_eq!(event.payload["to_agent"], serde_json::json!(to.to_string()));
     }
 
@@ -350,7 +359,10 @@ mod tests {
             EventBus::with_capacity(8),
         );
         let clone = bridge.clone();
-        bridge.register_agent(agent("agent_a")).await.expect("register");
+        bridge
+            .register_agent(agent("agent_a"))
+            .await
+            .expect("register");
         assert_eq!(clone.list_agents().await.len(), 1);
     }
 }

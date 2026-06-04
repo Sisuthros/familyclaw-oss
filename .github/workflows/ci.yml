@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings -A clippy::doc_markdown -A clippy::too_many-lines
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  layer-b-audit:
+    name: Layer B Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for Layer B contamination
+        run: |
+          # No soul files
+          ! find . -name "*.soul" -o -name "*.soul.md" | grep -v docs || exit 1
+          # No SOUL.md except example
+          ! find . -name "SOUL.md" | grep -v docs || exit 1
+          # No calibration files
+          ! find . -name "*.calibration.json" | grep -v docs || exit 1
+          # No API keys
+          ! grep -r "api_key\|API_KEY\|secret\|token" --include="*.rs" --include="*.toml" crates/ || exit 1
+          # No .env files
+          ! find . -name ".env" -o -name ".env.*" | grep -v ".env.example" || exit 1
+          echo "Layer B audit passed - no contamination found"

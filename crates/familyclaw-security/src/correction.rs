@@ -158,7 +158,9 @@ impl HumanCorrection {
     pub fn new(content: impl Into<String>) -> Result<Self> {
         let content = content.into();
         if content.trim().is_empty() {
-            return Err(SecurityError::invalid_input("correction content must not be empty"));
+            return Err(SecurityError::invalid_input(
+                "correction content must not be empty",
+            ));
         }
         Ok(Self {
             content,
@@ -219,7 +221,10 @@ mod tests {
         // ~90 vrk puolittumisaika → yhden vuorokauden jälkeen ~99 % jäljellä.
         let day = 60.0 * 60.0 * 24.0;
         let retention = DecayClass::Slow.lambda().retention(day);
-        assert!(retention > 0.98, "slow retention after 1 day was {retention}");
+        assert!(
+            retention > 0.98,
+            "slow retention after 1 day was {retention}"
+        );
     }
 
     #[test]

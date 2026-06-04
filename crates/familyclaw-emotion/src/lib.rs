@@ -107,7 +107,10 @@ mod tests {
 
         let blend = state.primary_blend().expect("determined_hope present");
         assert_eq!(blend.blend, Blend::DeterminedHope);
-        assert!(state.to_vad().dominance > 0.5, "sisu+pride → korkea dominanssi");
+        assert!(
+            state.to_vad().dominance > 0.5,
+            "sisu+pride → korkea dominanssi"
+        );
 
         // Pitkä vaimeneminen neutraalilla kalibroinnilla → blendi katoaa.
         for _ in 0..10 {

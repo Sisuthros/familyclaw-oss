@@ -265,9 +265,7 @@ mod tests {
     #[test]
     fn fresh_step_runs_closure_and_records() {
         let mut ctx = fresh();
-        let out: i32 = ctx
-            .step("add", || Ok(2 + 3))
-            .expect("step ok");
+        let out: i32 = ctx.step("add", || Ok(2 + 3)).expect("step ok");
         assert_eq!(out, 5);
         assert_eq!(ctx.steps_taken(), 1);
 
@@ -445,7 +443,10 @@ mod tests {
             ran.set(true);
             Ok(99)
         });
-        assert!(!ran.get(), "epäonnistunutta askelta ei aja uudelleen replayssa");
+        assert!(
+            !ran.get(),
+            "epäonnistunutta askelta ei aja uudelleen replayssa"
+        );
         match res {
             Err(DurableError::StepFailed { message, .. }) => assert_eq!(message, "nope"),
             other => panic!("expected StepFailed, got {other:?}"),
@@ -466,7 +467,8 @@ mod tests {
     fn snapshot_does_not_consume_step_cursor() {
         let mut ctx = fresh();
         let _ = ctx.step("a", || Ok::<_, String>(1)).expect("a");
-        ctx.snapshot(&serde_json::json!({"acc": 1})).expect("snapshot");
+        ctx.snapshot(&serde_json::json!({"acc": 1}))
+            .expect("snapshot");
         let _ = ctx.step("b", || Ok::<_, String>(2)).expect("b");
 
         // Lokissa: a (step0), snapshot, b (step1). Snapshot ei kuluta kursoria.
@@ -611,7 +613,14 @@ mod tests {
 
         // Replay palauttaa identtisen rakenteen jäsennettynä lokista.
         let mut ctx2 = DurableContext::new(journal).expect("ctx2");
-        let replayed: Payload = ctx2.step("build", || Ok(Payload { id: 0, tags: vec![] })).expect("replay");
+        let replayed: Payload = ctx2
+            .step("build", || {
+                Ok(Payload {
+                    id: 0,
+                    tags: vec![],
+                })
+            })
+            .expect("replay");
         assert_eq!(replayed, made);
     }
 }

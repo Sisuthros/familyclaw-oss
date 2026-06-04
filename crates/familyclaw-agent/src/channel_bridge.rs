@@ -128,8 +128,7 @@ mod tests {
 
         // Kanavan oma bus-seat (lähettäjä).
         let channel_seat = BeingId::new();
-        publish_envelope(&bus, channel_seat, envelope("from the channel"))
-            .expect("publish");
+        publish_envelope(&bus, channel_seat, envelope("from the channel")).expect("publish");
 
         // Anna viestin toimittua.
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;

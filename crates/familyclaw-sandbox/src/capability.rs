@@ -328,12 +328,9 @@ mod tests {
 
     #[test]
     fn from_iter_collects_capabilities() {
-        let caps: CapabilitySet = vec![
-            Capability::network("a"),
-            Capability::read_only_fs("/r"),
-        ]
-        .into_iter()
-        .collect();
+        let caps: CapabilitySet = vec![Capability::network("a"), Capability::read_only_fs("/r")]
+            .into_iter()
+            .collect();
         assert_eq!(caps.len(), 2);
         assert!(caps.allows_network_host("a"));
         assert!(caps.allows_read_path("/r/file"));

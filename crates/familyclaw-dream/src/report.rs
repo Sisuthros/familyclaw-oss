@@ -214,7 +214,11 @@ mod tests {
     fn counters_stay_in_sync_with_reflections() {
         let mut r = DreamReport::default();
         for _ in 0..10 {
-            r.record(Reflection::new(ReflectionKind::Merged, MessageId::new(), "x"));
+            r.record(Reflection::new(
+                ReflectionKind::Merged,
+                MessageId::new(),
+                "x",
+            ));
         }
         assert_eq!(r.merged, r.reflections.len());
         assert_eq!(r.total_actions(), r.reflections.len());

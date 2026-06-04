@@ -83,8 +83,12 @@ mod tests {
     fn end_to_end_latent_then_text_fallback() {
         // Kokonaisvirta: sama kanava onnistuu latentilla yhdelle
         // vastaanottajalle ja putoaa tekstiin toiselle.
-        let mut channel = InMemoryLatentChannel::new("agent_a/v1")
-            .with_link(RecursiveLink::new("agent_a/v1", 3, "agent_b/v1", 3));
+        let mut channel = InMemoryLatentChannel::new("agent_a/v1").with_link(RecursiveLink::new(
+            "agent_a/v1",
+            3,
+            "agent_b/v1",
+            3,
+        ));
 
         let hidden = LatentVector::new(vec![1.0, 2.0, 3.0], "agent_a/v1");
 

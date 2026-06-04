@@ -16,9 +16,7 @@ use familyclaw_core::time::{self, Timestamp};
 /// sama koodi tuottaa askeleet samassa järjestyksessä — `StepId` koodaa tämän
 /// järjestyksen, joten replay voi verrata odotettua ja löydettyä askelta
 /// paikka paikalta.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StepId(u64);
 

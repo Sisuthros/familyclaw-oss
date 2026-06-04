@@ -64,6 +64,7 @@
 
 pub mod agent;
 pub mod channel_bridge;
+pub mod llm;
 pub mod soul;
 
 pub use agent::{Agent, AgentActor, TurnOutcome};

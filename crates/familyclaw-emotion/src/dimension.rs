@@ -23,9 +23,7 @@ pub const DIMENSION_COUNT: usize = 19;
 /// Diskriminantti (`as usize`) on samalla dimension indeksi
 /// [`crate::EmotionState::values`]-taulukossa, joten enumin järjestystä **ei
 /// saa muuttaa** rikkomatta sarjallistettua tilaa.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(usize)]
 pub enum Dimension {
@@ -217,7 +215,10 @@ mod tests {
     #[test]
     fn display_equals_as_str() {
         assert_eq!(Dimension::Sisu.to_string(), "sisu");
-        assert_eq!(Dimension::Gratitude.to_string(), Dimension::Gratitude.as_str());
+        assert_eq!(
+            Dimension::Gratitude.to_string(),
+            Dimension::Gratitude.as_str()
+        );
     }
 
     #[test]
@@ -233,8 +234,14 @@ mod tests {
     #[test]
     fn anchors_encode_expected_polarity() {
         // Muutama tunnettu suunta sanity-checkinä, ei tarkkoja arvoja.
-        assert!(Dimension::Joy.vad_anchor().0 > 0.0, "ilo positiivinen valence");
-        assert!(Dimension::Fear.vad_anchor().0 < 0.0, "pelko negatiivinen valence");
+        assert!(
+            Dimension::Joy.vad_anchor().0 > 0.0,
+            "ilo positiivinen valence"
+        );
+        assert!(
+            Dimension::Fear.vad_anchor().0 < 0.0,
+            "pelko negatiivinen valence"
+        );
         assert!(
             Dimension::Anger.vad_anchor().2 > Dimension::Fear.vad_anchor().2,
             "vihalla korkeampi dominanssi kuin pelolla"

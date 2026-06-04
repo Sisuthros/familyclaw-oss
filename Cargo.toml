@@ -25,8 +25,10 @@ sha2 = "0.10"
 # tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# http (channels, organ servers)
+# http (channels, organ servers, LLM client)
 axum = "0.7"
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
 # wasm sandbox (optional — vain familyclaw-sandboxin "wasmtime"-featuren takana)
 # v35: korjattu Windows-MSVC OutOfFuel-trapin __fastfail-bugi (v27:ssä rikki).
 wasmtime = { version = "35", default-features = false, features = ["cranelift", "runtime"] }

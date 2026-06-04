@@ -127,7 +127,11 @@ mod tests {
         let (mem_replay, _) = run(mem_journal, &mem_effects);
         assert_eq!(mem_first, 123);
         assert_eq!(mem_replay, 123);
-        assert_eq!(mem_effects.get(), 2, "memory: ei uusia sivuvaikutuksia replayssa");
+        assert_eq!(
+            mem_effects.get(),
+            2,
+            "memory: ei uusia sivuvaikutuksia replayssa"
+        );
 
         // --- File ---
         let mut path = std::env::temp_dir();
@@ -149,7 +153,11 @@ mod tests {
 
         assert_eq!(file_first, 123);
         assert_eq!(file_replay, 123);
-        assert_eq!(file_effects.get(), 2, "file: ei uusia sivuvaikutuksia replayssa");
+        assert_eq!(
+            file_effects.get(),
+            2,
+            "file: ei uusia sivuvaikutuksia replayssa"
+        );
 
         // Sama tulos molemmilla taustoilla.
         assert_eq!(mem_replay, file_replay);

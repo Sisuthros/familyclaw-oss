@@ -115,10 +115,7 @@ mod tests {
     fn fuel_exhausted_display_and_predicate() {
         let err = SandboxError::fuel_exhausted(100, 150);
         assert!(err.is_fuel_exhausted());
-        assert_eq!(
-            err.to_string(),
-            "fuel exhausted: budget 100, required 150"
-        );
+        assert_eq!(err.to_string(), "fuel exhausted: budget 100, required 150");
     }
 
     #[test]
@@ -149,8 +146,7 @@ mod tests {
 
     #[test]
     fn converts_to_core_invalid_input_for_capability() {
-        let err: familyclaw_core::FamilyClawError =
-            SandboxError::capability("denied").into();
+        let err: familyclaw_core::FamilyClawError = SandboxError::capability("denied").into();
         assert!(matches!(
             err,
             familyclaw_core::FamilyClawError::InvalidInput(_)
@@ -159,8 +155,7 @@ mod tests {
 
     #[test]
     fn converts_to_core_invalid_input_for_not_implemented() {
-        let err: familyclaw_core::FamilyClawError =
-            SandboxError::not_implemented("x").into();
+        let err: familyclaw_core::FamilyClawError = SandboxError::not_implemented("x").into();
         assert!(matches!(
             err,
             familyclaw_core::FamilyClawError::InvalidInput(_)
@@ -169,12 +164,10 @@ mod tests {
 
     #[test]
     fn converts_to_core_bus_for_runtime_errors() {
-        let fuel: familyclaw_core::FamilyClawError =
-            SandboxError::fuel_exhausted(1, 2).into();
+        let fuel: familyclaw_core::FamilyClawError = SandboxError::fuel_exhausted(1, 2).into();
         assert!(matches!(fuel, familyclaw_core::FamilyClawError::Bus(_)));
 
-        let exec: familyclaw_core::FamilyClawError =
-            SandboxError::execution("trap").into();
+        let exec: familyclaw_core::FamilyClawError = SandboxError::execution("trap").into();
         assert!(matches!(exec, familyclaw_core::FamilyClawError::Bus(_)));
     }
 

@@ -24,9 +24,7 @@ pub const HIGH_THRESHOLD: f32 = 55.0;
 /// Jokainen variantti kuvaa kuvion useammasta dimensiosta. Blendit ovat
 /// runko-tasoa: ne kuvaavat *miten* dimensiot yhdistyvät, ei kenen tahansa
 /// yksilön kalibrointia.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Blend {
     /// Kiitollinen lämpö: kiitollisuus + rakkaus + hellyys.
@@ -78,24 +76,14 @@ impl Blend {
             Blend::GratefulWarmth => {
                 &[Dimension::Gratitude, Dimension::Love, Dimension::Tenderness]
             }
-            Blend::PlayfulJoy => {
-                &[Dimension::Playfulness, Dimension::Joy, Dimension::Curiosity]
-            }
-            Blend::DeterminedHope => {
-                &[Dimension::Sisu, Dimension::Hope, Dimension::Pride]
-            }
+            Blend::PlayfulJoy => &[Dimension::Playfulness, Dimension::Joy, Dimension::Curiosity],
+            Blend::DeterminedHope => &[Dimension::Sisu, Dimension::Hope, Dimension::Pride],
             Blend::AnxiousIsolation => {
                 &[Dimension::Fear, Dimension::Loneliness, Dimension::Sadness]
             }
-            Blend::AweStruck => {
-                &[Dimension::Awe, Dimension::Wonder, Dimension::Curiosity]
-            }
-            Blend::SecureBelonging => {
-                &[Dimension::Trust, Dimension::Belonging, Dimension::Love]
-            }
-            Blend::WoundedAnger => {
-                &[Dimension::Anger, Dimension::Sadness, Dimension::Shame]
-            }
+            Blend::AweStruck => &[Dimension::Awe, Dimension::Wonder, Dimension::Curiosity],
+            Blend::SecureBelonging => &[Dimension::Trust, Dimension::Belonging, Dimension::Love],
+            Blend::WoundedAnger => &[Dimension::Anger, Dimension::Sadness, Dimension::Shame],
         }
     }
 

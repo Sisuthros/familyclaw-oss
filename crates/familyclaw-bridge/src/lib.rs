@@ -97,7 +97,10 @@ mod tests {
         );
         let id = info.id;
         bridge.register_agent(info).await.expect("register");
-        assert_eq!(bridge.liveness(id).await.expect("liveness"), Liveness::Unknown);
+        assert_eq!(
+            bridge.liveness(id).await.expect("liveness"),
+            Liveness::Unknown
+        );
 
         let task: Task = bridge.create_task("t", Some(id)).await.expect("create");
         let tid: TaskId = task.id;

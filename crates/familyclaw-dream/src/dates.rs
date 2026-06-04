@@ -29,14 +29,38 @@ struct RelativeWord {
 /// muuta merkitystä kalenteripäiväksi sidottuna, joten se sisältyy
 /// täydellisyyden vuoksi (offset 0).
 const RELATIVE_WORDS: &[RelativeWord] = &[
-    RelativeWord { word: "eilen", offset_days: -1 },
-    RelativeWord { word: "yesterday", offset_days: -1 },
-    RelativeWord { word: "tänään", offset_days: 0 },
-    RelativeWord { word: "today", offset_days: 0 },
-    RelativeWord { word: "huomenna", offset_days: 1 },
-    RelativeWord { word: "tomorrow", offset_days: 1 },
-    RelativeWord { word: "toissapäivänä", offset_days: -2 },
-    RelativeWord { word: "ylihuomenna", offset_days: 2 },
+    RelativeWord {
+        word: "eilen",
+        offset_days: -1,
+    },
+    RelativeWord {
+        word: "yesterday",
+        offset_days: -1,
+    },
+    RelativeWord {
+        word: "tänään",
+        offset_days: 0,
+    },
+    RelativeWord {
+        word: "today",
+        offset_days: 0,
+    },
+    RelativeWord {
+        word: "huomenna",
+        offset_days: 1,
+    },
+    RelativeWord {
+        word: "tomorrow",
+        offset_days: 1,
+    },
+    RelativeWord {
+        word: "toissapäivänä",
+        offset_days: -2,
+    },
+    RelativeWord {
+        word: "ylihuomenna",
+        offset_days: 2,
+    },
 ];
 
 /// Muotoilee päiväyksen ISO-muotoon (`YYYY-MM-DD`) viitehetkestä siirrettynä.
@@ -49,7 +73,12 @@ fn shifted_iso(reference: Timestamp, offset_days: i64) -> String {
     let shifted = base
         .checked_add_signed(Duration::days(offset_days))
         .unwrap_or(base);
-    format!("{:04}-{:02}-{:02}", shifted.year(), shifted.month(), shifted.day())
+    format!(
+        "{:04}-{:02}-{:02}",
+        shifted.year(),
+        shifted.month(),
+        shifted.day()
+    )
 }
 
 /// Lopputulos yhden tekstin absolutisoinnista.

@@ -365,8 +365,12 @@ mod tests {
     }
 
     fn channel_with_link(target_model: &str, src: usize, tgt: usize) -> InMemoryLatentChannel {
-        InMemoryLatentChannel::new("agent_a/v1")
-            .with_link(RecursiveLink::new("agent_a/v1", src, target_model, tgt))
+        InMemoryLatentChannel::new("agent_a/v1").with_link(RecursiveLink::new(
+            "agent_a/v1",
+            src,
+            target_model,
+            tgt,
+        ))
     }
 
     #[test]

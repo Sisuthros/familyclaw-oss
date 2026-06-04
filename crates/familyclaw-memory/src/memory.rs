@@ -123,7 +123,7 @@ pub struct Memory {
     /// Jos asetettu, `MemoryStore::add` ohittaa jo kirjatun saman avaimen
     /// muiston, jolloin muistikirjaus on idempotentti replayssa
     /// (ratkaisee dual-write-ongelman: durable.step onnistuu mutta
-    /// memory_store.add ei ehdi ennen kaatumista).
+    /// `memory_store.add` ei ehdi ennen kaatumista).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_key: Option<String>,
 }
@@ -164,7 +164,8 @@ impl Memory {
     /// Suojattu ydin palauttaa aina `1.0`.
     #[must_use]
     pub fn retention(&self, at: Timestamp) -> f32 {
-        self.decay_policy.retention(self.age_secs(at), self.stability())
+        self.decay_policy
+            .retention(self.age_secs(at), self.stability())
     }
 
     /// Muiston vahvuus `S` Ebbinghaus-kaavaan, johdettuna tärkeydestä.

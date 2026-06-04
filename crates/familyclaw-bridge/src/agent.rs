@@ -535,7 +535,7 @@ mod tests {
 
         reg.heartbeat(a, ts(100)).await.expect("hb a"); // online @120
         reg.heartbeat(b, ts(50)).await.expect("hb b"); // offline @120 (70s old)
-        // c: ei heartbeatia → Unknown, ei online.
+                                                       // c: ei heartbeatia → Unknown, ei online.
 
         let online = reg.online_at(ts(120)).await;
         assert_eq!(online.len(), 1);

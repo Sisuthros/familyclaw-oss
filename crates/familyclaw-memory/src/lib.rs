@@ -76,9 +76,7 @@ pub use importance::{
     ImportanceFactors, WEIGHT_EMOTION, WEIGHT_IDENTITY, WEIGHT_NOVELTY, WEIGHT_REINFORCEMENT,
 };
 pub use memory::{Memory, MemoryBuilder, MemoryStatus, STABILITY_MAX, STABILITY_MIN};
-pub use retrieval::{
-    retrieve, retrieve_now, score, RetrievalContext, RetrievalResult,
-};
+pub use retrieval::{retrieve, retrieve_now, score, RetrievalContext, RetrievalResult};
 pub use store::{DecayReport, DecayThresholds, LocalJsonStore, MemoryStore};
 
 // Re-export tunnetyypit jotta käyttäjän ei tarvitse riippua
@@ -119,7 +117,10 @@ mod tests {
         let id = store.add(m).await.expect("add");
         assert!(!store.is_empty().await.expect("empty"));
 
-        store.reinforce(id, familyclaw_core::time::now()).await.expect("reinforce");
+        store
+            .reinforce(id, familyclaw_core::time::now())
+            .await
+            .expect("reinforce");
 
         let ctx = RetrievalContext::new("meaningful event")
             .with_emotions([Dimension::Joy])

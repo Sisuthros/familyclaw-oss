@@ -32,7 +32,9 @@ pub fn to_rfc3339(ts: Timestamp) -> String {
 pub fn parse_rfc3339(s: &str) -> crate::Result<Timestamp> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| crate::FamilyClawError::invalid_input(format!("invalid rfc3339 timestamp: {e}")))
+        .map_err(|e| {
+            crate::FamilyClawError::invalid_input(format!("invalid rfc3339 timestamp: {e}"))
+        })
 }
 
 /// Rakentaa aikaleiman Unix-sekunneista (UTC).
@@ -93,10 +95,7 @@ mod tests {
     #[test]
     fn parse_rejects_garbage() {
         let err = parse_rfc3339("not a date").expect_err("garbage must fail");
-        assert!(matches!(
-            err,
-            crate::FamilyClawError::InvalidInput(_)
-        ));
+        assert!(matches!(err, crate::FamilyClawError::InvalidInput(_)));
     }
 
     #[test]

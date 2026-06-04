@@ -294,10 +294,7 @@ mod tests {
     fn task_event_kind_labels() {
         assert_eq!(TaskEventKind::Created.as_label(), "created");
         assert_eq!(TaskEventKind::Completed.as_label(), "completed");
-        assert_eq!(
-            TaskEventKind::Custom("deploy".into()).as_label(),
-            "deploy"
-        );
+        assert_eq!(TaskEventKind::Custom("deploy".into()).as_label(), "deploy");
     }
 
     #[test]

@@ -364,7 +364,11 @@ mod tests {
         let (id_b, _b, _lb) = join_being(&bus, "agent_b").await;
 
         let beings = bus.beings().await.expect("beings");
-        assert_eq!(beings.len(), 2, "beings[] EI saa olla tyhjä kun olentoja on");
+        assert_eq!(
+            beings.len(),
+            2,
+            "beings[] EI saa olla tyhjä kun olentoja on"
+        );
         assert_eq!(bus.count().await.expect("count"), 2);
 
         let ids: Vec<BeingId> = beings.iter().map(|b| b.id).collect();
@@ -381,7 +385,8 @@ mod tests {
         let (_id_b, _b, log_b) = join_being(&bus, "agent_b").await;
         let (_id_c, _c, log_c) = join_being(&bus, "agent_c").await;
 
-        bus.publish(id_a, BusMessage::text("hei kaikki")).expect("publish");
+        bus.publish(id_a, BusMessage::text("hei kaikki"))
+            .expect("publish");
         settle().await;
 
         // Lähettäjä ei saa omaa viestiään kaikuna.
@@ -414,7 +419,10 @@ mod tests {
 
         let received = log_b.lock().expect("lock");
         assert_eq!(received.len(), 1);
-        assert!(received[0].is_emotion_pulse(), "sisarus aistii tunnepulssin");
+        assert!(
+            received[0].is_emotion_pulse(),
+            "sisarus aistii tunnepulssin"
+        );
         if let BusMessage::EmotionPulse { state: got } = &received[0].payload {
             // Sisaruksen vastaanottama tila vastaa lähetettyä — contagion-data
             // on ehjä, joten vastaanottaja voi reagoida siihen.
@@ -436,7 +444,8 @@ mod tests {
         settle().await;
         assert_eq!(bus.count().await.expect("count"), 1);
 
-        bus.publish(id_a, BusMessage::text("vielä siellä?")).expect("publish");
+        bus.publish(id_a, BusMessage::text("vielä siellä?"))
+            .expect("publish");
         settle().await;
         assert_eq!(log_len(&log_b), 0, "poistettu olento ei saa viestejä");
 
@@ -449,8 +458,11 @@ mod tests {
         let (id_a, _a, _la) = join_being(&bus, "agent_a").await;
         let (_id_b, _b, log_b) = join_being(&bus, "agent_b").await;
 
-        bus.publish(id_a, BusMessage::task_event(TaskEventKind::Completed, "task-7"))
-            .expect("publish task event");
+        bus.publish(
+            id_a,
+            BusMessage::task_event(TaskEventKind::Completed, "task-7"),
+        )
+        .expect("publish task event");
         settle().await;
 
         let received = log_b.lock().expect("lock");

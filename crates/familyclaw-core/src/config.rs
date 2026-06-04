@@ -261,7 +261,10 @@ mod tests {
     use super::*;
 
     fn sample_agent(name: &str) -> AgentConfig {
-        AgentConfig::new(name, ModelConfig::new("provider/model").with_fallback("provider/backup"))
+        AgentConfig::new(
+            name,
+            ModelConfig::new("provider/model").with_fallback("provider/backup"),
+        )
     }
 
     #[test]
@@ -298,12 +301,13 @@ mod tests {
         let a = sample_agent("agent_a");
         let b = sample_agent("agent_b");
         let a_id = a.id;
-        let family = FamilyConfig::new("test_family")
-            .with_agent(a)
-            .with_agent(b);
+        let family = FamilyConfig::new("test_family").with_agent(a).with_agent(b);
 
         assert_eq!(family.agents.len(), 2);
-        assert_eq!(family.agent_by_id(a_id).map(|x| x.name.as_str()), Some("agent_a"));
+        assert_eq!(
+            family.agent_by_id(a_id).map(|x| x.name.as_str()),
+            Some("agent_a")
+        );
         assert_eq!(
             family.agent_by_name("agent_b").map(|x| x.name.as_str()),
             Some("agent_b")
@@ -395,7 +399,10 @@ mod tests {
         let json = family.to_json_string().expect("serialize");
 
         let mut path = std::env::temp_dir();
-        path.push(format!("familyclaw-core-test-{}.json", uuid::Uuid::new_v4()));
+        path.push(format!(
+            "familyclaw-core-test-{}.json",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, &json).expect("write temp config");
 
         let loaded = FamilyConfig::from_json_file(&path).expect("load from file");

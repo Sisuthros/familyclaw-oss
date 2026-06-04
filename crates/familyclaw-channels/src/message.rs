@@ -94,10 +94,7 @@ impl OutboundMessage {
     ///
     /// # Errors
     /// [`crate::ChannelError::InvalidInput`] jos kohde tai sisältö on tyhjä.
-    pub fn new(
-        target: impl Into<String>,
-        body: impl Into<String>,
-    ) -> crate::ChannelResult<Self> {
+    pub fn new(target: impl Into<String>, body: impl Into<String>) -> crate::ChannelResult<Self> {
         let target = target.into();
         let body = body.into();
         if target.trim().is_empty() {
@@ -171,7 +168,11 @@ impl InboundMessage {
     /// [`MessageId`] ja UTC-aikaleima liitetään mukaan, jotta bus ja durable-
     /// loki voivat viitata viestiin yksikäsitteisesti ja deterministisesti.
     #[must_use]
-    pub fn into_envelope(self, kind: ChannelKind, channel_id: impl Into<String>) -> InboundEnvelope {
+    pub fn into_envelope(
+        self,
+        kind: ChannelKind,
+        channel_id: impl Into<String>,
+    ) -> InboundEnvelope {
         InboundEnvelope {
             id: MessageId::new(),
             kind,

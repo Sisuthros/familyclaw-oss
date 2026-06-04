@@ -177,7 +177,10 @@ mod tests {
     #[test]
     fn fresh_memory_has_full_retention() {
         for p in DecayPolicy::ALL {
-            assert!((p.retention(0.0, 1.0) - 1.0).abs() < 1e-6, "{p} ei tuore nollalla");
+            assert!(
+                (p.retention(0.0, 1.0) - 1.0).abs() < 1e-6,
+                "{p} ei tuore nollalla"
+            );
         }
     }
 
@@ -187,7 +190,10 @@ mod tests {
         let r_day = p.retention(STABILITY_TIME_SCALE_SECS, 1.0);
         let r_week = p.retention(STABILITY_TIME_SCALE_SECS * 7.0, 1.0);
         assert!(r_day < 1.0);
-        assert!(r_week < r_day, "viikon retentio {r_week} ei ole alle päivän {r_day}");
+        assert!(
+            r_week < r_day,
+            "viikon retentio {r_week} ei ole alle päivän {r_day}"
+        );
         assert!(r_week > 0.0);
     }
 
@@ -207,7 +213,10 @@ mod tests {
         let t = STABILITY_TIME_SCALE_SECS * 5.0;
         let weak = p.retention(t, 1.0);
         let strong = p.retention(t, 4.0);
-        assert!(strong > weak, "vahva muisto {strong} ei säily pidempään kuin heikko {weak}");
+        assert!(
+            strong > weak,
+            "vahva muisto {strong} ei säily pidempään kuin heikko {weak}"
+        );
     }
 
     #[test]
@@ -215,7 +224,10 @@ mod tests {
         // Normal λ=0.18, dt = 1 päivä, S = 1.0 → R = e^(-0.18) ≈ 0.8353.
         let r = DecayPolicy::Normal.retention(STABILITY_TIME_SCALE_SECS, 1.0);
         let expected = (-0.18_f32).exp();
-        assert!((r - expected).abs() < 1e-4, "retentio {r} ei vastaa odotettua {expected}");
+        assert!(
+            (r - expected).abs() < 1e-4,
+            "retentio {r} ei vastaa odotettua {expected}"
+        );
     }
 
     #[test]
@@ -242,7 +254,10 @@ mod tests {
             for &t in &[0.0, 1.0, 1e3, 1e6, 1e9] {
                 for &s in &[0.1, 1.0, 10.0] {
                     let r = p.retention(t, s);
-                    assert!((0.0..=1.0).contains(&r), "{p} t={t} s={s} → r={r} ulkona rajoista");
+                    assert!(
+                        (0.0..=1.0).contains(&r),
+                        "{p} t={t} s={s} → r={r} ulkona rajoista"
+                    );
                 }
             }
         }

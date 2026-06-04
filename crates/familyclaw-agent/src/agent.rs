@@ -19,9 +19,7 @@
 
 use std::sync::Arc;
 
-use familyclaw_bus::{
-    BeingId, BeingInfo, BusHandle, BusMessage, ResonanceMessage, TaskEventKind,
-};
+use familyclaw_bus::{BeingId, BeingInfo, BusHandle, BusMessage, ResonanceMessage, TaskEventKind};
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
 use familyclaw_durable::{DurableContext, Journal};
 use familyclaw_emotion::{Dimension, EmotionState};
@@ -100,7 +98,13 @@ where
     /// Tunnetila alkaa neutraalina. `being_id` johdetaan konfiguraation
     /// agenttitunnisteesta, jotta busin ja muistin identiteetit täsmäävät.
     #[must_use]
-    pub fn new(config: AgentConfig, soul: Soul, memory: Arc<S>, durable: DurableContext<J>, bus: BusHandle) -> Self {
+    pub fn new(
+        config: AgentConfig,
+        soul: Soul,
+        memory: Arc<S>,
+        durable: DurableContext<J>,
+        bus: BusHandle,
+    ) -> Self {
         let being_id = BeingId::from_agent_id(config.id);
         Self {
             config,
@@ -169,7 +173,11 @@ where
     /// # Errors
     /// - [`FamilyClawError::Memory`] jos muistin kirjaus epäonnistuu.
     /// - [`FamilyClawError`] (käärittynä) jos durable-askel epäonnistuu.
-    pub async fn handle_turn(&mut self, sender: BeingId, message: &BusMessage) -> Result<TurnOutcome> {
+    pub async fn handle_turn(
+        &mut self,
+        sender: BeingId,
+        message: &BusMessage,
+    ) -> Result<TurnOutcome> {
         let turn = self.turn_counter;
         let step_name = format!("turn-{turn}");
 
@@ -479,10 +487,7 @@ mod tests {
 
     /// Apuri: rakentaa testiagentin tuoreella in-memory-tilalla, liitettynä
     /// annettuun busiin.
-    fn test_agent(
-        name: &str,
-        bus: BusHandle,
-    ) -> Agent<LocalJsonStore, InMemoryJournal> {
+    fn test_agent(name: &str, bus: BusHandle) -> Agent<LocalJsonStore, InMemoryJournal> {
         // Geneerinen nimi sellaisenaan: `Agent::spawn` ei rekisteröi actoria
         // Ractorin globaaliin nimiavaruuteen (spawnaa `None`-nimellä), joten
         // samanniminen agentti ei törmää testien välillä.
@@ -687,7 +692,10 @@ mod tests {
 
         assert_eq!(agent_memory.len().await.expect("len"), 1);
         let ctx = RetrievalContext::new("tervehdys");
-        let hits = agent_memory.retrieve(&ctx, time::now()).await.expect("retrieve");
+        let hits = agent_memory
+            .retrieve(&ctx, time::now())
+            .await
+            .expect("retrieve");
         assert_eq!(hits.len(), 1);
 
         bus.stop();
@@ -735,7 +743,9 @@ mod tests {
     #[test]
     fn should_remember_logic() {
         assert!(should_remember(&BusMessage::text("x")));
-        assert!(!should_remember(&BusMessage::emotion_pulse(EmotionState::neutral())));
+        assert!(!should_remember(&BusMessage::emotion_pulse(
+            EmotionState::neutral()
+        )));
         assert!(!should_remember(&BusMessage::task_event(
             TaskEventKind::Started,
             "t1"

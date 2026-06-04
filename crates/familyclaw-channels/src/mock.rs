@@ -167,11 +167,10 @@ impl Channel for MockChannel {
     }
 
     fn receive(&self) -> ChannelResult<MessageStream> {
-        let mut guard = self
-            .inner
-            .inbound_rx
-            .lock()
-            .map_err(|_| ChannelError::backend(self.channel_id(), "inbound_rx lock poisoned"))?;
+        let mut guard =
+            self.inner.inbound_rx.lock().map_err(|_| {
+                ChannelError::backend(self.channel_id(), "inbound_rx lock poisoned")
+            })?;
         let rx = guard.take().ok_or_else(|| {
             ChannelError::receive(self.channel_id(), "receive stream already taken")
         })?;
@@ -306,10 +305,8 @@ mod tests {
         let stream = ch.receive().expect("stream");
 
         for i in 0..3 {
-            ch.inject(
-                InboundMessage::new("u", "c", format!("msg{i}")).expect("inbound"),
-            )
-            .expect("inject");
+            ch.inject(InboundMessage::new("u", "c", format!("msg{i}")).expect("inbound"))
+                .expect("inject");
         }
         ch.close_inbound();
 

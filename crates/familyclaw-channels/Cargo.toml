@@ -26,6 +26,10 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 
+# Discord adapteri (feature-gated)
+serenity = { version = "0.12", optional = true }
+futures = { version = "0.3", optional = true }
+
 [features]
 # Oletuksena vain runko + MockChannel. Oikeat kanava-adapterit ovat näiden
 # feature-flagien takana, jottei alustan ydinkäyttäjän tarvitse vetää sisään
@@ -33,7 +37,7 @@ uuid = { workspace = true }
 # adaptereista on vain rajapinta + dokumentaatio; SDK-riippuvuudet lisätään
 # featuren mukana vasta kun adapteri toteutetaan.
 default = []
-discord = []
+discord = ["dep:serenity", "dep:futures"]
 telegram = []
 whatsapp = []
 signal = []

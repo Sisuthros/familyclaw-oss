@@ -228,7 +228,11 @@ where
         b.relevance
             .partial_cmp(&a.relevance)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.memory.last_reinforced_at.cmp(&a.memory.last_reinforced_at))
+            .then_with(|| {
+                b.memory
+                    .last_reinforced_at
+                    .cmp(&a.memory.last_reinforced_at)
+            })
     });
     scored.truncate(ctx.limit);
     scored
@@ -339,9 +343,24 @@ mod tests {
 
     #[test]
     fn min_relevance_clamps() {
-        assert_eq!(RetrievalContext::new("x").with_min_relevance(5.0).min_relevance, 1.0);
-        assert_eq!(RetrievalContext::new("x").with_min_relevance(-1.0).min_relevance, 0.0);
-        assert_eq!(RetrievalContext::new("x").with_min_relevance(f32::NAN).min_relevance, 0.0);
+        assert_eq!(
+            RetrievalContext::new("x")
+                .with_min_relevance(5.0)
+                .min_relevance,
+            1.0
+        );
+        assert_eq!(
+            RetrievalContext::new("x")
+                .with_min_relevance(-1.0)
+                .min_relevance,
+            0.0
+        );
+        assert_eq!(
+            RetrievalContext::new("x")
+                .with_min_relevance(f32::NAN)
+                .min_relevance,
+            0.0
+        );
     }
 
     #[test]
@@ -352,7 +371,10 @@ mod tests {
         let now = time::now();
         let s_hit = score(&m, &hit, now).expect("scored");
         let s_miss = score(&m, &miss, now).expect("scored");
-        assert!(s_hit > s_miss, "osuva {s_hit} ei suurempi kuin osumaton {s_miss}");
+        assert!(
+            s_hit > s_miss,
+            "osuva {s_hit} ei suurempi kuin osumaton {s_miss}"
+        );
     }
 
     #[test]
@@ -388,7 +410,10 @@ mod tests {
         let without = RetrievalContext::new("warm");
         let s_emo = score(&m, &with_emotion, now).expect("e");
         let s_plain = score(&m, &without, now).expect("p");
-        assert!(s_emo > s_plain, "tunneosuma {s_emo} ei boostaa yli {s_plain}");
+        assert!(
+            s_emo > s_plain,
+            "tunneosuma {s_emo} ei boostaa yli {s_plain}"
+        );
     }
 
     #[test]
@@ -401,12 +426,15 @@ mod tests {
     #[test]
     fn archived_is_penalized_and_excludable() {
         let mut m = mem("the report content");
-        let baseline = score(&m, &RetrievalContext::new("report"), time::now())
-            .expect("active scored");
+        let baseline =
+            score(&m, &RetrievalContext::new("report"), time::now()).expect("active scored");
         m.archive();
-        let archived = score(&m, &RetrievalContext::new("report"), time::now())
-            .expect("archived scored");
-        assert!(archived < baseline, "arkistoitu {archived} ei vaimennettu alle {baseline}");
+        let archived =
+            score(&m, &RetrievalContext::new("report"), time::now()).expect("archived scored");
+        assert!(
+            archived < baseline,
+            "arkistoitu {archived} ei vaimennettu alle {baseline}"
+        );
         // Poissuljettaessa arkistoidut → None.
         let excluded = RetrievalContext::new("report").including_archived(false);
         assert!(score(&m, &excluded, time::now()).is_none());

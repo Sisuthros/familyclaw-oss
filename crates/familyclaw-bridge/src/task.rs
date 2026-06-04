@@ -61,9 +61,7 @@ impl TaskStatus {
         use TaskStatus::{Active, Done, Handed, Pending};
         matches!(
             (self, next),
-            (Pending, Active | Handed | Done)
-                | (Active, Done | Handed)
-                | (Handed, Active | Done)
+            (Pending, Active | Handed | Done) | (Active, Done | Handed) | (Handed, Active | Done)
         )
     }
 }
@@ -125,7 +123,9 @@ impl Task {
     /// [`FamilyClawError::InvalidInput`] jos otsikko on tyhjä.
     pub fn validate(&self) -> Result<()> {
         if self.title.trim().is_empty() {
-            return Err(FamilyClawError::invalid_input("task title must not be empty"));
+            return Err(FamilyClawError::invalid_input(
+                "task title must not be empty",
+            ));
         }
         Ok(())
     }

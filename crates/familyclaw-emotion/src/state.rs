@@ -322,7 +322,10 @@ mod tests {
             s.decay_with(DEFAULT_HALF_LIFE_SECS, DEFAULT_HALF_LIFE_SECS, &cal);
         }
         let v = s.value(Dimension::Love);
-        assert!((v - 20.0).abs() < 0.5, "arvo {v} ei lähestynyt baselinea 20");
+        assert!(
+            (v - 20.0).abs() < 0.5,
+            "arvo {v} ei lähestynyt baselinea 20"
+        );
     }
 
     #[test]

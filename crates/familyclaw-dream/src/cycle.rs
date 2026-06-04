@@ -391,16 +391,28 @@ mod tests {
 
         // Tasan yksi haudattu, yksi koskematon (c).
         let all = store.all().await.expect("all");
-        let tombstoned = all.iter().filter(|m| m.status == MemoryStatus::Tombstoned).count();
+        let tombstoned = all
+            .iter()
+            .filter(|m| m.status == MemoryStatus::Tombstoned)
+            .count();
         assert_eq!(tombstoned, 1);
     }
 
     #[tokio::test]
     async fn merge_leaves_distinct_memories_untouched() {
         let store = LocalJsonStore::in_memory();
-        store.add(mem("rust async runtime design", 0.5)).await.expect("a");
-        store.add(mem("python web framework tutorial", 0.5)).await.expect("b");
-        store.add(mem("a song about the ocean waves", 0.5)).await.expect("c");
+        store
+            .add(mem("rust async runtime design", 0.5))
+            .await
+            .expect("a");
+        store
+            .add(mem("python web framework tutorial", 0.5))
+            .await
+            .expect("b");
+        store
+            .add(mem("a song about the ocean waves", 0.5))
+            .await
+            .expect("c");
 
         let cycle = DreamCycle::with_config(
             &store,
@@ -424,9 +436,18 @@ mod tests {
     #[tokio::test]
     async fn merge_three_way_cluster_keeps_one() {
         let store = LocalJsonStore::in_memory();
-        store.add(mem("agent_a is in city a", 0.2)).await.expect("a");
-        store.add(mem("agent_a is in city a now", 0.9)).await.expect("b");
-        store.add(mem("agent_a is in city a today", 0.3)).await.expect("c");
+        store
+            .add(mem("agent_a is in city a", 0.2))
+            .await
+            .expect("a");
+        store
+            .add(mem("agent_a is in city a now", 0.9))
+            .await
+            .expect("b");
+        store
+            .add(mem("agent_a is in city a today", 0.3))
+            .await
+            .expect("c");
 
         let cycle = DreamCycle::with_config(
             &store,
@@ -457,10 +478,7 @@ mod tests {
             .add(mem("agent_a is in city a", 0.5))
             .await
             .expect("stale");
-        let fresh = store
-            .add(mem("the sky is blue", 0.5))
-            .await
-            .expect("fresh");
+        let fresh = store.add(mem("the sky is blue", 0.5)).await.expect("fresh");
 
         let mut journal = InMemoryJournal::new();
         mark_contradicted(&mut journal, stale).expect("mark");
@@ -556,16 +574,17 @@ mod tests {
 
         assert_eq!(report.dates_absolutized, 1);
         let updated = store.get(id).await.expect("g").expect("p");
-        assert!(updated.content.contains("eilen (2026-06-03)"), "sai: {}", updated.content);
+        assert!(
+            updated.content.contains("eilen (2026-06-03)"),
+            "sai: {}",
+            updated.content
+        );
     }
 
     #[tokio::test]
     async fn absolutize_is_idempotent_across_runs() {
         let store = LocalJsonStore::in_memory();
-        store
-            .add(mem("shipped tomorrow", 0.5))
-            .await
-            .expect("add");
+        store.add(mem("shipped tomorrow", 0.5)).await.expect("add");
         let cfg = DreamConfig::default()
             .merging(false)
             .dropping_contradicted(false)
@@ -592,7 +611,12 @@ mod tests {
             )
             .await
             .expect("add");
-        let before = store.get(id).await.expect("g").expect("p").reinforcement_count;
+        let before = store
+            .get(id)
+            .await
+            .expect("g")
+            .expect("p")
+            .reinforcement_count;
 
         let cycle = DreamCycle::with_config(
             &store,
@@ -675,12 +699,24 @@ mod tests {
     async fn full_cycle_runs_all_phases() {
         let store = LocalJsonStore::in_memory();
         // duplikaatit
-        store.add(mem("we shipped the release", 0.3)).await.expect("d1");
-        let keep = store.add(mem("we shipped the release", 0.8)).await.expect("d2");
+        store
+            .add(mem("we shipped the release", 0.3))
+            .await
+            .expect("d1");
+        let keep = store
+            .add(mem("we shipped the release", 0.8))
+            .await
+            .expect("d2");
         // ristiriita
-        let stale = store.add(mem("server is in frankfurt", 0.5)).await.expect("stale");
+        let stale = store
+            .add(mem("server is in frankfurt", 0.5))
+            .await
+            .expect("stale");
         // suhteellinen päivä
-        store.add(mem("meeting happened eilen", 0.4)).await.expect("date");
+        store
+            .add(mem("meeting happened eilen", 0.4))
+            .await
+            .expect("date");
         // matala retention
         let created = at() - Duration::days(90);
         store
@@ -697,7 +733,8 @@ mod tests {
         let mut journal = InMemoryJournal::new();
         mark_contradicted(&mut journal, stale).expect("mark");
 
-        let cycle = DreamCycle::with_config(&store, DreamConfig::default().with_merge_similarity(0.9));
+        let cycle =
+            DreamCycle::with_config(&store, DreamConfig::default().with_merge_similarity(0.9));
         let report = cycle.run(&journal, at()).await.expect("run");
 
         assert_eq!(report.scanned, 5);
@@ -729,8 +766,14 @@ mod tests {
     #[tokio::test]
     async fn disabled_phases_do_nothing() {
         let store = LocalJsonStore::in_memory();
-        store.add(mem("we shipped the release", 0.3)).await.expect("d1");
-        store.add(mem("we shipped the release", 0.8)).await.expect("d2");
+        store
+            .add(mem("we shipped the release", 0.3))
+            .await
+            .expect("d1");
+        store
+            .add(mem("we shipped the release", 0.8))
+            .await
+            .expect("d2");
 
         let cfg = DreamConfig::default()
             .merging(false)
@@ -754,7 +797,10 @@ mod tests {
     #[tokio::test]
     async fn run_without_journal_skips_contradiction_phase() {
         let store = LocalJsonStore::in_memory();
-        let id = store.add(mem("would be contradicted", 0.5)).await.expect("add");
+        let id = store
+            .add(mem("would be contradicted", 0.5))
+            .await
+            .expect("add");
         // Vaikka drop_contradicted on päällä, ilman journalia ei pudoteta.
         let cycle = DreamCycle::with_config(
             &store,
@@ -775,7 +821,10 @@ mod tests {
     fn representative_order_prefers_higher_importance() {
         let strong = mem("x", 0.9);
         let weak = mem("x", 0.1);
-        assert_eq!(representative_order(&strong, &weak), std::cmp::Ordering::Less);
+        assert_eq!(
+            representative_order(&strong, &weak),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]

@@ -106,10 +106,7 @@ impl CodeSandbox for WasmtimeSandbox {
         let entry = instance
             .get_typed_func::<(), i32>(&mut store, Self::ENTRY_POINT)
             .map_err(|e| {
-                SandboxError::setup(format!(
-                    "missing entry point `{}`: {e}",
-                    Self::ENTRY_POINT
-                ))
+                SandboxError::setup(format!("missing entry point `{}`: {e}", Self::ENTRY_POINT))
             })?;
 
         let fuel_before = store
@@ -163,9 +160,7 @@ mod tests {
 
     /// Pieni WAT-moduuli joka vie `run`-funktion ja palauttaa annetun arvon.
     fn wat_returning(value: i32) -> Vec<u8> {
-        let wat = format!(
-            r#"(module (func (export "run") (result i32) (i32.const {value})))"#
-        );
+        let wat = format!(r#"(module (func (export "run") (result i32) (i32.const {value})))"#);
         wat::parse_str(&wat).expect("valid wat compiles to wasm")
     }
 

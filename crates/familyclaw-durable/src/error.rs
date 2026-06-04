@@ -30,7 +30,9 @@ pub enum DurableError {
     ///
     /// Tämä on durable-execution-mallin kovin invariantti: koodin täytyy
     /// tuottaa samat askeleet samassa järjestyksessä joka ajolla.
-    #[error("nondeterministic replay at step #{index}: expected step {expected:?}, found {found:?}")]
+    #[error(
+        "nondeterministic replay at step #{index}: expected step {expected:?}, found {found:?}"
+    )]
     NondeterministicReplay {
         /// Askeleen sekvenssijärjestysnumero (0-pohjainen).
         index: u64,

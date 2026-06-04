@@ -61,9 +61,7 @@ pub mod anchor;
 pub mod correction;
 pub mod error;
 
-pub use anchor::{
-    verify_identity, AnchorHash, DecayLambda, IdentityAnchor, IdentityStatus,
-};
+pub use anchor::{verify_identity, AnchorHash, DecayLambda, IdentityAnchor, IdentityStatus};
 pub use correction::{CorrectionPriority, DecayClass, HumanCorrection};
 pub use error::{Result, SecurityError};
 
@@ -86,8 +84,7 @@ mod tests {
     #[test]
     fn public_api_is_reexported() {
         // Jos jokin re-export poistetaan, tämä testi lakkaa kääntymästä.
-        let anchor: IdentityAnchor =
-            IdentityAnchor::new("mem-1", "soul").expect("valid anchor");
+        let anchor: IdentityAnchor = IdentityAnchor::new("mem-1", "soul").expect("valid anchor");
         let status: IdentityStatus = anchor.verify("soul");
         assert!(status.is_intact());
 
@@ -98,8 +95,7 @@ mod tests {
         assert!(DecayLambda::ZERO.is_eternal());
 
         let anchors = [anchor];
-        let tampered =
-            verify_identity(AgentId::new(), &anchors, |_| Some("changed".to_string()));
+        let tampered = verify_identity(AgentId::new(), &anchors, |_| Some("changed".to_string()));
         assert_eq!(tampered.len(), 1);
 
         let veto: HumanCorrection = HumanCorrection::new("rule").expect("valid");

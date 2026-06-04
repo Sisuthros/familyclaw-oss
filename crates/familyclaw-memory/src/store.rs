@@ -349,11 +349,7 @@ impl MemoryStore for LocalJsonStore {
         Ok(retrieve(guard.values(), ctx, at))
     }
 
-    async fn run_decay(
-        &self,
-        thresholds: DecayThresholds,
-        at: Timestamp,
-    ) -> Result<DecayReport> {
+    async fn run_decay(&self, thresholds: DecayThresholds, at: Timestamp) -> Result<DecayReport> {
         let mut guard = self.memories.write().await;
         let mut report = DecayReport::default();
         for memory in guard.values_mut() {
@@ -418,7 +414,11 @@ mod tests {
         assert_eq!(store.len().await.expect("len"), 1);
         let got = store.get(id).await.expect("get").expect("present");
         assert_eq!(got.content, "first");
-        assert!(store.get(MessageId::new()).await.expect("get missing").is_none());
+        assert!(store
+            .get(MessageId::new())
+            .await
+            .expect("get missing")
+            .is_none());
     }
 
     #[tokio::test]
@@ -544,7 +544,10 @@ mod tests {
     #[tokio::test]
     async fn json_persistence_roundtrip() {
         let mut path = std::env::temp_dir();
-        path.push(format!("familyclaw-memory-store-{}.json", uuid::Uuid::new_v4()));
+        path.push(format!(
+            "familyclaw-memory-store-{}.json",
+            uuid::Uuid::new_v4()
+        ));
 
         let id = {
             let store = LocalJsonStore::open(&path).await.expect("open new");
@@ -571,7 +574,10 @@ mod tests {
     #[tokio::test]
     async fn open_missing_file_starts_empty() {
         let mut path = std::env::temp_dir();
-        path.push(format!("familyclaw-memory-absent-{}.json", uuid::Uuid::new_v4()));
+        path.push(format!(
+            "familyclaw-memory-absent-{}.json",
+            uuid::Uuid::new_v4()
+        ));
         // Varmista ettei ole.
         let _ = std::fs::remove_file(&path);
         let store = LocalJsonStore::open(&path).await.expect("open");
@@ -582,9 +588,14 @@ mod tests {
     #[tokio::test]
     async fn open_corrupt_file_errors() {
         let mut path = std::env::temp_dir();
-        path.push(format!("familyclaw-memory-corrupt-{}.json", uuid::Uuid::new_v4()));
+        path.push(format!(
+            "familyclaw-memory-corrupt-{}.json",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, "{ not valid json").expect("write garbage");
-        let err = LocalJsonStore::open(&path).await.expect_err("corrupt errors");
+        let err = LocalJsonStore::open(&path)
+            .await
+            .expect_err("corrupt errors");
         assert!(matches!(err, FamilyClawError::Serde(_)));
         let _ = std::fs::remove_file(&path);
     }

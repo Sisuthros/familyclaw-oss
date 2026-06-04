@@ -208,9 +208,9 @@ impl EventSubscriber {
             Err(broadcast::error::RecvError::Closed) => {
                 Err(FamilyClawError::bus("event bus closed"))
             }
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                Err(FamilyClawError::bus(format!("event bus lagged by {n} events")))
-            }
+            Err(broadcast::error::RecvError::Lagged(n)) => Err(FamilyClawError::bus(format!(
+                "event bus lagged by {n} events"
+            ))),
         }
     }
 
@@ -228,9 +228,9 @@ impl EventSubscriber {
             Err(broadcast::error::TryRecvError::Closed) => {
                 Err(FamilyClawError::bus("event bus closed"))
             }
-            Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                Err(FamilyClawError::bus(format!("event bus lagged by {n} events")))
-            }
+            Err(broadcast::error::TryRecvError::Lagged(n)) => Err(FamilyClawError::bus(format!(
+                "event bus lagged by {n} events"
+            ))),
         }
     }
 }
@@ -243,10 +243,7 @@ mod tests {
     fn event_kind_labels() {
         assert_eq!(EventKind::AgentRegistered.as_label(), "agent_registered");
         assert_eq!(EventKind::TaskHandedOff.as_label(), "task_handed_off");
-        assert_eq!(
-            EventKind::Custom("my_event".into()).as_label(),
-            "my_event"
-        );
+        assert_eq!(EventKind::Custom("my_event".into()).as_label(), "my_event");
     }
 
     #[test]

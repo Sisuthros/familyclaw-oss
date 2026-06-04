@@ -226,10 +226,14 @@ impl IdentityAnchor {
     pub fn new(memory_id: impl Into<String>, content: &str) -> Result<Self> {
         let memory_id = memory_id.into();
         if memory_id.trim().is_empty() {
-            return Err(SecurityError::invalid_input("anchor memory_id must not be empty"));
+            return Err(SecurityError::invalid_input(
+                "anchor memory_id must not be empty",
+            ));
         }
         if content.is_empty() {
-            return Err(SecurityError::invalid_input("anchor content must not be empty"));
+            return Err(SecurityError::invalid_input(
+                "anchor content must not be empty",
+            ));
         }
         Ok(Self {
             memory_id,

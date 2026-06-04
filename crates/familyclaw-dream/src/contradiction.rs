@@ -83,7 +83,9 @@ fn id_from_entry(entry: &JournalEntry) -> Option<MessageId> {
 /// # Errors
 /// Palauttaa [`familyclaw_durable::DurableError`]:n jos journalia ei voi
 /// lukea.
-pub fn contradicted_ids<J: Journal>(journal: &J) -> familyclaw_durable::Result<BTreeSet<MessageId>> {
+pub fn contradicted_ids<J: Journal>(
+    journal: &J,
+) -> familyclaw_durable::Result<BTreeSet<MessageId>> {
     let entries = journal.replay_all()?;
     Ok(entries.iter().filter_map(id_from_entry).collect())
 }
@@ -124,7 +126,11 @@ mod tests {
         let mut journal = InMemoryJournal::new();
         // Tavallinen workflow-askel, ei ristiriitamerkintä.
         journal
-            .append(JournalEntry::completed(StepId::ZERO, "do_work", json!({"ok": true})))
+            .append(JournalEntry::completed(
+                StepId::ZERO,
+                "do_work",
+                json!({"ok": true}),
+            ))
             .expect("append work");
         // Snapshot.
         journal

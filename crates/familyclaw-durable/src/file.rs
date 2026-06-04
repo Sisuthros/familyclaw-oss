@@ -270,18 +270,11 @@ mod tests {
         {
             // Kirjoita ehjä rivi, sitten roskarivi PÄÄTÖS-rivinvaihdolla
             // (= sisäkorruptio, ei vajaa kirjoitus), sitten ehjä rivi.
-            let good = serde_json::to_string(&JournalEntry::completed(
-                StepId::ZERO,
-                "a",
-                json!(1),
-            ))
-            .expect("ser");
-            let good2 = serde_json::to_string(&JournalEntry::completed(
-                StepId::new(1),
-                "b",
-                json!(2),
-            ))
-            .expect("ser");
+            let good = serde_json::to_string(&JournalEntry::completed(StepId::ZERO, "a", json!(1)))
+                .expect("ser");
+            let good2 =
+                serde_json::to_string(&JournalEntry::completed(StepId::new(1), "b", json!(2)))
+                    .expect("ser");
             let mut raw = OpenOptions::new()
                 .create(true)
                 .append(true)
