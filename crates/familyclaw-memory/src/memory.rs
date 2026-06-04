@@ -63,6 +63,109 @@ impl std::fmt::Display for MemoryStatus {
     }
 }
 
+// ---------------------------------------------------------------------------
+// agent_gamma Amplifier — verification-gated memory
+// ---------------------------------------------------------------------------
+
+/// Muiston varmennustila: kuinka luotettava tämä tieto on.
+///
+/// Uusi muisto on aina `Claim` — väite ilman todisteita. Kun todisteita
+/// kertyy, se nousee `Evidence`-tasolle ja lopulta `Confirmed`-tasolle
+/// (jossa sillä on vähintään kaksi eri todistetyyppiä).
+///
+/// Tämä on ortogonaalinen elinkaaritilaan (`MemoryStatus`) nähden: muisto
+/// voi olla `Active` ja `Claim` yhtä aikaa. Confirmed-muisto unohtuu
+/// hitaammin retrieval-painotuksessa (confidence × retention), mutta
+/// elinkaaritila (`Active → Archived → Tombstoned`) toimii samoin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    /// Väite — ei vahvistettu, voi olla väärä. (Oletustila uusille muistoille.)
+    #[default]
+    Claim,
+    /// Todisteita on olemassa (vähintään yksi), mutta ei vielä varmistettu.
+    Evidence,
+    /// Vahvistettu vähintään kahdella eri todistetyypillä.
+    Confirmed,
+}
+
+impl VerificationStatus {
+    /// Palauttaa painon (0.0–1.0) Oracle-scoringia ja retrieval-painotusta varten.
+    #[must_use]
+    pub const fn weight(self) -> f32 {
+        match self {
+            VerificationStatus::Claim => 0.2,
+            VerificationStatus::Evidence => 0.6,
+            VerificationStatus::Confirmed => 1.0,
+        }
+    }
+}
+
+impl std::fmt::Display for VerificationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VerificationStatus::Claim => "claim",
+            VerificationStatus::Evidence => "evidence",
+            VerificationStatus::Confirmed => "confirmed",
+        })
+    }
+}
+
+/// Todistetyyppi muiston varmennukseen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceType {
+    /// Build meni läpi.
+    BuildPassed,
+    /// Testit meni läpi.
+    TestPassed,
+    /// Käyttäjä vahvisti.
+    UserConfirmation,
+    /// Riippumaton havainto (toinen agentti vahvisti).
+    IndependentObservation,
+    /// Ulkoinen dokumentaatio vahvistaa.
+    ExternalDoc,
+    /// Tuotantometriikka vahvistaa.
+    ProductionMetric,
+}
+
+impl std::fmt::Display for EvidenceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EvidenceType::BuildPassed => "build_passed",
+            EvidenceType::TestPassed => "test_passed",
+            EvidenceType::UserConfirmation => "user_confirmation",
+            EvidenceType::IndependentObservation => "independent_observation",
+            EvidenceType::ExternalDoc => "external_doc",
+            EvidenceType::ProductionMetric => "production_metric",
+        })
+    }
+}
+
+/// Yksittäinen todiste muiston tueksi.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Evidence {
+    /// Todistetyyppi.
+    pub evidence_type: EvidenceType,
+    /// Linkki todisteeseen (commit SHA, testinimi, keskustelu-id tms.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    /// Aikaleima.
+    pub recorded_at: Timestamp,
+}
+
+impl Evidence {
+    /// Luo uuden todisteen.
+    #[must_use]
+    pub fn new(evidence_type: EvidenceType, link: Option<String>) -> Self {
+        Self {
+            evidence_type,
+            link,
+            recorded_at: familyclaw_core::time::now(),
+        }
+    }
+}
+
 /// Yksittäinen Eternal Thread -muisto.
 ///
 /// Luo muisto [`Memory::builder`]-rakentajalla. Kentät ovat julkisia
@@ -126,6 +229,32 @@ pub struct Memory {
     /// `memory_store.add` ei ehdi ennen kaatumista).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_key: Option<String>,
+
+    // ── agent_gamma Amplifier -kentät ──────────────────────────────────────────
+    // Kaikki #[serde(default)] — taaksepäin yhteensopiva olemassaolevien
+    // persistoitujen muistojen kanssa (vanha JSON ilman näitä kenttiä
+    // deserialisoituu oikein oletusarvoilla).
+
+    /// Varmennustila — kuinka luotettava tämä muisto on.
+    /// Uusi muisto on aina `Claim` (varmistamaton väite).
+    #[serde(default)]
+    pub verification_status: VerificationStatus,
+
+    /// Luottamustaso 0.0–1.0, johdettu varmennustilasta ja evidenceistä.
+    /// Käytetään Oracle-scoringissa ja retrieval-painotuksessa.
+    #[serde(default)]
+    pub confidence: f32,
+
+    /// Todisteet jotka tukevat tätä muistoa.
+    /// Tyhjä = ei todisteita (Claim-tason muisto).
+    #[serde(default)]
+    pub evidence: Vec<Evidence>,
+
+    /// Ryhmittelyavain samankaltaisille muistoille (esim. `"db-valinta"`,
+    /// `"provider-prefix-bug"`). Käytetään Oracle-preflightissa
+    /// frekvenssilaskentaan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern_key: Option<String>,
 }
 
 impl Memory {
@@ -230,6 +359,55 @@ impl Memory {
             true
         }
     }
+
+    // ── agent_gamma Amplifier — varmennusmetodit ───────────────────────────────
+
+    /// Lisää todisteen ja päivittää varmennustilan automaattisesti.
+    ///
+    /// # Promote-säännöt
+    /// - `Claim` + 1 evidence (mikä tahansa) → `Evidence` (confidence 0.7)
+    /// - `Evidence` + `UserConfirmation` → `Confirmed` (confidence 1.0)
+    /// - `Claim` + 2 distinct evidence types → `Confirmed` (confidence 1.0)
+    /// - `Confirmed` pysyy `Confirmed` — confidence ei laske koskaan.
+    pub fn add_evidence(&mut self, evidence: Evidence) {
+        self.evidence.push(evidence);
+
+        // Kerää uniikit todistetyypit
+        let mut types: Vec<EvidenceType> = self.evidence.iter()
+            .map(|e| e.evidence_type)
+            .collect();
+        types.sort();
+        types.dedup();
+
+        match self.verification_status {
+            VerificationStatus::Claim => {
+                if types.len() >= 2 {
+                    self.verification_status = VerificationStatus::Confirmed;
+                    self.confidence = 1.0;
+                } else {
+                    self.verification_status = VerificationStatus::Evidence;
+                    self.confidence = 0.7;
+                }
+            }
+            VerificationStatus::Evidence => {
+                if types.contains(&EvidenceType::UserConfirmation) || types.len() >= 2 {
+                    self.verification_status = VerificationStatus::Confirmed;
+                    self.confidence = 1.0;
+                }
+                // Muuten pysyy Evidencenä — yksi todiste ei riitä
+            }
+            VerificationStatus::Confirmed => {
+                // Confirmed pysyy confirmed — confidence voi nousta, muttei laske
+                self.confidence = self.confidence.max(1.0);
+            }
+        }
+    }
+
+    /// Onko muisto vahvistettu (luotettava)?
+    #[must_use]
+    pub const fn is_confirmed(&self) -> bool {
+        matches!(self.verification_status, VerificationStatus::Confirmed)
+    }
 }
 
 /// [`Memory`]-rakentaja, joka asettaa johdetut kentät (tärkeys, aikaleimat,
@@ -248,6 +426,10 @@ pub struct MemoryBuilder {
     tags: Vec<String>,
     source: String,
     turn_key: Option<String>,
+    // agent_gamma Amplifier -kentät
+    verification_status: VerificationStatus,
+    evidence: Vec<Evidence>,
+    pattern_key: Option<String>,
 }
 
 impl MemoryBuilder {
@@ -264,6 +446,10 @@ impl MemoryBuilder {
             tags: Vec::new(),
             source: String::new(),
             turn_key: None,
+            // agent_gamma Amplifier -oletukset: uusi muisto alkaa varmistamattomana väitteenä
+            verification_status: VerificationStatus::Claim,
+            evidence: Vec::new(),
+            pattern_key: None,
         }
     }
 
@@ -317,6 +503,20 @@ impl MemoryBuilder {
         self
     }
 
+    /// Asettaa varmennustilan (oletus: `Claim`).
+    #[must_use]
+    pub fn verification_status(mut self, status: VerificationStatus) -> Self {
+        self.verification_status = status;
+        self
+    }
+
+    /// Asettaa ryhmittelyavaimen (`pattern_key`) oraclen frekvenssilaskentaa varten.
+    #[must_use]
+    pub fn pattern_key(mut self, key: impl Into<String>) -> Self {
+        self.pattern_key = Some(key.into());
+        self
+    }
+
     /// Viimeistelee muiston: generoi tunnisteen, asettaa aikaleimat ja
     /// laskee tärkeyden osatekijöistä. Tila on aina [`MemoryStatus::Active`].
     #[must_use]
@@ -337,6 +537,10 @@ impl MemoryBuilder {
             source: self.source,
             status: MemoryStatus::Active,
             turn_key: self.turn_key,
+            verification_status: self.verification_status,
+            confidence: 0.0, // Asetetaan promote-logiikalla add_evidence()-kutsujen kautta
+            evidence: self.evidence,
+            pattern_key: self.pattern_key,
         }
     }
 }

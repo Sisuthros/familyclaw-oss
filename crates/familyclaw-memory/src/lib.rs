@@ -68,6 +68,7 @@
 pub mod decay;
 pub mod importance;
 pub mod memory;
+pub mod oracle;
 pub mod retrieval;
 pub mod store;
 
@@ -75,8 +76,14 @@ pub use decay::DecayPolicy;
 pub use importance::{
     ImportanceFactors, WEIGHT_EMOTION, WEIGHT_IDENTITY, WEIGHT_NOVELTY, WEIGHT_REINFORCEMENT,
 };
-pub use memory::{Memory, MemoryBuilder, MemoryStatus, STABILITY_MAX, STABILITY_MIN};
-pub use retrieval::{retrieve, retrieve_now, score, RetrievalContext, RetrievalResult};
+pub use memory::{
+    Evidence, EvidenceType, Memory, MemoryBuilder, MemoryStatus, VerificationStatus,
+    STABILITY_MAX, STABILITY_MIN,
+};
+pub use oracle::{preflight, OracleResult, PatternMatch, RiskLevel};
+pub use retrieval::{
+    retrieve, retrieve_now, score, RetrievalContext, RetrievalResult,
+};
 pub use store::{DecayReport, DecayThresholds, LocalJsonStore, MemoryStore};
 
 // Re-export tunnetyypit jotta käyttäjän ei tarvitse riippua

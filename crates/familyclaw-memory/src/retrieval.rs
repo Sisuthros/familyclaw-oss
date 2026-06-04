@@ -180,17 +180,32 @@ pub fn score(memory: &Memory, ctx: &RetrievalContext, at: Timestamp) -> Option<f
     let keyword = keyword_score(&ctx.query, memory);
     let emotion = emotion_score(&ctx.emotions, &memory.emotions);
     let importance = memory.importance.clamp(0.0, 1.0);
-    let retention = memory.retention(at).clamp(0.0, 1.0);
 
     let base = keyword.mul_add(
         W_KEYWORD,
         emotion.mul_add(W_EMOTION, importance * W_IMPORTANCE),
     );
-    let mut relevance = base * retention;
+    let mut relevance = base * adjusted_retention(memory, at);
     if memory.status == MemoryStatus::Archived {
         relevance *= ARCHIVED_PENALTY;
     }
     Some(relevance.clamp(0.0, 1.0))
+}
+
+/// Confidence-painotettu retention retrievalia varten.
+///
+/// Confirmed-muistot (confidence=1.0) säilyttävät täyden retentionin.
+/// Claim-muistot (confidence=0.0) saavat vain murto-osan — niitä ei ole
+/// vahvistettu, joten niiden ei pitäisi nousta hakutuloksissa.
+///
+/// Formula: `adjusted = retention · (0.2 + 0.8 · confidence)`
+/// - Claim (0.0) → 20% retentionista
+/// - Evidence (0.7) → 76% retentionista
+/// - Confirmed (1.0) → 100% retentionista
+fn adjusted_retention(memory: &Memory, at: Timestamp) -> f32 {
+    let base = memory.retention(at).clamp(0.0, 1.0);
+    let confidence = memory.confidence.clamp(0.0, 1.0);
+    base * (0.2 + 0.8 * confidence)
 }
 
 /// Suorittaa haun annetuille muistoille: pisteyttää, suodattaa kynnyksellä

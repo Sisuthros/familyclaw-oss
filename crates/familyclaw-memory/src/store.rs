@@ -289,6 +289,19 @@ impl MemoryStore for LocalJsonStore {
         let mut guard = self.memories.write().await;
         guard.insert(id, memory);
         self.persist(&guard).await?;
+
+        // ── agent_gamma Amplifier: write-verify ────────────────────────────────
+        // Varmista että muisto on varmasti tallennettu lukemalla se takaisin.
+        // LocalJsonStoressa tämä on defensiivinen tarkistus (HashMap.insert
+        // epäonnistuu vain muistin loppuessa); SurrealDB-toteutuksessa tämä
+        // on kriittinen — tietokantakirjoitus voi epäonnistua hiljaisesti.
+        if !guard.contains_key(&id) {
+            return Err(FamilyClawError::Memory(
+                "write-verify failed: memory not found after insert".into(),
+            ));
+        }
+        // ──────────────────────────────────────────────────────────────────
+
         Ok(id)
     }
 
