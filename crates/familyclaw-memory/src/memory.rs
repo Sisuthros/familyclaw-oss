@@ -234,7 +234,6 @@ pub struct Memory {
     // Kaikki #[serde(default)] — taaksepäin yhteensopiva olemassaolevien
     // persistoitujen muistojen kanssa (vanha JSON ilman näitä kenttiä
     // deserialisoituu oikein oletusarvoilla).
-
     /// Varmennustila — kuinka luotettava tämä muisto on.
     /// Uusi muisto on aina `Claim` (varmistamaton väite).
     #[serde(default)]
@@ -373,9 +372,7 @@ impl Memory {
         self.evidence.push(evidence);
 
         // Kerää uniikit todistetyypit
-        let mut types: Vec<EvidenceType> = self.evidence.iter()
-            .map(|e| e.evidence_type)
-            .collect();
+        let mut types: Vec<EvidenceType> = self.evidence.iter().map(|e| e.evidence_type).collect();
         types.sort();
         types.dedup();
 

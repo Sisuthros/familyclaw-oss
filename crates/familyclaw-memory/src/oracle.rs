@@ -115,7 +115,6 @@ fn token_overlap(prompt_tokens: &[String], memory: &Memory) -> f32 {
     ratio
 }
 
-
 /// Aja Oracle-preflight: tarkista onko annetuissa ehdokasmuistoissa
 /// kuvioita jotka osuvat annettuun promptiin.
 ///
@@ -195,12 +194,14 @@ mod tests {
         m
     }
 
-
     #[test]
     fn empty_candidates_returns_low_risk() {
         let result = preflight("test prompt", &[]);
         assert_eq!(result.risk_level, RiskLevel::Low);
-        assert_eq!(result.score, 0.0);
+        assert!(
+            (result.score - 0.0).abs() < f32::EPSILON,
+            "score should be 0.0"
+        );
         assert!(result.matched_patterns.is_empty());
     }
 
@@ -231,7 +232,11 @@ mod tests {
             &candidates,
         );
         // Kaksi confirmed-muistoa joissa on osuvia tokeneita (model, endpoint)
-        assert!(result.score > 0.0, "odotus: score > 0.0, saatiin: {}", result.score);
+        assert!(
+            result.score > 0.0,
+            "odotus: score > 0.0, saatiin: {}",
+            result.score
+        );
         assert!(!result.matched_patterns.is_empty());
     }
 
@@ -259,7 +264,10 @@ mod tests {
     fn no_match_with_unrelated_prompt() {
         let m = confirmed_mem("kuinka konfiguroida Rust-projekti");
         let result = preflight("paras pizza resepti", &[m]);
-        assert_eq!(result.score, 0.0);
+        assert!(
+            (result.score - 0.0).abs() < f32::EPSILON,
+            "score should be 0.0"
+        );
     }
 
     #[test]
