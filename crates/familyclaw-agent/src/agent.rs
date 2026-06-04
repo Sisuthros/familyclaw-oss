@@ -179,7 +179,7 @@ where
     ///
     /// Tämä on sivuvaikutus (ULKOINEN API-kutsu), joten se kannattaa ajaa
     /// deterministisen durable-askeleen JÄLKEEN. LLM-vastetta käytetään
-    /// enrichoimaan TurnOutcome summarytä ja voi haluttaessa lähettää
+    /// enrichoimaan `TurnOutcome` summarytä ja voi haluttaessa lähettää
     /// tekstin busiin.
     ///
     /// # Errors
@@ -294,7 +294,11 @@ where
         if let Some(thought) = self.think(message).await {
             match thought {
                 Ok(response) => {
-                    debug!(name = self.config.name, "LLM response: {}", &response[..response.len().min(120)]);
+                    debug!(
+                        name = self.config.name,
+                        "LLM response: {}",
+                        &response[..response.len().min(120)]
+                    );
                     // Julkaise vastaus busiin (sisarukset voivat reagoida).
                     if let Err(e) = self.say(&response) {
                         warn!(name = self.config.name, "LLM response publish failed: {e}");

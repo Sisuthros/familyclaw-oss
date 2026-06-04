@@ -1,4 +1,4 @@
-//! Automated 30-second showcase of FamilyClaw capabilities.
+//! Automated 30-second showcase of `FamilyClaw` capabilities.
 //!
 //! This demo showcases KERROS A features without any user input:
 //! 1. Spawns 2 agents on the Resonance Bus
@@ -67,6 +67,7 @@ async fn report_memory(name: &str, mem: &LocalJsonStore, query: &str) -> Result<
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing for info-level output
