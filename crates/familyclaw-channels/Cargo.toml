@@ -13,11 +13,6 @@ workspace = true
 
 [dependencies]
 familyclaw-core = { workspace = true }
-# HUOM: ei riippuvuutta familyclaw-busiin. Kanavakerros on InboundEnvelope-
-# kirjekuoren TUOTTAJA; envelope → familyclaw_bus::BusMessage -muunnos tehdään
-# agent-kerroksessa (joka riippuu molemmista). Näin vältetään crate-sykli ja
-# kanavakerros pysyy bus-riippumattomana. Integraatio kulkee `pump_to`-
-# sulkeuman + agent-craten adapterin kautta, ei suorana koodiriippuvuutena.
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -26,18 +21,14 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 
-# Discord adapteri (feature-gated)
-serenity = { version = "0.12", optional = true }
-futures = { version = "0.3", optional = true }
+# Discord adapter: HTTP webhook (lightweight, no gateway SDK needed).
+# Sends via webhook URL, receives via polling or future gateway integration.
+reqwest = { version = "0.12", optional = true }
 
 [features]
-# Oletuksena vain runko + MockChannel. Oikeat kanava-adapterit ovat näiden
-# feature-flagien takana, jottei alustan ydinkäyttäjän tarvitse vetää sisään
-# raskaita kanava-SDK:ita (serenity, teloxide, ...). Tässä KERROS A -repossa
-# adaptereista on vain rajapinta + dokumentaatio; SDK-riippuvuudet lisätään
-# featuren mukana vasta kun adapteri toteutetaan.
+# Default: runko + MockChannel only. Real adapters behind feature flags.
 default = []
-discord = ["dep:serenity", "dep:futures"]
+discord = ["dep:reqwest"]
 telegram = []
 whatsapp = []
 signal = []

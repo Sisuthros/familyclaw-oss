@@ -55,10 +55,16 @@ mod error;
 mod message;
 mod mock;
 
+#[cfg(feature = "discord")]
+mod discord;
+
 pub use channel::{Channel, MessageStream, SendFuture};
 pub use error::{ChannelError, ChannelResult};
 pub use message::{ChannelKind, InboundEnvelope, InboundMessage, OutboundMessage};
 pub use mock::{pump_to, MockChannel};
+
+#[cfg(feature = "discord")]
+pub use discord::DiscordChannel;
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).
 #[must_use]
