@@ -276,6 +276,16 @@ fn tmp_path(path: &Path) -> PathBuf {
 impl MemoryStore for LocalJsonStore {
     async fn add(&self, memory: Memory) -> Result<MessageId> {
         let id = memory.id;
+        // Idempotentti kirjaus: jos samalla turn_key:llä on jo muisto,
+        // ohita (dual-write-suoja: durable.step voi onnistua vaikka
+        // memory_store.add ei ehdi ennen kaatumista).
+        if let Some(ref key) = memory.turn_key {
+            let guard = self.memories.read().await;
+            let exists = guard.values().any(|m| m.turn_key.as_ref() == Some(key));
+            if exists {
+                return Ok(id);
+            }
+        }
         let mut guard = self.memories.write().await;
         guard.insert(id, memory);
         self.persist(&guard).await?;

@@ -51,6 +51,12 @@ pub struct TurnOutcome {
 /// per-kone kalibrointi (KERROS B) voi säätää tätä myöhemmin.
 const CONTAGION_FACTOR: f32 = 0.25;
 
+/// Jokaisen vuoron jalkeen tunnetila palautuu talla prosentilla kohti
+/// neutraalia. Arvo 0.10 (10 %) tarkoittaa: 10 vuoroa jatkuvan
+/// sisaarvaikutuksen jalkeen tunnetila on vajaa puolet maksimistaan
+/// (eksponentiaalinen vaimennus). Tama estaa feedback-loop-saturaation.
+const HOMEOSTASIS_RATE: f32 = 0.10;
+
 /// Agentti — yksi olento, joka kokoaa konfiguraation, sielun, tunnetilan,
 /// muistin, kaatumiskestävän lokin ja bus-yhteyden.
 ///
@@ -178,14 +184,8 @@ where
             summary,
         };
 
-        // Onko tämä vuoro jo lokissa (replay)? Kysytään ENNEN `step`-kutsua,
-        // koska `step` siirtää kursoria. Tämä ratkaisee muistikirjauksen
-        // kerran-ja-vain-kerran-semantiikan: `step` muistoi vain `TurnOutcomen`,
-        // mutta sitä SEURAAVA `add`-sivuvaikutus ei ole askeleen sisällä —
-        // joten se pitää nimenomaisesti vaimentaa replayssa, muuten muisto
-        // kahdentuisi joka uudelleenkäynnistyksessä.
-        let is_replay = self.durable.is_replaying();
-
+        // Deterministinen paattely: turn-outcome valmis.
+        // Sivuvaikutusten (muisti) idempotentti kasittely alla (kohta 2).
         let recorded: TurnOutcome = self
             .durable
             .step(&step_name, {
@@ -203,17 +203,30 @@ where
         //    sitten vain tarvittavat omistetut arvot (Arc-muistikahva + valmis
         //    muisto) `.await`-rajan yli. Näin asynkroninen tulevaisuus ei
         //    kaappaa `&Agent`-viitettä, ja se pysyy `Send` (Ractor vaatii sen).
-        if recorded.remembered && !is_replay {
+        // Idempotentti muistikirjaus: ajetaan AINA (myos replayssa),
+        // koska MemoryStore::add ohittaa duplikaatit turn_key:n perusteella.
+        // Tama ratkaisee dual-write-ongelman: jos durable.step onnistuu
+        // mutta prossessi kaatuu ennen memory_store.add -kutsua,
+        // replayssa muisto kirjataan uudelleen ja store ignooraa sen.
+        if recorded.remembered {
             let memory_store = Arc::clone(&self.memory);
-            let memory = self.build_memory(sender, message);
+            let mut memory = self.build_memory(sender, message);
+            memory.turn_key = Some(format!("{}:turn-{}", self.config.name, turn));
             memory_store
                 .add(memory)
                 .await
                 .map_err(|e| FamilyClawError::memory(format!("remember failed: {e}")))?;
         }
 
-        // 3. Päivitä tunnetila viestin perusteella (paikallinen, ei-durable).
+        // 3. Paivita tunnetila viestin perusteella (paikallinen, ei-durable).
         self.apply_emotional_effect(message);
+
+        // 4. Tunnehomeostaasi: jokaisen vuoron jalkeen tunnetila palautuu
+        //    hieman kohti neutraalia. Tama estaa eksponentiaalisen saturaation
+        //    (feedback loop) jaktuisissa sisaruskeskusteluissa: ilman
+        //    vaimennusta CONTAGION_FACTOR kasaa tunnetiloja rajattomasti
+        //    ja agentit "palaavat loppuun" muutamassa kymmenessa vuorossa.
+        self.apply_emotional_homeostasis();
 
         self.turn_counter += 1;
         Ok(recorded)
@@ -268,6 +281,25 @@ where
             }
             // Tehtävä- ja custom-viestit eivät oletuksena muuta tunnetilaa.
             _ => {}
+        }
+    }
+
+    /// Tunnehomeostaasi: palauttaa jokaisen dimension hieman kohti
+    /// neutraalia (`HOMEOSTASIS_RATE` * deviaatio). Tama on biologinen
+    /// vastine: tunneilmaisu haihtuu ilman jatkuvaa aihetta.
+    ///
+    /// Esim. jos `Joy = 80` ja neutraali on 0, deviaatio = 80,
+    /// palautuminen = `0.10 * 80 = 8`, uusi arvo = `72`.
+    fn apply_emotional_homeostasis(&mut self) {
+        for dim in Dimension::ALL {
+            let current = self.emotion.value(dim);
+            let neutral = EmotionState::neutral().value(dim);
+            let deviation = current - neutral;
+            if deviation.abs() > 0.01 {
+                let correction = deviation * HOMEOSTASIS_RATE;
+                let new_value = current - correction;
+                self.emotion.set(dim, new_value);
+            }
         }
     }
 
@@ -533,8 +565,10 @@ mod tests {
         assert_eq!(agent.memory().len().await.expect("len"), 0);
 
         // Mutta tunnetila tarttui: Joy 80*0.25 = 20, Curiosity 60*0.25 = 15.
-        assert_eq!(agent.emotion().value(Dimension::Joy), 20.0);
-        assert_eq!(agent.emotion().value(Dimension::Curiosity), 15.0);
+        // Homeostaasi vahentaa 10% jokaisen vuoron jalkeen:
+        // Joy 20*0.9 = 18.0, Curiosity 15*0.9 = 13.5.
+        assert_eq!(agent.emotion().value(Dimension::Joy), 18.0);
+        assert_eq!(agent.emotion().value(Dimension::Curiosity), 13.5);
 
         bus.stop();
     }

@@ -118,6 +118,14 @@ pub struct Memory {
     /// Elinkaaritila.
     #[serde(default)]
     pub status: MemoryStatus,
+
+    /// Deterministinen dedupointiavain (agentin turn-numero + tunniste).
+    /// Jos asetettu, `MemoryStore::add` ohittaa jo kirjatun saman avaimen
+    /// muiston, jolloin muistikirjaus on idempotentti replayssa
+    /// (ratkaisee dual-write-ongelman: durable.step onnistuu mutta
+    /// memory_store.add ei ehdi ennen kaatumista).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_key: Option<String>,
 }
 
 impl Memory {
@@ -238,6 +246,7 @@ pub struct MemoryBuilder {
     decay_policy: DecayPolicy,
     tags: Vec<String>,
     source: String,
+    turn_key: Option<String>,
 }
 
 impl MemoryBuilder {
@@ -253,6 +262,7 @@ impl MemoryBuilder {
             decay_policy: DecayPolicy::Normal,
             tags: Vec::new(),
             source: String::new(),
+            turn_key: None,
         }
     }
 
@@ -325,6 +335,7 @@ impl MemoryBuilder {
             tags: self.tags,
             source: self.source,
             status: MemoryStatus::Active,
+            turn_key: self.turn_key,
         }
     }
 }
