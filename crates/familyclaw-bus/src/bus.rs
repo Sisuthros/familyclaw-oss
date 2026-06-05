@@ -18,8 +18,10 @@
 //! [`ActorRef`]-viitteen turvalliseksi (ei `unwrap`) API:ksi.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use ractor::pg;
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 use tracing::{debug, warn};
 
@@ -57,31 +59,71 @@ pub enum BusOp {
     Count(RpcReplyPort<usize>),
 }
 
+/// `ractor::pg`-prosessiryhmien nimien yhteinen etuliite. Jokainen
+/// bus-instanssi saa tästä johdetun **uniikin** ryhmänimen (ks. [`BUS_SEQ`]),
+/// jotta rinnakkaiset busit eivät jaa samaa jäsenpoolia.
+const PG_GROUP_PREFIX: &str = "resonance-bus";
+
+/// Prosessin-uniikki juokseva laskuri bus-instanssien pg-ryhmänimille.
+///
+/// Jokainen [`ResonanceBus`] saa `pre_start`issa oman ryhmänsä
+/// (`resonance-bus-{n}`), joten kahden eri busin olennot eivät koskaan näy
+/// toistensa [`pg::get_members`]-tuloksessa. `ractor::pg` on prosessi-globaali
+/// nimiavaruus, joten pelkkä prosessin-sisäinen uniikkius riittää — ei kelloa
+/// eikä satunnaislukua tarvita.
+static BUS_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// [`ResonanceBus`]-actorin sisäinen tila: rekisteröidyt olennot.
+///
+/// Säilyttää HashMap-metadatan (nimet, BeingInfo) ListBeings-kyselyjä varten
+/// ja käyttää `ractor::pg` prosessiryhmää (`pg_group`) jäsenten hallintaan ja
+/// jakeluun (broadcast).
 pub struct BusState {
-    /// Liittyneet olennot tunnisteen mukaan indeksoituna.
+    /// Liittyneet olennot tunnisteen mukaan indeksoituna (metatiedot).
     beings: HashMap<BeingId, BeingInfo>,
+    /// Tämän bus-instanssin oma, prosessi-uniikki `ractor::pg`-ryhmän nimi.
+    /// Eristää tämän busin jäsenpoolin kaikista muista prosessin buseista.
+    pg_group: String,
 }
 
 impl BusState {
-    /// Toimittaa kirjekuoren kaikille muille kuin lähettäjälle ja palauttaa
-    /// onnistuneiden toimitusten määrän. Suljettuun postilaatikkoon (kuollut
-    /// olento) toimitus epäonnistuu hiljaisesti — se siivotaan supervision-
-    /// tapahtumassa.
-    fn broadcast(&self, envelope: &ResonanceMessage) -> usize {
+    /// Toimittaa kirjekuoren kaikille muille kuin lähettäjälle
+    /// käyttäen ractor::pg prosessiryhmää.
+    fn broadcast(&self, envelope: &ResonanceMessage, _myself: &ActorRef<BusOp>) -> usize {
+        let cells = pg::get_members(&self.pg_group);
         let mut delivered = 0;
-        for (id, info) in &self.beings {
-            if *id == envelope.from {
-                continue; // ei kaikua takaisin lähettäjälle
+        if let Some(sender_info) = self.beings.get(&envelope.from) {
+            let sender_cell = sender_info.inbox().get_cell();
+            for cell in cells {
+                // Skip sender by comparing ActorCell (PartialEq compares ActorId)
+                if cell == sender_cell {
+                    continue;
+                }
+                let inbox_ref: ActorRef<ResonanceMessage> = cell.clone().into();
+                match inbox_ref.cast(envelope.clone()) {
+                    Ok(()) => delivered += 1,
+                    Err(err) => {
+                        warn!(
+                            being = %cell.get_id(),
+                            error = %err,
+                            "viestin toimitus olennolle epäonnistui (postilaatikko suljettu?)"
+                        );
+                    }
+                }
             }
-            match info.inbox().cast(envelope.clone()) {
-                Ok(()) => delivered += 1,
-                Err(err) => {
-                    warn!(
-                        being = %id,
-                        error = %err,
-                        "viestin toimitus olennolle epäonnistui (postilaatikko suljettu?)"
-                    );
+        } else {
+            // Sender not in our map (shouldn't happen), send to all
+            for cell in cells {
+                let inbox_ref: ActorRef<ResonanceMessage> = cell.clone().into();
+                match inbox_ref.cast(envelope.clone()) {
+                    Ok(()) => delivered += 1,
+                    Err(err) => {
+                        warn!(
+                            being = %cell.get_id(),
+                            error = %err,
+                            "viestin toimitus olennolle epäonnistui (postilaatikko suljettu?)"
+                        );
+                    }
                 }
             }
         }
@@ -106,8 +148,12 @@ impl Actor for ResonanceBus {
         _myself: ActorRef<Self::Msg>,
         (): Self::Arguments,
     ) -> std::result::Result<Self::State, ActorProcessingErr> {
+        // Mintataan tälle instanssille oma, prosessi-uniikki pg-ryhmänimi.
+        let seq = BUS_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pg_group = format!("{PG_GROUP_PREFIX}-{seq}");
         Ok(BusState {
             beings: HashMap::new(),
+            pg_group,
         })
     }
 
@@ -120,22 +166,29 @@ impl Actor for ResonanceBus {
         match message {
             BusOp::Register(info) => {
                 let id = info.id();
-                // Linkitä olento busin alaiseksi (bus = supervisor), jotta
-                // olennon kaatuminen tulee tänne siivottavaksi sen sijaan että
-                // se jäisi haamuksi rekisteriin. `child.link(supervisor)`.
+                // Handle reregister: leave old inbox from process group if exists
+                if let Some(old_info) = state.beings.get(&id) {
+                    pg::leave(state.pg_group.clone(), vec![old_info.inbox().get_cell()]);
+                    old_info.inbox().get_cell().unlink(myself.get_cell());
+                }
+                // Linkitä olento busin alaiseksi (bus = supervisor)
                 info.inbox().get_cell().link(myself.get_cell());
+                // Liitä prosessiryhmään jakelua varten
+                pg::join(state.pg_group.clone(), vec![info.inbox().get_cell()]);
                 debug!(being = %id, name = info.name(), "olento rekisteröity busiin");
                 state.beings.insert(id, info);
             }
             BusOp::Deregister(id) => {
                 if let Some(info) = state.beings.remove(&id) {
                     info.inbox().get_cell().unlink(myself.get_cell());
+                    // Poista prosessiryhmästä
+                    pg::leave(state.pg_group.clone(), vec![info.inbox().get_cell()]);
                     debug!(being = %id, "olento poistettu busista");
                 }
             }
             BusOp::Publish(envelope) => {
                 let kind = envelope.payload.kind_label();
-                let n = state.broadcast(&envelope);
+                let n = state.broadcast(&envelope, &myself);
                 debug!(
                     from = %envelope.from,
                     kind,
@@ -552,5 +605,50 @@ mod tests {
         let cloned = BusHandle::from_ref(bus.actor_ref().clone());
         assert_eq!(cloned.count().await.expect("count via clone"), 0);
         bus.stop();
+    }
+
+    /// Regressiotesti: kaksi samanaikaista busia EIVÄT jaa pg-jäsenpoolia.
+    ///
+    /// Vanha globaali `const PG_GROUP = "resonance-bus"` -malli sai testin A
+    /// olennot näkymään testin B `pg::get_members`-tuloksessa → broadcast-laskut
+    /// vuotivat ristiin (rinnakkais-flakiness). Per-instanssi-ryhmänimen kanssa
+    /// kummankin busin näkymä on tiukasti oma. Tämä testi epäonnistuisi vanhaa
+    /// koodia vastaan.
+    #[tokio::test]
+    async fn two_buses_have_isolated_member_pools() {
+        let bus1 = ResonanceBus::start(None).await.expect("start bus1");
+        let bus2 = ResonanceBus::start(None).await.expect("start bus2");
+
+        // Liitä kaksi olentoa busiin 1 ja kolme busiin 2.
+        let (_a1, _ra1, log1_a) = join_being(&bus1, "b1_agent_a").await;
+        let (id1_b, _rb1, log1_b) = join_being(&bus1, "b1_agent_b").await;
+        let (_a2, _ra2, log2_a) = join_being(&bus2, "b2_agent_a").await;
+        let (_b2, _rb2, log2_b) = join_being(&bus2, "b2_agent_b").await;
+        let (_c2, _rc2, log2_c) = join_being(&bus2, "b2_agent_c").await;
+
+        // Lukumäärät ovat instanssikohtaisia — eivät jaettuja.
+        assert_eq!(bus1.count().await.expect("count bus1"), 2);
+        assert_eq!(bus2.count().await.expect("count bus2"), 3);
+
+        // Broadcast busissa 1 tavoittaa VAIN busin 1 muut olennot (agent_a),
+        // EI busin 2 kolmea olentoa. Tämä on testin ydin: vanha globaali
+        // `PG_GROUP` vuotaisi viestin busin 2 olennoille (`pg::get_members`
+        // palauttaisi myös ne) → alla olevat `== 0`-väitteet kaatuisivat.
+        bus1.publish(id1_b, BusMessage::text("vain perheelle 1"))
+            .expect("publish bus1");
+        settle().await;
+
+        // Lähettäjä ei saa omaa viestiään kaikuna.
+        assert_eq!(log_len(&log1_b), 0, "lähettäjä ei saa omaa viestiään");
+        // Busin 1 toinen olento saa sen (broadcast toimii busin sisällä).
+        assert_eq!(log_len(&log1_a), 1, "busin 1 sisarus saa viestin");
+        // Busin 2 olennot EIVÄT saa mitään — tämä kaatuu vanhaa globaalia
+        // jäsenpoolia vastaan (ristiinvuoto-regression vartija).
+        assert_eq!(log_len(&log2_a), 0, "busin 2 olento ei saa busin 1 viestiä");
+        assert_eq!(log_len(&log2_b), 0, "busin 2 olento ei saa busin 1 viestiä");
+        assert_eq!(log_len(&log2_c), 0, "busin 2 olento ei saa busin 1 viestiä");
+
+        bus1.stop();
+        bus2.stop();
     }
 }
