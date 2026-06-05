@@ -1,6 +1,6 @@
 [package]
 name = "familyclaw-security"
-description = "Identity-anchorit, HumanCorrection, tamper-hälytys"
+description = "Identity anchors, HumanCorrection, tamper alerting"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

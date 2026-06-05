@@ -1,6 +1,6 @@
 [package]
 name = "familyclaw-channels"
-description = "Discord/Telegram/WhatsApp/Signal -kanavakerros"
+description = "Discord/Telegram/WhatsApp/Signal channel layer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

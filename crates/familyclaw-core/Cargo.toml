@@ -1,6 +1,6 @@
 [package]
 name = "familyclaw-core"
-description = "Ydintyypit, config, virheenkäsittely (ei unwrap)"
+description = "Core types, config, error handling (no unwrap)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

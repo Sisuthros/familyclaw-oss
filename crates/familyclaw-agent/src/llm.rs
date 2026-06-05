@@ -166,15 +166,20 @@ impl LlmClient {
         &self.config
     }
 
+    /// Builds the chat completions endpoint URL from the API base.
+    ///
+    /// Handles trailing slashes correctly and guarantees no whitespace.
+    #[must_use]
+    pub fn build_endpoint(api_base: &str) -> String {
+        format!("{}/chat/completions", api_base.trim_end_matches('/'))
+    }
+
     /// Completes a chat conversation, returning the response text.
     ///
     /// # Errors
     /// Returns an error if the HTTP request fails or the response is invalid.
     pub async fn complete(&self, messages: &[LlmMessage]) -> Result<String, LlmError> {
-        let endpoint = format!(
-            "{} /chat/completions",
-            self.config.api_base.trim_end_matches('/')
-        );
+        let endpoint = Self::build_endpoint(&self.config.api_base);
 
         let request_body = ChatCompletionsRequest {
             model: &self.config.model,
@@ -225,10 +230,7 @@ impl LlmClient {
         &self,
         messages: &[LlmMessage],
     ) -> Result<CompletionResult, LlmError> {
-        let endpoint = format!(
-            "{} /chat/completions",
-            self.config.api_base.trim_end_matches('/')
-        );
+        let endpoint = Self::build_endpoint(&self.config.api_base);
 
         let request_body = ChatCompletionsRequest {
             model: &self.config.model,
@@ -439,5 +441,39 @@ mod tests {
         // This test just verifies the client compiles — no live API calls.
         let config = LlmConfig::new("http://localhost:8000/v1", "test-key", "test-model");
         let _client = LlmClient::new(config);
+    }
+
+    #[test]
+    fn test_build_endpoint_no_trailing_slash() {
+        let endpoint = LlmClient::build_endpoint("https://api.openai.com/v1");
+        assert_eq!(endpoint, "https://api.openai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_build_endpoint_with_trailing_slash() {
+        let endpoint = LlmClient::build_endpoint("https://api.openai.com/v1/");
+        assert_eq!(endpoint, "https://api.openai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_build_endpoint_no_whitespace() {
+        let endpoint = LlmClient::build_endpoint("https://api.openai.com/v1");
+        assert!(
+            !endpoint.contains(' '),
+            "endpoint must not contain whitespace"
+        );
+        assert_eq!(endpoint, "https://api.openai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_build_endpoint_custom_base() {
+        let endpoint = LlmClient::build_endpoint("http://localhost:8080/v1");
+        assert_eq!(endpoint, "http://localhost:8080/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_build_endpoint_custom_base_with_slash() {
+        let endpoint = LlmClient::build_endpoint("http://localhost:8080/v1/");
+        assert_eq!(endpoint, "http://localhost:8080/v1/chat/completions");
     }
 }

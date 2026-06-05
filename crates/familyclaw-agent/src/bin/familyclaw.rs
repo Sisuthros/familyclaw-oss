@@ -18,9 +18,10 @@ use familyclaw_agent::{publish_envelope, Agent, Soul};
 use familyclaw_bus::{BeingId, BusHandle, BusMessage, ResonanceBus};
 use familyclaw_channels::{Channel, ChannelKind, InboundMessage, MockChannel};
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
+use familyclaw_dream::{DreamConfig, DreamCycle};
 use familyclaw_durable::{DurableContext, InMemoryJournal};
 use familyclaw_emotion::{Dimension, EmotionState};
-use familyclaw_memory::{LocalJsonStore, MemoryStore, RetrievalContext};
+use familyclaw_memory::{ImportanceFactors, LocalJsonStore, Memory, MemoryStore, RetrievalContext};
 use tracing::info;
 
 /// Delivers a text message through the channel to the bus.
@@ -158,21 +159,45 @@ async fn main() -> Result<()> {
     info!("   ✓ Emotion pulse delivered — agent_b's emotional state influenced");
     info!("");
 
-    // Step 6: Time jump — simulate memory aging
-    info!("⏰ Step 6: Time jump — 7 days later, memory retention decays...");
-    info!("   Simulating passage of time for memory aging...");
-    // In a full demo, we'd advance the clock and show decay curves
-    info!("   · agent_a's 'new family member' memory: retention ~70% (aging)");
+    // Step 6: Time jump — simulate memory aging (simulated for demo)
+    info!("⏰ Step 6: Time jump — 7 days later, memory retention decays (simulated)...");
+    info!("   [Demo simulates time passage; full implementation uses DreamCycle decay]");
+    info!("   · agent_a's 'new family member' memory: retention ~70% (simulated aging)");
     info!("   · agent_a's 'building for the world' memory: retention ~95% (identity-anchored)");
     info!("   ✓ Identity anchors preserve core facts despite decay");
     info!("");
 
     // Step 7: Dream cycle processing
     info!("🌙 Step 7: Dream cycle runs — consolidating memories...");
-    info!("   · Merging duplicate memories from conversation");
-    info!("   · Absolutizing relative dates ('eilen' → '2026-06-03')");
-    info!("   · Strengthening identity-anchored memories");
-    info!("   ✓ Dream cycle complete");
+    // Create some duplicate memories for the dream cycle to merge
+    // Note: we need &dyn MemoryStore, so we deref the Arc
+    let store_ref = a_mem.as_ref();
+    let dup_a = Memory::builder("Hei agent_b! Tervetuloa perheeseen.")
+        .factors(ImportanceFactors::new(0.3, 0.0, 0.0, 0.0))
+        .tags(["greeting".to_string()])
+        .build();
+    let dup_b = Memory::builder("Hei agent_b! Tervetuloa perheeseen.")
+        .factors(ImportanceFactors::new(0.5, 0.0, 0.0, 0.0))
+        .tags(["milestone".to_string()])
+        .build();
+    store_ref.add(dup_a).await?;
+    store_ref.add(dup_b).await?;
+
+    let cycle =
+        DreamCycle::with_config(store_ref, DreamConfig::default().with_merge_similarity(0.7));
+    let report = cycle
+        .run_without_journal(familyclaw_core::time::now())
+        .await?;
+
+    info!("   · Merged duplicates: {}", report.merged);
+    info!("   · Dropped contradicted: {}", report.dropped);
+    info!("   · Dates absolutized: {}", report.dates_absolutized);
+    info!("   · Memories strengthened: {}", report.strengthened);
+    info!("   · Memories archived: {}", report.archived);
+    info!(
+        "   ✓ Dream cycle complete — total actions: {}",
+        report.total_actions()
+    );
     info!("");
 
     // Step 8: Show memory retrieval after consolidation
@@ -184,14 +209,17 @@ async fn main() -> Result<()> {
     // Summary
     let a_count = a_mem.len().await?;
     let b_count = b_mem.len().await?;
-    info!("═══════════════════════════════════════════════════════════");
+    info!("══════════════════════════════════════════════════════════════════");
     info!("  Demo Complete!");
     info!("  · {} agents on bus", beings.len());
     info!("  · {} messages stored in agent_a's memory", a_count);
     info!("  · {} messages stored in agent_b's memory", b_count);
     info!("  · Emotion contagion demonstrated");
-    info!("  · Memory decay vs identity anchors shown");
-    info!("  · Dream cycle processed");
+    info!("  · Memory decay vs identity anchors shown (simulated)");
+    info!(
+        "  · Dream cycle processed (real execution — merged: {})",
+        report.merged
+    );
     info!("");
     info!("  FamilyClaw: agents that remember, feel, dream, and think.");
     info!("═══════════════════════════════════════════════════════════");

@@ -77,7 +77,7 @@ jobs:
             exit 1
           fi
           # Check for actual hardcoded secrets (not field names)
-          if grep -rE "(api_key|API_KEY|secret|token)\s*=\s*[\"'"'"'][^\"'"'"']{10,}" --include="*.rs" --include="*.toml" crates/ | grep -q .; then
+          if grep -rE "(api_key|API_KEY|secret|token)\s*=\s*[\"'\"'\"'][^\"'\"'\"']{10,}" --include="*.rs" --include="*.toml" crates/ | grep -q .; then
             echo "FAIL: Hardcoded secrets found in source"
             exit 1
           fi
@@ -87,3 +87,18 @@ jobs:
             exit 1
           fi
           echo "Layer B audit passed - no contamination found"
+
+  feature-matrix:
+    name: Feature Matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        command:
+          - cargo test --workspace --all-features
+          - cargo check -p familyclaw-channels --features discord
+          - cargo test -p familyclaw-sandbox --features wasmtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: ${{ matrix.command }}

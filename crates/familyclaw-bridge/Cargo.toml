@@ -1,6 +1,6 @@
 [package]
 name = "familyclaw-bridge"
-description = "Agent registry / task / handoff (kääre olemassa olevalle family-bridgelle)"
+description = "Agent registry / task / handoff (adapted from existing family-bridge)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

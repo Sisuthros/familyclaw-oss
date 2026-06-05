@@ -1,6 +1,6 @@
 [package]
 name = "familyclaw-bus"
-description = "Resonance Bus — Ractor actor-malli + affektiivinen hermosto"
+description = "Resonance Bus — Ractor actor model + affective nervous system"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

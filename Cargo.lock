@@ -481,6 +481,7 @@ dependencies = [
  "familyclaw-bus",
  "familyclaw-channels",
  "familyclaw-core",
+ "familyclaw-dream",
  "familyclaw-durable",
  "familyclaw-emotion",
  "familyclaw-memory",

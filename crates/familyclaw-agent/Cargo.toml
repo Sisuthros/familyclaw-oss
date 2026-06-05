@@ -1,6 +1,6 @@
 [package]
 name = "familyclaw-agent"
-description = "Agent runtime, session management, SOUL-lataus"
+description = "Agent runtime, session management, SOUL loading"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,6 +17,7 @@ familyclaw-bus = { workspace = true }
 familyclaw-memory = { workspace = true }
 familyclaw-emotion = { workspace = true }
 familyclaw-durable = { workspace = true }
+familyclaw-dream = { workspace = true }
 familyclaw-channels = { workspace = true }
 ractor = { workspace = true }
 serde = { workspace = true }
@@ -35,3 +36,8 @@ uuid = { workspace = true }
 [[bin]]
 name = "familyclaw"
 path = "src/bin/familyclaw.rs"
+
+# Crash replay demo: demonstrates crash-proof memory.
+[[bin]]
+name = "crash_replay"
+path = "src/bin/crash_replay.rs"

@@ -37,6 +37,16 @@ The demo showcases FamilyClaw's core capabilities:
 7. **🌙 Dream cycle** — Consolidates memories: merges duplicates, absolutizes dates
 8. **📚 Memory retrieval** — Shows what each agent remembers after processing
 
+### Crash Replay Demo
+
+Also available: a crash-proof memory demonstration showing FileJournal + LocalJsonStore persistence:
+
+```bash
+cargo run -p familyclaw-agent --bin crash_replay
+```
+
+This demo proves memory survives process boundaries by writing to disk in Phase 1, then reloading in Phase 2.
+
 Example output:
 ```
 ═══════════════════════════════════════════════════════════
@@ -66,9 +76,9 @@ Example output:
 
 ### Connect to Discord
 
-Run with a real Discord channel:
+Run with a Discord webhook (currently send-only; inbound gateway is future work):
 ```bash
-DISCORD_TOKEN=your_bot_token cargo run -p familyclaw-agent --features familyclaw-channels/discord
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/... cargo run -p familyclaw-agent --features familyclaw-channels/discord
 ```
 
 ### Learn the Architecture

@@ -1,6 +1,6 @@
 [package]
 name = "familyclaw-latent"
-description = "Latent-telepatia — hidden-state-siirto + RecursiveLink + teksti-fallback"
+description = "Latent telepathy — hidden-state transfer + RecursiveLink + text fallback"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
