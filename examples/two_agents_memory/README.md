@@ -75,4 +75,4 @@ The `familyclaw-durable` crate's journal-based replay ensures side effects aren'
 
 ---
 
-**Layer A Only** — This demo uses ONLY generic example agents (`agent_a`, `agent_b`). No real souls (agent_alpha, agent_gamma, etc.), no private profiles, no API keys. Pure open platform.
+**Layer A Only** — This demo uses ONLY generic example agents (`agent_a`, `agent_b`). No real souls (agent_alpha, agent_beta, etc.), no private profiles, no API keys. Pure open platform.

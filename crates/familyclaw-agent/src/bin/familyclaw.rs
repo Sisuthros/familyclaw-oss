@@ -164,7 +164,7 @@ async fn main() -> Result<()> {
     info!("   [Demo simulates time passage; full implementation uses DreamCycle decay]");
     info!("   · agent_a's 'new family member' memory: retention ~70% (simulated aging)");
     info!("   · agent_a's 'building for the world' memory: retention ~95% (identity-anchored)");
-    info!("   ✓ Identity anchors preserve core facts despite decay");
+    info!("   ✓ Identity anchors: supported by memory model, not exercised in this short demo");
     info!("");
 
     // Step 7: Dream cycle processing

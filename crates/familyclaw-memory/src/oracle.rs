@@ -1,4 +1,4 @@
-//! Pattern Oracle — agent_gamma Amplifier.
+//! Pattern Oracle — verification-gated provenance.
 //!
 //! Ennen muistin kirjoitusta tai tärkeää päätöstä Oracle tarkistaa
 //! onko vastaavia kuvioita (pattern) nähty aiemmin. Confirmed-muistot

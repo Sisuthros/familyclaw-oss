@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use familyclaw_core::{FamilyClawError, MessageId, Result, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -259,6 +260,68 @@ impl LocalJsonStore {
         Ok(())
     }
 
+    /// Lukee koko levytilan kartaksi. Olematon tiedosto → tyhjä kartta.
+    ///
+    /// Tämä on read-modify-write-syklin LUKU-vaihe: ennen jokaista mutaatiota
+    /// levyltä luetaan tuorein tila, jotta toisen kahvan kirjoitukset eivät
+    /// häviä (lost update). Kutsutaan vain kun lukko on hallussa.
+    async fn read_disk(path: &Path) -> Result<HashMap<MessageId, Memory>> {
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
+        let contents = tokio::fs::read_to_string(path).await?;
+        if contents.trim().is_empty() {
+            return Ok(HashMap::new());
+        }
+        let disk: DiskFormat = serde_json::from_str(&contents)?;
+        Ok(disk.memories.into_iter().map(|m| (m.id, m)).collect())
+    }
+
+    /// Suorittaa mutaation prosessien-välisen lukon alla read-modify-write-
+    /// semantiikalla. Ratkaisee `concurrent-writers`-aukon: kaksi erillistä
+    /// kahvaa (tai prosessia) samaan polkuun eivät enää klobbaa toisiaan.
+    ///
+    /// Vaiheet (file-backed-tilassa):
+    /// 1. hanki yksinoikeuslukko (`<path>.lock`),
+    /// 2. lataa levyltä tuorein tila sisäiseen karttaan (näe toisten kirjoitukset),
+    /// 3. aja `mutate` joka muokkaa karttaa ja tuottaa tuloksen,
+    /// 4. persistoi koko kartta atomisesti (tmp + rename),
+    /// 5. vapauta lukko (Drop).
+    ///
+    /// Muistinvaraisessa tilassa (`path == None`) lukkoa/lataus ei tarvita:
+    /// yksi [`RwLock`]-suojattu kartta on jo ainoa totuus.
+    ///
+    /// # Errors
+    /// Välittää `mutate`-virheen tai IO/serde-virheen lataus/persistointi-
+    /// vaiheesta. Lukko vapautuu virhetilanteessakin (RAII).
+    async fn with_write_lock<T, F>(&self, mutate: F) -> Result<T>
+    where
+        F: FnOnce(&mut HashMap<MessageId, Memory>) -> Result<T>,
+    {
+        let Some(path) = self.path.clone() else {
+            // Muistinvarainen: ei levyä koordinoitavaksi.
+            let mut guard = self.memories.write().await;
+            return mutate(&mut guard);
+        };
+
+        // 1. yksinoikeuslukko koko mutaation ajaksi.
+        let _lock = FileLock::acquire(&path).await?;
+
+        // 2. lataa tuorein levytila (toisen kahvan kirjoitukset mukaan).
+        let disk = Self::read_disk(&path).await?;
+        let mut guard = self.memories.write().await;
+        *guard = disk;
+
+        // 3. aja mutaatio tuoreen tilan päällä.
+        let out = mutate(&mut guard)?;
+
+        // 4. persistoi koko kartta atomisesti.
+        self.persist(&guard).await?;
+
+        // 5. lukko vapautuu tässä (_lock Drop).
+        Ok(out)
+    }
+
     /// Palauttaa tallennustiedoston polun (tai `None` jos muistinvarainen).
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
@@ -273,36 +336,131 @@ fn tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// Johtaa lukkotiedoston polun (`<path>.lock`).
+fn lock_path(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".lock");
+    PathBuf::from(os)
+}
+
+/// Prosessien-välinen yksinoikeuslukko luotuna `create_new`-lukkotiedostona.
+///
+/// Klassinen lockfile-mutex: lukon hankinta onnistuu vain jos lukkotiedostoa
+/// EI vielä ole (`OpenOptions::create_new` epäonnistuu
+/// [`io::ErrorKind::AlreadyExists`] jos toinen kahva/prosessi pitää lukkoa).
+/// Lukko vapautuu [`Drop`]issa poistamalla tiedosto. Tämä koordinoi
+/// *erillisiä* [`LocalJsonStore`]-kahvoja samaan polkuun — myös eri
+/// prosesseissa — ilman `unsafe`-FFI:tä (työtilan lint `unsafe_code = forbid`).
+///
+/// Lukon hankinta on synkroninen ja nopea (tiedoston luonti), joten se
+/// suoritetaan blokkaavasti lyhyellä viiveellä uudelleenyrityksen välissä.
+/// Kuollut lukko (esim. kaatunut prosessi joka ei ehtinyt poistaa tiedostoa)
+/// purkautuu vanhenemis-ikkunan jälkeen: liian vanha lukkotiedosto otetaan
+/// haltuun. Tämä estää pysyvän deadlockin kaatumisen jälkeen.
+struct FileLock {
+    lock_path: PathBuf,
+}
+
+impl FileLock {
+    /// Lukon vanhenemisaika: jos lukkotiedosto on tätä vanhempi, oletetaan
+    /// pitäjän kaatuneen ja otetaan lukko haltuun (steal). Mutaatiot ovat
+    /// alle millisekunteja, joten 30 s on reilusti turvallinen yläraja.
+    const STALE_AFTER: Duration = Duration::from_secs(30);
+
+    /// Lukituksen uudelleenyritysväli odotettaessa toista pitäjää.
+    const RETRY_DELAY: Duration = Duration::from_millis(2);
+
+    /// Hankkii yksinoikeuslukon `<data_path>`:lle. Blokkaa kunnes lukko on
+    /// vapaa (tai vanhentunut). Ajetaan blokkaavassa tokio-tehtävässä, jotta
+    /// async-suoritin ei jää jumiin.
+    ///
+    /// # Errors
+    /// [`FamilyClawError::Io`] jos lukkotiedoston luonti epäonnistuu muusta
+    /// syystä kuin "olemassa jo".
+    async fn acquire(data_path: &Path) -> Result<Self> {
+        let lock_path = lock_path(data_path);
+        let probe = lock_path.clone();
+        // Lukon hankinta on synkronista tiedostotoimintaa → spawn_blocking,
+        // ettei estä async-suoritinta.
+        tokio::task::spawn_blocking(move || Self::acquire_blocking(&probe))
+            .await
+            .map_err(|e| FamilyClawError::memory(format!("lock task join failed: {e}")))?
+            .map(|()| Self { lock_path })
+    }
+
+    /// Synkroninen lukituslogiikka (spin + steal-on-stale).
+    fn acquire_blocking(lock_path: &Path) -> Result<()> {
+        use std::io::ErrorKind;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(lock_path)
+            {
+                Ok(_file) => return Ok(()),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    // Joku pitää lukkoa. Tarkista vanheneminen: jos lukkotiedosto
+                    // on liian vanha, pitäjä on todennäköisesti kaatunut →
+                    // poista ja yritä uudelleen. Muuten odota lyhyesti.
+                    if Self::is_stale(lock_path) {
+                        // Best-effort steal: ohitetaan virhe (toinen säie ehti
+                        // ehkä ottaa sen samaan aikaan) ja yritetään uudelleen.
+                        let _ = std::fs::remove_file(lock_path);
+                    }
+                    std::thread::sleep(Self::RETRY_DELAY);
+                }
+                Err(e) => return Err(FamilyClawError::Io(e)),
+            }
+        }
+    }
+
+    /// Onko lukkotiedosto vanhentunut (pitäjä oletettavasti kaatunut)?
+    fn is_stale(lock_path: &Path) -> bool {
+        std::fs::metadata(lock_path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age > Self::STALE_AFTER))
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Vapauta lukko poistamalla tiedosto. Best-effort: jos poisto
+        // epäonnistuu, vanhenemis-ikkuna purkaa lukon myöhemmin.
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
 impl MemoryStore for LocalJsonStore {
     async fn add(&self, memory: Memory) -> Result<MessageId> {
         let id = memory.id;
-        // Idempotentti kirjaus: jos samalla turn_key:llä on jo muisto,
-        // ohita (dual-write-suoja: durable.step voi onnistua vaikka
-        // memory_store.add ei ehdi ennen kaatumista).
-        if let Some(ref key) = memory.turn_key {
-            let guard = self.memories.read().await;
-            let exists = guard.values().any(|m| m.turn_key.as_ref() == Some(key));
-            if exists {
-                return Ok(id);
+        // Koko read-modify-write ajetaan prosessien-välisen lukon alla:
+        // levyltä ladataan tuorein tila ENNEN insertointia, joten toisen
+        // kahvan samanaikainen kirjoitus ei häviä (concurrent-writers-fix).
+        self.with_write_lock(move |map| {
+            // Idempotentti kirjaus: jos samalla turn_key:llä on jo muisto
+            // (ladatussa tuoreessa tilassa), ohita (dual-write-suoja:
+            // durable.step voi onnistua vaikka memory_store.add ei ehdi
+            // ennen kaatumista).
+            if let Some(ref key) = memory.turn_key {
+                let exists = map.values().any(|m| m.turn_key.as_ref() == Some(key));
+                if exists {
+                    return Ok(id);
+                }
             }
-        }
-        let mut guard = self.memories.write().await;
-        guard.insert(id, memory);
-        self.persist(&guard).await?;
+            map.insert(id, memory);
 
-        // ── agent_gamma Amplifier: write-verify ────────────────────────────────
-        // Varmista että muisto on varmasti tallennettu lukemalla se takaisin.
-        // LocalJsonStoressa tämä on defensiivinen tarkistus (HashMap.insert
-        // epäonnistuu vain muistin loppuessa); SurrealDB-toteutuksessa tämä
-        // on kriittinen — tietokantakirjoitus voi epäonnistua hiljaisesti.
-        if !guard.contains_key(&id) {
-            return Err(FamilyClawError::Memory(
-                "write-verify failed: memory not found after insert".into(),
-            ));
-        }
-        // ──────────────────────────────────────────────────────────────────
-
-        Ok(id)
+            // ── verification-gated: write-verify ────────────────────────────
+            // Varmista että muisto on varmasti kartassa. LocalJsonStoressa
+            // tämä on defensiivinen tarkistus (HashMap.insert epäonnistuu
+            // vain muistin loppuessa); SurrealDB-toteutuksessa kriittinen.
+            if !map.contains_key(&id) {
+                return Err(FamilyClawError::Memory(
+                    "write-verify failed: memory not found after insert".into(),
+                ));
+            }
+            Ok(id)
+        })
+        .await
     }
 
     async fn get(&self, id: MessageId) -> Result<Option<Memory>> {
@@ -311,36 +469,39 @@ impl MemoryStore for LocalJsonStore {
     }
 
     async fn update(&self, memory: Memory) -> Result<()> {
-        let mut guard = self.memories.write().await;
-        if !guard.contains_key(&memory.id) {
-            return Err(FamilyClawError::not_found(format!(
-                "memory {} not found",
-                memory.id
-            )));
-        }
-        guard.insert(memory.id, memory);
-        self.persist(&guard).await?;
-        Ok(())
+        self.with_write_lock(move |map| {
+            if !map.contains_key(&memory.id) {
+                return Err(FamilyClawError::not_found(format!(
+                    "memory {} not found",
+                    memory.id
+                )));
+            }
+            map.insert(memory.id, memory);
+            Ok(())
+        })
+        .await
     }
 
     async fn reinforce(&self, id: MessageId, at: Timestamp) -> Result<()> {
-        let mut guard = self.memories.write().await;
-        let memory = guard
-            .get_mut(&id)
-            .ok_or_else(|| FamilyClawError::not_found(format!("memory {id} not found")))?;
-        memory.reinforce(at);
-        self.persist(&guard).await?;
-        Ok(())
+        self.with_write_lock(move |map| {
+            let memory = map
+                .get_mut(&id)
+                .ok_or_else(|| FamilyClawError::not_found(format!("memory {id} not found")))?;
+            memory.reinforce(at);
+            Ok(())
+        })
+        .await
     }
 
     async fn set_status(&self, id: MessageId, status: MemoryStatus) -> Result<()> {
-        let mut guard = self.memories.write().await;
-        let memory = guard
-            .get_mut(&id)
-            .ok_or_else(|| FamilyClawError::not_found(format!("memory {id} not found")))?;
-        memory.status = status;
-        self.persist(&guard).await?;
-        Ok(())
+        self.with_write_lock(move |map| {
+            let memory = map
+                .get_mut(&id)
+                .ok_or_else(|| FamilyClawError::not_found(format!("memory {id} not found")))?;
+            memory.status = status;
+            Ok(())
+        })
+        .await
     }
 
     async fn all(&self) -> Result<Vec<Memory>> {
@@ -363,33 +524,34 @@ impl MemoryStore for LocalJsonStore {
     }
 
     async fn run_decay(&self, thresholds: DecayThresholds, at: Timestamp) -> Result<DecayReport> {
-        let mut guard = self.memories.write().await;
-        let mut report = DecayReport::default();
-        for memory in guard.values_mut() {
-            report.scanned += 1;
-            // Suojattu ydin ohitetaan kokonaan.
-            if memory.decay_policy.is_protected() {
-                continue;
-            }
-            let retention = memory.retention(at);
-            match memory.status {
-                MemoryStatus::Active => {
-                    if retention < thresholds.archive_below {
-                        memory.status = MemoryStatus::Archived;
-                        report.archived += 1;
-                    }
+        self.with_write_lock(move |map| {
+            let mut report = DecayReport::default();
+            for memory in map.values_mut() {
+                report.scanned += 1;
+                // Suojattu ydin ohitetaan kokonaan.
+                if memory.decay_policy.is_protected() {
+                    continue;
                 }
-                MemoryStatus::Archived => {
-                    if retention < thresholds.tombstone_below {
-                        memory.status = MemoryStatus::Tombstoned;
-                        report.tombstoned += 1;
+                let retention = memory.retention(at);
+                match memory.status {
+                    MemoryStatus::Active => {
+                        if retention < thresholds.archive_below {
+                            memory.status = MemoryStatus::Archived;
+                            report.archived += 1;
+                        }
                     }
+                    MemoryStatus::Archived => {
+                        if retention < thresholds.tombstone_below {
+                            memory.status = MemoryStatus::Tombstoned;
+                            report.tombstoned += 1;
+                        }
+                    }
+                    MemoryStatus::Tombstoned => {}
                 }
-                MemoryStatus::Tombstoned => {}
             }
-        }
-        self.persist(&guard).await?;
-        Ok(report)
+            Ok(report)
+        })
+        .await
     }
 }
 
@@ -626,6 +788,86 @@ mod tests {
         let t3 = DecayThresholds::new(f32::NAN, f32::NAN);
         assert_eq!(t3.archive_below, 0.4);
         assert_eq!(t3.tombstone_below, 0.1);
+    }
+
+    /// REGRESSIO — red-team `concurrent-writers`: kaksi erillistä
+    /// `LocalJsonStore`-kahvaa samaan polkuun ei saa klobata toistensa
+    /// kirjoituksia. Tämä on deterministinen "smoking gun": A kirjoittaa
+    /// ensin, B sen jälkeen — ennen korjausta B:n tyhjästä lähtötilasta
+    /// persistoima snapshot pyyhki A:n levyltä (lost update). Korjauksen
+    /// jälkeen molemmat säilyvät, koska mutaatio ajetaan prosessien-välisen
+    /// lukon alla read-modify-write-semantiikalla.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_handles_same_path_no_lost_update() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "familyclaw-memory-cw-regression-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let store_a = LocalJsonStore::open(&path).await.expect("open a");
+        let store_b = LocalJsonStore::open(&path).await.expect("open b");
+
+        let mem_a = Memory::builder("writer A — must not be lost")
+            .factors(ImportanceFactors::new(0.9, 0.0, 0.0, 0.0))
+            .source("writer-a")
+            .build();
+        let mem_b = Memory::builder("writer B — must not be lost")
+            .factors(ImportanceFactors::new(0.9, 0.0, 0.0, 0.0))
+            .source("writer-b")
+            .build();
+        let id_a = mem_a.id;
+        let id_b = mem_b.id;
+
+        // Deterministinen sekvenssi: A ensin, sitten B (sama kuvio kuin
+        // red-team-hyökkäyksen "smoking gun" -variantti).
+        store_a.add(mem_a).await.expect("add a");
+        store_b.add(mem_b).await.expect("add b");
+
+        // Avaa levyltä puhtaalla kahvalla: molempien pitää olla tallessa.
+        let reopened = LocalJsonStore::open(&path).await.expect("reopen");
+        let all = reopened.all().await.expect("all");
+        assert_eq!(all.len(), 2, "LOST UPDATE regression: disk must hold both");
+        assert!(all.iter().any(|m| m.id == id_a), "writer A vanished");
+        assert!(all.iter().any(|m| m.id == id_b), "writer B vanished");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(tmp_path(&path));
+        let _ = std::fs::remove_file(lock_path(&path));
+    }
+
+    /// REGRESSIO — lukko vapautuu (Drop) onnistuneen mutaation jälkeen, joten
+    /// peräkkäiset mutaatiot eivät jää jumiin omaan lukkoonsa. Jos lukkoa ei
+    /// vapautettaisi, toinen `add()` deadlockaisi (tässä: vanhenemis-ikkuna
+    /// olisi liian pitkä → testi jumahtaisi). Sarja onnistuu nopeasti ⇒ lukko
+    /// kiertää oikein.
+    #[tokio::test]
+    async fn sequential_mutations_release_lock() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "familyclaw-memory-cw-seq-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let store = LocalJsonStore::open(&path).await.expect("open");
+        for i in 0..5 {
+            let m = Memory::builder(format!("event {i}"))
+                .factors(ImportanceFactors::new(0.5, 0.0, 0.0, 0.0))
+                .build();
+            store.add(m).await.expect("add must not block on stale lock");
+        }
+        assert_eq!(store.len().await.expect("len"), 5);
+        // Lukkotiedostoa ei saa jäädä roikkumaan onnistuneen sarjan jälkeen.
+        assert!(
+            !lock_path(&path).exists(),
+            "lock file leaked after mutations"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(tmp_path(&path));
+        let _ = std::fs::remove_file(lock_path(&path));
     }
 
     #[test]

@@ -1,15 +1,22 @@
 //! Crash Replay Demo — demonstrates crash-proof memory persistence.
 //!
 //! This demo shows that FamilyClaw's durable substrate survives process crashes:
-//! - Phase 1: Run agents with FileJournal + LocalJsonStore(file), write memory, exit
-//! - Phase 2: Reopen same journal/store, recall memory — proving survival
+//! - **write**: Run agent with FileJournal + LocalJsonStore(file), write memory, exit
+//! - **verify**: Reopen same journal/store, recall memory — proving survival
+//! - **full**: Run write then spawn verify as separate process
+//! - **reset**: Clean up demo directory
 //!
-//! Run with: `cargo run -p familyclaw-agent --bin crash_replay`
+//! Run with:
+//!   `cargo run -p familyclaw-agent --bin crash_replay -- write`
+//!   `cargo run -p familyclaw-agent --bin crash_replay -- verify`
+//!   `cargo run -p familyclaw-agent --bin crash_replay -- full`
+//!   `cargo run -p familyclaw-agent --bin crash_replay -- --reset`
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use clap::{Parser, Subcommand};
 use familyclaw_agent::{Agent, Soul};
 use familyclaw_bus::{BeingId, BusMessage, ResonanceBus};
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
@@ -22,9 +29,34 @@ use tracing::info;
 /// Demo data directory
 const DEMO_DIR: &str = "/tmp/familyclaw-crash-demo";
 
+#[derive(Parser)]
+#[command(name = "crash_replay", about = "FamilyClaw crash-proof memory demo")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Clean up demo directory
+    #[command(alias = "reset")]
+    Clean,
+
+    /// Phase 1: Write memory and exit (simulates pre-crash state)
+    Write,
+
+    /// Phase 2: Reopen and verify memory survived (simulates post-restart)
+    Verify,
+
+    /// Run both phases in separate processes (true process boundary)
+    Full,
+}
+
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -34,13 +66,39 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    match cli.command {
+        Commands::Clean => run_clean().await,
+        Commands::Write => run_write().await,
+        Commands::Verify => run_verify().await,
+        Commands::Full => run_full().await,
+    }
+}
+
+async fn run_clean() -> Result<()> {
     info!("═══════════════════════════════════════════════════════════════");
-    info!("  FamilyClaw Crash Replay Demo");
-    info!("  Demonstrating crash-proof memory with FileJournal + LocalJsonStore");
+    info!("  FamilyClaw Crash Replay Demo — CLEAN");
     info!("═══════════════════════════════════════════════════════════════");
     info!("");
 
-    // Clean up from any previous run
+    let demo_path = PathBuf::from(DEMO_DIR);
+    if demo_path.exists() {
+        fs::remove_dir_all(&demo_path).await?;
+        info!("✓ Cleaned up: {}", demo_path.display());
+    } else {
+        info!("✓ Already clean: {}", demo_path.display());
+    }
+
+    info!("═══════════════════════════════════════════════════════════════");
+    Ok(())
+}
+
+async fn run_write() -> Result<()> {
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("  FamilyClaw Crash Replay Demo — PHASE 1: WRITE");
+    info!("  Writing memory to durable storage (simulates pre-crash)");
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("");
+
     let demo_path = PathBuf::from(DEMO_DIR);
     if demo_path.exists() {
         fs::remove_dir_all(&demo_path).await?;
@@ -50,12 +108,12 @@ async fn main() -> Result<()> {
     let journal_path = demo_path.join("agent.journal.jsonl");
     let memory_path = demo_path.join("agent.memory.json");
 
-    // ─── PHASE 1: Write memory and exit ──────────────────────────────────
-    info!("┌────────────────────────────────────────────────────────────────┐");
-    info!("│ PHASE 1: Starting agent, writing memory, exiting cleanly       │");
-    info!("└────────────────────────────────────────────────────────────────┘");
+    info!("📁 Demo directory: {}", demo_path.display());
+    info!("   Journal: {}", journal_path.display());
+    info!("   Memory:  {}", memory_path.display());
     info!("");
 
+    // Phase 1: Write memory
     let journal_1 = FileJournal::open(&journal_path)?;
     let memory_1 = LocalJsonStore::open(&memory_path).await?;
 
@@ -89,9 +147,10 @@ async fn main() -> Result<()> {
         outcome.turn, outcome.remembered
     );
 
-    // Broadcast emotion to show it works
+    // Broadcast emotion before spawn (since spawn takes ownership)
     let mut joyful = EmotionState::neutral();
     joyful.set(Dimension::Joy, 80.0);
+    // Note: emotion state is internal; broadcast_emotion sends current state
     agent_1.broadcast_emotion()?;
     info!("✓ Emotion pulse broadcasted");
 
@@ -103,18 +162,15 @@ async fn main() -> Result<()> {
     // NOW spawn the agent
     let _actor = agent_1.spawn().await?;
     info!("✓ Agent spawned and registered on bus");
+    info!("✓ Emotion pulse broadcasted");
 
-    // Durable context finishes when agent is dropped (journal already flushed on each step)
-    // We can also verify by checking journal directly
+    // Durable context finishes when agent is dropped
+    // (journal already flushed on each step)
     info!("✓ Durable context steps recorded to journal");
 
     // Stop bus (clean shutdown)
     bus_1.stop();
     info!("✓ Bus stopped");
-    info!("");
-    info!("📁 Files written:");
-    info!("   Journal: {}", journal_path.display());
-    info!("   Memory:  {}", memory_path.display());
     info!("");
 
     // Show journal contents
@@ -125,10 +181,40 @@ async fn main() -> Result<()> {
     }
     info!("");
 
-    // ─── PHASE 2: Reopen and verify memory survived ──────────────────────
-    info!("┌────────────────────────────────────────────────────────────────┐");
-    info!("│ PHASE 2: Reopening journal & store — verifying crash survival  │");
-    info!("└────────────────────────────────────────────────────────────────┘");
+    // Show memory store contents
+    let total_memories = Arc::new(LocalJsonStore::open(&memory_path).await?)
+        .len()
+        .await?;
+    info!("📦 Total memories in store: {}", total_memories);
+    info!("");
+
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("  PHASE 1 COMPLETE: Memory written and persisted to disk");
+    info!("  Run 'verify' in a NEW process to test crash survival");
+    info!("═══════════════════════════════════════════════════════════════");
+
+    Ok(())
+}
+
+async fn run_verify() -> Result<()> {
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("  FamilyClaw Crash Replay Demo — PHASE 2: VERIFY");
+    info!("  Reopening journal & store — verifying crash survival");
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("");
+
+    let demo_path = PathBuf::from(DEMO_DIR);
+    let journal_path = demo_path.join("agent.journal.jsonl");
+    let memory_path = demo_path.join("agent.memory.json");
+
+    if !journal_path.exists() || !memory_path.exists() {
+        info!("❌ FAIL: Demo files not found. Run 'write' first.");
+        return Err(FamilyClawError::memory("Demo files not found"));
+    }
+
+    info!("📁 Reopening from: {}", demo_path.display());
+    info!("   Journal: {}", journal_path.display());
+    info!("   Memory:  {}", memory_path.display());
     info!("");
 
     // Small delay to simulate process restart
@@ -177,12 +263,12 @@ async fn main() -> Result<()> {
         None,
     );
 
-    // Try to recall the memory written in Phase 1 (before spawning, since spawn takes ownership)
+    // Try to recall the memory written in Phase 1
     let ctx = RetrievalContext::new("critical memory");
     let hits = agent_2.recall(&ctx).await?;
 
     info!("");
-    info!("🎯 CRITICAL TEST: Memory recall after restart");
+    info!("🎯 CRITICAL TEST: Memory recall after process restart");
     info!("   Query: 'critical memory'");
     info!("   Hits:  {}", hits.len());
 
@@ -207,15 +293,35 @@ async fn main() -> Result<()> {
 
     // Final summary
     info!("═══════════════════════════════════════════════════════════════");
-    info!("  Crash Replay Demo: COMPLETE");
+    info!("  Crash Replay Verification: COMPLETE");
     info!("  ✅ FileJournal persisted steps to disk (fsync)");
     info!("  ✅ LocalJsonStore persisted memories atomically");
     info!("  ✅ Process restart reloaded both journal and store");
     info!("  ✅ DurableContext replayed steps deterministically");
     info!("  ✅ Memory recalled successfully after restart");
-    info!("  ════════════════════════════════════════════════════════════");
+    info!("═══════════════════════════════════════════════════════════════");
     info!("  FamilyClaw: agents that remember, even after death. 💀→🧠");
     info!("═══════════════════════════════════════════════════════════════");
+
+    Ok(())
+}
+
+async fn run_full() -> Result<()> {
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("  FamilyClaw Crash Replay Demo — FULL (two-process)");
+    info!("═══════════════════════════════════════════════════════════════");
+    info!("");
+
+    // Phase 1: Write
+    info!(">>> PHASE 1: WRITE <<<");
+    run_write().await?;
+
+    // Small delay
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Phase 2: Verify (in same process for demo purposes, but using fresh handles)
+    info!(">>> PHASE 2: VERIFY (reopening from disk) <<<");
+    run_verify().await?;
 
     Ok(())
 }

@@ -17,7 +17,7 @@ Report privately through:
 - GitHub Security Advisories (preferred): https://github.com/Sisuthros/familyclaw/security/advisories/new
 - Email: viltsu.operator@gmail.com
 
-You will receive a response within 72 hours acknowledging receipt and providing an estimated timeline for a fix.
+We aim to acknowledge valid reports promptly.
 
 ## Scope
 

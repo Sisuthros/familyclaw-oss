@@ -64,7 +64,7 @@ impl std::fmt::Display for MemoryStatus {
 }
 
 // ---------------------------------------------------------------------------
-// agent_gamma Amplifier — verification-gated memory
+// verification-gated verification-gated memory
 // ---------------------------------------------------------------------------
 
 /// Muiston varmennustila: kuinka luotettava tämä tieto on.
@@ -230,7 +230,7 @@ pub struct Memory {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_key: Option<String>,
 
-    // ── agent_gamma Amplifier -kentät ──────────────────────────────────────────
+    // ── verification-gated -kentät ──────────────────────────────────────────
     // Kaikki #[serde(default)] — taaksepäin yhteensopiva olemassaolevien
     // persistoitujen muistojen kanssa (vanha JSON ilman näitä kenttiä
     // deserialisoituu oikein oletusarvoilla).
@@ -359,7 +359,7 @@ impl Memory {
         }
     }
 
-    // ── agent_gamma Amplifier — varmennusmetodit ───────────────────────────────
+    // ── verification-gated varmennusmetodit ───────────────────────────────
 
     /// Lisää todisteen ja päivittää varmennustilan automaattisesti.
     ///
@@ -423,7 +423,7 @@ pub struct MemoryBuilder {
     tags: Vec<String>,
     source: String,
     turn_key: Option<String>,
-    // agent_gamma Amplifier -kentät
+    // verification-gated -kentät
     verification_status: VerificationStatus,
     evidence: Vec<Evidence>,
     pattern_key: Option<String>,
@@ -443,7 +443,7 @@ impl MemoryBuilder {
             tags: Vec::new(),
             source: String::new(),
             turn_key: None,
-            // agent_gamma Amplifier -oletukset: uusi muisto alkaa varmistamattomana väitteenä
+            // verification-gated -oletukset: uusi muisto alkaa varmistamattomana väitteenä
             verification_status: VerificationStatus::Claim,
             evidence: Vec::new(),
             pattern_key: None,

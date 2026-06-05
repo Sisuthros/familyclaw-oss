@@ -335,3 +335,39 @@ mod tests {
         assert!(text.contains("\"kind\":\"step_completed\""));
     }
 }
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+    use serde_json::json;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn timestamp_doesnt_affect_replay() {
+        // Create two entries with the same step_id and kind but at different times
+        let entry1 = JournalEntry::completed(StepId::ZERO, "test", json!({"value": 42}));
+
+        // Wait to ensure different timestamp
+        thread::sleep(Duration::from_millis(10));
+
+        let entry2 = JournalEntry::completed(StepId::ZERO, "test", json!({"value": 42}));
+
+        // Timestamps WILL be different
+        assert_ne!(
+            entry1.timestamp, entry2.timestamp,
+            "timestamps should differ"
+        );
+
+        // But entries themselves are NOT equal (because PartialEq includes timestamp)
+        assert_ne!(
+            entry1, entry2,
+            "entries with different timestamps are not equal"
+        );
+
+        // However, replay logic ONLY compares step_name and kind
+        assert_eq!(entry1.step_name(), entry2.step_name());
+        assert_eq!(entry1.kind, entry2.kind);
+        assert_eq!(entry1.step_id, entry2.step_id);
+    }
+}

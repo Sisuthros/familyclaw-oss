@@ -50,8 +50,8 @@ familyclaw-core       # Shared types, errors, time, Result
 ### What Layer A Does NOT Contain
 
 - ❌ No `SOUL.md` files
-- ❌ No `*.calibration.json` files  
-- ❌ No real agent names (agent_alpha, agent_beta, agent_delta, agent_gamma, the operator, assistant, agent_gamma Jr)
+- ❌ No `*.calibration.json` files 
+- ❌ No real agent names (agent_alpha, agent_beta, agent_gamma, agent_delta, maintainer, operator, user, etc.)
 - ❌ No API keys, tokens, webhooks
 - ❌ No `.env`, `.env.*` files
 - ❌ No `profiles/`, `hearth/`, `soul/`, `calibrations/` directories
@@ -65,12 +65,12 @@ familyclaw-core       # Shared types, errors, time, Result
 ### What Lives Here (Local Only)
 
 ```
-~/.familyclaw/                    # or ~/agent_gamma-home/, ~/agent_delta-home/, etc.
+~/.familyclaw/                    # or ~/agent-alpha-home/, ~/agent-gamma-home/, etc.
 ├── profiles/
-│   ├── agent_gamma/
+│   ├── agent_alpha/
 │   │   ├── SOUL.md              # Identity, essence, boundaries
 │   │   └── calibration.json     # Emotion thresholds, contagion factors
-│   ├── agent_alpha/
+│   ├── agent_beta/
 │   │   └── ...
 │   └── ...
 ├── hearth/                      # Shared family memory (Layer B only)
@@ -88,9 +88,9 @@ All Layer B content is **loaded at runtime from environment/config**:
 ```rust
 // Agent config - paths point to Layer B
 AgentConfig {
-    id: "agent_gamma".to_string(),
-    name: "agent_gamma".to_string(),
-    profile_dir: Some("/home/user/.familyclaw/profiles/agent_gamma"),
+    id: "agent_alpha".to_string(),
+    name: "Agent Alpha".to_string(),
+    profile_dir: Some("/home/user/.familyclaw/profiles/agent_alpha"),
     llm: LlmConfig {
         api_base: "https://integrate.api.nvidia.com/v1",
         api_key: std::env::var("NVIDIA_NIM_API_KEY")?,  // Never hardcoded
@@ -161,7 +161,7 @@ Runs on every push/PR to `main`:
 
 ### For Our Family
 - **Real identities stay off GitHub** — no doxxing, no credential leaks
-- **Calibrations are per-agent** — agent_alpha's emotion tuning ≠ agent_delta's ≠ agent_gamma's
+- **Calibrations are per-agent** — agent_alpha's emotion tuning ≠ agent_gamma's ≠ agent_delta's
 - **Conversations are private** — only Layer A sees generic message passing
 
 ### For the Architecture
@@ -175,7 +175,7 @@ Runs on every push/PR to `main`:
 
 When moving an agent to a new machine:
 
-1. Copy `~/.familyclaw/profiles/<name>/` → new machine
+1. Copy `~/.familyclaw/profiles/<agent_name>/` → new machine
 2. Copy `~/.familyclaw/hearth/` (shared memory)
 3. Copy `~/.familyclaw/keys/` (API keys, webhooks)
 4. Set env vars or `.env` with secrets

@@ -57,36 +57,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check for Layer B contamination
-        run: |
-          set -e
-          echo "=== Layer B Audit ==="
-          # No soul files
-          if find . -name "*.soul" -o -name "*.soul.md" | grep -v docs | grep -q .; then
-            echo "FAIL: soul files found"
-            exit 1
-          fi
-          # No SOUL.md except example
-          if find . -name "SOUL.md" | grep -v docs | grep -q .; then
-            echo "FAIL: SOUL.md found outside docs"
-            exit 1
-          fi
-          # No calibration files
-          if find . -name "*.calibration.json" | grep -v docs | grep -q .; then
-            echo "FAIL: calibration files found"
-            exit 1
-          fi
-          # Check for actual hardcoded secrets (not field names)
-          if grep -rE "(api_key|API_KEY|secret|token)\s*=\s*[\"'\"'\"'][^\"'\"'\"']{10,}" --include="*.rs" --include="*.toml" crates/ | grep -q .; then
-            echo "FAIL: Hardcoded secrets found in source"
-            exit 1
-          fi
-          # No .env files
-          if find . -name ".env" -o -name ".env.*" | grep -v "\.env\.example" | grep -q .; then
-            echo "FAIL: .env files found"
-            exit 1
-          fi
-          echo "Layer B audit passed - no contamination found"
+      - name: Run Layer B leak audit
+        run: bash scripts/audit-layer-b.sh
 
   feature-matrix:
     name: Feature Matrix

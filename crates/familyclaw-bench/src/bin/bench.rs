@@ -1,0 +1,201 @@
+//! `bench` — FamilyClaw-jatkuvuusbenchmarkin CLI.
+//!
+//! Ajaa yhden skenaarion tai kaikki ja kirjoittaa scorecardin (design §4, §6).
+//! `bench all` rakentaa [`FamilyClawSubject`]:n, ajaa kolme skenaariota
+//! ([`CrashMatrix`], [`RetentionCurve`], [`DreamQuality`]) kiinteällä
+//! **injektoidulla kellolla** ja kirjoittaa `SCORECARD.md` + `scorecard.json`
+//! hakemistoon `crates/familyclaw-bench/out/` (sekä kopion `docs/SCORECARD.md`).
+//!
+//! ## Reprodusoitavuus (design §2.2, §6)
+//! Kello injektoidaan vakiona ([`FIXED_CLOCK_RFC3339`]) — järjestelmäkelloa ei
+//! lueta. Sama syöte → tavu-tavulta identtinen scorecard joka ajolla.
+//!
+//! Aja:
+//!   `cargo run -p familyclaw-bench -- all`
+//!   `cargo run -p familyclaw-bench -- s1`   (yksittäinen skenaario)
+
+use std::path::{Path, PathBuf};
+
+use clap::Parser;
+
+use familyclaw_bench::scenarios::{CrashMatrix, DreamQuality, RetentionCurve};
+use familyclaw_bench::{
+    BenchError, FamilyClawSubject, Harness, Result, Scenario, Scorecard,
+};
+use familyclaw_core::time;
+
+/// Kiinteä injektoitu referenssikello (design §6: reprodusoitava byte-for-byte).
+///
+/// `2026-06-04T12:00:00Z` — kaikki skenaariot ja scorecard ankkuroidaan tähän,
+/// jolloin kaksi peräkkäistä ajoa tuottaa identtisen `scorecard.json`:n.
+const FIXED_CLOCK_RFC3339: &str = "2026-06-04T12:00:00Z";
+
+/// Jatkuvuusbenchmarkin komentorivikäyttöliittymä.
+#[derive(Parser)]
+#[command(name = "bench", about = "FamilyClaw continuity benchmark harness")]
+struct Cli {
+    /// Ajettava skenaario tunnisteella, tai `all` kaikille (esim. `s1`, `all`).
+    #[arg(value_name = "SCENARIO")]
+    scenario: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Tracing-alustus — `RUST_LOG`-ympäristömuuttuja ohjaa tasoa.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
+
+    let cli = Cli::parse();
+
+    // Injektoitu kello — EI järjestelmäkello (reprodusoitavuus, design §2.2).
+    let clock = time::parse_rfc3339(FIXED_CLOCK_RFC3339)?;
+
+    // Valitse ajettavat skenaariot tunnisteen perusteella.
+    let scenarios = select_scenarios(&cli.scenario)?;
+
+    // Rakenna FamilyClaw-subjekti (ajaa continuity_daemon-binääriä mustana
+    // laatikkona). Binäärin polku paikannetaan ympäristöstä; varmistetaan että
+    // se on rakennettu ja löydettävissä ennen ajoa.
+    ensure_daemon_env()?;
+    let mut subject = FamilyClawSubject::from_env()?;
+
+    tracing::info!(
+        scenario = %cli.scenario,
+        clock = %FIXED_CLOCK_RFC3339,
+        "running continuity benchmark"
+    );
+
+    let card = Harness::new()
+        .run(&mut subject, &scenarios, clock)
+        .await?;
+
+    write_outputs(&card, &cli.scenario)?;
+
+    // Tulosta lyhyt yhteenveto stdoutiin (ihmiselle); koneluettava artefakti on
+    // scorecard.json.
+    println!("{}", card.to_markdown());
+
+    if card.all_passed() {
+        tracing::info!("benchmark complete: ALL PASSED");
+    } else {
+        tracing::warn!("benchmark complete: SOME SCENARIOS FAILED");
+    }
+
+    Ok(())
+}
+
+/// Rakentaa ajettavat skenaariot tunnisteesta.
+///
+/// `all` ajaa S1+S2+S3 kiinteässä järjestyksessä. Yksittäiset tunnisteet
+/// (`s1`/`s2`/`s3` tai täysi `s1_crash_matrix` jne.) ajavat vain yhden.
+///
+/// # Errors
+/// [`BenchError::Scenario`] jos tunniste on tuntematon.
+fn select_scenarios(id: &str) -> Result<Vec<Box<dyn Scenario>>> {
+    let s1 = || -> Box<dyn Scenario> { Box::new(CrashMatrix::new()) };
+    let s2 = || -> Box<dyn Scenario> { Box::new(RetentionCurve::new()) };
+    let s3 = || -> Box<dyn Scenario> { Box::new(DreamQuality::new()) };
+
+    match id {
+        "all" => Ok(vec![s1(), s2(), s3()]),
+        "s1" | "s1_crash_matrix" => Ok(vec![s1()]),
+        "s2" | "s2_retention_curve" => Ok(vec![s2()]),
+        "s3" | "s3_dream_quality" => Ok(vec![s3()]),
+        other => Err(BenchError::scenario(format!(
+            "unknown scenario '{other}' (expected: all, s1, s2, s3)"
+        ))),
+    }
+}
+
+/// Varmistaa että `continuity_daemon`-binääri löytyy: jos `CONTINUITY_DAEMON_BIN`
+/// ei ole asetettu, johtaa sen nykyisen binäärin sijainnista (`target/<profile>/`)
+/// ja asettaa ympäristömuuttujan.
+///
+/// `cargo run -p familyclaw-bench` rakentaa `bench`-binäärin
+/// `target/<profile>/`-hakemistoon, jossa myös `continuity_daemon` sijaitsee
+/// (workspace-binäärit jakavat saman hakemiston).
+///
+/// # Errors
+/// [`BenchError::Subject`] jos binääriä ei löydy mistään.
+fn ensure_daemon_env() -> Result<()> {
+    // Eksplisiittinen yliajo voittaa — älä koske jos jo asetettu.
+    if std::env::var("CONTINUITY_DAEMON_BIN").is_ok() {
+        return Ok(());
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| BenchError::subject(format!("current_exe failed: {e}")))?;
+    // exe = target/<profile>/bench(.exe) → profiilihakemisto = exe.parent().
+    let profile_dir = exe
+        .parent()
+        .ok_or_else(|| BenchError::subject("bench binary has no parent dir"))?;
+    let mut bin = profile_dir.join("continuity_daemon");
+    if cfg!(windows) {
+        bin.set_extension("exe");
+    }
+    if !bin.exists() {
+        return Err(BenchError::subject(format!(
+            "continuity_daemon not found at {} — run \
+             `cargo build -p familyclaw-agent --bin continuity_daemon` first \
+             (or set CONTINUITY_DAEMON_BIN)",
+            bin.display()
+        )));
+    }
+    std::env::set_var("CONTINUITY_DAEMON_BIN", &bin);
+    Ok(())
+}
+
+/// Kirjoittaa scorecardin sekä `out/`-hakemistoon että `docs/SCORECARD.md`:hen.
+///
+/// `scorecard.json` kirjoitetaan vain `all`-ajossa (täysi tuloskortti); yksittäiset
+/// skenaarioajot kirjoittavat vain markdownin diagnostiikaksi.
+///
+/// # Errors
+/// [`BenchError::Io`]/[`BenchError::Serde`] jos kirjoitus tai sarjallistus epäonnistuu.
+fn write_outputs(card: &Scorecard, scenario: &str) -> Result<()> {
+    let root = workspace_crate_root();
+    let out_dir = root.join("out");
+    std::fs::create_dir_all(&out_dir)?;
+
+    let json = card.to_json()?;
+    let md = card.to_markdown();
+
+    // Tavu-tavulta deterministinen JSON kirjoitetaan ilman lopun rivinvaihtoa,
+    // jotta kahden ajon vertailu on suora byte-vertailu (design §6).
+    write_atomic(&out_dir.join("scorecard.json"), json.as_bytes())?;
+    write_atomic(&out_dir.join("SCORECARD.md"), md.as_bytes())?;
+
+    // Julkinen artefakti repon `docs/`-hakemistoon (design §4).
+    if scenario == "all" {
+        let docs_dir = root
+            .parent()
+            .and_then(Path::parent)
+            .map(|ws| ws.join("docs"));
+        if let Some(docs_dir) = docs_dir {
+            std::fs::create_dir_all(&docs_dir)?;
+            write_atomic(&docs_dir.join("SCORECARD.md"), md.as_bytes())?;
+        }
+    }
+
+    tracing::info!(out = %out_dir.display(), "scorecard written");
+    Ok(())
+}
+
+/// Kirjoittaa tiedoston sisällön (ylikirjoittaa). Eristetty apuri yhtenäistä
+/// virheenkäsittelyä varten.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// Palauttaa `familyclaw-bench`-craten juuren (`CARGO_MANIFEST_DIR`).
+///
+/// Tämä on käännösaikainen vakio joka osoittaa aina `crates/familyclaw-bench/`:iin
+/// riippumatta ajohakemistosta — `out/` kirjoitetaan tänne deterministisesti.
+fn workspace_crate_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}

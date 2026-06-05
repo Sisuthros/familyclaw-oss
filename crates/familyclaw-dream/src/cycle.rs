@@ -199,6 +199,16 @@ where
                 if id == rep_id {
                     continue;
                 }
+                // KRIITTINEN INVARIANTTI (design §3 S3): suojattua ydintä
+                // (λ=0, ProtectedCore) ei saa KOSKAAN haudata — ei edes
+                // merge-vaiheessa ei-edustajana. Tämä peilaa
+                // `Memory::tombstone()`-metodin kieltäytymistä (memory.rs).
+                // `representative_order` suosii jo suojattua edustajaksi, mutta
+                // jos klusterissa on >1 suojattu (vain yksi voi olla edustaja),
+                // muut suojatut säilyvät tässä aktiivisina muuttumattomina.
+                if candidates[idx].decay_policy.is_protected() {
+                    continue;
+                }
                 self.store.set_status(id, MemoryStatus::Tombstoned).await?;
                 report.record(Reflection::new(
                     ReflectionKind::Merged,
@@ -301,12 +311,23 @@ where
 
 /// Vertailufunktio edustajan valintaan: vahvin ensin.
 ///
-/// Järjestys: korkeampi tärkeys → tuoreempi (`last_reinforced_at`) →
-/// pienempi id (deterministinen tasapelin ratkaisu).
+/// Järjestys: **suojattu ydin ensin** (ProtectedCore voittaa aina, jotta
+/// identiteetti-ankkuri ei koskaan päädy haudattavaksi ei-edustajana) →
+/// korkeampi tärkeys → tuoreempi (`last_reinforced_at`) → pienempi id
+/// (deterministinen tasapelin ratkaisu).
 fn representative_order(a: &Memory, b: &Memory) -> std::cmp::Ordering {
-    b.importance
-        .partial_cmp(&a.importance)
-        .unwrap_or(std::cmp::Ordering::Equal)
+    // Suojattu ydin valitaan edustajaksi importance-arvosta riippumatta:
+    // näin ei-suojattu lähes-duplikaatti ei voi syrjäyttää sitä ja johtaa
+    // ankkurin hautaamiseen (design §3 S3: protected_core_intact == 1.0).
+    let a_protected = a.decay_policy.is_protected();
+    let b_protected = b.decay_policy.is_protected();
+    b_protected
+        .cmp(&a_protected)
+        .then_with(|| {
+            b.importance
+                .partial_cmp(&a.importance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .then_with(|| b.last_reinforced_at.cmp(&a.last_reinforced_at))
         .then_with(|| a.id.cmp(&b.id))
 }
@@ -396,6 +417,66 @@ mod tests {
             .filter(|m| m.status == MemoryStatus::Tombstoned)
             .count();
         assert_eq!(tombstoned, 1);
+    }
+
+    /// Regressio (red-team `dream-corruption`, 2026-06-05): suojattua
+    /// identiteetti-ankkuria EI saa haudata merge-vaiheessa, vaikka klusterissa
+    /// on korkeamman importancen ei-suojattu lähes-duplikaatti. Aiemmin
+    /// `merge_duplicates` kutsui `set_status(Tombstoned)` suoraan ohittaen
+    /// `is_protected()`-vartijan (toisin kuin `drop_contradicted` ja
+    /// `consolidate`) → ankkuri haudattiin ei-edustajana ja
+    /// `protected_core_intact` rikkoutui. Korjaus: suojattu ydin valitaan aina
+    /// edustajaksi JA suojattua ei koskaan haudata merge-silmukassa.
+    #[tokio::test]
+    async fn merge_never_tombstones_protected_core_as_nonrepresentative() {
+        let store = LocalJsonStore::in_memory();
+        // ProtectedCore, MATALAMPI importance.
+        let anchor = store
+            .add(
+                Memory::builder("i am part of this family and always will be")
+                    .factors(ImportanceFactors::new(0.40, 0.40, 0.0, 0.0))
+                    .decay_policy(DecayPolicy::ProtectedCore)
+                    .build(),
+            )
+            .await
+            .expect("anchor");
+        // Ei-suojattu, KORKEAMPI importance, leksikaalisesti lähes-identtinen
+        // (Jaccard ≈ 0.857 ≥ 0.85 oletuskynnys) → klusteroituu ankkurin kanssa.
+        let dup = store
+            .add(
+                Memory::builder("i am part of this family and always will be forever")
+                    .factors(ImportanceFactors::new(0.95, 0.95, 0.0, 0.0))
+                    .build(),
+            )
+            .await
+            .expect("dup");
+
+        let cycle = DreamCycle::with_config(
+            &store,
+            DreamConfig::default()
+                .dropping_contradicted(false)
+                .absolutizing_dates(false)
+                .consolidating(false),
+        );
+        let _ = cycle.run_without_journal(at()).await.expect("run");
+
+        // Ankkurin on pysyttävä aktiivisena ja sisällöltään muuttumattomana.
+        let anchor_after = store.get(anchor).await.expect("g").expect("p");
+        assert_eq!(
+            anchor_after.status,
+            MemoryStatus::Active,
+            "suojattu ankkuri haudattiin merge-vaiheessa ei-edustajana"
+        );
+        assert_eq!(
+            anchor_after.content, "i am part of this family and always will be",
+            "suojatun ankkurin sisältö muuttui"
+        );
+        // Suojattu ydin valitaan edustajaksi → ei-suojattu duplikaatti häviää.
+        assert_eq!(
+            store.get(dup).await.expect("g").expect("p").status,
+            MemoryStatus::Tombstoned,
+            "ei-suojatun lähes-duplikaatin pitäisi hävitä suojatulle edustajalle"
+        );
     }
 
     #[tokio::test]
@@ -824,6 +905,26 @@ mod tests {
         assert_eq!(
             representative_order(&strong, &weak),
             std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn representative_order_prefers_protected_core_over_higher_importance() {
+        // Suojattu ydin (matala importance) voittaa ei-suojatun (korkea
+        // importance) — estää ankkurin hautaamisen ei-edustajana.
+        let protected = Memory::builder("x")
+            .factors(ImportanceFactors::new(0.1, 0.1, 0.0, 0.0))
+            .decay_policy(DecayPolicy::ProtectedCore)
+            .build();
+        let strong = mem("x", 0.9);
+        assert_eq!(
+            representative_order(&protected, &strong),
+            std::cmp::Ordering::Less,
+            "ProtectedCore on järjestyksessä ensin (edustaja)"
+        );
+        assert_eq!(
+            representative_order(&strong, &protected),
+            std::cmp::Ordering::Greater
         );
     }
 

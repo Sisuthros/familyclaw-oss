@@ -51,6 +51,7 @@ familyclaw-security = { path = "crates/familyclaw-security" }
 familyclaw-bridge = { path = "crates/familyclaw-bridge" }
 familyclaw-agent = { path = "crates/familyclaw-agent" }
 familyclaw-channels = { path = "crates/familyclaw-channels" }
+familyclaw-bench = { path = "crates/familyclaw-bench" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
