@@ -17,6 +17,23 @@ platform and your private souls.*
 
 ---
 
+## 🏗️ Hire the creator
+
+**The FamilyClaw Authors** built FamilyClaw — 20,000 lines of Rust in 24 hours,
+12 crates, 452 tests, production-grade architecture.
+
+📍 Larnaca, Cyprus (EU) · 💼 Available for Rust/AI consulting · ⌛ Immediate start
+
+**What I deliver:**
+- High-performance Rust systems (Tokio, Ractor, async, WASM)
+- AI agent architecture & integration (OpenAI-compatible LLMs, RAG, memory)
+- DORA & EU AI Act compliance (financial sector)
+- Full-stack platform architecture
+
+📧 **viltsu.operator@gmail.com** · 🔗 [GitHub](https://github.com/Sisuthros) · 💼 [Upwork profile coming soon]
+
+---
+
 ## What it solves
 
 Most agent frameworks treat an agent as a stateless function call: it wakes
