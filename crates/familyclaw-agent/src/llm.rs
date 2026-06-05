@@ -194,8 +194,14 @@ impl LlmClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::Http(format!("HTTP {status}: {body}")));
+            // Redact body for auth errors to prevent API key leakage in logs.
+            let is_auth = status.as_u16() == 401 || status.as_u16() == 403;
+            let detail = if is_auth {
+                "[redacted]".to_string()
+            } else {
+                response.text().await.unwrap_or_default()
+            };
+            return Err(LlmError::Http(format!("HTTP {status}: {detail}")));
         }
 
         let chat_response: ChatCompletionsResponse = response
@@ -242,8 +248,14 @@ impl LlmClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::Http(format!("HTTP {status}: {body}")));
+            // Redact body for auth errors to prevent API key leakage in logs.
+            let is_auth = status.as_u16() == 401 || status.as_u16() == 403;
+            let detail = if is_auth {
+                "[redacted]".to_string()
+            } else {
+                response.text().await.unwrap_or_default()
+            };
+            return Err(LlmError::Http(format!("HTTP {status}: {detail}")));
         }
 
         let chat_response: ChatCompletionsResponse = response
