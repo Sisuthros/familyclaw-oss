@@ -26,9 +26,35 @@ engine, latent risk, agent_epsilon host) remain hers and are NOT touched here.
 
 ## 1. The claim we make true and prove
 
-> *Kill a FamilyClaw agent mid-task. Restart it. It resumes the exact step,
-> every side effect runs exactly once, it remembers everything — and overnight
-> its memory got cleaner. No other shipping platform does all four.*
+> **HEADLINE (revised 2026-06-05 after AgentScope analysis):**
+> *"Every rival forgets how to forget. FamilyClaw dreams."*
+> Overnight, a FamilyClaw agent's memory gets **cleaner** — duplicates merged,
+> contradictions dropped, relative dates absolutized — and its **identity is
+> provably untouched** (protected-core anchors, λ=0). No shipping platform
+> markets active memory consolidation with a guaranteed identity invariant.
+>
+> **Supporting claim (durable replay):** kill it mid-task with SIGKILL; it
+> resumes the exact step, side-effects exactly once. This is the *adversarial*
+> version of continuity — distinct from AgentScope's *cooperative* "safe
+> interruption" (graceful pause within a live process, not process-death replay).
+
+### Why the pivot: AgentScope contests durable-resume, not dreaming
+
+AgentScope (Alibaba/ModelScope, 26k+★, Apache-2.0) ships an ecosystem (core +
+Runtime + ReMe memory + OpenJudge + Trinity-RFT + Java/TS + QwenPaw). It markets
+"Safe Interruption: resumption without data loss" and ReMe persistent file+vector
+memory. So **durable-resume is contested ground**; Letta has sleep-time compute;
+OpenFANG has history compaction. But **active nightly consolidation that heals
+memory while guaranteeing identity anchors are never merged/dropped/altered is
+uncontested**. ReMe *retrieves*; Dreaming *rewrites*. That verb is the moat.
+
+Therefore: **S3 Dream Quality is the headline scenario**; S1 durable replay is
+supporting evidence. The money metrics are `protected_core_intact == 1.0` and
+`false_merge_rate == 0` alongside `dedup_precision` / `contradiction_drop`.
+
+**Raised stake:** this headline is only credible if the red-team `dream-corruption`
+attack (false-merge of distinct memories; anchor tombstoned as non-representative)
+finds NO hole — or every hole is fixed. That attack is already in the workflow.
 
 Verified state of E:\Familyclaw (2026-06-05, live): 12 crates build green.
 - `familyclaw-durable` (51 tests) — **competitive-grade**. `context.rs` has the
