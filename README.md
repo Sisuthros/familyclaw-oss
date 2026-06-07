@@ -186,7 +186,7 @@ cargo test -p familyclaw-sandbox --features wasmtime
 
 # Code quality
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings -A clippy::doc_markdown -A clippy::too_many-lines
+cargo clippy --workspace --all-targets -- -D warnings -A clippy::doc_markdown -A clippy::too_many_lines
 
 # Layer B audit (matches CI)
 ./scripts/audit-layer-b.sh

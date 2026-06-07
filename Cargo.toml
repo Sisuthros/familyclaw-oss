@@ -51,6 +51,7 @@ familyclaw-security = { path = "crates/familyclaw-security" }
 familyclaw-bridge = { path = "crates/familyclaw-bridge" }
 familyclaw-agent = { path = "crates/familyclaw-agent" }
 familyclaw-channels = { path = "crates/familyclaw-channels" }
+familyclaw-runtime = { path = "crates/familyclaw-runtime" }
 familyclaw-bench = { path = "crates/familyclaw-bench" }
 familyclaw-gemu = { path = "crates/familyclaw-gemu" }
 familyclaw-hearth = { path = "crates/familyclaw-hearth" }

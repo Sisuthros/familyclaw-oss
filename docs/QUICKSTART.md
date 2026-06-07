@@ -87,7 +87,7 @@ cargo test --workspace
 cargo fmt --all -- --check
 
 # Lint with clippy
-cargo clippy --workspace --all-targets -- -D warnings -A clippy::doc_markdown -A clippy::too_many-lines
+cargo clippy --workspace --all-targets -- -D warnings -A clippy::doc_markdown -A clippy::too_many_lines
 
 # Build docs
 cargo doc --all --no-deps --open

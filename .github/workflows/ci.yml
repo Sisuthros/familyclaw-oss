@@ -40,7 +40,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings -A clippy::doc_markdown -A clippy::too_many-lines
+      - run: cargo clippy --all-targets -- -D warnings -A clippy::doc_markdown -A clippy::too_many_lines
 
   fmt:
     name: Format

@@ -88,15 +88,10 @@
 
 | Metric | Value |
 |--------|-------|
-| narrative_thread_integrity | 1.0000 |
-| cross_reference_recall | 1.0000 |
-| contagion_works | 1.0000 |
 | anchor_intact | 1.0000 |
+| contagion_works | 1.0000 |
+| cross_reference_recall | 1.0000 |
+| narrative_thread_integrity | 1.0000 |
 | timeline_order | 1.0000 |
 
-- agent_gamma + agent_alpha: 3 events preserved in narrative thread
-- Cross-reference retrievable from thread
-- Emotional contagion: agent_gamma joy spread to agent_alpha
-- agent_gamma identity anchor intact after full scenario
-- All events in strict chronological order
 

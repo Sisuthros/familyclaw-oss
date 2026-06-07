@@ -1622,8 +1622,11 @@ name = "familyclaw-gateway"
 version = "0.1.0"
 dependencies = [
  "axum 0.7.9",
+ "familyclaw-agent",
  "familyclaw-bus",
+ "familyclaw-channels",
  "familyclaw-core",
+ "familyclaw-runtime",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1689,6 +1692,23 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "familyclaw-runtime"
+version = "0.1.0"
+dependencies = [
+ "axum 0.7.9",
+ "familyclaw-agent",
+ "familyclaw-bus",
+ "familyclaw-channels",
+ "familyclaw-core",
+ "familyclaw-durable",
+ "familyclaw-memory",
+ "ractor",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

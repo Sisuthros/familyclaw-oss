@@ -1,0 +1,33 @@
+[package]
+name = "familyclaw-runtime"
+description = "FamilyClaw runtime assembly — wires bus + agents + channels + reply pump (C5 build_family)"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+familyclaw-core = { workspace = true }
+familyclaw-bus = { workspace = true }
+familyclaw-agent = { workspace = true }
+familyclaw-channels = { workspace = true }
+familyclaw-memory = { workspace = true }
+familyclaw-durable = { workspace = true }
+ractor = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
+# Mock-LLM-palvelin (OpenAI-yhteensopiva) roundtrip-integraatiotestiin.
+# Workspace-deppi (ei uutta ulkoista riippuvuutta) ja vain test-puolella.
+axum = { workspace = true }
+serde_json = { workspace = true }
+familyclaw-channels = { workspace = true }
+familyclaw-agent = { workspace = true }
+familyclaw-core = { workspace = true }

@@ -18,6 +18,9 @@ workspace = true
 [dependencies]
 familyclaw-core = { workspace = true }
 familyclaw-bus = { workspace = true }
+familyclaw-runtime = { workspace = true }
+familyclaw-agent = { workspace = true }
+familyclaw-channels = { workspace = true, features = ["telegram"] }
 tokio = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }
