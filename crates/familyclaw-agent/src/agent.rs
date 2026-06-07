@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use familyclaw_bus::{BeingId, BeingInfo, BusHandle, BusMessage, ResonanceMessage, TaskEventKind};
+use familyclaw_channels::OutboundMessage;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
 use familyclaw_durable::{DurableContext, Journal};
 use familyclaw_emotion::{Dimension, EmotionState};
@@ -35,6 +36,28 @@ use familyclaw_sandbox::{CodeSandbox, SandboxOutput, SandboxRequest};
 
 /// Type-erased memory store for trait-object-based agents.
 pub type ErasedMemoryStore = Arc<dyn MemoryStore + Send + Sync>;
+
+/// Reply-kanava (C1 Malli A): se mpsc-lähetyspää, jota Agent käyttää
+/// työntääkseen LLM-vastauksen ulos kanavalle. **mpsc, EI bus** — busiin
+/// julkaisu triggeröisi uuden [`Agent::handle_turn`]:n (ääretön silmukka).
+///
+/// Gateway omistaa vastaanottopään ([`new_reply_channel`]) ja kutsuu
+/// `Channel::send`. Agent ei koskaan kutsu kanavaa suoraan.
+///
+/// [`UnboundedSender::send`](tokio::sync::mpsc::UnboundedSender::send) ei ole
+/// async eikä lukkiudu — siksi turvallinen kutsua synkronisesta
+/// [`Agent::route_reply`]:stä.
+pub type ReplySink = tokio::sync::mpsc::UnboundedSender<OutboundMessage>;
+
+/// Rakentaa reply-kanavaparin: [`ReplySink`] agentille + vastaanottopää
+/// gatewaylle (C1 Malli A — gateway omistaa recv-pään ja kutsuu `Channel::send`).
+#[must_use]
+pub fn new_reply_channel() -> (
+    ReplySink,
+    tokio::sync::mpsc::UnboundedReceiver<OutboundMessage>,
+) {
+    tokio::sync::mpsc::unbounded_channel()
+}
 
 /// Type-erased journal for trait-object-based agents.
 pub type ErasedJournal = Box<dyn Journal + Send + Sync>;
@@ -94,6 +117,19 @@ pub struct Agent {
     llm: Option<LlmClient>,
     /// Sandbox koodin suorittamiseen (valinnainen, `wasmtime`-featuren kanssa).
     sandbox: Option<Arc<dyn CodeSandbox>>,
+    /// Reply-kanava (C1 Malli A): minne LLM-vastaus työnnetään ulos. `None` =
+    /// pudota vastaukset (nykyinen, taaksepäin-yhteensopiva käytös).
+    reply_sink: Option<ReplySink>,
+    /// Reply-kohde: kanavakohtainen vastausosoite (keskustelu/kanava-id), johon
+    /// [`Agent::route_reply`] lähettää. `None` = ei tunnettua kohdetta
+    /// (vastaukset pudotetaan vaikka sink olisi asennettu).
+    ///
+    /// **Huom (C2-aukko):** koska [`BusMessage`] ei tällä hetkellä kanna
+    /// kanava-alkuperää (`MessageOrigin`), reply-kohde annetaan agentille
+    /// erikseen ([`Agent::with_reply_target`]). Kun laajempi C2-origin-sopimus
+    /// (origin-kenttä bus-viestissä) on rakennettu, kohde voidaan johtaa
+    /// per-viesti käsiteltävästä viestistä. Ks. open question.
+    reply_target: Option<String>,
 }
 
 impl Agent {
@@ -126,7 +162,29 @@ impl Agent {
             turn_counter: 0,
             llm,
             sandbox,
+            reply_sink: None,
+            reply_target: None,
         }
+    }
+
+    /// Asenna reply-sink (C1 Malli A). `None` = pudota vastaukset (nykyinen
+    /// käytös, taaksepäin-yhteensopiva). Palauttaa `self` ketjutusta varten,
+    /// jotta [`Agent::new`]-signatuuri pysyy muuttumattomana (C1 vaatii: ei
+    /// muuteta olemassa olevaa konstruktoria).
+    #[must_use]
+    pub fn with_reply_sink(mut self, sink: ReplySink) -> Self {
+        self.reply_sink = Some(sink);
+        self
+    }
+
+    /// Aseta reply-kohde (kanavakohtainen vastausosoite, johon vastaukset
+    /// reititetään). Tämä on väliaikainen C2-silta kunnes [`BusMessage`] kantaa
+    /// kanava-alkuperän (`MessageOrigin`) per-viesti. Palauttaa `self`
+    /// ketjutusta varten.
+    #[must_use]
+    pub fn with_reply_target(mut self, target: impl Into<String>) -> Self {
+        self.reply_target = Some(target.into());
+        self
     }
 
     /// Agentin näyttönimi.
@@ -366,6 +424,32 @@ impl Agent {
             }
         };
 
+        // 5b. Reply-path (C1 Malli A, TEHTÄVÄ C2): jos `think()` tuotti tekstin
+        //     JA reply-sink + reply-kohde on asennettu, työnnä vastaus ULOS
+        //     kanavalle. Tämä on ERI polku kuin bus-julkaisu — gateway omistaa
+        //     recv-pään ja kutsuu `Channel::send`. EMME julkaise busiin
+        //     (ääretön-silmukka-suoja: bus-reply triggeröisi uuden
+        //     handle_turn:n). Ajetaan VAIN tuoreessa vuorossa, ei replayssa:
+        //     ulkomaailmaan lähetys on idempotentittömyysraja (kahdentaisi
+        //     viestin käyttäjälle), joten replay ei saa toistaa sitä.
+        if !self.durable.is_replaying() {
+            if let Some(thought) = thought_response.as_deref().filter(|s| !s.is_empty()) {
+                if let Some(target) = self.reply_target.as_deref() {
+                    match OutboundMessage::new(target, thought) {
+                        Ok(reply) => {
+                            if let Err(e) = self.route_reply(reply) {
+                                // Reitityksen epäonnistuminen (suljettu sink) ei
+                                // saa kaataa vuoroa — loki ja jatka.
+                                warn!("reply routing failed (non-fatal): {e}");
+                            }
+                        }
+                        // Tyhjä target/body torjutaan jo aiemmin; varmuuden vuoksi.
+                        Err(e) => warn!("reply build failed (non-fatal): {e}"),
+                    }
+                }
+            }
+        }
+
         // Liitä LLM-ajattelun tiivistelmä vuoron yhteenvetoon (jos saatu).
         let recorded = match thought_response {
             Some(thought) if !thought.is_empty() => {
@@ -469,6 +553,30 @@ impl Agent {
     /// [`FamilyClawError::Bus`] jos julkaisu epäonnistuu.
     pub fn say(&self, body: impl Into<String>) -> Result<()> {
         self.bus.publish(self.being_id, BusMessage::text(body))
+    }
+
+    /// Reitittää vastauksen **ulos kanavalle** reply-sinkin kautta (C1 Malli A).
+    ///
+    /// Tämä on **eri polku** kuin [`Agent::say`]/[`Agent::broadcast_emotion`]:
+    /// ne julkaisevat busiin (sisarukset kuulevat), kun taas `route_reply`
+    /// työntää viestin mpsc-kanavaan, jonka gateway omistaa ja jonka kautta
+    /// `Channel::send` kutsutaan ulkomaailmaan. **Ei bus-julkaisua** —
+    /// bus-reply triggeröisi uuden [`Agent::handle_turn`]:n (ääretön silmukka).
+    ///
+    /// No-op (palauttaa `Ok`) jos reply-sinkiä ei ole asennettu — tämä on
+    /// taaksepäin-yhteensopiva oletuskäytös (vastaukset pudotetaan).
+    ///
+    /// # Errors
+    /// [`FamilyClawError::Bus`] jos sink on asennettu mutta vastaanottopää on
+    /// suljettu (gateway lopetti) — vastausta ei voitu toimittaa.
+    pub fn route_reply(&self, msg: OutboundMessage) -> Result<()> {
+        match self.reply_sink.as_ref() {
+            Some(sink) => sink
+                .send(msg)
+                .map_err(|e| FamilyClawError::bus(format!("reply sink closed: {e}"))),
+            // Ei sinkiä = pudota vastaus (nykyinen käytös, taaksepäin-yht.sop.).
+            None => Ok(()),
+        }
     }
 
     /// Julkaisee tehtävätapahtuman busiin (kevyt signaali sisaruksille).
@@ -910,5 +1018,78 @@ mod tests {
         let json = serde_json::to_string(&o).expect("ser");
         let back: TurnOutcome = serde_json::from_str(&json).expect("de");
         assert_eq!(o, back);
+    }
+
+    // ---- C2 reply-path (C1 Malli A) -------------------------------------
+
+    /// Ydinväite (TEHTÄVÄ C2): kun reply-sink + reply-kohde on asennettu,
+    /// agentin tuottama vastaus päätyy reply-sinkiin OIKEALLA kohteella
+    /// (channel/conversation-id). Tämä on se sama polku, jonka `handle_turn`
+    /// ajaa kun `think()` tuottaa tekstin: rakenna `OutboundMessage` kohteella
+    /// → `route_reply` → gateway saa sen recv-päästä.
+    #[tokio::test]
+    async fn route_reply_reaches_sink_with_correct_target() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+
+        let (sink, mut rx) = new_reply_channel();
+        let agent = test_agent("agent_a", bus.clone())
+            .with_reply_sink(sink)
+            .with_reply_target("discord:general-42");
+
+        // Sama rakennuslogiikka kuin handle_turn:in reply-path-haarassa:
+        // think-teksti → OutboundMessage agentin reply-kohteella.
+        let thought = "ajattelin tämän";
+        let reply = OutboundMessage::new("discord:general-42", thought).expect("reply");
+        agent.route_reply(reply).expect("route");
+
+        // Gateway (recv-pää) sai vastauksen oikealla channel/conversation-id:llä.
+        let got = rx.recv().await.expect("reply delivered");
+        assert_eq!(got.target, "discord:general-42", "vastaus oikeaan kanavaan");
+        assert_eq!(got.body, thought);
+
+        bus.stop();
+    }
+
+    /// Ilman reply-sinkiä `route_reply` on no-op (palauttaa Ok) — nykyinen,
+    /// taaksepäin-yhteensopiva käytös (vastaukset pudotetaan).
+    #[tokio::test]
+    async fn route_reply_without_sink_is_noop() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let agent = test_agent("agent_a", bus.clone());
+        let reply = OutboundMessage::new("anywhere", "ei kuulijaa").expect("reply");
+        // Ei paniikkia, ei virhettä — vastaus vain pudotetaan.
+        agent.route_reply(reply).expect("noop ok");
+        bus.stop();
+    }
+
+    /// Jos sink on asennettu mutta gateway sulki recv-pään, `route_reply`
+    /// palauttaa Err (vastausta ei voitu toimittaa) — eikä paniikkaa.
+    #[tokio::test]
+    async fn route_reply_errors_when_sink_closed() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let (sink, rx) = new_reply_channel();
+        drop(rx); // gateway lopetti → recv-pää suljettu.
+        let agent = test_agent("agent_a", bus.clone()).with_reply_sink(sink);
+        let reply = OutboundMessage::new("c", "hukkaan").expect("reply");
+        assert!(
+            agent.route_reply(reply).is_err(),
+            "suljettu sink → toimitusvirhe"
+        );
+        bus.stop();
+    }
+
+    /// `with_reply_sink` / `with_reply_target` ketjuttuvat eivätkä muuta
+    /// `Agent::new`-signatuuria (C1: konstruktoria ei kosketa).
+    #[tokio::test]
+    async fn reply_setters_chain_and_preserve_identity() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let (sink, _rx) = new_reply_channel();
+        let agent = test_agent("agent_a", bus.clone())
+            .with_reply_sink(sink)
+            .with_reply_target("tg:chat-7");
+        // Identiteetti säilyy setterien jälkeen.
+        assert_eq!(agent.name(), "agent_a");
+        assert_eq!(agent.turns_taken(), 0);
+        bus.stop();
     }
 }

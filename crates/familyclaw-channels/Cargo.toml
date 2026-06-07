@@ -21,15 +21,15 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 
-# Discord adapter: HTTP webhook (lightweight, no gateway SDK needed).
-# Sends via webhook URL, receives via polling or future gateway integration.
-reqwest = { version = "0.12", optional = true }
+# Discord/Telegram adapters: HTTP REST (lightweight, no gateway/teloxide SDK).
+# Discord sends via webhook URL; Telegram uses Bot API getUpdates/sendMessage.
+reqwest = { workspace = true, optional = true }
 
 [features]
 # Default: runko + MockChannel only. Real adapters behind feature flags.
 default = []
 discord = ["dep:reqwest"]
-telegram = []
+telegram = ["dep:reqwest"]
 whatsapp = []
 signal = []
 

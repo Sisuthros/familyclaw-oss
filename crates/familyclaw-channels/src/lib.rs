@@ -58,6 +58,9 @@ mod mock;
 #[cfg(feature = "discord")]
 mod discord;
 
+#[cfg(feature = "telegram")]
+mod telegram;
+
 pub use channel::{Channel, MessageStream, SendFuture};
 pub use error::{ChannelError, ChannelResult};
 pub use message::{ChannelKind, InboundEnvelope, InboundMessage, OutboundMessage};
@@ -65,6 +68,9 @@ pub use mock::{pump_to, MockChannel};
 
 #[cfg(feature = "discord")]
 pub use discord::DiscordChannel;
+
+#[cfg(feature = "telegram")]
+pub use telegram::TelegramChannel;
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).
 #[must_use]
