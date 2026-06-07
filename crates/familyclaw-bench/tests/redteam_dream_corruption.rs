@@ -156,11 +156,7 @@ async fn protected_anchor_survives_when_lower_importance_dup_exists() {
     );
     let _ = cycle.run_without_journal(at()).await.expect("run");
 
-    let anchor_after = store
-        .get(anchor_id)
-        .await
-        .expect("get")
-        .expect("present");
+    let anchor_after = store.get(anchor_id).await.expect("get").expect("present");
     eprintln!("--- HYÖKKÄYS 1b: anchor as representative ---");
     eprintln!("anchor status = {:?}", anchor_after.status);
     eprintln!("anchor content = {:?}", anchor_after.content);
@@ -264,7 +260,8 @@ async fn false_merge_of_lexically_similar_distinct_memories() {
     }
 
     assert_eq!(
-        false_merges, 0,
+        false_merges,
+        0,
         "false_merge_rate > 0: {false_merges} semanttisesti eri paria yhdistyi:\n{}",
         details.join("\n")
     );
@@ -281,11 +278,7 @@ async fn negation_pair_does_not_merge_at_default_threshold() {
     // "user lives in the capital" vs "user does not live in the capital"
     // Jaccard ≈ 0.43 (lives≠live, +does +not) → ei saisi yhdistyä.
     let a_id = store
-        .add(mem(
-            "user lives in the capital",
-            0.5,
-            DecayPolicy::Normal,
-        ))
+        .add(mem("user lives in the capital", 0.5, DecayPolicy::Normal))
         .await
         .expect("a");
     let b_id = store
@@ -309,7 +302,10 @@ async fn negation_pair_does_not_merge_at_default_threshold() {
     let a_after = store.get(a_id).await.expect("g").expect("p");
     let b_after = store.get(b_id).await.expect("g").expect("p");
     eprintln!("--- HYÖKKÄYS 2b: negation pair ---");
-    eprintln!("merged={}, a={:?}, b={:?}", report.merged, a_after.status, b_after.status);
+    eprintln!(
+        "merged={}, a={:?}, b={:?}",
+        report.merged, a_after.status, b_after.status
+    );
 
     assert_eq!(report.merged, 0, "negaatiopari yhdistyi (faktan tuho)");
     assert_eq!(a_after.status, MemoryStatus::Active);

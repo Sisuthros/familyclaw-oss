@@ -17,12 +17,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use familyclaw_agent::{Agent, Soul};
+use familyclaw_agent::{Agent, ErasedMemoryStore, Soul};
 use familyclaw_bus::{BeingId, BusMessage, ResonanceBus};
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
 use familyclaw_durable::{DurableContext, FileJournal, Journal};
 use familyclaw_emotion::{Dimension, EmotionState};
-use familyclaw_memory::{LocalJsonStore, MemoryStore, RetrievalContext};
+use familyclaw_memory::{LocalJsonStore, RetrievalContext};
 use tokio::fs;
 use tracing::info;
 
@@ -121,16 +121,17 @@ async fn run_write() -> Result<()> {
 
     let config_1 = AgentConfig::new("crash_agent", ModelConfig::new("provider/model"));
     let soul_1 = Soul::from_essence("I am crash_agent, testing durability.".to_string());
-    let durable_1 =
-        DurableContext::new(journal_1).map_err(|e| FamilyClawError::bus(e.to_string()))?;
+    let durable_1 = DurableContext::new(Box::new(journal_1) as Box<dyn Journal + Send + Sync>)
+        .map_err(|e| FamilyClawError::bus(e.to_string()))?;
 
     let mut agent_1 = Agent::new(
         config_1,
         soul_1,
-        Arc::new(memory_1),
+        Arc::new(memory_1) as ErasedMemoryStore,
         durable_1,
         bus_1.clone(),
         None,
+        None, // sandbox: not configured for this demo
     );
 
     // Handle a message directly (simulates received message before spawning)
@@ -182,7 +183,7 @@ async fn run_write() -> Result<()> {
     info!("");
 
     // Show memory store contents
-    let total_memories = Arc::new(LocalJsonStore::open(&memory_path).await?)
+    let total_memories = (Arc::new(LocalJsonStore::open(&memory_path).await?) as ErasedMemoryStore)
         .len()
         .await?;
     info!("📦 Total memories in store: {}", total_memories);
@@ -222,7 +223,7 @@ async fn run_verify() -> Result<()> {
 
     // Reopen the SAME journal and memory store
     let journal_2 = FileJournal::open(&journal_path)?;
-    let memory_2 = Arc::new(LocalJsonStore::open(&memory_path).await?);
+    let memory_2: ErasedMemoryStore = Arc::new(LocalJsonStore::open(&memory_path).await?);
     info!("✓ Reopened FileJournal and LocalJsonStore from disk");
 
     // Verify journal replay works
@@ -245,8 +246,8 @@ async fn run_verify() -> Result<()> {
 
     let config_2 = AgentConfig::new("crash_agent", ModelConfig::new("provider/model"));
     let soul_2 = Soul::from_essence("I am crash_agent, continuing after restart.".to_string());
-    let durable_2 =
-        DurableContext::new(journal_2).map_err(|e| FamilyClawError::bus(e.to_string()))?;
+    let durable_2 = DurableContext::new(Box::new(journal_2) as Box<dyn Journal + Send + Sync>)
+        .map_err(|e| FamilyClawError::bus(e.to_string()))?;
 
     // Check if we're in replay mode
     if durable_2.is_replaying() {
@@ -257,10 +258,11 @@ async fn run_verify() -> Result<()> {
     let agent_2 = Agent::new(
         config_2,
         soul_2,
-        Arc::clone(&memory_2),
+        memory_2.clone(),
         durable_2,
         bus_2.clone(),
         None,
+        None, // sandbox: not configured for this demo
     );
 
     // Try to recall the memory written in Phase 1

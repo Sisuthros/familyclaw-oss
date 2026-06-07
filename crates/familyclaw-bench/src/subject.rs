@@ -35,11 +35,7 @@ pub struct Task {
 impl Task {
     /// Rakentaa tehtävän tunnisteesta, kuvauksesta ja askelista.
     #[must_use]
-    pub fn new(
-        id: impl Into<String>,
-        description: impl Into<String>,
-        steps: Vec<String>,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, description: impl Into<String>, steps: Vec<String>) -> Self {
         Self {
             id: id.into(),
             description: description.into(),

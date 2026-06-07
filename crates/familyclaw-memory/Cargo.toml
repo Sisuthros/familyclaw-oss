@@ -2,7 +2,7 @@
 name = "familyclaw-memory"
 description = "Eternal Thread — Ebbinghaus decay, VAD, identity anchors"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

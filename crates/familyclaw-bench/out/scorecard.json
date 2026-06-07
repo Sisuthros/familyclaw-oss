@@ -62,6 +62,34 @@
         "protected_core_intact=true (anchors=3), false_merge_rate=0",
         "subject sleep_cycle liveness: scanned=5 merged=4 protected_core_intact=true"
       ]
+    },
+    {
+      "id": "s4_emotional_contagion",
+      "passed": true,
+      "metrics": {
+        "contagion_correct": 1.0,
+        "homeostasis_works": 1.0,
+        "memory_isolation": 1.0,
+        "subject_recall_hits": 1.0
+      },
+      "notes": [
+        "contagion: joy=80.0→18.0 (expected 18.0), curiosity=60.0→13.5 (expected 13.5)",
+        "homeostasis: 9/9 turns moved toward neutral",
+        "memory_isolation: a_remembers=true b_isolated=true b_remembers_own=true",
+        "bus alive with 0 being(s)"
+      ]
+    },
+    {
+      "id": "s5_semantic_retrieval",
+      "passed": true,
+      "metrics": {
+        "semantic_boost": 0.03850001096725464,
+        "semantic_top1_is_shipped": 1.0
+      },
+      "notes": [
+        "keyword relevance(shipped)=0.064, semantic relevance(shipped)=0.103, boost=0.039",
+        "kw top-1 ocean=false, sem top-1 ocean=false"
+      ]
     }
   ],
   "clock": "2026-06-04T12:00:00Z"

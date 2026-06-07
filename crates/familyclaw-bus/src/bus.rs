@@ -75,7 +75,7 @@ static BUS_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// [`ResonanceBus`]-actorin sisäinen tila: rekisteröidyt olennot.
 ///
-/// Säilyttää HashMap-metadatan (nimet, BeingInfo) ListBeings-kyselyjä varten
+/// Säilyttää HashMap-metadatan (nimet, `BeingInfo`) ListBeings-kyselyjä varten
 /// ja käyttää `ractor::pg` prosessiryhmää (`pg_group`) jäsenten hallintaan ja
 /// jakeluun (broadcast).
 pub struct BusState {

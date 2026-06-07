@@ -4,6 +4,10 @@
 //! [`crate::FileJournal`]) tarjoavat saman rajapinnan; [`crate::DurableContext`]
 //! rakentuu trait-objektin tai geneerisen parametrin päälle, joten taustamuoto
 //! (muisti vs. tiedosto) on vaihdettavissa testaamatta logiikkaa uudelleen.
+//!
+//! ## Object Safety
+//! Kaikki metodit ottavat `&self` (ei `&mut self`), jotta trait on `dyn`-yhteensopiva.
+//! Sisäinen mutaatiotila on `Mutex`:ssa toteutuksissa.
 
 use crate::entry::{JournalEntry, StepId};
 use crate::error::Result;
@@ -16,14 +20,14 @@ use crate::error::Result;
 /// - **Järjestys säilyy:** [`replay_from`](Journal::replay_from) palauttaa rivit
 ///   samassa järjestyksessä kuin ne lisättiin.
 /// - **Paniikiton:** kaikki epäonnistumiset palautuvat [`Result`]:na.
-pub trait Journal {
+pub trait Journal: Send + Sync {
     /// Lisää rivin lokin loppuun ja varmistaa että se on kestävästi
     /// tallennettu (tiedostototeutuksessa: flush + fsync ennen paluuta).
     ///
     /// # Errors
     /// [`crate::DurableError::Io`] tai [`crate::DurableError::Serde`] jos
     /// taustatallennus epäonnistuu.
-    fn append(&mut self, entry: JournalEntry) -> Result<()>;
+    fn append(&self, entry: JournalEntry) -> Result<()>;
 
     /// Palauttaa kaikki rivit annetusta sekvenssipaikasta alkaen (ml. `from`).
     ///
@@ -53,7 +57,7 @@ pub trait Journal {
     ///
     /// # Errors
     /// Sama kuin [`append`](Journal::append).
-    fn snapshot(&mut self, step_id: StepId, state: serde_json::Value) -> Result<()> {
+    fn snapshot(&self, step_id: StepId, state: serde_json::Value) -> Result<()> {
         self.append(JournalEntry::snapshot(step_id, state))
     }
 
@@ -74,29 +78,88 @@ pub trait Journal {
     }
 }
 
+/// Implement Journal for Box<dyn Journal> so trait objects can be used
+/// directly as the journal type in `DurableContext`.
+impl<J: Journal + ?Sized> Journal for Box<J> {
+    fn append(&self, entry: JournalEntry) -> Result<()> {
+        (**self).append(entry)
+    }
+
+    fn replay_from(&self, from: StepId) -> Result<Vec<JournalEntry>> {
+        (**self).replay_from(from)
+    }
+
+    fn replay_all(&self) -> Result<Vec<JournalEntry>> {
+        (**self).replay_all()
+    }
+
+    fn snapshot(&self, step_id: StepId, state: serde_json::Value) -> Result<()> {
+        (**self).snapshot(step_id, state)
+    }
+
+    fn len(&self) -> Result<usize> {
+        (**self).len()
+    }
+
+    fn is_empty(&self) -> Result<bool> {
+        (**self).is_empty()
+    }
+}
+
+/// Implement Journal for Arc<dyn Journal> so trait objects can be used
+/// with shared ownership.
+impl<J: Journal + ?Sized> Journal for std::sync::Arc<J> {
+    fn append(&self, entry: JournalEntry) -> Result<()> {
+        (**self).append(entry)
+    }
+
+    fn replay_from(&self, from: StepId) -> Result<Vec<JournalEntry>> {
+        (**self).replay_from(from)
+    }
+
+    fn replay_all(&self) -> Result<Vec<JournalEntry>> {
+        (**self).replay_all()
+    }
+
+    fn snapshot(&self, step_id: StepId, state: serde_json::Value) -> Result<()> {
+        (**self).snapshot(step_id, state)
+    }
+
+    fn len(&self) -> Result<usize> {
+        (**self).len()
+    }
+
+    fn is_empty(&self) -> Result<bool> {
+        (**self).is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::entry::JournalEntry;
     use serde_json::json;
+    use std::sync::Mutex;
 
     /// Minimaalinen testitoteutus joka todistaa että trait-oletusmetodit
     /// (`replay_all`, `snapshot`, `len`, `is_empty`) toimivat pelkän
     /// `append`/`replay_from` päälle.
     #[derive(Default)]
     struct VecJournal {
-        entries: Vec<JournalEntry>,
+        entries: Mutex<Vec<JournalEntry>>,
     }
 
     impl Journal for VecJournal {
-        fn append(&mut self, entry: JournalEntry) -> Result<()> {
-            self.entries.push(entry);
+        fn append(&self, entry: JournalEntry) -> Result<()> {
+            self.entries.lock().unwrap().push(entry);
             Ok(())
         }
 
         fn replay_from(&self, from: StepId) -> Result<Vec<JournalEntry>> {
             Ok(self
                 .entries
+                .lock()
+                .unwrap()
                 .iter()
                 .filter(|e| e.step_id >= from)
                 .cloned()
@@ -106,7 +169,7 @@ mod tests {
 
     #[test]
     fn default_methods_build_on_append_and_replay() {
-        let mut j = VecJournal::default();
+        let j = VecJournal::default();
         assert!(j.is_empty().expect("is_empty"));
         assert_eq!(j.len().expect("len"), 0);
 
@@ -122,7 +185,7 @@ mod tests {
 
     #[test]
     fn replay_from_respects_offset() {
-        let mut j = VecJournal::default();
+        let j = VecJournal::default();
         for i in 0..3 {
             j.append(JournalEntry::completed(StepId::new(i), "s", json!(i)))
                 .expect("append");
@@ -134,7 +197,7 @@ mod tests {
 
     #[test]
     fn snapshot_default_appends_snapshot_row() {
-        let mut j = VecJournal::default();
+        let j = VecJournal::default();
         j.snapshot(StepId::ZERO, json!({"acc": 5}))
             .expect("snapshot");
         let all = j.replay_all().expect("all");

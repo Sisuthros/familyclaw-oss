@@ -39,10 +39,11 @@ use crate::similarity::is_near_duplicate;
 ///
 /// `S: MemoryStore + Sync` — `Sync` vaaditaan koska [`MemoryStore::is_empty`]
 /// -oletusmetodi edellyttää sitä ja jakso lukee tallennusta samanaikaisesti.
+/// `S: ?Sized` sallii trait-objektit (`dyn MemoryStore`, `Arc<dyn MemoryStore>`, jne.).
 #[derive(Debug)]
 pub struct DreamCycle<'a, S>
 where
-    S: MemoryStore + Sync,
+    S: MemoryStore + Sync + ?Sized,
 {
     /// Muistitallennus jota konsolidoidaan.
     store: &'a S,
@@ -52,7 +53,7 @@ where
 
 impl<'a, S> DreamCycle<'a, S>
 where
-    S: MemoryStore + Sync,
+    S: MemoryStore + Sync + ?Sized,
 {
     /// Luo unijakson oletuskonfiguraatiolla.
     #[must_use]
@@ -311,7 +312,7 @@ where
 
 /// Vertailufunktio edustajan valintaan: vahvin ensin.
 ///
-/// Järjestys: **suojattu ydin ensin** (ProtectedCore voittaa aina, jotta
+/// Järjestys: **suojattu ydin ensin** (`ProtectedCore` voittaa aina, jotta
 /// identiteetti-ankkuri ei koskaan päädy haudattavaksi ei-edustajana) →
 /// korkeampi tärkeys → tuoreempi (`last_reinforced_at`) → pienempi id
 /// (deterministinen tasapelin ratkaisu).

@@ -2,7 +2,7 @@
 name = "familyclaw-agent"
 description = "Agent runtime, session management, SOUL loading"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

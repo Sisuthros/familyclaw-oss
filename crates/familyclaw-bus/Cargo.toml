@@ -2,7 +2,7 @@
 name = "familyclaw-bus"
 description = "Resonance Bus — Ractor actor model + affective nervous system"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

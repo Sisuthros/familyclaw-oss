@@ -36,8 +36,8 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use familyclaw_core::{time, Timestamp};
-use familyclaw_durable::{DurableContext, FileJournal, Journal};
 use familyclaw_dream::DreamCycle;
+use familyclaw_durable::{DurableContext, FileJournal, Journal};
 use familyclaw_memory::{
     DecayPolicy, ImportanceFactors, LocalJsonStore, Memory, MemoryStore, RetrievalContext,
 };

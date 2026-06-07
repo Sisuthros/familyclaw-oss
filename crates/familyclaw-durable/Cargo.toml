@@ -2,7 +2,7 @@
 name = "familyclaw-durable"
 description = "Durable substrate — deterministic replay (crash-proof)"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

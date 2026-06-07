@@ -39,7 +39,7 @@
 //! use familyclaw_agent::{Agent, Soul};
 //! use familyclaw_bus::{BeingId, BusMessage, ResonanceBus};
 //! use familyclaw_core::{AgentConfig, ModelConfig};
-//! use familyclaw_durable::{DurableContext, InMemoryJournal};
+//! use familyclaw_durable::{DurableContext, InMemoryJournal, Journal};
 //! use familyclaw_memory::LocalJsonStore;
 //!
 //! # async fn demo() -> familyclaw_core::Result<()> {
@@ -48,10 +48,10 @@
 //! let config = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
 //! let soul = Soul::from_essence("I am agent_a, a generic example being.");
 //! let memory = Arc::new(LocalJsonStore::in_memory());
-//! let durable = DurableContext::new(InMemoryJournal::new())
+//! let durable = DurableContext::new(Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>)
 //!     .map_err(|e| familyclaw_core::FamilyClawError::bus(e.to_string()))?;
 //!
-//! let mut agent = Agent::new(config, soul, memory, durable, bus.clone(), None);
+//! let mut agent = Agent::new(config, soul, memory, durable, bus.clone(), None, None);
 //! let outcome = agent
 //!     .handle_turn(BeingId::new(), &BusMessage::text("hei sisarus"))
 //!     .await?;
@@ -67,7 +67,7 @@ pub mod channel_bridge;
 pub mod llm;
 pub mod soul;
 
-pub use agent::{Agent, AgentActor, TurnOutcome};
+pub use agent::{Agent, AgentActor, ErasedMemoryStore, TurnOutcome};
 pub use channel_bridge::{envelope_to_bus_message, publish_envelope, pump_channel_to_bus};
 pub use soul::{load_soul, resolve_profile_dir, Soul, PROFILE_DIR_ENV};
 

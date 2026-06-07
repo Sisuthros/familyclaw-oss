@@ -83,7 +83,10 @@ mod tests {
         assert!(matches!(BenchError::subject("x"), BenchError::Subject(_)));
         assert!(matches!(BenchError::scenario("x"), BenchError::Scenario(_)));
         assert!(matches!(BenchError::metric("x"), BenchError::Metric(_)));
-        assert!(matches!(BenchError::scorecard("x"), BenchError::Scorecard(_)));
+        assert!(matches!(
+            BenchError::scorecard("x"),
+            BenchError::Scorecard(_)
+        ));
     }
 
     #[test]

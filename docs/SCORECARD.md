@@ -60,3 +60,43 @@
 - protected_core_intact=true (anchors=3), false_merge_rate=0
 - subject sleep_cycle liveness: scanned=5 merged=4 protected_core_intact=true
 
+## s4_emotional_contagion — PASS
+
+| Metric | Value |
+|--------|-------|
+| contagion_correct | 1.0000 |
+| homeostasis_works | 1.0000 |
+| memory_isolation | 1.0000 |
+| subject_recall_hits | 1.0000 |
+
+- contagion: joy=80.0→18.0 (expected 18.0), curiosity=60.0→13.5 (expected 13.5)
+- homeostasis: 9/9 turns moved toward neutral
+- memory_isolation: a_remembers=true b_isolated=true b_remembers_own=true
+- bus alive with 0 being(s)
+
+## s5_semantic_retrieval — PASS
+
+| Metric | Value |
+|--------|-------|
+| semantic_boost | 0.0385 |
+| semantic_top1_is_shipped | 1.0000 |
+
+- keyword relevance(shipped)=0.064, semantic relevance(shipped)=0.103, boost=0.039
+- kw top-1 ocean=false, sem top-1 ocean=false
+
+## s6_eternal_thread — PASS
+
+| Metric | Value |
+|--------|-------|
+| narrative_thread_integrity | 1.0000 |
+| cross_reference_recall | 1.0000 |
+| contagion_works | 1.0000 |
+| anchor_intact | 1.0000 |
+| timeline_order | 1.0000 |
+
+- agent_gamma + agent_alpha: 3 events preserved in narrative thread
+- Cross-reference retrievable from thread
+- Emotional contagion: agent_gamma joy spread to agent_alpha
+- agent_gamma identity anchor intact after full scenario
+- All events in strict chronological order
+

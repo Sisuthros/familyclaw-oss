@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn malformed_marker_payload_is_skipped() {
-        let mut journal = InMemoryJournal::new();
+        let journal = InMemoryJournal::new();
         // Oikea marker-nimi mutta väärä hyötykuorma (ei "memory"-avainta).
         journal
             .append(JournalEntry::marker(
@@ -173,7 +173,7 @@ mod tests {
     fn step_named_like_marker_is_not_a_contradiction() {
         // Workflow-askel jonka nimi sattuu olemaan CONTRADICT_STEP EI ole
         // ristiriitamerkintä — vain `EntryKind::Marker` lasketaan.
-        let mut journal = InMemoryJournal::new();
+        let journal = InMemoryJournal::new();
         journal
             .append(JournalEntry::completed(
                 StepId::ZERO,

@@ -66,6 +66,12 @@ pub struct RetrievalContext {
     /// Sisällytetäänkö arkistoidut muistot (vaimennettuna). Oletus `true`.
     #[serde(default = "default_true")]
     pub include_archived: bool,
+
+    /// Semanttisen haun paino (`0.0..=1.0`).
+    /// 0 = pelkkä avainsanaosuma (oletus, taaksepäin yhteensopiva),
+    /// 1 = pelkkä semanttinen samankaltaisuus (bigram Dice).
+    #[serde(default)]
+    pub semantic_weight: f32,
 }
 
 /// serde-oletus `true`-kentille.
@@ -88,6 +94,7 @@ impl RetrievalContext {
             limit: Self::DEFAULT_LIMIT,
             min_relevance: 0.0,
             include_archived: true,
+            semantic_weight: 0.0,
         }
     }
 
@@ -127,6 +134,14 @@ impl RetrievalContext {
     #[must_use]
     pub fn including_archived(mut self, include: bool) -> Self {
         self.include_archived = include;
+        self
+    }
+
+    /// Asettaa semanttisen haun painon (`0.0..=1.0`, puristetaan).
+    /// 0 = pelkkä avainsana (oletus), 1 = pelkkä bigram-semantiikka.
+    #[must_use]
+    pub fn with_semantic_weight(mut self, weight: f32) -> Self {
+        self.semantic_weight = weight.clamp(0.0, 1.0);
         self
     }
 
@@ -178,10 +193,13 @@ pub fn score(memory: &Memory, ctx: &RetrievalContext, at: Timestamp) -> Option<f
     }
 
     let keyword = keyword_score(&ctx.query, memory);
+    let semantic = semantic_score(&ctx.query, memory);
+    // Yhdistetty tekstiosuma: keyword × (1-w) + semantic × w
+    let text_score = keyword.mul_add(1.0 - ctx.semantic_weight, semantic * ctx.semantic_weight);
     let emotion = emotion_score(&ctx.emotions, &memory.emotions);
     let importance = memory.importance.clamp(0.0, 1.0);
 
-    let base = keyword.mul_add(
+    let base = text_score.mul_add(
         W_KEYWORD,
         emotion.mul_add(W_EMOTION, importance * W_IMPORTANCE),
     );
@@ -260,6 +278,63 @@ where
     I: IntoIterator<Item = &'a Memory>,
 {
     retrieve(memories, ctx, time::now())
+}
+
+/// Semanttinen samankaltaisuus: osittaisosuma unigrammeilla.
+///
+/// Laskee kuinka moni kyselyn sana esiintyy *osittain* muiston
+/// sanoissa (substring-match). Tämä tavoittaa "ship" ↔ "shipped",
+/// "bridge" ↔ "bridges" jne.
+///
+/// Suodatetaan pois yleiset englannin täytesanat (≤ 2 merkkiä
+/// tai stoplistalla). Normalisoidaan kyselyn sanojen määrällä.
+///
+/// Tyhjä kysely tai sisältö → 0.0.
+fn semantic_score(query: &str, memory: &Memory) -> f32 {
+    let query_words: Vec<String> = meaningful_words(query);
+    let content_lower = memory.content.to_lowercase();
+    let tags_lower: Vec<String> = memory.tags.iter().map(|t| t.to_lowercase()).collect();
+
+    if query_words.is_empty() {
+        return 0.0;
+    }
+
+    let mut hits = 0_usize;
+    for qw in &query_words {
+        let in_content = content_lower.contains(qw.as_str());
+        let in_tags = tags_lower.iter().any(|t| t.contains(qw.as_str()));
+        if in_content || in_tags {
+            hits += 1;
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = hits as f32 / query_words.len() as f32;
+    ratio
+}
+
+/// Poimii merkitykselliset sanat: lowercase, suodattaa lyhyet ja stop-sanat.
+fn meaningful_words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            w.chars().count() > 2 && !is_stopword(&lower)
+        })
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+/// Yleiset englannin stop-sanat jotka eivät kanna semanttista merkitystä.
+fn is_stopword(word: &str) -> bool {
+    matches!(
+        word,
+        "the" | "and" | "for" | "are" | "but" | "not"
+            | "you" | "all" | "can" | "had" | "her" | "was"
+            | "one" | "our" | "out" | "has" | "have" | "did"
+            | "get" | "got" | "its" | "let" | "may" | "nor"
+            | "off" | "old" | "per" | "put" | "set" | "she"
+            | "too" | "use" | "who" | "how" | "any" | "yet"
+    )
 }
 
 /// Avainsanaosuma: osuneiden kyselysanojen suhde kaikkiin kyselysanoihin.

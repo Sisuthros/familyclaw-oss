@@ -2,7 +2,7 @@
 name = "familyclaw-core"
 description = "Core types, config, error handling (no unwrap)"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

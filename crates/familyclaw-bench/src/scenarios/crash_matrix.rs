@@ -220,9 +220,7 @@ impl Scenario for CrashMatrix {
                         side_effect_overcount: 0,
                         matches_baseline: baseline.resumed_clean,
                     };
-                    let note = format!(
-                        "{point:?}: loud refusal (correct) → {err}"
-                    );
+                    let note = format!("{point:?}: loud refusal (correct) → {err}");
                     (assessment, note)
                 }
             };
@@ -257,17 +255,13 @@ impl Scenario for CrashMatrix {
         let matches_metric = if all_match_baseline { 1.0 } else { 0.0 };
 
         // passed = kaikki kolme täydellisiä.
-        let passed = (resume_score - 1.0).abs() < f64::EPSILON
-            && total_overcount == 0
-            && all_match_baseline;
+        let passed =
+            (resume_score - 1.0).abs() < f64::EPSILON && total_overcount == 0 && all_match_baseline;
 
-        let result = ScenarioResult {
-            passed,
-            ..result
-        }
-        .with_metric("resume_correctness", resume_score)
-        .with_metric("side_effect_overcount", overcount_metric)
-        .with_metric("result_matches_baseline", matches_metric);
+        let result = ScenarioResult { passed, ..result }
+            .with_metric("resume_correctness", resume_score)
+            .with_metric("side_effect_overcount", overcount_metric)
+            .with_metric("result_matches_baseline", matches_metric);
 
         Ok(result)
     }

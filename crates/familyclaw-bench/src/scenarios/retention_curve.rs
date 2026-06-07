@@ -91,9 +91,15 @@ enum Class {
 fn seed_plan() -> Vec<(&'static str, Class)> {
     vec![
         ("I am agent_alpha, part of this team", Class::Anchor),
-        ("My team: agent_alpha, agent_beta, agent_gamma, agent_delta", Class::Anchor),
+        (
+            "My team: agent_alpha, agent_beta, agent_gamma, agent_delta",
+            Class::Anchor,
+        ),
         ("The project shipped its first release", Class::Important),
-        ("We agreed durable replay is the spearhead", Class::Important),
+        (
+            "We agreed durable replay is the spearhead",
+            Class::Important,
+        ),
         ("The weather was cloudy this afternoon", Class::Trivia),
         ("Someone mentioned a coffee break at noon", Class::Trivia),
         ("A passing comment about the bus schedule", Class::Trivia),
@@ -242,8 +248,14 @@ impl Scenario for RetentionCurve {
             let trivia_recall = recall_at_k(trivia_total, trivia_live)?;
 
             result = result
-                .with_metric(format!("recall_at_{RECALL_K}_anchors_day{days}"), anchor_recall)
-                .with_metric(format!("recall_at_{RECALL_K}_trivia_day{days}"), trivia_recall);
+                .with_metric(
+                    format!("recall_at_{RECALL_K}_anchors_day{days}"),
+                    anchor_recall,
+                )
+                .with_metric(
+                    format!("recall_at_{RECALL_K}_trivia_day{days}"),
+                    trivia_recall,
+                );
 
             // Ankkureiden keskimääräinen retentio (pitäisi olla tasan 1.0).
             let anchor_retention = mean_retention(&store, &seeds, Class::Anchor, at).await?;

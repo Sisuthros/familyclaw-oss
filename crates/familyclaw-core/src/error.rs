@@ -49,6 +49,10 @@ pub enum FamilyClawError {
     /// LLM-pyyntö epäonnistui (verkko- tai API-virhe).
     #[error("llm error: {0}")]
     Llm(String),
+
+    /// Sandbox-suoritus epäonnistui (WASM, fuel, capability).
+    #[error("sandbox error: {0}")]
+    Sandbox(String),
 }
 
 impl FamilyClawError {
@@ -81,6 +85,11 @@ impl FamilyClawError {
     /// Rakentaa [`FamilyClawError::Llm`]-variantin.
     pub fn llm(msg: impl Into<String>) -> Self {
         Self::Llm(msg.into())
+    }
+
+    /// Rakentaa [`FamilyClawError::Sandbox`]-variantin.
+    pub fn sandbox(msg: impl Into<String>) -> Self {
+        Self::Sandbox(msg.into())
     }
 }
 
@@ -153,5 +162,12 @@ mod tests {
     fn error_is_send_sync_static() {
         fn assert_send_sync<T: Send + Sync + 'static>() {}
         assert_send_sync::<FamilyClawError>();
+    }
+
+    #[test]
+    fn sandbox_constructor_sets_variant_and_message() {
+        let err = FamilyClawError::sandbox("no wasmtime");
+        assert!(matches!(err, FamilyClawError::Sandbox(_)));
+        assert_eq!(err.to_string(), "sandbox error: no wasmtime");
     }
 }

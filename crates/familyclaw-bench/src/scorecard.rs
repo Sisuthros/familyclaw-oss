@@ -30,7 +30,11 @@ impl Scorecard {
     /// tuloste on tavu-tavulta deterministinen riippumatta siitä missä
     /// järjestyksessä harness ajoi skenaariot (design §2.2, §6).
     #[must_use]
-    pub fn new(subject: impl Into<String>, scenarios: Vec<ScenarioResult>, clock: Timestamp) -> Self {
+    pub fn new(
+        subject: impl Into<String>,
+        scenarios: Vec<ScenarioResult>,
+        clock: Timestamp,
+    ) -> Self {
         let mut scenarios = scenarios;
         scenarios.sort_by(|a, b| a.id.cmp(&b.id));
         Self {
@@ -67,7 +71,11 @@ impl Scorecard {
         out.push_str("# FamilyClaw Continuity Scorecard\n\n");
         // `write!` Stringiin ei voi epäonnistua, joten tulos ohitetaan turvallisesti.
         let _ = writeln!(out, "- **Subject:** {}", self.subject);
-        let _ = writeln!(out, "- **Reference clock:** {}", time::to_rfc3339(self.clock));
+        let _ = writeln!(
+            out,
+            "- **Reference clock:** {}",
+            time::to_rfc3339(self.clock)
+        );
         let _ = writeln!(
             out,
             "- **Overall:** {}\n",

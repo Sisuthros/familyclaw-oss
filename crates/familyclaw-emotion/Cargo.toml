@@ -2,7 +2,7 @@
 name = "familyclaw-emotion"
 description = "19-dim VAD emotion engine CORE (empty calibration)"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

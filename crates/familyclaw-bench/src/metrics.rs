@@ -74,10 +74,8 @@ pub fn dedup_precision(true_merges: usize, false_merges: usize) -> Result<f64> {
     if total == 0 {
         return Ok(1.0);
     }
-    Ok(
-        f64::from(u32::try_from(true_merges).unwrap_or(u32::MAX))
-            / f64::from(u32::try_from(total).unwrap_or(u32::MAX)),
-    )
+    Ok(f64::from(u32::try_from(true_merges).unwrap_or(u32::MAX))
+        / f64::from(u32::try_from(total).unwrap_or(u32::MAX)))
 }
 
 /// Suojatun ytimen eheys: `1.0` jos yksikään identiteetti-ankkuri ei kadonnut

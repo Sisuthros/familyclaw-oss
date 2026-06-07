@@ -58,9 +58,7 @@ mod tests {
 
     use super::*;
     use crate::scenario::ScenarioResult;
-    use crate::subject::{
-        CrashPoint, DreamSummary, RecallHit, RestartReport, RunHandle, Task,
-    };
+    use crate::subject::{CrashPoint, DreamSummary, RecallHit, RestartReport, RunHandle, Task};
 
     struct StubSubject;
 

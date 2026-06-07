@@ -2,7 +2,7 @@
 name = "familyclaw-bench"
 description = "Continuity benchmark harness — reproducible proof of crash-resume, retention and dreaming"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -17,6 +17,9 @@ familyclaw-durable = { workspace = true }
 familyclaw-memory = { workspace = true }
 familyclaw-dream = { workspace = true }
 familyclaw-agent = { workspace = true }
+familyclaw-bus = { workspace = true }
+familyclaw-emotion = { workspace = true }
+familyclaw-hearth = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

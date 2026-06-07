@@ -22,10 +22,15 @@
 //! tyngän pois avattaessa: tynkä on aina keskeneräinen (fsyncattamaton) kirjoitus
 //! joka ei koskaan valmistunut, joten sen hylkääminen on turvallista JA
 //! välttämätöntä, jotta append jatkuu puhtaalta rivirajalta.
+//!
+//! ## Object Safety
+//! Metodit ottavat `&self` jotta trait on `dyn`-yhteensopiva. File-kahva on
+//! `Mutex<File>`-suojassa.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::entry::{JournalEntry, StepId};
 use crate::error::{DurableError, Result};
@@ -35,11 +40,12 @@ use crate::journal::Journal;
 ///
 /// Pitää avoimen tiedostokahvan kirjoitusta varten ja muistaa polun lukua
 /// varten. Avaaminen luo tiedoston jos sitä ei ole; olemassa olevaan
-/// tiedostoon jatketaan (append-tila).
+/// tiedostoon jatketaan (append-tila). File-kahva on Mutex-suojassa jotta
+/// trait on `dyn`-yhteensopiva (`&self` metodit).
 #[derive(Debug)]
 pub struct FileJournal {
     path: PathBuf,
-    file: File,
+    file: Mutex<File>,
 }
 
 impl FileJournal {
@@ -61,7 +67,10 @@ impl FileJournal {
             .read(true)
             .append(true)
             .open(&path)?;
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file: Mutex::new(file),
+        })
     }
 
     /// Palauttaa journalin tiedostopolun.
@@ -73,6 +82,8 @@ impl FileJournal {
     /// Lukee ja jäsentää kaikki rivit, sietäen vajaan viimeisen rivin
     /// (kaatumisen jälki). Palautuvat rivit ovat tiedostojärjestyksessä.
     fn read_all_entries(&self) -> Result<Vec<JournalEntry>> {
+        let _file = self.file.lock().unwrap();
+        // Create a new file handle for reading since we can't hold the lock
         let file = File::open(&self.path)?;
         let reader = BufReader::new(file);
 
@@ -219,15 +230,16 @@ fn last_byte_of(path: &Path) -> Result<Option<u8>> {
 }
 
 impl Journal for FileJournal {
-    fn append(&mut self, entry: JournalEntry) -> Result<()> {
+    fn append(&self, entry: JournalEntry) -> Result<()> {
         // Sarjallista ensin: jos serde epäonnistuu, levyä ei kosketa.
         let mut line = serde_json::to_string(&entry)?;
         line.push('\n');
-        self.file.write_all(line.as_bytes())?;
-        self.file.flush()?;
+        let mut file = self.file.lock().unwrap();
+        file.write_all(line.as_bytes())?;
+        file.flush()?;
         // fsync: takaa että rivi on fyysisesti levyllä ennen paluuta — tämä on
         // koko kaatumiskestävyyden ydin.
-        self.file.sync_all()?;
+        file.sync_all()?;
         Ok(())
     }
 
@@ -279,7 +291,7 @@ mod tests {
     #[test]
     fn open_create_append_replay_roundtrip() {
         let tmp = TempPath::new("roundtrip");
-        let mut j = FileJournal::open(tmp.path()).expect("open");
+        let j = FileJournal::open(tmp.path()).expect("open");
         assert!(j.is_empty().expect("empty"));
 
         j.append(JournalEntry::completed(StepId::ZERO, "a", json!(1)))
@@ -297,7 +309,7 @@ mod tests {
     fn reopen_persists_entries() {
         let tmp = TempPath::new("persist");
         {
-            let mut j = FileJournal::open(tmp.path()).expect("open 1");
+            let j = FileJournal::open(tmp.path()).expect("open 1");
             j.append(JournalEntry::completed(StepId::ZERO, "a", json!(1)))
                 .expect("append");
         }
@@ -312,11 +324,11 @@ mod tests {
     fn append_continues_existing_file() {
         let tmp = TempPath::new("continue");
         {
-            let mut j = FileJournal::open(tmp.path()).expect("open 1");
+            let j = FileJournal::open(tmp.path()).expect("open 1");
             j.append(JournalEntry::completed(StepId::ZERO, "a", json!(1)))
                 .expect("append");
         }
-        let mut j2 = FileJournal::open(tmp.path()).expect("open 2");
+        let j2 = FileJournal::open(tmp.path()).expect("open 2");
         j2.append(JournalEntry::completed(StepId::new(1), "b", json!(2)))
             .expect("append");
         assert_eq!(j2.replay_all().expect("replay").len(), 2);
@@ -325,7 +337,7 @@ mod tests {
     #[test]
     fn replay_from_filters() {
         let tmp = TempPath::new("from");
-        let mut j = FileJournal::open(tmp.path()).expect("open");
+        let j = FileJournal::open(tmp.path()).expect("open");
         for i in 0..3 {
             j.append(JournalEntry::completed(StepId::new(i), "s", json!(i)))
                 .expect("append");
@@ -339,7 +351,7 @@ mod tests {
     fn tolerates_truncated_last_line_after_crash() {
         let tmp = TempPath::new("truncated");
         {
-            let mut j = FileJournal::open(tmp.path()).expect("open");
+            let j = FileJournal::open(tmp.path()).expect("open");
             j.append(JournalEntry::completed(StepId::ZERO, "a", json!(1)))
                 .expect("append");
         }
@@ -401,7 +413,7 @@ mod tests {
         let tmp = TempPath::new("heal-torn");
         // Vaihe 1: kaksi ehjää askelta levylle.
         {
-            let mut j = FileJournal::open(tmp.path()).expect("open 1");
+            let j = FileJournal::open(tmp.path()).expect("open 1");
             j.append(JournalEntry::completed(StepId::ZERO, "a", json!(1)))
                 .expect("append a");
             j.append(JournalEntry::completed(StepId::new(1), "b", json!(2)))
@@ -420,7 +432,7 @@ mod tests {
 
         // Vaihe 3: open EHEYTTÄÄ tyngän (typistys), sitten append step c.
         {
-            let mut j = FileJournal::open(tmp.path()).expect("open 2 heals");
+            let j = FileJournal::open(tmp.path()).expect("open 2 heals");
             // Heti avauksen jälkeen tiedosto päättyy ehjään riviin (\n).
             let after_open = std::fs::read_to_string(tmp.path()).expect("read");
             assert!(
@@ -469,7 +481,7 @@ mod tests {
             raw.flush().expect("flush");
         }
         // open: rivi on ehjä → säilytetään, vain `\n` lisätään.
-        let mut j = FileJournal::open(tmp.path()).expect("open heals newline");
+        let j = FileJournal::open(tmp.path()).expect("open heals newline");
         assert_eq!(j.replay_all().expect("replay").len(), 1, "ehjä rivi säilyy");
         // Append jatkuu puhtaasti.
         j.append(JournalEntry::completed(StepId::new(1), "b", json!(2)))

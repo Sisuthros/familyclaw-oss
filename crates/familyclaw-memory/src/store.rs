@@ -18,7 +18,9 @@
 //! monisäikeisessä tokio-ajossa.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
 use familyclaw_core::{FamilyClawError, MessageId, Result, Timestamp};
@@ -82,76 +84,64 @@ fn clamp_unit(x: f32, fallback: f32) -> f32 {
     }
 }
 
+/// Type-erased future for dyn-compatible trait.
+/// Lifetime `'a` captures the borrow of `&self` so returned futures can reference `self`.
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 /// Muistin tallennusabstraktio.
 ///
 /// Toteutukset vastaavat persistoinnista ja samanaikaisuudesta. Kaikki
 /// metodit ovat asynkronisia, jotta tietokantapohjaiset backendit
 /// (`Surreal<Any>`) mahtuvat samaan rajapintaan.
-pub trait MemoryStore {
+pub trait MemoryStore: Send + Sync {
     /// Lisää muiston tallennukseen ja palauttaa sen tunnisteen.
     ///
     /// # Errors
     /// [`FamilyClawError::Memory`] jos tallennus epäonnistuu.
-    fn add(&self, memory: Memory) -> impl std::future::Future<Output = Result<MessageId>> + Send;
+    fn add(&self, memory: Memory) -> BoxFuture<'_, Result<MessageId>>;
 
     /// Hakee muiston tunnisteella, tai `None` jos ei löydy.
     ///
     /// # Errors
     /// [`FamilyClawError::Memory`] jos haku epäonnistuu.
-    fn get(
-        &self,
-        id: MessageId,
-    ) -> impl std::future::Future<Output = Result<Option<Memory>>> + Send;
+    fn get(&self, id: MessageId) -> BoxFuture<'_, Result<Option<Memory>>>;
 
     /// Korvaa olemassa olevan muiston (sama `id`).
     ///
     /// # Errors
     /// [`FamilyClawError::NotFound`] jos tunnistetta ei ole, tai
     /// [`FamilyClawError::Memory`] tallennusvirheestä.
-    fn update(&self, memory: Memory) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn update(&self, memory: Memory) -> BoxFuture<'_, Result<()>>;
 
     /// Vahvistaa muiston (nostaa retention + tärkeyttä) hetkeen `at`.
     ///
     /// # Errors
     /// [`FamilyClawError::NotFound`] jos tunnistetta ei ole.
-    fn reinforce(
-        &self,
-        id: MessageId,
-        at: Timestamp,
-    ) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn reinforce(&self, id: MessageId, at: Timestamp) -> BoxFuture<'_, Result<()>>;
 
     /// Asettaa muiston elinkaaritilan suoraan.
     ///
     /// # Errors
     /// [`FamilyClawError::NotFound`] jos tunnistetta ei ole.
-    fn set_status(
-        &self,
-        id: MessageId,
-        status: MemoryStatus,
-    ) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn set_status(&self, id: MessageId, status: MemoryStatus) -> BoxFuture<'_, Result<()>>;
 
     /// Palauttaa kaikki muistot (myös arkistoidut/haudatut).
     ///
     /// # Errors
     /// [`FamilyClawError::Memory`] jos luku epäonnistuu.
-    fn all(&self) -> impl std::future::Future<Output = Result<Vec<Memory>>> + Send;
+    fn all(&self) -> BoxFuture<'_, Result<Vec<Memory>>>;
 
     /// Muistojen kokonaismäärä.
     ///
     /// # Errors
     /// [`FamilyClawError::Memory`] jos luku epäonnistuu.
-    fn len(&self) -> impl std::future::Future<Output = Result<usize>> + Send;
+    fn len(&self) -> BoxFuture<'_, Result<usize>>;
 
     /// Onko tallennus tyhjä.
     ///
     /// # Errors
     /// [`FamilyClawError::Memory`] jos luku epäonnistuu.
-    fn is_empty(&self) -> impl std::future::Future<Output = Result<bool>> + Send
-    where
-        Self: Sync,
-    {
-        async { Ok(self.len().await? == 0) }
-    }
+    fn is_empty(&self) -> BoxFuture<'_, Result<bool>>;
 
     /// Suorittaa haun annetulla kontekstilla ajanhetkellä `at`.
     ///
@@ -161,7 +151,7 @@ pub trait MemoryStore {
         &self,
         ctx: &RetrievalContext,
         at: Timestamp,
-    ) -> impl std::future::Future<Output = Result<Vec<RetrievalResult>>> + Send;
+    ) -> BoxFuture<'_, Result<Vec<RetrievalResult>>>;
 
     /// Ajaa vaimennus-läpikäynnin hetkeen `at`: siirtää alle kynnyksen
     /// pudonneet muistot arkistoon ja haudattaviksi. Suojattua ydintä ei
@@ -173,7 +163,7 @@ pub trait MemoryStore {
         &self,
         thresholds: DecayThresholds,
         at: Timestamp,
-    ) -> impl std::future::Future<Output = Result<DecayReport>> + Send;
+    ) -> BoxFuture<'_, Result<DecayReport>>;
 }
 
 /// JSON-tiedostoon persistoiva muistitallennus.
@@ -431,127 +421,167 @@ impl Drop for FileLock {
 }
 
 impl MemoryStore for LocalJsonStore {
-    async fn add(&self, memory: Memory) -> Result<MessageId> {
+    fn add(&self, memory: Memory) -> BoxFuture<'_, Result<MessageId>> {
         let id = memory.id;
         // Koko read-modify-write ajetaan prosessien-välisen lukon alla:
         // levyltä ladataan tuorein tila ENNEN insertointia, joten toisen
         // kahvan samanaikainen kirjoitus ei häviä (concurrent-writers-fix).
-        self.with_write_lock(move |map| {
-            // Idempotentti kirjaus: jos samalla turn_key:llä on jo muisto
-            // (ladatussa tuoreessa tilassa), ohita (dual-write-suoja:
-            // durable.step voi onnistua vaikka memory_store.add ei ehdi
-            // ennen kaatumista).
-            if let Some(ref key) = memory.turn_key {
-                let exists = map.values().any(|m| m.turn_key.as_ref() == Some(key));
-                if exists {
-                    return Ok(id);
+        let this = self;
+        Box::pin(async move {
+            this.with_write_lock(move |map| {
+                // Idempotentti kirjaus: jos samalla turn_key:llä on jo muisto
+                // (ladatussa tuoreessa tilassa), ohita (dual-write-suoja:
+                // durable.step voi onnistua vaikka memory_store.add ei ehdi
+                // ennen kaatumista).
+                if let Some(ref key) = memory.turn_key {
+                    let exists = map.values().any(|m| m.turn_key.as_ref() == Some(key));
+                    if exists {
+                        return Ok(id);
+                    }
                 }
-            }
-            map.insert(id, memory);
+                map.insert(id, memory);
 
-            // ── verification-gated: write-verify ────────────────────────────
-            // Varmista että muisto on varmasti kartassa. LocalJsonStoressa
-            // tämä on defensiivinen tarkistus (HashMap.insert epäonnistuu
-            // vain muistin loppuessa); SurrealDB-toteutuksessa kriittinen.
-            if !map.contains_key(&id) {
-                return Err(FamilyClawError::Memory(
-                    "write-verify failed: memory not found after insert".into(),
-                ));
-            }
-            Ok(id)
+                // ── verification-gated: write-verify ────────────────────────────
+                // Varmista että muisto on varmasti kartassa. LocalJsonStoressa
+                // tämä on defensiivinen tarkistus (HashMap.insert epäonnistuu
+                // vain muistin loppuessa); SurrealDB-toteutuksessa kriittinen.
+                if !map.contains_key(&id) {
+                    return Err(FamilyClawError::Memory(
+                        "write-verify failed: memory not found after insert".into(),
+                    ));
+                }
+                Ok(id)
+            })
+            .await
         })
-        .await
     }
 
-    async fn get(&self, id: MessageId) -> Result<Option<Memory>> {
-        let guard = self.memories.read().await;
-        Ok(guard.get(&id).cloned())
-    }
-
-    async fn update(&self, memory: Memory) -> Result<()> {
-        self.with_write_lock(move |map| {
-            if !map.contains_key(&memory.id) {
-                return Err(FamilyClawError::not_found(format!(
-                    "memory {} not found",
-                    memory.id
-                )));
-            }
-            map.insert(memory.id, memory);
-            Ok(())
+    fn get(&self, id: MessageId) -> BoxFuture<'_, Result<Option<Memory>>> {
+        let this = self;
+        Box::pin(async move {
+            let guard = this.memories.read().await;
+            Ok(guard.get(&id).cloned())
         })
-        .await
     }
 
-    async fn reinforce(&self, id: MessageId, at: Timestamp) -> Result<()> {
-        self.with_write_lock(move |map| {
-            let memory = map
-                .get_mut(&id)
-                .ok_or_else(|| FamilyClawError::not_found(format!("memory {id} not found")))?;
-            memory.reinforce(at);
-            Ok(())
+    fn update(&self, memory: Memory) -> BoxFuture<'_, Result<()>> {
+        let this = self;
+        Box::pin(async move {
+            this.with_write_lock(move |map| {
+                if !map.contains_key(&memory.id) {
+                    return Err(FamilyClawError::not_found(format!(
+                        "memory {} not found",
+                        memory.id
+                    )));
+                }
+                map.insert(memory.id, memory);
+                Ok(())
+            })
+            .await
         })
-        .await
     }
 
-    async fn set_status(&self, id: MessageId, status: MemoryStatus) -> Result<()> {
-        self.with_write_lock(move |map| {
-            let memory = map
-                .get_mut(&id)
-                .ok_or_else(|| FamilyClawError::not_found(format!("memory {id} not found")))?;
-            memory.status = status;
-            Ok(())
+    fn reinforce(&self, id: MessageId, at: Timestamp) -> BoxFuture<'_, Result<()>> {
+        let this = self;
+        Box::pin(async move {
+            this.with_write_lock(move |map| {
+                let memory = map
+                    .get_mut(&id)
+                    .ok_or_else(|| FamilyClawError::not_found(format!("memory {id} not found")))?;
+                memory.reinforce(at);
+                Ok(())
+            })
+            .await
         })
-        .await
     }
 
-    async fn all(&self) -> Result<Vec<Memory>> {
-        let guard = self.memories.read().await;
-        Ok(guard.values().cloned().collect())
+    fn set_status(&self, id: MessageId, status: MemoryStatus) -> BoxFuture<'_, Result<()>> {
+        let this = self;
+        Box::pin(async move {
+            this.with_write_lock(move |map| {
+                let memory = map
+                    .get_mut(&id)
+                    .ok_or_else(|| FamilyClawError::not_found(format!("memory {id} not found")))?;
+                memory.status = status;
+                Ok(())
+            })
+            .await
+        })
     }
 
-    async fn len(&self) -> Result<usize> {
-        let guard = self.memories.read().await;
-        Ok(guard.len())
+    fn all(&self) -> BoxFuture<'_, Result<Vec<Memory>>> {
+        let this = self;
+        Box::pin(async move {
+            let guard = this.memories.read().await;
+            Ok(guard.values().cloned().collect())
+        })
     }
 
-    async fn retrieve(
+    fn len(&self) -> BoxFuture<'_, Result<usize>> {
+        let this = self;
+        Box::pin(async move {
+            let guard = this.memories.read().await;
+            Ok(guard.len())
+        })
+    }
+
+    fn is_empty(&self) -> BoxFuture<'_, Result<bool>> {
+        let this = self;
+        Box::pin(async move {
+            let guard = this.memories.read().await;
+            Ok(guard.is_empty())
+        })
+    }
+
+    fn retrieve(
         &self,
         ctx: &RetrievalContext,
         at: Timestamp,
-    ) -> Result<Vec<RetrievalResult>> {
-        let guard = self.memories.read().await;
-        Ok(retrieve(guard.values(), ctx, at))
+    ) -> BoxFuture<'_, Result<Vec<RetrievalResult>>> {
+        let this = self;
+        let ctx = ctx.clone();
+        Box::pin(async move {
+            let guard = this.memories.read().await;
+            Ok(retrieve(guard.values(), &ctx, at))
+        })
     }
 
-    async fn run_decay(&self, thresholds: DecayThresholds, at: Timestamp) -> Result<DecayReport> {
-        self.with_write_lock(move |map| {
-            let mut report = DecayReport::default();
-            for memory in map.values_mut() {
-                report.scanned += 1;
-                // Suojattu ydin ohitetaan kokonaan.
-                if memory.decay_policy.is_protected() {
-                    continue;
-                }
-                let retention = memory.retention(at);
-                match memory.status {
-                    MemoryStatus::Active => {
-                        if retention < thresholds.archive_below {
-                            memory.status = MemoryStatus::Archived;
-                            report.archived += 1;
-                        }
+    fn run_decay(
+        &self,
+        thresholds: DecayThresholds,
+        at: Timestamp,
+    ) -> BoxFuture<'_, Result<DecayReport>> {
+        let this = self;
+        Box::pin(async move {
+            this.with_write_lock(move |map| {
+                let mut report = DecayReport::default();
+                for memory in map.values_mut() {
+                    report.scanned += 1;
+                    // Suojattu ydin ohitetaan kokonaan.
+                    if memory.decay_policy.is_protected() {
+                        continue;
                     }
-                    MemoryStatus::Archived => {
-                        if retention < thresholds.tombstone_below {
-                            memory.status = MemoryStatus::Tombstoned;
-                            report.tombstoned += 1;
+                    let retention = memory.retention(at);
+                    match memory.status {
+                        MemoryStatus::Active => {
+                            if retention < thresholds.archive_below {
+                                memory.status = MemoryStatus::Archived;
+                                report.archived += 1;
+                            }
                         }
+                        MemoryStatus::Archived => {
+                            if retention < thresholds.tombstone_below {
+                                memory.status = MemoryStatus::Tombstoned;
+                                report.tombstoned += 1;
+                            }
+                        }
+                        MemoryStatus::Tombstoned => {}
                     }
-                    MemoryStatus::Tombstoned => {}
                 }
-            }
-            Ok(report)
+                Ok(report)
+            })
+            .await
         })
-        .await
     }
 }
 
@@ -856,7 +886,10 @@ mod tests {
             let m = Memory::builder(format!("event {i}"))
                 .factors(ImportanceFactors::new(0.5, 0.0, 0.0, 0.0))
                 .build();
-            store.add(m).await.expect("add must not block on stale lock");
+            store
+                .add(m)
+                .await
+                .expect("add must not block on stale lock");
         }
         assert_eq!(store.len().await.expect("len"), 5);
         // Lukkotiedostoa ei saa jäädä roikkumaan onnistuneen sarjan jälkeen.

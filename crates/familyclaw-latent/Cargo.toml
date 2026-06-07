@@ -2,7 +2,7 @@
 name = "familyclaw-latent"
 description = "Latent telepathy — hidden-state transfer + RecursiveLink + text fallback"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

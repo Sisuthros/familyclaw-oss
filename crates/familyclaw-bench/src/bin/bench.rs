@@ -1,8 +1,9 @@
 //! `bench` — FamilyClaw-jatkuvuusbenchmarkin CLI.
 //!
 //! Ajaa yhden skenaarion tai kaikki ja kirjoittaa scorecardin (design §4, §6).
-//! `bench all` rakentaa [`FamilyClawSubject`]:n, ajaa kolme skenaariota
-//! ([`CrashMatrix`], [`RetentionCurve`], [`DreamQuality`]) kiinteällä
+//! `bench all` rakentaa [`FamilyClawSubject`]:n, ajaa neljä skenaariota
+//! ([`CrashMatrix`], [`RetentionCurve`], [`DreamQuality`], [`EmotionalContagion`])
+//! kiinteällä
 //! **injektoidulla kellolla** ja kirjoittaa `SCORECARD.md` + `scorecard.json`
 //! hakemistoon `crates/familyclaw-bench/out/` (sekä kopion `docs/SCORECARD.md`).
 //!
@@ -18,10 +19,11 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
-use familyclaw_bench::scenarios::{CrashMatrix, DreamQuality, RetentionCurve};
-use familyclaw_bench::{
-    BenchError, FamilyClawSubject, Harness, Result, Scenario, Scorecard,
+use familyclaw_bench::scenarios::{
+    CrashMatrix, DreamQuality, EmotionalContagion, EternalThread, RetentionCurve,
+    SemanticRetrieval,
 };
+use familyclaw_bench::{BenchError, FamilyClawSubject, Harness, Result, Scenario, Scorecard};
 use familyclaw_core::time;
 
 /// Kiinteä injektoitu referenssikello (design §6: reprodusoitava byte-for-byte).
@@ -70,9 +72,7 @@ async fn main() -> Result<()> {
         "running continuity benchmark"
     );
 
-    let card = Harness::new()
-        .run(&mut subject, &scenarios, clock)
-        .await?;
+    let card = Harness::new().run(&mut subject, &scenarios, clock).await?;
 
     write_outputs(&card, &cli.scenario)?;
 
@@ -100,14 +100,20 @@ fn select_scenarios(id: &str) -> Result<Vec<Box<dyn Scenario>>> {
     let s1 = || -> Box<dyn Scenario> { Box::new(CrashMatrix::new()) };
     let s2 = || -> Box<dyn Scenario> { Box::new(RetentionCurve::new()) };
     let s3 = || -> Box<dyn Scenario> { Box::new(DreamQuality::new()) };
+    let s4 = || -> Box<dyn Scenario> { Box::new(EmotionalContagion::new()) };
+    let s5 = || -> Box<dyn Scenario> { Box::new(SemanticRetrieval::new()) };
+    let s6 = || -> Box<dyn Scenario> { Box::new(EternalThread::new()) };
 
     match id {
-        "all" => Ok(vec![s1(), s2(), s3()]),
+        "all" => Ok(vec![s1(), s2(), s3(), s4(), s5(), s6()]),
         "s1" | "s1_crash_matrix" => Ok(vec![s1()]),
         "s2" | "s2_retention_curve" => Ok(vec![s2()]),
         "s3" | "s3_dream_quality" => Ok(vec![s3()]),
+        "s4" | "s4_emotional_contagion" => Ok(vec![s4()]),
+        "s5" | "s5_semantic_retrieval" => Ok(vec![s5()]),
+        "s6" | "s6_eternal_thread" => Ok(vec![s6()]),
         other => Err(BenchError::scenario(format!(
-            "unknown scenario '{other}' (expected: all, s1, s2, s3)"
+            "unknown scenario '{other}' (expected: all, s1, s2, s3, s4, s5, s6)"
         ))),
     }
 }

@@ -1,21 +1,32 @@
 //! [`InMemoryJournal`] — kestämätön journal-toteutus testaukseen ja
 //! kehitykseen.
 //!
-//! Pitää rivit `Vec`-vektorissa. Ei kestä prosessin uudelleenkäynnistystä —
+//! Pitää rivit `Vec`-vektorissa suojattuna `Arc<Mutex<...>>`-alla jotta
+//! trait on `dyn`-yhteensopiva. Ei kestä prosessin uudelleenkäynnistystä —
 //! kaatumiskestävyyteen käytä [`crate::FileJournal`]:ia. Tämä on silti hyödyllinen
 //! yksikkötesteissä ja deterministisen replayn varmentamisessa ilman levyä.
 
 use crate::entry::{JournalEntry, StepId};
 use crate::error::Result;
 use crate::journal::Journal;
+use std::sync::{Arc, Mutex};
 
 /// Muistinvarainen append-only journal.
 ///
 /// Säilyttää rivit lisäysjärjestyksessä. Klooni on syvä (täysi kopio rivistä),
 /// joten kloonatun journalin muokkaus ei vaikuta alkuperäiseen.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct InMemoryJournal {
-    entries: Vec<JournalEntry>,
+    entries: Arc<Mutex<Vec<JournalEntry>>>,
+}
+
+impl Clone for InMemoryJournal {
+    fn clone(&self) -> Self {
+        let entries = self.entries.lock().unwrap().clone();
+        Self {
+            entries: Arc::new(Mutex::new(entries)),
+        }
+    }
 }
 
 impl InMemoryJournal {
@@ -29,31 +40,35 @@ impl InMemoryJournal {
     /// ladatuista).
     #[must_use]
     pub fn from_entries(entries: Vec<JournalEntry>) -> Self {
-        Self { entries }
+        Self {
+            entries: Arc::new(Mutex::new(entries)),
+        }
     }
 
     /// Palauttaa viittauksen kaikkiin riveihin ilman kloonausta.
     #[must_use]
-    pub fn entries(&self) -> &[JournalEntry] {
-        &self.entries
+    pub fn entries(&self) -> Vec<JournalEntry> {
+        self.entries.lock().unwrap().clone()
     }
 
     /// Kuluttaa journalin ja palauttaa rivit.
     #[must_use]
     pub fn into_entries(self) -> Vec<JournalEntry> {
-        self.entries
+        Arc::try_unwrap(self.entries).unwrap().into_inner().unwrap()
     }
 }
 
 impl Journal for InMemoryJournal {
-    fn append(&mut self, entry: JournalEntry) -> Result<()> {
-        self.entries.push(entry);
+    fn append(&self, entry: JournalEntry) -> Result<()> {
+        self.entries.lock().unwrap().push(entry);
         Ok(())
     }
 
     fn replay_from(&self, from: StepId) -> Result<Vec<JournalEntry>> {
         Ok(self
             .entries
+            .lock()
+            .unwrap()
             .iter()
             .filter(|e| e.step_id >= from)
             .cloned()
@@ -61,11 +76,11 @@ impl Journal for InMemoryJournal {
     }
 
     fn replay_all(&self) -> Result<Vec<JournalEntry>> {
-        Ok(self.entries.clone())
+        Ok(self.entries.lock().unwrap().clone())
     }
 
     fn len(&self) -> Result<usize> {
-        Ok(self.entries.len())
+        Ok(self.entries.lock().unwrap().len())
     }
 }
 
@@ -83,7 +98,7 @@ mod tests {
 
     #[test]
     fn append_then_replay_preserves_order() {
-        let mut j = InMemoryJournal::new();
+        let j = InMemoryJournal::new();
         for i in 0..4 {
             j.append(JournalEntry::completed(StepId::new(i), "s", json!(i)))
                 .expect("append");
@@ -107,7 +122,7 @@ mod tests {
 
     #[test]
     fn replay_from_filters_by_step_id() {
-        let mut j = InMemoryJournal::new();
+        let j = InMemoryJournal::new();
         j.append(JournalEntry::completed(StepId::new(0), "a", json!(0)))
             .expect("append");
         j.append(JournalEntry::completed(StepId::new(1), "b", json!(1)))
@@ -122,11 +137,11 @@ mod tests {
 
     #[test]
     fn clone_is_independent() {
-        let mut original = InMemoryJournal::new();
+        let original = InMemoryJournal::new();
         original
             .append(JournalEntry::completed(StepId::ZERO, "a", json!(1)))
             .expect("append");
-        let mut copy = original.clone();
+        let copy = original.clone();
         copy.append(JournalEntry::completed(StepId::new(1), "b", json!(2)))
             .expect("append");
         assert_eq!(original.len().expect("len"), 1);

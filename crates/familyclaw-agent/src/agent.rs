@@ -31,6 +31,13 @@ use tracing::{debug, warn};
 
 use crate::llm::{LlmClient, LlmConfig, LlmMessage};
 use crate::soul::Soul;
+use familyclaw_sandbox::{CodeSandbox, SandboxOutput, SandboxRequest};
+
+/// Type-erased memory store for trait-object-based agents.
+pub type ErasedMemoryStore = Arc<dyn MemoryStore + Send + Sync>;
+
+/// Type-erased journal for trait-object-based agents.
+pub type ErasedJournal = Box<dyn Journal + Send + Sync>;
 
 /// Yhden vuoron (turn) lopputulos, joka kirjataan durable-lokiin
 /// deterministisesti. Pidetään pienenä ja sarjallistuvana, jotta replay on
@@ -59,17 +66,13 @@ const HOMEOSTASIS_RATE: f32 = 0.10;
 /// Agentti — yksi olento, joka kokoaa konfiguraation, sielun, tunnetilan,
 /// muistin, kaatumiskestävän lokin ja bus-yhteyden.
 ///
-/// Geneerinen muistitallennuksen `S` ja journalin `J` yli, jotta sama
-/// runtime toimii niin in-memory-kehityksessä kuin levypersistoidussa
-/// tuotannossa.
+/// Käyttää trait-olioita (`Box<dyn ...>`) generiikkojen sijaan, jotta
+/// ulkopuoliset kehittäjät voivat rakentaa alustalle ilman monimutkaisia
+/// tyyppiparametreja. Tämä on Pappa:n vaadittu "Generics-Helvetin polttaminen".
 ///
 /// `Agent` ei ole itse actor — se on actorin *tila*. Käytä
 /// [`Agent::spawn`]-metodia liittääksesi sen busiin actorina.
-pub struct Agent<S, J>
-where
-    S: MemoryStore + Send + Sync + 'static,
-    J: Journal + Send + Sync + 'static,
-{
+pub struct Agent {
     /// Identiteetti + mallikonfiguraatio.
     config: AgentConfig,
     /// Olennon busissa käyttämä tunniste (johdettu `config.id`:stä).
@@ -80,36 +83,35 @@ where
     emotion: EmotionState,
     /// Muisti-substraatti (Eternal Thread). Jaettu, jotta useat haarat
     /// (actor + ulkoinen lukija) voivat käyttää samaa tallennusta.
-    memory: Arc<S>,
+    memory: ErasedMemoryStore,
     /// Kaatumiskestävä askelloki (deterministinen replay).
-    durable: DurableContext<J>,
+    durable: DurableContext<ErasedJournal>,
     /// Resonance Bus -kahva (julkaisuun ja kyselyihin).
     bus: BusHandle,
     /// Kuinka monta vuoroa on käsitelty (durable-askelten nimien sekvensointiin).
     turn_counter: u64,
     /// LLM-clienti ajatteluun (valinnainen, jotta testit toimivat ilman LLM:ää).
     llm: Option<LlmClient>,
+    /// Sandbox koodin suorittamiseen (valinnainen, `wasmtime`-featuren kanssa).
+    sandbox: Option<Arc<dyn CodeSandbox>>,
 }
 
-impl<S, J> Agent<S, J>
-where
-    S: MemoryStore + Send + Sync + 'static,
-    J: Journal + Send + Sync + 'static,
-{
+impl Agent {
     /// Rakentaa agentin valmiista osista.
     ///
     /// Tunnetila alkaa neutraalina. `being_id` johdetaan konfiguraation
     /// agenttitunnisteesta, jotta busin ja muistin identiteetit täsmäävät.
     /// LLM-clienti on valinnainen - jos annettu, agentti voi käyttää LLM:ää
-    /// ajattelua varten (think-metodi).
+    /// ajattelua varten (think-metodi). Sandbox on valinnainen koodin suorittamiseen.
     #[must_use]
     pub fn new(
         config: AgentConfig,
         soul: Soul,
-        memory: Arc<S>,
-        durable: DurableContext<J>,
+        memory: ErasedMemoryStore,
+        durable: DurableContext<ErasedJournal>,
         bus: BusHandle,
         llm_config: Option<LlmConfig>,
+        sandbox: Option<Arc<dyn CodeSandbox>>,
     ) -> Self {
         let being_id = BeingId::from_agent_id(config.id);
         let llm = llm_config.map(LlmClient::new);
@@ -123,6 +125,7 @@ where
             bus,
             turn_counter: 0,
             llm,
+            sandbox,
         }
     }
 
@@ -158,7 +161,7 @@ where
 
     /// Jaettu muistikahva (esim. ulkoiseen hakuun testeissä).
     #[must_use]
-    pub fn memory(&self) -> Arc<S> {
+    pub fn memory(&self) -> ErasedMemoryStore {
         Arc::clone(&self.memory)
     }
 
@@ -174,34 +177,77 @@ where
         self.llm.as_ref()
     }
 
-    /// Agentin ajattelu: kutsuu LLM:ää system promptin + kontekstin + viestin
-    /// perusteella ja palauttaa vastauksen.
+    /// Agentin sandbox (valinnainen).
+    #[must_use]
+    pub fn sandbox(&self) -> Option<Arc<dyn CodeSandbox>> {
+        self.sandbox.clone()
+    }
+
+    /// Suorittaa koodia sandboxissa (työkalu LLM:lle).
     ///
-    /// Tämä on sivuvaikutus (ULKOINEN API-kutsu), joten se kannattaa ajaa
-    /// deterministisen durable-askeleen JÄLKEEN. LLM-vastetta käytetään
-    /// enrichoimaan `TurnOutcome` summarytä ja voi haluttaessa lähettää
-    /// tekstin busiin.
+    /// Palauttaa työkalu-vastauksen joka sisältää stdout/stderr ja fuel-kulutuksen.
+    ///
+    /// # Errors
+    /// - [`FamilyClawError::Sandbox`] jos sandbox ei ole konfiguroitu tai suoritus epäonnistuu.
+    pub fn execute_code(&self, wasm_bytes: Vec<u8>) -> Result<SandboxOutput> {
+        let sandbox = self
+            .sandbox
+            .as_ref()
+            .ok_or_else(|| FamilyClawError::sandbox("sandbox not configured"))?;
+
+        let request = SandboxRequest::new(wasm_bytes);
+        sandbox
+            .execute(&request)
+            .map_err(|e| FamilyClawError::sandbox(e.to_string()))
+    }
+
+    /// Agentin ajattelu: hakee relevantit muistot Eternal Threadista (RAG),
+    /// rakentaa system promptin (sielu + muistit) ja kutsuu LLM:ää.
+    ///
+    /// Natiivisti **async** — ei `block_on`/`block_in_place`-kuvioita, jotka
+    /// paniikkaisivat `current_thread`-runtimessa tai voisivat deadlockata.
+    ///
+    /// Palauttaa `None` jos LLM-clientiä ei ole (harmless no-op), muuten
+    /// `Some(Ok(text))` tai `Some(Err(..))` LLM-virheestä.
     ///
     /// # Errors
     /// - [`FamilyClawError::Llm`] jos LLM-kutsu epäonnistuu.
-    /// - Palauttaa `None` jos LLM-clientiä ei ole configissa (harmless no-op).
+    #[allow(clippy::format_push_string)]
     pub async fn think(&self, current_message: &BusMessage) -> Option<Result<String>> {
         let llm = self.llm.as_ref()?;
 
-        // Rakennetaan viestit: system prompt -> muistit -> nykyinen viesti
-        let mut messages = Vec::new();
-
-        // 1. System prompt (Soul's essence)
-        messages.push(LlmMessage::system(self.soul.essence.clone()));
-
-        // 2. Nykyinen viesti
-        let content = match current_message {
+        let query = match current_message {
             BusMessage::Text { body } => body.clone(),
             BusMessage::Latent { text_shadow, .. } => text_shadow.clone(),
             other => format!("[{}]", other.kind_label()),
         };
-        messages.push(LlmMessage::user(content));
 
+        // 0. ORIENT: hae relevantit muistot ENSIN (RAG — ennen LLM-kutsua).
+        let recall_ctx = RetrievalContext::new(query.clone()).with_limit(5);
+        let memories = self.recall(&recall_ctx).await.unwrap_or_else(|e| {
+            warn!("recall failed in think (non-fatal): {e}");
+            Vec::new()
+        });
+
+        // 1. System prompt: sielun ydin + muistit kontekstina.
+        let mut system_prompt = self.soul.essence.clone();
+        if !memories.is_empty() {
+            system_prompt.push_str("\n\n[RELEVANT MEMORIES FROM ETERNAL THREAD]:\n");
+            for (i, mem) in memories.iter().enumerate() {
+                system_prompt.push_str(&format!(
+                    "  {}. (relevance: {:.2}) {}\n",
+                    i + 1,
+                    mem.relevance,
+                    mem.memory.content
+                ));
+            }
+            system_prompt.push_str("[END MEMORIES]\n");
+        }
+
+        // 2. Viestit: system prompt -> nykyinen viesti.
+        let messages = vec![LlmMessage::system(system_prompt), LlmMessage::user(query)];
+
+        // 3. LLM-kutsu (async, ei block_on).
         Some(
             llm.complete(&messages)
                 .await
@@ -286,29 +332,51 @@ where
         self.apply_emotional_homeostasis();
 
         // 5. LLM-ajattelu (sivuvaikutus): jos LLM-clienti on konfiguroitu,
-        //    agentti "ajattelee" viestin pohjalta. Vastausta käytetään
-        //    (a) enrichoimaan TurnOutcomen summaryä ja (b) julkaisemaan
-        //    tekstivastaus busiin. Ajattelu on sivuvaikutus joka ajetaan
-        //    durable-askeleen jälkeen — replaya ei tarvita, koska ajattelu
-        //    on idempotentti ulkoinen kutsu.
-        if let Some(thought) = self.think(message).await {
-            match thought {
-                Ok(response) => {
-                    debug!(
-                        name = self.config.name,
-                        "LLM response: {}",
-                        &response[..response.len().min(120)]
-                    );
-                    // Julkaise vastaus busiin (sisarukset voivat reagoida).
-                    if let Err(e) = self.say(&response) {
-                        warn!(name = self.config.name, "LLM response publish failed: {e}");
-                    }
+        //    agentti "ajattelee" viestin pohjalta. LLM-generointi on ULKOINEN
+        //    sivuvaikutus → ajamme sen tuoreessa vuorossa OIKEASSA async-
+        //    kontekstissa (ei `block_on` durable-sulkimen sisällä, joka
+        //    paniikkaisi `current_thread`-runtimessa / voisi deadlockata) ja
+        //    tallennamme TULOKSEN durable-askeleeseen. Replayssa emme aja
+        //    `think`:iä uudelleen — `durable.step` palauttaa tallennetun tekstin.
+        let think_step = format!("{step_name}-think");
+        let thought_response: Option<String> = if self.llm.is_none() {
+            None
+        } else if self.durable.is_replaying() {
+            // Replay: palauta tallennettu LLM-vastaus lokista ilman uutta kutsua.
+            self.durable
+                .step(&think_step, || Ok(String::new()))
+                .ok()
+                .filter(|s| !s.is_empty())
+        } else {
+            // Tuore vuoro: aja LLM async-kontekstissa, tallenna tulos askeleeseen.
+            match self.think(message).await {
+                Some(Ok(text)) => self
+                    .durable
+                    .step(&think_step, {
+                        let text = text.clone();
+                        move || Ok(text)
+                    })
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+                Some(Err(e)) => {
+                    warn!("think failed (non-fatal): {e}");
+                    None
                 }
-                Err(e) => {
-                    warn!(name = self.config.name, "LLM think failed: {e}");
+                None => None,
+            }
+        };
+
+        // Liitä LLM-ajattelun tiivistelmä vuoron yhteenvetoon (jos saatu).
+        let recorded = match thought_response {
+            Some(thought) if !thought.is_empty() => {
+                let snippet: String = thought.chars().take(160).collect();
+                TurnOutcome {
+                    summary: format!("{} | thought: {snippet}", recorded.summary),
+                    ..recorded
                 }
             }
-        }
+            _ => recorded,
+        };
 
         self.turn_counter += 1;
         Ok(recorded)
@@ -440,7 +508,7 @@ where
         // ([`BeingInfo`]) kautta, ei Ractorin prosessinlaajuisen nimiavaruuden.
         // Samanniminen agentti (esim. `agent_a` kahdessa eri perheessä/testissä)
         // ei silloin törmää globaaliin "already registered" -virheeseen.
-        let (actor, _join) = Actor::spawn(None, AgentActor::<S, J>::new(), self)
+        let (actor, _join) = Actor::spawn(None, AgentActor::new(), self)
             .await
             .map_err(|e| FamilyClawError::bus(format!("agent '{name}' spawn failed: {e}")))?;
 
@@ -476,20 +544,21 @@ fn summarize(sender: BeingId, message: &BusMessage) -> String {
     format!("{} from {sender}", message.kind_label())
 }
 
+/// Type-erased agent for actor (no generics).
+type ErasedAgent = Agent;
+
 /// [`Agent`]:n Ractor-actor-kuori.
 ///
 /// Tila on itse [`Agent`]. Viestityyppi on [`ResonanceMessage`] (busin
 /// kieli), joten actor liittyy busiin samalla rajapinnalla kuin mikä tahansa
 /// olento.
 ///
-/// Actor on tilaton (kaikki tila on [`Agent`]-arvossa). Tyyppiparametrit
-/// `S`/`J` kytkevät kuoren samaan muisti-/journal-toteutukseen kuin agentti
-/// — ne kuljetetaan [`PhantomData`]:lla, koska itse actor ei säilö dataa.
-pub struct AgentActor<S, J> {
-    _marker: std::marker::PhantomData<fn() -> (S, J)>,
+/// Actor on tilaton (kaikki tila on [`Agent`]-arvossa).
+pub struct AgentActor {
+    _marker: std::marker::PhantomData<fn() -> ErasedAgent>,
 }
 
-impl<S, J> AgentActor<S, J> {
+impl AgentActor {
     /// Rakentaa uuden (tilattoman) actor-kuoren.
     #[must_use]
     fn new() -> Self {
@@ -499,14 +568,10 @@ impl<S, J> AgentActor<S, J> {
     }
 }
 
-impl<S, J> Actor for AgentActor<S, J>
-where
-    S: MemoryStore + Send + Sync + 'static,
-    J: Journal + Send + Sync + 'static,
-{
+impl Actor for AgentActor {
     type Msg = ResonanceMessage;
-    type State = Agent<S, J>;
-    type Arguments = Agent<S, J>;
+    type State = ErasedAgent;
+    type Arguments = ErasedAgent;
 
     async fn pre_start(
         &self,
@@ -561,15 +626,17 @@ mod tests {
 
     /// Apuri: rakentaa testiagentin tuoreella in-memory-tilalla, liitettynä
     /// annettuun busiin.
-    fn test_agent(name: &str, bus: BusHandle) -> Agent<LocalJsonStore, InMemoryJournal> {
+    fn test_agent(name: &str, bus: BusHandle) -> Agent {
         // Geneerinen nimi sellaisenaan: `Agent::spawn` ei rekisteröi actoria
         // Ractorin globaaliin nimiavaruuteen (spawnaa `None`-nimellä), joten
         // samanniminen agentti ei törmää testien välillä.
         let config = AgentConfig::new(name, ModelConfig::new("provider/model"));
         let soul = Soul::from_essence(format!("I am {name}, a generic example being."));
-        let memory = Arc::new(LocalJsonStore::in_memory());
-        let durable = DurableContext::new(InMemoryJournal::new()).expect("durable ctx");
-        Agent::new(config, soul, memory, durable, bus, None)
+        let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
+        let durable =
+            DurableContext::new(Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>)
+                .expect("durable ctx");
+        Agent::new(config, soul, memory, durable, bus, None, None)
     }
 
     #[tokio::test]
@@ -677,11 +744,14 @@ mod tests {
         // replayssa — review issue #9.)
         let bus = ResonanceBus::start(None).await.expect("bus");
 
-        // Sama Arc<LocalJsonStore> sekä alkuperäisessä että resume-ajossa.
-        let shared_memory = Arc::new(LocalJsonStore::in_memory());
+        // Sama Arc<ErasedMemoryStore> sekä alkuperäisessä että resume-ajossa.
+        let shared_memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
 
         let journal = {
-            let durable = DurableContext::new(InMemoryJournal::new()).expect("ctx");
+            let durable = DurableContext::new(
+                Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>
+            )
+            .expect("ctx");
             let config = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
             let mut agent = Agent::new(
                 config,
@@ -689,6 +759,7 @@ mod tests {
                 Arc::clone(&shared_memory),
                 durable,
                 bus.clone(),
+                None,
                 None,
             );
             agent
@@ -715,6 +786,7 @@ mod tests {
             Arc::clone(&shared_memory),
             resumed_ctx,
             bus.clone(),
+            None,
             None,
         );
 

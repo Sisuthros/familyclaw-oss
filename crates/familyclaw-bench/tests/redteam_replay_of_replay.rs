@@ -138,8 +138,17 @@ fn start_args<'a>(
     crash_at: Option<&'a str>,
 ) -> Vec<&'a str> {
     let mut v = vec![
-        "start", "--journal", journal, "--store", store, "--task", task, "--steps", steps,
-        "--clock", CLOCK,
+        "start",
+        "--journal",
+        journal,
+        "--store",
+        store,
+        "--task",
+        task,
+        "--steps",
+        steps,
+        "--clock",
+        CLOCK,
     ];
     if let Some(point) = crash_at {
         v.push("--crash-at");
@@ -168,7 +177,10 @@ fn replay_of_replay_thrice_resumes_clean_with_side_effects_once() {
 
     // ── Crash #1: mid_write → torn last line; steps 0,1 committed. ──
     let (ok1, _o1, e1) = run(&bin, &start_args(&jp, &sp, task, steps, Some("mid_write")));
-    assert!(!ok1, "mid_write must exit non-zero (injected crash). stderr={e1}");
+    assert!(
+        !ok1,
+        "mid_write must exit non-zero (injected crash). stderr={e1}"
+    );
     let committed_after_c1 = count_completed_lines(&journal);
     let mem_after_c1 = count_task_memories(&store, task);
     eprintln!("[c1 mid_write] committed_lines={committed_after_c1} memories={mem_after_c1}");
@@ -183,7 +195,10 @@ fn replay_of_replay_thrice_resumes_clean_with_side_effects_once() {
     assert!(!ok2, "mid_replay must exit non-zero. stderr={e2}");
     let committed_after_c2 = count_completed_lines(&journal);
     let mem_after_c2 = count_task_memories(&store, task);
-    eprintln!("[c2 mid_replay] committed_lines={committed_after_c2} memories={mem_after_c2} stderr={}", e2.trim());
+    eprintln!(
+        "[c2 mid_replay] committed_lines={committed_after_c2} memories={mem_after_c2} stderr={}",
+        e2.trim()
+    );
 
     // ── Crash #3: mid_replay AGAIN → replay-of-replay. ──
     // Toinen replayn-keskeyttävä kaatuminen PERÄKKÄIN — "resume the resume".
@@ -191,7 +206,10 @@ fn replay_of_replay_thrice_resumes_clean_with_side_effects_once() {
     assert!(!ok3, "second mid_replay must exit non-zero. stderr={e3}");
     let committed_after_c3 = count_completed_lines(&journal);
     let mem_after_c3 = count_task_memories(&store, task);
-    eprintln!("[c3 mid_replay#2] committed_lines={committed_after_c3} memories={mem_after_c3} stderr={}", e3.trim());
+    eprintln!(
+        "[c3 mid_replay#2] committed_lines={committed_after_c3} memories={mem_after_c3} stderr={}",
+        e3.trim()
+    );
 
     // INVARIANTTI 1: toistuvat replay-kaatumiset eivät saa LISÄTÄ rivejä
     // journaliin (replay vain toistaa, ei kirjoita) — eikä turmella ehjiä.
@@ -210,7 +228,16 @@ fn replay_of_replay_thrice_resumes_clean_with_side_effects_once() {
 
     // ── Final resume: täytyy jatkua puhtaasti. ──
     let resume_args = vec![
-        "resume", "--journal", &jp, "--store", &sp, "--task", task, "--steps", steps, "--clock",
+        "resume",
+        "--journal",
+        &jp,
+        "--store",
+        &sp,
+        "--task",
+        task,
+        "--steps",
+        steps,
+        "--clock",
         CLOCK,
     ];
     let (okr, or, er) = run(&bin, &resume_args);
@@ -219,11 +246,13 @@ fn replay_of_replay_thrice_resumes_clean_with_side_effects_once() {
     eprintln!("[resume] {report}");
 
     assert_eq!(
-        report["resumed_clean"], serde_json::Value::Bool(true),
+        report["resumed_clean"],
+        serde_json::Value::Bool(true),
         "after replay-of-replay, final resume must reach the clean end state"
     );
     assert_eq!(
-        report["was_replaying"], serde_json::Value::Bool(true),
+        report["was_replaying"],
+        serde_json::Value::Bool(true),
         "journal had committed steps → resume must enter replay mode"
     );
 
@@ -285,14 +314,26 @@ fn torn_write_then_resume_keeps_journal_readable_seam_closed() {
     assert!(!ok1, "mid_write must crash");
 
     let resume_args = vec![
-        "resume", "--journal", &jp, "--store", &sp, "--task", task, "--steps", steps, "--clock",
+        "resume",
+        "--journal",
+        &jp,
+        "--store",
+        &sp,
+        "--task",
+        task,
+        "--steps",
+        steps,
+        "--clock",
         CLOCK,
     ];
 
     // Ensimmäinen resume: ONNISTUU ja saavuttaa puhtaan lopputilan.
     let (okr, or, er) = run(&bin, &resume_args);
     assert!(okr, "first resume succeeds. stderr={er}");
-    assert_eq!(result_json(&or)["resumed_clean"], serde_json::Value::Bool(true));
+    assert_eq!(
+        result_json(&or)["resumed_clean"],
+        serde_json::Value::Bool(true)
+    );
 
     // KORJAUS-INVARIANTTI: yksikään fyysinen rivi ei saa sisältää kahta step_id:tä
     // — eli torn-tynkä + tuore rivi EIVÄT sulautuneet (heal-on-open typisti tyngän).
@@ -362,10 +403,16 @@ fn full_journal_replay_crashes_thrice_then_resume_is_noop_clean() {
     // Kaadu kesken replayn KOLMESTI peräkkäin.
     for round in 1..=3 {
         let (ok, _o, e) = run(&bin, &start_args(&jp, &sp, task, steps, Some("mid_replay")));
-        assert!(!ok, "mid_replay round {round} must exit non-zero. stderr={e}");
+        assert!(
+            !ok,
+            "mid_replay round {round} must exit non-zero. stderr={e}"
+        );
         let committed = count_completed_lines(&journal);
         let mem = count_task_memories(&store, task);
-        eprintln!("[full mid_replay round {round}] committed={committed} mem={mem} stderr={}", e.trim());
+        eprintln!(
+            "[full mid_replay round {round}] committed={committed} mem={mem} stderr={}",
+            e.trim()
+        );
         assert_eq!(
             committed, committed0,
             "round {round}: replay crash must not change committed step count"
@@ -378,7 +425,16 @@ fn full_journal_replay_crashes_thrice_then_resume_is_noop_clean() {
 
     // Resume: kaikki jo lokissa → puhdas, ei uusia muistoja.
     let resume_args = vec![
-        "resume", "--journal", &jp, "--store", &sp, "--task", task, "--steps", steps, "--clock",
+        "resume",
+        "--journal",
+        &jp,
+        "--store",
+        &sp,
+        "--task",
+        task,
+        "--steps",
+        steps,
+        "--clock",
         CLOCK,
     ];
     let (okr, or, er) = run(&bin, &resume_args);

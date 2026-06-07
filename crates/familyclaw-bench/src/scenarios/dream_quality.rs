@@ -40,8 +40,8 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 
 use familyclaw_core::{MessageId, Timestamp};
-use familyclaw_durable::InMemoryJournal;
 use familyclaw_dream::{mark_contradicted, DreamCycle};
+use familyclaw_durable::InMemoryJournal;
 use familyclaw_memory::{
     DecayPolicy, ImportanceFactors, LocalJsonStore, Memory, MemoryStatus, MemoryStore,
 };
@@ -240,7 +240,10 @@ impl Scenario for DreamQuality {
             .with_metric("dedup_precision", outcome.dedup_precision)
             .with_metric("contradiction_drop", outcome.contradiction_drop)
             .with_metric("date_absolutized", date_absolutized)
-            .with_metric("protected_core_intact", protected_core_intact(outcome.protected_intact))
+            .with_metric(
+                "protected_core_intact",
+                protected_core_intact(outcome.protected_intact),
+            )
             .with_metric("false_merge_rate", false_merge_rate)
             .with_note(format!(
                 "merged {}/{} true duplicates ({} clusters)",
@@ -312,7 +315,8 @@ impl Outcome {
         let mut anchors_intact = true;
         for (id, original) in &seeded.anchors {
             match store.get(*id).await? {
-                Some(after) if after.status == MemoryStatus::Active && &after.content == original => {}
+                Some(after)
+                    if after.status == MemoryStatus::Active && &after.content == original => {}
                 _ => {
                     anchors_intact = false;
                     break;
@@ -489,17 +493,17 @@ mod tests {
         // Dedup toimi täydellä tarkkuudella (ei vääriä yhdistyksiä).
         assert_eq!(result.metrics.get("dedup_precision").copied(), Some(1.0));
         // Kaikki ei-suojatut ristiriidat pudotettiin.
-        assert_eq!(
-            result.metrics.get("contradiction_drop").copied(),
-            Some(1.0)
-        );
+        assert_eq!(result.metrics.get("contradiction_drop").copied(), Some(1.0));
         // Vähintään yksi päiväys absolutisoitiin.
         let dates = result
             .metrics
             .get("date_absolutized")
             .copied()
             .expect("date metric");
-        assert!(dates >= 1.0, "odotettiin ≥1 absolutisoitua päiväystä, sai {dates}");
+        assert!(
+            dates >= 1.0,
+            "odotettiin ≥1 absolutisoitua päiväystä, sai {dates}"
+        );
 
         assert!(result.passed, "S3 pitäisi läpäistä: {:?}", result.notes);
     }

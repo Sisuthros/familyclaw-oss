@@ -70,7 +70,7 @@ fn filejournal_two_handles_concurrent_append_integrity() {
         let path = path.clone();
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
-            let mut j = FileJournal::open(&path).expect("open journal handle");
+            let j = FileJournal::open(&path).expect("open journal handle");
             // Synkronoi molemmat säikeet alkamaan yhtä aikaa → maksimaalinen
             // lomitusriski.
             barrier.wait();
@@ -140,9 +140,7 @@ fn filejournal_two_handles_concurrent_append_integrity() {
 
     // (b) replay_all kautta — sama polku jota tuotanto käyttää. Sisäkorruptio
     //     (lomittunut rivi joka EI ole viimeinen) palauttaa CorruptEntry-virheen.
-    let replay = FileJournal::open(&path)
-        .expect("reopen")
-        .replay_all();
+    let replay = FileJournal::open(&path).expect("reopen").replay_all();
     match &replay {
         Ok(entries) => eprintln!("[journal] replay_all OK, {} entries", entries.len()),
         Err(e) => eprintln!("[journal] replay_all ERROR: {e}"),
@@ -165,7 +163,8 @@ fn filejournal_two_handles_concurrent_append_integrity() {
         replay.err()
     );
     assert_eq!(
-        parsed_ok, total_written,
+        parsed_ok,
+        total_written,
         "LOST WRITE: only {parsed_ok} of {total_written} appends survived (lines on disk={})",
         lines.len()
     );

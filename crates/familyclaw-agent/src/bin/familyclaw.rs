@@ -14,14 +14,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use familyclaw_agent::{publish_envelope, Agent, Soul};
+use familyclaw_agent::{publish_envelope, Agent, ErasedMemoryStore, Soul};
 use familyclaw_bus::{BeingId, BusHandle, BusMessage, ResonanceBus};
 use familyclaw_channels::{Channel, ChannelKind, InboundMessage, MockChannel};
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
 use familyclaw_dream::{DreamConfig, DreamCycle};
-use familyclaw_durable::{DurableContext, InMemoryJournal};
+use familyclaw_durable::{DurableContext, InMemoryJournal, Journal};
 use familyclaw_emotion::{Dimension, EmotionState};
-use familyclaw_memory::{ImportanceFactors, LocalJsonStore, Memory, MemoryStore, RetrievalContext};
+use familyclaw_memory::{ImportanceFactors, LocalJsonStore, Memory, RetrievalContext};
 use tracing::info;
 
 /// Delivers a text message through the channel to the bus.
@@ -44,19 +44,28 @@ async fn deliver_via_channel(
 }
 
 /// Builds a demo agent with in-memory storage.
-fn build_agent(name: &str, bus: &BusHandle) -> Result<Agent<LocalJsonStore, InMemoryJournal>> {
+fn build_agent(name: &str, bus: &BusHandle) -> Result<Agent> {
     let config = AgentConfig::new(name, ModelConfig::new("provider/model"));
     let soul = Soul::from_essence(format!(
         "I am {name}, an autonomous agent on the FamilyClaw platform."
     ));
-    let memory = Arc::new(LocalJsonStore::in_memory());
-    let durable = DurableContext::new(InMemoryJournal::new())
-        .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-    Ok(Agent::new(config, soul, memory, durable, bus.clone(), None))
+    let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
+    let durable =
+        DurableContext::new(Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>)
+            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+    Ok(Agent::new(
+        config,
+        soul,
+        memory,
+        durable,
+        bus.clone(),
+        None,
+        None,
+    ))
 }
 
 /// Reports memory state for an agent.
-async fn report_memory(name: &str, mem: &LocalJsonStore, query: &str) -> Result<()> {
+async fn report_memory(name: &str, mem: &ErasedMemoryStore, query: &str) -> Result<()> {
     let total = mem.len().await?;
     let hits = mem
         .retrieve(&RetrievalContext::new(query), familyclaw_core::time::now())
@@ -222,7 +231,7 @@ async fn main() -> Result<()> {
     );
     info!("");
     info!("  FamilyClaw: agents that remember, feel, dream, and think.");
-    info!("═══════════════════════════════════════════════════════════");
+    info!("════════════════════════════════════════════════════════════");
 
     bus.stop();
     Ok(())
