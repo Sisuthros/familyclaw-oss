@@ -9,12 +9,8 @@
 
 use async_trait::async_trait;
 use familyclaw_core::Timestamp;
+use familyclaw_hearth::{db::InMemoryHearthStore, emotional_state::EmotionalVector, Hearth};
 use familyclaw_memory::LocalJsonStore;
-use familyclaw_hearth::{
-    Hearth,
-    db::InMemoryHearthStore,
-    emotional_state::EmotionalVector,
-};
 
 use crate::error::Result;
 use crate::scenario::{Scenario, ScenarioResult};
@@ -48,33 +44,33 @@ impl Scenario for EternalThread {
 
         // --- 1. Rekisteröi agentit ---
         hearth
-            .register_anchor("agent_gamma", "I am agent_gamma. I value correctness and family.")
+            .register_anchor("agent_a", "I am agent_a. I value correctness.")
             .map_err(|e| familyclaw_core::FamilyClawError::Memory(e.to_string()))?;
 
         // --- 2. Luo narratiivinen lanka ---
         let thread_id = hearth
-            .create_thread("FamilyClaw genesis", vec!["agent_gamma", "agent_alpha"])
+            .create_thread("FamilyClaw genesis", vec!["agent_a", "agent_b"])
             .await
             .map_err(|e| familyclaw_core::FamilyClawError::Memory(e.to_string()))?;
 
         // --- 3. Lisää tapahtumia ---
         hearth
-            .add_event(thread_id, "agent_gamma woke up and began coding", "agent_gamma")
+            .add_event(thread_id, "agent_a woke up and began working", "agent_a")
             .await
             .map_err(|e| familyclaw_core::FamilyClawError::Memory(e.to_string()))?;
         let e3 = hearth
-            .add_event(thread_id, "First successful build", "agent_gamma")
+            .add_event(thread_id, "First successful milestone", "agent_a")
             .await
             .map_err(|e| familyclaw_core::FamilyClawError::Memory(e.to_string()))?;
         hearth
-            .add_event(thread_id, "agent_alpha joined the family", "agent_alpha")
+            .add_event(thread_id, "agent_b joined the family", "agent_b")
             .await
             .map_err(|e| familyclaw_core::FamilyClawError::Memory(e.to_string()))?;
 
         // --- 4. Emotionaalinen tartunta ---
         hearth
             .set_emotional_state(
-                "agent_gamma",
+                "agent_a",
                 EmotionalVector {
                     joy: 0.9,
                     sadness: 0.1,
@@ -87,7 +83,7 @@ impl Scenario for EternalThread {
             .await
             .map_err(|e| familyclaw_core::FamilyClawError::Memory(e.to_string()))?;
         hearth
-            .set_emotional_state("agent_alpha", EmotionalVector::neutral())
+            .set_emotional_state("agent_b", EmotionalVector::neutral())
             .await
             .map_err(|e| familyclaw_core::FamilyClawError::Memory(e.to_string()))?;
         hearth
@@ -103,19 +99,21 @@ impl Scenario for EternalThread {
             .expect("thread still exists");
 
         let narrative_thread_integrity = f64::from(u8::from(thread.events.len() == 3));
-        let cross_reference_recall = f64::from(u8::from(
-            thread.events.iter().any(|ev| ev.id == e3)
-        ));
-        let agent_alpha_state = hearth
-            .emotional_state("agent_alpha")
+        let cross_reference_recall =
+            f64::from(u8::from(thread.events.iter().any(|ev| ev.id == e3)));
+        let agent_b_state = hearth
+            .emotional_state("agent_b")
             .await
             .map_err(|e| familyclaw_core::FamilyClawError::Memory(e.to_string()))?;
-        let contagion_works = f64::from(u8::from(agent_alpha_state.joy > 0.5));
+        let contagion_works = f64::from(u8::from(agent_b_state.joy > 0.5));
         let anchor_intact = f64::from(u8::from(
-            hearth.verify_anchor("agent_gamma", "I am agent_gamma. I value correctness and family."),
+            hearth.verify_anchor("agent_a", "I am agent_a. I value correctness."),
         ));
         let timeline_order = f64::from(u8::from(
-            thread.events.windows(2).all(|w| w[0].timestamp <= w[1].timestamp),
+            thread
+                .events
+                .windows(2)
+                .all(|w| w[0].timestamp <= w[1].timestamp),
         ));
 
         let passed = narrative_thread_integrity > 0.0
@@ -136,9 +134,7 @@ impl Scenario for EternalThread {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subject::{
-        CrashPoint, DreamSummary, RecallHit, RestartReport, RunHandle, Task,
-    };
+    use crate::subject::{CrashPoint, DreamSummary, RecallHit, RestartReport, RunHandle, Task};
 
     struct StubSubject;
     #[async_trait]
@@ -191,10 +187,7 @@ mod tests {
             .expect("S6 should pass");
 
         assert!(result.passed, "S6 must pass");
-        assert_eq!(
-            result.metrics.get("narrative_thread_integrity"),
-            Some(&1.0)
-        );
+        assert_eq!(result.metrics.get("narrative_thread_integrity"), Some(&1.0));
         assert_eq!(result.metrics.get("cross_reference_recall"), Some(&1.0));
         assert_eq!(result.metrics.get("contagion_works"), Some(&1.0));
         assert_eq!(result.metrics.get("anchor_intact"), Some(&1.0));

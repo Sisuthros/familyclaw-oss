@@ -115,14 +115,22 @@ async fn main() -> anyhow::Result<()> {
             sandbox,
             include_dirs,
             policy,
-        } => cmd_run(task.join(" "), path, model, yolo, sandbox, include_dirs, policy)?,
+        } => cmd_run(
+            task.join(" "),
+            path,
+            model,
+            yolo,
+            sandbox,
+            include_dirs,
+            policy,
+        )?,
         Command::Chat {
             path,
             model,
             yolo,
             task,
         } => cmd_chat(path, model, yolo, task)?,
-        Command::Version => cmd_version()?,
+        Command::Version => cmd_version(),
     }
 
     Ok(())
@@ -132,13 +140,19 @@ async fn main() -> anyhow::Result<()> {
 fn cmd_scan(path: &Path) -> anyhow::Result<()> {
     println!(
         "🔍 Gemu skannaa: {}\n",
-        path.canonicalize().unwrap_or_else(|_| path.to_path_buf()).display()
+        path.canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .display()
     );
 
     let project = context::scan(path)?;
     println!("{}", project.tree);
     println!();
-    println!("📊 {} tiedostoa, {} cratea", project.total_files, project.cargo_tomls.len());
+    println!(
+        "📊 {} tiedostoa, {} cratea",
+        project.total_files,
+        project.cargo_tomls.len()
+    );
     println!("📄 {} arkkitehtuuridokumenttia", project.arch_docs.len());
     println!();
     println!("Valmiina rälläköintiin. Kokeile: gemu run \"tehtäväsi tähän\"");
@@ -163,17 +177,30 @@ fn cmd_run(
     // Varmista Gemini CLI
     let version = gemini::check_installed()?;
     println!("🏎️  Gemu käynnistyy (Gemini CLI v{})...", version);
-    println!("📂 Projekti: {}", path.canonicalize().unwrap_or_else(|_| path.clone()).display());
+    println!(
+        "📂 Projekti: {}",
+        path.canonicalize()
+            .unwrap_or_else(|_| path.clone())
+            .display()
+    );
 
     // Skannaa projekti
     println!("🔍 Skannataan koodipuu...");
     let project = context::scan(&path)?;
-    println!("   {} tiedostoa, {} cratea", project.total_files, project.cargo_tomls.len());
+    println!(
+        "   {} tiedostoa, {} cratea",
+        project.total_files,
+        project.cargo_tomls.len()
+    );
 
     // Rakenna prompt
     println!("🔧 Rakennetaan Pääkatsastusmies-prompt...");
     let mega_prompt = prompt::build(&project, &task);
-    println!("   Prompt: {} merkkiä (n. {} tokenia)", mega_prompt.len(), mega_prompt.len() / 4);
+    println!(
+        "   Prompt: {} merkkiä (n. {} tokenia)",
+        mega_prompt.len(),
+        mega_prompt.len() / 4
+    );
 
     // Konfiguraatio
     let config = GemuConfig {
@@ -205,15 +232,15 @@ fn cmd_run(
 }
 
 /// Interaktiivinen sessio.
-fn cmd_chat(
-    path: PathBuf,
-    model: String,
-    yolo: bool,
-    task: Option<String>,
-) -> anyhow::Result<()> {
+fn cmd_chat(path: PathBuf, model: String, yolo: bool, task: Option<String>) -> anyhow::Result<()> {
     let version = gemini::check_installed()?;
-    println!("🏎️  Gemu chat (Gemini CLI v{})", version);
-    println!("📂 Projekti: {}", path.canonicalize().unwrap_or_else(|_| path.clone()).display());
+    println!("🏎️  Gemu chat (Gemini CLI v{version})");
+    println!(
+        "📂 Projekti: {}",
+        path.canonicalize()
+            .unwrap_or_else(|_| path.clone())
+            .display()
+    );
 
     // Skannaa projekti
     println!("🔍 Skannataan koodipuu...");
@@ -246,7 +273,7 @@ fn cmd_chat(
 }
 
 /// Versiotarkistus.
-fn cmd_version() -> anyhow::Result<()> {
+fn cmd_version() {
     match gemini::check_installed() {
         Ok(version) => {
             println!("✅ Gemini CLI v{version}");
@@ -270,6 +297,4 @@ fn cmd_version() -> anyhow::Result<()> {
             println!("  export GEMINI_API_KEY=...");
         }
     }
-
-    Ok(())
 }

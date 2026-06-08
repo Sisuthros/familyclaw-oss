@@ -175,12 +175,8 @@ mod tests {
 
     #[test]
     fn thread_add_event() {
-        let mut thread = NarrativeThread::new(
-            "Test thread",
-            vec!["agent_gamma".into(), "agent_alpha".into()],
-        );
-        let event =
-            ThreadEvent::new(thread.id, EventType::MemoryCreated, "hello", "agent_gamma");
+        let mut thread = NarrativeThread::new("Test thread", vec!["agent_gamma".into(), "agent_alpha".into()]);
+        let event = ThreadEvent::new(thread.id, EventType::MemoryCreated, "hello", "agent_gamma");
         thread.add_event(event);
         assert_eq!(thread.event_count(), 1);
     }
@@ -227,8 +223,7 @@ mod tests {
 
     #[test]
     fn event_link_to_deduplicates() {
-        let mut event =
-            ThreadEvent::new(Uuid::new_v4(), EventType::MemoryCreated, "test", "agent");
+        let mut event = ThreadEvent::new(Uuid::new_v4(), EventType::MemoryCreated, "test", "agent");
         let target = Uuid::new_v4();
         event.link_to(target);
         event.link_to(target); // duplicate

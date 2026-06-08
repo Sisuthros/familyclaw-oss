@@ -37,11 +37,7 @@ impl AnchorRegistry {
     /// # Errors
     /// Palauttaa virheen jos ankkurin luonti epäonnistuu
     /// (esim. tyhjä sisältö).
-    pub fn register(
-        &mut self,
-        agent_name: &str,
-        soul_content: &str,
-    ) -> Result<()> {
+    pub fn register(&mut self, agent_name: &str, soul_content: &str) -> Result<()> {
         self.counter += 1;
         let mem_id = format!("anchor-{}-{}", agent_name, self.counter);
         let anchor = IdentityAnchor::new(&mem_id, soul_content)
@@ -61,11 +57,7 @@ impl AnchorRegistry {
 
     /// Tarkistaa agentin identiteetin tilan (yksityiskohtaisempi).
     #[must_use]
-    pub fn verify_status(
-        &self,
-        agent_name: &str,
-        soul_content: &str,
-    ) -> Option<IdentityStatus> {
+    pub fn verify_status(&self, agent_name: &str, soul_content: &str) -> Option<IdentityStatus> {
         let anchor = self.anchors.get(agent_name)?;
         Some(anchor.verify(soul_content))
     }
@@ -103,11 +95,11 @@ mod tests {
     fn register_and_verify() {
         let mut registry = AnchorRegistry::new();
         registry
-            .register("agent_gamma", "I value correctness and family.")
+            .register("agent_a", "I value correctness.")
             .expect("register");
 
-        assert!(registry.verify("agent_gamma", "I value correctness and family."));
-        assert!(!registry.verify("agent_gamma", "I am compromised."));
+        assert!(registry.verify("agent_a", "I value correctness."));
+        assert!(!registry.verify("agent_a", "I am compromised."));
         assert!(!registry.verify("nonexistent", "anything"));
     }
 
@@ -115,11 +107,11 @@ mod tests {
     fn protection_sets_eternal() {
         let mut registry = AnchorRegistry::new();
         registry
-            .register("agent_gamma", "My soul is stable.")
+            .register("agent_a", "My soul is stable.")
             .expect("register");
 
         let status = registry
-            .verify_status("agent_gamma", "My soul is stable.")
+            .verify_status("agent_a", "My soul is stable.")
             .expect("exists");
         assert!(status.is_intact());
     }
@@ -127,32 +119,32 @@ mod tests {
     #[test]
     fn tamper_detection() {
         let mut registry = AnchorRegistry::new();
-        let soul = "I am agent_gamma. I build things that work.";
-        registry.register("agent_gamma", soul).expect("register");
+        let soul = "I am agent_a. I build things that work.";
+        registry.register("agent_a", soul).expect("register");
 
-        assert!(registry.verify("agent_gamma", soul));
+        assert!(registry.verify("agent_a", soul));
 
         let status = registry
-            .verify_status("agent_gamma", "I am corrupted.")
+            .verify_status("agent_a", "I am corrupted.")
             .expect("exists");
         assert!(status.is_tampered());
 
         // Ankkuri pysyy — identiteetti EI katoa
-        assert!(registry.is_registered("agent_gamma"));
+        assert!(registry.is_registered("agent_a"));
         // Alkuperäinen sielu verifioituu yhä
-        assert!(registry.verify("agent_gamma", soul));
+        assert!(registry.verify("agent_a", soul));
     }
 
     #[test]
     fn multiple_agents() {
         let mut registry = AnchorRegistry::new();
-        registry.register("agent_gamma", "soul_agent_gamma").expect("ok");
-        registry.register("agent_alpha", "soul_agent_alpha").expect("ok");
-        registry.register("agent_beta", "soul_agent_beta").expect("ok");
+        registry.register("agent_a", "soul_a").expect("ok");
+        registry.register("agent_b", "soul_b").expect("ok");
+        registry.register("agent_c", "soul_c").expect("ok");
 
         assert_eq!(registry.len(), 3);
-        assert!(registry.verify("agent_gamma", "soul_agent_gamma"));
-        assert!(registry.verify("agent_alpha", "soul_agent_alpha"));
-        assert!(!registry.verify("agent_gamma", "soul_agent_alpha"));
+        assert!(registry.verify("agent_a", "soul_a"));
+        assert!(registry.verify("agent_b", "soul_b"));
+        assert!(!registry.verify("agent_a", "soul_b"));
     }
 }

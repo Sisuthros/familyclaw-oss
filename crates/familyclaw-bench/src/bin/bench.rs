@@ -20,8 +20,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 use familyclaw_bench::scenarios::{
-    CrashMatrix, DreamQuality, EmotionalContagion, EternalThread, RetentionCurve,
-    SemanticRetrieval,
+    CrashMatrix, DreamQuality, EmotionalContagion, EternalThread, RetentionCurve, SemanticRetrieval,
 };
 use familyclaw_bench::{BenchError, FamilyClawSubject, Harness, Result, Scenario, Scorecard};
 use familyclaw_core::time;

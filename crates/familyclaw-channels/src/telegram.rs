@@ -201,10 +201,7 @@ impl TelegramChannel {
     /// Long-poll-silmukka: pollaa `getUpdates`, kanonisoi viestit ja työntää ne
     /// virtaan. Palaa kun vastaanotin (`tx`) on suljettu (stream pudotettu) tai
     /// virhe on pysyvä. Verkkovirheissä jatkaa pienen viiveen jälkeen.
-    async fn poll_loop(
-        inner: Arc<Inner>,
-        tx: tokio::sync::mpsc::UnboundedSender<InboundEnvelope>,
-    ) {
+    async fn poll_loop(inner: Arc<Inner>, tx: tokio::sync::mpsc::UnboundedSender<InboundEnvelope>) {
         let mut offset: Option<i64> = None;
         loop {
             if tx.is_closed() {
@@ -218,8 +215,8 @@ impl TelegramChannel {
                         offset = Some(next);
                     }
                     for inbound in outcome.messages {
-                        let env = inbound
-                            .into_envelope(ChannelKind::Telegram, inner.channel_id.clone());
+                        let env =
+                            inbound.into_envelope(ChannelKind::Telegram, inner.channel_id.clone());
                         if tx.send(env).is_err() {
                             debug!(
                                 channel = %inner.channel_id,
@@ -417,8 +414,7 @@ fn parse_get_updates(body: &str, prev_offset: Option<i64>) -> Result<PollOutcome
             .unwrap_or(chat_id);
 
         // Yksittäinen kelvoton viesti ei kaada koko kierrosta — ohitetaan.
-        if let Ok(inbound) = InboundMessage::new(sender_id.to_string(), chat_id.to_string(), text)
-        {
+        if let Ok(inbound) = InboundMessage::new(sender_id.to_string(), chat_id.to_string(), text) {
             messages.push(inbound);
         }
     }

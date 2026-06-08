@@ -40,8 +40,16 @@ pub fn scan(root: &Path) -> anyhow::Result<ProjectContext> {
 
     tree_lines.push(format!("{}", root.display()));
     tree_lines.push("│".to_string());
-    walk_dir(&root, &root, 0, &mut tree_lines, &mut arch_docs,
-             &mut cargo_tomls, &mut rust_sources, &mut total_files)?;
+    walk_dir(
+        &root,
+        &root,
+        0,
+        &mut tree_lines,
+        &mut arch_docs,
+        &mut cargo_tomls,
+        &mut rust_sources,
+        &mut total_files,
+    )?;
 
     // Lajittele Rust-tiedostot
     let mut sorted: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
@@ -77,12 +85,14 @@ fn walk_dir(
     rust_sources: &mut BTreeMap<String, Vec<PathBuf>>,
     total_files: &mut usize,
 ) -> anyhow::Result<()> {
-    let mut entries: Vec<_> = std::fs::read_dir(current)?
-        .filter_map(Result::ok)
-        .collect();
+    let mut entries: Vec<_> = std::fs::read_dir(current)?.filter_map(Result::ok).collect();
     entries.sort_by_key(std::fs::DirEntry::file_name);
 
-    let prefix = if depth > 0 { "  ".repeat(depth - 1) } else { String::new() };
+    let prefix = if depth > 0 {
+        "  ".repeat(depth - 1)
+    } else {
+        String::new()
+    };
 
     for (i, entry) in entries.iter().enumerate() {
         let is_last = i == entries.len() - 1;
@@ -98,30 +108,48 @@ fn walk_dir(
             continue;
         }
 
-        let rel = entry.path().strip_prefix(base)
+        let rel = entry
+            .path()
+            .strip_prefix(base)
             .unwrap_or(&entry.path())
             .to_path_buf();
 
         if file_type.is_dir() {
             tree_lines.push(format!("{prefix}{connector}{name}/"));
-            walk_dir(base, &entry.path(), depth + 1, tree_lines,
-                     arch_docs, cargo_tomls, rust_sources, total_files)?;
+            walk_dir(
+                base,
+                &entry.path(),
+                depth + 1,
+                tree_lines,
+                arch_docs,
+                cargo_tomls,
+                rust_sources,
+                total_files,
+            )?;
         } else {
             *total_files += 1;
             tree_lines.push(format!("{prefix}{connector}{name}"));
 
-            let ext = entry.path().extension()
+            let ext = entry
+                .path()
+                .extension()
                 .and_then(|e| e.to_str())
                 .map(str::to_lowercase)
                 .unwrap_or_default();
 
             // Tunnista arkkitehtuuridokumentit
-            let is_md = entry.path().extension()
+            let is_md = entry
+                .path()
+                .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("md"));
-            let is_txt = entry.path().extension()
+            let is_txt = entry
+                .path()
+                .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("txt"));
-            if name.contains("ARCHITECTURE") || name.contains("DESIGN")
-                || name.contains("SCORECARD") || (is_md && depth <= 3)
+            if name.contains("ARCHITECTURE")
+                || name.contains("DESIGN")
+                || name.contains("SCORECARD")
+                || (is_md && depth <= 3)
             {
                 // Syvemmältä vain jos dokumentti
                 if is_md || is_txt {
@@ -136,7 +164,8 @@ fn walk_dir(
 
             // Rust-lähdekoodit
             if ext == "rs" {
-                let crate_name = rel.iter()
+                let crate_name = rel
+                    .iter()
                     .nth(1) // crates/<nimi>/...
                     .map_or_else(|| "root".to_string(), |c| c.to_string_lossy().to_string());
                 rust_sources

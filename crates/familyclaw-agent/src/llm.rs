@@ -92,13 +92,19 @@ impl LlmConfig {
     /// Efektiivinen request-timeout [`Duration`]:na (oletus täytetty).
     #[must_use]
     pub fn request_timeout(&self) -> Duration {
-        Duration::from_millis(self.request_timeout_ms.unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS))
+        Duration::from_millis(
+            self.request_timeout_ms
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS),
+        )
     }
 
     /// Efektiivinen connect-timeout [`Duration`]:na (oletus täytetty).
     #[must_use]
     pub fn connect_timeout(&self) -> Duration {
-        Duration::from_millis(self.connect_timeout_ms.unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS))
+        Duration::from_millis(
+            self.connect_timeout_ms
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS),
+        )
     }
 }
 

@@ -50,9 +50,7 @@ pub trait HearthStore: familyclaw_memory::MemoryStore {
     fn set_thread(
         &self,
         thread: NarrativeThread,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<()>> + Send + '_>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
     /// Luo uuden narratiivisen langan.
     ///
@@ -62,9 +60,7 @@ pub trait HearthStore: familyclaw_memory::MemoryStore {
         &self,
         title: &str,
         participants: Vec<String>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Uuid>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Uuid>> + Send + '_>> {
         let thread = NarrativeThread::new(title, participants);
         Box::pin(async move {
             let id = thread.id;
@@ -84,9 +80,7 @@ pub trait HearthStore: familyclaw_memory::MemoryStore {
         content: &str,
         agent_id: &str,
         event_type: EventType,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Uuid>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Uuid>> + Send + '_>> {
         let event = ThreadEvent::new(thread_id, event_type, content, agent_id);
         Box::pin(async move {
             let Some(mut thread) = self.get_thread(thread_id).await? else {
@@ -107,25 +101,19 @@ pub trait HearthStore: familyclaw_memory::MemoryStore {
     fn get_emotional_state(
         &self,
         agent_id: &str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<EmotionalVector>> + Send + '_>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<EmotionalVector>> + Send + '_>>;
 
     /// Asettaa agentin tunnetilan.
     fn set_emotional_state(
         &self,
         agent_id: &str,
         state: EmotionalVector,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<()>> + Send + '_>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
     /// Listaa kaikki agentit joilla on tunnetila.
     fn list_agents_with_emotion(
         &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send + '_>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send + '_>>;
 }
 
 /// Kevyt muistinvarainen toteutus — käärii minkä tahansa `MemoryStore`:n.
@@ -154,18 +142,12 @@ impl<M: familyclaw_memory::MemoryStore> InMemoryHearthStore<M> {
     }
 }
 
-impl<M: familyclaw_memory::MemoryStore> familyclaw_memory::MemoryStore
-    for InMemoryHearthStore<M>
-{
+impl<M: familyclaw_memory::MemoryStore> familyclaw_memory::MemoryStore for InMemoryHearthStore<M> {
     fn add(
         &self,
         memory: familyclaw_memory::Memory,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<familyclaw_core::MessageId>>
-                + Send
-                + '_,
-        >,
+        Box<dyn std::future::Future<Output = Result<familyclaw_core::MessageId>> + Send + '_>,
     > {
         delegate_memory_store!(self, add, memory)
     }
@@ -175,10 +157,7 @@ impl<M: familyclaw_memory::MemoryStore> familyclaw_memory::MemoryStore
         id: familyclaw_core::MessageId,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<
-                    Output = Result<Option<familyclaw_memory::Memory>>,
-                > + Send
-                + '_,
+            dyn std::future::Future<Output = Result<Option<familyclaw_memory::Memory>>> + Send + '_,
         >,
     > {
         delegate_memory_store!(self, get, id)
@@ -187,9 +166,7 @@ impl<M: familyclaw_memory::MemoryStore> familyclaw_memory::MemoryStore
     fn update(
         &self,
         memory: familyclaw_memory::Memory,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<()>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         delegate_memory_store!(self, update, memory)
     }
 
@@ -197,9 +174,7 @@ impl<M: familyclaw_memory::MemoryStore> familyclaw_memory::MemoryStore
         &self,
         id: familyclaw_core::MessageId,
         at: familyclaw_core::Timestamp,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<()>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         delegate_memory_store!(self, reinforce, id, at)
     }
 
@@ -207,37 +182,27 @@ impl<M: familyclaw_memory::MemoryStore> familyclaw_memory::MemoryStore
         &self,
         id: familyclaw_core::MessageId,
         status: familyclaw_memory::MemoryStatus,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<()>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         delegate_memory_store!(self, set_status, id, status)
     }
 
     fn all(
         &self,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Vec<familyclaw_memory::Memory>>>
-                + Send
-                + '_,
-        >,
+        Box<dyn std::future::Future<Output = Result<Vec<familyclaw_memory::Memory>>> + Send + '_>,
     > {
         delegate_memory_store!(self, all)
     }
 
     fn len(
         &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<usize>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize>> + Send + '_>> {
         delegate_memory_store!(self, len)
     }
 
     fn is_empty(
         &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>> {
         delegate_memory_store!(self, is_empty)
     }
 
@@ -247,9 +212,8 @@ impl<M: familyclaw_memory::MemoryStore> familyclaw_memory::MemoryStore
         at: familyclaw_core::Timestamp,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<
-                    Output = Result<Vec<familyclaw_memory::RetrievalResult>>,
-                > + Send
+            dyn std::future::Future<Output = Result<Vec<familyclaw_memory::RetrievalResult>>>
+                + Send
                 + '_,
         >,
     > {
@@ -261,27 +225,18 @@ impl<M: familyclaw_memory::MemoryStore> familyclaw_memory::MemoryStore
         thresholds: familyclaw_memory::DecayThresholds,
         at: familyclaw_core::Timestamp,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<familyclaw_memory::DecayReport>,
-                > + Send
-                + '_,
-        >,
+        Box<dyn std::future::Future<Output = Result<familyclaw_memory::DecayReport>> + Send + '_>,
     > {
         delegate_memory_store!(self, run_decay, thresholds, at)
     }
 }
 
-impl<M: familyclaw_memory::MemoryStore + Send + Sync> HearthStore
-    for InMemoryHearthStore<M>
-{
+impl<M: familyclaw_memory::MemoryStore + Send + Sync> HearthStore for InMemoryHearthStore<M> {
     fn create_thread(
         &self,
         title: &str,
         participants: Vec<String>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Uuid>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Uuid>> + Send + '_>> {
         let title = title.to_string();
         Box::pin(async move {
             let thread = NarrativeThread::new(&title, participants);
@@ -297,21 +252,16 @@ impl<M: familyclaw_memory::MemoryStore + Send + Sync> HearthStore
         content: &str,
         agent_id: &str,
         event_type: EventType,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Uuid>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Uuid>> + Send + '_>> {
         let content = content.to_string();
         let agent_id = agent_id.to_string();
         Box::pin(async move {
-            let event =
-                ThreadEvent::new(thread_id, event_type, &content, &agent_id);
+            let event = ThreadEvent::new(thread_id, event_type, &content, &agent_id);
             let event_id = event.id;
             let mut threads = self.threads.write().await;
-            let thread = threads
-                .get_mut(&thread_id)
-                .ok_or_else(|| familyclaw_core::FamilyClawError::Memory(
-                    format!("thread {thread_id} not found")
-                ))?;
+            let thread = threads.get_mut(&thread_id).ok_or_else(|| {
+                familyclaw_core::FamilyClawError::Memory(format!("thread {thread_id} not found"))
+            })?;
             thread.add_event(event);
             Ok(event_id)
         })
@@ -321,11 +271,7 @@ impl<M: familyclaw_memory::MemoryStore + Send + Sync> HearthStore
         &self,
         thread_id: Uuid,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Option<NarrativeThread>>>
-                + Send
-                + '_,
-        >,
+        Box<dyn std::future::Future<Output = Result<Option<NarrativeThread>>> + Send + '_>,
     > {
         Box::pin(async move {
             let threads = self.threads.read().await;
@@ -336,9 +282,7 @@ impl<M: familyclaw_memory::MemoryStore + Send + Sync> HearthStore
     fn set_thread(
         &self,
         thread: NarrativeThread,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<()>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             self.threads.write().await.insert(thread.id, thread);
             Ok(())
@@ -348,9 +292,8 @@ impl<M: familyclaw_memory::MemoryStore + Send + Sync> HearthStore
     fn get_emotional_state(
         &self,
         agent_id: &str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<EmotionalVector>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<EmotionalVector>> + Send + '_>>
+    {
         let agent_id = agent_id.to_string();
         Box::pin(async move {
             let states = self.emotional_states.read().await;
@@ -365,9 +308,7 @@ impl<M: familyclaw_memory::MemoryStore + Send + Sync> HearthStore
         &self,
         agent_id: &str,
         state: EmotionalVector,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<()>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let agent_id = agent_id.to_string();
         Box::pin(async move {
             self.emotional_states
@@ -380,9 +321,7 @@ impl<M: familyclaw_memory::MemoryStore + Send + Sync> HearthStore
 
     fn list_agents_with_emotion(
         &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send + '_>> {
         Box::pin(async move {
             let states = self.emotional_states.read().await;
             Ok(states.keys().cloned().collect())
@@ -400,22 +339,12 @@ mod tests {
         let mem = LocalJsonStore::in_memory();
         let store = InMemoryHearthStore::new(mem);
 
-        let thread_id = HearthStore::create_thread(
-            &store,
-            "Test",
-            vec!["a".into()],
-        )
-        .await
-        .expect("create");
-        HearthStore::add_thread_event(
-            &store,
-            thread_id,
-            "hello",
-            "a",
-            EventType::MemoryCreated,
-        )
-        .await
-        .expect("add event");
+        let thread_id = HearthStore::create_thread(&store, "Test", vec!["a".into()])
+            .await
+            .expect("create");
+        HearthStore::add_thread_event(&store, thread_id, "hello", "a", EventType::MemoryCreated)
+            .await
+            .expect("add event");
 
         let thread = HearthStore::get_thread(&store, thread_id)
             .await
@@ -457,8 +386,7 @@ mod tests {
             .await
             .expect("is_empty"));
 
-        let m = familyclaw_memory::Memory::builder("test")
-            .build();
+        let m = familyclaw_memory::Memory::builder("test").build();
         let _id = familyclaw_memory::MemoryStore::add(&store, m)
             .await
             .expect("add");

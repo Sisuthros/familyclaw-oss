@@ -121,7 +121,7 @@ async fn run_write() -> Result<()> {
 
     let config_1 = AgentConfig::new("crash_agent", ModelConfig::new("provider/model"));
     let soul_1 = Soul::from_essence("I am crash_agent, testing durability.".to_string());
-    let durable_1 = DurableContext::new(Box::new(journal_1) as Box<dyn Journal + Send + Sync>)
+    let durable_1 = DurableContext::new(Arc::new(journal_1) as Arc<dyn Journal + Send + Sync>)
         .map_err(|e| FamilyClawError::bus(e.to_string()))?;
 
     let mut agent_1 = Agent::new(
@@ -246,7 +246,7 @@ async fn run_verify() -> Result<()> {
 
     let config_2 = AgentConfig::new("crash_agent", ModelConfig::new("provider/model"));
     let soul_2 = Soul::from_essence("I am crash_agent, continuing after restart.".to_string());
-    let durable_2 = DurableContext::new(Box::new(journal_2) as Box<dyn Journal + Send + Sync>)
+    let durable_2 = DurableContext::new(Arc::new(journal_2) as Arc<dyn Journal + Send + Sync>)
         .map_err(|e| FamilyClawError::bus(e.to_string()))?;
 
     // Check if we're in replay mode

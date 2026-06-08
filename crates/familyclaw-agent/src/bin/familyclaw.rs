@@ -51,7 +51,7 @@ fn build_agent(name: &str, bus: &BusHandle) -> Result<Agent> {
     ));
     let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
     let durable =
-        DurableContext::new(Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>)
+        DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
             .map_err(|e| FamilyClawError::bus(e.to_string()))?;
     Ok(Agent::new(
         config,

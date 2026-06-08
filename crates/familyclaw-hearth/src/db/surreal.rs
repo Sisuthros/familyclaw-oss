@@ -34,8 +34,7 @@ use familyclaw_memory::{
 };
 
 /// Tyyppieristetty future dyn-yhteensopivuutta varten (vrt. [`MemoryStore`]).
-type BoxFuture<'a, T> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Kääntää SurrealDB-virheen [`FamilyClawError::Memory`]:ksi.
 fn map_db_err(e: impl std::fmt::Display) -> FamilyClawError {
@@ -140,11 +139,7 @@ impl MemoryStore for SurrealHearthStore {
         })
     }
 
-    fn set_status(
-        &self,
-        id: MessageId,
-        status: MemoryStatus,
-    ) -> BoxFuture<'_, Result<()>> {
+    fn set_status(&self, id: MessageId, status: MemoryStatus) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let Some(mut memory) = self.get(id).await? else {
                 return Err(FamilyClawError::NotFound(format!("memory {id}")));
@@ -271,10 +266,7 @@ impl HearthStore for SurrealHearthStore {
         })
     }
 
-    fn get_thread(
-        &self,
-        thread_id: Uuid,
-    ) -> BoxFuture<'_, Result<Option<NarrativeThread>>> {
+    fn get_thread(&self, thread_id: Uuid) -> BoxFuture<'_, Result<Option<NarrativeThread>>> {
         Box::pin(async move {
             let mut res = self
                 .db
@@ -290,10 +282,7 @@ impl HearthStore for SurrealHearthStore {
         })
     }
 
-    fn get_emotional_state(
-        &self,
-        agent_id: &str,
-    ) -> BoxFuture<'_, Result<EmotionalVector>> {
+    fn get_emotional_state(&self, agent_id: &str) -> BoxFuture<'_, Result<EmotionalVector>> {
         let agent_id = agent_id.to_string();
         Box::pin(async move {
             let mut res = self

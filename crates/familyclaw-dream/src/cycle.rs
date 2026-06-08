@@ -86,7 +86,11 @@ where
     /// [`familyclaw_core::FamilyClawError`] jos muistitallennus epäonnistuu,
     /// tai durable-journalin lukuvirhe käännettynä
     /// [`familyclaw_core::FamilyClawError::Memory`]:ksi.
-    pub async fn run<J: Journal>(&self, journal: &J, at: Timestamp) -> Result<DreamReport> {
+    pub async fn run(
+        &self,
+        journal: &(dyn Journal + Send + Sync),
+        at: Timestamp,
+    ) -> Result<DreamReport> {
         let contradicted = if self.config.drop_contradicted {
             contradicted_ids(journal)
                 .map_err(|e| familyclaw_core::FamilyClawError::memory(e.to_string()))?

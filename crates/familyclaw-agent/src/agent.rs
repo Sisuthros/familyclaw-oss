@@ -61,7 +61,7 @@ pub fn new_reply_channel() -> (
 }
 
 /// Type-erased journal for trait-object-based agents.
-pub type ErasedJournal = Box<dyn Journal + Send + Sync>;
+pub type ErasedJournal = Arc<dyn Journal + Send + Sync>;
 
 /// Yhden vuoron (turn) lopputulos, joka kirjataan durable-lokiin
 /// deterministisesti. Pidetään pienenä ja sarjallistuvana, jotta replay on
@@ -862,7 +862,7 @@ mod tests {
         let soul = Soul::from_essence(format!("I am {name}, a generic example being."));
         let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
         let durable =
-            DurableContext::new(Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>)
+            DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
                 .expect("durable ctx");
         Agent::new(config, soul, memory, durable, bus, None, None)
     }
@@ -977,7 +977,7 @@ mod tests {
 
         let journal = {
             let durable = DurableContext::new(
-                Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>
+                Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>
             )
             .expect("ctx");
             let config = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
@@ -1210,10 +1210,18 @@ mod tests {
         let soul = Soul::from_essence("I am agent_a.");
         let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
         let durable =
-            DurableContext::new(Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>)
+            DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
                 .expect("durable");
         let llm_cfg = LlmConfig::new("http://localhost:9/v1", "k", "single-model");
-        let agent = Agent::new(config, soul, memory, durable, bus.clone(), Some(llm_cfg), None);
+        let agent = Agent::new(
+            config,
+            soul,
+            memory,
+            durable,
+            bus.clone(),
+            Some(llm_cfg),
+            None,
+        );
 
         let failover = agent.llm().expect("llm wired");
         assert_eq!(failover.len(), 1, "yksi config → 1-pituinen ketju");
@@ -1229,7 +1237,11 @@ mod tests {
         let bus = ResonanceBus::start(None).await.expect("bus");
         let resolver = EnvEndpointResolver::new()
             .with_provider("openai", "https://api.openai.com/v1", "OPENAI_API_KEY")
-            .with_provider("deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY");
+            .with_provider(
+                "deepseek",
+                "https://api.deepseek.com/v1",
+                "DEEPSEEK_API_KEY",
+            );
         let model = ModelConfig::new("openai/gpt-4o").with_fallback("deepseek/deepseek-v4-pro");
         let chain = build_llm_chain(&model, &resolver).expect("chain builds");
 
@@ -1261,10 +1273,14 @@ mod tests {
 
         // Muisto on tagattu session-tagilla → recall samalla vaaditulla tagilla
         // löytää sen.
-        let scoped = RetrievalContext::new("sessio-viesti")
-            .with_required_tags([origin.session_tag()]);
+        let scoped =
+            RetrievalContext::new("sessio-viesti").with_required_tags([origin.session_tag()]);
         let hits = agent.recall(&scoped).await.expect("recall scoped");
-        assert_eq!(hits.len(), 1, "session-tagilla suodatettu recall löytää muiston");
+        assert_eq!(
+            hits.len(),
+            1,
+            "session-tagilla suodatettu recall löytää muiston"
+        );
         assert!(hits[0].memory.tags.contains(&origin.session_tag()));
 
         bus.stop();
@@ -1287,7 +1303,7 @@ mod tests {
         // Sessio A kirjoittaa muiston jaettuun storeen.
         {
             let durable = DurableContext::new(
-                Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>,
+                Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>
             )
             .expect("durable");
             let mut agent_a = Agent::new(
@@ -1310,7 +1326,7 @@ mod tests {
         // ("agent_b") → eri turn_key → muisti-store ei deduplikoi sitä A:n
         // turn-0:n kanssa (dedup on per-agentti turn_key, ei per-sessio).
         let durable_b =
-            DurableContext::new(Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>)
+            DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
                 .expect("durable");
         let mut agent_b = Agent::new(
             AgentConfig::new("agent_b", ModelConfig::new("provider/model")),
@@ -1335,7 +1351,9 @@ mod tests {
             .with_required_tags([origin_b.session_tag()]);
         let b_sees = agent_b.recall(&b_scope).await.expect("recall b");
         assert!(
-            b_sees.iter().all(|r| !r.memory.content.contains("kanavasta A")),
+            b_sees
+                .iter()
+                .all(|r| !r.memory.content.contains("kanavasta A")),
             "B:n sessio ei saa nähdä A:n muistoa"
         );
 

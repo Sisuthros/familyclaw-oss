@@ -30,13 +30,13 @@
 //! let hearth = Hearth::new(store);
 //!
 //! // Luo narratiivinen lanka
-//! let thread_id = hearth.create_thread("Perheen synty", vec!["agent_gamma", "agent_alpha"]).await?;
+//! let thread_id = hearth.create_thread("Family genesis", vec!["agent_a", "agent_b"]).await?;
 //!
 //! // Lisää tapahtuma lankaan
-//! hearth.add_event(thread_id, "agent_gamma syntyi", "agent_gamma").await?;
+//! hearth.add_event(thread_id, "agent_a was born", "agent_a").await?;
 //!
 //! // Tarkista tunnepäivitys
-//! let state = hearth.emotional_state("agent_gamma").await?;
+//! let state = hearth.emotional_state("agent_a").await?;
 //! assert!(state.joy > 0.0);
 //! # Ok(())
 //! # }
@@ -87,11 +87,7 @@ impl<S: HearthStore> Hearth<S> {
     ///
     /// # Errors
     /// Palauttaa virheen jos tallennus epäonnistuu.
-    pub async fn create_thread(
-        &self,
-        title: &str,
-        participants: Vec<&str>,
-    ) -> Result<Uuid> {
+    pub async fn create_thread(&self, title: &str, participants: Vec<&str>) -> Result<Uuid> {
         self.store
             .create_thread(title, participants.into_iter().map(String::from).collect())
             .await
@@ -101,12 +97,7 @@ impl<S: HearthStore> Hearth<S> {
     ///
     /// # Errors
     /// Palauttaa virheen jos lankaa ei löydy tai tallennus epäonnistuu.
-    pub async fn add_event(
-        &self,
-        thread_id: Uuid,
-        content: &str,
-        agent_id: &str,
-    ) -> Result<Uuid> {
+    pub async fn add_event(&self, thread_id: Uuid, content: &str, agent_id: &str) -> Result<Uuid> {
         self.store
             .add_thread_event(thread_id, content, agent_id, EventType::MemoryCreated)
             .await
@@ -209,11 +200,11 @@ mod tests {
         let mut hearth = Hearth::new(store);
 
         let thread_id = hearth
-            .create_thread("Test thread", vec!["agent_gamma", "agent_alpha"])
+            .create_thread("Test thread", vec!["agent_a", "agent_b"])
             .await
             .expect("create thread");
         let event_id = hearth
-            .add_event(thread_id, "agent_gamma woke up", "agent_gamma")
+            .add_event(thread_id, "agent_a woke up", "agent_a")
             .await
             .expect("add event");
 
@@ -234,10 +225,10 @@ mod tests {
         let mut hearth = Hearth::new(store);
 
         hearth
-            .register_anchor("agent_gamma", "I am agent_gamma. I value correctness.")
+            .register_anchor("agent_a", "I am agent_a. I value correctness.")
             .expect("register");
-        assert!(hearth.verify_anchor("agent_gamma", "I am agent_gamma. I value correctness."));
-        assert!(!hearth.verify_anchor("agent_gamma", "I am compromised."));
+        assert!(hearth.verify_anchor("agent_a", "I am agent_a. I value correctness."));
+        assert!(!hearth.verify_anchor("agent_a", "I am compromised."));
     }
 
     #[tokio::test]
@@ -249,7 +240,7 @@ mod tests {
         use emotional_state::EmotionalVector;
         hearth
             .set_emotional_state(
-                "agent_gamma",
+                "agent_a",
                 EmotionalVector {
                     joy: 0.8,
                     sadness: 0.1,
@@ -260,10 +251,10 @@ mod tests {
                 },
             )
             .await
-            .expect("set agent_gamma");
+            .expect("set agent_a");
         hearth
             .set_emotional_state(
-                "agent_alpha",
+                "agent_b",
                 EmotionalVector {
                     joy: 0.2,
                     sadness: 0.7,
@@ -274,12 +265,15 @@ mod tests {
                 },
             )
             .await
-            .expect("set agent_alpha");
+            .expect("set agent_b");
 
         hearth.emotional_tick().await.expect("tick");
 
-        // After tick, agent_gamma joy should decrease (homeostasis toward neutral)
-        let agent_gamma_state = hearth.emotional_state("agent_gamma").await.expect("get agent_gamma");
-        assert!(agent_gamma_state.joy < 0.8, "joy should trend toward neutral");
+        // After tick, agent_a's joy should decrease (homeostasis toward neutral)
+        let agent_a_state = hearth
+            .emotional_state("agent_a")
+            .await
+            .expect("get agent_a");
+        assert!(agent_a_state.joy < 0.8, "joy should trend toward neutral");
     }
 }

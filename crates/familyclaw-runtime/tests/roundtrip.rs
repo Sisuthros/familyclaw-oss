@@ -14,7 +14,7 @@
 //!                                                              └─► MockChannel.outbox
 //! ```
 //!
-//! Tämä on "agent_epsilon lähettää 1. viestin" -ekvivalentti: yksi inbound-viesti
+//! Tämä on "generinen agentti lähettää 1. viestin" -ekvivalentti: yksi inbound-viesti
 //! tuottaa yhden ulosmenevän vastauksen oikealla kohteella, ja vastauksen
 //! sisältö on TASAN se mitä mock-LLM palautti (ei satunnaisuutta, ei verkkoa
 //! ulos testistä).
@@ -28,6 +28,7 @@
 //! ulkoista API:a.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::routing::post;
@@ -87,7 +88,10 @@ async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
     let outbox_probe = channel.clone();
 
     channel
-        .inject(InboundMessage::new("the operator-id", "agent_epsilon-chat", "agent_epsilon, oletko siellä?").expect("inbound"))
+        .inject(
+            InboundMessage::new("the operator-id", "agent_epsilon-chat", "generic being, are you there?")
+                .expect("inbound"),
+        )
         .expect("inject");
     // Sulje saapuva virta: puskuroitu viesti kulutetaan, sitten pumppu päättyy
     // deterministisesti (ei riipu ajastuksesta).
@@ -96,11 +100,8 @@ async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
     // 3. Resolveri osoittaa provider-prefiksin "mock" mock-LLM:n base-URL:ään.
     //    Avain luetaan env-muuttujasta jota EI ole asetettu → tyhjä Bearer,
     //    mutta mock ei tarkista auth:ia. (KERROS A: ei kovakoodattua avainta.)
-    let resolver = EnvEndpointResolver::new().with_provider(
-        "mock",
-        api_base,
-        "FAMILYCLAW_MOCK_LLM_KEY_UNSET",
-    );
+    let resolver =
+        EnvEndpointResolver::new().with_provider("mock", api_base, "FAMILYCLAW_MOCK_LLM_KEY_UNSET");
 
     // 4. Agentti käyttää mallia "mock/agent_epsilon" → resolveri ratkaisee sen
     //    mock-LLM:ään → Agent saa Some(llm) → think() tuottaa kiinteän tekstin.
@@ -116,7 +117,7 @@ async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
         Some("roundtrip-bus".to_string()),
         agent_cfg,
         soul,
-        Box::new(channel) as Box<dyn Channel>,
+        Box::new(channel),
         reply_target.clone(),
         &resolver,
     )
@@ -124,7 +125,11 @@ async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
     .expect("build_family");
 
     // Bus elossa + agentti rekisteröity (sama valmius jonka /readyz raportoi).
-    assert_eq!(runtime.bus().count().await.expect("count"), 1, "agentti busissa");
+    assert_eq!(
+        runtime.bus().count().await.expect("count"),
+        1,
+        "agentti busissa"
+    );
 
     // 7. Odota että ketju ehtii: pump → handle_turn → think (HTTP) → route_reply
     //    → drain → Channel::send. Pollaa outboxia (max ~3s) sen sijaan että
@@ -202,7 +207,7 @@ async fn dead_primary_fails_over_to_live_fallback() {
         Some("failover-bus".to_string()),
         agent_cfg,
         soul,
-        Box::new(channel) as Box<dyn Channel>,
+        Box::new(channel),
         reply_target.clone(),
         &resolver,
     )
@@ -220,7 +225,11 @@ async fn dead_primary_fails_over_to_live_fallback() {
     }
 
     // 6. TODISTE: vastaus tuli silti läpi (fallbackin kautta), oikealla kohteella.
-    assert_eq!(sent.len(), 1, "kuollut primary → failover fallbackiin → yksi vastaus");
+    assert_eq!(
+        sent.len(),
+        1,
+        "kuollut primary → failover fallbackiin → yksi vastaus"
+    );
     assert_eq!(sent[0].target, reply_target, "vastaus oikeaan keskusteluun");
     assert_eq!(
         sent[0].body, FIXED_LLM_REPLY,
@@ -298,7 +307,7 @@ async fn timeout_primary_fails_over_to_live_fallback() {
         Some("timeout-failover-bus".to_string()),
         agent_cfg,
         soul,
-        Box::new(channel) as Box<dyn Channel>,
+        Box::new(channel),
         reply_target.clone(),
         &resolver,
     )
@@ -374,7 +383,7 @@ async fn two_origins_route_replies_to_correct_targets_no_leak() {
     let chain = build_llm_chain(&model, &resolver).expect("chain builds");
     let memory: Arc<dyn MemoryStore + Send + Sync> = Arc::new(LocalJsonStore::in_memory());
     let durable =
-        DurableContext::new(Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>)
+        DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
             .expect("durable");
     let agent = Agent::new(
         AgentConfig::new("agent_epsilon", model),
@@ -444,7 +453,7 @@ async fn without_llm_no_reply_is_emitted() {
         None,
         agent_cfg,
         soul,
-        Box::new(channel) as Box<dyn Channel>,
+        Box::new(channel),
         "c".to_string(),
         &resolver,
     )
@@ -482,7 +491,7 @@ async fn inbound_reaches_agent_over_bus() {
         None,
         agent_cfg,
         soul,
-        Box::new(channel) as Box<dyn Channel>,
+        Box::new(channel),
         "c".to_string(),
         &resolver,
     )

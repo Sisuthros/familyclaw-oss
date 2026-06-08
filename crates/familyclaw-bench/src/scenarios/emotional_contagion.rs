@@ -168,36 +168,50 @@ impl Scenario for EmotionalContagion {
 
         // ── 6. Testaa muistin eristys ──────────────────────────────────────
         // agent_a "näkee" viestin → muistaa sen. agent_b EI saa nähdä agent_a:n muistoja.
-        let mem_a = familyclaw_memory::Memory::builder("agent_a saw: the family shipped the feature")
-            .source("agent_a")
-            .created_at(clock)
-            .build();
-        store_a.add(mem_a).await
+        let mem_a =
+            familyclaw_memory::Memory::builder("agent_a saw: the family shipped the feature")
+                .source("agent_a")
+                .created_at(clock)
+                .build();
+        store_a
+            .add(mem_a)
+            .await
             .map_err(|e| crate::BenchError::scenario(format!("add mem a: {e}")))?;
 
         let mem_b = familyclaw_memory::Memory::builder("agent_b saw: the weather is sunny")
             .source("agent_b")
             .created_at(clock)
             .build();
-        store_b.add(mem_b).await
+        store_b
+            .add(mem_b)
+            .await
             .map_err(|e| crate::BenchError::scenario(format!("add mem b: {e}")))?;
 
         // agent_a hakee "feature" → löytää omansa
         let ctx_a = RetrievalContext::new("feature").with_limit(5);
-        let hits_a = store_a.retrieve(&ctx_a, clock).await
+        let hits_a = store_a
+            .retrieve(&ctx_a, clock)
+            .await
             .map_err(|e| crate::BenchError::scenario(format!("retrieve a: {e}")))?;
 
         // agent_b hakee "weather" → löytää omansa, EI agent_a:n muistoja
         let ctx_b = RetrievalContext::new("weather").with_limit(5);
-        let hits_b = store_b.retrieve(&ctx_b, clock).await
+        let hits_b = store_b
+            .retrieve(&ctx_b, clock)
+            .await
             .map_err(|e| crate::BenchError::scenario(format!("retrieve b: {e}")))?;
 
-        let a_remembers = hits_a.iter().any(|h| h.memory.content.contains("family shipped"));
-        let b_isolated = !hits_b.iter().any(|h| h.memory.content.contains("family shipped"));
+        let a_remembers = hits_a
+            .iter()
+            .any(|h| h.memory.content.contains("family shipped"));
+        let b_isolated = !hits_b
+            .iter()
+            .any(|h| h.memory.content.contains("family shipped"));
         let b_remembers_own = hits_b.iter().any(|h| h.memory.content.contains("weather"));
         let a_isolated_from_b = !hits_a.iter().any(|h| h.memory.content.contains("weather"));
 
-        let memory_isolation_works = a_remembers && b_isolated && b_remembers_own && a_isolated_from_b;
+        let memory_isolation_works =
+            a_remembers && b_isolated && b_remembers_own && a_isolated_from_b;
 
         // ── 7. Elävyyskoe: subjektin recall ────────────────────────────────
         let subject_hits = subject.recall("emotion", clock).await?;
@@ -207,8 +221,7 @@ impl Scenario for EmotionalContagion {
         let homeostasis_score = if homeostasis_works { 1.0 } else { 0.0 };
         let isolation_score = if memory_isolation_works { 1.0 } else { 0.0 };
 
-        let passed =
-            contagion_works && homeostasis_works && memory_isolation_works;
+        let passed = contagion_works && homeostasis_works && memory_isolation_works;
 
         let result = ScenarioResult::new(Self::ID, passed)
             .with_metric("contagion_correct", contagion_score)

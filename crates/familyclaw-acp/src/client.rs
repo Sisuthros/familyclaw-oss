@@ -47,7 +47,7 @@ impl AcpClient {
     ///
     /// # Errors
     /// [`AcpError::Spawn`] jos binääriä ei löydy tai prosessi ei käynnisty.
-    pub async fn spawn(config: &AcpAgentConfig) -> Result<Self, AcpError> {
+    pub fn spawn(config: &AcpAgentConfig) -> Result<Self, AcpError> {
         let mut cmd = Command::new(&config.binary);
 
         // ACP-moodi päälle

@@ -48,7 +48,7 @@
 //! let config = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
 //! let soul = Soul::from_essence("I am agent_a, a generic example being.");
 //! let memory = Arc::new(LocalJsonStore::in_memory());
-//! let durable = DurableContext::new(Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>)
+//! let durable = DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
 //!     .map_err(|e| familyclaw_core::FamilyClawError::bus(e.to_string()))?;
 //!
 //! let mut agent = Agent::new(config, soul, memory, durable, bus.clone(), None, None);
@@ -69,9 +69,7 @@ pub mod llm_chain;
 pub mod session;
 pub mod soul;
 
-pub use agent::{
-    new_reply_channel, Agent, AgentActor, ErasedMemoryStore, ReplySink, TurnOutcome,
-};
+pub use agent::{new_reply_channel, Agent, AgentActor, ErasedMemoryStore, ReplySink, TurnOutcome};
 pub use channel_bridge::{
     envelope_origin, envelope_to_bus_message, publish_envelope, pump_channel_to_bus,
 };

@@ -136,7 +136,7 @@ pub async fn build_family(
     // 4. Muisti (Eternal Thread, in-memory MVP) + durable-konteksti.
     let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
     let durable =
-        DurableContext::new(Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>)
+        DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
             .map_err(|e| FamilyClawError::bus(e.to_string()))?;
 
     // 5. Rakenna agentti ja kytke reply-sink + staattinen reply-kohde.

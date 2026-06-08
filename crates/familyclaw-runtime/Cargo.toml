@@ -18,6 +18,7 @@ familyclaw-agent = { workspace = true }
 familyclaw-channels = { workspace = true }
 familyclaw-memory = { workspace = true }
 familyclaw-durable = { workspace = true }
+familyclaw-dream = { workspace = true }
 ractor = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

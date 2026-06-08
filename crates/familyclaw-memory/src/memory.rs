@@ -428,6 +428,7 @@ pub struct MemoryBuilder {
     tags: Vec<String>,
     source: String,
     turn_key: Option<String>,
+    embedding: Option<Vec<f32>>,
     // verification-gated -kentät
     verification_status: VerificationStatus,
     evidence: Vec<Evidence>,
@@ -450,6 +451,7 @@ impl MemoryBuilder {
             turn_key: None,
             // verification-gated -oletukset: uusi muisto alkaa varmistamattomana väitteenä
             verification_status: VerificationStatus::Claim,
+            embedding: None,
             evidence: Vec::new(),
             pattern_key: None,
         }
@@ -519,6 +521,13 @@ impl MemoryBuilder {
         self
     }
 
+    /// Asettaa upotusvektorin semanttista haun varten.
+    #[must_use]
+    pub fn embedding(mut self, embedding: impl Into<Vec<f32>>) -> Self {
+        self.embedding = Some(embedding.into());
+        self
+    }
+
     /// Viimeistelee muiston: generoi tunnisteen, asettaa aikaleimat ja
     /// laskee tärkeyden osatekijöistä. Tila on aina [`MemoryStatus::Active`].
     #[must_use]
@@ -539,6 +548,7 @@ impl MemoryBuilder {
             source: self.source,
             status: MemoryStatus::Active,
             turn_key: self.turn_key,
+            embedding: self.embedding,
             verification_status: self.verification_status,
             confidence: 0.0, // Asetetaan promote-logiikalla add_evidence()-kutsujen kautta
             evidence: self.evidence,

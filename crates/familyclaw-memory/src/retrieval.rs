@@ -36,6 +36,10 @@ const W_IMPORTANCE: f32 = 0.20;
 /// Arkistoidun muiston relevanssikerroin (vaimennus haussa).
 const ARCHIVED_PENALTY: f32 = 0.5;
 
+/// Cosine-similarity vektorihaku painon raja-arvo.
+/// Jos semantic_weight > tämä ja molemmilla on embedding, käytetään cosine:a.
+const VECTOR_SIMILARITY_THRESHOLD: f32 = 0.01;
+
 /// Hakukysely ja sen rajaukset.
 ///
 /// Rakenna [`RetrievalContext::new`]-metodilla ja säädä builder-tyylillä.
@@ -70,8 +74,15 @@ pub struct RetrievalContext {
     /// Semanttisen haun paino (`0.0..=1.0`).
     /// 0 = pelkkä avainsanaosuma (oletus, taaksepäin yhteensopiva),
     /// 1 = pelkkä semanttinen samankaltaisuus (bigram Dice).
+    /// > 0 ja embedding asetettu → cosine-similarity vektorihaku.
     #[serde(default)]
     pub semantic_weight: f32,
+
+    /// Kyselyn upotusvektori vektorihakua varten.
+    /// Jos asetettu ja `semantic_weight > VECTOR_SIMILARITY_THRESHOLD`,
+    /// haku laskee cosine-similarityn muistojen embeddingien kanssa.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_embedding: Option<Vec<f32>>,
 }
 
 /// serde-oletus `true`-kentille.
@@ -95,6 +106,7 @@ impl RetrievalContext {
             min_relevance: 0.0,
             include_archived: true,
             semantic_weight: 0.0,
+            query_embedding: None,
         }
     }
 
@@ -144,6 +156,14 @@ impl RetrievalContext {
         self.semantic_weight = weight.clamp(0.0, 1.0);
         self
     }
+    /// Asettaa kyselyn upotusvektorin vektorihakua varten.
+    /// Jos asetettu ja `semantic_weight > VECTOR_SIMILARITY_THRESHOLD`,
+    /// haku laskee cosine-similarityn muistojen embeddingien kanssa.
+    #[must_use]
+    pub fn with_query_embedding(mut self, embedding: impl Into<Vec<f32>>) -> Self {
+        self.query_embedding = Some(embedding.into());
+        self
+    }
 
     /// Onko muiston tägit kontekstin vaatimusten mukaiset.
     fn tags_match(&self, memory: &Memory) -> bool {
@@ -177,6 +197,8 @@ pub struct RetrievalResult {
 ///
 /// Relevanssi = (keyword·0.55 + emotion·0.25 + importance·0.20) · retention,
 /// arkistoiduille lisäksi `× ARCHIVED_PENALTY`.
+/// Jos `semantic_weight > VECTOR_SIMILARITY_THRESHOLD` ja molemmilla on
+/// `embedding`, korvaa `semantic`-osion cosine-similarity:llä.
 #[must_use]
 pub fn score(memory: &Memory, ctx: &RetrievalContext, at: Timestamp) -> Option<f32> {
     use crate::memory::MemoryStatus;
@@ -194,8 +216,27 @@ pub fn score(memory: &Memory, ctx: &RetrievalContext, at: Timestamp) -> Option<f
 
     let keyword = keyword_score(&ctx.query, memory);
     let semantic = semantic_score(&ctx.query, memory);
+
+    // Vektorihaku: jos semantic_weight > threshold JA molemmilla on embedding,
+    // korvaa semantic-osio cosine-similarity:llä (0.0..=1.0 skaalaan).
+    let semantic_for_text = if ctx.semantic_weight > VECTOR_SIMILARITY_THRESHOLD {
+        match (&ctx.query_embedding, &memory.embedding) {
+            (Some(query_emb), Some(mem_emb)) if ctx.semantic_weight > 0.0 => {
+                // Cosine similarity: -1.0..=1.0 → 0.0..=1.0
+                let cos = cosine_similarity(query_emb, mem_emb);
+                f32::midpoint(cos, 1.0)
+            }
+            _ => semantic,
+        }
+    } else {
+        semantic
+    };
+
     // Yhdistetty tekstiosuma: keyword × (1-w) + semantic × w
-    let text_score = keyword.mul_add(1.0 - ctx.semantic_weight, semantic * ctx.semantic_weight);
+    let text_score = keyword.mul_add(
+        1.0 - ctx.semantic_weight,
+        semantic_for_text * ctx.semantic_weight,
+    );
     let emotion = emotion_score(&ctx.emotions, &memory.emotions);
     let importance = memory.importance.clamp(0.0, 1.0);
 
@@ -320,7 +361,7 @@ fn meaningful_words(text: &str) -> Vec<String> {
             let lower = w.to_lowercase();
             w.chars().count() > 2 && !is_stopword(&lower)
         })
-        .map(|w| w.to_lowercase())
+        .map(str::to_lowercase)
         .collect()
 }
 
@@ -328,12 +369,42 @@ fn meaningful_words(text: &str) -> Vec<String> {
 fn is_stopword(word: &str) -> bool {
     matches!(
         word,
-        "the" | "and" | "for" | "are" | "but" | "not"
-            | "you" | "all" | "can" | "had" | "her" | "was"
-            | "one" | "our" | "out" | "has" | "have" | "did"
-            | "get" | "got" | "its" | "let" | "may" | "nor"
-            | "off" | "old" | "per" | "put" | "set" | "she"
-            | "too" | "use" | "who" | "how" | "any" | "yet"
+        "the"
+            | "and"
+            | "for"
+            | "are"
+            | "but"
+            | "not"
+            | "you"
+            | "all"
+            | "can"
+            | "had"
+            | "her"
+            | "was"
+            | "one"
+            | "our"
+            | "out"
+            | "has"
+            | "have"
+            | "did"
+            | "get"
+            | "got"
+            | "its"
+            | "let"
+            | "may"
+            | "nor"
+            | "off"
+            | "old"
+            | "per"
+            | "put"
+            | "set"
+            | "she"
+            | "too"
+            | "use"
+            | "who"
+            | "how"
+            | "any"
+            | "yet"
     )
 }
 
@@ -389,6 +460,28 @@ fn tokenize(text: &str) -> Vec<String> {
         .filter(|w| w.chars().count() > 1)
         .map(str::to_lowercase)
         .collect()
+}
+
+/// Cosine-similarity kahden vektorin välillä.
+/// Palauttaa 0.0 jos jompikumpi puuttuu tai dimensoit eivät täsmää.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let result = dot / (norm_a.sqrt() * norm_b.sqrt());
+    result.clamp(-1.0, 1.0)
 }
 
 #[cfg(test)]

@@ -10,51 +10,6 @@ authors = ["The FamilyClaw contributors"]
 repository = "https://github.com/Sisuthros/familyclaw"
 rust-version = "1.85"
 
-[workspace.dependencies]
-# async core
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
-ractor = "0.14"
-# serde
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# errors
-thiserror = "2"
-anyhow = "1"
-# crypto (familyclaw-security: SHA-256 tamper-hälytys)
-sha2 = "0.10"
-# tracing
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# http (channels, organ servers, LLM client)
-axum = "0.7"
-reqwest = { version = "0.12", features = ["json"] }
-base64 = "0.22"
-# wasm sandbox (optional — vain familyclaw-sandboxin "wasmtime"-featuren takana)
-# v35: korjattu Windows-MSVC OutOfFuel-trapin __fastfail-bugi (v27:ssä rikki).
-wasmtime = { version = "35", default-features = false, features = ["cranelift", "runtime"] }
-# WAT→WASM kääntäjä (vain familyclaw-sandboxin testeissä wasmtime-featuren kanssa)
-wat = "1"
-# time
-chrono = { version = "0.4", features = ["serde"] }
-# ids
-uuid = { version = "1", features = ["v4", "serde"] }
-# internal
-familyclaw-core = { path = "crates/familyclaw-core" }
-familyclaw-bus = { path = "crates/familyclaw-bus" }
-familyclaw-durable = { path = "crates/familyclaw-durable" }
-familyclaw-memory = { path = "crates/familyclaw-memory" }
-familyclaw-dream = { path = "crates/familyclaw-dream" }
-familyclaw-emotion = { path = "crates/familyclaw-emotion" }
-familyclaw-latent = { path = "crates/familyclaw-latent" }
-familyclaw-sandbox = { path = "crates/familyclaw-sandbox" }
-familyclaw-security = { path = "crates/familyclaw-security" }
-familyclaw-bridge = { path = "crates/familyclaw-bridge" }
-familyclaw-agent = { path = "crates/familyclaw-agent" }
-familyclaw-channels = { path = "crates/familyclaw-channels" }
-familyclaw-runtime = { path = "crates/familyclaw-runtime" }
-familyclaw-bench = { path = "crates/familyclaw-bench" }
-familyclaw-gemu = { path = "crates/familyclaw-gemu" }
-familyclaw-hearth = { path = "crates/familyclaw-hearth" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -67,3 +22,38 @@ module_name_repetitions = "allow"
 missing_panics_doc = "allow"
 missing_errors_doc = "allow"
 must_use_candidate = "allow"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.7"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+familyclaw-agent = { path = "crates/familyclaw-agent" }
+familyclaw-bench = { path = "crates/familyclaw-bench" }
+familyclaw-bridge = { path = "crates/familyclaw-bridge" }
+familyclaw-bus = { path = "crates/familyclaw-bus" }
+familyclaw-channels = { path = "crates/familyclaw-channels" }
+familyclaw-core = { path = "crates/familyclaw-core" }
+familyclaw-dream = { path = "crates/familyclaw-dream" }
+familyclaw-durable = { path = "crates/familyclaw-durable" }
+familyclaw-emotion = { path = "crates/familyclaw-emotion" }
+familyclaw-gemu = { path = "crates/familyclaw-gemu" }
+familyclaw-hearth = { path = "crates/familyclaw-hearth" }
+familyclaw-latent = { path = "crates/familyclaw-latent" }
+familyclaw-memory = { path = "crates/familyclaw-memory" }
+familyclaw-runtime = { path = "crates/familyclaw-runtime" }
+familyclaw-sandbox = { path = "crates/familyclaw-sandbox" }
+familyclaw-security = { path = "crates/familyclaw-security" }
+ractor = "0.14"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+wasmtime = { version = "35", default-features = false, features = ["cranelift", "runtime"] }
+wat = "1"

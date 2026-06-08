@@ -99,10 +99,22 @@ pub enum EntryKind {
     ///
     /// [`DurableError::NondeterministicReplay`]: crate::DurableError::NondeterministicReplay
     Marker {
-        /// Markerin looginen nimi (esim. `"memory_contradicted"`).
+        /// Markerin looginen nimi (esim. "memory_contradicted").
         name: String,
         /// Vapaamuotoinen JSON-hyötykuorma.
         payload: serde_json::Value,
+    },
+
+    /// Sessiotilan tallennus (session persistence) - marker-tietue joka
+    /// tallentaa viestin alkup. (MessageOrigin) jotta sessio voidaan
+    /// palauttaa replayssa/startupissa.
+    SessionState {
+        /// Kanavainstanssin tunniste.
+        channel_id: String,
+        /// Keskustelun/ryhmän tunniste.
+        conversation: String,
+        /// Kanavakohtainen lähettäjän tunniste (auditointi).
+        sender: String,
     },
 }
 
@@ -118,7 +130,9 @@ impl EntryKind {
             EntryKind::StepCompleted { name, .. } | EntryKind::StepFailed { name, .. } => {
                 Some(name.as_str())
             }
-            EntryKind::Snapshot { .. } | EntryKind::Marker { .. } => None,
+            EntryKind::Snapshot { .. }
+            | EntryKind::Marker { .. }
+            | EntryKind::SessionState { .. } => None,
         }
     }
 
@@ -129,9 +143,16 @@ impl EntryKind {
     }
 
     /// Onko rivi marker (workflow-askeleen ulkopuolinen annotaatio).
+    ///
+    /// SessionState tallennetaan muistinvaraisesti marker-kategorian alla
+    /// jotta se suodatetaan replay-kursorista pois, mutta säilyy journalissa
+    /// startup-kirjoittamiseen.
     #[must_use]
     pub const fn is_marker(&self) -> bool {
-        matches!(self, EntryKind::Marker { .. })
+        matches!(
+            self,
+            EntryKind::Marker { .. } | EntryKind::SessionState { .. }
+        )
     }
 
     /// Onko rivi **workflow-askel** (valmistunut tai epäonnistunut).
@@ -222,10 +243,45 @@ impl JournalEntry {
         )
     }
 
+    /// Rakentaa sessiotilan tallennusrivin.
+    ///
+    /// SessionState on marker-tietue (ei workflow-askel) jotta se ei häiritse
+    /// replay-kursoria. Tallentaa MessageOrigin-tiedot jotta sessio voidaan
+    /// palauttaa startupissa tai replayssa.
+    #[must_use]
+    pub fn session_state_entry(
+        step_id: StepId,
+        channel_id: impl Into<String>,
+        conversation: impl Into<String>,
+        sender: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            step_id,
+            EntryKind::SessionState {
+                channel_id: channel_id.into(),
+                conversation: conversation.into(),
+                sender: sender.into(),
+            },
+        )
+    }
+
     /// Palauttaa rivin askeleen nimen jos sellainen on.
     #[must_use]
     pub fn step_name(&self) -> Option<&str> {
         self.kind.step_name()
+    }
+
+    /// Hakee SessionState jos rivin laji on SessionState.
+    #[must_use]
+    pub fn session_state(&self) -> Option<(&str, &str, &str)> {
+        match &self.kind {
+            EntryKind::SessionState {
+                channel_id,
+                conversation,
+                sender,
+            } => Some((channel_id, conversation, sender)),
+            _ => None,
+        }
     }
 }
 

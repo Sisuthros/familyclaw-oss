@@ -466,8 +466,8 @@ mod tests {
     #[test]
     fn with_origin_attaches_per_message_origin() {
         let origin = MessageOrigin::new("discord-main", "general", "user-42");
-        let env =
-            ResonanceMessage::new(BeingId::new(), BusMessage::text("ulkoa")).with_origin(origin.clone());
+        let env = ResonanceMessage::new(BeingId::new(), BusMessage::text("ulkoa"))
+            .with_origin(origin.clone());
         assert_eq!(env.origin(), Some(&origin));
         assert_eq!(env.origin().expect("origin").reply_target(), "general");
     }

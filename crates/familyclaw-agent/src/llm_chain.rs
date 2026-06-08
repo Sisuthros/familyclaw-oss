@@ -315,7 +315,11 @@ mod tests {
     fn test_resolver() -> EnvEndpointResolver {
         EnvEndpointResolver::new()
             .with_provider("openai", "https://api.openai.com/v1", "OPENAI_API_KEY")
-            .with_provider("deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY")
+            .with_provider(
+                "deepseek",
+                "https://api.deepseek.com/v1",
+                "DEEPSEEK_API_KEY",
+            )
             .with_provider("opencode", "https://opencode.ai/zen/v1", "OPENCODE_API_KEY")
     }
 
@@ -325,7 +329,10 @@ mod tests {
             EnvEndpointResolver::split("openai/gpt-4o"),
             ("openai", "gpt-4o")
         );
-        assert_eq!(EnvEndpointResolver::split("bare-model"), ("bare-model", "bare-model"));
+        assert_eq!(
+            EnvEndpointResolver::split("bare-model"),
+            ("bare-model", "bare-model")
+        );
     }
 
     #[test]
@@ -339,7 +346,9 @@ mod tests {
     #[test]
     fn resolver_rejects_unknown_provider() {
         let r = test_resolver();
-        let err = r.resolve("mystery/model").expect_err("unknown provider rejected");
+        let err = r
+            .resolve("mystery/model")
+            .expect_err("unknown provider rejected");
         assert!(matches!(err, FamilyClawError::Config(_)));
     }
 

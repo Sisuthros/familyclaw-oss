@@ -83,8 +83,8 @@ fn id_from_entry(entry: &JournalEntry) -> Option<MessageId> {
 /// # Errors
 /// Palauttaa [`familyclaw_durable::DurableError`]:n jos journalia ei voi
 /// lukea.
-pub fn contradicted_ids<J: Journal>(
-    journal: &J,
+pub fn contradicted_ids(
+    journal: &(dyn Journal + Send + Sync),
 ) -> familyclaw_durable::Result<BTreeSet<MessageId>> {
     let entries = journal.replay_all()?;
     Ok(entries.iter().filter_map(id_from_entry).collect())

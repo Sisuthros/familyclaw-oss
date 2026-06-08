@@ -78,8 +78,7 @@ impl SharedEmotionalState {
 
     /// Asettaa agentin tunnetilan.
     pub fn set(&mut self, agent_id: &str, state: EmotionalVector) {
-        self.agents
-            .insert(agent_id.to_string(), state.clamped());
+        self.agents.insert(agent_id.to_string(), state.clamped());
     }
 
     /// Palauttaa agentin tunnetilan, tai neutraalin jos ei löydy.
@@ -103,7 +102,10 @@ impl SharedEmotionalState {
             return;
         };
         let w = weight.clamp(0.0, 1.0);
-        let target = self.agents.entry(to.to_string()).or_insert_with(EmotionalVector::neutral);
+        let target = self
+            .agents
+            .entry(to.to_string())
+            .or_insert_with(EmotionalVector::neutral);
 
         target.joy += (source.joy - target.joy) * w;
         target.sadness += (source.sadness - target.sadness) * w;
@@ -180,7 +182,7 @@ mod tests {
 
         state.contagion("agent_gamma", "agent_alpha", 0.5);
         let agent_alpha = state.get("agent_alpha").expect("agent_alpha exists");
-        // agent_alpha joy nousi agent_gamma korkeasta ilosta
+        // agent_b:n joy nousi agent_a:n korkeasta ilosta
         assert!(agent_alpha.joy > 0.5, "contagion should spread joy");
         assert!(agent_alpha.joy < 0.9, "but not fully match source");
     }
@@ -208,7 +210,10 @@ mod tests {
         let final_state = state.get("agent").expect("agent exists");
         // Ääripäät lähestyvät neutraalia 0.5
         assert!(final_state.joy < 0.95, "high emotions should trend down");
-        assert!(final_state.confidence > 0.05, "low emotions should trend up");
+        assert!(
+            final_state.confidence > 0.05,
+            "low emotions should trend up"
+        );
     }
 
     #[test]
@@ -226,9 +231,12 @@ mod tests {
         // Ei contagion-tickiä — tilat pysyvät erillään
         state.homeostasis("agent_alpha");
         let agent_alpha = state.get("agent_alpha").expect("agent_alpha exists");
-        // Ilman contagionia agent_alpha pysyy neutraalina (homeostasis vie kohti 0.5)
+        // Ilman contagionia agent_b pysyy neutraalina (homeostasis vie kohti 0.5)
         // Joy oli 0.5, homeostasis siirtää kohti 0.5 → pysyy 0.5
-        assert!((agent_alpha.joy - 0.5).abs() < 0.01, "without contagion, agent stays neutral");
+        assert!(
+            (agent_alpha.joy - 0.5).abs() < 0.01,
+            "without contagion, agent stays neutral"
+        );
     }
 
     #[test]
@@ -256,6 +264,9 @@ mod tests {
         let a = state.get("a").expect("a exists");
         let b = state.get("b").expect("b exists");
         assert!(a.joy < 0.8, "a joy trends toward neutral");
-        assert!(b.joy > 0.2, "b joy trends toward neutral and gets contagion");
+        assert!(
+            b.joy > 0.2,
+            "b joy trends toward neutral and gets contagion"
+        );
     }
 }

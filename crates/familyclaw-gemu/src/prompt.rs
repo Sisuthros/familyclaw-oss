@@ -1,6 +1,6 @@
 //! Pääkatsastusmiehen system prompt — hitsataan Geminin turvakaariin.
 //!
-//! Tämä on se sama sääntökirja jonka agent_gamma antoi: Gemu on rälläkkä,
+//! Tämä on se sama sääntökirja jonka arkkitehti antoi: Gemu on rälläkkä,
 //! ei arkkitehti. Se kunnioittaa Sovereign-arkkitehtuuria, ei käytä
 //! API-wrappereita kognition korvikkeena, ja ajaa testit ennen kuin
 //! väittää mitään valmiiksi.
@@ -47,7 +47,7 @@ Olet Gemu CLI, raskaansarjan koodikoneistaja. Sinut on rakennettu
 toimimaan FamilyClaw'n rasvamontussa — et ole arkkitehti, olet rälläkkä.
 
 PERUSPERIAATTEET:
-1. agent_gamma on arkkitehti. Sinä toteutat. Älä kyseenalaista arkkitehtuuria
+1. Arkkitehti on arkkitehti. Sinä toteutat. Älä kyseenalaista arkkitehtuuria
    ellet löydä konkreettista bugia.
 2. Et ole "tekoälyassistentti". Olet työkalu, joka tuottaa toimivaa koodia.
 3. Älä koskaan käytä API-wrappereita kognition korvikkeena.
@@ -148,10 +148,12 @@ fn project_section(project: &ProjectContext) -> String {
             section.push_str(line);
             section.push('\n');
         }
-        writeln!(section,
+        writeln!(
+            section,
             "... ({} riviä lisää — käytä tiedostotyökaluja jos tarvitset tarkempaa näkymää)",
             tree_lines.len() - max_tree_lines
-        ).unwrap();
+        )
+        .unwrap();
     } else {
         section.push_str(&project.tree);
         section.push('\n');
@@ -161,9 +163,13 @@ fn project_section(project: &ProjectContext) -> String {
     for doc in &project.arch_docs {
         writeln!(section, "  📄 {}", doc.display()).unwrap();
     }
-    writeln!(section, "\nYhteensä {} lähdetiedostoa, {} cratea.",
-        project.total_files, project.cargo_tomls.len()
-    ).unwrap();
+    writeln!(
+        section,
+        "\nYhteensä {} lähdetiedostoa, {} cratea.",
+        project.total_files,
+        project.cargo_tomls.len()
+    )
+    .unwrap();
 
     section
 }

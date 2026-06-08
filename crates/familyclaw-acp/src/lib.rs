@@ -35,6 +35,6 @@ pub use message::{AcpRequest, AcpResponse, AcpToolCall, AcpToolResult};
 /// # Errors
 /// [`AcpError::Spawn`] jos binääriä ei löydy tai prosessin käynnistys
 /// epäonnistuu.
-pub async fn spawn(config: &AcpAgentConfig) -> Result<AcpClient, AcpError> {
-    AcpClient::spawn(config).await
+pub fn spawn(config: &AcpAgentConfig) -> Result<AcpClient, AcpError> {
+    AcpClient::spawn(config)
 }

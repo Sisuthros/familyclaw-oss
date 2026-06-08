@@ -16,9 +16,7 @@
 
 use async_trait::async_trait;
 use familyclaw_core::Timestamp;
-use familyclaw_memory::{
-    ImportanceFactors, LocalJsonStore, Memory, MemoryStore, RetrievalContext,
-};
+use familyclaw_memory::{ImportanceFactors, LocalJsonStore, Memory, MemoryStore, RetrievalContext};
 
 use crate::error::Result;
 use crate::scenario::{Scenario, ScenarioResult};
@@ -103,9 +101,7 @@ impl Scenario for SemanticRetrieval {
             .first()
             .is_some_and(|h| h.memory.content.contains("ocean"));
 
-        let top1_correct = hits_sem
-            .first()
-            .is_some_and(|h| h.memory.id == id_shipped);
+        let top1_correct = hits_sem.first().is_some_and(|h| h.memory.id == id_shipped);
 
         let passed = boost > 0.0 && top1_correct && !sem_top_is_ocean;
 
@@ -126,9 +122,7 @@ impl Scenario for SemanticRetrieval {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subject::{
-        CrashPoint, DreamSummary, RecallHit, RestartReport, RunHandle, Task,
-    };
+    use crate::subject::{CrashPoint, DreamSummary, RecallHit, RestartReport, RunHandle, Task};
 
     struct StubSubject;
 
@@ -175,11 +169,7 @@ mod tests {
         let result = scenario.run(&mut subject, clock).await.expect("run");
 
         assert_eq!(result.id, SemanticRetrieval::ID);
-        assert!(
-            result.passed,
-            "S5 should pass: {:?}",
-            result.notes
-        );
+        assert!(result.passed, "S5 should pass: {:?}", result.notes);
         let boost = result.metrics.get("semantic_boost").copied().unwrap_or(0.0);
         assert!(boost > 0.0, "semantic_boost must be > 0, got {boost}");
     }

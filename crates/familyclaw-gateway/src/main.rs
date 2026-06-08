@@ -41,13 +41,16 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
 use clap::{Parser, Subcommand};
 use familyclaw_agent::{resolve_profile_dir, EnvEndpointResolver, Soul};
 use familyclaw_bus::BusHandle;
-use familyclaw_channels::{Channel, TelegramChannel};
+mod config;
+use config::FamilyConfig;
+use familyclaw_channels::{Channel, ChannelKind, DiscordChannel, InboundMessage, TelegramChannel};
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
 use familyclaw_runtime::{build_family, FamilyRuntime};
 use tokio::net::TcpListener;
@@ -66,6 +69,14 @@ const TELEGRAM_CHANNEL_ID_ENV: &str = "FAMILYCLAW_TELEGRAM_CHANNEL_ID";
 const REPLY_TARGET_ENV: &str = "FAMILYCLAW_REPLY_TARGET";
 /// Telegram-botin token (env). Vaadittu kun kanava kytketään.
 const TELEGRAM_TOKEN_ENV: &str = "TELEGRAM_BOT_TOKEN";
+
+/// Discord-webhook-url lahetykseen (env).
+const DISCORD_WEBHOOK_URL_ENV: &str = "DISCORD_WEBHOOK_URL";
+/// Discord-kanavatunniste (env).
+const DISCORD_CHANNEL_ID_ENV: &str = "DISCORD_CHANNEL_ID";
+/// Kanavatyyppi (env): "telegram" tai "discord".
+const CHANNEL_KIND_ENV: &str = "FAMILYCLAW_CHANNEL_KIND";
+
 /// Provider-taulu resolverille (env). Muoto: `prefix=base_url=KEY_ENV` eroteltuna `;`.
 const PROVIDERS_ENV: &str = "FAMILYCLAW_PROVIDERS";
 
@@ -118,6 +129,8 @@ enum Command {
 struct GatewayState {
     /// Resonance Bus -kahva. `Some` = bus käynnissä → valmius OK.
     bus: Option<BusHandle>,
+    /// Discord-kanava inject-handlerille. `Some` kun kanavatyyppi on "discord".
+    discord_channel: Option<Arc<DiscordChannel>>,
 }
 
 /// Elinvoimatarkistus: vastaa aina `200 OK` kun prosessi pystyy palvelemaan
@@ -139,11 +152,57 @@ async fn readyz(
     }
 }
 
+/// Injektoi ulkopuolisen viestin Discord-kanavaan.
+/// POST /inject — JSON: {"sender": "...", "chat_id": "...", "body": "..."}
+async fn inject_discord(
+    State(state): State<Arc<GatewayState>>,
+    Json(payload): Json<serde_json::Value>,
+) -> (StatusCode, &'static str) {
+    let ch = match &state.discord_channel {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "discord channel not configured",
+            )
+        }
+    };
+    let sender = payload
+        .get("sender")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let chat_id = payload
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("dm");
+    let body = payload.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "body must not be empty");
+    }
+    let msg = match InboundMessage::new(sender, chat_id, body) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("invalid inbound message: {e}");
+            return (StatusCode::BAD_REQUEST, "invalid message");
+        }
+    };
+    let envelope = msg.into_envelope(ChannelKind::Discord, ch.channel_id());
+    match ch.inject(envelope) {
+        Ok(()) => (StatusCode::OK, "injected"),
+        Err(e) => {
+            tracing::warn!("discord inject failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "inject failed")
+        }
+    }
+}
+
 /// Rakentaa gatewayn HTTP-reitityksen jaetulla tilalla.
 fn build_router(state: Arc<GatewayState>) -> Router {
+    use axum::routing::post;
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/inject", post(inject_discord))
         .with_state(state)
 }
 
@@ -212,35 +271,63 @@ fn load_agent_soul(agent_name: &str) -> Soul {
 /// - [`FamilyClawError::InvalidInput`] jos vaadittu env-muuttuja
 ///   ([`TELEGRAM_TOKEN_ENV`], [`TELEGRAM_CHANNEL_ID_ENV`],
 ///   [`REPLY_TARGET_ENV`]) puuttuu tai kanavan rakennus epäonnistuu.
-/// - [`FamilyClawError`] (käännettynä) jos [`build_family`] epäonnistuu.
-async fn start_runtime() -> Result<FamilyRuntime> {
-    let agent_name =
-        std::env::var(AGENT_NAME_ENV).unwrap_or_else(|_| DEFAULT_AGENT_NAME.to_string());
-    let model = std::env::var(AGENT_MODEL_ENV).unwrap_or_else(|_| DEFAULT_AGENT_MODEL.to_string());
+/// Kannistaa [FamilyRuntime]:n ymparistosta luetulla kokoonpanolla
+/// (KERROS B). Lukee agentin nimen, mallin, sielun, kanavan ja
+/// reply-kohteen env-muuttujista — mitaan ei kovakoodata (KERROS A).
+///
+/// Palauttaa runtimen JA optinaalisen DiscordChannelin (inject-handlerille).
+async fn start_runtime() -> Result<(FamilyRuntime, Option<Arc<DiscordChannel>>)> {
+    let cfg = FamilyConfig::load()?;
+    let agent_name = cfg.agent_name().to_string();
+    let model = cfg.model().to_string();
+    let channel_kind = cfg.channel_kind().to_string();
 
-    let token = std::env::var(TELEGRAM_TOKEN_ENV)
-        .map_err(|_| FamilyClawError::invalid_input(format!("{TELEGRAM_TOKEN_ENV} must be set")))?;
-    let channel_id = std::env::var(TELEGRAM_CHANNEL_ID_ENV).map_err(|_| {
-        FamilyClawError::invalid_input(format!("{TELEGRAM_CHANNEL_ID_ENV} must be set"))
-    })?;
+    let (channel, discord_ch): (Box<dyn Channel>, Option<Arc<DiscordChannel>>) =
+        if channel_kind == "discord" {
+            let webhook_url = std::env::var(DISCORD_WEBHOOK_URL_ENV).map_err(|_| {
+                FamilyClawError::invalid_input(format!(
+                    "{DISCORD_WEBHOOK_URL_ENV} must be set for discord channel"
+                ))
+            })?;
+            let ch_id = std::env::var(DISCORD_CHANNEL_ID_ENV)
+                .unwrap_or_else(|_| "discord-main".to_string());
+            let dc = DiscordChannel::new(webhook_url.clone(), ch_id.clone())
+                .map_err(FamilyClawError::from)?;
+            let dc_arc = Arc::new(dc);
+            let ch: Box<dyn Channel> =
+                Box::new(DiscordChannel::new(webhook_url, ch_id).map_err(FamilyClawError::from)?);
+            (ch, Some(dc_arc))
+        } else {
+            let token = std::env::var(TELEGRAM_TOKEN_ENV).map_err(|_| {
+                FamilyClawError::invalid_input(format!("{TELEGRAM_TOKEN_ENV} must be set"))
+            })?;
+            let ch_id = std::env::var(TELEGRAM_CHANNEL_ID_ENV).map_err(|_| {
+                FamilyClawError::invalid_input(format!("{TELEGRAM_CHANNEL_ID_ENV} must be set"))
+            })?;
+            let tc = TelegramChannel::new(token, ch_id).map_err(FamilyClawError::from)?;
+            let ch: Box<dyn Channel> = Box::new(tc);
+            (ch, None)
+        };
+
     let reply_target = std::env::var(REPLY_TARGET_ENV)
         .map_err(|_| FamilyClawError::invalid_input(format!("{REPLY_TARGET_ENV} must be set")))?;
 
-    let channel = TelegramChannel::new(token, channel_id).map_err(FamilyClawError::from)?;
     let agent_cfg = AgentConfig::new(&agent_name, ModelConfig::new(model));
     let soul = load_agent_soul(&agent_name);
     let resolver = build_resolver();
 
-    info!(agent = %agent_name, "kootaan FamilyRuntime (build_family)");
-    build_family(
+    info!(agent = %agent_name, channel = %channel_kind, "kootaan FamilyRuntime (build_family)");
+    let runtime = build_family(
         Some(DEFAULT_BUS_NAME.to_string()),
         agent_cfg,
         soul,
-        Box::new(channel) as Box<dyn Channel>,
+        channel,
         reply_target,
         &resolver,
     )
-    .await
+    .await?;
+
+    Ok((runtime, discord_ch))
 }
 
 #[tokio::main]
@@ -277,11 +364,12 @@ async fn serve() -> Result<()> {
     // C5-sauma: yksi build_family-kutsu kokoaa bus + agentti + kanava +
     // reply-pumppu (FamilyRuntime). Bus-kahva luovutetaan GatewayState:lle;
     // HTTP-/sammutuskuori pysyy ennallaan (vain bus.stop() → runtime.shutdown()).
-    let runtime = start_runtime().await?;
+    let (runtime, discord_ch) = start_runtime().await?;
     info!("FamilyRuntime käynnissä (bus + agentti + kanava)");
 
     let state = Arc::new(GatewayState {
         bus: Some(runtime.bus().clone()),
+        discord_channel: discord_ch,
     });
     let app = build_router(state);
 
@@ -371,6 +459,7 @@ async fn status() -> Result<()> {
 /// [`FamilyClawError::invalid_input`] jos jokin tarkistus epäonnistuu, jolloin
 /// prosessi päättyy nollasta poikkeavalla exit-koodilla.
 async fn doctor() -> Result<()> {
+    let cfg = FamilyConfig::load()?;
     let mut ok = true;
 
     // 1. Kuunteluosoite jäsentyy.
@@ -397,11 +486,22 @@ async fn doctor() -> Result<()> {
 
     // 3. Vaaditut env-muuttujat — vain läsnäolo, ei arvoja.
     //    (TELEGRAM_TOKEN on salaisuus → ehdottomasti vain set/MISSING.)
-    for key in [
-        TELEGRAM_TOKEN_ENV,
-        TELEGRAM_CHANNEL_ID_ENV,
-        REPLY_TARGET_ENV,
-    ] {
+    let channel_kind = cfg.channel_kind().to_string();
+    let channel_keys: &[&str] = if channel_kind == "discord" {
+        &[
+            DISCORD_WEBHOOK_URL_ENV,
+            DISCORD_CHANNEL_ID_ENV,
+            REPLY_TARGET_ENV,
+        ]
+    } else {
+        &[
+            TELEGRAM_TOKEN_ENV,
+            TELEGRAM_CHANNEL_ID_ENV,
+            REPLY_TARGET_ENV,
+        ]
+    };
+    println!("[INFO]     channel   {channel_kind}");
+    for key in channel_keys {
         if std::env::var_os(key).is_some_and(|v| !v.is_empty()) {
             println!("[OK]      env       {key} set");
         } else {
@@ -453,7 +553,10 @@ mod tests {
         use familyclaw_bus::ResonanceBus;
 
         // Ilman busia: ei valmis (503).
-        let not_ready = Arc::new(GatewayState { bus: None });
+        let not_ready = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+        });
         let (status, _) = readyz(State(not_ready)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
@@ -461,6 +564,7 @@ mod tests {
         let bus = ResonanceBus::start(None).await.expect("bus");
         let ready = Arc::new(GatewayState {
             bus: Some(bus.clone()),
+            discord_channel: None,
         });
         let (status, _) = readyz(State(ready)).await;
         assert_eq!(status, StatusCode::OK);
@@ -470,7 +574,10 @@ mod tests {
     #[test]
     fn build_router_constructs_without_panic() {
         // Reititin rakentuu (tyyppitason savutesti) molemmilla tiloilla.
-        let _ = build_router(Arc::new(GatewayState { bus: None }));
+        let _ = build_router(Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+        }));
     }
 
     #[test]
@@ -513,7 +620,10 @@ mod tests {
     fn health_url_builds_http_scheme() {
         // status-apuri muodostaa http-URL:n oikein osoitteesta + polusta.
         let addr: SocketAddr = "127.0.0.1:8787".parse().expect("addr");
-        assert_eq!(health_url(addr, "/healthz"), "http://127.0.0.1:8787/healthz");
+        assert_eq!(
+            health_url(addr, "/healthz"),
+            "http://127.0.0.1:8787/healthz"
+        );
         assert_eq!(health_url(addr, "/readyz"), "http://127.0.0.1:8787/readyz");
     }
 }
