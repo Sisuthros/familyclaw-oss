@@ -5,8 +5,22 @@
 //!
 //! **KERROS A only:** No family-specific names, souls, or private data.
 
+use std::time::Duration;
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+
+/// Oletus **request**-timeout (koko pyyntö, ml. vastauksen luku) jos
+/// [`LlmConfig::request_timeout_ms`] ei ole asetettu. 60 s on järkevä yläraja
+/// LLM-completionille: tarpeeksi väljä hitaalle mallille, mutta riittävän
+/// tiukka ettei jumittunut primary blokkaa failoveria ikuisesti (F1).
+pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 60_000;
+
+/// Oletus **connect**-timeout (TCP/TLS-kättely) jos
+/// [`LlmConfig::connect_timeout_ms`] ei ole asetettu. 10 s erottaa "endpoint
+/// ei vastaa lainkaan" -tilanteen hitaasta generoinnista — connect-vaihe ei
+/// saa nojata koko 60 s request-budjettiin.
+pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
 
 /// LLM configuration — loaded at runtime from env/file (never hardcoded).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +33,19 @@ pub struct LlmConfig {
     pub model: String,
     /// Maximum tokens in response
     pub max_tokens: u32,
+    /// Koko pyynnön (request + vastauksen luku) timeout millisekunteina.
+    /// `None` → [`DEFAULT_REQUEST_TIMEOUT_MS`]. KERROS B voi virittää tämän
+    /// per provider (esim. nopealle endpointille tiukempi, hitaalle väljempi).
+    /// **F1:** ilman timeoutia jumittunut primary blokkaisi
+    /// [`crate::llm_chain::LlmFailover::complete`]:n ikuisesti — timeout
+    /// pakottaa kuolleen primaryn antautumaan, jolloin failover laukeaa.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
+    /// TCP/TLS-yhteyden muodostuksen timeout millisekunteina. `None` →
+    /// [`DEFAULT_CONNECT_TIMEOUT_MS`]. Erottaa "ei kuuntele / ei reititystä"
+    /// -tilanteen hitaasta generoinnista.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
 }
 
 impl LlmConfig {
@@ -34,6 +61,8 @@ impl LlmConfig {
             api_key: api_key.into(),
             model: model.into(),
             max_tokens: 2048, // default
+            request_timeout_ms: None,
+            connect_timeout_ms: None,
         }
     }
 
@@ -42,6 +71,34 @@ impl LlmConfig {
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
         self
+    }
+
+    /// Asettaa koko pyynnön timeoutin (millisekunteina). KERROS B -viritys per
+    /// provider. Ks. [`DEFAULT_REQUEST_TIMEOUT_MS`].
+    #[must_use]
+    pub fn with_request_timeout_ms(mut self, ms: u64) -> Self {
+        self.request_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Asettaa yhteyden muodostuksen timeoutin (millisekunteina). KERROS B
+    /// -viritys per provider. Ks. [`DEFAULT_CONNECT_TIMEOUT_MS`].
+    #[must_use]
+    pub fn with_connect_timeout_ms(mut self, ms: u64) -> Self {
+        self.connect_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Efektiivinen request-timeout [`Duration`]:na (oletus täytetty).
+    #[must_use]
+    pub fn request_timeout(&self) -> Duration {
+        Duration::from_millis(self.request_timeout_ms.unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS))
+    }
+
+    /// Efektiivinen connect-timeout [`Duration`]:na (oletus täytetty).
+    #[must_use]
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_millis(self.connect_timeout_ms.unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS))
     }
 }
 
@@ -152,12 +209,34 @@ pub struct LlmClient {
 
 impl LlmClient {
     /// Creates a new LLM client with the given config.
+    ///
+    /// **F1:** rakentaa `reqwest::Client`:n **request- ja connect-timeoutilla**
+    /// ([`LlmConfig::request_timeout`] / [`LlmConfig::connect_timeout`]). Ilman
+    /// timeoutia jumittunut primary (yhteys hyväksytään mutta vastaus ei tule)
+    /// blokkaisi [`crate::llm_chain::LlmFailover::complete`]:n ikuisesti, eikä
+    /// failover laukeaisi koskaan. Timeout muuttaa hyytyneen primaryn
+    /// **retryable** [`LlmError::Timeout`]-virheeksi, jolloin ketju siirtyy
+    /// fallbackiin.
+    ///
+    /// Jos `reqwest::Client`:n rakennus epäonnistuu (epätavallista — esim.
+    /// TLS-backendin alustus), palataan oletusklienttiin ilman timeoutteja,
+    /// jotta konstruktori pysyy infallible-rajapinnaltaan (`#[must_use]`, ei
+    /// `Result`). Tämä on turvallinen degradaatio: failover toimii yhä
+    /// connection-virheillä, vain hang-suoja menetetään äärimmäistapauksessa.
     #[must_use]
     pub fn new(config: LlmConfig) -> Self {
-        Self {
-            client: Client::new(),
-            config,
-        }
+        let client = Client::builder()
+            .timeout(config.request_timeout())
+            .connect_timeout(config.connect_timeout())
+            .build()
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "reqwest client build with timeouts failed — falling back to default client"
+                );
+                Client::new()
+            });
+        Self { config, client }
     }
 
     /// Returns a reference to the config.
@@ -195,7 +274,7 @@ impl LlmClient {
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| LlmError::Http(format!("request failed: {e}")))?;
+            .map_err(|e| LlmError::from_reqwest("request failed", &e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -209,10 +288,15 @@ impl LlmClient {
             return Err(LlmError::Http(format!("HTTP {status}: {detail}")));
         }
 
-        let chat_response: ChatCompletionsResponse = response
-            .json()
-            .await
-            .map_err(|e| LlmError::Parse(format!("response parse error: {e}")))?;
+        let chat_response: ChatCompletionsResponse = response.json().await.map_err(|e| {
+            // Body-luvun timeout (koko-request-budjetti ylittyi vastausta
+            // luettaessa) → retryable Timeout (F1); aito dekoodausvirhe → Parse.
+            if e.is_timeout() {
+                LlmError::Timeout(format!("response read timed out: {e}"))
+            } else {
+                LlmError::Parse(format!("response parse error: {e}"))
+            }
+        })?;
 
         chat_response
             .choices
@@ -246,7 +330,7 @@ impl LlmClient {
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| LlmError::Http(format!("request failed: {e}")))?;
+            .map_err(|e| LlmError::from_reqwest("request failed", &e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -260,10 +344,15 @@ impl LlmClient {
             return Err(LlmError::Http(format!("HTTP {status}: {detail}")));
         }
 
-        let chat_response: ChatCompletionsResponse = response
-            .json()
-            .await
-            .map_err(|e| LlmError::Parse(format!("response parse error: {e}")))?;
+        let chat_response: ChatCompletionsResponse = response.json().await.map_err(|e| {
+            // Body-luvun timeout (koko-request-budjetti ylittyi vastausta
+            // luettaessa) → retryable Timeout (F1); aito dekoodausvirhe → Parse.
+            if e.is_timeout() {
+                LlmError::Timeout(format!("response read timed out: {e}"))
+            } else {
+                LlmError::Parse(format!("response parse error: {e}"))
+            }
+        })?;
 
         let choice = chat_response
             .choices
@@ -307,18 +396,63 @@ impl CompletionResult {
 /// LLM error types.
 #[derive(Debug, Clone)]
 pub enum LlmError {
-    /// HTTP request failed
+    /// HTTP request failed (yhteysvirhe tai ei-onnistunut statuskoodi)
     Http(String),
+    /// Pyyntö aikakatkaistiin (request- tai connect-timeout). **F1:** tämä on
+    /// **retryable** — jumittunut primary antautuu timeoutilla, ja
+    /// [`crate::llm_chain::LlmFailover`] siirtyy seuraavaan fallbackiin.
+    Timeout(String),
     /// Response parsing failed
     Parse(String),
     /// No content in response
     NoContent,
 }
 
+impl LlmError {
+    /// Onko virhe **uudelleenyritettävä** (failover saa kokeilla seuraavaa
+    /// klienttiä)?
+    ///
+    /// **F1-ydin:** [`LlmError::Timeout`] (jumittunut/hyytynyt primary) on
+    /// retryable, samoin [`LlmError::Http`] (yhteysvirhe tai 5xx/429 -tyyppinen
+    /// hetkellinen häiriö) ja [`LlmError::NoContent`] (toinen malli voi tuottaa
+    /// sisällön). Vain [`LlmError::Parse`] **ei** ole retryable: sama vastaus
+    /// jäsentyisi seuraavallakin yrityksellä samalla mallilla samaan virheeseen,
+    /// joten se on deterministinen — mutta koska failover kokeilee *eri*
+    /// klienttejä (eri malli/endpoint), parse-virhe yhdellä mallilla ei kerro
+    /// mitään seuraavasta. Konservatiivisesti: kohtele parse-virhettä
+    /// **ei-retryable**:na, jotta ilmeisen rikkinäinen pyyntö (esim. väärä
+    /// request-muoto) ei jauha koko ketjua turhaan; verkko-/timeout-/sisältö-
+    /// luokat ovat retryable.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        match self {
+            LlmError::Timeout(_) | LlmError::Http(_) | LlmError::NoContent => true,
+            LlmError::Parse(_) => false,
+        }
+    }
+
+    /// Kuvaa `reqwest::Error`:n oikeaan [`LlmError`]-luokkaan: aito timeout →
+    /// [`LlmError::Timeout`] (retryable, F1); kaikki muut (ml. ECONNREFUSED
+    /// `is_connect()`) → [`LlmError::Http`], joka on niin ikään retryable.
+    /// Näin sekä jumittunut primary (timeout) että kuollut primary
+    /// (yhteysvirhe) laukaisevat failoverin, mutta virheluokat erottuvat
+    /// lokeissa ja [`is_retryable`](LlmError::is_retryable):n semantiikassa.
+    /// `context` etuliittää viestin (esim. `"request failed"`).
+    #[must_use]
+    fn from_reqwest(context: &str, e: &reqwest::Error) -> Self {
+        if e.is_timeout() {
+            LlmError::Timeout(format!("{context}: {e}"))
+        } else {
+            LlmError::Http(format!("{context}: {e}"))
+        }
+    }
+}
+
 impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LlmError::Http(msg) => write!(f, "HTTP error: {msg}"),
+            LlmError::Timeout(msg) => write!(f, "Timeout error: {msg}"),
             LlmError::Parse(msg) => write!(f, "Parse error: {msg}"),
             LlmError::NoContent => write!(f, "No content in response"),
         }
@@ -475,5 +609,111 @@ mod tests {
     fn test_build_endpoint_custom_base_with_slash() {
         let endpoint = LlmClient::build_endpoint("http://localhost:8080/v1/");
         assert_eq!(endpoint, "http://localhost:8080/v1/chat/completions");
+    }
+
+    // ---- F1 timeout + retryable-luokittelu ------------------------------
+
+    #[test]
+    fn config_defaults_timeouts_when_unset() {
+        // Oletukset: ei null-timeoutia → request 60s, connect 10s.
+        let cfg = LlmConfig::new("http://x/v1", "k", "m");
+        assert_eq!(cfg.request_timeout_ms, None);
+        assert_eq!(cfg.connect_timeout_ms, None);
+        assert_eq!(
+            cfg.request_timeout(),
+            Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS)
+        );
+        assert_eq!(
+            cfg.connect_timeout(),
+            Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn config_timeouts_are_configurable_per_llmconfig() {
+        // KERROS B voi virittää per provider.
+        let cfg = LlmConfig::new("http://x/v1", "k", "m")
+            .with_request_timeout_ms(2_500)
+            .with_connect_timeout_ms(500);
+        assert_eq!(cfg.request_timeout(), Duration::from_millis(2_500));
+        assert_eq!(cfg.connect_timeout(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn config_timeout_serde_roundtrip_and_backward_compat() {
+        // Uudet kentät sarjallistuvat; vanha JSON ilman niitä yhä deserialisoituu
+        // (serde default → None → oletus voimassa). Taaksepäin-yhteensopiva.
+        let cfg = LlmConfig::new("http://x/v1", "k", "m").with_request_timeout_ms(1234);
+        let json = serde_json::to_string(&cfg).expect("ser");
+        assert!(json.contains("request_timeout_ms"));
+        let back: LlmConfig = serde_json::from_str(&json).expect("de");
+        assert_eq!(back.request_timeout_ms, Some(1234));
+
+        // Vanha JSON ilman timeout-kenttiä → None (ei kaadu).
+        let legacy = r#"{"api_base":"http://x/v1","api_key":"k","model":"m","max_tokens":2048}"#;
+        let legacy_cfg: LlmConfig = serde_json::from_str(legacy).expect("legacy de");
+        assert_eq!(legacy_cfg.request_timeout_ms, None);
+        assert_eq!(legacy_cfg.connect_timeout_ms, None);
+    }
+
+    #[test]
+    fn timeout_error_is_retryable() {
+        // F1-ydin: timeout (jumittunut primary) on retryable → failover laukeaa.
+        assert!(LlmError::Timeout("slow primary".into()).is_retryable());
+    }
+
+    #[test]
+    fn http_and_nocontent_errors_are_retryable() {
+        // Yhteysvirhe (kuollut primary) ja tyhjä sisältö → kokeile fallbackia.
+        assert!(LlmError::Http("connection refused".into()).is_retryable());
+        assert!(LlmError::NoContent.is_retryable());
+    }
+
+    #[test]
+    fn parse_error_is_not_retryable() {
+        // Deterministinen jäsennysvirhe ei hyödy ketjun jauhamisesta.
+        assert!(!LlmError::Parse("bad json".into()).is_retryable());
+    }
+
+    #[test]
+    fn timeout_error_displays_distinctly() {
+        let e = LlmError::Timeout("request failed: operation timed out".into());
+        let s = format!("{e}");
+        assert!(s.starts_with("Timeout error:"), "got: {s}");
+    }
+
+    #[tokio::test]
+    async fn client_request_times_out_against_a_hanging_endpoint() {
+        // Slow-loris: endpoint hyväksyy TCP-yhteyden mutta EI vastaa koskaan.
+        // Lyhyellä request-timeoutilla complete() palauttaa retryable Timeout-
+        // virheen (ei jää roikkumaan ikuisesti). Tämä on F1:n yksikkötaso:
+        // "yhteys hyväksytään mutta nukutaan yli timeoutin".
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // Hyväksy yhteydet mutta älä koskaan vastaa (pidä socketit auki).
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            // Hyväksy kunnes listener sulkeutuu; socketit pidetään `held`:ssä
+            // auki (ei vastausta) → asiakas hyytyy kunnes oma timeout laukeaa.
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let cfg = LlmConfig::new(format!("http://{addr}/v1"), "k", "m")
+            .with_request_timeout_ms(300)
+            .with_connect_timeout_ms(300);
+        let client = LlmClient::new(cfg);
+
+        let result = client.complete(&[LlmMessage::user("hei")]).await;
+        let err = result.expect_err("hanging endpoint must time out, not hang");
+        assert!(
+            matches!(err, LlmError::Timeout(_)),
+            "expected retryable Timeout, got {err:?}"
+        );
+        assert!(err.is_retryable(), "timeout must be retryable for failover");
     }
 }

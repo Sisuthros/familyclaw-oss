@@ -24,12 +24,15 @@ use crate::error::Result;
 use crate::scenario::{Scenario, ScenarioResult};
 use crate::subject::Subject;
 
+/// S5 Semantic Retrieval — osittaisosuman semanttinen haku.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SemanticRetrieval;
 
 impl SemanticRetrieval {
+    /// Skenaarion yksilöivä tunniste.
     pub const ID: &'static str = "s5_semantic_retrieval";
 
+    /// Luo uuden SemanticRetrieval-skenaarion.
     #[must_use]
     pub fn new() -> Self {
         Self

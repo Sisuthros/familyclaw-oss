@@ -230,6 +230,11 @@ pub struct Memory {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_key: Option<String>,
 
+    /// Valinnainen upotusvektori semanttista haun varten.
+    /// Jos asetettu, haku voi käyttää cosine-similarityä avainsanan sijaan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+
     // ── verification-gated -kentät ──────────────────────────────────────────
     // Kaikki #[serde(default)] — taaksepäin yhteensopiva olemassaolevien
     // persistoitujen muistojen kanssa (vanha JSON ilman näitä kenttiä

@@ -12,7 +12,7 @@ use familyclaw_core::Timestamp;
 use familyclaw_memory::LocalJsonStore;
 use familyclaw_hearth::{
     Hearth,
-    db::{HearthStore as _, InMemoryHearthStore},
+    db::InMemoryHearthStore,
     emotional_state::EmotionalVector,
 };
 
@@ -25,8 +25,10 @@ use crate::subject::Subject;
 pub struct EternalThread;
 
 impl EternalThread {
+    /// Skenaarion yksilöivä tunniste.
     pub const ID: &'static str = "s6_eternal_thread";
 
+    /// Luo uuden EternalThread-skenaarion.
     #[must_use]
     pub fn new() -> Self {
         Self

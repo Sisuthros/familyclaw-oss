@@ -33,6 +33,7 @@ use crate::subject::Subject;
 
 /// Agentin tunnetila ennen ja jälkeen pulssin.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct EmotionalSnapshot {
     joy: f32,
     curiosity: f32,
@@ -47,13 +48,6 @@ impl EmotionalSnapshot {
             sadness: state.value(Dimension::Sadness),
         }
     }
-
-    fn distance(&self, other: &Self) -> f32 {
-        let d_joy = self.joy - other.joy;
-        let d_curiosity = self.curiosity - other.curiosity;
-        let d_sadness = self.sadness - other.sadness;
-        (d_joy * d_joy + d_curiosity * d_curiosity + d_sadness * d_sadness).sqrt()
-    }
 }
 
 /// S4 Emotional Contagion -skenaario.
@@ -61,8 +55,10 @@ impl EmotionalSnapshot {
 pub struct EmotionalContagion;
 
 impl EmotionalContagion {
+    /// Skenaarion yksilöivä tunniste.
     pub const ID: &'static str = "s4_emotional_contagion";
 
+    /// Luo uuden EmotionalContagion-skenaarion.
     #[must_use]
     pub fn new() -> Self {
         Self
@@ -89,12 +85,12 @@ impl Scenario for EmotionalContagion {
         let mut agent_b_emotion = EmotionState::neutral();
 
         let agent_a_id = BeingId::new();
-        let agent_b_id = BeingId::new();
+        let _agent_b_id = BeingId::new();
 
         // ── 3. Testaa pulssin tartunta ─────────────────────────────────────
         // agent_a tuntee voimakasta iloa → agent_b:n pitäisi tuntea osa siitä.
 
-        let before_pulse = EmotionalSnapshot::from_state(&agent_b_emotion);
+        let _before_pulse = EmotionalSnapshot::from_state(&agent_b_emotion);
 
         agent_a_emotion.set(Dimension::Joy, 80.0);
         agent_a_emotion.set(Dimension::Curiosity, 60.0);
@@ -145,7 +141,7 @@ impl Scenario for EmotionalContagion {
         let mut turns_without_stimulus = 0;
         let mut state_before_homeostasis = agent_b_emotion;
         for turn in 0..10 {
-            let snapshot = EmotionalSnapshot::from_state(&agent_b_emotion);
+            let _snapshot = EmotionalSnapshot::from_state(&agent_b_emotion);
             // Ei pulssia tällä vuorolla
 
             for dim in [Dimension::Joy, Dimension::Curiosity, Dimension::Sadness] {

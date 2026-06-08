@@ -32,7 +32,7 @@
 use std::sync::Arc;
 
 use familyclaw_agent::{
-    new_reply_channel, primary_llm_config, Agent, ErasedMemoryStore, LlmEndpointResolver, Soul,
+    build_llm_chain, new_reply_channel, Agent, ErasedMemoryStore, LlmEndpointResolver, Soul,
 };
 use familyclaw_bus::{BeingId, BusHandle, ResonanceBus, ResonanceMessage};
 use familyclaw_channels::Channel;
@@ -88,10 +88,12 @@ impl FamilyRuntime {
 /// (spawn) → `route_reply` → reply-jono → `Channel::send`. MVP: yksi agentti,
 /// yksi kanava, staattinen reply-kohde.
 ///
-/// LLM on **valinnainen**: jos [`primary_llm_config`] ei ratkea (esim. avain
-/// puuttuu ympäristöstä), agentti spawnataan ilman LLM:ää — se muistaa ja
-/// reagoi tunnetilassa, mutta ei tuota tekstivastauksia. Tämä pitää
-/// kokoonpanon käynnistettävänä ilman provider-avaimia (savutestit, CI).
+/// LLM on **valinnainen**: jos [`build_llm_chain`] ei ratkaise yhtäkään mallia
+/// endpointiksi (esim. avain puuttuu ympäristöstä), agentti spawnataan ilman
+/// LLM:ää — se muistaa ja reagoi tunnetilassa, mutta ei tuota tekstivastauksia.
+/// Tämä pitää kokoonpanon käynnistettävänä ilman provider-avaimia (savutestit,
+/// CI). Kun ketju ratkeaa, koko failover (primary + fallbackit) kytketään
+/// agentille [`Agent::with_failover`]:lla.
 ///
 /// # Tuotanto-raja (MVP-rajoite)
 /// Yksi `reply_target`/agentti on oikein **vain yhdelle kanavalle ja yhdelle
@@ -124,8 +126,12 @@ pub async fn build_family(
     //    runtime omistaa recv-pään ja kutsuu Channel::send (alla, askel 9).
     let (sink, mut reply_rx) = new_reply_channel();
 
-    // 3. LLM (valinnainen): jos avain/endpoint puuttuu, agentti toimii ilman.
-    let llm = primary_llm_config(&agent_cfg.model, resolver).ok();
+    // 3. LLM-failover-ketju (valinnainen): jos yksikään malli ei ratkea
+    //    endpointiksi (esim. avain/endpoint puuttuu), agentti toimii ilman
+    //    LLM:ää. Rakennetaan KOKO ketju (primary + fallbackit) — F1: primaryn
+    //    kuolema (timeout/HTTP/rate) ei enää tapa vuoroa, vaan seuraavaa
+    //    fallbackia kokeillaan järjestyksessä ([`Agent::think`]).
+    let failover = build_llm_chain(&agent_cfg.model, resolver).ok();
 
     // 4. Muisti (Eternal Thread, in-memory MVP) + durable-konteksti.
     let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
@@ -134,9 +140,15 @@ pub async fn build_family(
             .map_err(|e| FamilyClawError::bus(e.to_string()))?;
 
     // 5. Rakenna agentti ja kytke reply-sink + staattinen reply-kohde.
-    let agent = Agent::new(agent_cfg, soul, memory, durable, bus.clone(), llm, None)
+    //    LLM annetaan `None`:na konstruktorille ja KOKO failover-ketju
+    //    kytketään erikseen [`Agent::with_failover`]:lla (jos se ratkesi).
+    //    Näin agentti saa primary + fallbackit, ei vain primaryä.
+    let mut agent = Agent::new(agent_cfg, soul, memory, durable, bus.clone(), None, None)
         .with_reply_sink(sink)
         .with_reply_target(reply_target);
+    if let Some(failover) = failover {
+        agent = agent.with_failover(failover);
+    }
 
     // 6. Spawnaa agentti actorina (rekisteröi busiin).
     let actor = agent.spawn().await?;
@@ -213,8 +225,8 @@ mod tests {
             .expect("inject");
         channel.close_inbound();
 
-        // Tunnistamaton provider → ei LLM:ää (primary_llm_config None) → agentti
-        // toimii ilman tekstivastausta. Tämä on KERROS A -puhdas polku.
+        // Tunnistamaton provider → build_llm_chain ei ratkaise → ei LLM:ää →
+        // agentti toimii ilman tekstivastausta. Tämä on KERROS A -puhdas polku.
         let resolver = EnvEndpointResolver::new();
         let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
         let soul = Soul::from_essence("I am agent_a, a generic example being.");

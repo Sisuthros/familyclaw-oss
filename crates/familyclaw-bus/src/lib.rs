@@ -71,7 +71,7 @@ pub mod message;
 
 pub use being::{BeingInfo, BeingSnapshot, CollectedLog, CollectorBeing, CollectorState};
 pub use bus::{BusHandle, BusOp, BusState, ResonanceBus};
-pub use message::{BeingId, BusMessage, ResonanceMessage, TaskEventKind};
+pub use message::{BeingId, BusMessage, MessageOrigin, ResonanceMessage, TaskEventKind};
 
 // Re-export ydinvirhetyypit, jotta kutsujan ei tarvitse riippua
 // `familyclaw-core`sta erikseen bussia käyttäessään.

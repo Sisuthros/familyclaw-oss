@@ -70,6 +70,13 @@ pub struct EnvEndpointResolver {
     providers: HashMap<String, (String, String)>,
     /// Maksimi tokenit per vastaus (välitetään jokaiseen [`LlmConfig`]:iin).
     max_tokens: Option<u32>,
+    /// Request-timeout (ms) joka asetetaan jokaiseen ratkaistuun
+    /// [`LlmConfig`]:iin (KERROS B -viritys). `None` → [`LlmConfig`]:n oletus
+    /// ([`crate::llm::DEFAULT_REQUEST_TIMEOUT_MS`]) jää voimaan.
+    request_timeout_ms: Option<u64>,
+    /// Connect-timeout (ms) joka asetetaan jokaiseen ratkaistuun
+    /// [`LlmConfig`]:iin. `None` → [`crate::llm::DEFAULT_CONNECT_TIMEOUT_MS`].
+    connect_timeout_ms: Option<u64>,
 }
 
 impl EnvEndpointResolver {
@@ -104,6 +111,22 @@ impl EnvEndpointResolver {
         self
     }
 
+    /// Asettaa request-timeoutin (ms) kaikkiin ratkaistuihin asetuksiin
+    /// (F1, KERROS B -viritys). Ks. [`LlmConfig::with_request_timeout_ms`].
+    #[must_use]
+    pub fn with_request_timeout_ms(mut self, ms: u64) -> Self {
+        self.request_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Asettaa connect-timeoutin (ms) kaikkiin ratkaistuihin asetuksiin
+    /// (F1, KERROS B -viritys). Ks. [`LlmConfig::with_connect_timeout_ms`].
+    #[must_use]
+    pub fn with_connect_timeout_ms(mut self, ms: u64) -> Self {
+        self.connect_timeout_ms = Some(ms);
+        self
+    }
+
     /// Pilkkoo mallinimen `(provider, malli)`-pariksi.
     fn split(model_name: &str) -> (&str, &str) {
         match model_name.split_once('/') {
@@ -127,6 +150,12 @@ impl LlmEndpointResolver for EnvEndpointResolver {
         if let Some(max) = self.max_tokens {
             cfg = cfg.with_max_tokens(max);
         }
+        if let Some(ms) = self.request_timeout_ms {
+            cfg = cfg.with_request_timeout_ms(ms);
+        }
+        if let Some(ms) = self.connect_timeout_ms {
+            cfg = cfg.with_connect_timeout_ms(ms);
+        }
         Ok(cfg)
     }
 }
@@ -144,18 +173,50 @@ pub struct LlmFailover {
 }
 
 impl LlmFailover {
+    /// Rakentaa **yhden klientin** failover-ketjun (pituus 1) valmiista
+    /// [`LlmConfig`]:sta — taaksepäin-yhteensopiva silta yhden mallin
+    /// tapaukselle ([`Agent::new`](crate::Agent::new) kääräisee tähän, kun
+    /// sille annetaan `Some(LlmConfig)`). Käyttäytyy täsmälleen kuin suora
+    /// `LlmClient::new(cfg)`-kutsu, mutta [`complete`](LlmFailover::complete)
+    /// kulkee saman failover-rajapinnan läpi (ketjun pituus 1 = ei fallbackeja).
+    #[must_use]
+    pub fn single(cfg: LlmConfig) -> Self {
+        let primary = cfg.model.clone();
+        Self {
+            chain: vec![LlmClient::new(cfg)],
+            primary,
+        }
+    }
+
     /// Yrittää `complete()`:ä jokaisella klientilla järjestyksessä kunnes yksi
     /// onnistuu. Palauttaa viimeisen virheen jos kaikki epäonnistuvat.
     ///
+    /// **F1 — retryable-semantiikka:** failover siirtyy seuraavaan klienttiin
+    /// vain **uudelleenyritettävällä** virheellä
+    /// ([`LlmError::is_retryable`]): timeout (jumittunut primary), yhteysvirhe
+    /// (kuollut primary), 5xx/429-tyyppinen häiriö ja tyhjä sisältö. **Ei-
+    /// retryable** virhe (esim. parse-virhe) palautetaan **välittömästi** —
+    /// koko ketjun jauhaminen ilmeisen rikkinäisellä pyynnöllä olisi turhaa.
+    /// Tämä on juurisyy-korjaus: ilman request-timeoutia hyytynyt primary
+    /// blokkasi tämän silmukan ikuisesti; nyt timeout pakottaa retryable-virheen
+    /// ja seuraavaa fallbackia kokeillaan.
+    ///
     /// # Errors
-    /// Viimeisin [`LlmError`] jos kaikki ketjun klientit epäonnistuvat, tai
-    /// [`LlmError::NoContent`] jos ketju on tyhjä.
+    /// Viimeisin [`LlmError`] jos kaikki ketjun klientit epäonnistuvat (tai
+    /// ensimmäinen ei-retryable virhe), tai [`LlmError::NoContent`] jos ketju on
+    /// tyhjä.
     pub async fn complete(&self, messages: &[LlmMessage]) -> std::result::Result<String, LlmError> {
         let mut last_err: Option<LlmError> = None;
         for client in &self.chain {
             match client.complete(messages).await {
                 Ok(text) => return Ok(text),
-                Err(e) => last_err = Some(e),
+                Err(e) if e.is_retryable() => {
+                    // Retryable (timeout/yhteys/5xx/tyhjä) → kokeile seuraavaa.
+                    tracing::debug!(error = %e, "retryable LLM error — trying next fallback");
+                    last_err = Some(e);
+                }
+                // Ei-retryable (esim. parse) → palauta heti, älä jauha ketjua.
+                Err(e) => return Err(e),
             }
         }
         Err(last_err.unwrap_or(LlmError::NoContent))
@@ -364,6 +425,33 @@ mod tests {
         assert_eq!(primary.model, "deepseek-v4-pro");
     }
 
+    #[test]
+    fn resolver_applies_timeouts_to_resolved_config() {
+        // F1: KERROS B virittää timeoutin → se päätyy ratkaistuun LlmConfigiin
+        // → gateway-tuotantopolku perii sen (build_resolver → resolve → new).
+        let r = test_resolver()
+            .with_request_timeout_ms(7_000)
+            .with_connect_timeout_ms(800);
+        let cfg = r.resolve("openai/gpt-4o").expect("resolves");
+        assert_eq!(cfg.request_timeout_ms, Some(7_000));
+        assert_eq!(cfg.connect_timeout_ms, Some(800));
+    }
+
+    #[test]
+    fn resolver_without_timeout_leaves_config_default() {
+        // Ilman viritystä resolveri ei pakota timeoutia → LlmConfigin oletus
+        // (60s/10s LlmClient::new:ssä) jää voimaan.
+        let r = test_resolver();
+        let cfg = r.resolve("openai/gpt-4o").expect("resolves");
+        assert_eq!(cfg.request_timeout_ms, None);
+        assert_eq!(cfg.connect_timeout_ms, None);
+    }
+
+    /// F1 retryable-semantiikka yksikkötasolla: ei-retryable virhe palautetaan
+    /// **välittömästi** eikä koko ketjua jauheta. Käytämme tyhjää (mahdotonta
+    /// ratkaista) endpointtia varmistaaksemme rakenteen — varsinainen
+    /// timeout→failover-todiste on runtime-roundtripissä
+    /// (`timeout_primary_fails_over_to_live_fallback`).
     #[tokio::test]
     async fn complete_on_empty_chain_path_is_no_content() {
         // Suora rakennus tyhjällä ketjulla ei ole sallittu rajapinnan kautta,

@@ -44,6 +44,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
+use clap::{Parser, Subcommand};
 use familyclaw_agent::{resolve_profile_dir, EnvEndpointResolver, Soul};
 use familyclaw_bus::BusHandle;
 use familyclaw_channels::{Channel, TelegramChannel};
@@ -77,6 +78,37 @@ const DEFAULT_BUS_NAME: &str = "familyclaw-gateway-bus";
 /// silmukkaosoitteeseen oletuksena (turvallinen oletus — ei altista
 /// gatewayta verkolle ilman tietoista valintaa).
 const DEFAULT_ADDR: &str = "127.0.0.1:8787";
+
+/// FamilyClaw-gatewayn komentorivikäyttöliittymä.
+///
+/// Ilman alikomentoa gateway käyttäytyy kuten ennen CLI:tä — käynnistää
+/// palvelimen (`serve`). Tämä säilyttää taaksepäinyhteensopivuuden
+/// `cargo run -p familyclaw-gateway`- ja Docker-`CMD`-kutsuihin, jotka eivät
+/// anna argumentteja.
+#[derive(Parser)]
+#[command(name = "familyclaw-gateway", version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Gatewayn alikomennot.
+#[derive(Subcommand)]
+enum Command {
+    /// Käynnistä gateway-palvelin (oletus, kun alikomentoa ei anneta).
+    Serve,
+    /// Kysy käynnissä olevan gatewayn tila (`/healthz` + `/readyz`).
+    ///
+    /// Lukee [`ADDR_ENV`]:n (tai oletusosoitteen) ja tekee HTTP-pyynnöt.
+    /// Tulostaa tilan ja palaa exit-koodilla `0` vain kun `/readyz` = 200.
+    Status,
+    /// Tarkista kokoonpano käynnistämättä palvelinta (offline-diagnostiikka).
+    ///
+    /// Vahvistaa kuunteluosoitteen jäsentymisen, portin vapauden ja vaaditut
+    /// ympäristömuuttujat. Salaisuuksista raportoidaan **vain läsnäolo**
+    /// (asetettu/puuttuu) — arvoja ei koskaan tulosteta.
+    Doctor,
+}
 
 /// Gatewayn jaettu ajonaikainen tila, johon HTTP-handlerit viittaavat.
 ///
@@ -222,6 +254,23 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    // Ilman alikomentoa = serve (taaksepäinyhteensopivuus).
+    match Cli::parse().command.unwrap_or(Command::Serve) {
+        Command::Serve => serve().await,
+        Command::Status => status().await,
+        Command::Doctor => doctor().await,
+    }
+}
+
+/// Käynnistää gateway-palvelimen ja pysyy pystyssä `Ctrl-C`:hen asti.
+///
+/// Tämä on entinen `main`-runko muuttumattomana: yksi [`build_family`]-kutsu
+/// kokoaa busin + agentin + kanavan + reply-pumpun (`FamilyRuntime`), HTTP-kuori
+/// sitoo portin ja siisti sammutus pysäyttää runtimen.
+///
+/// # Errors
+/// [`FamilyClawError`] jos kokoonpano, sidonta tai palvelu epäonnistuu.
+async fn serve() -> Result<()> {
     let addr = resolve_addr()?;
     info!(%addr, "familyclaw-gateway käynnistyy");
 
@@ -257,6 +306,118 @@ async fn main() -> Result<()> {
     serve_result.map_err(|e| FamilyClawError::bus(format!("gateway serve error: {e}")))?;
     info!("familyclaw-gateway pysähtyi siististi");
     Ok(())
+}
+
+/// Muodostaa `http://<addr><path>`-URL:n kuunteluosoitteesta.
+///
+/// Käynnissä oleva gateway sitoutuu oletuksena loopbackiin, joten `status`
+/// olettaa `http`-skeeman (ei TLS:ää) — sama oletus kuin palvelimen sidonnassa.
+fn health_url(addr: SocketAddr, path: &str) -> String {
+    format!("http://{addr}{path}")
+}
+
+/// Kysyy käynnissä olevan gatewayn tilan (`/healthz` + `/readyz`).
+///
+/// Lukee kuunteluosoitteen [`resolve_addr`]:n kautta ja tekee kaksi HTTP
+/// GET -pyyntöä. Tulostaa kummankin endpointin tilan. Palaa `Ok(())` vain
+/// kun `/readyz` vastaa `200 OK`; muuten [`FamilyClawError::bus`], jolloin
+/// prosessi päättyy nollasta poikkeavalla exit-koodilla.
+///
+/// # Errors
+/// - [`FamilyClawError::config`] jos kuunteluosoite on jäsentymätön.
+/// - [`FamilyClawError::bus`] jos gatewayyn ei saada yhteyttä tai `/readyz`
+///   ei ole `200`.
+async fn status() -> Result<()> {
+    let addr = resolve_addr()?;
+    let client = reqwest::Client::new();
+
+    let health = client
+        .get(health_url(addr, "/healthz"))
+        .send()
+        .await
+        .map_err(|e| FamilyClawError::bus(format!("gateway not reachable at {addr}: {e}")))?;
+    let health_ok = health.status().is_success();
+    println!("healthz {addr} -> {}", health.status());
+
+    let ready = client
+        .get(health_url(addr, "/readyz"))
+        .send()
+        .await
+        .map_err(|e| FamilyClawError::bus(format!("gateway not reachable at {addr}: {e}")))?;
+    let ready_status = ready.status();
+    println!("readyz  {addr} -> {ready_status}");
+
+    if health_ok && ready_status.as_u16() == 200 {
+        println!("status: ready");
+        Ok(())
+    } else {
+        Err(FamilyClawError::bus(format!(
+            "gateway not ready (healthz ok={health_ok}, readyz={ready_status})"
+        )))
+    }
+}
+
+/// Tarkistaa gatewayn kokoonpannon offline (käynnistämättä palvelinta).
+///
+/// Suorittaa kolme tarkistusta ja tulostaa kunkin tuloksen:
+/// 1. **addr** — [`resolve_addr`] jäsentää kuunteluosoitteen,
+/// 2. **port** — osoite saadaan väliaikaisesti sidottua (portti vapaa),
+/// 3. **env** — vaaditut ympäristömuuttujat ovat asetettu.
+///
+/// Salaisuuksista (esim. [`TELEGRAM_TOKEN_ENV`]) raportoidaan **vain läsnäolo**
+/// (`set`/`MISSING`) — arvoja ei tulosteta (MEMORY.md secret-leak-sääntö).
+///
+/// # Errors
+/// [`FamilyClawError::invalid_input`] jos jokin tarkistus epäonnistuu, jolloin
+/// prosessi päättyy nollasta poikkeavalla exit-koodilla.
+async fn doctor() -> Result<()> {
+    let mut ok = true;
+
+    // 1. Kuunteluosoite jäsentyy.
+    match resolve_addr() {
+        Ok(addr) => {
+            println!("[OK]      addr      {addr}");
+            // 2. Portti vapaa — kokeile väliaikaista sidontaa.
+            match TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    println!("[OK]      port      {addr} bindable");
+                    drop(listener);
+                }
+                Err(e) => {
+                    println!("[FAIL]    port      {addr} not bindable: {e}");
+                    ok = false;
+                }
+            }
+        }
+        Err(e) => {
+            println!("[FAIL]    addr      {e}");
+            ok = false;
+        }
+    }
+
+    // 3. Vaaditut env-muuttujat — vain läsnäolo, ei arvoja.
+    //    (TELEGRAM_TOKEN on salaisuus → ehdottomasti vain set/MISSING.)
+    for key in [
+        TELEGRAM_TOKEN_ENV,
+        TELEGRAM_CHANNEL_ID_ENV,
+        REPLY_TARGET_ENV,
+    ] {
+        if std::env::var_os(key).is_some_and(|v| !v.is_empty()) {
+            println!("[OK]      env       {key} set");
+        } else {
+            println!("[MISSING] env       {key}");
+            ok = false;
+        }
+    }
+
+    if ok {
+        println!("doctor: ok");
+        Ok(())
+    } else {
+        Err(FamilyClawError::invalid_input(
+            "doctor: one or more checks failed",
+        ))
+    }
 }
 
 /// Odottaa sammutussignaalia (`Ctrl-C`). Palaa kun signaali saapuu, mikä
@@ -310,5 +471,49 @@ mod tests {
     fn build_router_constructs_without_panic() {
         // Reititin rakentuu (tyyppitason savutesti) molemmilla tiloilla.
         let _ = build_router(Arc::new(GatewayState { bus: None }));
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        // clap-määrittely on sisäisesti ehjä (paljastaa derive-virheet).
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn cli_no_args_defaults_to_serve() {
+        // Ilman alikomentoa = serve (taaksepäinyhteensopivuus).
+        let cli = Cli::parse_from(["familyclaw-gateway"]);
+        assert!(
+            matches!(cli.command.unwrap_or(Command::Serve), Command::Serve),
+            "argumentiton kutsu pitää tarkoittaa serve"
+        );
+    }
+
+    #[test]
+    fn cli_parses_each_subcommand() {
+        // serve/status/doctor jäsentyvät odotetuiksi varianteiksi.
+        let serve = Cli::parse_from(["familyclaw-gateway", "serve"]);
+        assert!(matches!(serve.command, Some(Command::Serve)));
+
+        let status = Cli::parse_from(["familyclaw-gateway", "status"]);
+        assert!(matches!(status.command, Some(Command::Status)));
+
+        let doctor = Cli::parse_from(["familyclaw-gateway", "doctor"]);
+        assert!(matches!(doctor.command, Some(Command::Doctor)));
+    }
+
+    #[test]
+    fn cli_rejects_unknown_subcommand() {
+        // Tuntematon alikomento ei jäsenny (clap palauttaa virheen).
+        assert!(Cli::try_parse_from(["familyclaw-gateway", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn health_url_builds_http_scheme() {
+        // status-apuri muodostaa http-URL:n oikein osoitteesta + polusta.
+        let addr: SocketAddr = "127.0.0.1:8787".parse().expect("addr");
+        assert_eq!(health_url(addr, "/healthz"), "http://127.0.0.1:8787/healthz");
+        assert_eq!(health_url(addr, "/readyz"), "http://127.0.0.1:8787/readyz");
     }
 }

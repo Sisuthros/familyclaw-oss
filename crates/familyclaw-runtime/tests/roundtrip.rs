@@ -157,6 +157,272 @@ async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
     runtime.shutdown();
 }
 
+/// **F1-failover-todiste**: kun primary-endpoint on kuollut (yhteys
+/// hylätään), mutta fallback-malli osoittaa elävään mock-LLM:ään, ketju
+/// failoveroi automaattisesti fallbackiin ja tuottaa silti vastauksen.
+/// Ennen F1:tä Agent piti vain yhtä klienttiä → primaryn kuolema tappoi vuoron.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_primary_fails_over_to_live_fallback() {
+    // 1. Elävä mock-LLM fallbackille (palauttaa kiinteän tekstin).
+    let live_base = spawn_mock_llm().await;
+
+    // 2. Kuollut "primary"-endpoint: sido portti ja sulje listener heti, jolloin
+    //    osoitteeseen ei kuuntele mitään → reqwest saa yhteysvirheen → failover.
+    let dead_addr = {
+        let l = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("dead bind");
+        let addr = l.local_addr().expect("dead addr");
+        drop(l); // vapauta portti → mikään ei kuuntele.
+        addr
+    };
+    let dead_base = format!("http://{dead_addr}/v1");
+
+    let channel = MockChannel::new("mock-failover").expect("channel");
+    let outbox_probe = channel.clone();
+    channel
+        .inject(InboundMessage::new("the operator-id", "fo-chat", "kestääkö ketju?").expect("inbound"))
+        .expect("inject");
+    channel.close_inbound();
+
+    // 3. Resolveri: "dead"-provider → kuollut endpoint, "live"-provider → mock.
+    let resolver = EnvEndpointResolver::new()
+        .with_provider("dead", dead_base, "FAMILYCLAW_DEAD_KEY_UNSET")
+        .with_provider("live", live_base, "FAMILYCLAW_LIVE_KEY_UNSET");
+
+    // 4. Primary = dead/model (kaatuu), fallback = live/model (onnistuu).
+    let agent_cfg = AgentConfig::new(
+        "agent_epsilon",
+        ModelConfig::new("dead/model").with_fallback("live/model"),
+    );
+    let soul = familyclaw_agent::Soul::from_essence("generic being for failover test");
+
+    let reply_target = "fo-chat".to_string();
+    let runtime = build_family(
+        Some("failover-bus".to_string()),
+        agent_cfg,
+        soul,
+        Box::new(channel) as Box<dyn Channel>,
+        reply_target.clone(),
+        &resolver,
+    )
+    .await
+    .expect("build_family");
+
+    // 5. Pollaa outboxia: primary kaatuu, fallback tuottaa vastauksen.
+    let mut sent = Vec::new();
+    for _ in 0..60 {
+        sent = outbox_probe.sent();
+        if !sent.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 6. TODISTE: vastaus tuli silti läpi (fallbackin kautta), oikealla kohteella.
+    assert_eq!(sent.len(), 1, "kuollut primary → failover fallbackiin → yksi vastaus");
+    assert_eq!(sent[0].target, reply_target, "vastaus oikeaan keskusteluun");
+    assert_eq!(
+        sent[0].body, FIXED_LLM_REPLY,
+        "vastaus tuli fallback-mallilta (live mock-LLM)"
+    );
+
+    runtime.shutdown();
+}
+
+/// Käynnistää **hyytyvän** (slow-loris) HTTP-endpointin: hyväksyy TCP-yhteyden
+/// mutta EI koskaan kirjoita vastausta. Tämä simuloi jumittunutta primaryä,
+/// joka — toisin kuin `dead_primary` (ECONNREFUSED) — hyväksyy yhteyden mutta
+/// nukkuu yli request-timeoutin. Palauttaa base-URL:n resolverille.
+///
+/// Säilytetyt socketit pidetään elossa taustataskissa (drop sulkisi ne ja
+/// muuttaisi käytöksen yhteysvirheeksi).
+async fn spawn_hanging_llm() -> String {
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("hang bind");
+    let addr = listener.local_addr().expect("hang addr");
+
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        // Hyväksy yhteys, ÄLÄ vastaa, pidä socket auki `held`:ssä → asiakas
+        // hyytyy kunnes oma request-timeout laukeaa. Päättyy kun listener sulkeutuu.
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+
+    format!("http://{addr}/v1")
+}
+
+/// **F1-timeout-todiste (juurisyy):** primary HYVÄKSYY yhteyden mutta NUKKUU yli
+/// request-timeoutin (slow-loris/hang). Ennen F1:tä `LlmClient` rakensi
+/// `reqwest::Client`:n ILMAN timeoutia → hyytynyt primary blokkasi
+/// `LlmFailover::complete()`:n ikuisesti eikä failover lauennut koskaan.
+/// Tämän testin lyhyellä timeoutilla primary antautuu retryable
+/// `LlmError::Timeout`-virheellä → ketju failoveroi elävään fallbackiin →
+/// vastaus tulee silti läpi. Erotuksena `dead_primary`-testiin tämä laukeaa
+/// TIMEOUTISTA, ei pelkästä ECONNREFUSED:ista.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeout_primary_fails_over_to_live_fallback() {
+    // 1. Elävä mock-LLM fallbackille + hyytyvä "primary".
+    let live_base = spawn_mock_llm().await;
+    let hanging_base = spawn_hanging_llm().await;
+
+    let channel = MockChannel::new("mock-timeout-fo").expect("channel");
+    let outbox_probe = channel.clone();
+    channel
+        .inject(InboundMessage::new("the operator-id", "to-chat", "jumittuuko ketju?").expect("inbound"))
+        .expect("inject");
+    channel.close_inbound();
+
+    // 2. Resolveri: "hang"-provider → hyytyvä endpoint LYHYELLÄ request-
+    //    timeoutilla (300ms) jotta testi on nopea; "live"-provider → mock.
+    //    Timeout asetetaan resolverista (KERROS B -polku) → se periytyy
+    //    jokaiseen ratkaistuun LlmConfigiin = sama polku jonka gateway ajaa.
+    let resolver = EnvEndpointResolver::new()
+        .with_request_timeout_ms(300)
+        .with_connect_timeout_ms(300)
+        .with_provider("hang", hanging_base, "FAMILYCLAW_HANG_KEY_UNSET")
+        .with_provider("live", live_base, "FAMILYCLAW_LIVE_KEY_UNSET");
+
+    // 3. Primary = hang/model (hyytyy → timeout), fallback = live/model (onnistuu).
+    let agent_cfg = AgentConfig::new(
+        "agent_epsilon",
+        ModelConfig::new("hang/model").with_fallback("live/model"),
+    );
+    let soul = familyclaw_agent::Soul::from_essence("generic being for timeout-failover test");
+
+    let reply_target = "to-chat".to_string();
+    let runtime = build_family(
+        Some("timeout-failover-bus".to_string()),
+        agent_cfg,
+        soul,
+        Box::new(channel) as Box<dyn Channel>,
+        reply_target.clone(),
+        &resolver,
+    )
+    .await
+    .expect("build_family");
+
+    // 4. Pollaa outboxia: hyytynyt primary aikakatkaistaan (~300ms), sitten
+    //    fallback tuottaa vastauksen. Annetaan reilu ikkuna (timeout + verkko).
+    let mut sent = Vec::new();
+    for _ in 0..120 {
+        sent = outbox_probe.sent();
+        if !sent.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 5. TODISTE: vastaus tuli läpi fallbackin kautta — failover laukesi
+    //    TIMEOUTISTA (ei ECONNREFUSED), oikealla kohteella.
+    assert_eq!(
+        sent.len(),
+        1,
+        "hyytynyt primary → timeout → failover fallbackiin → yksi vastaus"
+    );
+    assert_eq!(sent[0].target, reply_target, "vastaus oikeaan keskusteluun");
+    assert_eq!(
+        sent[0].body, FIXED_LLM_REPLY,
+        "vastaus tuli fallback-mallilta (live mock-LLM) timeoutin jälkeen"
+    );
+
+    runtime.shutdown();
+}
+
+/// Vahvistaa että ilman LLM:ää (provider tuntematon → ei think-tekstiä) ketju
+/// EI tuota ulosmenevää viestiä — eli reply tulee aidosti `think()`:istä, ei
+/// jostain muusta lähteestä. (Negatiivinen kontrolli roundtrip-väitteelle.)
+/// **F2-todiste (per-viesti-origin reititys):** yksi agentti saa kaksi viestia
+/// **eri alkuperista** (chA/convA ja chB/convB). Jokaisen vastauksen kohde
+/// johdetaan **per viesti** kirjekuoren `origin`-kentasta -> kaksi vastausta
+/// OIKEISIIN kohteisiin (convA -> convA, convB -> convB), EI vuotoa eika
+/// molempia staattiseen kohteeseen.
+///
+/// Tama on F2:n juurisyy-todiste: ennen originin kuljetusta bus-kirjekuoreen
+/// agentti reititti AINA staattiseen [`Agent::with_reply_target`]-arvoon, joten
+/// >1 keskustelu vuoti samaan kohteeseen. Nyt origin kantaa keskustelun ja
+/// reply-kohde on per-viesti. Staattinen kohde annetaan tarkoituksella
+/// MOLEMMISTA poikkeavana ("UNUSED-static"): jos reititys vahingossa kayttaisi
+/// sita, testi kaatuisi.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_origins_route_replies_to_correct_targets_no_leak() {
+    use std::sync::Arc;
+
+    use familyclaw_agent::{build_llm_chain, new_reply_channel, Agent, Soul};
+    use familyclaw_bus::{BeingId, BusMessage, MessageOrigin, ResonanceBus};
+    use familyclaw_durable::{DurableContext, InMemoryJournal, Journal};
+    use familyclaw_memory::{LocalJsonStore, MemoryStore};
+
+    // 1. Elava mock-LLM (kiintea vastaus) - sama teksti molemmille vuoroille,
+    //    joten ero nakyy VAIN kohteessa (target), ei sisallossa.
+    let api_base = spawn_mock_llm().await;
+    let resolver =
+        EnvEndpointResolver::new().with_provider("mock", api_base, "FAMILYCLAW_F2_MOCK_KEY_UNSET");
+
+    // 2. Bus + reply-sink (otetaan recv-paa talteen, tarkistetaan kohteet).
+    let bus = ResonanceBus::start(Some("f2-origin-bus".to_string()))
+        .await
+        .expect("bus");
+    let (sink, mut reply_rx) = new_reply_channel();
+
+    // 3. Agentti yhdella mallilla (mock-LLM) + reply-sink + STAATTINEN kohde
+    //    joka EI ole kumpikaan keskustelu (todistaa etta origin voittaa).
+    let model = ModelConfig::new("mock/agent_epsilon");
+    let chain = build_llm_chain(&model, &resolver).expect("chain builds");
+    let memory: Arc<dyn MemoryStore + Send + Sync> = Arc::new(LocalJsonStore::in_memory());
+    let durable =
+        DurableContext::new(Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>)
+            .expect("durable");
+    let agent = Agent::new(
+        AgentConfig::new("agent_epsilon", model),
+        Soul::from_essence("generic being for F2 origin routing test"),
+        memory,
+        durable,
+        bus.clone(),
+        None,
+        None,
+    )
+    .with_reply_sink(sink)
+    .with_reply_target("UNUSED-static-target")
+    .with_failover(chain);
+    let _actor = agent.spawn().await.expect("spawn");
+
+    // 4. Kanavan oma bus-seat (ERI kuin agentti, muuten "oma kaiku" skipataan).
+    let channel_seat = BeingId::new();
+
+    // 5. Julkaise KAKSI viestia eri alkuperista origin-kentan kanssa.
+    let origin_a = MessageOrigin::new("chA", "convA", "user-a");
+    let origin_b = MessageOrigin::new("chB", "convB", "user-b");
+    bus.publish_with_origin(channel_seat, BusMessage::text("viesti A:lta"), origin_a)
+        .expect("publish A");
+    bus.publish_with_origin(channel_seat, BusMessage::text("viesti B:lta"), origin_b)
+        .expect("publish B");
+
+    // 6. Keraa kaksi vastausta reply-sinkista (timeoutilla, ei kiinteaa unta).
+    let mut targets = Vec::new();
+    for _ in 0..2 {
+        let out = tokio::time::timeout(Duration::from_secs(5), reply_rx.recv())
+            .await
+            .expect("reply within timeout")
+            .expect("reply present");
+        targets.push(out.target);
+    }
+    targets.sort();
+
+    // 7. TODISTE: kaksi vastausta, kohteet = convA ja convB (per-viesti-origin),
+    //    EI "UNUSED-static-target", EI vuotoa (kumpikin tasmalleen kerran).
+    assert_eq!(
+        targets,
+        vec!["convA".to_string(), "convB".to_string()],
+        "vastaukset ohjautuivat per-viesti-originin kohteisiin, ei staattiseen"
+    );
+
+    bus.stop();
+}
+
 /// Vahvistaa että ilman LLM:ää (provider tuntematon → ei think-tekstiä) ketju
 /// EI tuota ulosmenevää viestiä — eli reply tulee aidosti `think()`:istä, ei
 /// jostain muusta lähteestä. (Negatiivinen kontrolli roundtrip-väitteelle.)
@@ -169,7 +435,7 @@ async fn without_llm_no_reply_is_emitted() {
         .expect("inject");
     channel.close_inbound();
 
-    // Tyhjä resolveri → provider ei ratkea → primary_llm_config None → ei LLM:ää.
+    // Tyhjä resolveri → provider ei ratkea → build_llm_chain Err → ei LLM:ää.
     let resolver = EnvEndpointResolver::new();
     let agent_cfg = AgentConfig::new("agent_epsilon", ModelConfig::new("unknown/model"));
     let soul = familyclaw_agent::Soul::from_essence("generic being");

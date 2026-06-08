@@ -30,7 +30,8 @@ use familyclaw_memory::{
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tracing::{debug, warn};
 
-use crate::llm::{LlmClient, LlmConfig, LlmMessage};
+use crate::llm::{LlmConfig, LlmMessage};
+use crate::llm_chain::LlmFailover;
 use crate::soul::Soul;
 use familyclaw_sandbox::{CodeSandbox, SandboxOutput, SandboxRequest};
 
@@ -113,8 +114,13 @@ pub struct Agent {
     bus: BusHandle,
     /// Kuinka monta vuoroa on käsitelty (durable-askelten nimien sekvensointiin).
     turn_counter: u64,
-    /// LLM-clienti ajatteluun (valinnainen, jotta testit toimivat ilman LLM:ää).
-    llm: Option<LlmClient>,
+    /// LLM-failover-ketju ajatteluun (valinnainen, jotta testit toimivat ilman
+    /// LLM:ää). [`Agent::new`] kääräisee yhden [`LlmConfig`]:n 1-pituiseksi
+    /// ketjuksi ([`LlmFailover::single`]); koko fallback-ketju kytketään
+    /// [`Agent::with_failover`]:lla (esim. runtimen `build_family`). Näin
+    /// [`Agent::think`] saa failoverin: jos primary kuolee (timeout/HTTP/rate),
+    /// ketjun seuraavaa klienttiä kokeillaan kunnes yksi onnistuu.
+    llm: Option<LlmFailover>,
     /// Sandbox koodin suorittamiseen (valinnainen, `wasmtime`-featuren kanssa).
     sandbox: Option<Arc<dyn CodeSandbox>>,
     /// Reply-kanava (C1 Malli A): minne LLM-vastaus työnnetään ulos. `None` =
@@ -130,6 +136,19 @@ pub struct Agent {
     /// (origin-kenttä bus-viestissä) on rakennettu, kohde voidaan johtaa
     /// per-viesti käsiteltävästä viestistä. Ks. open question.
     reply_target: Option<String>,
+    /// Sessio-isolaation alkuperä (F4). `None` = nykyinen jaettu-scope käytös
+    /// (taaksepäin-yhteensopiva: kaikki vuorot jakavat saman muisti-scopen).
+    /// `Some(origin)` → vuoron muistot tagataan
+    /// [`MessageOrigin::session_tag`]:lla ja [`Agent::think`]:n recall suodattuu
+    /// samalla tagilla → eri sessioiden muistot eivät vuoda toistensa
+    /// kontekstiin (yksi agentti + yksi muisti, scope tagilla — ei
+    /// per-sessio-instansseja).
+    ///
+    /// **F2-riippuvuus:** kun [`ResonanceMessage`] kantaa originin per-viesti
+    /// (F2-sopimus), tämä asetetaan per-vuoro käsiteltävästä viestistä eikä
+    /// staattisesti rakennusvaiheessa. Siihen asti origin annetaan
+    /// [`Agent::with_session`]:lla (oikein yhdelle sessiolle/agentille).
+    session: Option<crate::session::MessageOrigin>,
 }
 
 impl Agent {
@@ -150,7 +169,10 @@ impl Agent {
         sandbox: Option<Arc<dyn CodeSandbox>>,
     ) -> Self {
         let being_id = BeingId::from_agent_id(config.id);
-        let llm = llm_config.map(LlmClient::new);
+        // Yksi `LlmConfig` kääritään 1-pituiseksi failover-ketjuksi: sama
+        // käytös kuin ennen (ei fallbackeja), mutta `think()` kulkee nyt
+        // failover-rajapinnan läpi. Koko ketju kytketään [`with_failover`]:lla.
+        let llm = llm_config.map(LlmFailover::single);
         Self {
             config,
             being_id,
@@ -164,6 +186,7 @@ impl Agent {
             sandbox,
             reply_sink: None,
             reply_target: None,
+            session: None,
         }
     }
 
@@ -184,6 +207,46 @@ impl Agent {
     #[must_use]
     pub fn with_reply_target(mut self, target: impl Into<String>) -> Self {
         self.reply_target = Some(target.into());
+        self
+    }
+
+    /// Aseta **sessio-isolaation alkuperä** (F4). Tämän jälkeen agentin
+    /// käsittelemien vuorojen muistot tagataan
+    /// [`MessageOrigin::session_tag`](crate::session::MessageOrigin::session_tag)
+    /// :lla, ja [`Agent::think`]:n recall suodattuu samalla tagilla — eli vain
+    /// **tämän session** muistot näkyvät kontekstina. Yksi agentti + yksi
+    /// muisti riittävät: isolaatio tehdään tagilla, ei erillisillä
+    /// instansseilla. `None`-tila (oletus) säilyttää jaetun scopen
+    /// (taaksepäin-yhteensopiva). Palauttaa `self` ketjutusta varten.
+    ///
+    /// **F2-raja:** kun [`ResonanceMessage`] kantaa originin per-viesti
+    /// (F2-sopimus), tämä korvautuu per-vuoro-johdolla
+    /// ([`MessageOrigin::from_inbound_envelope`](crate::session::MessageOrigin::from_inbound_envelope)).
+    #[must_use]
+    pub fn with_session(mut self, origin: crate::session::MessageOrigin) -> Self {
+        self.session = Some(origin);
+        self
+    }
+
+    /// Agentin sessio-alkuperä (F4), jos asetettu.
+    #[must_use]
+    pub const fn session(&self) -> Option<&crate::session::MessageOrigin> {
+        self.session.as_ref()
+    }
+
+    /// Kytkee **koko failover-ketjun** agentille (korvaa
+    /// [`Agent::new`]:n rakentaman 1-pituisen ketjun). Käytä tätä, kun haluat
+    /// primary + fallbackit: rakenna ketju [`build_llm_chain`](crate::build_llm_chain):lla
+    /// ([`ModelConfig`](familyclaw_core::ModelConfig) → [`LlmFailover`]) ja anna
+    /// se tähän. [`Agent::think`] yrittää sitten ketjun klienttejä
+    /// järjestyksessä, kunnes yksi onnistuu (juurisyy-korjaus: primaryn kuolema
+    /// ei enää tapa vuoroa).
+    ///
+    /// Palauttaa `self` ketjutusta varten; [`Agent::new`]-signatuuria ei
+    /// muuteta (taaksepäin-yhteensopiva).
+    #[must_use]
+    pub fn with_failover(mut self, failover: LlmFailover) -> Self {
+        self.llm = Some(failover);
         self
     }
 
@@ -229,9 +292,9 @@ impl Agent {
         self.turn_counter
     }
 
-    /// Agentin LLM-clienti (valinnainen).
+    /// Agentin LLM-failover-ketju (valinnainen).
     #[must_use]
-    pub const fn llm(&self) -> Option<&LlmClient> {
+    pub const fn llm(&self) -> Option<&LlmFailover> {
         self.llm.as_ref()
     }
 
@@ -281,7 +344,14 @@ impl Agent {
         };
 
         // 0. ORIENT: hae relevantit muistot ENSIN (RAG — ennen LLM-kutsua).
-        let recall_ctx = RetrievalContext::new(query.clone()).with_limit(5);
+        //    F4 sessio-isolaatio: jos sessio on asetettu, vaadi session-tag →
+        //    vain TÄMÄN session muistot näkyvät kontekstina (ei vuotoa toisesta
+        //    keskustelusta). Ilman sessiota (None) recall on jaettu (nykyinen,
+        //    taaksepäin-yhteensopiva käytös).
+        let mut recall_ctx = RetrievalContext::new(query.clone()).with_limit(5);
+        if let Some(origin) = self.session.as_ref() {
+            recall_ctx = recall_ctx.with_required_tags([origin.session_tag()]);
+        }
         let memories = self.recall(&recall_ctx).await.unwrap_or_else(|e| {
             warn!("recall failed in think (non-fatal): {e}");
             Vec::new()
@@ -313,15 +383,13 @@ impl Agent {
         )
     }
 
-    /// Käsittelee yhden vuoron **kaatumiskestävästi**.
+    /// Käsittelee yhden vuoron **kaatumiskestävästi** (ilman per-viesti-
+    /// alkuperää — käyttää staattista reply-kohdetta jos asetettu).
     ///
-    /// Vuoron *lopputulos* ([`TurnOutcome`]) kirjataan durable-askeleeseen
-    /// ([`DurableContext::step`]), joten uudelleenkäynnistyksessä jo
-    /// suoritetut vuorot toistuvat lokista ajamatta sivuvaikutuksia
-    /// uudelleen (design §2.1). Itse muistikirjaus tehdään askeleen
-    /// päättelemän lipun mukaan.
-    ///
-    /// Palauttaa vuoron lopputuloksen.
+    /// Tämä on taaksepäin-yhteensopiva kuori
+    /// [`handle_turn_with_origin`](Self::handle_turn_with_origin):lle
+    /// `origin = None`:lla. Reply ohjautuu agentin staattiseen
+    /// [`with_reply_target`](Self::with_reply_target)-kohteeseen.
     ///
     /// # Errors
     /// - [`FamilyClawError::Memory`] jos muistin kirjaus epäonnistuu.
@@ -330,6 +398,37 @@ impl Agent {
         &mut self,
         sender: BeingId,
         message: &BusMessage,
+    ) -> Result<TurnOutcome> {
+        self.handle_turn_with_origin(sender, message, None).await
+    }
+
+    /// Käsittelee yhden vuoron **kaatumiskestävästi**, per-viesti-alkuperän
+    /// ([`familyclaw_bus::MessageOrigin`]) kanssa (F2).
+    ///
+    /// Vuoron *lopputulos* ([`TurnOutcome`]) kirjataan durable-askeleeseen
+    /// ([`DurableContext::step`]), joten uudelleenkäynnistyksessä jo
+    /// suoritetut vuorot toistuvat lokista ajamatta sivuvaikutuksia
+    /// uudelleen (design §2.1). Itse muistikirjaus tehdään askeleen
+    /// päättelemän lipun mukaan.
+    ///
+    /// ## Reply-kohteen johto (F2-ydin)
+    /// Vastauksen kohde johdetaan **per viesti**: jos `origin` on annettu, kohde
+    /// on `origin.reply_target()` (se keskustelu, josta viesti tuli). Muuten
+    /// palataan agentin staattiseen [`with_reply_target`](Self::with_reply_target)
+    /// -arvoon. Näin yksi agentti voi palvella montaa keskustelua ilman että
+    /// vastaukset vuotavat väärään kohteeseen — eikä yhden kanavan +
+    /// staattisen kohteen MVP-käytös rikkoonnu (`origin = None` → entinen polku).
+    ///
+    /// Palauttaa vuoron lopputuloksen.
+    ///
+    /// # Errors
+    /// - [`FamilyClawError::Memory`] jos muistin kirjaus epäonnistuu.
+    /// - [`FamilyClawError`] (käärittynä) jos durable-askel epäonnistuu.
+    pub async fn handle_turn_with_origin(
+        &mut self,
+        sender: BeingId,
+        message: &BusMessage,
+        origin: Option<&familyclaw_bus::MessageOrigin>,
     ) -> Result<TurnOutcome> {
         let turn = self.turn_counter;
         let step_name = format!("turn-{turn}");
@@ -434,7 +533,14 @@ impl Agent {
         //     viestin käyttäjälle), joten replay ei saa toistaa sitä.
         if !self.durable.is_replaying() {
             if let Some(thought) = thought_response.as_deref().filter(|s| !s.is_empty()) {
-                if let Some(target) = self.reply_target.as_deref() {
+                // F2: johda reply-kohde per viesti. Origin ENSIN (se keskustelu
+                // josta viesti tuli), FALLBACK staattiseen reply-kohteeseen.
+                // Näin >1 keskustelu reitittyy oikein, ja yhden kanavan +
+                // staattisen kohteen MVP-käytös säilyy (origin = None).
+                let target: Option<&str> = origin
+                    .map(familyclaw_bus::MessageOrigin::reply_target)
+                    .or(self.reply_target.as_deref());
+                if let Some(target) = target {
                     match OutboundMessage::new(target, thought) {
                         Ok(reply) => {
                             if let Err(e) = self.route_reply(reply) {
@@ -483,12 +589,20 @@ impl Agent {
         let emotional_charge = vad_magnitude(&vad);
         let factors = ImportanceFactors::new(emotional_charge, 0.0, 0.3, 0.0);
 
+        // F4 sessio-isolaatio: tagaa muisto session-tagilla kun sessio on
+        // asetettu, jotta [`Agent::think`]:n recall voi suodattaa per-sessio.
+        // Ilman sessiota (None) vain `from:`-tag → jaettu scope (nykyinen
+        // käytös, taaksepäin-yhteensopiva).
+        let mut tags = vec![format!("from:{sender}")];
+        if let Some(origin) = self.session.as_ref() {
+            tags.push(origin.session_tag());
+        }
         let mut builder = Memory::builder(content)
             .vad(vad)
             .factors(factors)
             .decay_policy(DecayPolicy::Normal)
             .source("bus")
-            .tags([format!("from:{sender}")]);
+            .tags(tags);
         if let Some((dim, _)) = self.emotion.dominant() {
             builder = builder.emotions([dim]);
         }
@@ -702,7 +816,13 @@ impl Actor for AgentActor {
         if sender == agent.being_id {
             return Ok(());
         }
-        match agent.handle_turn(sender, &envelope.payload).await {
+        // F2: per-viesti-alkuperä kirjekuoresta → reply-kohde johdetaan per
+        // viesti (origin.reply_target()), fallback staattiseen kohteeseen.
+        let origin = envelope.origin.clone();
+        match agent
+            .handle_turn_with_origin(sender, &envelope.payload, origin.as_ref())
+            .await
+        {
             Ok(outcome) => {
                 debug!(
                     agent = agent.name(),
@@ -1074,6 +1194,188 @@ mod tests {
         assert!(
             agent.route_reply(reply).is_err(),
             "suljettu sink → toimitusvirhe"
+        );
+        bus.stop();
+    }
+
+    // ---- F1 failover-wiring ---------------------------------------------
+
+    /// `Agent::new(Some(LlmConfig))` kääräisee yhden klientin 1-pituiseksi
+    /// failover-ketjuksi (taaksepäin-yhteensopiva: ei fallbackeja).
+    #[tokio::test]
+    async fn new_with_llm_config_wraps_single_failover() {
+        use crate::llm::LlmConfig;
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let config = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+        let soul = Soul::from_essence("I am agent_a.");
+        let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
+        let durable =
+            DurableContext::new(Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>)
+                .expect("durable");
+        let llm_cfg = LlmConfig::new("http://localhost:9/v1", "k", "single-model");
+        let agent = Agent::new(config, soul, memory, durable, bus.clone(), Some(llm_cfg), None);
+
+        let failover = agent.llm().expect("llm wired");
+        assert_eq!(failover.len(), 1, "yksi config → 1-pituinen ketju");
+        assert_eq!(failover.primary_model(), "single-model");
+        bus.stop();
+    }
+
+    /// `with_failover` korvaa konstruktorin 1-pituisen ketjun KOKO ketjulla
+    /// (primary + fallbackit) — F1: agentti saa failoverin, ei vain primaryä.
+    #[tokio::test]
+    async fn with_failover_replaces_chain_with_full_failover() {
+        use crate::llm_chain::{build_llm_chain, EnvEndpointResolver};
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let resolver = EnvEndpointResolver::new()
+            .with_provider("openai", "https://api.openai.com/v1", "OPENAI_API_KEY")
+            .with_provider("deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY");
+        let model = ModelConfig::new("openai/gpt-4o").with_fallback("deepseek/deepseek-v4-pro");
+        let chain = build_llm_chain(&model, &resolver).expect("chain builds");
+
+        // Agentti rakennetaan ILMAN llm:ää, sitten kytketään koko ketju.
+        let agent = test_agent("agent_a", bus.clone()).with_failover(chain);
+        let failover = agent.llm().expect("failover wired");
+        assert_eq!(failover.len(), 2, "primary + 1 fallback");
+        assert_eq!(failover.primary_model(), "openai/gpt-4o");
+        bus.stop();
+    }
+
+    // ---- F4 sessio-isolaatio --------------------------------------------
+
+    use crate::session::MessageOrigin;
+
+    /// F4 write-side: kun sessio on asetettu, vuoron muisto saa session-tagin
+    /// (`session:<channel>:<conversation>`) `from:`-tagin lisäksi. Ilman
+    /// sessiota tagia ei ole (jaettu scope säilyy).
+    #[tokio::test]
+    async fn session_tags_memory_for_isolation() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let origin = MessageOrigin::new("discord-main", "general", "user-1");
+        let mut agent = test_agent("agent_a", bus.clone()).with_session(origin.clone());
+
+        agent
+            .handle_turn(BeingId::new(), &BusMessage::text("sessio-viesti"))
+            .await
+            .expect("turn");
+
+        // Muisto on tagattu session-tagilla → recall samalla vaaditulla tagilla
+        // löytää sen.
+        let scoped = RetrievalContext::new("sessio-viesti")
+            .with_required_tags([origin.session_tag()]);
+        let hits = agent.recall(&scoped).await.expect("recall scoped");
+        assert_eq!(hits.len(), 1, "session-tagilla suodatettu recall löytää muiston");
+        assert!(hits[0].memory.tags.contains(&origin.session_tag()));
+
+        bus.stop();
+    }
+
+    /// F4 read-side (ydinväite): kahden eri session muistot **eivät vuoda**
+    /// toistensa kontekstiin. Sama jaettu muisti, mutta vaadittu session-tag
+    /// erottaa A:n muistot B:n hausta.
+    #[tokio::test]
+    async fn sessions_do_not_leak_memories_across_each_other() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+
+        // JAETTU muisti (yksi store) — todistaa että isolaatio tulee tagista,
+        // ei erillisistä storeista.
+        let shared: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
+
+        let origin_a = MessageOrigin::new("discord-main", "channel-a", "u");
+        let origin_b = MessageOrigin::new("discord-main", "channel-b", "u");
+
+        // Sessio A kirjoittaa muiston jaettuun storeen.
+        {
+            let durable = DurableContext::new(
+                Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>,
+            )
+            .expect("durable");
+            let mut agent_a = Agent::new(
+                AgentConfig::new("agent_a", ModelConfig::new("provider/model")),
+                Soul::from_essence("I am agent_a."),
+                Arc::clone(&shared),
+                durable,
+                bus.clone(),
+                None,
+                None,
+            )
+            .with_session(origin_a.clone());
+            agent_a
+                .handle_turn(BeingId::new(), &BusMessage::text("salaisuus kanavasta A"))
+                .await
+                .expect("turn a");
+        }
+
+        // Sessio B kirjoittaa OMAN muistonsa SAMAAN storeen. Eri agentti-nimi
+        // ("agent_b") → eri turn_key → muisti-store ei deduplikoi sitä A:n
+        // turn-0:n kanssa (dedup on per-agentti turn_key, ei per-sessio).
+        let durable_b =
+            DurableContext::new(Box::new(InMemoryJournal::new()) as Box<dyn Journal + Send + Sync>)
+                .expect("durable");
+        let mut agent_b = Agent::new(
+            AgentConfig::new("agent_b", ModelConfig::new("provider/model")),
+            Soul::from_essence("I am agent_b."),
+            Arc::clone(&shared),
+            durable_b,
+            bus.clone(),
+            None,
+            None,
+        )
+        .with_session(origin_b.clone());
+        agent_b
+            .handle_turn(BeingId::new(), &BusMessage::text("viesti kanavasta B"))
+            .await
+            .expect("turn b");
+
+        // Jaettu store sisältää MOLEMMAT muistot.
+        assert_eq!(shared.len().await.expect("len"), 2);
+
+        // B:n session-scope (vaadittu B-tag) EI näe A:n muistoa.
+        let b_scope = RetrievalContext::new("salaisuus kanavasta A")
+            .with_required_tags([origin_b.session_tag()]);
+        let b_sees = agent_b.recall(&b_scope).await.expect("recall b");
+        assert!(
+            b_sees.iter().all(|r| !r.memory.content.contains("kanavasta A")),
+            "B:n sessio ei saa nähdä A:n muistoa"
+        );
+
+        // A:n session-scope näkee A:n oman muiston (positiivinen kontrolli).
+        let a_scope = RetrievalContext::new("salaisuus kanavasta A")
+            .with_required_tags([origin_a.session_tag()]);
+        let a_sees = agent_b.recall(&a_scope).await.expect("recall a");
+        assert_eq!(a_sees.len(), 1, "A:n sessio näkee oman muistonsa");
+        assert!(a_sees[0].memory.content.contains("kanavasta A"));
+
+        bus.stop();
+    }
+
+    /// Ilman sessiota (None) recall on jaettu — taaksepäin-yhteensopiva
+    /// negatiivinen kontrolli: nykyinen MVP-käytös säilyy muuttumattomana.
+    #[tokio::test]
+    async fn no_session_keeps_shared_scope() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let mut agent = test_agent("agent_a", bus.clone());
+        assert!(agent.session().is_none(), "oletus: ei sessiota");
+
+        agent
+            .handle_turn(BeingId::new(), &BusMessage::text("jaettu viesti"))
+            .await
+            .expect("turn");
+
+        // Recall ILMAN tagivaatimusta löytää muiston (jaettu scope).
+        let hits = agent
+            .recall(&RetrievalContext::new("jaettu viesti"))
+            .await
+            .expect("recall");
+        assert_eq!(hits.len(), 1);
+        // Muistossa ei ole session-tagia (ei `session:`-etuliitettä).
+        assert!(
+            hits[0]
+                .memory
+                .tags
+                .iter()
+                .all(|t| !t.starts_with(crate::session::SESSION_TAG_PREFIX)),
+            "ilman sessiota muisto ei saa session-tagia"
         );
         bus.stop();
     }

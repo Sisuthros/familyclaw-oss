@@ -66,15 +66,19 @@ pub mod agent;
 pub mod channel_bridge;
 pub mod llm;
 pub mod llm_chain;
+pub mod session;
 pub mod soul;
 
 pub use agent::{
     new_reply_channel, Agent, AgentActor, ErasedMemoryStore, ReplySink, TurnOutcome,
 };
-pub use channel_bridge::{envelope_to_bus_message, publish_envelope, pump_channel_to_bus};
+pub use channel_bridge::{
+    envelope_origin, envelope_to_bus_message, publish_envelope, pump_channel_to_bus,
+};
 pub use llm_chain::{
     build_llm_chain, primary_llm_config, EnvEndpointResolver, LlmEndpointResolver, LlmFailover,
 };
+pub use session::{MessageOrigin, SESSION_TAG_PREFIX};
 pub use soul::{load_soul, resolve_profile_dir, Soul, PROFILE_DIR_ENV};
 
 // Re-export ydinvirhetyypit kutsujan mukavuudeksi.

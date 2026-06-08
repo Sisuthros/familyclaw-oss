@@ -1622,11 +1622,13 @@ name = "familyclaw-gateway"
 version = "0.1.0"
 dependencies = [
  "axum 0.7.9",
+ "clap",
  "familyclaw-agent",
  "familyclaw-bus",
  "familyclaw-channels",
  "familyclaw-core",
  "familyclaw-runtime",
+ "reqwest 0.12.28",
  "tokio",
  "tracing",
  "tracing-subscriber",

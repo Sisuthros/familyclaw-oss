@@ -23,7 +23,7 @@
 //! Geneeristä alustakoodia: ei kovakoodattuja olentonimiä, avaimia eikä
 //! polkuja. Lähettävän olennon [`BeingId`] annetaan aina ajonaikaisesti.
 
-use familyclaw_bus::{BeingId, BusHandle, BusMessage};
+use familyclaw_bus::{BeingId, BusHandle, BusMessage, MessageOrigin};
 use familyclaw_channels::{pump_to, InboundEnvelope, MessageStream};
 
 use crate::{FamilyClawError, Result};
@@ -33,9 +33,10 @@ use crate::{FamilyClawError, Result};
 ///
 /// Kirjekuoren tekstisisältö (`body`) muuttuu [`BusMessage::Text`]:ksi — se on
 /// muoto, jonka busin olennot (agentit) käsittelevät vuoroina. Kirjekuoren
-/// alkuperätiedot (kanava, lähettäjä, keskustelu) eivät mahdu busin
-/// hyötykuormaan; lähettäjä välitetään erikseen julkaistaessa olennon
-/// [`BeingId`]:nä (ks. [`publish_envelope`]).
+/// alkuperätiedot (kanava, lähettäjä, keskustelu) **säilytetään** bus-
+/// kirjekuoren `origin`-kentässä (ks. [`envelope_origin`] + [`publish_envelope`])
+/// — ne eivät mahdu *hyötykuormaan* (`BusMessage`) mutta ne ovat
+/// vastausreitityksen edellytys.
 ///
 /// Tämä on vapaa funktio eikä `impl From<InboundEnvelope> for BusMessage`,
 /// koska molemmat tyypit ovat *vieraita* tälle cratelle (orphan-sääntö
@@ -46,17 +47,41 @@ pub fn envelope_to_bus_message(envelope: InboundEnvelope) -> BusMessage {
     BusMessage::text(envelope.body)
 }
 
-/// Julkaisee yhden kanavakirjekuoren Resonance Busiin annetun olennon nimissä.
+/// Poimii kanavakirjekuoren **per-viesti-alkuperän** bus-kerroksen
+/// [`MessageOrigin`]:ksi (F2-origin-sopimus).
+///
+/// Kanavakerros tuottaa jo täsmälleen tarvittavat kentät (`channel_id`,
+/// `conversation`, `sender`); tämä kuvaa ne kenttä kentältä bus-kirjekuoren
+/// `origin`-kenttään, jonka vastaanottava agentti käyttää vastauksen kohteen
+/// (`conversation`) johtamiseen per viesti. Näin >1 keskustelu reitittyy
+/// oikein eikä vuoda toisiinsa.
+#[must_use]
+pub fn envelope_origin(envelope: &InboundEnvelope) -> MessageOrigin {
+    MessageOrigin::new(
+        envelope.channel_id.clone(),
+        envelope.conversation.clone(),
+        envelope.sender.clone(),
+    )
+}
+
+/// Julkaisee yhden kanavakirjekuoren Resonance Busiin annetun olennon nimissä,
+/// **alkuperätiedot säilyttäen** (F2).
 ///
 /// `from` on se olento ([`BeingId`]), jonka *postilaatikkona* kanava toimii —
 /// esim. kanavan oma bus-seat. Näin saapuva ulkomaailman liikenne saa
 /// busin sisällä yksikäsitteisen lähettäjäidentiteetin, jonka muut olennot
 /// näkevät [`familyclaw_bus::ResonanceMessage::from`]-kentässä.
 ///
+/// Kirjekuoren alkuperä (kanava/keskustelu/lähettäjä) viedään bus-viestin
+/// `origin`-kenttään ([`envelope_origin`]) — ei pudoteta. Tämä on F2:n ydin:
+/// vastaanottava agentti johtaa vastauksen kohteen tästä per viesti, joten
+/// useampi keskustelu reitittyy oikeisiin kohteisiin.
+///
 /// # Errors
 /// [`FamilyClawError::Bus`] jos busiin julkaisu epäonnistuu.
 pub fn publish_envelope(bus: &BusHandle, from: BeingId, envelope: InboundEnvelope) -> Result<()> {
-    bus.publish(from, envelope_to_bus_message(envelope))
+    let origin = envelope_origin(&envelope);
+    bus.publish_with_origin(from, envelope_to_bus_message(envelope), origin)
 }
 
 /// Pumppaa kanavan koko saapuvan virran Resonance Busiin.

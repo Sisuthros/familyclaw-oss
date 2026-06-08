@@ -225,6 +225,70 @@ impl BusMessage {
 /// Bus rikastaa jokaisen julkaisun tähän muotoon, jotta vastaanottajat
 /// tietävät kuka resonoi ja milloin. Kuori on `Clone`, koska sama viesti
 /// monistetaan jokaiselle vastaanottavalle olennolle (broadcast).
+/// Yhden saapuvan viestin **alkuperae** bus-kirjekuoressa (F2-origin-sopimus):
+/// mistae kanavasta, mistae keskustelusta ja keneltae viesti tuli.
+///
+/// Tama on **kevyt, riippumaton** tyyppi busin matalimmassa kerroksessa: vain
+/// kolme [`String`]-kenttaa, jotta bus ei joudu riippumaan kanava- tai
+/// agenttikerroksesta (kerrossuunta on yksisuuntainen — ne riippuvat busista,
+/// ei toisin pain). Agenttikerroksen `MessageOrigin` kuvautuu suoraan tahan ja
+/// takaisin (`channel_id`/`conversation`/`sender` tasmaavat kenttae kentaelta).
+///
+/// ## Miksi origin kuuluu kirjekuoreen, ei hyotykuormaan
+/// [`BusMessage`] on *sisaeltoe* (teksti/tunnepulssi/latent). Alkuperae on
+/// *metatietoa* siitae mistae sisaeltoe saapui — sama tieto kuin laehettaejae
+/// ([`ResonanceMessage::from`]) ja aikaleima. Origin kirjekuoressa antaa
+/// vastaanottajalle (agentille) keinon johtaa **vastauksen kohde** per viesti
+/// (`conversation`), niin etta useampi keskustelu ei reitity vaerin.
+///
+/// ## OSS-raja (KERROS A)
+/// Ei kovakoodattuja kanavanimiae, keskusteluja eikae avaimia — kaikki tulee
+/// ajonaikaisesti saapuvasta viestistae.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MessageOrigin {
+    /// Kanavainstanssin tunniste (esim. `"discord-main"`).
+    pub channel_id: String,
+    /// Keskustelun/ryhmaen tunniste (vastausosoite).
+    pub conversation: String,
+    /// Kanavakohtainen laehettaejaen tunniste (auditointi).
+    pub sender: String,
+}
+
+impl MessageOrigin {
+    /// Rakentaa alkuperaen paljaista osista.
+    #[must_use]
+    pub fn new(
+        channel_id: impl Into<String>,
+        conversation: impl Into<String>,
+        sender: impl Into<String>,
+    ) -> Self {
+        Self {
+            channel_id: channel_id.into(),
+            conversation: conversation.into(),
+            sender: sender.into(),
+        }
+    }
+
+    /// Reply-kohde taelle alkuperaelle: keskustelu, josta viesti tuli.
+    #[must_use]
+    pub fn reply_target(&self) -> &str {
+        &self.conversation
+    }
+}
+
+/// Busin läpi kulkeva viesti **kirjekuoressa**: hyötykuorma + lähettäjä +
+/// tunniste + aikaleima + valinnainen per-viesti-alkuperä ([`origin`]).
+///
+/// Bus rikastaa jokaisen julkaisun tähän muotoon, jotta vastaanottajat
+/// tietävät kuka resonoi ja milloin. Kuori on `Clone`, koska sama viesti
+/// monistetaan jokaiselle vastaanottavalle olennolle (broadcast).
+///
+/// [`origin`] (F2-origin-sopimus) kantaa ulkomaailman alkuperän
+/// ([`MessageOrigin`]: kanava + keskustelu + lähettäjä) silloin kun viesti tuli
+/// kanavakerroksen kautta. Vastaanottava agentti johtaa siitä vastauksen
+/// kohteen per viesti; `None`-tapauksessa palataan staattiseen reply-kohteeseen.
+///
+/// [`origin`]: ResonanceMessage::origin
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResonanceMessage {
     /// Viestin yksilöivä tunniste.
@@ -235,10 +299,19 @@ pub struct ResonanceMessage {
     pub at: Timestamp,
     /// Varsinainen hyötykuorma.
     pub payload: BusMessage,
+    /// Per-viesti-alkuperä (kanava/keskustelu/lähettäjä), jos viesti tuli
+    /// ulkomaailmasta kanavakerroksen kautta. Sisäisesti syntyneet viestit
+    /// (olentojen väliset pulssit, say/announce) jättävät sen `None`:ksi.
+    /// `#[serde(default)]` → vanhat (origin-ttömät) durable-replayt
+    /// deserialisoituvat `None`:ksi (taaksepäin-yhteensopiva).
+    #[serde(default)]
+    pub origin: Option<MessageOrigin>,
 }
 
 impl ResonanceMessage {
     /// Rakentaa kirjekuoren tuoreella tunnisteella ja nykyhetken aikaleimalla.
+    /// Origin on `None` (sisäinen viesti); ulkomaailman alkuperä liitetään
+    /// [`with_origin`](Self::with_origin):llä.
     #[must_use]
     pub fn new(from: BeingId, payload: BusMessage) -> Self {
         Self {
@@ -246,7 +319,22 @@ impl ResonanceMessage {
             from,
             at: time::now(),
             payload,
+            origin: None,
         }
+    }
+
+    /// Liittää per-viesti-alkuperän kirjekuoreen (F2). Palauttaa `self`
+    /// ketjutusta varten.
+    #[must_use]
+    pub fn with_origin(mut self, origin: MessageOrigin) -> Self {
+        self.origin = Some(origin);
+        self
+    }
+
+    /// Per-viesti-alkuperä, jos asetettu.
+    #[must_use]
+    pub fn origin(&self) -> Option<&MessageOrigin> {
+        self.origin.as_ref()
     }
 
     /// Onko tämän kirjekuoren hyötykuorma affektiivinen pulssi.
@@ -364,5 +452,69 @@ mod tests {
         let json = serde_json::to_string(&env).expect("serialize");
         let back: ResonanceMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(env, back);
+    }
+
+    // ---- F2 per-viesti-alkuperä (origin) -------------------------------
+
+    #[test]
+    fn new_message_has_no_origin_by_default() {
+        // Sisäisesti syntyneet viestit (say/pulse) eivät kanna alkuperää.
+        let env = ResonanceMessage::new(BeingId::new(), BusMessage::text("sisäinen"));
+        assert!(env.origin().is_none());
+    }
+
+    #[test]
+    fn with_origin_attaches_per_message_origin() {
+        let origin = MessageOrigin::new("discord-main", "general", "user-42");
+        let env =
+            ResonanceMessage::new(BeingId::new(), BusMessage::text("ulkoa")).with_origin(origin.clone());
+        assert_eq!(env.origin(), Some(&origin));
+        assert_eq!(env.origin().expect("origin").reply_target(), "general");
+    }
+
+    #[test]
+    fn message_origin_serde_roundtrip() {
+        let origin = MessageOrigin::new("tg-1", "room-7", "alice");
+        let json = serde_json::to_string(&origin).expect("serialize");
+        let back: MessageOrigin = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(origin, back);
+    }
+
+    #[test]
+    fn resonance_message_with_origin_serde_roundtrip() {
+        let env = ResonanceMessage::new(BeingId::new(), BusMessage::text("origin-roundtrip"))
+            .with_origin(MessageOrigin::new("discord-main", "channel-a", "u"));
+        let json = serde_json::to_string(&env).expect("serialize");
+        let back: ResonanceMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(env, back);
+        assert_eq!(back.origin().expect("origin").conversation, "channel-a");
+    }
+
+    #[test]
+    fn legacy_envelope_without_origin_field_deserializes_to_none() {
+        // Taaksepäin-yhteensopivuus: vanha durable-replay-rivi EI sisällä
+        // `origin`-kenttää. `#[serde(default)]` → None, ei deserialisointivirhe.
+        // Rakennetaan "vanha" muoto serialisoimalla nykyinen ja poistamalla
+        // origin-avain JSON-objektista (faithfulimpi kuin käsin koodattu rivi:
+        // id/timestamp-muodot pysyvät oikeina riippumatta sisäisestä esityksestä).
+        let env = ResonanceMessage::new(BeingId::new(), BusMessage::text("vanha"));
+        let mut value: serde_json::Value = serde_json::to_value(&env).expect("to value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("origin")
+            .expect("nykyinen muoto sisältää origin-avaimen");
+        assert!(
+            value.get("origin").is_none(),
+            "origin-avain poistettu (simuloi vanhaa riviä)"
+        );
+
+        let back: ResonanceMessage =
+            serde_json::from_value(value).expect("legacy envelope deserializes");
+        assert!(back.origin().is_none(), "puuttuva origin-kenttä → None");
+        match back.payload {
+            BusMessage::Text { body } => assert_eq!(body, "vanha"),
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 }

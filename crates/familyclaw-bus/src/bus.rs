@@ -322,6 +322,22 @@ impl BusHandle {
         self.publish_envelope(ResonanceMessage::new(from, payload))
     }
 
+    /// Julkaisee hyötykuorman **per-viesti-alkuperän** kanssa (F2): kirjekuori
+    /// kantaa [`MessageOrigin`]:n, josta vastaanottava agentti johtaa
+    /// vastauksen kohteen per viesti. Käytetään kanavakerroksen sillassa, kun
+    /// saapuva viesti tulee ulkomaailmasta tunnetusta keskustelusta.
+    ///
+    /// # Errors
+    /// [`FamilyClawError::Bus`] jos viestin lähetys actorille epäonnistuu.
+    pub fn publish_with_origin(
+        &self,
+        from: BeingId,
+        payload: BusMessage,
+        origin: crate::message::MessageOrigin,
+    ) -> Result<()> {
+        self.publish_envelope(ResonanceMessage::new(from, payload).with_origin(origin))
+    }
+
     /// Palauttaa tilannekuvan liittyneistä olennoista.
     ///
     /// **Tämä lista ei ole tyhjä kun olentoja on liittynyt** (design §2.2).
