@@ -35,6 +35,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+      - name: Build continuity_daemon for tests
+        run: cargo build -p familyclaw-agent --bin continuity_daemon
       - name: cargo test
         run: cargo test --workspace --all-targets
       - name: cargo test (all features)
@@ -77,8 +79,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Build bench binary
         run: cargo build -p familyclaw-bench --bin bench --profile release
-      - name: Build continuity_daemon (debug for bench)
-        run: cargo build -p familyclaw-agent --bin continuity_daemon
       - name: Run bench all
         run: cargo run -p familyclaw-bench --bin bench -- all
       - name: Upload scorecard
