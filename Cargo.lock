@@ -1662,6 +1662,7 @@ name = "familyclaw-hearth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cfg-if",
  "chrono",
  "familyclaw-bus",
  "familyclaw-core",
@@ -1712,6 +1713,7 @@ dependencies = [
  "familyclaw-core",
  "familyclaw-dream",
  "familyclaw-durable",
+ "familyclaw-hearth",
  "familyclaw-memory",
  "ractor",
  "serde_json",
@@ -3041,6 +3043,22 @@ checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
 dependencies = [
  "mime",
  "unicase",
+]
+
+[[package]]
+name = "minimal-gateway"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "familyclaw-agent",
+ "familyclaw-bus",
+ "familyclaw-channels",
+ "familyclaw-core",
+ "familyclaw-runtime",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

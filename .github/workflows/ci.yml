@@ -1,76 +1,144 @@
-name: CI
+name: FamilyClaw CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, release/*]
   pull_request:
     branches: [main]
+  release:
+    types: [published]
 
 env:
-  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
   RUST_BACKTRACE: 1
 
 jobs:
   check:
-    name: Check
+    name: Check (compile only)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check --workspace --all-targets
 
   test:
-    name: Test
+    name: Test (unit + integration)
     runs-on: ubuntu-latest
+    needs: check
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+      - name: cargo test (all features)
+        run: cargo test --workspace --all-features
 
   clippy:
-    name: Clippy
+    name: Clippy (pedantic)
     runs-on: ubuntu-latest
+    needs: check
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings -A clippy::doc_markdown -A clippy::too_many_lines
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::doc_markdown -A clippy::too_many_lines
 
   fmt:
-    name: Format
+    name: Format check
     runs-on: ubuntu-latest
+    needs: check
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
 
-  layer-b-audit:
-    name: Layer B Audit
+  bench:
+    name: Benchmark (deterministic scorecard)
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Layer B leak audit
-        run: bash scripts/audit-layer-b.sh
-
-  feature-matrix:
-    name: Feature Matrix
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        command:
-          - cargo test --workspace --all-features
-          - cargo check -p familyclaw-channels --features discord
-          - cargo test -p familyclaw-sandbox --features wasmtime
+    needs: check
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: ${{ matrix.command }}
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build bench binary
+        run: cargo build -p familyclaw-bench --bin bench --profile release
+      - name: Build continuity_daemon
+        run: cargo build -p familyclaw-agent --bin continuity_daemon --profile release
+      - name: Run bench all
+        run: cargo run -p familyclaw-bench --bin bench -- all
+      - name: Upload scorecard
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorecard
+          path: crates/familyclaw-bench/out/
+          retention-days: 30
+
+  layer-b-audit:
+    name: Layer B Audit (no secrets in OSS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run audit script
+        run: |
+          if [ -f ./scripts/audit-layer-b.sh ]; then
+            chmod +x ./scripts/audit-layer-b.sh
+            ./scripts/audit-layer-b.sh
+          else
+            echo "No audit script found — manual check:"
+            echo "Checking for hardcoded secrets..."
+            git grep -i "api_key\|token\|secret\|password" -- "*.rs" "*.toml" "*.md" | grep -v "test" | grep -v ".gitignore" || true
+            echo "Checking for family member names..."
+            git grep -i "agent_alpha\|agent_beta\|agent_delta\|agent_gamma\|the operator" -- "*.rs" "*.toml" *.md | grep -v "test" | grep -v "docs/" | grep -v "example" || true
+            echo "Audit complete — if output above is empty, you're clean."
+
+  release:
+    name: Release (tag push)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: [check, test, clippy, fmt, bench, layer-b-audit]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: |
+          cargo build -p familyclaw-agent --bin familyclaw --profile release
+          cargo build -p familyclaw-agent --bin crash_replay --profile release
+          cargo build -p familyclaw-agent --bin continuity_daemon --profile release
+          cargo build -p familyclaw-bench --bin bench --profile release
+          cargo build -p familyclaw-gateway --profile release
+          cargo build -p minimal-gateway --profile release
+      - name: Create release artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/familyclaw dist/
+          cp target/release/crash_replay dist/
+          cp target/release/continuity_daemon dist/
+          cp target/release/bench dist/
+          cp target/release/familyclaw-gateway dist/
+          cp target/release/minimal-gateway dist/
+          tar -czf familyclaw-${{ github.event.release.tag_name }}-linux-x86_64.tar.gz -C dist .
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: familyclaw-*-linux-x86_64.tar.gz
+          draft: false
+          prerelease: ${{ github.event.release.prerelease }}

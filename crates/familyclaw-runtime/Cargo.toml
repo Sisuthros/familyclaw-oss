@@ -19,6 +19,7 @@ familyclaw-channels = { workspace = true }
 familyclaw-memory = { workspace = true }
 familyclaw-durable = { workspace = true }
 familyclaw-dream = { workspace = true }
+familyclaw-hearth = { workspace = true }
 ractor = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

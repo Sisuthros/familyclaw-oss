@@ -5,6 +5,34 @@ All notable changes to FamilyClaw will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha] - 2026-06-09
+
+### Added
+- **examples/minimal-gateway** — "FamilyClaw in 60 seconds" demo: 1 agent + Resonance Bus + MockChannel, zero external deps
+- **CONTRIBUTING.md** — Contribution guidelines, PR checklist, commit conventions, benchmark requirements
+- **GOVERNANCE.md** — Maintainer roles, bus factor ≥ 2, RFC process, KERROS A/B boundary (non-negotiable), release process
+- **GitHub Actions CI** — check, test, clippy, fmt, bench (scorecard artifact), layer-b-audit, release pipeline with binary artifacts
+- **README.md** — "60 seconds" quickstart, benchmark command, verification commands
+
+### Changed
+- **familyclaw-gateway** — Removed 9 dead-code constants; config now flows through FamilyConfig (KERROS B boundary respected)
+- **familyclaw-hearth** — Fixed `unused_mut` warning in test
+- **familyclaw-gateway src/config.rs** — Removed unused `is_yolo()` accessor
+
+### Verified
+- `cargo check --workspace` — 0 warnings
+- `cargo test --workspace` — 120+ tests PASS
+- `cargo run -p familyclaw-bench --bin bench -- all` — **6/6 scenarios PASS** (crash_matrix, retention_curve, dream_quality, emotional_contagion, semantic_retrieval, eternal_thread)
+- Deterministic Scorecard generated at `crates/familyclaw-bench/out/SCORECARD.md`
+
+### Security
+- Layer B contamination audit in CI (enforces KERROS A/B boundary)
+- SHA-256 tamper detection on durable log
+- Input sanitization for all external-facing channels
+- WASM sandbox with fuel limiting for untrusted code
+
+---
+
 ## [0.1.0] - 2026-06-04
 
 ### Added

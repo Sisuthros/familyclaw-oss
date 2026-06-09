@@ -59,30 +59,20 @@ use tracing::{error, info, warn};
 /// Ympäristömuuttuja, joka määrää gatewayn kuunteluosoitteen.
 const ADDR_ENV: &str = "FAMILYCLAW_GATEWAY_ADDR";
 
-/// Agentin näyttönimi (env). Geneerinen oletus — ei perheenjäsentä.
-const AGENT_NAME_ENV: &str = "FAMILYCLAW_AGENT_NAME";
-/// Agentin malli `"provider/model"` (env).
-const AGENT_MODEL_ENV: &str = "FAMILYCLAW_AGENT_MODEL";
-/// Telegram-kanavainstanssin tunniste (env).
-const TELEGRAM_CHANNEL_ID_ENV: &str = "FAMILYCLAW_TELEGRAM_CHANNEL_ID";
-/// Staattinen reply-kohde — Telegram chat-id, johon vastaukset ohjataan (env).
-const REPLY_TARGET_ENV: &str = "FAMILYCLAW_REPLY_TARGET";
 /// Telegram-botin token (env). Vaadittu kun kanava kytketään.
+/// (Muut env-väliaineet palveluvan kautta `FamilyConfig` — nähdään `config.rs`.)
 const TELEGRAM_TOKEN_ENV: &str = "TELEGRAM_BOT_TOKEN";
-
-/// Discord-webhook-url lahetykseen (env).
-const DISCORD_WEBHOOK_URL_ENV: &str = "DISCORD_WEBHOOK_URL";
-/// Discord-kanavatunniste (env).
-const DISCORD_CHANNEL_ID_ENV: &str = "DISCORD_CHANNEL_ID";
-/// Kanavatyyppi (env): "telegram" tai "discord".
-const CHANNEL_KIND_ENV: &str = "FAMILYCLAW_CHANNEL_KIND";
 
 /// Provider-taulu resolverille (env). Muoto: `prefix=base_url=KEY_ENV` eroteltuna `;`.
 const PROVIDERS_ENV: &str = "FAMILYCLAW_PROVIDERS";
 
-/// Geneeriset oletukset (KERROS A — ei perhe-/avain-/polkutietoa).
-const DEFAULT_AGENT_NAME: &str = "agent_a";
-const DEFAULT_AGENT_MODEL: &str = "provider/model";
+/// Env-nimet virheviesteissä (ei lueta suoraan — `FamilyConfig` hoitaa)
+const DISCORD_WEBHOOK_URL_ENV: &str = "DISCORD_WEBHOOK_URL";
+const DISCORD_CHANNEL_ID_ENV: &str = "DISCORD_CHANNEL_ID";
+const TELEGRAM_CHANNEL_ID_ENV: &str = "FAMILYCLAW_TELEGRAM_CHANNEL_ID";
+const REPLY_TARGET_ENV: &str = "FAMILYCLAW_REPLY_TARGET";
+
+/// Oletusarvot joita `FamilyConfig` käyttää (KERROS B).
 const DEFAULT_BUS_NAME: &str = "familyclaw-gateway-bus";
 
 /// Oletuskuunteluosoite, kun [`ADDR_ENV`] ei ole asetettu. Sidotaan
@@ -284,33 +274,47 @@ async fn start_runtime() -> Result<(FamilyRuntime, Option<Arc<DiscordChannel>>)>
 
     let (channel, discord_ch): (Box<dyn Channel>, Option<Arc<DiscordChannel>>) =
         if channel_kind == "discord" {
-            let webhook_url = std::env::var(DISCORD_WEBHOOK_URL_ENV).map_err(|_| {
-                FamilyClawError::invalid_input(format!(
+            let webhook_url = cfg.discord_webhook_url();
+            if webhook_url.is_empty() {
+                return Err(FamilyClawError::invalid_input(format!(
                     "{DISCORD_WEBHOOK_URL_ENV} must be set for discord channel"
-                ))
-            })?;
-            let ch_id = std::env::var(DISCORD_CHANNEL_ID_ENV)
-                .unwrap_or_else(|_| "discord-main".to_string());
-            let dc = DiscordChannel::new(webhook_url.clone(), ch_id.clone())
+                )));
+            }
+            let ch_id = cfg.discord_channel_id();
+            let dc = DiscordChannel::new(webhook_url.to_string(), ch_id.to_string())
                 .map_err(FamilyClawError::from)?;
             let dc_arc = Arc::new(dc);
-            let ch: Box<dyn Channel> =
-                Box::new(DiscordChannel::new(webhook_url, ch_id).map_err(FamilyClawError::from)?);
+            let ch: Box<dyn Channel> = Box::new(
+                DiscordChannel::new(webhook_url.to_string(), ch_id.to_string())
+                    .map_err(FamilyClawError::from)?
+            );
             (ch, Some(dc_arc))
         } else {
-            let token = std::env::var(TELEGRAM_TOKEN_ENV).map_err(|_| {
-                FamilyClawError::invalid_input(format!("{TELEGRAM_TOKEN_ENV} must be set"))
-            })?;
-            let ch_id = std::env::var(TELEGRAM_CHANNEL_ID_ENV).map_err(|_| {
-                FamilyClawError::invalid_input(format!("{TELEGRAM_CHANNEL_ID_ENV} must be set"))
-            })?;
-            let tc = TelegramChannel::new(token, ch_id).map_err(FamilyClawError::from)?;
+            let token = cfg.telegram_token();
+            if token.is_empty() {
+                return Err(FamilyClawError::invalid_input(format!(
+                    "{TELEGRAM_TOKEN_ENV} must be set"
+                )));
+            }
+            let ch_id = cfg.telegram_channel_id();
+            if ch_id.is_empty() {
+                return Err(FamilyClawError::invalid_input(format!(
+                    "{TELEGRAM_CHANNEL_ID_ENV} must be set"
+                )));
+            }
+            let tc = TelegramChannel::new(token.to_string(), ch_id.to_string())
+                .map_err(FamilyClawError::from)?;
             let ch: Box<dyn Channel> = Box::new(tc);
             (ch, None)
         };
 
-    let reply_target = std::env::var(REPLY_TARGET_ENV)
-        .map_err(|_| FamilyClawError::invalid_input(format!("{REPLY_TARGET_ENV} must be set")))?;
+    let reply_target = cfg.reply_target();
+    if reply_target.is_empty() {
+        return Err(FamilyClawError::invalid_input(format!(
+            "{REPLY_TARGET_ENV} must be set"
+        )));
+    }
+    let reply_target = reply_target.to_string();
 
     let agent_cfg = AgentConfig::new(&agent_name, ModelConfig::new(model));
     let soul = load_agent_soul(&agent_name);

@@ -237,7 +237,4 @@ impl FamilyConfig {
     pub fn telegram_channel_id(&self) -> &str {
         &self.channel.telegram.channel_id
     }
-    pub fn is_yolo(&self) -> bool {
-        self.security.profile == "yolo"
-    }
 }

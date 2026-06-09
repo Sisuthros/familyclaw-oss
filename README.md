@@ -109,10 +109,28 @@ paths, and ships unit tests in-module.
 **Prerequisites:** Rust 1.85+ (edition 2021). No external services required for
 the demo — it runs entirely in-memory.
 
+### FamilyClaw in 60 seconds ⚡
+
 ```bash
 git clone https://github.com/Sisuthros/familyclaw
 cd familyclaw
 
+# One command: builds + runs 1 agent + Resonance Bus + MockChannel
+cargo run -p minimal-gateway -- --duration 10
+```
+
+**What happens:**
+1. 🚀 Starts Resonance Bus (`minimal-gateway-bus`)
+2. 🤖 Spawns `agent_a` with durable memory + emotion
+3. 📥 Injects a message via MockChannel
+4. 🔁 Message flows: Channel → Bus → Agent → Memory + Emotion
+5. 📤 Shows outbox (agent replied)
+6. 🛑 Clean shutdown on Ctrl-C or timeout
+
+*No Telegram, Discord, or API keys needed. Pure Rust, pure demo.*
+
+### Full test suite
+```bash
 # Build & test everything (workspace tests)
 cargo test --workspace
 
@@ -187,6 +205,10 @@ cargo test -p familyclaw-sandbox --features wasmtime
 # Code quality
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings -A clippy::doc_markdown -A clippy::too_many_lines
+
+# Benchmark suite — 6 scenarios, deterministic scorecard
+cargo run -p familyclaw-bench --bin bench -- all
+# → outputs crates/familyclaw-bench/out/SCORECARD.md + scorecard.json
 
 # Layer B audit (matches CI)
 ./scripts/audit-layer-b.sh

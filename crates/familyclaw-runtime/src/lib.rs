@@ -30,14 +30,16 @@
 //! ajonaikaisesti kutsujalta (gateway lukee ne ympäristöstä — KERROS B).
 
 use std::sync::Arc;
+use std::env;
 
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, Agent, ErasedMemoryStore, LlmEndpointResolver, Soul,
 };
 use familyclaw_bus::{BeingId, BusHandle, ResonanceBus, ResonanceMessage};
 use familyclaw_channels::Channel;
-use familyclaw_core::{AgentConfig, FamilyClawError, Result};
-use familyclaw_durable::{DurableContext, InMemoryJournal, Journal};
+use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
+use familyclaw_durable::{DurableContext, FileJournal, InMemoryJournal, Journal};
+use familyclaw_dream::DreamCycle;
 use familyclaw_memory::LocalJsonStore;
 use ractor::ActorRef;
 
@@ -134,15 +136,40 @@ pub async fn build_family(
     let failover = build_llm_chain(&agent_cfg.model, resolver).ok();
 
     // 4. Muisti (Eternal Thread, in-memory MVP) + durable-konteksti.
-    let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
-    let durable =
-        DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
+    let (memory, durable, dream_journal) = if let Ok(data_dir) = env::var("FAMILYCLAW_DATA_DIR") {
+        let dir = std::path::PathBuf::from(&data_dir);
+        std::fs::create_dir_all(&dir).ok();
+        let journal = FileJournal::open(dir.join("journal.jsonl"))
             .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+        let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(journal);
+        let mem = LocalJsonStore::open(dir.join("memory.json"))
+            .await
+            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+        let dur = DurableContext::new(Arc::clone(&dream_j))
+            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+        (Arc::new(mem) as ErasedMemoryStore, dur, Some(dream_j))
+    } else {
+        let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
+        let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(InMemoryJournal::new());
+        let durable =
+            DurableContext::new(Arc::clone(&dream_j))
+                .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+        (memory, durable, Some(dream_j))
+    };
 
-    // 5. Rakenna agentti ja kytke reply-sink + staattinen reply-kohde.
+    // 5. Ankkuroi identiteetti ennen agentin rakennusta.
+    if let Ok(_) = env::var("FAMILYCLAW_HEARTH_ENABLED") {
+        let mut registry = familyclaw_hearth::anchor_registry::AnchorRegistry::new();
+        if let Err(e) = registry.register(&agent_cfg.name, &soul.essence) {
+            tracing::warn!("Anchor registration failed (non-fatal): {e}");
+        } else { tracing::info!("Identity anchor registered for {}", agent_cfg.name); }
+    }
+
+    // 6. Rakenna agentti ja kytke reply-sink + staattinen reply-kohde.
     //    LLM annetaan `None`:na konstruktorille ja KOKO failover-ketju
     //    kytketään erikseen [`Agent::with_failover`]:lla (jos se ratkesi).
     //    Näin agentti saa primary + fallbackit, ei vain primaryä.
+    let dream_store = Arc::clone(&memory);
     let mut agent = Agent::new(agent_cfg, soul, memory, durable, bus.clone(), None, None)
         .with_reply_sink(sink)
         .with_reply_target(reply_target);
@@ -150,14 +177,14 @@ pub async fn build_family(
         agent = agent.with_failover(failover);
     }
 
-    // 6. Spawnaa agentti actorina (rekisteröi busiin).
+    // 7. Spawnaa agentti actorina (rekisteröi busiin).
     let actor = agent.spawn().await?;
 
-    // 7. Kanavan oma bus-seat — ERI kuin agentin being_id, muuten AgentActor
+    // 8. Kanavan oma bus-seat — ERI kuin agentin being_id, muuten AgentActor
     //    skippaisi viestin "omana kaikuna" (agent.rs handle, sender-tarkistus).
     let channel_seat = BeingId::new();
 
-    // 8. Avaa kanavan saapuva virta ja pumppaa se busiin omassa taskissaan.
+    // 9. Avaa kanavan saapuva virta ja pumppaa se busiin omassa taskissaan.
     //    pump_channel_to_bus blokkaa kunnes virta sulkeutuu → pakko spawnata.
     let stream = channel.receive().map_err(FamilyClawError::from)?;
     let pump = tokio::spawn({
@@ -169,7 +196,7 @@ pub async fn build_family(
         }
     });
 
-    // 9. Tyhjennä agentin reply-jono kanavalle (drain). Jaa kanava Arc:lla —
+    // 10. Tyhjennä agentin reply-jono kanavalle (drain). Jaa kanava Arc:lla —
     //    receive() on jo kutsuttu (askel 8), send() menee Arc:n kautta.
     let ch: Arc<dyn Channel> = Arc::from(channel);
     let drain = tokio::spawn(async move {
@@ -180,6 +207,21 @@ pub async fn build_family(
         }
     });
 
+    if let Some(dream_journal) = dream_journal {
+        let interval_secs: u64 = env::var("FAMILYCLAW_DREAM_INTERVAL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(6 * 3600);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                let store: &dyn familyclaw_memory::MemoryStore = &*dream_store;
+                let journal: &(dyn Journal + Send + Sync) = &*dream_journal;
+                let cycle = DreamCycle::new(store);
+                match cycle.run(journal, time::now()).await {
+                    Ok(report) => tracing::info!(target: "familyclaw::dream", scanned=report.scanned, merged=report.merged, dropped=report.dropped, strengthened=report.strengthened, archived=report.archived, absolutized=report.dates_absolutized, "Dream cycle completed"),
+                    Err(e) => tracing::warn!("Dream cycle failed: {e}"),
+                }
+            }
+        });
+    }
     // 10. Kokoa runtime — omistaa busin, agentin ja molemmat taskit.
     Ok(FamilyRuntime {
         bus,

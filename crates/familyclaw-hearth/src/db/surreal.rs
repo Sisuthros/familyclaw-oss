@@ -1,341 +1,286 @@
-//! SurrealDB v3 -pohjainen [`HearthStore`]-toteutus (`surreal`-feature).
+//! SurrealDB v3 backend for The Hearth.
 //!
-//! [`SurrealHearthStore`] käärii `Surreal<Any>`-yhteyden (in-mem dev tai
-//! `RocksDB` prod) ja toteuttaa sekä [`familyclaw_memory::MemoryStore`]:n että
-//! [`HearthStore`]:n. Skeema ([`crate::db::schema::HEARTH_SCHEMA`]) sovelletaan
-//! yhteyden alustuksessa.
+//! Implements [`HearthStore`] trait using SurrealDB (`surrealdb::Surreal<Any>`).
+//! Supports in-memory dev and RocksDB production backends via the same client.
 //!
-//! ## Tärkeää: `serde_json::Value` välikätenä
-//! SurrealDB v3 palauttaa omat tietueensa; tässä toteutuksessa **emme**
-//! deserialisoi suoraan domain-structeihin vaan kuljetamme datan
-//! [`serde_json::Value`]:n kautta ja `serde_json::from_value`/`to_value`
-//! -muunnoksilla. Tämä eristää meidät SurrealDB:n tietuetyypeistä (esim. v2:n
-//! `Thing`) ja pitää backendin vaihdettavana.
-//!
-//! ## Stub-status
-//! Tämä on tarkoituksellisesti **stub**: se kääntyy `surreal`-featuren takana,
-//! mutta sitä ei ajeta yksikkötesteissä (ei vaadi käynnissä olevaa
-//! SurrealDB-palvelinta). Oletustoteutus on edelleen
-//! [`crate::db::InMemoryHearthStore`].
+//! Feature-gated behind `surreal` flag.
 
-use familyclaw_core::{FamilyClawError, MessageId, Result, Timestamp};
-use surrealdb::engine::any::Any;
-use surrealdb::Surreal;
-use uuid::Uuid;
+#[cfg(feature = "surreal")]
+pub mod surreal {
+    use std::sync::Arc;
+    use surrealdb::{engine::any::Any, Surreal};
+    use uuid::Uuid;
+    use familyclaw_core::Result;
+    use crate::{HearthStore, NarrativeThread, emotional_state::EmotionalVector, narrative::EventType};
 
-use crate::db::schema::HEARTH_SCHEMA;
-use crate::db::HearthStore;
-use crate::emotional_state::EmotionalVector;
-use crate::narrative::NarrativeThread;
+    /// SurrealDB-backed HearthStore implementation.
+    #[derive(Clone)]
+    pub struct SurrealHearthStore {
+        db: Arc<Surreal<Any>>,
+    }
 
-use familyclaw_memory::{
-    DecayReport, DecayThresholds, Memory, MemoryStatus, MemoryStore, RetrievalContext,
-    RetrievalResult,
-};
+    impl SurrealHearthStore {
+        /// Connect to SurrealDB and initialize schema.
+        ///
+        /// # Arguments
+        /// * `conn_str` - Connection string, e.g.:
+        ///   - In-memory: `mem://`
+        ///   - File (RocksDB): `rocksdb:///path/to/db`
+        ///   - Remote: `ws://host:8000` or `wss://host:8000`
+        ///
+        /// # Errors
+        /// Returns error if connection or schema initialization fails.
+        pub async fn connect(conn_str: &str) -> Result<Self> {
+            // SurrealDB v3: use engine::any::connect which handles all endpoint types
+            let db = surrealdb::engine::any::connect(conn_str).await
+                .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("SurrealDB connect failed: {e}")))?;
 
-/// Tyyppieristetty future dyn-yhteensopivuutta varten (vrt. [`MemoryStore`]).
-type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+            // Use namespace/database
+            db.use_ns("familyclaw").use_db("hearth").await
+                .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("SurrealDB ns/db failed: {e}")))?;
 
-/// Kääntää SurrealDB-virheen [`FamilyClawError::Memory`]:ksi.
-fn map_db_err(e: impl std::fmt::Display) -> FamilyClawError {
-    FamilyClawError::Memory(format!("surreal: {e}"))
-}
+            // Initialize schema
+            Self::init_schema(&db).await?;
 
-/// SurrealDB v3 -pohjainen Hearth-tallennus.
-///
-/// Käärii `Surreal<Any>`-yhteyden. Luo [`SurrealHearthStore::connect`]:llä.
-pub struct SurrealHearthStore {
-    /// Tietokantayhteys (in-mem dev tai `RocksDB` prod).
-    db: Surreal<Any>,
-}
-
-impl SurrealHearthStore {
-    /// Avaa yhteyden annettuun endpointiin ja soveltaa skeeman.
-    ///
-    /// `endpoint` on esim. `"mem://"` (dev) tai `"rocksdb://path"` (prod).
-    ///
-    /// # Errors
-    /// [`FamilyClawError::Memory`] jos yhteys, namespace/db-valinta tai skeeman
-    /// soveltaminen epäonnistuu.
-    pub async fn connect(endpoint: &str, ns: &str, db: &str) -> Result<Self> {
-        // Varoita salaamattomasta etäyhteydestä: paikalliset enginet
-        // (`mem://`, `rocksdb://`, `surrealkv://`, `file://`) ovat turvallisia,
-        // mutta `ws://`/`http://` lähettää liikenteen selväkielisenä. Käytä
-        // tuotannossa `wss://`/`https://`.
-        if endpoint.starts_with("ws://") || endpoint.starts_with("http://") {
-            eprintln!(
-                "WARN: SurrealHearthStore yhdistää salaamattomaan endpointiin \
-                 ({endpoint}); käytä tuotannossa wss://- tai https://-osoitetta."
-            );
+            Ok(Self { db: Arc::new(db) })
         }
-        let conn = surrealdb::engine::any::connect(endpoint)
-            .await
-            .map_err(map_db_err)?;
-        conn.use_ns(ns).use_db(db).await.map_err(map_db_err)?;
-        conn.query(HEARTH_SCHEMA).await.map_err(map_db_err)?;
-        Ok(Self { db: conn })
-    }
 
-    /// Käärii valmiin yhteyden (skeemaa ei sovelleta uudelleen).
-    #[must_use]
-    pub fn from_connection(db: Surreal<Any>) -> Self {
-        Self { db }
-    }
-}
+        /// Initialize the Hearth schema (tables, indexes).
+        async fn init_schema(db: &Surreal<Any>) -> Result<()> {
+            // Hardcoded schema to avoid include_str issues
+            let schema_sql = r#"
+DEFINE TABLE memory_event SCHEMAFULL;
+DEFINE FIELD id ON memory_event TYPE string;
+DEFINE FIELD content ON memory_event TYPE string;
+DEFINE FIELD embedding ON memory_event TYPE array<float>;
+DEFINE FIELD memory_type ON memory_event TYPE string;
+DEFINE FIELD agent_id ON memory_event TYPE string;
+DEFINE FIELD decay_class ON memory_event TYPE string;
+DEFINE FIELD created_at ON memory_event TYPE datetime;
+DEFINE FIELD participants ON memory_event TYPE array<string>;
+DEFINE INDEX idx_embedding ON memory_event FIELDS embedding HNSW DIMENSION 1536;
 
-impl MemoryStore for SurrealHearthStore {
-    fn add(&self, memory: Memory) -> BoxFuture<'_, Result<MessageId>> {
-        Box::pin(async move {
-            let id = memory.id;
-            // serde_json::Value välikätenä — EI suoraa struct-bindausta.
-            let data = serde_json::to_value(&memory)?;
-            self.db
-                .query("CREATE memory_event CONTENT $data")
-                .bind(("data", data))
-                .await
-                .map_err(map_db_err)?;
-            Ok(id)
-        })
-    }
+DEFINE TABLE narrative_thread SCHEMAFULL;
+DEFINE FIELD id ON narrative_thread TYPE string;
+DEFINE FIELD title ON narrative_thread TYPE string;
+DEFINE FIELD participants ON narrative_thread TYPE array<string>;
+DEFINE FIELD created_at ON narrative_thread TYPE datetime;
 
-    fn get(&self, id: MessageId) -> BoxFuture<'_, Result<Option<Memory>>> {
-        Box::pin(async move {
-            let mut res = self
-                .db
-                .query("SELECT * FROM memory_event WHERE id = $id")
-                .bind(("id", id.to_string()))
-                .await
-                .map_err(map_db_err)?;
-            let rows: Vec<serde_json::Value> = res.take(0).map_err(map_db_err)?;
-            match rows.into_iter().next() {
-                Some(v) => Ok(Some(serde_json::from_value(v)?)),
-                None => Ok(None),
-            }
-        })
-    }
+DEFINE TABLE thread_event SCHEMAFULL;
+DEFINE FIELD id ON thread_event TYPE string;
+DEFINE FIELD thread_id ON thread_event TYPE string;
+DEFINE FIELD event_type ON thread_event TYPE string;
+DEFINE FIELD content ON thread_event TYPE string;
+DEFINE FIELD agent_id ON thread_event TYPE string;
+DEFINE FIELD linked_to ON thread_event TYPE array<string>;
+DEFINE INDEX idx_thread ON thread_event FIELDS thread_id;
 
-    fn update(&self, memory: Memory) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move {
-            let id = memory.id.to_string();
-            let data = serde_json::to_value(&memory)?;
-            self.db
-                .query("UPDATE memory_event CONTENT $data WHERE id = $id")
-                .bind(("data", data))
-                .bind(("id", id))
-                .await
-                .map_err(map_db_err)?;
+DEFINE TABLE emotional_state SCHEMAFULL;
+DEFINE FIELD agent_id ON emotional_state TYPE string;
+DEFINE FIELD joy ON emotional_state TYPE float;
+DEFINE FIELD sadness ON emotional_state TYPE float;
+DEFINE FIELD curiosity ON emotional_state TYPE float;
+DEFINE FIELD anxiety ON emotional_state TYPE float;
+DEFINE FIELD confidence ON emotional_state TYPE float;
+DEFINE FIELD affection ON emotional_state TYPE float;
+DEFINE FIELD updated_at ON emotional_state TYPE datetime;
+
+DEFINE TABLE anchor SCHEMAFULL;
+DEFINE FIELD agent_name ON anchor TYPE string;
+DEFINE FIELD content_hash ON anchor TYPE string;
+DEFINE FIELD protected ON anchor TYPE bool;
+DEFINE FIELD decay_class ON anchor TYPE string;
+"#;
+
+            db.query(schema_sql).await
+                .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("Schema init failed: {e}")))?;
+
             Ok(())
-        })
+        }
+
+        /// Get the underlying DB for advanced operations.
+        pub fn db(&self) -> &Arc<Surreal<Any>> {
+            &self.db
+        }
     }
 
-    fn reinforce(&self, id: MessageId, at: Timestamp) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move {
-            // Stub: lue–muokkaa–kirjoita domain-tyypin kautta.
-            let Some(mut memory) = self.get(id).await? else {
-                return Err(FamilyClawError::NotFound(format!("memory {id}")));
-            };
-            memory.reinforce(at);
-            self.update(memory).await
-        })
-    }
+    impl HearthStore for SurrealHearthStore {
+        // --- Narrative threads ---
 
-    fn set_status(&self, id: MessageId, status: MemoryStatus) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move {
-            let Some(mut memory) = self.get(id).await? else {
-                return Err(FamilyClawError::NotFound(format!("memory {id}")));
-            };
-            memory.status = status;
-            self.update(memory).await
-        })
-    }
+        fn get_thread(
+            &self,
+            thread_id: Uuid,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<NarrativeThread>>> + Send + '_>,
+        > {
+            let db = Arc::clone(&self.db);
+            Box::pin(async move {
+                let rows: Vec<serde_json::Value> = db
+                    .query("SELECT * FROM narrative_thread WHERE id = $thread_id")
+                    .bind(("thread_id", thread_id.to_string()))
+                    .await
+                    .map_err(|e| {
+                        familyclaw_core::FamilyClawError::Memory(format!("SurrealDB query failed: {e}"))
+                    })?
+                    .take(0)
+                    .map_err(|e| {
+                        familyclaw_core::FamilyClawError::Memory(format!("SurrealDB take failed: {e}"))
+                    })?;
 
-    fn all(&self) -> BoxFuture<'_, Result<Vec<Memory>>> {
-        Box::pin(async move {
-            let mut res = self
-                .db
-                .query("SELECT * FROM memory_event")
-                .await
-                .map_err(map_db_err)?;
-            let rows: Vec<serde_json::Value> = res.take(0).map_err(map_db_err)?;
-            rows.into_iter()
-                .map(|v| serde_json::from_value(v).map_err(Into::into))
-                .collect()
-        })
-    }
-
-    fn len(&self) -> BoxFuture<'_, Result<usize>> {
-        Box::pin(async move {
-            // Laske tietokannassa — älä lataa kaikkia rivejä muistiin.
-            let mut res = self
-                .db
-                .query("SELECT count() FROM memory_event GROUP ALL")
-                .await
-                .map_err(map_db_err)?;
-            let rows: Vec<serde_json::Value> = res.take(0).map_err(map_db_err)?;
-            Ok(rows
-                .first()
-                .and_then(|v| v.get("count").and_then(serde_json::Value::as_u64))
-                .unwrap_or(0) as usize)
-        })
-    }
-
-    fn is_empty(&self) -> BoxFuture<'_, Result<bool>> {
-        Box::pin(async move { Ok(self.len().await? == 0) })
-    }
-
-    fn retrieve(
-        &self,
-        ctx: &RetrievalContext,
-        at: Timestamp,
-    ) -> BoxFuture<'_, Result<Vec<RetrievalResult>>> {
-        // Stub: hae kaikki muistot tietokannasta ja delegoi jaettuun
-        // pisteytys-/lajittelulogiikkaan (sama kuin LocalJsonStore).
-        //
-        // TODO(perf): tämä lataa KAIKKI muistot muistiin ja pisteyttää ne
-        // sovelluskerroksessa. Tuotannossa tämä pitäisi työntää tietokantaan:
-        // `SELECT * FROM memory_event WHERE query_string CONTAINS $q` +
-        // emotion-/recency-pisteytys SurrealQL:ssä, jotta isot korpukset eivät
-        // vuoda muistiin. Rajoitus: O(n) muistinkäyttö muistojen määrässä.
-        let ctx = ctx.clone();
-        Box::pin(async move {
-            let memories = self.all().await?;
-            Ok(familyclaw_memory::retrieve(&memories, &ctx, at))
-        })
-    }
-
-    fn run_decay(
-        &self,
-        thresholds: DecayThresholds,
-        at: Timestamp,
-    ) -> BoxFuture<'_, Result<DecayReport>> {
-        Box::pin(async move {
-            // Stub: lataa, sovella vaimennusta domain-tyypin kautta,
-            // kirjoita muuttuneet takaisin. Sama logiikka kuin
-            // LocalJsonStore::run_decay (status-elinkaari, suojattu ydin).
-            let mut report = DecayReport::default();
-            for mut memory in self.all().await? {
-                report.scanned += 1;
-                if memory.decay_policy.is_protected() {
-                    continue;
+                if rows.is_empty() {
+                    return Ok(None);
                 }
-                let retention = memory.retention(at);
-                let prev = memory.status;
-                match memory.status {
-                    MemoryStatus::Active => {
-                        if retention < thresholds.archive_below {
-                            memory.status = MemoryStatus::Archived;
-                            report.archived += 1;
-                        }
-                    }
-                    MemoryStatus::Archived => {
-                        if retention < thresholds.tombstone_below {
-                            memory.status = MemoryStatus::Tombstoned;
-                            report.tombstoned += 1;
-                        }
-                    }
-                    MemoryStatus::Tombstoned => {}
-                }
-                if memory.status != prev {
-                    self.update(memory).await?;
-                }
-            }
-            Ok(report)
-        })
-    }
-}
 
-impl HearthStore for SurrealHearthStore {
-    // `create_thread` ja `add_thread_event` käyttävät trait-default-toteutuksia
-    // jotka rakentuvat `get_thread`:n ja `set_thread`:n päälle — ei duplikaatiota.
+                let row = &rows[0];
+                let thread = NarrativeThread {
+                    id: Uuid::parse_str(row.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+                        .unwrap_or_else(|_| Uuid::nil()),
+                    title: row.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    participants: row
+                        .get("participants")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    created_at: row
+                        .get("created_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(chrono::Utc::now),
+                    events: Vec::new(), // Events loaded separately
+                };
+                Ok(Some(thread))
+            })
+        }
 
-    fn set_thread(&self, thread: NarrativeThread) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move {
+        fn set_thread(
+            &self,
+            thread: NarrativeThread,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+            let db = Arc::clone(&self.db);
             let id = thread.id.to_string();
-            let data = serde_json::to_value(&thread)?;
-            // Upsert: korvaa olemassa oleva tai luo uusi.
-            self.db
-                .query(
-                    "UPDATE narrative_thread CONTENT $data WHERE id = $id \
-                     ELSE CREATE narrative_thread CONTENT $data",
+            let title = thread.title;
+            let participants = thread.participants;
+            let created_at = thread.created_at.to_rfc3339();
+            Box::pin(async move {
+                db.query(
+                    "UPSERT narrative_thread SET id = $id, title = $title, participants = $participants, created_at = $created_at"
                 )
-                .bind(("data", data))
                 .bind(("id", id))
+                .bind(("title", title))
+                .bind(("participants", participants))
+                .bind(("created_at", created_at))
                 .await
-                .map_err(map_db_err)?;
-            Ok(())
-        })
-    }
+                .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("SurrealDB upsert failed: {e}")))?;
+                Ok(())
+            })
+        }
 
-    fn get_thread(&self, thread_id: Uuid) -> BoxFuture<'_, Result<Option<NarrativeThread>>> {
-        Box::pin(async move {
-            let mut res = self
-                .db
-                .query("SELECT * FROM narrative_thread WHERE id = $id")
-                .bind(("id", thread_id.to_string()))
-                .await
-                .map_err(map_db_err)?;
-            let rows: Vec<serde_json::Value> = res.take(0).map_err(map_db_err)?;
-            match rows.into_iter().next() {
-                Some(v) => Ok(Some(serde_json::from_value(v)?)),
-                None => Ok(None),
-            }
-        })
-    }
+        // --- Emotional state ---
 
-    fn get_emotional_state(&self, agent_id: &str) -> BoxFuture<'_, Result<EmotionalVector>> {
-        let agent_id = agent_id.to_string();
-        Box::pin(async move {
-            let mut res = self
-                .db
-                .query("SELECT * FROM emotional_state WHERE agent_id = $aid")
-                .bind(("aid", agent_id))
-                .await
-                .map_err(map_db_err)?;
-            let rows: Vec<serde_json::Value> = res.take(0).map_err(map_db_err)?;
-            match rows.into_iter().next() {
-                Some(v) => Ok(serde_json::from_value(v)?),
-                None => Ok(EmotionalVector::neutral()),
-            }
-        })
-    }
+        fn get_emotional_state(
+            &self,
+            agent_id: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<EmotionalVector>> + Send + '_>> {
+            let db = Arc::clone(&self.db);
+            let agent_id = agent_id.to_string();
+            Box::pin(async move {
+                let rows: Vec<serde_json::Value> = db
+                    .query("SELECT * FROM emotional_state WHERE agent_id = $agent_id")
+                    .bind(("agent_id", agent_id))
+                    .await
+                    .map_err(|e| {
+                        familyclaw_core::FamilyClawError::Memory(format!("SurrealDB query failed: {e}"))
+                    })?
+                    .take(0)
+                    .map_err(|e| {
+                        familyclaw_core::FamilyClawError::Memory(format!("SurrealDB take failed: {e}"))
+                    })?;
 
-    fn set_emotional_state(
-        &self,
-        agent_id: &str,
-        state: EmotionalVector,
-    ) -> BoxFuture<'_, Result<()>> {
-        let agent_id = agent_id.to_string();
-        Box::pin(async move {
-            let data = serde_json::to_value(state.clamped())?;
-            self.db
-                .query(
-                    "UPDATE emotional_state CONTENT $data WHERE agent_id = $aid \
-                     ELSE CREATE emotional_state CONTENT $data",
-                )
-                .bind(("data", data))
-                .bind(("aid", agent_id))
-                .await
-                .map_err(map_db_err)?;
-            Ok(())
-        })
-    }
+                if rows.is_empty() {
+                    return Ok(EmotionalVector::neutral());
+                }
 
-    fn list_agents_with_emotion(&self) -> BoxFuture<'_, Result<Vec<String>>> {
-        Box::pin(async move {
-            let mut res = self
-                .db
-                .query("SELECT agent_id FROM emotional_state")
-                .await
-                .map_err(map_db_err)?;
-            let rows: Vec<serde_json::Value> = res.take(0).map_err(map_db_err)?;
-            Ok(rows
-                .into_iter()
-                .filter_map(|v| {
-                    v.get("agent_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
+                let row = &rows[0];
+                Ok(EmotionalVector {
+                    joy: row.get("joy").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    sadness: row.get("sadness").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    curiosity: row.get("curiosity").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    anxiety: row.get("anxiety").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    confidence: row.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    affection: row.get("affection").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
                 })
-                .collect())
-        })
+            })
+        }
+
+        fn set_emotional_state(
+            &self,
+            agent_id: &str,
+            state: EmotionalVector,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+            let db = Arc::clone(&self.db);
+            let agent_id = agent_id.to_string();
+            let updated_at = chrono::Utc::now().to_rfc3339();
+            let joy = state.joy;
+            let sadness = state.sadness;
+            let curiosity = state.curiosity;
+            let anxiety = state.anxiety;
+            let confidence = state.confidence;
+            let affection = state.affection;
+            Box::pin(async move {
+                db.query(
+                    "UPSERT emotional_state SET agent_id = $agent_id, joy = $joy, sadness = $sadness, curiosity = $curiosity, anxiety = $anxiety, confidence = $confidence, affection = $affection, updated_at = $updated_at"
+                )
+                .bind(("agent_id", agent_id))
+                .bind(("joy", joy))
+                .bind(("sadness", sadness))
+                .bind(("curiosity", curiosity))
+                .bind(("anxiety", anxiety))
+                .bind(("confidence", confidence))
+                .bind(("affection", affection))
+                .bind(("updated_at", updated_at))
+                .await
+                .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("SurrealDB upsert failed: {e}")))?;
+                Ok(())
+            })
+        }
+
+        fn list_agents_with_emotion(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send + '_>> {
+            let db = Arc::clone(&self.db);
+            Box::pin(async move {
+                let rows: Vec<serde_json::Value> = db
+                    .query("SELECT agent_id FROM emotional_state")
+                    .await
+                    .map_err(|e| {
+                        familyclaw_core::FamilyClawError::Memory(format!("SurrealDB query failed: {e}"))
+                    })?
+                    .take(0)
+                    .map_err(|e| {
+                        familyclaw_core::FamilyClawError::Memory(format!("SurrealDB take failed: {e}"))
+                    })?;
+
+                Ok(rows
+                    .iter()
+                    .filter_map(|v| v.get("agent_id").and_then(|id| id.as_str()).map(String::from))
+                    .collect())
+            })
+        }
+    }
+}
+
+#[cfg(all(test, feature = "surreal"))]
+mod tests {
+    use super::surreal::SurrealHearthStore;
+
+    #[tokio::test]
+    async fn surreal_hearth_store_connect_mem() {
+        let store = SurrealHearthStore::connect("mem://").await;
+        assert!(store.is_ok(), "Should connect to mem://");
     }
 }

@@ -197,7 +197,7 @@ mod tests {
     async fn hearth_create_thread_and_add_event() {
         let mem_store = LocalJsonStore::in_memory();
         let store = InMemoryHearthStore::new(mem_store);
-        let mut hearth = Hearth::new(store);
+        let hearth = Hearth::new(store);
 
         let thread_id = hearth
             .create_thread("Test thread", vec!["agent_a", "agent_b"])
