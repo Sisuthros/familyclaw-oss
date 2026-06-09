@@ -99,13 +99,13 @@ jobs:
             chmod +x ./scripts/audit-layer-b.sh
             ./scripts/audit-layer-b.sh
           else
-            echo "No audit script found — manual check:"
+            echo "No audit script found -- manual check:"
             echo "Checking for hardcoded secrets..."
             git grep -i "api_key\|token\|secret\|password" -- "*.rs" "*.toml" "*.md" | grep -v "test" | grep -v ".gitignore" || true
             echo "Checking for family member names..."
             git grep -i "agent_alpha\|agent_beta\|agent_delta\|agent_gamma\|the operator" -- "*.rs" "*.toml" *.md | grep -v "test" | grep -v "docs/" | grep -v "example" || true
-            echo "Audit complete — if output above is empty, you're clean."
-
+            echo "Audit complete -- if output above is empty, you're clean."
+          fi
   release:
     name: Release (tag push)
     runs-on: ubuntu-latest
