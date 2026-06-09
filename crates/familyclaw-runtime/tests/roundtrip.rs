@@ -28,13 +28,12 @@
 //! ulkoista API:a.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::routing::post;
 use axum::{Json, Router};
 use familyclaw_agent::EnvEndpointResolver;
-use familyclaw_channels::{Channel, InboundMessage, MockChannel};
+use familyclaw_channels::{InboundMessage, MockChannel};
 use familyclaw_core::{AgentConfig, ModelConfig};
 use familyclaw_runtime::build_family;
 
