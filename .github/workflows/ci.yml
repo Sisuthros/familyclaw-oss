@@ -77,8 +77,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Build bench binary
         run: cargo build -p familyclaw-bench --bin bench --profile release
-      - name: Build continuity_daemon
-        run: cargo build -p familyclaw-agent --bin continuity_daemon --profile release
+      - name: Build continuity_daemon (debug for bench)
+        run: cargo build -p familyclaw-agent --bin continuity_daemon
       - name: Run bench all
         run: cargo run -p familyclaw-bench --bin bench -- all
       - name: Upload scorecard
