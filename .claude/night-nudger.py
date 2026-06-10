@@ -31,7 +31,9 @@ STATE = STATE_DIR / "night-nudger-state.json"
 PRIO = STATE_DIR / "NIGHT_RUN_2026-06-11.md"
 
 # Per-run cap so each headless run is bounded and we cycle frequently.
-MAX_TURNS = 200
+# Smaller cap => the run commits a finished item and exits before it loses work
+# to a turn-limit/usage-limit cutoff. The loop just starts another run.
+MAX_TURNS = 80
 # Backoff when a run fails fast (likely rate limit). Grows up to ~the reset window.
 BACKOFF_MIN_S = 30
 BACKOFF_MAX_S = 15 * 60   # 15 min cap between retries
@@ -64,8 +66,15 @@ AUTONOMIA-RAJAT (EHDOTTOMAT): SAA koodata/testata/committaa/pushata feature-bran
 EI KOSKAAN: main-merge, tuotanto/Hetzner, agent_alpha/perheen infra (.openclaw, .hermes, Docker),
 force-push, sielujen/avaimien committointi, /profiles tai hearth/ tai *.b64 -tiedostojen muokkaus.
 
-Jos voit, tee USEITA kohtia tässä ajossa (max-turns rajaa). Ole tehokas, älä selitä — koodaa.
-Aja `cargo test` ennen jokaista committia. Jos jokin ei käänny, korjaa ennen committia.
+KRIITTINEN: COMMITTAA + PUSHAA HETI kun YKSI kohta on valmis (käännös+testit vihreät +
+turva-portti läpi). ÄLÄ kasaa montaa kohtaa yhteen committiin — sinut voidaan katkaista
+milloin tahansa (max-turns / käyttöraja), ja committaamaton työ katoaa. Yksi kohta -> yksi
+commit -> push -> seuraava kohta. Tee niin monta kohtaa kuin ehdit, mutta committaa jokainen
+heti valmistuessaan.
+
+Ole tehokas, älä selitä — koodaa. Aja `cargo test` ennen jokaista committia. Jos jokin ei
+käänny, korjaa ennen committia. Jos kaikki priolistan kohdat ovat valmiita, syvennä:
+lisää testejä, reuna-tapauksia, dokumentaatiota, tai paranna olemassa olevaa.
 """
 
 
