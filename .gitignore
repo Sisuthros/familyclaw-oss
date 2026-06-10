@@ -75,3 +75,8 @@ fixlib.ps1
 familyclaw.toml
 # Python-silta odottaa Layer-A/tooling-sijoituspäätöstä — poissa historiasta toistaiseksi.
 bridge.py
+
+# Yö-nudgerin runtime-tila (logit, state) — ei committiin, skripti+priolista kyllä
+.claude/night-nudger-state.json
+.claude/night-nudger*.log
+.claude/night-nudger-stdout.log
