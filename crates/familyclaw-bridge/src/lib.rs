@@ -12,6 +12,13 @@
 //! - [`event`] — [`Event`], [`EventKind`], publish/subscribe ([`EventBus`]).
 //! - [`bridge`] — [`FamilyBridge`] koostaa edellä mainitut ja julkaisee
 //!   tapahtumat tilamuutoksista.
+//! - [`orchestrator`] — DAG-pohjainen moniagenttiorkesterointi
+//!   ([`OrchestrationPlan`], [`Orchestrator`]) joka ohjaa tehtävätaulua
+//!   vain laillisin tilasiirtymin.
+//! - [`contract`] — tyypitetty FIPA-ContractNet ([`Capability`], [`Contract`],
+//!   [`ContractBoard`]) todennettavalla täyttämisellä (skeema + jälkiehdot).
+//! - [`contract_bus`] — kuljetuksesta riippumattomat sopimusviestit
+//!   ([`ContractMessage`]) puhtaalla serdellä.
 //!
 //! ## Suunnitteluperiaatteet
 //! - **Tokio-pohjainen, säieturvallinen.** Jaettu tila on `Arc<RwLock<…>>`
@@ -55,12 +62,24 @@
 
 pub mod agent;
 pub mod bridge;
+pub mod contract;
+pub mod contract_bus;
 pub mod event;
+pub mod orchestrator;
 pub mod task;
 
 pub use agent::{AgentInfo, AgentRegistry, AgentRole, HostKind, Liveness};
 pub use bridge::FamilyBridge;
+pub use contract::{
+    Capability, CapabilityRegistry, Clause, ClauseOp, Contract, ContractBoard, ContractError,
+    ContractResult, ContractStatus, Deliverable, Field, FieldType, Schema, SchemaViolation,
+};
+pub use contract_bus::{ContractMessage, CONTRACT_CUSTOM_NAME};
 pub use event::{Event, EventBus, EventKind, EventSubscriber};
+pub use orchestrator::{
+    NodeId, OrchestrationPlan, Orchestrator, RunReport, TaskNode, MAX_DELEGATION_DEPTH,
+    STEP_ASSIGNED, WORKFLOW_DONE,
+};
 pub use task::{Task, TaskBoard, TaskId, TaskStatus};
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).

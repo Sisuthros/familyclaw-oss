@@ -1,0 +1,21 @@
+[package]
+name = "familyclaw-observability"
+description = "Metrics, event recording and per-role RBAC for the multi-agent fleet"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+familyclaw-core = { workspace = true }
+familyclaw-bridge = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
