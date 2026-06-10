@@ -19,6 +19,8 @@
 //!   [`ContractBoard`]) todennettavalla täyttämisellä (skeema + jälkiehdot).
 //! - [`contract_bus`] — kuljetuksesta riippumattomat sopimusviestit
 //!   ([`ContractMessage`]) puhtaalla serdellä.
+//! - [`executor`] — orkesteroinnin ja konkreettisen agentin välinen suoritussauma
+//!   ([`TurnExecutor`], [`OrchestratedTurn`]) hermeettisellä [`MockTurnExecutor`]:lla.
 //!
 //! ## Suunnitteluperiaatteet
 //! - **Tokio-pohjainen, säieturvallinen.** Jaettu tila on `Arc<RwLock<…>>`
@@ -65,6 +67,7 @@ pub mod bridge;
 pub mod contract;
 pub mod contract_bus;
 pub mod event;
+pub mod executor;
 pub mod orchestrator;
 pub mod task;
 
@@ -76,9 +79,10 @@ pub use contract::{
 };
 pub use contract_bus::{ContractMessage, CONTRACT_CUSTOM_NAME};
 pub use event::{Event, EventBus, EventKind, EventSubscriber};
+pub use executor::{MockFailure, MockTurnExecutor, OrchestratedTurn, TurnExecutor};
 pub use orchestrator::{
     NodeId, OrchestrationPlan, Orchestrator, RunReport, TaskNode, MAX_DELEGATION_DEPTH,
-    STEP_ASSIGNED, WORKFLOW_DONE,
+    STEP_ASSIGNED, STEP_FAILED, WORKFLOW_DONE,
 };
 pub use task::{Task, TaskBoard, TaskId, TaskStatus};
 
