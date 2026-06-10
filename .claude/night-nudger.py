@@ -20,6 +20,14 @@ import os
 import sys
 from pathlib import Path
 
+# Real usage meter — reads the operator Claude Max weekly/session utilization from the
+# Anthropic API rate-limit headers (verified to match the Plan-usage UI).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from usage_meter import read_usage
+except Exception:
+    read_usage = None
+
 REPO = Path(r"E:\Familyclaw")
 BRANCH = "feat/night-2026-06-11"
 # Full path to the claude launcher (.cmd wrapper) — Python's CreateProcess needs the
@@ -37,8 +45,9 @@ MAX_TURNS = 80
 # Backoff when a run fails fast (likely rate limit). Grows up to ~the reset window.
 BACKOFF_MIN_S = 30
 BACKOFF_MAX_S = 15 * 60   # 15 min cap between retries
-# Total wall-clock budget for the whole nudger (safety stop). 0 = until killed.
-TOTAL_BUDGET_HOURS = 8
+# Total wall-clock safety stop. Long enough to outlast a session-reset wait and
+# keep spending the weekly budget. The REAL stop condition is week_util >= WEEK_STOP_AT.
+TOTAL_BUDGET_HOURS = 12
 
 NUDGE_PROMPT = f"""ultracode
 
@@ -146,10 +155,27 @@ def run_once(run_no):
     return rc, dur, tail, looks_like_limit
 
 
+# Stop only when the WEEKLY limit is essentially spent.
+WEEK_STOP_AT = 0.99          # stop the whole run when 7d utilization >= this
+SESSION_WAIT_AT = 0.985      # if session is this full but week is not, wait for session reset
+POLL_WHEN_BLOCKED_S = 180    # re-check usage this often while waiting for a reset
+
+
+def usage_snapshot():
+    if read_usage is None:
+        return None
+    try:
+        u = read_usage()
+        return u if u.get("week_util") is not None else None
+    except Exception as e:
+        log(f"usage read failed: {e}")
+        return None
+
+
 def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     log("=" * 60)
-    log("FamilyClaw night-nudger START — autonominen, selviää rajan yli")
+    log("FamilyClaw night-nudger START — ajaa kunnes VIIKKOLIMITTI on syöty")
     state = load_state()
     t_start = time.time()
     run_no = len(state.get("runs", []))
@@ -157,26 +183,47 @@ def main():
 
     while True:
         if TOTAL_BUDGET_HOURS and (time.time() - t_start) > TOTAL_BUDGET_HOURS * 3600:
-            log(f"Total budget {TOTAL_BUDGET_HOURS}h reached — stopping nudger.")
+            log(f"Wall-clock budget {TOTAL_BUDGET_HOURS}h reached — stopping.")
             break
+
+        # --- REAL limit check before each run ---
+        u = usage_snapshot()
+        if u:
+            wk = u.get("week_util") or 0.0
+            ss = u.get("session_util") or 0.0
+            reset = u.get("week_reset")
+            mins = int((reset - time.time()) / 60) if reset else None
+            log(f"USAGE: viikko={wk*100:.1f}% session={ss*100:.1f}% viikkoreset~{mins}min")
+
+            if wk >= WEEK_STOP_AT:
+                log(f"VIIKKOLIMITTI SYÖTY ({wk*100:.1f}% >= {WEEK_STOP_AT*100:.0f}%). Tavoite saavutettu — stop.")
+                break
+
+            if ss >= SESSION_WAIT_AT and wk < WEEK_STOP_AT:
+                # Session full but weekly budget remains — wait for the session window
+                # to reset, then keep spending the weekly budget.
+                log(f"Session täynnä ({ss*100:.1f}%) mutta viikkoa jäljellä ({wk*100:.1f}%). "
+                    f"Odotetaan session-resetia ({POLL_WHEN_BLOCKED_S}s), jatketaan sitten.")
+                time.sleep(POLL_WHEN_BLOCKED_S)
+                continue
 
         run_no += 1
         rc, dur, tail, looks_like_limit = run_once(run_no)
+        snap = usage_snapshot()
         state["runs"].append({"n": run_no, "rc": rc, "dur_s": int(dur), "at": now(),
-                              "limit": looks_like_limit, "tail": tail[-400:]})
+                              "limit": looks_like_limit,
+                              "week_util": (snap or {}).get("week_util"),
+                              "session_util": (snap or {}).get("session_util"),
+                              "tail": tail[-300:]})
         save_state(state)
 
         if looks_like_limit or (rc != 0 and dur < 20):
-            # Usage limit hit (or a fast crash). Back off and retry — this is the
-            # mechanism that survives the reset window (session ~3h, weekly ~3.5h).
-            log(f"Limit/fast-fail (rc={rc}, {int(dur)}s, limit={looks_like_limit}). "
-                f"Backoff {backoff}s then retry.")
+            log(f"Limit/fast-fail (rc={rc}, {int(dur)}s). Backoff {backoff}s, re-check usage, retry.")
             time.sleep(backoff)
             backoff = min(backoff * 2, BACKOFF_MAX_S)
         else:
-            # Productive run: reset backoff, brief pause, go again.
             backoff = BACKOFF_MIN_S
-            time.sleep(10)
+            time.sleep(8)
 
     log("night-nudger STOP")
 
