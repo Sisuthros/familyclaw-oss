@@ -71,8 +71,10 @@ fixlib.ps1
 # Rust-buildin väliartefaktit.
 *.rlib
 # Ajonaikainen perhe-runtime-konfiguraatio sitoo yksityisen identiteetin + Discord-kanavan.
-# Julkaise tarvittaessa familyclaw.toml.example tyhjennetyillä kentillä.
+# Julkaistaan vain tyhjennetty familyclaw.toml.example (alla sallittu).
 familyclaw.toml
+# OSS-skeleton (tyhjät secret-kentät) on julkaistava — varmista ettei se jää ignoreen.
+!familyclaw.toml.example
 # Python-silta odottaa Layer-A/tooling-sijoituspäätöstä — poissa historiasta toistaiseksi.
 bridge.py
 

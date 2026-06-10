@@ -55,6 +55,36 @@ This demo proves memory survives process boundaries by writing to disk in Phase 
 
 ## Next Steps
 
+### Run the Gateway
+
+The gateway (`familyclaw-gateway`) is the long-running service that wires an
+agent to a chat channel. It ships a small CLI:
+
+```bash
+cargo run -p familyclaw-gateway -- serve    # start the gateway (default)
+cargo run -p familyclaw-gateway -- status   # print effective config
+cargo run -p familyclaw-gateway -- doctor   # pre-flight checks
+```
+
+Configuration is loaded from a TOML file (looked up in this order):
+
+1. `$FAMILYCLAW_CONFIG` (explicit path)
+2. `$XDG_CONFIG_HOME/familyclaw/familyclaw.toml`
+3. `$HOME/.config/familyclaw/familyclaw.toml` (default)
+
+Copy the published skeleton and fill in your private fields:
+
+```bash
+mkdir -p ~/.config/familyclaw
+cp familyclaw.toml.example ~/.config/familyclaw/familyclaw.toml
+# then edit: set provider model + supply the API key via env, never in the file
+```
+
+Secrets (API keys, tokens, webhook URLs) belong in **environment variables** or
+your private config — never in the repo. Every field has an env override; see
+the comments in [`familyclaw.toml.example`](../familyclaw.toml.example) for the
+full list (e.g. `FAMILYCLAW_PROVIDER_API_KEY`, `FAMILYCLAW_AGENT_NAME`).
+
 ### Connect to Discord
 
 Run with a Discord webhook (currently send-only; inbound gateway is future work):

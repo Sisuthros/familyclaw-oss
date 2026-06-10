@@ -1,0 +1,66 @@
+# FamilyClaw gateway configuration — OSS skeleton (KERROS A / Layer A).
+#
+# Copy this file to your private config location and fill in the blanked-out
+# secret fields. The gateway looks for the live file (in priority order):
+#
+#   1. $FAMILYCLAW_CONFIG                       (explicit path)
+#   2. $XDG_CONFIG_HOME/familyclaw/familyclaw.toml
+#   3. $HOME/.config/familyclaw/familyclaw.toml (default)
+#
+# If no file is found, built-in defaults + env overrides are used.
+#
+# IMPORTANT (Layer boundary): this example contains NO real keys, tokens,
+# channel IDs, model names tied to a person, souls, or private paths. The live
+# `familyclaw.toml` is git-ignored — never commit it. Secrets belong in env
+# variables or your private config, never in this repo.
+
+[agent]
+# Display name of the agent this gateway serves. Generic placeholder only.
+# Env override: FAMILYCLAW_AGENT_NAME
+name = "agent_a"
+
+[channel]
+# Active channel adapter: "telegram" | "discord".
+# Env override: FAMILYCLAW_CHANNEL_KIND
+kind = "telegram"
+
+# Where replies are routed by default when no per-message origin is present
+# (e.g. a chat/conversation ID). Leave empty to derive purely from the incoming
+# message origin. Env override: FAMILYCLAW_CHANNEL_REPLY_TARGET
+reply_target = ""
+
+[channel.discord]
+# Discord webhook URL for outbound messages. Leave empty here — set it in your
+# private config or via the channel's own secret handling. Do NOT commit a URL.
+webhook_url = ""
+# Logical channel identifier (your own label, not a real 17-19 digit snowflake).
+channel_id = "discord-main"
+
+[channel.telegram]
+# Telegram bot token. Leave empty — provide via private config, never here.
+token = ""
+# Logical channel/chat identifier (your own label, not a real numeric chat ID).
+channel_id = ""
+
+[provider]
+# LLM provider kind (free-form label your Layer B resolver understands).
+kind = "anthropic"
+# Model identifier. Env override: FAMILYCLAW_PROVIDER_MODEL
+model = "claude-sonnet-4-6"
+# API key — ALWAYS leave empty in committed config. Supply at runtime via
+# env override: FAMILYCLAW_PROVIDER_API_KEY
+api_key = ""
+
+[memory]
+# How long working memories are retained before decay (hours). 168 = 7 days.
+# Env override: FAMILYCLAW_MEMORY_RETENTION_HOURS
+retention_hours = 168
+# Soft cap on working-set memories before compaction is favoured.
+max_working_memories = 500
+# Importance threshold below which memories are eligible for compaction (0..1).
+compaction_threshold = 0.3
+
+[security]
+# Autonomy posture: "supervised" (human-in-the-loop) is the safe default.
+# Env override: FAMILYCLAW_SECURITY_PROFILE
+profile = "supervised"
