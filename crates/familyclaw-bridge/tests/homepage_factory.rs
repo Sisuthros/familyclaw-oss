@@ -62,9 +62,26 @@ async fn online_agent(
     bridge.heartbeat(id, now).await.expect("heartbeat");
 }
 
-/// `homepage_design`-kyky: syöte `BrandBrief { brand, audience }`, tulos
-/// `HomepageDesign { headline, sections, cta }`, jälkiehdot
-/// `non_empty(headline)` + `min_len(sections, 1)`.
+/// `HomepageDesign`-tulosskeema: `{ headline:Str, sections:Arr, cta:Str }`.
+fn homepage_design_output() -> Schema {
+    Schema::new(vec![
+        Field::required("headline", FieldType::Str),
+        Field::required("sections", FieldType::Arr),
+        Field::required("cta", FieldType::Str),
+    ])
+}
+
+/// `HomepageDesign`-jälkiehdot: `non_empty(headline)` + `min_len(sections, 1)`.
+fn homepage_design_postconditions() -> Vec<Clause> {
+    vec![
+        Clause::non_empty("headline"),
+        Clause::min_len("sections", 1),
+    ]
+}
+
+/// `homepage_design`-kyky **täydellä** `BrandBrief { brand, audience }`-
+/// syöteskeemalla. Käytetään eksplisiittisessä sopimustodistuksessa, jossa
+/// `propose` ajetaan oikealla briefillä syötteenä.
 fn homepage_design_capability() -> Capability {
     Capability::new(
         "homepage_design",
@@ -73,17 +90,24 @@ fn homepage_design_capability() -> Capability {
             Field::required("brand", FieldType::Str),
             Field::required("audience", FieldType::Str),
         ]),
-        // HomepageDesign
-        Schema::new(vec![
-            Field::required("headline", FieldType::Str),
-            Field::required("sections", FieldType::Arr),
-            Field::required("cta", FieldType::Str),
-        ]),
+        homepage_design_output(),
     )
-    .with_postconditions(vec![
-        Clause::non_empty("headline"),
-        Clause::min_len("sections", 1),
-    ])
+    .with_postconditions(homepage_design_postconditions())
+}
+
+/// `homepage_design`-kyky **tyhjällä** syöteskeemalla. Tämä on solmuun
+/// kiinnitettävä variantti: orkesterin sisäinen sopimusrata ([`Orchestrator::
+/// run_with`] → [`ContractBoard::propose`]) ehdottaa kyvyn tyhjällä `{}`-
+/// syötteellä, joten solmun kyvyn syöteskeeman on hyväksyttävä tyhjä objekti.
+/// Tulosskeema ja jälkiehdot ovat identtiset täyden variantin kanssa, joten
+/// toimitteen todennus (`headline`, `sections`, `cta` + jälkiehdot) on sama.
+fn homepage_design_node_capability() -> Capability {
+    Capability::new(
+        "homepage_design",
+        Schema::empty(),
+        homepage_design_output(),
+    )
+    .with_postconditions(homepage_design_postconditions())
 }
 
 /// `deploy`-kyky: tulos jolla on vähintään `url`-kenttä, jälkiehto
@@ -114,15 +138,18 @@ fn factory_plan() -> OrchestrationPlan {
             )
             .with_role(AgentRole::Strategy)
             .with_capabilities(["homepage_design"])
-            .with_capability(homepage_design_capability()),
+            .with_capability(homepage_design_node_capability()),
             // review: ei kyvyn vaatimusta, riippuu designista.
             TaskNode::new("review", "review the design", "approve or request changes")
                 .with_role(AgentRole::Scout)
                 .with_deps(["design"]),
-            // deploy: vaatii deploy-kyvyn, riippuu reviewista.
+            // deploy: vaatii deploy-kyvyn, riippuu reviewista, ja kantaa
+            // deploy-sopimuksen (tulos `result: object`). Mockin ei-homepage-
+            // toimite `{ "result": ..., "assignee": ... }` täyttää skeeman.
             TaskNode::new("deploy", "deploy the homepage", "ship to production")
                 .with_role(AgentRole::Executor)
                 .with_capabilities(["deploy"])
+                .with_capability(deploy_capability())
                 .with_deps(["review"]),
         ],
     )
@@ -162,10 +189,16 @@ async fn register_factory_agents(
     .await;
 
     // agent_epsilon mainostaa kykynsä kykyrekisteriin (CapabilityRegistry.advertise).
-    bridge
-        .capabilities()
-        .advertise(homepage_design_capability())
-        .await;
+    // FamilyBridge (KERROS A) ei vielä omista kykyrekisteriä, joten käytämme
+    // erillistä rekisteriä todistaaksemme advertise-reitin toimivuuden.
+    let registry = CapabilityRegistry::new();
+    registry.advertise(homepage_design_capability()).await;
+    registry.advertise(deploy_capability()).await;
+    assert_eq!(
+        registry.find_by_name("homepage_design").await.len(),
+        1,
+        "agent_epsilon's homepage_design capability is advertised"
+    );
 
     (agent_epsilon, agent_beta, agent_gamma)
 }
@@ -285,12 +318,7 @@ async fn homepage_factory_runs_end_to_end() {
     while let Ok(Some(ev)) = events.try_recv() {
         if let familyclaw_bridge::EventKind::Custom(name) = &ev.kind {
             if name == STEP_ASSIGNED {
-                if let Some(node) = ev
-                    .payload
-                    .as_ref()
-                    .and_then(|p| p.get("node_id"))
-                    .and_then(|v| v.as_str())
-                {
+                if let Some(node) = ev.payload.get("node_id").and_then(|v| v.as_str()) {
                     assigned_nodes.push(node.to_string());
                 }
             }
@@ -369,6 +397,45 @@ async fn malformed_design_halts_factory_at_contract_boundary() {
 
     // --- design-sopimus menee Failed-tilaan fulfill():ssä (eksplisiittinen
     //     todistus samalla viallisella toimitteella). ------------------------
+    prove_malformed_design_fails_contract(agent_epsilon, &plan, design_tasks[0].id, &executor, now).await;
+
+    // --- Tapahtumat: vain design osoitettiin; review/deploy ei. -------------
+    let mut assigned_nodes: Vec<String> = Vec::new();
+    let mut step_failed = 0;
+    while let Ok(Some(ev)) = events.try_recv() {
+        if let familyclaw_bridge::EventKind::Custom(name) = &ev.kind {
+            if name == STEP_ASSIGNED {
+                if let Some(node) = ev.payload.get("node_id").and_then(|v| v.as_str()) {
+                    assigned_nodes.push(node.to_string());
+                }
+            } else if name == familyclaw_bridge::STEP_FAILED {
+                step_failed += 1;
+            }
+        }
+    }
+    assert_eq!(
+        assigned_nodes,
+        vec!["design".to_string()],
+        "only design is ever assigned; review and deploy never run"
+    );
+    assert_eq!(step_failed, 1, "design emits exactly one step_failed");
+}
+
+/// Eksplisiittinen todistus että viallinen `design`-toimite kaataa
+/// `homepage_design`-sopimuksen `fulfill`-todennuksessa.
+///
+/// Ehdottaa kyvyn täydellä `BrandBrief`-syötteellä, hyväksyy sopimuksen, ajaa
+/// `failing()`-suorittimen tuottaman saman viallisen toimitteen `fulfill`:n
+/// läpi ja varmistaa: (1) virhe on tulosskeeman rikkomus (puuttuva `headline`),
+/// (2) sopimus päätyy [`ContractStatus::Failed`]-tilaan, (3) sama viallinen
+/// hyötykuorma ei läpäise tulosskeemaa erilliselläkään `is_valid`-tarkistuksella.
+async fn prove_malformed_design_fails_contract(
+    agent_epsilon: AgentId,
+    plan: &OrchestrationPlan,
+    design_task: familyclaw_bridge::TaskId,
+    executor: &MockTurnExecutor,
+    now: Timestamp,
+) {
     let cap = homepage_design_capability();
     let brief = serde_json::json!({ "brand": "DuckUps", "audience": "founders" });
     let board = ContractBoard::new();
@@ -382,14 +449,18 @@ async fn malformed_design_halts_factory_at_contract_boundary() {
     let turn = OrchestratedTurn::new(
         plan.id.clone(),
         NodeId::new("design"),
-        design_tasks[0].id,
+        design_task,
         agent_epsilon,
         "design the homepage",
         brief.to_string(),
         brief.clone(),
         now,
     );
-    let bad = executor.execute(turn).await.expect("execute (still a deliverable)");
+    let bad = executor
+        .execute(turn)
+        .await
+        .expect("execute (still a deliverable)");
+    let bad_payload = bad.payload.clone();
     let err = board
         .fulfill(contract.id, bad, now)
         .await
@@ -409,34 +480,7 @@ async fn malformed_design_halts_factory_at_contract_boundary() {
         "design contract goes Failed at fulfill()"
     );
 
-    // --- Tapahtumat: vain design osoitettiin; review/deploy ei. -------------
-    let mut assigned_nodes: Vec<String> = Vec::new();
-    let mut step_failed = 0;
-    while let Ok(Some(ev)) = events.try_recv() {
-        if let familyclaw_bridge::EventKind::Custom(name) = &ev.kind {
-            if name == STEP_ASSIGNED {
-                if let Some(node) = ev
-                    .payload
-                    .as_ref()
-                    .and_then(|p| p.get("node_id"))
-                    .and_then(|v| v.as_str())
-                {
-                    assigned_nodes.push(node.to_string());
-                }
-            } else if name == familyclaw_bridge::STEP_FAILED {
-                step_failed += 1;
-            }
-        }
-    }
-    assert_eq!(
-        assigned_nodes,
-        vec!["design".to_string()],
-        "only design is ever assigned; review and deploy never run"
-    );
-    assert_eq!(step_failed, 1, "design emits exactly one step_failed");
-
-    // Lisää todiste: viallinen Deliverable rikkoo molemmat jälkiehdot.
-    let bad_payload = serde_json::json!({ "sections": [], "cta": "" });
+    // Lisätodiste: sama viallinen hyötykuorma ei ole tulosskeeman mukainen.
     let bad_deliverable = Deliverable::new(agent_epsilon, bad_payload, now);
     assert!(
         !cap.output.is_valid(&bad_deliverable.payload),
