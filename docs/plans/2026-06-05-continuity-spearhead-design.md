@@ -3,7 +3,7 @@
 **Date:** 2026-06-05
 **Authors:** the operator + Claude (Opus 4.8)
 **Status:** Approved design → ready for parallel implementation
-**Branch target:** `feat/continuity-bench` (in E:\Familyclaw)
+**Branch target:** `feat/continuity-bench` (repo root)
 
 > Goal (the operator): make FamilyClaw the *objectively most advanced* persistent-agent
 > product — leave OpenClaw and Hermes Agent **no seam** to attack on continuity.
@@ -56,7 +56,7 @@ supporting evidence. The money metrics are `protected_core_intact == 1.0` and
 attack (false-merge of distinct memories; anchor tombstoned as non-representative)
 finds NO hole — or every hole is fixed. That attack is already in the workflow.
 
-Verified state of E:\Familyclaw (2026-06-05, live): 12 crates build green.
+Verified state of the repo (2026-06-05, live): 12 crates build green.
 - `familyclaw-durable` (51 tests) — **competitive-grade**. `context.rs` has the
   torn-last-line crash test proving side-effects run exactly once; loud
   `NondeterministicReplay` (never silently wrong).
