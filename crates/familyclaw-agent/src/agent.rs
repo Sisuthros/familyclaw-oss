@@ -736,10 +736,18 @@ impl Agent {
         match message {
             BusMessage::EmotionPulse { state } => {
                 for dim in Dimension::ALL {
-                    let delta = state.value(dim) * CONTAGION_FACTOR;
-                    if delta > 0.0 {
-                        self.emotion.stimulate(dim, delta);
-                    }
+                    // Affektiivinen contagion *lähestymisenä*, ei kasauksena:
+                    // vastaanottaja liikkuu lähteen tunnetilaa kohti osuudella
+                    // CONTAGION_FACTOR. Koska delta lasketaan EROSTA
+                    // (lähde − vastaanottaja), arvo ei voi koskaan ylittää
+                    // lähdettä eikä saturoida kattoon — jokainen pulssi
+                    // pienenee kun arvot lähestyvät toisiaan. Tämä korjaa
+                    // code review #2:n "tuotannon kaataja"-bugin, jossa
+                    // `lähde * CONTAGION_FACTOR` -kasaus + 10 %:n homeostaasi
+                    // tasapainottui arvoon `2.25 * lähde` → saturaatio kattoon.
+                    let current = self.emotion.value(dim);
+                    let delta = (state.value(dim) - current) * CONTAGION_FACTOR;
+                    self.emotion.stimulate(dim, delta);
                 }
             }
             BusMessage::Text { .. } | BusMessage::Latent { .. } => {
@@ -1605,6 +1613,92 @@ mod tests {
             received.is_err(),
             "Hesitate-tilassa reply:tä ei saa lähettää, saatiin: {received:?}"
         );
+        bus.stop();
+    }
+
+    /// Regressiotesti (code review #2, "tuotannon kaataja"): jatkuva
+    /// korkea sisaruspulssi EI saa ajaa vastaanottajan dimensiota kattoon
+    /// (100). Ennen korjausta contagion lisäsi `source * 0.25` joka tikki
+    /// riippumatta vastaanottajan arvosta → homeostaasi (10 %) ei ehtinyt
+    /// vaimentaa ja tasapaino oli `2.25 * source` → saturaatio kattoon.
+    /// Korjauksen jälkeen contagion lähestyy lähdettä (`(source - target) *
+    /// factor`), joten arvo ei voi ylittää lähdettä eikä saturoidu kattoon.
+    #[tokio::test]
+    async fn repeated_contagion_does_not_saturate_to_ceiling() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let mut agent = test_agent("agent_sat", bus.clone());
+
+        // Sisarus jatkuvassa korkeassa ilossa (mutta EI katossa: 80/100).
+        let mut sibling_state = EmotionState::neutral();
+        sibling_state.set(Dimension::Joy, 80.0);
+
+        // Sata vuoroa samaa korkeaa pulssia — pahin tapaus feedback-loopille.
+        for _ in 0..100 {
+            agent
+                .handle_turn(BeingId::new(), &BusMessage::emotion_pulse(sibling_state))
+                .await
+                .expect("turn");
+        }
+
+        let joy = agent.emotion().value(Dimension::Joy);
+        // Ei saturaatiota kattoon: pysyy reilusti alle 100.
+        assert!(
+            joy < 100.0,
+            "jatkuva contagion ei saa saturoida kattoon, joy = {joy}"
+        );
+        // Eikä saa ylittää lähteen arvoa (contagion = lähestyminen, ei kasaus).
+        assert!(
+            joy <= 80.0 + 1e-3,
+            "vastaanottaja ei saa ylittää lähdettä (80), joy = {joy}"
+        );
+    }
+
+    /// Kun korkeat sisaruspulssit loppuvat, homeostaasi vetää tunnetilan
+    /// takaisin kohti neutraalia (baseline 0) — ei jää jumiin kohonneeseen
+    /// arvoon. Todistaa että decay/homeostaasi-termi tasapainottaa contagionin.
+    #[tokio::test]
+    async fn homeostasis_pulls_back_toward_baseline_after_contagion() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let mut agent = test_agent("agent_decay", bus.clone());
+
+        // Nosta tunnetila contagionilla muutamalla pulssilla.
+        let mut sibling_state = EmotionState::neutral();
+        sibling_state.set(Dimension::Joy, 80.0);
+        for _ in 0..5 {
+            agent
+                .handle_turn(BeingId::new(), &BusMessage::emotion_pulse(sibling_state))
+                .await
+                .expect("turn");
+        }
+        let elevated = agent.emotion().value(Dimension::Joy);
+        assert!(elevated > 0.0, "contagion nosti iloa, joy = {elevated}");
+
+        // Pulssit loppuvat → neutraalit (tunnetilaa muuttamattomat) vuorot.
+        // Task-viesti ei muuta tunnetilaa (vain homeostaasi ajetaan).
+        for _ in 0..30 {
+            agent
+                .handle_turn(
+                    BeingId::new(),
+                    &BusMessage::task_event(TaskEventKind::Started, "noop"),
+                )
+                .await
+                .expect("turn");
+        }
+        let relaxed = agent.emotion().value(Dimension::Joy);
+        // Homeostaasi veti takaisin kohti baselinea (0) — selvästi alaspäin.
+        assert!(
+            relaxed < elevated,
+            "homeostaasin pitäisi laskea iloa: {elevated} -> {relaxed}"
+        );
+        // 30 vuoroa 10 %:n eksponentiaalista vaimennusta → murto-osa
+        // alkuperäisestä. Robusti suhteellinen raja (ei herkkä tarkalle
+        // contagion/decay-aritmetiikalle): vähintään 90 % palautunut.
+        assert!(
+            relaxed < elevated * 0.1,
+            "pitkän tauon jälkeen ilon pitäisi olla lähellä baselinea: \
+             {elevated} -> {relaxed}"
+        );
+
         bus.stop();
     }
 

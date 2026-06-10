@@ -104,15 +104,17 @@ impl Scenario for EmotionalContagion {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         // Simuloi agent_b:n vastaanotto: affektiivinen tartunta
-        // CONTAGION_FACTOR = 0.25 (familyclaw-agent/src/agent.rs)
+        // CONTAGION_FACTOR = 0.25 (familyclaw-agent/src/agent.rs).
+        // Contagion on *lähestymistä* lähdettä kohti (ei kasausta), jotta
+        // toistuva pulssi ei saturoidu kattoon: delta = (lähde − oma) · kerroin.
+        // agent_b alkaa neutraalista (0), joten tulos = lähde · kerroin.
         let contagion: f32 = 0.25;
 
         // Käy läpi dimension ja sovella tartunta
         for dim in [Dimension::Joy, Dimension::Curiosity] {
-            let delta = agent_a_emotion.value(dim) * contagion;
-            if delta > 0.0 {
-                agent_b_emotion.stimulate(dim, delta);
-            }
+            let current = agent_b_emotion.value(dim);
+            let delta = (agent_a_emotion.value(dim) - current) * contagion;
+            agent_b_emotion.stimulate(dim, delta);
         }
 
         // Homeostaasi: 10% palautuminen kohti neutraalia
