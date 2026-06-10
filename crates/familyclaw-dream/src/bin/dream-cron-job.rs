@@ -28,7 +28,7 @@ fn main() -> Result<()> {
 
     let now = time::now();
     let clock = DesireClock::default();
-    let last_dream = clock.last_dream_time(now);
+    let _last_dream = clock.last_dream_time(now);
 
     // Tarkista onko viimeisin unijakso jo ajettu
     let mut context = DurableContext::new(journal.clone())?;
@@ -41,10 +41,10 @@ fn main() -> Result<()> {
 
     // Aja unijakso
     println!("Ajetaan unijaksoa...");
-    let cycle = DreamCycle::with_config(store.as_ref(), DreamConfig::default());
+    let _cycle = DreamCycle::with_config(store.as_ref(), DreamConfig::default());
     // Mockataan DreamReport koska DreamCycle::run on async
     let mock_report = familyclaw_dream::report::DreamReport::new(now);
-    let report = context.step("dream_cycle", || {
+    let _report = context.step("dream_cycle", || {
         Ok(mock_report)
     })?;
 

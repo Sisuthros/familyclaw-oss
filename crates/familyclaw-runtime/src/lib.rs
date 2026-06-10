@@ -158,7 +158,7 @@ pub async fn build_family(
     };
 
     // 5. Ankkuroi identiteetti ennen agentin rakennusta.
-    if let Ok(_) = env::var("FAMILYCLAW_HEARTH_ENABLED") {
+    if env::var("FAMILYCLAW_HEARTH_ENABLED").is_ok() {
         let mut registry = familyclaw_hearth::anchor_registry::AnchorRegistry::new();
         if let Err(e) = registry.register(&agent_cfg.name, &soul.essence) {
             tracing::warn!("Anchor registration failed (non-fatal): {e}");

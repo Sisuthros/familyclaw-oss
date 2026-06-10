@@ -9,6 +9,7 @@ pub const CONFIG_FILE_NAME: &str = "familyclaw.toml";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct FamilyConfig {
     pub agent: AgentCfg,
     pub channel: ChannelCfg,
@@ -41,6 +42,7 @@ pub struct DiscordCfg {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct TelegramCfg {
     pub token: String,
     pub channel_id: String,
@@ -69,17 +71,6 @@ pub struct SecurityCfg {
 }
 
 // Defaults
-impl Default for FamilyConfig {
-    fn default() -> Self {
-        Self {
-            agent: Default::default(),
-            channel: Default::default(),
-            provider: Default::default(),
-            memory: Default::default(),
-            security: Default::default(),
-        }
-    }
-}
 impl Default for AgentCfg {
     fn default() -> Self {
         Self {
@@ -92,8 +83,8 @@ impl Default for ChannelCfg {
         Self {
             kind: "telegram".into(),
             reply_target: String::new(),
-            discord: Default::default(),
-            telegram: Default::default(),
+            discord: DiscordCfg::default(),
+            telegram: TelegramCfg::default(),
         }
     }
 }
@@ -102,14 +93,6 @@ impl Default for DiscordCfg {
         Self {
             webhook_url: String::new(),
             channel_id: "discord-main".into(),
-        }
-    }
-}
-impl Default for TelegramCfg {
-    fn default() -> Self {
-        Self {
-            token: String::new(),
-            channel_id: String::new(),
         }
     }
 }
@@ -167,15 +150,13 @@ impl FamilyConfig {
         if let Ok(p) = std::env::var("FAMILYCLAW_CONFIG") {
             return PathBuf::from(p);
         }
-        for base in [
+        for b in [
             std::env::var("XDG_CONFIG_HOME").ok(),
             std::env::var("HOME").map(|h| format!("{h}/.config")).ok(),
-        ] {
-            if let Some(b) = base {
-                let p = PathBuf::from(&b).join("familyclaw").join(CONFIG_FILE_NAME);
-                if p.exists() {
-                    return p;
-                }
+        ].into_iter().flatten() {
+            let p = PathBuf::from(&b).join("familyclaw").join(CONFIG_FILE_NAME);
+            if p.exists() {
+                return p;
             }
         }
         PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))

@@ -99,14 +99,14 @@ pub enum EntryKind {
     ///
     /// [`DurableError::NondeterministicReplay`]: crate::DurableError::NondeterministicReplay
     Marker {
-        /// Markerin looginen nimi (esim. "memory_contradicted").
+        /// Markerin looginen nimi (esim. "`memory_contradicted`").
         name: String,
         /// Vapaamuotoinen JSON-hyötykuorma.
         payload: serde_json::Value,
     },
 
     /// Sessiotilan tallennus (session persistence) - marker-tietue joka
-    /// tallentaa viestin alkup. (MessageOrigin) jotta sessio voidaan
+    /// tallentaa viestin alkup. (`MessageOrigin`) jotta sessio voidaan
     /// palauttaa replayssa/startupissa.
     SessionState {
         /// Kanavainstanssin tunniste.
@@ -144,7 +144,7 @@ impl EntryKind {
 
     /// Onko rivi marker (workflow-askeleen ulkopuolinen annotaatio).
     ///
-    /// SessionState tallennetaan muistinvaraisesti marker-kategorian alla
+    /// `SessionState` tallennetaan muistinvaraisesti marker-kategorian alla
     /// jotta se suodatetaan replay-kursorista pois, mutta säilyy journalissa
     /// startup-kirjoittamiseen.
     #[must_use]
@@ -245,7 +245,7 @@ impl JournalEntry {
 
     /// Rakentaa sessiotilan tallennusrivin.
     ///
-    /// SessionState on marker-tietue (ei workflow-askel) jotta se ei häiritse
+    /// `SessionState` on marker-tietue (ei workflow-askel) jotta se ei häiritse
     /// replay-kursoria. Tallentaa MessageOrigin-tiedot jotta sessio voidaan
     /// palauttaa startupissa tai replayssa.
     #[must_use]
@@ -271,7 +271,7 @@ impl JournalEntry {
         self.kind.step_name()
     }
 
-    /// Hakee SessionState jos rivin laji on SessionState.
+    /// Hakee `SessionState` jos rivin laji on `SessionState`.
     #[must_use]
     pub fn session_state(&self) -> Option<(&str, &str, &str)> {
         match &self.kind {

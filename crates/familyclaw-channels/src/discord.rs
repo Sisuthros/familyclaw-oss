@@ -14,7 +14,7 @@
 //! - Vastaanotto voidaan lisätä myöhemmin gateway-integraatiolla
 //!
 //! ## KERROS A -säännöt
-//! Kaikki konfiguraatio (webhook_url) on ajonaikaista — ei kovakoodattuja
+//! Kaikki konfiguraatio (`webhook_url`) on ajonaikaista — ei kovakoodattuja
 //! arvoja.
 
 use std::sync::Arc;
@@ -28,10 +28,10 @@ use crate::message::{ChannelKind, InboundEnvelope, OutboundMessage};
 
 /// Discord-kanava webhook-lähetys — toteuttaa [`Channel`]-rajapinnan.
 ///
-/// Lähettää viestejä Discord-webhookin kautta HTTP POSTilla.
+/// Lähettää viestejä Discord-webhookin kautta HTTP `POSTilla`.
 /// Vastaanotto (gateway polling) lisätään myöhemmässä vaiheessa;
 /// tällä hetkellä `receive()` palauttaa tyhjän virran ja injektointi
-/// tapahtuu manuaalisesti `inject()`:llä (sama malli kuin MockChannel).
+/// tapahtuu manuaalisesti `inject()`:llä (sama malli kuin `MockChannel`).
 ///
 /// Kaikki asetukset ovat ajonaikaisia — ei kovakoodattuja arvoja.
 pub struct DiscordChannel {
@@ -51,7 +51,7 @@ impl DiscordChannel {
     /// Luo uuden Discord-kanavan webhook-lähetyksellä.
     ///
     /// # Errors
-    /// Palauttaa virheen jos webhook_url on tyhjä.
+    /// Palauttaa virheen jos `webhook_url` on tyhjä.
     pub fn new(
         webhook_url: impl Into<String>,
         channel_name: impl Into<String>,
@@ -89,7 +89,7 @@ impl DiscordChannel {
 
     /// Injektoi saapuvan viestin kanavavirtaan.
     ///
-    /// Sama malli kuin MockChannel — kun oikea gateway-integraatio
+    /// Sama malli kuin `MockChannel` — kun oikea gateway-integraatio
     /// lisätään (KERROS B), tämä korvataan automaattisella pollauksella.
     pub fn inject(&self, envelope: InboundEnvelope) -> ChannelResult<()> {
         let tx = self.inner.inbound_tx.lock().unwrap();

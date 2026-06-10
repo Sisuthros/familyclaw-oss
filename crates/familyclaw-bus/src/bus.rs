@@ -88,7 +88,7 @@ pub struct BusState {
 
 impl BusState {
     /// Toimittaa kirjekuoren kaikille muille kuin lähettäjälle
-    /// käyttäen ractor::pg prosessiryhmää.
+    /// käyttäen `ractor::pg` prosessiryhmää.
     fn broadcast(&self, envelope: &ResonanceMessage, _myself: &ActorRef<BusOp>) -> usize {
         let cells = pg::get_members(&self.pg_group);
         let mut delivered = 0;

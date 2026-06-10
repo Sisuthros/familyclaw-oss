@@ -143,19 +143,16 @@ async fn readyz(
 }
 
 /// Injektoi ulkopuolisen viestin Discord-kanavaan.
-/// POST /inject — JSON: {"sender": "...", "chat_id": "...", "body": "..."}
+/// POST /inject — JSON: {"sender": "...", "`chat_id"`: "...", "body": "..."}
 async fn inject_discord(
     State(state): State<Arc<GatewayState>>,
     Json(payload): Json<serde_json::Value>,
 ) -> (StatusCode, &'static str) {
-    let ch = match &state.discord_channel {
-        Some(c) => c,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "discord channel not configured",
-            )
-        }
+    let Some(ch) = &state.discord_channel else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "discord channel not configured",
+        );
     };
     let sender = payload
         .get("sender")
@@ -261,11 +258,8 @@ fn load_agent_soul(agent_name: &str) -> Soul {
 /// - [`FamilyClawError::InvalidInput`] jos vaadittu env-muuttuja
 ///   ([`TELEGRAM_TOKEN_ENV`], [`TELEGRAM_CHANNEL_ID_ENV`],
 ///   [`REPLY_TARGET_ENV`]) puuttuu tai kanavan rakennus epäonnistuu.
-/// Kannistaa [FamilyRuntime]:n ymparistosta luetulla kokoonpanolla
-/// (KERROS B). Lukee agentin nimen, mallin, sielun, kanavan ja
-/// reply-kohteen env-muuttujista — mitaan ei kovakoodata (KERROS A).
 ///
-/// Palauttaa runtimen JA optinaalisen DiscordChannelin (inject-handlerille).
+/// Palauttaa runtimen JA optinaalisen `DiscordChannelin` (inject-handlerille).
 async fn start_runtime() -> Result<(FamilyRuntime, Option<Arc<DiscordChannel>>)> {
     let cfg = FamilyConfig::load()?;
     let agent_name = cfg.agent_name().to_string();

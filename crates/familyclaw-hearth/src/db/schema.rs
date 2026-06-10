@@ -4,12 +4,12 @@
 //! muistitapahtumat (vektorihaku HNSW), narratiiviset langat ja niiden
 //! tapahtumat, agenttien tunnetila sekä identiteettiankkurit.
 //!
-//! Skeema on SurrealDB v3 -syntaksia (`DEFINE TABLE ... SCHEMAFULL`,
+//! Skeema on `SurrealDB` v3 -syntaksia (`DEFINE TABLE ... SCHEMAFULL`,
 //! `array<float>`, `HNSW`-indeksit). Sitä sovelletaan kerran tietokannan
 //! alustuksessa [`crate::db::surreal::SurrealHearthStore`]:n toimesta.
 
 /// SurrealDB-skeema The Hearthille.
-pub const HEARTH_SCHEMA: &str = r#"
+pub const HEARTH_SCHEMA: &str = r"
 DEFINE TABLE memory_event SCHEMAFULL;
 DEFINE FIELD id ON memory_event TYPE string;
 DEFINE FIELD content ON memory_event TYPE string;
@@ -51,4 +51,4 @@ DEFINE FIELD agent_name ON anchor TYPE string;
 DEFINE FIELD content_hash ON anchor TYPE string;
 DEFINE FIELD protected ON anchor TYPE bool;
 DEFINE FIELD decay_class ON anchor TYPE string;
-"#;
+";

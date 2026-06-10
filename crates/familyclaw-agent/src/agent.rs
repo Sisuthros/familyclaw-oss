@@ -161,7 +161,7 @@ pub struct Agent {
     /// (`handle_turn`:ssa) + `EmotionActionGovernor` tekevät
     /// `EmotionPulse`-signaaleista "verta" eikä LLM-syötettä, ja
     /// päättävät mitä toimintatilaa (Hesitate / Reflect / Speak /
-    /// EngageWarmly / ReachOut / Initiate) agentti käyttää.
+    /// `EngageWarmly` / `ReachOut` / Initiate) agentti käyttää.
     governor: Option<Box<dyn EmotionActionGoverning + Send + Sync>>,
 }
 
@@ -481,6 +481,9 @@ impl Agent {
     /// # Errors
     /// - [`FamilyClawError::Memory`] jos muistin kirjaus epäonnistuu.
     /// - [`FamilyClawError`] (käärittynä) jos durable-askel epäonnistuu.
+    // Vuoronkäsittely on yhtenäinen, peräkkäinen prosessi; pilkkominen vain
+    // rivimäärän takia hajottaisi loogisen kokonaisuuden.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_turn_with_origin(
         &mut self,
         sender: BeingId,

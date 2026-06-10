@@ -40,11 +40,20 @@ pub struct DesireClock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NextDream {
     /// Unijakso käynnistyy tänään yöllä.
-    Tonight { at: Timestamp },
+    Tonight {
+        /// Ajankohta jolloin tämänyöinen unijakso käynnistyy.
+        at: Timestamp,
+    },
     /// Unijakso käynnistyy huomenna yöllä.
-    Tomorrow { at: Timestamp },
+    Tomorrow {
+        /// Ajankohta jolloin huomisyöinen unijakso käynnistyy.
+        at: Timestamp,
+    },
     /// Edellinen unijakso jäi ajamatta (kone ei päällä).
-    Missed { should_have_run_at: Timestamp },
+    Missed {
+        /// Ajankohta jolloin unijakson olisi pitänyt käynnistyä.
+        should_have_run_at: Timestamp,
+    },
 }
 
 impl Default for DesireClock {
@@ -73,7 +82,7 @@ impl DesireClock {
     /// - [`NextDream::Tomorrow`] jos tämä yö on jo mennyt
     #[must_use]
     pub fn next_dream_time(&self, now: Timestamp) -> NextDream {
-        let utc: DateTime<Utc> = now.into();
+        let utc: DateTime<Utc> = now;
         let today_reflection = Utc
             .with_ymd_and_hms(
                 utc.year(),
@@ -88,13 +97,13 @@ impl DesireClock {
         if utc < today_reflection {
             // Tänään yö ei ole vielä mennyt → unijakso tänä yönä
             NextDream::Tonight {
-                at: today_reflection.into(),
+                at: today_reflection,
             }
         } else {
             // Tämä yö on mennyt → unijakso huomenna
             let tomorrow_reflection = today_reflection + chrono::Duration::days(1);
             NextDream::Tomorrow {
-                at: tomorrow_reflection.into(),
+                at: tomorrow_reflection,
             }
         }
     }
@@ -106,7 +115,7 @@ impl DesireClock {
     /// - [`NextDream::Tonight`] jos tämä yö on mennyt (kone oli päällä tänään)
     #[must_use]
     pub fn last_dream_time(&self, now: Timestamp) -> NextDream {
-        let utc: DateTime<Utc> = now.into();
+        let utc: DateTime<Utc> = now;
         let today_reflection = Utc
             .with_ymd_and_hms(
                 utc.year(),
@@ -122,12 +131,12 @@ impl DesireClock {
             // Tänään yö ei ole vielä mennyt → viimeisin unijakso oli eilen
             let yesterday_reflection = today_reflection - chrono::Duration::days(1);
             NextDream::Missed {
-                should_have_run_at: yesterday_reflection.into(),
+                should_have_run_at: yesterday_reflection,
             }
         } else {
             // Tämä yö on mennyt → viimeisin unijakso oli tänään
             NextDream::Tonight {
-                at: today_reflection.into(),
+                at: today_reflection,
             }
         }
     }
