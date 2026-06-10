@@ -12,8 +12,16 @@
 //! lueta. Sama syöte → tavu-tavulta identtinen scorecard joka ajolla.
 //!
 //! Aja:
-//!   `cargo run -p familyclaw-bench -- all`
-//!   `cargo run -p familyclaw-bench -- s1`   (yksittäinen skenaario)
+//!   `cargo run -p familyclaw-bench -- all`       (kaikki, FamilyClaw)
+//!   `cargo run -p familyclaw-bench -- s1`        (yksittäinen skenaario)
+//!   `cargo run -p familyclaw-bench -- compare`   (vertailu: FamilyClaw vs
+//!                                                 kilpailijan-muotoinen perustaso
+//!                                                 → `COMPARISON.md`)
+
+// Tuotenimet (FamilyClaw, OpenClaw, Letta, Hermes) ja CLI-esimerkit esiintyvät
+// dokumentaatiossa proosana — ne eivät ole koodisymboleita, joten
+// doc_markdown-backtick-vaatimus ei koske niitä (sama allow kuin lib.rs:ssä).
+#![allow(clippy::doc_markdown)]
 
 use std::path::{Path, PathBuf};
 
@@ -22,7 +30,10 @@ use clap::Parser;
 use familyclaw_bench::scenarios::{
     CrashMatrix, DreamQuality, EmotionalContagion, EternalThread, RetentionCurve, SemanticRetrieval,
 };
-use familyclaw_bench::{BenchError, FamilyClawSubject, Harness, Result, Scenario, Scorecard};
+use familyclaw_bench::{
+    BenchError, ComparativeScorecard, FamilyClawSubject, Harness, MarkdownFileSubject, Result,
+    Scenario, Scorecard,
+};
 use familyclaw_core::time;
 
 /// Kiinteä injektoitu referenssikello (design §6: reprodusoitava byte-for-byte).
@@ -35,7 +46,10 @@ const FIXED_CLOCK_RFC3339: &str = "2026-06-04T12:00:00Z";
 #[derive(Parser)]
 #[command(name = "bench", about = "FamilyClaw continuity benchmark harness")]
 struct Cli {
-    /// Ajettava skenaario tunnisteella, tai `all` kaikille (esim. `s1`, `all`).
+    /// Ajettava skenaario tunnisteella, `all` kaikille FamilyClawlla, tai
+    /// `compare` ajamaan kaikki skenaariot **molemmilla** subjekteilla
+    /// (FamilyClaw vs kilpailijan-muotoinen perustaso) ja kirjoittamaan
+    /// vertailuraportti (esim. `s1`, `all`, `compare`).
     #[arg(value_name = "SCENARIO")]
     scenario: String,
 }
@@ -55,6 +69,12 @@ async fn main() -> Result<()> {
 
     // Injektoitu kello — EI järjestelmäkello (reprodusoitavuus, design §2.2).
     let clock = time::parse_rfc3339(FIXED_CLOCK_RFC3339)?;
+
+    // `compare` ajaa SAMAN skenaariosarjan molemmilla subjekteilla ja kirjoittaa
+    // vertailuraportin; muut tunnisteet ajavat vain FamilyClawn (kuten ennen).
+    if cli.scenario == "compare" {
+        return run_compare(clock).await;
+    }
 
     // Valitse ajettavat skenaariot tunnisteen perusteella.
     let scenarios = select_scenarios(&cli.scenario)?;
@@ -83,6 +103,57 @@ async fn main() -> Result<()> {
         tracing::info!("benchmark complete: ALL PASSED");
     } else {
         tracing::warn!("benchmark complete: SOME SCENARIOS FAILED");
+    }
+
+    Ok(())
+}
+
+/// Ajaa kaikki skenaariot **molemmilla** subjekteilla ja kirjoittaa
+/// vertailuraportin (`COMPARISON.md`).
+///
+/// FamilyClaw ajetaan `continuity_daemon`-binääriä vasten (sama musta laatikko
+/// kuin `all`-ajossa); kilpailijan-muotoinen perustaso
+/// ([`MarkdownFileSubject`]) ajetaan puhtaasti in-process. Molemmat saavat
+/// **saman** skenaariosarjan ja **saman** injektoidun kellon, joten tuloste on
+/// tavu-tavulta reprodusoitava (design §6).
+///
+/// # Errors
+/// [`BenchError`] jos daemon-binääriä ei löydy tai jokin skenaario/kirjoitus
+/// epäonnistuu.
+async fn run_compare(clock: familyclaw_core::Timestamp) -> Result<()> {
+    tracing::info!(
+        clock = %FIXED_CLOCK_RFC3339,
+        "running COMPARATIVE continuity benchmark (FamilyClaw vs baseline)"
+    );
+
+    // FamilyClaw — daemon-binääri mustana laatikkona.
+    ensure_daemon_env()?;
+    let mut familyclaw = FamilyClawSubject::from_env()?;
+    let fc_card = Harness::new()
+        .run(&mut familyclaw, &select_scenarios("all")?, clock)
+        .await?;
+
+    // Kilpailijan-muotoinen perustaso — puhdas in-process (ei daemonia).
+    // Tuore skenaariosarja: `Box<dyn Scenario>` kulutetaan ajossa.
+    let mut baseline = MarkdownFileSubject::new();
+    let base_card = Harness::new()
+        .run(&mut baseline, &select_scenarios("all")?, clock)
+        .await?;
+
+    let comparison = ComparativeScorecard::new(fc_card, base_card, clock);
+
+    write_comparison(&comparison)?;
+
+    // Tulosta vertailu stdoutiin (ihmiselle).
+    println!("{}", comparison.to_markdown());
+
+    if comparison.familyclaw_wins_crash_matrix() {
+        tracing::info!(
+            "comparison complete: FamilyClaw WINS crash_matrix \
+             (side_effect_overcount 0 vs >0)"
+        );
+    } else {
+        tracing::warn!("comparison complete: FamilyClaw advantage NOT established this run");
     }
 
     Ok(())
@@ -187,6 +258,29 @@ fn write_outputs(card: &Scorecard, scenario: &str) -> Result<()> {
     }
 
     tracing::info!(out = %out_dir.display(), "scorecard written");
+    Ok(())
+}
+
+/// Kirjoittaa vertailuraportin (`COMPARISON.md`) sekä `out/`-hakemistoon että
+/// julkiseen `docs/`-hakemistoon (sama kuvio kuin [`write_outputs`]).
+///
+/// # Errors
+/// [`BenchError::Io`] jos hakemiston luonti tai kirjoitus epäonnistuu.
+fn write_comparison(comparison: &ComparativeScorecard) -> Result<()> {
+    let root = workspace_crate_root();
+    let out_dir = root.join("out");
+    std::fs::create_dir_all(&out_dir)?;
+
+    let md = comparison.to_markdown();
+    write_atomic(&out_dir.join("COMPARISON.md"), md.as_bytes())?;
+
+    // Julkinen artefakti repon `docs/`-hakemistoon (rinnan SCORECARD.md:n kanssa).
+    if let Some(docs_dir) = root.parent().and_then(Path::parent).map(|ws| ws.join("docs")) {
+        std::fs::create_dir_all(&docs_dir)?;
+        write_atomic(&docs_dir.join("COMPARISON.md"), md.as_bytes())?;
+    }
+
+    tracing::info!(out = %out_dir.display(), "comparison written");
     Ok(())
 }
 

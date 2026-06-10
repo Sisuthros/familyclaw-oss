@@ -22,6 +22,9 @@
 //! - `FAMILYCLAW_PROFILE_DIR` — sielun profiilihakemiston juuri (valinnainen),
 //! - `FAMILYCLAW_TELEGRAM_CHANNEL_ID` — Telegram-kanavainstanssin tunniste,
 //! - `FAMILYCLAW_REPLY_TARGET` — staattinen reply-kohde (Telegram chat-id),
+//! - `FAMILYCLAW_GATEWAY_TOKEN` — valinnainen bearer-token, joka suojaa
+//!   `POST /inject`:n (asetettuna pyyntö vaatii `Authorization: Bearer <token>`;
+//!   tyhjänä endpoint pysyy loopback-only-avoimena kuten ennen),
 //! - `TELEGRAM_BOT_TOKEN` — Telegram-botin token (vaadittu kanavalle),
 //! - `FAMILYCLAW_PROVIDERS` — provider-taulu resolverille, muoto
 //!   `prefix=base_url=KEY_ENV` puolipistein eroteltuna (valinnainen; ilman
@@ -42,7 +45,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{Json, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
 use axum::Router;
 use clap::{Parser, Subcommand};
@@ -71,6 +74,11 @@ const DISCORD_WEBHOOK_URL_ENV: &str = "DISCORD_WEBHOOK_URL";
 const DISCORD_CHANNEL_ID_ENV: &str = "DISCORD_CHANNEL_ID";
 const TELEGRAM_CHANNEL_ID_ENV: &str = "FAMILYCLAW_TELEGRAM_CHANNEL_ID";
 const REPLY_TARGET_ENV: &str = "FAMILYCLAW_REPLY_TARGET";
+
+/// Valinnainen bearer-token, joka suojaa `POST /inject`:n (env). Käytetään
+/// vain virheviesteissä/dokumentaatiossa — varsinainen arvo luetaan
+/// `FamilyConfig`:n kautta. Vrt. OpenClawin `OPENCLAW_GATEWAY_TOKEN`.
+const GATEWAY_TOKEN_ENV: &str = "FAMILYCLAW_GATEWAY_TOKEN";
 
 /// Oletusarvot joita `FamilyConfig` käyttää (KERROS B).
 const DEFAULT_BUS_NAME: &str = "familyclaw-gateway-bus";
@@ -121,6 +129,11 @@ struct GatewayState {
     bus: Option<BusHandle>,
     /// Discord-kanava inject-handlerille. `Some` kun kanavatyyppi on "discord".
     discord_channel: Option<Arc<DiscordChannel>>,
+    /// Valinnainen `POST /inject`-bearer-token. `Some` = endpoint vaatii
+    /// `Authorization: Bearer <token>`:n; `None` = avoin loopback-only-oletus
+    /// (yhteensopiva aiemman käytöksen kanssa). Vrt. OpenClawin
+    /// `OPENCLAW_GATEWAY_TOKEN`.
+    inject_token: Option<Arc<str>>,
 }
 
 /// Elinvoimatarkistus: vastaa aina `200 OK` kun prosessi pystyy palvelemaan
@@ -142,12 +155,73 @@ async fn readyz(
     }
 }
 
+/// Vakioaikainen tavujonojen vertailu (defense-in-depth bearer-tokenille).
+///
+/// Palauttaa `true` vain jos jonot ovat samanpituiset ja tavuittain identtiset.
+/// Suoritusaika riippuu vain pidemmän jonon pituudesta, ei sisällöstä — emme
+/// oikosulje ensimmäisestä eroavasta tavusta, jottei vertailu vuoda
+/// ajoituskanavaa hyökkääjälle (sama idiomi kuin `familyclaw-security`:n
+/// ankkuritiivisteen vertailussa).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Tarkistaa `POST /inject`:n bearer-token-valtuutuksen.
+///
+/// - Jos tokenia **ei** ole konfiguroitu ([`GatewayState::inject_token`] =
+///   `None`), pyyntö hyväksytään sellaisenaan (avoin loopback-only-oletus,
+///   taaksepäinyhteensopiva).
+/// - Jos token **on** konfiguroitu, otsikon `Authorization: Bearer <token>`
+///   on oltava läsnä ja täsmättävä vakioaikaisesti — muuten
+///   [`StatusCode::UNAUTHORIZED`].
+///
+/// Token-arvoja ei koskaan lokiteta (MEMORY.md secret-leak-sääntö).
+///
+/// Huom: paluutyyppi on `std::result::Result` täsmällisesti, koska tämän
+/// kraatin laajuudessa `Result` viittaa [`familyclaw_core::Result`]-aliakseen.
+fn check_inject_auth(
+    state: &GatewayState,
+    headers: &HeaderMap,
+) -> std::result::Result<(), StatusCode> {
+    let Some(expected) = state.inject_token.as_deref() else {
+        // Ei tokenia konfiguroitu → avoin oletus (loopback-only).
+        return Ok(());
+    };
+    // Pura `Authorization: Bearer <token>` — puuttuva/virheellinen otsikko = 401.
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::trim);
+    match presented {
+        Some(tok) if constant_time_eq(tok.as_bytes(), expected.as_bytes()) => Ok(()),
+        _ => {
+            tracing::warn!("inject: hylätty 401 — puuttuva tai väärä bearer-token");
+            Err(StatusCode::UNAUTHORIZED)
+        }
+    }
+}
+
 /// Injektoi ulkopuolisen viestin Discord-kanavaan.
 /// POST /inject — JSON: {"sender": "...", "chat_id": "...", "body": "..."}
+///
+/// Jos [`GATEWAY_TOKEN_ENV`] on konfiguroitu, pyyntö vaatii otsikon
+/// `Authorization: Bearer <token>` (vakioaikainen täsmäys), muuten `401`.
 async fn inject_discord(
     State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> (StatusCode, &'static str) {
+    if let Err(code) = check_inject_auth(&state, &headers) {
+        return (code, "unauthorized");
+    }
     let ch = match &state.discord_channel {
         Some(c) => c,
         None => {
@@ -266,11 +340,27 @@ fn load_agent_soul(agent_name: &str) -> Soul {
 /// reply-kohteen env-muuttujista — mitaan ei kovakoodata (KERROS A).
 ///
 /// Palauttaa runtimen JA optinaalisen DiscordChannelin (inject-handlerille).
-async fn start_runtime() -> Result<(FamilyRuntime, Option<Arc<DiscordChannel>>)> {
+async fn start_runtime() -> Result<(FamilyRuntime, Option<Arc<DiscordChannel>>, Option<Arc<str>>)> {
     let cfg = FamilyConfig::load()?;
     let agent_name = cfg.agent_name().to_string();
     let model = cfg.model().to_string();
     let channel_kind = cfg.channel_kind().to_string();
+
+    // /inject-suojaus: tyhjä token = avoin loopback-only-oletus (varoitus),
+    // asetettu token = pakollinen bearer-täsmäys. Arvoa ei koskaan lokiteta.
+    let inject_token: Option<Arc<str>> = {
+        let raw = cfg.gateway_token().trim();
+        if raw.is_empty() {
+            warn!(
+                "{GATEWAY_TOKEN_ENV} ei asetettu — POST /inject on suojaamaton \
+                 (luota loopback-sidontaan). Aseta token tuotannossa."
+            );
+            None
+        } else {
+            info!("POST /inject suojattu bearer-tokenilla ({GATEWAY_TOKEN_ENV})");
+            Some(Arc::from(raw))
+        }
+    };
 
     let (channel, discord_ch): (Box<dyn Channel>, Option<Arc<DiscordChannel>>) =
         if channel_kind == "discord" {
@@ -331,7 +421,7 @@ async fn start_runtime() -> Result<(FamilyRuntime, Option<Arc<DiscordChannel>>)>
     )
     .await?;
 
-    Ok((runtime, discord_ch))
+    Ok((runtime, discord_ch, inject_token))
 }
 
 #[tokio::main]
@@ -368,12 +458,13 @@ async fn serve() -> Result<()> {
     // C5-sauma: yksi build_family-kutsu kokoaa bus + agentti + kanava +
     // reply-pumppu (FamilyRuntime). Bus-kahva luovutetaan GatewayState:lle;
     // HTTP-/sammutuskuori pysyy ennallaan (vain bus.stop() → runtime.shutdown()).
-    let (runtime, discord_ch) = start_runtime().await?;
+    let (runtime, discord_ch, inject_token) = start_runtime().await?;
     info!("FamilyRuntime käynnissä (bus + agentti + kanava)");
 
     let state = Arc::new(GatewayState {
         bus: Some(runtime.bus().clone()),
         discord_channel: discord_ch,
+        inject_token,
     });
     let app = build_router(state);
 
@@ -514,6 +605,15 @@ async fn doctor() -> Result<()> {
         }
     }
 
+    // /inject-suojaus: valinnainen, joten ei kaada doctoria. Vain läsnäolo —
+    // token on salaisuus, arvoa ei tulosteta. Puuttuva = varoitus avoimesta
+    // endpointista, ei virhe.
+    if cfg.gateway_token().trim().is_empty() {
+        println!("[WARN]    inject    {GATEWAY_TOKEN_ENV} unset — POST /inject open (loopback-only)");
+    } else {
+        println!("[OK]      inject    {GATEWAY_TOKEN_ENV} set — POST /inject requires bearer");
+    }
+
     if ok {
         println!("doctor: ok");
         Ok(())
@@ -560,6 +660,7 @@ mod tests {
         let not_ready = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            inject_token: None,
         });
         let (status, _) = readyz(State(not_ready)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -569,6 +670,7 @@ mod tests {
         let ready = Arc::new(GatewayState {
             bus: Some(bus.clone()),
             discord_channel: None,
+            inject_token: None,
         });
         let (status, _) = readyz(State(ready)).await;
         assert_eq!(status, StatusCode::OK);
@@ -581,6 +683,7 @@ mod tests {
         let _ = build_router(Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            inject_token: None,
         }));
     }
 
@@ -629,5 +732,80 @@ mod tests {
             "http://127.0.0.1:8787/healthz"
         );
         assert_eq!(health_url(addr, "/readyz"), "http://127.0.0.1:8787/readyz");
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_bytes() {
+        // Vakioaikainen vertailu täsmää vain samanpituisiin, tavuittain
+        // identtisiin jonoihin (ei oikosulkua ensimmäisestä erosta).
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        assert!(!constant_time_eq(b"s3cret", b"s3crXt"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cre")); // eri pituus
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    /// Apuri: rakentaa `Authorization`-otsikon sisältävän [`HeaderMap`]:n.
+    fn headers_with_auth(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            value.parse().expect("valid header value"),
+        );
+        h
+    }
+
+    #[test]
+    fn inject_auth_no_token_configured_accepts() {
+        // (c) Tokenia ei konfiguroitu → pyyntö hyväksytään ilman otsikkoa
+        //     (taaksepäinyhteensopiva avoin loopback-oletus).
+        let state = GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+        };
+        assert!(check_inject_auth(&state, &HeaderMap::new()).is_ok());
+        // Ylimääräinen otsikko ei haittaa kun suojausta ei ole.
+        assert!(check_inject_auth(&state, &headers_with_auth("Bearer whatever")).is_ok());
+    }
+
+    #[test]
+    fn inject_auth_token_configured_correct_bearer_accepts() {
+        // (a) Token konfiguroitu + oikea Bearer → hyväksytään.
+        let state = GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: Some(Arc::from("s3cret-token")),
+        };
+        assert!(check_inject_auth(&state, &headers_with_auth("Bearer s3cret-token")).is_ok());
+    }
+
+    #[test]
+    fn inject_auth_token_configured_wrong_or_missing_rejects_401() {
+        // (b) Token konfiguroitu + väärä/puuttuva Bearer → 401.
+        let state = GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: Some(Arc::from("s3cret-token")),
+        };
+        // Väärä token.
+        assert_eq!(
+            check_inject_auth(&state, &headers_with_auth("Bearer wrong-token")),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        // Otsikko kokonaan puuttuu.
+        assert_eq!(
+            check_inject_auth(&state, &HeaderMap::new()),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        // Bearer-prefiksi puuttuu (paljas token).
+        assert_eq!(
+            check_inject_auth(&state, &headers_with_auth("s3cret-token")),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        // Oikea prefiksi mutta tyhjä token.
+        assert_eq!(
+            check_inject_auth(&state, &headers_with_auth("Bearer ")),
+            Err(StatusCode::UNAUTHORIZED)
+        );
     }
 }

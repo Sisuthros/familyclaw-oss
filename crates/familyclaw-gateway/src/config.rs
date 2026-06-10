@@ -66,6 +66,10 @@ pub struct MemoryCfg {
 #[serde(default)]
 pub struct SecurityCfg {
     pub profile: String,
+    /// Valinnainen bearer-token, jolla `POST /inject` suojataan. Tyhjä = ei
+    /// tokenia → loopback-only-oletuskäytös (avoin). Asetettuna `/inject`
+    /// vaatii `Authorization: Bearer <token>` ja hylkää väärät 401:llä.
+    pub gateway_token: String,
 }
 
 // Defaults
@@ -135,6 +139,7 @@ impl Default for SecurityCfg {
     fn default() -> Self {
         Self {
             profile: "supervised".into(),
+            gateway_token: String::new(),
         }
     }
 }
@@ -203,6 +208,9 @@ impl FamilyConfig {
         if let Ok(v) = std::env::var("FAMILYCLAW_SECURITY_PROFILE") {
             self.security.profile = v;
         }
+        if let Ok(v) = std::env::var("FAMILYCLAW_GATEWAY_TOKEN") {
+            self.security.gateway_token = v;
+        }
         if let Ok(v) = std::env::var("FAMILYCLAW_MEMORY_RETENTION_HOURS") {
             if let Ok(n) = v.parse() {
                 self.memory.retention_hours = n;
@@ -236,5 +244,10 @@ impl FamilyConfig {
     }
     pub fn telegram_channel_id(&self) -> &str {
         &self.channel.telegram.channel_id
+    }
+    /// Valinnainen `POST /inject`-bearer-token. Tyhjä = ei suojausta
+    /// (loopback-only-oletuskäytös).
+    pub fn gateway_token(&self) -> &str {
+        &self.security.gateway_token
     }
 }
