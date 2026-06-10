@@ -1,6 +1,6 @@
 //! # minimal-gateway
 //!
-/** **FamilyClaw in 60 seconds** — boots 1 agent + Resonance Bus, no external deps.
+/*! **FamilyClaw in 60 seconds** — boots 1 agent + Resonance Bus, no external deps.
 
 ## Run
 ```bash

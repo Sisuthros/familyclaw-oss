@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub struct AcpRequest {
     /// Prompt-teksti agentille.
     pub prompt: String,
-    /// Käyttöoikeustila (esim. "default", "bypass_permissions").
+    /// Käyttöoikeustila (esim. "default", "`bypass_permissions`").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     /// Työhakemisto.
@@ -61,7 +61,7 @@ pub struct AcpResponse {
 /// Agentin tekemä työkalukutsu.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpToolCall {
-    /// Työkalun nimi (esim. "read_file", "execute_command").
+    /// Työkalun nimi (esim. "`read_file`", "`execute_command`").
     pub tool: String,
     /// Työkalun argumentit JSON-muodossa.
     pub arguments: serde_json::Value,

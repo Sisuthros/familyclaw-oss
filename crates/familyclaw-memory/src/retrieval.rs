@@ -37,7 +37,7 @@ const W_IMPORTANCE: f32 = 0.20;
 const ARCHIVED_PENALTY: f32 = 0.5;
 
 /// Cosine-similarity vektorihaku painon raja-arvo.
-/// Jos semantic_weight > tämä ja molemmilla on embedding, käytetään cosine:a.
+/// Jos `semantic_weight` > tämä ja molemmilla on embedding, käytetään cosine:a.
 const VECTOR_SIMILARITY_THRESHOLD: f32 = 0.01;
 
 /// Hakukysely ja sen rajaukset.

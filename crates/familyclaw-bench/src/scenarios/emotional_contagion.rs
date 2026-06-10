@@ -71,6 +71,14 @@ impl Scenario for EmotionalContagion {
         Self::ID
     }
 
+    // Skenaario on yhtenäinen vaiheittainen koeasetelma; rivimäärän takia
+    // pilkkominen hajottaisi sen luettavuuden. `agent_a_*`/`agent_b_*` -nimet
+    // ovat tarkoituksella samankaltaisia (kaksi symmetristä agenttia).
+    #[allow(
+        clippy::too_many_lines,
+        clippy::similar_names,
+        clippy::cast_precision_loss
+    )]
     async fn run(&self, subject: &mut dyn Subject, clock: Timestamp) -> Result<ScenarioResult> {
         // ── 1. Käynnistä Resonance Bus ─────────────────────────────────────
         let bus = ResonanceBus::start(None)

@@ -1,4 +1,4 @@
-//! # EmotionActionGovernor — emotions inform action decisions
+//! # `EmotionActionGovernor` — emotions inform action decisions
 //!
 //! Bridges the 19-dim emotion state to a discrete [`ActionDecision`] that the
 //! agent runtime can use to gate behaviour (tone, verbosity, which LLM tools
@@ -42,7 +42,7 @@ use crate::state::EmotionState;
 /// Discrete decision the governor emits.
 ///
 /// The variant order is significant: [`ActionDecision::partial_cmp`] orders
-/// them by "activeness" (Hesitate < Reflect < Speak < EngageWarmly < ReachOut
+/// them by "activeness" (Hesitate < Reflect < Speak < `EngageWarmly` < `ReachOut`
 /// < Initiate), so a caller can write `decision >= ActionDecision::Speak`
 /// to ask "are we willing to speak at all?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -78,7 +78,7 @@ impl ActionDecision {
         }
     }
 
-    /// Does this decision authorize *speaking* (Speak, EngageWarmly, ReachOut,
+    /// Does this decision authorize *speaking* (Speak, `EngageWarmly`, `ReachOut`,
     /// Initiate)? Convenience predicate for the agent runtime.
     #[must_use]
     pub fn may_speak(self) -> bool {
@@ -125,7 +125,7 @@ pub struct GoverningProfile {
     /// permits [`ActionDecision::Initiate`]. Use 1.0 to disable.
     pub initiative_dominance: f32,
     /// Whether the warmth blend is *required* (all components above
-    /// threshold) to upgrade to EngageWarmly, or whether *any* single
+    /// threshold) to upgrade to `EngageWarmly`, or whether *any* single
     /// warmth dimension above `warmth_ceiling` is enough.
     pub warmth_requires_blend: bool,
 }

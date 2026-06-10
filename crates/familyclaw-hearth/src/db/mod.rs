@@ -124,9 +124,9 @@ pub trait HearthStore: familyclaw_memory::MemoryStore {
 pub struct InMemoryHearthStore<M: familyclaw_memory::MemoryStore> {
     /// Kääritty MemoryStore-toteutus.
     memory: M,
-    /// Narratiiviset langat (thread_id → thread).
+    /// Narratiiviset langat (`thread_id` → thread).
     threads: RwLock<HashMap<Uuid, NarrativeThread>>,
-    /// Agenttien tunnetilat (agent_id → state).
+    /// Agenttien tunnetilat (`agent_id` → state).
     emotional_states: RwLock<HashMap<String, EmotionalVector>>,
 }
 

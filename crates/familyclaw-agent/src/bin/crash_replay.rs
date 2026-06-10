@@ -1,7 +1,7 @@
 //! Crash Replay Demo — demonstrates crash-proof memory persistence.
 //!
-//! This demo shows that FamilyClaw's durable substrate survives process crashes:
-//! - **write**: Run agent with FileJournal + LocalJsonStore(file), write memory, exit
+//! This demo shows that `FamilyClaw`'s durable substrate survives process crashes:
+//! - **write**: Run agent with `FileJournal` + LocalJsonStore(file), write memory, exit
 //! - **verify**: Reopen same journal/store, recall memory — proving survival
 //! - **full**: Run write then spawn verify as separate process
 //! - **reset**: Clean up demo directory

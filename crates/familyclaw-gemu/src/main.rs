@@ -161,6 +161,9 @@ fn cmd_scan(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Suorita tehtävä Geminillä.
+// `task` otetaan omistettuna CLI-jäsentimeltä; viitteeksi muuttaminen vaatisi
+// kutsupaikkojen muokkaamisen eikä muuta käyttäytymistä.
+#[allow(clippy::needless_pass_by_value)]
 fn cmd_run(
     task: String,
     path: PathBuf,
@@ -176,7 +179,7 @@ fn cmd_run(
 
     // Varmista Gemini CLI
     let version = gemini::check_installed()?;
-    println!("🏎️  Gemu käynnistyy (Gemini CLI v{})...", version);
+    println!("🏎️  Gemu käynnistyy (Gemini CLI v{version})...");
     println!(
         "📂 Projekti: {}",
         path.canonicalize()
@@ -232,6 +235,9 @@ fn cmd_run(
 }
 
 /// Interaktiivinen sessio.
+// `task` otetaan omistettuna CLI-jäsentimeltä; viitteeksi muuttaminen vaatisi
+// kutsupaikkojen muokkaamisen eikä muuta käyttäytymistä.
+#[allow(clippy::needless_pass_by_value)]
 fn cmd_chat(path: PathBuf, model: String, yolo: bool, task: Option<String>) -> anyhow::Result<()> {
     let version = gemini::check_installed()?;
     println!("🏎️  Gemu chat (Gemini CLI v{version})");

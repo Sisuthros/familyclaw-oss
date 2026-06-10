@@ -91,7 +91,7 @@ impl LatentChannel for BusLatentChannel {
 
         // Lähetä viesti busin kautta.
         self.bus.publish(self.being_id, bus_message).map_err(|e| {
-            familyclaw_latent::FamilyClawError::bus(format!("Failed to deliver via bus: {}", e))
+            familyclaw_latent::FamilyClawError::bus(format!("Failed to deliver via bus: {e}"))
         })?;
         Ok(())
     }

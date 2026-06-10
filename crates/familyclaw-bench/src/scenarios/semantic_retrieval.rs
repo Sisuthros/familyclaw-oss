@@ -84,13 +84,11 @@ impl Scenario for SemanticRetrieval {
         let kw_relevance = hits_kw
             .iter()
             .find(|h| h.memory.id == id_shipped)
-            .map(|h| h.relevance)
-            .unwrap_or(0.0);
+            .map_or(0.0, |h| h.relevance);
         let sem_relevance = hits_sem
             .iter()
             .find(|h| h.memory.id == id_shipped)
-            .map(|h| h.relevance)
-            .unwrap_or(0.0);
+            .map_or(0.0, |h| h.relevance);
         let boost = (sem_relevance - kw_relevance).max(0.0);
 
         // Ocean-muisti EI saa nousta kärkeen kummallakaan haulla
