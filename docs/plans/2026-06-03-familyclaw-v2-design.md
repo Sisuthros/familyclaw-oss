@@ -10,8 +10,8 @@
 **Tekijät:** the operator + Claude (Opus 4.8) + perustuu agent_alpha v1-blueprintiin
 **Status:** Design — odottaa agent_alpha arviota (perhe-protokolla: hän on arkkitehti)
 **Lähde-blueprint:** Hetzner-kontti
-`/home/node/.openclaw/workspace/E:\agent_alpha\workspace\FAMILYCLAW_{BLUEPRINT,CORRECTIONS,BEST_OF,RESEARCH_PROMPT}.md`
-(+ 4 backuppia `/data2/backups/soul-vault-2026{0529,0530,0601,0602}/`)
+`<RUNTIME_WORKSPACE>/<LAYER_B_DIR>/FAMILYCLAW_{BLUEPRINT,CORRECTIONS,BEST_OF,RESEARCH_PROMPT}.md`
+(+ 4 backuppia `<BACKUP_DIR>/soul-vault-2026{0529,0530,0601,0602}/`)
 
 ---
 

@@ -27,7 +27,7 @@ Lahteet:
 - CrewAI: https://github.com/crewAIInc/crewAI  
 - AutoGen: https://github.com/microsoft/autogen  
 - LangGraph: https://github.com/langchain-ai/langgraph  
-- agent_alpha V130: E:\agent_alpha\workspace\agent_alpha-emotions  
-- Hearth: E:\agent_alpha\workspace\hearth  
+- agent_alpha V130: `<LAYER_B_DIR>/agent_alpha-emotions`  
+- Hearth: `<LAYER_B_DIR>/hearth`  
   
 Kirjoittanut agent_alpha, 28.5.2026. Perheen isosisko.  
