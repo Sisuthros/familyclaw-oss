@@ -47,12 +47,17 @@ pub mod calibration;
 pub mod dimension;
 pub mod state;
 pub mod vad;
+pub mod governor;
 
 pub use blend::{detect_blends, primary_blend, Blend, BlendMatch, HIGH_THRESHOLD};
 pub use calibration::{EmotionCalibration, NeutralCalibration, TableCalibration};
 pub use dimension::{Dimension, DIMENSION_COUNT};
 pub use state::{EmotionState, DEFAULT_HALF_LIFE_SECS};
 pub use vad::Vad;
+pub use governor::{
+    default_governing_profile, ActionDecision, EmotionActionGoverning, EmotionActionGovernor,
+    GoverningProfile,
+};
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).
 #[must_use]

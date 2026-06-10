@@ -187,6 +187,22 @@ impl<J: Journal> DurableContext<J> {
     pub fn journal(&self) -> &J {
         &self.journal
     }
+
+    /// Tarkistaa onko annettu askel jo suoritettu.
+    ///
+    /// # Errors
+    /// Palauttaa virheen jos journalin luku epäonnistuu.
+    pub fn has_run_step(&self, name: &str) -> Result<bool> {
+        // Replay-vektori sisältää vain askel-rivit (StepCompleted/StepFailed)
+        for entry in &self.replay {
+            if let Some(step_name) = entry.step_name() {
+                if step_name == name {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// Lyhyt diagnostiikkaleima ei-askel-rivilajille (snapshot/marker/tuleva laji).

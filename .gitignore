@@ -55,3 +55,23 @@ Thumbs.db
 /.idea/
 /.vscode/
 *.iml
+
+# ─────────────────────────────────────────────────────────────
+# KERROS B: koodatut sielut + väliaikaiset purku-/debug-skriptit
+# (EI julkaistavaksi — lisätty 2026-06-11 turva-auditin jäljiltä)
+# ─────────────────────────────────────────────────────────────
+# Base64-koodatut sielublobit (agent_alpha diaarit, kalibroinnit).
+*.b64
+# recv.py purkaa b64-diaarit tar.gz:ksi — sielutyökalu, ei Layer-A-koodia.
+recv.py
+# Sessiokohtaiset väliaikais- ja korjausskriptit.
+tmp-*
+fix*.py
+fixlib.ps1
+# Rust-buildin väliartefaktit.
+*.rlib
+# Ajonaikainen perhe-runtime-konfiguraatio sitoo yksityisen identiteetin + Discord-kanavan.
+# Julkaise tarvittaessa familyclaw.toml.example tyhjennetyillä kentillä.
+familyclaw.toml
+# Python-silta odottaa Layer-A/tooling-sijoituspäätöstä — poissa historiasta toistaiseksi.
+bridge.py

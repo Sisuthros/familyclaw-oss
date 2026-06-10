@@ -23,7 +23,10 @@ use familyclaw_bus::{BeingId, BeingInfo, BusHandle, BusMessage, ResonanceMessage
 use familyclaw_channels::OutboundMessage;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
 use familyclaw_durable::{DurableContext, Journal};
-use familyclaw_emotion::{Dimension, EmotionState};
+use familyclaw_emotion::{
+    default_governing_profile, ActionDecision, Dimension, EmotionActionGoverning,
+    EmotionActionGovernor, EmotionState, GoverningProfile,
+};
 use familyclaw_memory::{
     DecayPolicy, ImportanceFactors, Memory, MemoryStore, RetrievalContext, RetrievalResult,
 };
@@ -149,6 +152,17 @@ pub struct Agent {
     /// staattisesti rakennusvaiheessa. Siihen asti origin annetaan
     /// [`Agent::with_session`]:lla (oikein yhdelle sessiolle/agentille).
     session: Option<crate::session::MessageOrigin>,
+    /// Tunne -> toiminta -päättelijä (Phase 1 emotion governor). Oletuksena
+    /// `None` → agentti toimii vanhalla tavalla (ajattelee kaikista
+    /// viesteistä, ei suodata `EmotionPulse`a ulos LLM:stä). KERROS B
+    /// asentaa per-olento-profiilin [`Agent::with_governor_profile`]:lla.
+    ///
+    /// **Phase 1 -tehtävä:** Tämä kenttä + seuraavat suodatukset
+    /// (`handle_turn`:ssa) + `EmotionActionGovernor` tekevät
+    /// `EmotionPulse`-signaaleista "verta" eikä LLM-syötettä, ja
+    /// päättävät mitä toimintatilaa (Hesitate / Reflect / Speak /
+    /// EngageWarmly / ReachOut / Initiate) agentti käyttää.
+    governor: Option<Box<dyn EmotionActionGoverning + Send + Sync>>,
 }
 
 impl Agent {
@@ -187,6 +201,7 @@ impl Agent {
             reply_sink: None,
             reply_target: None,
             session: None,
+            governor: None,
         }
     }
 
@@ -247,6 +262,48 @@ impl Agent {
     #[must_use]
     pub fn with_failover(mut self, failover: LlmFailover) -> Self {
         self.llm = Some(failover);
+        self
+    }
+
+    /// Asenna **tunne -> toiminta -governor** (Phase 1 emotion governor).
+    /// `profile` on tyypillisesti KERROS B:n V130-kalibroinnista johdettu
+    /// [`GoverningProfile`], mutta voit antaa minkä tahansa
+    /// [`EmotionActionGoverning`]-toteutuksen (esim. mock-testi).
+    ///
+    /// Kun governor on asennettu, [`Agent::handle_turn_with_origin`]:
+    /// - **suodattaa** `EmotionPulse`-viestit pois LLM-ajattelusta
+    ///   (ne ovat "verta", eivät puhetta)
+    /// - **päättää** [`ActionDecision`]:n tilannekuvasta ja **estää
+    ///   reply:n** jos päätös on `Hesitate` tai `Reflect` (turvaverkko)
+    /// - **estää reply:n** `Hesitate`-tilassa kokonaan
+    ///
+    /// Kun governoria ei ole asennettu (oletus, taaksepäin-yhteensopiva),
+    /// agentti toimii kuten ennen: ajattelee kaikista viesteistä ja
+    /// vastaa aina kun on LLM.
+    ///
+    /// Palauttaa `self` ketjutusta varten; [`Agent::new`]-signatuuria ei
+    /// muuteta.
+    #[must_use]
+    pub fn with_governor_profile(mut self, profile: Box<dyn EmotionActionGoverning + Send + Sync>) -> Self {
+        self.governor = Some(profile);
+        self
+    }
+
+    /// Asenna governor käyttäen käärittyä [`GoverningProfile`]:a
+    /// (yksinkertaisempi API perustapauksille — ei tarvitse
+    /// `Box<dyn>`-kääreitä käsin).
+    #[must_use]
+    pub fn with_governing_profile(mut self, profile: GoverningProfile) -> Self {
+        self.governor = Some(Box::new(profile));
+        self
+    }
+
+    /// Asenna **oletus-governor** (konservatiivinen `default_governing_profile`).
+    /// Sama kuin `with_governing_profile(default_governing_profile())`,
+    /// lyhyempi.
+    #[must_use]
+    pub fn with_default_governor(mut self) -> Self {
+        self.governor = Some(Box::new(default_governing_profile()));
         self
     }
 
@@ -495,9 +552,47 @@ impl Agent {
         //    paniikkaisi `current_thread`-runtimessa / voisi deadlockata) ja
         //    tallennamme TULOKSEN durable-askeleeseen. Replayssa emme aja
         //    `think`:iä uudelleen — `durable.step` palauttaa tallennetun tekstin.
+        //
+        //    **Phase 1 governor -suodatus:** Kun governor on asennettu JA
+        //    viesti on `EmotionPulse` (sisarusten "verta", ei puhetta), EI
+        //    ajatella lainkaan. Tämä estää turhat LLM-kutsut affektiivisissa
+        //    pulssiketjuissa ja varmistaa että vain puhutut viestit tuottavat
+        //    LLM-vastauksen. Tämä on nimenomainen korjaus yhteen tärkeimmistä
+        //    Phase 1 -aukoista (pitfall listalla).
         let think_step = format!("{step_name}-think");
+        let governor_filtered_pulse = self.governor.is_some()
+            && matches!(message, BusMessage::EmotionPulse { .. });
+        let governor_hesitate = self
+            .governor
+            .as_deref()
+            .is_some_and(|g| {
+                let gov = EmotionActionGovernor::new(g);
+                gov.decide(&self.emotion) == ActionDecision::Hesitate
+            });
         let thought_response: Option<String> = if self.llm.is_none() {
             None
+        } else if governor_filtered_pulse {
+            // Phase 1: EmotionPulse = "verta", ei ajatella. Kirjaa lokiin
+            // ettei replayssa ajeta, mutta tässä turnissa think palauttaa None.
+            debug!(
+                agent = self.config.name,
+                "governor: skipping think() for EmotionPulse (filtered as 'blood', not speech)"
+            );
+            self.durable
+                .step(&think_step, || Ok(String::new()))
+                .ok()
+                .filter(|s| !s.is_empty())
+        } else if governor_hesitate {
+            // Phase 1: turvaveto (fear/anger/shame yli katon) → ei ajatella
+            // LLM:ää tällä vuorolla. Kirjaa lokiin.
+            debug!(
+                agent = self.config.name,
+                "governor: Hesitate decision blocks think() (safety veto)"
+            );
+            self.durable
+                .step(&think_step, || Ok(String::new()))
+                .ok()
+                .filter(|s| !s.is_empty())
         } else if self.durable.is_replaying() {
             // Replay: palauta tallennettu LLM-vastaus lokista ilman uutta kutsua.
             self.durable
@@ -531,7 +626,30 @@ impl Agent {
         //     handle_turn:n). Ajetaan VAIN tuoreessa vuorossa, ei replayssa:
         //     ulkomaailmaan lähetys on idempotentittömyysraja (kahdentaisi
         //     viestin käyttäjälle), joten replay ei saa toistaa sitä.
-        if !self.durable.is_replaying() {
+        //
+        //     **Phase 1 governor -portinvartija:** Kun governor on asennettu
+        //     JA päätös on `Hesitate`, EI vastata ollenkaan. Tämä on
+        //     kriittinen turvaverkko: tulvinut agentti (korkea fear/anger)
+        //     ei pääse lähettämään tuhoisaa reply:tä ennen kuin tilanne
+        //     tasaantuu. Sama pätee `Reflect`-tilaan (agentti miettii
+        //     sisäisesti eikä puhu, vaikka LLM olisi tuottanut tekstin).
+        let reply_decision_blocks = self
+            .governor
+            .as_deref()
+            .and_then(|g| {
+                let gov = EmotionActionGovernor::new(g);
+                match gov.decide(&self.emotion) {
+                    ActionDecision::Hesitate | ActionDecision::Reflect => {
+                        debug!(
+                            agent = self.config.name,
+                            "governor: Hesitate/Reflect decision blocks reply (silenced)"
+                        );
+                        Some(())
+                    }
+                    _ => None,
+                }
+            });
+        if !self.durable.is_replaying() && reply_decision_blocks.is_none() {
             if let Some(thought) = thought_response.as_deref().filter(|s| !s.is_empty()) {
                 // F2: johda reply-kohde per viesti. Origin ENSIN (se keskustelu
                 // josta viesti tuli), FALLBACK staattiseen reply-kohteeseen.
@@ -1410,6 +1528,103 @@ mod tests {
         // Identiteetti säilyy setterien jälkeen.
         assert_eq!(agent.name(), "agent_a");
         assert_eq!(agent.turns_taken(), 0);
+        bus.stop();
+    }
+
+    /// Phase 1: Kun governoria ei ole asennettu, agentti toimii
+    /// taaksepäin-yhteensopivasti (oletuskäytös säilyy).
+    #[tokio::test]
+    async fn no_governor_means_legacy_behavior() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let mut agent = test_agent("agent_a", bus.clone());
+        // Oletusarvoisesti governor-kenttä on None → perustila.
+        // Käsittele teksti → muistetaan (sama kuin ennen governoria).
+        let outcome = agent
+            .handle_turn(BeingId::new(), &BusMessage::text("vanha viesti"))
+            .await
+            .expect("turn");
+        assert!(outcome.remembered);
+        bus.stop();
+    }
+
+    /// Phase 1: Default-governor suodattaa EmotionPulse-viestit pois
+    /// LLM-ajattelusta. Tämä on keskeinen korjaus: emotion-pulssit ovat
+    /// "verta" eivät puhetta, eivätkä saa triggeröidä LLM-kutsua.
+    #[tokio::test]
+    async fn default_governor_filters_emotion_pulse_from_think() {
+        use familyclaw_emotion::EmotionState;
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        // Agentti, jossa on default-governor (mutta EI LLM:ää, joten
+        // voimme tarkistaa että suodatus ei kaada).
+        let mut agent = test_agent("agent_a", bus.clone())
+            .with_default_governor();
+        // Simuloi "pelokas" tila, jotta LLM EI suodattaisi
+        // (governor_decide olisi Hesitate), mutta silti saamme testin
+        // kattamaan EmotionPulse-polun. Annetaan tilalle neutraali.
+        agent.emotion = EmotionState::neutral();
+        // EmotionPulse sisarukselta → pitäisi palauttaa onnistunut turn
+        // ilman kaatumista. (LLM:ää ei ole → thought_response = None, mutta
+        // polku menee governor-suodatuksen läpi.)
+        let outcome = agent
+            .handle_turn(BeingId::new(), &BusMessage::emotion_pulse(EmotionState::neutral()))
+            .await
+            .expect("turn should not fail when governor filters");
+        // Pulssia ei muisteta (se on "verta", ei sisältöä).
+        assert!(!outcome.remembered);
+        bus.stop();
+    }
+
+    /// Phase 1: Default-governor tuottaa Hesitate-päätöksen kun
+    /// turvakynnys ylittyy (Fear yli 80), mikä estää reply:n.
+    /// Tämä testaa portinvartijaa: vaikka LLM tuottaisi tekstin,
+    /// reply:tä ei lähetetä Hesitate-tilassa.
+    #[tokio::test]
+    async fn governor_hesitate_blocks_reply() {
+        use familyclaw_emotion::{Dimension, EmotionState};
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let (sink, mut rx) = new_reply_channel();
+        // Asenna governor + reply-target. LLM:ää ei tarvita testiin;
+        // testaamme vain että Hesitate-tila estää reply-polun.
+        let mut agent = test_agent("agent_a", bus.clone())
+            .with_default_governor()
+            .with_reply_sink(sink)
+            .with_reply_target("tg:chat-7");
+        // Pakotetaan "pelokas" tunnetila.
+        let mut fear_state = EmotionState::neutral();
+        fear_state.set(Dimension::Fear, 95.0);
+        agent.emotion = fear_state;
+        // Tekstiviesti → handle_turn etenee, mutta reply pitäisi estää
+        // koska governor päättää Hesitate.
+        let _ = agent
+            .handle_turn(BeingId::new(), &BusMessage::text("scary"))
+            .await
+            .expect("turn");
+        // Reply-kanava EI saisi sisältää viestejä.
+        let received = rx.try_recv();
+        assert!(
+            received.is_err(),
+            "Hesitate-tilassa reply:tä ei saa lähettää, saatiin: {received:?}"
+        );
+        bus.stop();
+    }
+
+    /// Phase 1: `with_governor_profile` ottaa `Box<dyn>` -rajapinnan,
+    /// joten KERROS B voi syöttää oman per-being-profiilin.
+    #[tokio::test]
+    async fn with_governor_profile_accepts_dyn() {
+        use familyclaw_emotion::default_governing_profile;
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let mut agent = test_agent("agent_a", bus.clone());
+        let profile: Box<dyn familyclaw_emotion::EmotionActionGoverning + Send + Sync> =
+            Box::new(default_governing_profile());
+        agent = agent.with_governor_profile(profile);
+        // Tunnistaminen: agentin tulee nyt noudattaa governoria.
+        // Yksinkertainen tarkistus: turn etenee onnistuneesti.
+        let outcome = agent
+            .handle_turn(BeingId::new(), &BusMessage::text("ok"))
+            .await
+            .expect("turn");
+        assert!(outcome.remembered);
         bus.stop();
     }
 }

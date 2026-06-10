@@ -20,6 +20,11 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[[bin]]
+name = "dream-cron-job"
+path = "src/bin/dream-cron-job.rs"
