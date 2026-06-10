@@ -10,6 +10,8 @@
 //! - [`agent`] — [`AgentRegistry`], [`AgentInfo`], liveness/heartbeat.
 //! - [`task`] — [`Task`], [`TaskStatus`]-tilakone, [`TaskBoard`] (sis. handoff).
 //! - [`event`] — [`Event`], [`EventKind`], publish/subscribe ([`EventBus`]).
+//! - [`executor`] — [`WorkExecutor`]-sauma ja [`DefaultSimulatingExecutor`]
+//!   (Homepage Factory, KERROS A producer).
 //! - [`bridge`] — [`FamilyBridge`] koostaa edellä mainitut ja julkaisee
 //!   tapahtumat tilamuutoksista.
 //!
@@ -56,11 +58,13 @@
 pub mod agent;
 pub mod bridge;
 pub mod event;
+pub mod executor;
 pub mod task;
 
 pub use agent::{AgentInfo, AgentRegistry, AgentRole, HostKind, Liveness};
 pub use bridge::FamilyBridge;
 pub use event::{Event, EventBus, EventKind, EventSubscriber};
+pub use executor::{DefaultSimulatingExecutor, WorkExecutor, WorkOutcome};
 pub use task::{Task, TaskBoard, TaskId, TaskStatus};
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).

@@ -82,3 +82,4 @@ bridge.py
 .claude/night-nudger-state.json
 .claude/night-nudger*.log
 .claude/night-nudger-stdout.log
+__pycache__/
