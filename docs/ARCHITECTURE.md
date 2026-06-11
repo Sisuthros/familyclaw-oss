@@ -98,8 +98,13 @@ nothing else in the workspace. The agent runtime is the apex that composes them.
   `AnchorHash` SHA-256 is **only a tamper alarm** — substrate is truth, hash is
   guard.
 - **`familyclaw-bridge`** — `AgentRegistry` (heartbeat liveness), `TaskBoard`
-  (`Pending → Active/Handed → Done`), `EventBus` (broadcast). Transport-
-  independent; MCP/HTTP adapters layer on separately.
+  (`Pending → Active/Handed → Done`), `EventBus` (broadcast), and the
+  `WorkExecutor` seam (`execute(&Task) -> WorkOutcome`). The seam keeps task
+  execution abstract (Layer-A producer side of the Homepage Factory): the caller
+  owns status transitions, so executors are side-effect-free and swappable.
+  `DefaultSimulatingExecutor` is the deterministic, no-network default; a live
+  executor (Layer B) drops in behind the same trait. Transport-independent;
+  MCP/HTTP adapters layer on separately.
 - **`familyclaw-agent`** — `Agent` / `AgentActor`: composes config, soul,
   emotion, memory, durable, and bus into one Ractor being. Loads souls at
   runtime from the profile dir (Layer B). Ships the `familyclaw` demo binary.

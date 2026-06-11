@@ -136,6 +136,11 @@ mod tests {
     use super::*;
     use crate::subject::{CrashPoint, DreamSummary, RecallHit, RestartReport, RunHandle, Task};
 
+    /// Tyhjä [`Subject`]-tupla. `EternalThread::run` ajaa skenaarionsa kokonaan
+    /// oman [`Hearth`]-instanssinsa varassa eikä koske `subject`-parametriin, joten
+    /// nämä metodit ovat tavoittamattomia. `unimplemented!`-viestit dokumentoivat
+    /// invariantin: jos jokin näistä laukeaa, skenaario on alkanut käyttää subjektia
+    /// odottamattomasti, ja testi on päivitettävä antamaan oikea tupla.
     struct StubSubject;
     #[async_trait]
     impl Subject for StubSubject {
@@ -147,33 +152,33 @@ mod tests {
             _task: &Task,
             _clock: Timestamp,
         ) -> std::result::Result<RunHandle, crate::error::BenchError> {
-            unimplemented!()
+            unimplemented!("EternalThread ei käytä subjektia: start_task on tavoittamaton")
         }
         async fn kill(
             &mut self,
             _handle: &RunHandle,
             _point: CrashPoint,
         ) -> std::result::Result<(), crate::error::BenchError> {
-            unimplemented!()
+            unimplemented!("EternalThread ei käytä subjektia: kill on tavoittamaton")
         }
         async fn restart(
             &mut self,
             _clock: Timestamp,
         ) -> std::result::Result<RestartReport, crate::error::BenchError> {
-            unimplemented!()
+            unimplemented!("EternalThread ei käytä subjektia: restart on tavoittamaton")
         }
         async fn recall(
             &mut self,
             _query: &str,
             _clock: Timestamp,
         ) -> std::result::Result<Vec<RecallHit>, crate::error::BenchError> {
-            unimplemented!()
+            unimplemented!("EternalThread ei käytä subjektia: recall on tavoittamaton")
         }
         async fn sleep_cycle(
             &mut self,
             _clock: Timestamp,
         ) -> std::result::Result<DreamSummary, crate::error::BenchError> {
-            unimplemented!()
+            unimplemented!("EternalThread ei käytä subjektia: sleep_cycle on tavoittamaton")
         }
     }
 
