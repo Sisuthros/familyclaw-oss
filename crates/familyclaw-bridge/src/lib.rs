@@ -10,10 +10,19 @@
 //! - [`agent`] — [`AgentRegistry`], [`AgentInfo`], liveness/heartbeat.
 //! - [`task`] — [`Task`], [`TaskStatus`]-tilakone, [`TaskBoard`] (sis. handoff).
 //! - [`event`] — [`Event`], [`EventKind`], publish/subscribe ([`EventBus`]).
-//! - [`executor`] — [`WorkExecutor`]-sauma ja [`DefaultSimulatingExecutor`]
+//! - [`work_executor`] — [`WorkExecutor`]-sauma ja [`DefaultSimulatingExecutor`]
 //!   (Homepage Factory, KERROS A producer).
+//! - [`executor`] — orkesteroinnin ja konkreettisen agentin välinen suoritussauma
+//!   ([`TurnExecutor`], [`OrchestratedTurn`]) hermeettisellä [`MockTurnExecutor`]:lla.
 //! - [`bridge`] — [`FamilyBridge`] koostaa edellä mainitut ja julkaisee
 //!   tapahtumat tilamuutoksista.
+//! - [`orchestrator`] — DAG-pohjainen moniagenttiorkesterointi
+//!   ([`OrchestrationPlan`], [`Orchestrator`]) joka ohjaa tehtävätaulua
+//!   vain laillisin tilasiirtymin.
+//! - [`contract`] — tyypitetty FIPA-ContractNet ([`Capability`], [`Contract`],
+//!   [`ContractBoard`]) todennettavalla täyttämisellä (skeema + jälkiehdot).
+//! - [`contract_bus`] — kuljetuksesta riippumattomat sopimusviestit
+//!   ([`ContractMessage`]) puhtaalla serdellä.
 //!
 //! ## Suunnitteluperiaatteet
 //! - **Tokio-pohjainen, säieturvallinen.** Jaettu tila on `Arc<RwLock<…>>`
@@ -57,15 +66,29 @@
 
 pub mod agent;
 pub mod bridge;
+pub mod contract;
+pub mod contract_bus;
 pub mod event;
 pub mod executor;
+pub mod orchestrator;
 pub mod task;
+pub mod work_executor;
 
 pub use agent::{AgentInfo, AgentRegistry, AgentRole, HostKind, Liveness};
 pub use bridge::FamilyBridge;
+pub use contract::{
+    Capability, CapabilityRegistry, Clause, ClauseOp, Contract, ContractBoard, ContractError,
+    ContractResult, ContractStatus, Deliverable, Field, FieldType, Schema, SchemaViolation,
+};
+pub use contract_bus::{ContractMessage, CONTRACT_CUSTOM_NAME};
 pub use event::{Event, EventBus, EventKind, EventSubscriber};
-pub use executor::{DefaultSimulatingExecutor, WorkExecutor, WorkOutcome};
+pub use executor::{MockFailure, MockTurnExecutor, OrchestratedTurn, TurnExecutor};
+pub use orchestrator::{
+    NodeId, OrchestrationPlan, Orchestrator, RunReport, TaskNode, MAX_DELEGATION_DEPTH,
+    STEP_ASSIGNED, STEP_FAILED, WORKFLOW_DONE,
+};
 pub use task::{Task, TaskBoard, TaskId, TaskStatus};
+pub use work_executor::{DefaultSimulatingExecutor, WorkExecutor, WorkOutcome};
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).
 #[must_use]

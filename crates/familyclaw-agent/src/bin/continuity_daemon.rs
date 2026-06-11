@@ -393,10 +393,12 @@ async fn run_resume(args: ResumeArgs) -> DaemonResult<()> {
         let payload = step_payload(&args.task, index);
         let recorded: String = ctx.step(&name, move || Ok(payload))?;
 
+        // ADR: Dual-write fix — always persist memory for steps recorded in journal.
+        // turn_key makes this idempotent (safe to call during replay).
+        persist_step_memory(&store, &args.task, index, &recorded, clock).await?;
+
         if was_fresh {
             fresh_steps += 1;
-            // Idempotentti muistikirjaus tuoreille askeleille (turn_key suojaa).
-            persist_step_memory(&store, &args.task, index, &recorded, clock).await?;
         }
     }
 

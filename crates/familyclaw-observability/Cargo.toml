@@ -1,6 +1,6 @@
 [package]
-name = "familyclaw-bridge"
-description = "Agent registry / task / handoff (adapted from existing family-bridge)"
+name = "familyclaw-observability"
+description = "Metrics, event recording and per-role RBAC for the multi-agent fleet"
 version.workspace = true
 edition = "2021"
 license.workspace = true
@@ -12,16 +12,10 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-async-trait = { workspace = true }
 familyclaw-core = { workspace = true }
+familyclaw-bridge = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
-tokio = { workspace = true }
-async-trait = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-async-trait = { workspace = true }

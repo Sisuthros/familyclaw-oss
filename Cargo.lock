@@ -1704,6 +1704,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "familyclaw-observability"
+version = "0.1.0"
+dependencies = [
+ "familyclaw-bridge",
+ "familyclaw-core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "familyclaw-runtime"
 version = "0.1.0"
 dependencies = [

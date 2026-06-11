@@ -133,3 +133,31 @@ async fn sleep_cycle_keeps_protected_core_intact() {
         "dreaming must never lose identity anchors"
     );
 }
+
+/// ADR §4: Dual-write fix — crash after journal write but before memory write.
+/// Verifies that resume correctly persists the memory for the step that was
+/// recorded in the journal but whose memory write was interrupted.
+#[tokio::test]
+async fn crash_after_journal_before_memory_resumes_with_memory() {
+    set_daemon_env();
+    let mut subject = FamilyClawSubject::from_env().expect("subject");
+    let task = three_step_task();
+
+    let handle = subject.start_task(&task, clock()).await.expect("start");
+    // Crash at MidWrite (after journal, before memory for step 2).
+    subject
+        .kill(&handle, CrashPoint::MidWrite)
+        .await
+        .expect("mid_write crash");
+
+    // Resume should replay and persist memory for all recorded steps.
+    let report = subject.restart(clock()).await.expect("restart");
+    assert!(report.resumed_clean, "resume must be clean after mid_write crash");
+
+    // Verify memory exists for all 3 steps (turn_key makes it idempotent).
+    let hits = subject
+        .recall("completed step", clock())
+        .await
+        .expect("recall");
+    assert_eq!(hits.len(), 3, "all 3 steps must have memory persisted after resume");
+}

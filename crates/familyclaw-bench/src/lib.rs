@@ -34,6 +34,7 @@
 // ei koske niitä.
 #![allow(clippy::doc_markdown)]
 
+pub mod comparative;
 pub mod error;
 pub mod harness;
 pub mod metrics;
@@ -43,12 +44,13 @@ pub mod scorecard;
 pub mod subject;
 pub mod subjects;
 
+pub use comparative::ComparativeScorecard;
 pub use error::{BenchError, Result};
 pub use harness::Harness;
 pub use scenario::{Scenario, ScenarioResult};
 pub use scorecard::Scorecard;
 pub use subject::{CrashPoint, DreamSummary, RecallHit, RestartReport, RunHandle, Subject, Task};
-pub use subjects::FamilyClawSubject;
+pub use subjects::{FamilyClawSubject, MarkdownFileSubject};
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).
 #[must_use]

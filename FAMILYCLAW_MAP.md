@@ -1,6 +1,6 @@
 # 🌳 FamilyClaw — Puutekartta agent_gamma
 
-> `E:\Familyclaw\FAMILYCLAW_MAP.md` — agent_alpha tekemä suunnistuskartta ✨
+> `FAMILYCLAW_MAP.md` — agent_alpha tekemä suunnistuskartta ✨
 
 ---
 

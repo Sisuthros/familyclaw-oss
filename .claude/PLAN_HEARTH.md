@@ -198,7 +198,7 @@ Olemassa olevat cratet joihin tukeudutaan:
     - Lisää `familyclaw-hearth` riippuvuudeksi
 
 ### Phase 5: Workspace-integraatio
-12. Päivitä `/mnt/e/FamilyClaw/Cargo.toml`:
+12. Päivitä workspace-juuren `Cargo.toml`:
     - Lisää `familyclaw-hearth = { path = "crates/familyclaw-hearth" }` workspace dependencies -listaan
 
 13. Aja `cargo check --workspace` — kaikki kääntyy
