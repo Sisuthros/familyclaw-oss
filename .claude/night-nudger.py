@@ -121,7 +121,10 @@ def run_once(run_no):
     cmd = [
         CLAUDE, "-p",
         "--max-turns", str(MAX_TURNS),
-        "--permission-mode", "acceptEdits",
+        # bypassPermissions: headless runs have no human to approve Bash (cargo/git).
+        # acceptEdits only auto-approves file edits, which stalled runs #1-67.
+        # .claude/settings.json also allowlists cargo+git as belt-and-suspenders.
+        "--permission-mode", "bypassPermissions",
         "--model", "claude-opus-4-8",
     ]
     try:
