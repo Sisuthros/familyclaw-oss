@@ -45,6 +45,8 @@ secrets/
 /data/
 /data2/
 *.lance/
+/local/
+.local/
 *.sqlite
 *.db
 /tmp/

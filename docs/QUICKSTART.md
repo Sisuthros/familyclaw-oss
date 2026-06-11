@@ -14,15 +14,25 @@ rustc --version  # Should show 1.85 or higher
 
 ## Build & Run
 
-Three commands to see the demo:
+**Public demo first (Layer A — no keys):**
 
 ```bash
 git clone https://github.com/Sisuthros/familyclaw.git
 cd familyclaw
-cargo run -p familyclaw-agent --bin familyclaw
+cargo run -p minimal-gateway -- --duration 10
 ```
 
-That's it. The demo runs automatically and completes in ~30 seconds.
+Or run the full public validation script on Windows:
+
+```powershell
+powershell -File scripts/public-demo.ps1
+```
+
+**Living Seed demo (two agents, in-memory):**
+
+```bash
+cargo run -p familyclaw-agent --bin familyclaw
+```
 
 ## What You'll See
 
@@ -81,9 +91,10 @@ cp familyclaw.toml.example ~/.config/familyclaw/familyclaw.toml
 ```
 
 Secrets (API keys, tokens, webhook URLs) belong in **environment variables** or
-your private config — never in the repo. Every field has an env override; see
-the comments in [`familyclaw.toml.example`](../familyclaw.toml.example) for the
-full list (e.g. `FAMILYCLAW_PROVIDER_API_KEY`, `FAMILYCLAW_AGENT_NAME`).
+your private config — never in the repo. Copy [`.env.example`](../.env.example)
+to a path outside the repo (e.g. `~/.config/familyclaw/familyclaw.env`) and
+load it before running the gateway. See [`RUNBOOK_WINDOWS.md`](RUNBOOK_WINDOWS.md)
+for optional Telegram/Discord wiring (Layer B).
 
 ### Connect to Discord
 

@@ -14,9 +14,9 @@
 # `familyclaw.toml` is git-ignored — never commit it. Secrets belong in env
 # variables or your private config, never in this repo.
 #
-# Windows paths setup:
-#   $env:FAMILYCLAW_PROFILE_DIR = "E:\familyclaw-profiles"
-#   $env:FAMILYCLAW_DATA_DIR    = "E:\familyclaw-data"
+# Windows / private setup (Layer B — paths are yours, not in this repo):
+#   $env:FAMILYCLAW_PROFILE_DIR = "$env:USERPROFILE\familyclaw-profiles"
+#   $env:FAMILYCLAW_DATA_DIR    = "$env:USERPROFILE\familyclaw-data"
 
 [agent]
 # Display name of the agent this gateway serves. Generic placeholder only.

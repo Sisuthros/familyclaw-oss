@@ -1,12 +1,16 @@
-# Initialize JSON memory store for FamilyClaw MVP (Windows).
-# Usage: powershell -File scripts/init-familyclaw-data.ps1
+# Initialize JSON memory store (LocalJsonStore MVP). No RocksDB lock issues.
+#
+# Usage:
+#   powershell -File scripts/init-familyclaw-data.ps1
+#   powershell -File scripts/init-familyclaw-data.ps1 -DataDir C:\path\to\data
 
 param(
     [string]$DataDir = $env:FAMILYCLAW_DATA_DIR
 )
 
 if (-not $DataDir) {
-    $DataDir = "E:\familyclaw-data"
+    $repoRoot = Split-Path $PSScriptRoot -Parent
+    $DataDir = Join-Path $repoRoot ".local" "data"
 }
 
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
@@ -34,3 +38,4 @@ if (-not (Test-Path $memory)) {
 }
 
 Write-Host "FAMILYCLAW_DATA_DIR ready: $DataDir"
+Write-Host "Export: `$env:FAMILYCLAW_DATA_DIR = `"$DataDir`""

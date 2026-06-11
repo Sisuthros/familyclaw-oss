@@ -1,10 +1,25 @@
-# Windows-tuotantokäyttöönotto
+# Windows — julkinen demo ja yksityinen käyttöönotto
 
-FamilyClaw-gatewayn käyttöönotto Windowsilla (Layer B erillään reposta).
+1. **Julkinen demo (Kerros A)** — ensin, ei avaimia: [`QUICKSTART.md`](QUICKSTART.md), `scripts/public-demo.ps1`
+2. **Yksityinen gateway (Kerros B)** — omat profiilit ja kanavat repoon ulkopuolella: [`LAYER_BOUNDARY.md`](LAYER_BOUNDARY.md)
 
-Katso myös [`QUICKSTART.md`](QUICKSTART.md) (kehitysdemo) ja [`LAYER_BOUNDARY.md`](LAYER_BOUNDARY.md) (mitä ei koskaan commitoida).
+## Julkinen demo (Kerros A)
 
-## Esivaatimukset
+Ei Telegramia, ei SOUL-tiedostoja, ei salaisuuksia:
+
+```powershell
+cd <repo-root>
+powershell -File scripts/public-demo.ps1
+powershell -File scripts/public-demo.ps1 -Full   # + compare-bench
+```
+
+Tai yksittäinen 10 s -ajo:
+
+```powershell
+cargo run -p minimal-gateway -- --duration 10
+```
+
+## Esivaatimukset (Kerros B)
 
 - Rust 1.85+ ([`rustup`](https://rustup.rs/))
 - Git
@@ -17,50 +32,66 @@ Tarkista Rust:
 rustc --version   # 1.85 tai uudempi
 ```
 
-## Hakemistorakenne (Layer B)
+## Hakemistorakenne (Kerros B)
 
-Nämä polut ovat **paikallisia** — eivät kuulu git-repoon.
+Nämä polut ovat **paikallisia** — valitse omat sijaintisi, eivät kuulu git-repoon.
 
-| Polku | Käyttö |
-|-------|--------|
-| `E:\familyclaw-profiles` | Agenttien sielut (`SOUL.md`, `IDENTITY.md`, kalibrointi) |
-| `E:\familyclaw-data` | Ajonaikainen data (MVP JSON tai myöhemmin SurrealDB/RocksDB) |
+| Muuttuja / polku | Käyttö |
+|------------------|--------|
+| `FAMILYCLAW_PROFILE_DIR` | Agenttien profiilit (`SOUL.md`, `IDENTITY.md`) |
+| `FAMILYCLAW_DATA_DIR` | Pysyvä data (MVP: `memory.json`, `journal.jsonl`) |
 
-Luo hakemistot kerran:
+Esimerkki (korvaa omat polut):
 
 ```powershell
-New-Item -ItemType Directory -Force -Path E:\familyclaw-profiles, E:\familyclaw-data
+$profiles = Join-Path $env:USERPROFILE "familyclaw-profiles"
+$data     = Join-Path $env:USERPROFILE "familyclaw-data"
+New-Item -ItemType Directory -Force -Path $profiles, $data | Out-Null
 ```
 
-Profiilirakenne (esimerkki agentille `agent_alpha`):
+Profiilirakenne (geneerinen `agent_a`):
 
 ```
-E:\familyclaw-profiles\
-  agent_alpha\
+%FAMILYCLAW_PROFILE_DIR%\
+  agent_a\
     SOUL.md
     IDENTITY.md
 ```
 
 Gateway lataa sielun polusta `FAMILYCLAW_PROFILE_DIR\<agent_name>\` kun `FAMILYCLAW_AGENT_NAME` on asetettu (oletus `agent_a`).
 
-## Pakolliset ympäristömuuttujat
+Kehityksessä voit alustaa JSON-datan repoon sidottuun `.local/data` (gitignored):
 
-Aseta ne istunnossa tai `.env`-tiedostossa **repoon ulkopuolella** (esim. `E:\familyclaw-profiles\.env`).
+```powershell
+powershell -File scripts/init-familyclaw-data.ps1
+```
+
+## Pakolliset ympäristömuuttujat (Kerros B)
+
+Kopioi reposta [`.env.example`](../.env.example) yksityiseen polkuun ja täytä arvot:
+
+```powershell
+$configDir = Join-Path $env:USERPROFILE ".config" "familyclaw"
+New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+Copy-Item .env.example "$configDir\familyclaw.env"
+# muokkaa familyclaw.env — älä commitoi
+. .\scripts\load-env.ps1 -Path "$configDir\familyclaw.env"
+```
 
 | Muuttuja | Kuvaus |
 |----------|--------|
-| `FAMILYCLAW_PROFILE_DIR` | Profiilien juuri → `E:\familyclaw-profiles` |
-| `FAMILYCLAW_DATA_DIR` | Pysyvän muistin hakemisto → `E:\familyclaw-data` |
+| `FAMILYCLAW_PROFILE_DIR` | Profiilien juuri |
+| `FAMILYCLAW_DATA_DIR` | Pysyvän muistin hakemisto |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot API -token ([@BotFather](https://t.me/BotFather)) |
-| `FAMILYCLAW_GATEWAY_TOKEN` | Jaettu salaisuus tuotantoon (webhook/HTTP-suojaus; Layer B — älä commitoi) |
+| `FAMILYCLAW_GATEWAY_TOKEN` | Jaettu salaisuus tuotantoon (webhook/HTTP-suojaus) |
 
-Lisäksi gateway vaatii Telegram-kanavalle (katso `familyclaw-gateway`):
+Lisäksi gateway vaatii Telegram-kanavalle:
 
 | Muuttuja | Kuvaus |
 |----------|--------|
-| `FAMILYCLAW_TELEGRAM_CHANNEL_ID` | Looginen kanavatunniste (esim. `tg-agent_alpha`) |
+| `FAMILYCLAW_TELEGRAM_CHANNEL_ID` | Looginen kanavatunniste (esim. `tg-main`) |
 | `FAMILYCLAW_REPLY_TARGET` | Telegram-chat-id vastauksille (numeerinen) |
-| `FAMILYCLAW_AGENT_NAME` | Agentin nimi = profiilikansion nimi (esim. `agent_alpha`) |
+| `FAMILYCLAW_AGENT_NAME` | Profiilikansion nimi (esim. `agent_a`) |
 
 LLM-vastaukset (valinnainen mutta suositeltu tuotannossa):
 
@@ -72,16 +103,8 @@ $env:ANTHROPIC_API_KEY = "<avaimesi>"
 Esimerkki istunnon alustuksesta:
 
 ```powershell
-cd E:\Familyclaw
-
-$env:FAMILYCLAW_PROFILE_DIR = "E:\familyclaw-profiles"
-$env:FAMILYCLAW_DATA_DIR    = "E:\familyclaw-data"
-$env:FAMILYCLAW_GATEWAY_TOKEN = "<pitkä satunnainen merkkijono>"
-$env:TELEGRAM_BOT_TOKEN     = "<bot-token>"
-$env:FAMILYCLAW_TELEGRAM_CHANNEL_ID = "tg-agent_alpha"
-$env:FAMILYCLAW_REPLY_TARGET = "<chat-id>"
-$env:FAMILYCLAW_AGENT_NAME  = "agent_alpha"
-$env:FAMILYCLAW_GATEWAY_ADDR = "127.0.0.1:8787"
+cd <repo-root>
+. .\scripts\load-env.ps1 -Path "$env:USERPROFILE\.config\familyclaw\familyclaw.env"
 ```
 
 Kuuntele vain localhostilla oletuksena. Jos avaat portin verkkoon, varmista palomuuri ja `FAMILYCLAW_GATEWAY_TOKEN`.
@@ -137,8 +160,8 @@ Kun `FAMILYCLAW_DATA_DIR` on asetettu, runtime käyttää **JSON-tiedostoja**:
 
 | Tiedosto | Sisältö |
 |----------|---------|
-| `E:\familyclaw-data\journal.jsonl` | Durable-journali (crash-replay) |
-| `E:\familyclaw-data\memory.json` | `LocalJsonStore` — työmuisti levyllä |
+| `%FAMILYCLAW_DATA_DIR%\journal.jsonl` | Durable-journali (crash-replay) |
+| `%FAMILYCLAW_DATA_DIR%\memory.json` | `LocalJsonStore` — työmuisti levyllä |
 
 Ilman `FAMILYCLAW_DATA_DIR`:ää muisti on vain prosessin RAM:issa (katoaa uudelleenkäynnistyksessä).
 
@@ -149,7 +172,7 @@ Tämä polku on yksiprosessinen ja turvallinen Windows-kehitykseen — **ei Rock
 `familyclaw-hearth` tukee SurrealDB 3.x -yhteyttä:
 
 - Kehitys: `mem://`
-- Tuotanto (tiedosto): `rocksdb:///E:/familyclaw-data/hearth`
+- Tuotanto (tiedosto): `rocksdb:///<absolute-path>/hearth`
 
 Rakenna feature-flagilla kun Hearth otetaan käyttöön:
 
@@ -176,7 +199,7 @@ IO error: lock hold by current process
 
 ### Sääntö
 
-**Yksi prosessi kerrallaan** avaa `E:\familyclaw-data` (tai sen RocksDB-alikansion).
+**Yksi prosessi kerrallaan** avaa RocksDB-tietokantapolun.
 
 ### Korjaus
 
@@ -201,14 +224,14 @@ Valinnainen TOML täydentää env-muuttujia. Kopioi esimerkki:
 ```powershell
 $configDir = "$env:USERPROFILE\.config\familyclaw"
 New-Item -ItemType Directory -Force -Path $configDir
-Copy-Item E:\Familyclaw\familyclaw.toml.example "$configDir\familyclaw.toml"
+Copy-Item familyclaw.toml.example "$configDir\familyclaw.toml"
 # Muokkaa: agent.name, channel.telegram, provider — salaisuudet env:iin
 ```
 
 Tai osoita eksplisiittisesti:
 
 ```powershell
-$env:FAMILYCLAW_CONFIG = "E:\familyclaw-profiles\familyclaw.toml"
+$env:FAMILYCLAW_CONFIG = "$configDir\familyclaw.toml"
 ```
 
 ## Validointi (bench + CI)
@@ -245,17 +268,16 @@ cargo run -p familyclaw-bench --bin bench -- s1   # crash matrix
 cargo run -p familyclaw-bench --bin bench -- s3   # dream quality
 ```
 
-## E2E: Telegram + agent_alpha
+## E2E: gateway + Telegram (Kerros B)
 
-Kun I1-env on kunnossa ja `E:\familyclaw-profiles\agent_alpha\SOUL.md` on paikallaan:
+Kun yksityinen env on ladattu ja `%FAMILYCLAW_PROFILE_DIR%\agent_a\SOUL.md` on olemassa:
 
 ```powershell
-$env:FAMILYCLAW_PROFILE_DIR = "E:\familyclaw-profiles"
-$env:FAMILYCLAW_DATA_DIR    = "E:\familyclaw-data"
-cargo run -p familyclaw-gateway -- serve
+. .\scripts\load-env.ps1 -Path "$env:USERPROFILE\.config\familyclaw\familyclaw.env"
+.\scripts\e2e-gateway.ps1 -StartGateway
 ```
 
-Lähetä viesti Telegram-botille → odota vastaus agentin SOUL:lla ja muistilla restartin yli (`memory.json` + `journal.jsonl`).
+Lähetä viesti Telegram-botille → odota vastaus agentin SOUL:lla ja muistilla restartin yli.
 
 ## Vianetsintä
 
@@ -269,7 +291,7 @@ Lähetä viesti Telegram-botille → odota vastaus agentin SOUL:lla ja muistilla
 
 **Muisti tyhjenee uudelleenkäynnistyksessä**
 
-- `FAMILYCLAW_DATA_DIR` ei ollut asetettu → käytä `E:\familyclaw-data`.
+- `FAMILYCLAW_DATA_DIR` ei ollut asetettu → aja `scripts/init-familyclaw-data.ps1` tai aseta polku env:iin.
 
 **RocksDB LOCK / data-kansio lukittu**
 

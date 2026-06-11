@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use familyclaw_core::{time, Result};
+use familyclaw_core::{time, Result, FamilyClawError};
 use familyclaw_dream::{desire_clock::DesireClock, DreamConfig, DreamCycle};
 use familyclaw_durable::{context::DurableContext, FileJournal};
 use familyclaw_memory::LocalJsonStore;
@@ -40,11 +40,11 @@ async fn main() -> Result<()> {
 
     // Lue data-hakemisto ympäristöstä
     let data_dir = std::env::var("FAMILYCLAW_DATA_DIR")
-        .map_err(|_| anyhow::anyhow!("FAMILYCLAW_DATA_DIR ei asetettu — vaaditaan memory.json ja journal.jsonl"))?;
+        .map_err(|_| FamilyClawError::config("FAMILYCLAW_DATA_DIR ei asetettu — vaaditaan memory.json ja journal.jsonl"))?;
 
     let data_path = std::path::Path::new(&data_dir);
     std::fs::create_dir_all(data_path)
-        .map_err(|e| anyhow::anyhow!("FAMILYCLAW_DATA_DIR hakemiston luonti epäonnistui: {e}"))?;
+        .map_err(|e| FamilyClawError::config(format!("FAMILYCLAW_DATA_DIR hakemiston luonti epäonnistui: {e}")))?;
 
     let journal_path = data_path.join("journal.jsonl");
     let memory_path = data_path.join("memory.json");

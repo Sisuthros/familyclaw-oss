@@ -1,13 +1,24 @@
-# Load Layer B `.env` into the current PowerShell session.
-# Usage: . .\scripts\load-env.ps1
-#        . .\scripts\load-env.ps1 -Path E:\familyclaw-profiles\.env
+# Load a private Layer B `.env` into the current PowerShell session.
+#
+# Usage:
+#   . .\scripts\load-env.ps1 -Path $env:USERPROFILE\.config\familyclaw\familyclaw.env
+#   $env:FAMILYCLAW_ENV_FILE = "..." ; . .\scripts\load-env.ps1
 
 param(
-    [string]$Path = "E:\familyclaw-profiles\.env"
+    [string]$Path = $env:FAMILYCLAW_ENV_FILE
 )
 
+if (-not $Path) {
+    Write-Error @"
+No env file path. Copy repo .env.example to a private location, then:
+  . .\scripts\load-env.ps1 -Path `$env:USERPROFILE\.config\familyclaw\familyclaw.env
+Or set FAMILYCLAW_ENV_FILE.
+"@
+    exit 1
+}
+
 if (-not (Test-Path $Path)) {
-    Write-Error "Env file not found: $Path (copy from .env.example first)"
+    Write-Error "Env file not found: $Path"
     exit 1
 }
 

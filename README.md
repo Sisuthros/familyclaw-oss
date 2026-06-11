@@ -119,6 +119,12 @@ cd familyclaw
 cargo run -p minimal-gateway -- --duration 10
 ```
 
+Windows: full public validation (tests + bench, no keys):
+
+```powershell
+powershell -File scripts/public-demo.ps1
+```
+
 **What happens:**
 1. 🚀 Starts Resonance Bus (`minimal-gateway-bus`)
 2. 🤖 Spawns `agent_a` with durable memory + emotion
@@ -180,7 +186,7 @@ Inbound gateway: future work.
 
 ## Loading Your Own Family (Layer B)
 
-The platform loads agent profiles at runtime — **they never live in the repo**:
+After the public demo works, load private profiles at runtime — **they never live in the repo**:
 
 ```bash
 export FAMILYCLAW_PROFILE_DIR=/path/to/your/private/profiles

@@ -30,5 +30,6 @@ cd E:\Familyclaw
 cargo test --workspace
 cargo run -p familyclaw-bench --bin bench -- all
 cargo run -p familyclaw-bench --bin bench -- compare
-.\scripts\homepage-factory-live-smoke.ps1
+powershell -File scripts/public-demo.ps1 -Full
+.\scripts\homepage-factory-live-smoke.ps1 -CompareBench
 ```
