@@ -58,6 +58,9 @@ mod mock;
 #[cfg(feature = "discord")]
 mod discord;
 
+#[cfg(feature = "discord")]
+mod discord_interactions;
+
 #[cfg(feature = "telegram")]
 mod telegram;
 
@@ -68,6 +71,12 @@ pub use mock::{pump_to, MockChannel};
 
 #[cfg(feature = "discord")]
 pub use discord::DiscordChannel;
+
+#[cfg(feature = "discord")]
+pub use discord_interactions::{
+    verify_signature, DiscordInteraction, RESPONSE_CHANNEL_MESSAGE, RESPONSE_DEFERRED_CHANNEL_MESSAGE,
+    RESPONSE_PONG,
+};
 
 #[cfg(feature = "telegram")]
 pub use telegram::TelegramChannel;

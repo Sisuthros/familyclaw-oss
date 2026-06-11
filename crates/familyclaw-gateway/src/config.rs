@@ -38,6 +38,8 @@ pub struct ChannelCfg {
 pub struct DiscordCfg {
     pub webhook_url: String,
     pub channel_id: String,
+    /// Ed25519 public key (hex) Discord Interactions -verifyyn.
+    pub public_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -97,6 +99,7 @@ impl Default for DiscordCfg {
         Self {
             webhook_url: String::new(),
             channel_id: "discord-main".into(),
+            public_key: String::new(),
         }
     }
 }
@@ -192,6 +195,21 @@ impl FamilyConfig {
         if let Ok(v) = std::env::var("FAMILYCLAW_GATEWAY_TOKEN") {
             self.security.gateway_token = v;
         }
+        if let Ok(v) = std::env::var("DISCORD_WEBHOOK_URL") {
+            self.channel.discord.webhook_url = v;
+        }
+        if let Ok(v) = std::env::var("DISCORD_CHANNEL_ID") {
+            self.channel.discord.channel_id = v;
+        }
+        if let Ok(v) = std::env::var("DISCORD_PUBLIC_KEY") {
+            self.channel.discord.public_key = v;
+        }
+        if let Ok(v) = std::env::var("TELEGRAM_BOT_TOKEN") {
+            self.channel.telegram.token = v;
+        }
+        if let Ok(v) = std::env::var("FAMILYCLAW_TELEGRAM_CHANNEL_ID") {
+            self.channel.telegram.channel_id = v;
+        }
         if let Ok(v) = std::env::var("FAMILYCLAW_MEMORY_RETENTION_HOURS") {
             if let Ok(n) = v.parse() {
                 self.memory.retention_hours = n;
@@ -219,6 +237,9 @@ impl FamilyConfig {
     }
     pub fn discord_channel_id(&self) -> &str {
         &self.channel.discord.channel_id
+    }
+    pub fn discord_public_key(&self) -> &str {
+        &self.channel.discord.public_key
     }
     pub fn telegram_token(&self) -> &str {
         &self.channel.telegram.token

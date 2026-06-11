@@ -24,11 +24,12 @@ uuid = { workspace = true }
 # Discord/Telegram adapters: HTTP REST (lightweight, no gateway/teloxide SDK).
 # Discord sends via webhook URL; Telegram uses Bot API getUpdates/sendMessage.
 reqwest = { workspace = true, optional = true }
+ed25519-dalek = { version = "2.2", optional = true }
 
 [features]
 # Default: runko + MockChannel only. Real adapters behind feature flags.
 default = []
-discord = ["dep:reqwest"]
+discord = ["dep:reqwest", "dep:ed25519-dalek"]
 telegram = ["dep:reqwest"]
 whatsapp = []
 signal = []

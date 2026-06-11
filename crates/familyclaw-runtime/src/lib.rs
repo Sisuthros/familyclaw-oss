@@ -208,19 +208,29 @@ pub async fn build_family(
     });
 
     if let Some(dream_journal) = dream_journal {
-        let interval_secs: u64 = env::var("FAMILYCLAW_DREAM_INTERVAL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(6 * 3600);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-                let store: &dyn familyclaw_memory::MemoryStore = &*dream_store;
-                let journal: &(dyn Journal + Send + Sync) = &*dream_journal;
-                let cycle = DreamCycle::new(store);
-                match cycle.run(journal, time::now()).await {
-                    Ok(report) => tracing::info!(target: "familyclaw::dream", scanned=report.scanned, merged=report.merged, dropped=report.dropped, strengthened=report.strengthened, archived=report.archived, absolutized=report.dates_absolutized, "Dream cycle completed"),
-                    Err(e) => tracing::warn!("Dream cycle failed: {e}"),
+        let dream_disabled = env::var("FAMILYCLAW_DREAM_DISABLED")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        if dream_disabled {
+            tracing::info!(target: "familyclaw::dream", "runtime dream loop disabled (FAMILYCLAW_DREAM_DISABLED)");
+        } else {
+            let interval_secs: u64 = env::var("FAMILYCLAW_DREAM_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6 * 3600);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                    let store: &dyn familyclaw_memory::MemoryStore = &*dream_store;
+                    let journal: &(dyn Journal + Send + Sync) = &*dream_journal;
+                    let cycle = DreamCycle::new(store);
+                    match cycle.run(journal, time::now()).await {
+                        Ok(report) => tracing::info!(target: "familyclaw::dream", scanned=report.scanned, merged=report.merged, dropped=report.dropped, strengthened=report.strengthened, archived=report.archived, absolutized=report.dates_absolutized, "Dream cycle completed"),
+                        Err(e) => tracing::warn!("Dream cycle failed: {e}"),
+                    }
                 }
-            }
-        });
+            });
+        }
     }
     // 10. Kokoa runtime — omistaa busin, agentin ja molemmat taskit.
     Ok(FamilyRuntime {

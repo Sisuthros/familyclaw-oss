@@ -46,6 +46,7 @@ use std::sync::Arc;
 
 use axum::extract::{Json, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::body::Bytes;
 use axum::routing::get;
 use axum::Router;
 use clap::{Parser, Subcommand};
@@ -53,7 +54,10 @@ use familyclaw_agent::{resolve_profile_dir, EnvEndpointResolver, Soul};
 use familyclaw_bus::BusHandle;
 mod config;
 use config::FamilyConfig;
-use familyclaw_channels::{Channel, ChannelKind, DiscordChannel, InboundMessage, TelegramChannel};
+use familyclaw_channels::{
+    verify_signature, Channel, ChannelKind, DiscordChannel, DiscordInteraction, InboundMessage,
+    RESPONSE_DEFERRED_CHANNEL_MESSAGE, RESPONSE_PONG, TelegramChannel,
+};
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
 use familyclaw_runtime::{build_family, FamilyRuntime};
 use tokio::net::TcpListener;
@@ -71,6 +75,7 @@ const PROVIDERS_ENV: &str = "FAMILYCLAW_PROVIDERS";
 
 /// Env-nimet virheviesteissä (ei lueta suoraan — `FamilyConfig` hoitaa)
 const DISCORD_WEBHOOK_URL_ENV: &str = "DISCORD_WEBHOOK_URL";
+const DISCORD_PUBLIC_KEY_ENV: &str = "DISCORD_PUBLIC_KEY";
 const DISCORD_CHANNEL_ID_ENV: &str = "DISCORD_CHANNEL_ID";
 const TELEGRAM_CHANNEL_ID_ENV: &str = "FAMILYCLAW_TELEGRAM_CHANNEL_ID";
 const REPLY_TARGET_ENV: &str = "FAMILYCLAW_REPLY_TARGET";
@@ -134,6 +139,8 @@ struct GatewayState {
     /// (yhteensopiva aiemman käytöksen kanssa). Vrt. OpenClawin
     /// `OPENCLAW_GATEWAY_TOKEN`.
     inject_token: Option<Arc<str>>,
+    /// Discord Interactions Ed25519 public key (hex). `Some` → `/discord/interactions` aktiivinen.
+    discord_public_key: Option<Arc<str>>,
 }
 
 /// Elinvoimatarkistus: vastaa aina `200 OK` kun prosessi pystyy palvelemaan
@@ -260,14 +267,119 @@ async fn inject_discord(
     }
 }
 
+/// Discord Interactions endpoint — Ed25519-verify + inject + deferred vastaus.
+async fn handle_discord_interaction(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(public_key) = state.discord_public_key.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "discord interactions not configured"})),
+        );
+    };
+    let Some(ch) = state.discord_channel.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "discord channel not configured"})),
+        );
+    };
+
+    let sig = headers
+        .get("X-Signature-Ed25519")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let timestamp = headers
+        .get("X-Signature-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if sig.is_empty() || timestamp.is_empty() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "missing signature headers"})),
+        );
+    }
+
+    if let Err(e) = verify_signature(public_key, sig, timestamp, &body) {
+        tracing::warn!("discord interaction verify failed: {e}");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid signature"})),
+        );
+    }
+
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("discord interaction json parse failed: {e}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"type": 4, "data": {"content": "invalid payload", "flags": 64}})),
+            );
+        }
+    };
+
+    let interaction = match DiscordInteraction::from_payload(&payload) {
+        Ok(ix) => ix,
+        Err(e) => {
+            tracing::warn!("discord interaction parse failed: {e}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"type": 4, "data": {"content": "invalid interaction", "flags": 64}})),
+            );
+        }
+    };
+
+    if interaction.is_ping() {
+        return (StatusCode::OK, Json(serde_json::json!({"type": RESPONSE_PONG})));
+    }
+
+    if !interaction.is_application_command() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"type": 4, "data": {"content": "unsupported interaction type", "flags": 64}})),
+        );
+    }
+
+    let inbound = match interaction.into_inbound() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("discord slash empty message: {e}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"type": 4, "data": {"content": "message required", "flags": 64}})),
+            );
+        }
+    };
+
+    let envelope = inbound.into_envelope(ChannelKind::Discord, ch.channel_id());
+    if let Err(e) = ch.inject(envelope) {
+        tracing::warn!("discord interaction inject failed: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"type": 4, "data": {"content": "inject failed", "flags": 64}})),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"type": RESPONSE_DEFERRED_CHANNEL_MESSAGE})),
+    )
+}
+
 /// Rakentaa gatewayn HTTP-reitityksen jaetulla tilalla.
 fn build_router(state: Arc<GatewayState>) -> Router {
     use axum::routing::post;
-    Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/inject", post(inject_discord))
-        .with_state(state)
+        .route("/inject", post(inject_discord));
+    if state.discord_public_key.is_some() && state.discord_channel.is_some() {
+        router = router.route("/discord/interactions", post(handle_discord_interaction));
+    }
+    router.with_state(state)
 }
 
 /// Ratkaisee kuunteluosoitteen ympäristömuuttujasta tai oletuksesta.
@@ -336,8 +448,14 @@ fn load_agent_soul(agent_name: &str) -> Soul {
 ///   ([`TELEGRAM_TOKEN_ENV`], [`TELEGRAM_CHANNEL_ID_ENV`],
 ///   [`REPLY_TARGET_ENV`]) puuttuu tai kanavan rakennus epäonnistuu.
 ///
-/// Palauttaa runtimen JA optinaalisen DiscordChannelin (inject-handlerille).
-async fn start_runtime() -> Result<(FamilyRuntime, Option<Arc<DiscordChannel>>, Option<Arc<str>>)> {
+/// Palauttaa runtimen, Discord-kanavan (inject/interactions), inject-tokenin ja public keyn.
+async fn start_runtime(
+) -> Result<(
+    FamilyRuntime,
+    Option<Arc<DiscordChannel>>,
+    Option<Arc<str>>,
+    Option<Arc<str>>,
+)> {
     let cfg = FamilyConfig::load()?;
     let agent_name = cfg.agent_name().to_string();
     let model = cfg.model().to_string();
@@ -418,7 +536,22 @@ async fn start_runtime() -> Result<(FamilyRuntime, Option<Arc<DiscordChannel>>, 
     )
     .await?;
 
-    Ok((runtime, discord_ch, inject_token))
+    let discord_public_key: Option<Arc<str>> = if channel_kind == "discord" {
+        let pk = cfg.discord_public_key().trim();
+        if pk.is_empty() {
+            warn!(
+                "{DISCORD_PUBLIC_KEY_ENV} puuttuu — POST /discord/interactions ei ole käytössä"
+            );
+            None
+        } else {
+            info!("Discord Interactions aktiivinen ({DISCORD_PUBLIC_KEY_ENV} set)");
+            Some(Arc::from(pk))
+        }
+    } else {
+        None
+    };
+
+    Ok((runtime, discord_ch, inject_token, discord_public_key))
 }
 
 #[tokio::main]
@@ -455,13 +588,14 @@ async fn serve() -> Result<()> {
     // C5-sauma: yksi build_family-kutsu kokoaa bus + agentti + kanava +
     // reply-pumppu (FamilyRuntime). Bus-kahva luovutetaan GatewayState:lle;
     // HTTP-/sammutuskuori pysyy ennallaan (vain bus.stop() → runtime.shutdown()).
-    let (runtime, discord_ch, inject_token) = start_runtime().await?;
+    let (runtime, discord_ch, inject_token, discord_public_key) = start_runtime().await?;
     info!("FamilyRuntime käynnissä (bus + agentti + kanava)");
 
     let state = Arc::new(GatewayState {
         bus: Some(runtime.bus().clone()),
         discord_channel: discord_ch,
         inject_token,
+        discord_public_key,
     });
     let app = build_router(state);
 
@@ -602,6 +736,26 @@ async fn doctor() -> Result<()> {
         }
     }
 
+    if channel_kind == "discord" {
+        if std::env::var_os(DISCORD_PUBLIC_KEY_ENV).is_some_and(|v| !v.is_empty()) {
+            println!("[OK]      env       {DISCORD_PUBLIC_KEY_ENV} set (interactions)");
+        } else {
+            println!("[WARN]    env       {DISCORD_PUBLIC_KEY_ENV} unset — /discord/interactions off");
+        }
+    }
+
+    if std::env::var_os("FAMILYCLAW_DATA_DIR").is_some_and(|v| !v.is_empty()) {
+        println!("[OK]      env       FAMILYCLAW_DATA_DIR set");
+    } else {
+        println!("[WARN]    env       FAMILYCLAW_DATA_DIR unset — in-memory memory only");
+    }
+
+    if std::env::var_os("FAMILYCLAW_PROFILE_DIR").is_some_and(|v| !v.is_empty()) {
+        println!("[OK]      env       FAMILYCLAW_PROFILE_DIR set");
+    } else {
+        println!("[WARN]    env       FAMILYCLAW_PROFILE_DIR unset — generic soul");
+    }
+
     // /inject-suojaus: valinnainen, joten ei kaada doctoria. Vain läsnäolo —
     // token on salaisuus, arvoa ei tulosteta. Puuttuva = varoitus avoimesta
     // endpointista, ei virhe.
@@ -658,6 +812,7 @@ mod tests {
             bus: None,
             discord_channel: None,
             inject_token: None,
+            discord_public_key: None,
         });
         let (status, _) = readyz(State(not_ready)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -668,6 +823,7 @@ mod tests {
             bus: Some(bus.clone()),
             discord_channel: None,
             inject_token: None,
+            discord_public_key: None,
         });
         let (status, _) = readyz(State(ready)).await;
         assert_eq!(status, StatusCode::OK);
@@ -681,6 +837,7 @@ mod tests {
             bus: None,
             discord_channel: None,
             inject_token: None,
+            discord_public_key: None,
         }));
     }
 
@@ -759,6 +916,7 @@ mod tests {
             bus: None,
             discord_channel: None,
             inject_token: None,
+            discord_public_key: None,
         };
         assert!(check_inject_auth(&state, &HeaderMap::new()).is_ok());
         // Ylimääräinen otsikko ei haittaa kun suojausta ei ole.
@@ -772,6 +930,7 @@ mod tests {
             bus: None,
             discord_channel: None,
             inject_token: Some(Arc::from("s3cret-token")),
+            discord_public_key: None,
         };
         assert!(check_inject_auth(&state, &headers_with_auth("Bearer s3cret-token")).is_ok());
     }
@@ -783,6 +942,7 @@ mod tests {
             bus: None,
             discord_channel: None,
             inject_token: Some(Arc::from("s3cret-token")),
+            discord_public_key: None,
         };
         // Väärä token.
         assert_eq!(

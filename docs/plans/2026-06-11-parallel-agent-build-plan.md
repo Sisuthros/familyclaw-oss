@@ -1,9 +1,9 @@
 # FamilyClaw — rinnakkaisagenttien rakennussuunnitelma
 
-> **Versio:** 2026-06-11  
+> **Versio:** 2026-06-11 (ilta)  
 > **Kohdeyleisö:** Nemotron 3 Ultra, DeepSeek 4 Pro, Cursor (Auto), Antigravity  
 > **Omistaja:** operator — avaimet, SOUL-hyväksyntä, tuotantopalvelin  
-> **Nykyvalmius:** ~35 % → tavoite **~75 % (1 pv)** / **~88 % (2–3 pv)** / **~94 % (1–2 vk)**
+> **Nykyvalmius:** ~**55–60 %** → tavoite **~75 % (1 pv)** / **~88 % (2–3 pv)** / **~94 % (1–2 vk)**
 
 ---
 
@@ -17,27 +17,30 @@
 | Eternal Thread + decay | Valmis | S2, S5, S6 PASS |
 | DreamCycle | Valmis | S3 PASS |
 | Resonance Bus + contagion | Valmis | S4 PASS |
-| Gateway + Telegram | Osittain | `familyclaw-gateway` |
-| Surpass-vertailu | Worktreessä | `E:/familyclaw-surpass` |
-| Clippy pedantic clean | Worktreessä | `E:/familyclaw-wf-301-2-clippy` |
+| Gateway + Telegram | Valmis (E2E odottaa I1) | `familyclaw-gateway` |
+| Surpass-merge + observability | **Valmis** | commit `87b864d`, `familyclaw-observability`, `comparative.rs` |
+| Dual-write resume | **Valmis** | `continuity_daemon.rs` + integraatiotesti |
+| WorkExecutor + TurnExecutor | **Valmis** | `familyclaw-bridge` |
+| Dream-cron binääri | **Valmis** | `dream-cron-job` + `FAMILYCLAW_DREAM_DISABLED` |
+| Discord inbound MVP | **Valmis** | `POST /discord/interactions` + Ed25519 |
+| Clippy pedantic clean | Valmis (night-haara) | `feat/night-2026-06-11` |
 
 ### Mitä puuttuu (kriittinen)
 
 | Osa | Tila | Polku |
 |-----|------|-------|
-| Agenttien sielut (SOUL) | Tyhjä runko | `E:/familyclaw-profiles` |
-| Runtime data / muisti | LOCK-virheet, tyhjä | `E:/familyclaw-data` |
-| Haarojen yhdistäminen | 3 worktreeä | `E:/Familyclaw` + worktreet |
-| Dual-write-korjaus | Avoin | `docs/CODE_REVIEW_2026-06-04.md` |
-| Dream-cron tuotannossa | TODO | `familyclaw-dream` |
+| Agenttien sielut (SOUL) | Luonnokset ~45 % | `E:/familyclaw-profiles` |
+| `.env` avaimet (I1) | Odottaa operator | `E:/familyclaw-profiles/.env` |
+| LiveTurnExecutor | Odottaa agent_gamma PR | `docs/handoff/agent_gamma_LIVE_TURN_EXECUTOR.md` |
+| E2E Telegram + agent_alpha | Odottaa I1 | C7 |
 | OSS-julkaisu | Vaihe 6 avoin | README roadmap |
 
 ### Kypsyys nyt
 
-- **Layer A (koodi):** ~78 %
-- **Layer B (profiilit):** ~5 %
-- **Tuotantodemo:** ~30 %
-- **Kokonaisuus:** ~35 %
+- **Layer A (koodi):** ~**85 %**
+- **Layer B (profiilit):** ~**45 %**
+- **Tuotantodemo:** ~**35 %**
+- **Kokonaisuus:** ~**55–60 %**
 
 ---
 
@@ -115,10 +118,11 @@ git worktree add E:\familyclaw-deepseek -b feat/deepseek-review
 ### Merge-järjestys (pakollinen)
 
 ```
-1. wf_301-2-clippy        → main     (Cursor)
-2. feat/deepseek-review   → main     (vain docs/ADR, Cursor)
-3. feat/nemotron-core     → main     (Cursor, DeepSeek review OK)
-4. feat/surpass-build     → main     (Cursor, konfliktit viimeiseksi)
+✅ 1. wf_301-2-clippy        → night (aiemmin)
+✅ 2. feat/surpass-build     → night (87b864d)
+⏳ 3. agent_gamma PR (LiveTurnExecutor / amplifier) — kun valmis
+⏳ 4. feat/nemotron-core       → main (N3/N4 nyt night-haarassa)
+⏳ 5. feat/deepseek-review     → docs/review-kommentit
 ```
 
 ### Konfliktien välttäminen
@@ -139,15 +143,15 @@ git worktree add E:\familyclaw-deepseek -b feat/deepseek-review
 
 ### Cursor (integraatiopäällikkö)
 
-- [ ] **C1** Luo worktreet (`familyclaw-nemotron`, `familyclaw-deepseek`)
-- [ ] **C2** Merge clippy-haara → main
-- [ ] **C3** Korjaa `E:/familyclaw-data` LOCK (sulje kilpailevat prosessit)
-- [ ] **C4** Valitse MVP data-polku: `FAMILYCLAW_DATA_DIR` JSON (suositus ensin)
-- [ ] **C5** Merge surpass-haara → main (observability, COMPARISON, SURPASS_DEMO)
+- [x] **C1** Luo worktreet (`familyclaw-nemotron`, `familyclaw-deepseek`)
+- [x] **C2** Merge clippy-haara → main
+- [x] **C3** Korjaa `E:/familyclaw-data` LOCK (JSON-MVP + init-skripti)
+- [x] **C4** Valitse MVP data-polku: `FAMILYCLAW_DATA_DIR` JSON
+- [x] **C5** Merge surpass-haara → main (observability, COMPARISON, SURPASS_DEMO)
 - [ ] **C6** Merge nemotron-core (kun DeepSeek review OK + CI green)
-- [ ] **C7** E2E: gateway + Telegram + agent_alpha SOUL
-- [ ] **C8** Aja benchmark: `cargo run -p familyclaw-bench --bin bench -- all`
-- [ ] **C9** Päivitä `docs/SCORECARD.md` jos tulokset muuttuvat
+- [ ] **C7** E2E: gateway + Telegram + agent_alpha SOUL (odottaa I1 `.env`)
+- [x] **C8** Aja benchmark: `cargo run -p familyclaw-bench --bin bench -- all`
+- [x] **C9** Päivitä `docs/SCORECARD.md` jos tulokset muuttuvat
 
 ### DeepSeek 4 Pro (arkkitehtuuri + review)
 
@@ -164,11 +168,11 @@ git worktree add E:\familyclaw-deepseek -b feat/deepseek-review
 
 > **Sääntö:** Odota D2 + D3 valmiina ennen dual-write-koodausta.
 
-- [ ] **N1** Toteuta dual-write DeepSeekin ADR:n mukaan (`familyclaw-agent`, `familyclaw-durable`)
-- [ ] **N2** Lisää regressiotestit D3-matriisin mukaan
-- [ ] **N3** DreamCycle ajastus (`familyclaw-dream` + gateway-hook tai erillinen binääri)
-- [ ] **N4** Discord inbound MVP (`familyclaw-channels`, `familyclaw-gateway`)
-- [ ] **N5** (valinnainen P2) WorkExecutor-seam: `docs/plans/2026-06-11-p3-workexecutor-seam.md`
+- [x] **N1** Toteuta dual-write DeepSeekin ADR:n mukaan (`familyclaw-agent`, `familyclaw-durable`)
+- [x] **N2** Lisää regressiotestit D3-matriisin mukaan
+- [x] **N3** DreamCycle ajastus (`dream-cron-job` + `FAMILYCLAW_DREAM_DISABLED`)
+- [x] **N4** Discord inbound MVP (`/discord/interactions`, Ed25519)
+- [x] **N5** WorkExecutor-seam (`familyclaw-bridge/src/work_executor.rs`)
 - [ ] **N6** Avaa PR `feat/nemotron-core` → main, tag `@DeepSeek review`
 
 ### Antigravity (Layer B + käyttöönotto)
@@ -183,7 +187,7 @@ git worktree add E:\familyclaw-deepseek -b feat/deepseek-review
 
 ### operator (ihminen — bottleneck)
 
-- [ ] **I1** Toimita `.env`: `TELEGRAM_BOT_TOKEN`, `FAMILYCLAW_GATEWAY_TOKEN`, LLM API-avaimet
+- [ ] **I1** Toimita `.env`: kopioi `E:/familyclaw-profiles/.env.example` → `.env`, täytä avaimet
 - [ ] **I2** Hyväksy agent_alpha SOUL (Antigravity luonnostelee)
 - [ ] **I3** (myöhemmin) Hetzner + `install.sh` / systemd
 
@@ -489,10 +493,27 @@ Swarm on jo tuottanut — ulkoiset agentit voivat jatkaa näistä:
 | Windows runbook | `docs/RUNBOOK_WINDOWS.md` | Antigravity / Cursor |
 | agent_delta/agent_beta/agent_epsilon SOUL | `E:/familyclaw-profiles/{agent_delta,agent_beta,agent_epsilon}/` | operator hyväksyntä |
 | hearth + calibration | `family/hearth/README.md`, `*/calibration.json` | operator täyttää |
-| Dream-cron suunnitelma | `docs/plans/2026-06-11-dream-cron-design.md` | Nemotron N3 |
-| Discord inbound suunnitelma | `docs/plans/2026-06-11-discord-inbound-design.md` | Nemotron N4 |
+| Dream-cron suunnitelma | `docs/plans/2026-06-11-dream-cron-design.md` | ✅ `dream-cron-job` toteutettu |
+| Discord inbound suunnitelma | `docs/plans/2026-06-11-discord-inbound-design.md` | ✅ N4 gateway + channels |
+| `.env.example` + init-skriptit | `E:/familyclaw-profiles/.env.example`, `scripts/init-familyclaw-data.ps1` | operator täyttää `.env` |
+| agent_gamma handoff | `docs/handoff/agent_gamma_LIVE_TURN_EXECUTOR.md` | agent_gamma PR |
 | Tämä suunnitelma | `docs/plans/2026-06-11-parallel-agent-build-plan.md` | Kaikki |
 
 ---
 
-*Luotu: 2026-06-11. Päivitetty: hybridimalli + skaalaus + kickoff-viestit.*
+## 15. Seuraava aalto (2026-06-11 ilta)
+
+| # | Kuka | Tehtävä | Tulos |
+|---|------|---------|-------|
+| **I1** | operator | Täytä `E:/familyclaw-profiles/.env` | Gateway + Telegram käynnistyy |
+| **C7** | Cursor | E2E Telegram agent_alpha-profiililla | Elävä demo |
+| **Push** | Cursor | `git push origin feat/night-2026-06-11` | Tiimi näkee saman tipin |
+| **P1** | agent_gamma | `LiveTurnExecutor` PR | Homepage Factory live |
+| **C-HF** | Cursor | `scripts/homepage-factory-live-smoke.ps1` kun P1 merged | Surpass-vision todistettu |
+| **N6** | Nemotron/Cursor | PR review + merge `feat/nemotron-core` | N3/N4 mainissa |
+
+Pullonkaula siirtyi **ihmisen `.env`:ään** ja **agent_gamma LiveTurnExecutor-PR:ään** — surpass-merge ja dual-write ovat valmiit.
+
+---
+
+*Luotu: 2026-06-11. Päivitetty: 2026-06-11 ilta — surpass merged, N3/N4 toteutettu, kypsyys ~55–60 %.*

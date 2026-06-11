@@ -13,6 +13,10 @@
 # channel IDs, model names tied to a person, souls, or private paths. The live
 # `familyclaw.toml` is git-ignored — never commit it. Secrets belong in env
 # variables or your private config, never in this repo.
+#
+# Windows paths setup:
+#   $env:FAMILYCLAW_PROFILE_DIR = "E:\familyclaw-profiles"
+#   $env:FAMILYCLAW_DATA_DIR    = "E:\familyclaw-data"
 
 [agent]
 # Display name of the agent this gateway serves. Generic placeholder only.
@@ -35,6 +39,8 @@ reply_target = ""
 webhook_url = ""
 # Logical channel identifier (your own label, not a real 17-19 digit snowflake).
 channel_id = "discord-main"
+# Ed25519 public key hex for POST /discord/interactions (env: DISCORD_PUBLIC_KEY).
+public_key = ""
 
 [channel.telegram]
 # Telegram bot token. Leave empty — provide via private config, never here.
@@ -64,3 +70,9 @@ compaction_threshold = 0.3
 # Autonomy posture: "supervised" (human-in-the-loop) is the safe default.
 # Env override: FAMILYCLAW_SECURITY_PROFILE
 profile = "supervised"
+# Bearer token for POST /inject (env: FAMILYCLAW_GATEWAY_TOKEN). Leave empty in repo.
+gateway_token = ""
+
+# Dream-cron (external scheduler): disable gateway's 6h loop in production.
+# Env: FAMILYCLAW_DREAM_DISABLED=1
+# Env: FAMILYCLAW_DREAM_INTERVAL_SECS=21600 (dev only when cron disabled)
