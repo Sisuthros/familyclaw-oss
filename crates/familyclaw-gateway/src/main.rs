@@ -44,9 +44,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Json, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::body::Bytes;
 use axum::routing::get;
 use axum::Router;
 use clap::{Parser, Subcommand};
@@ -56,7 +56,7 @@ mod config;
 use config::FamilyConfig;
 use familyclaw_channels::{
     verify_signature, Channel, ChannelKind, DiscordChannel, DiscordInteraction, InboundMessage,
-    RESPONSE_DEFERRED_CHANNEL_MESSAGE, RESPONSE_PONG, TelegramChannel,
+    TelegramChannel, RESPONSE_DEFERRED_CHANNEL_MESSAGE, RESPONSE_PONG,
 };
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
 use familyclaw_runtime::{build_family, FamilyRuntime};
@@ -316,7 +316,9 @@ async fn handle_discord_interaction(
             tracing::warn!("discord interaction json parse failed: {e}");
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"type": 4, "data": {"content": "invalid payload", "flags": 64}})),
+                Json(
+                    serde_json::json!({"type": 4, "data": {"content": "invalid payload", "flags": 64}}),
+                ),
             );
         }
     };
@@ -327,19 +329,26 @@ async fn handle_discord_interaction(
             tracing::warn!("discord interaction parse failed: {e}");
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"type": 4, "data": {"content": "invalid interaction", "flags": 64}})),
+                Json(
+                    serde_json::json!({"type": 4, "data": {"content": "invalid interaction", "flags": 64}}),
+                ),
             );
         }
     };
 
     if interaction.is_ping() {
-        return (StatusCode::OK, Json(serde_json::json!({"type": RESPONSE_PONG})));
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"type": RESPONSE_PONG})),
+        );
     }
 
     if !interaction.is_application_command() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"type": 4, "data": {"content": "unsupported interaction type", "flags": 64}})),
+            Json(
+                serde_json::json!({"type": 4, "data": {"content": "unsupported interaction type", "flags": 64}}),
+            ),
         );
     }
 
@@ -349,7 +358,9 @@ async fn handle_discord_interaction(
             tracing::warn!("discord slash empty message: {e}");
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"type": 4, "data": {"content": "message required", "flags": 64}})),
+                Json(
+                    serde_json::json!({"type": 4, "data": {"content": "message required", "flags": 64}}),
+                ),
             );
         }
     };
@@ -449,8 +460,7 @@ fn load_agent_soul(agent_name: &str) -> Soul {
 ///   [`REPLY_TARGET_ENV`]) puuttuu tai kanavan rakennus epäonnistuu.
 ///
 /// Palauttaa runtimen, Discord-kanavan (inject/interactions), inject-tokenin ja public keyn.
-async fn start_runtime(
-) -> Result<(
+async fn start_runtime() -> Result<(
     FamilyRuntime,
     Option<Arc<DiscordChannel>>,
     Option<Arc<str>>,
@@ -491,7 +501,7 @@ async fn start_runtime(
             let dc_arc = Arc::new(dc);
             let ch: Box<dyn Channel> = Box::new(
                 DiscordChannel::new(webhook_url.to_string(), ch_id.to_string())
-                    .map_err(FamilyClawError::from)?
+                    .map_err(FamilyClawError::from)?,
             );
             (ch, Some(dc_arc))
         } else {
@@ -539,9 +549,7 @@ async fn start_runtime(
     let discord_public_key: Option<Arc<str>> = if channel_kind == "discord" {
         let pk = cfg.discord_public_key().trim();
         if pk.is_empty() {
-            warn!(
-                "{DISCORD_PUBLIC_KEY_ENV} puuttuu — POST /discord/interactions ei ole käytössä"
-            );
+            warn!("{DISCORD_PUBLIC_KEY_ENV} puuttuu — POST /discord/interactions ei ole käytössä");
             None
         } else {
             info!("Discord Interactions aktiivinen ({DISCORD_PUBLIC_KEY_ENV} set)");
@@ -740,7 +748,9 @@ async fn doctor() -> Result<()> {
         if std::env::var_os(DISCORD_PUBLIC_KEY_ENV).is_some_and(|v| !v.is_empty()) {
             println!("[OK]      env       {DISCORD_PUBLIC_KEY_ENV} set (interactions)");
         } else {
-            println!("[WARN]    env       {DISCORD_PUBLIC_KEY_ENV} unset — /discord/interactions off");
+            println!(
+                "[WARN]    env       {DISCORD_PUBLIC_KEY_ENV} unset — /discord/interactions off"
+            );
         }
     }
 
@@ -760,7 +770,9 @@ async fn doctor() -> Result<()> {
     // token on salaisuus, arvoa ei tulosteta. Puuttuva = varoitus avoimesta
     // endpointista, ei virhe.
     if cfg.gateway_token().trim().is_empty() {
-        println!("[WARN]    inject    {GATEWAY_TOKEN_ENV} unset — POST /inject open (loopback-only)");
+        println!(
+            "[WARN]    inject    {GATEWAY_TOKEN_ENV} unset — POST /inject open (loopback-only)"
+        );
     } else {
         println!("[OK]      inject    {GATEWAY_TOKEN_ENV} set — POST /inject requires bearer");
     }

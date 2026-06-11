@@ -175,19 +175,20 @@ mod tests {
 
     #[test]
     fn thread_add_event() {
-        let mut thread = NarrativeThread::new("Test thread", vec!["agent_gamma".into(), "agent_alpha".into()]);
-        let event = ThreadEvent::new(thread.id, EventType::MemoryCreated, "hello", "agent_gamma");
+        let mut thread =
+            NarrativeThread::new("Test thread", vec!["agent_a".into(), "agent_b".into()]);
+        let event = ThreadEvent::new(thread.id, EventType::MemoryCreated, "hello", "agent_a");
         thread.add_event(event);
         assert_eq!(thread.event_count(), 1);
     }
 
     #[test]
     fn thread_cross_reference() {
-        let mut thread_a = NarrativeThread::new("A", vec!["agent_gamma".into()]);
-        let mut thread_b = NarrativeThread::new("B", vec!["agent_alpha".into()]);
+        let mut thread_a = NarrativeThread::new("A", vec!["agent_a".into()]);
+        let mut thread_b = NarrativeThread::new("B", vec!["agent_b".into()]);
 
         let mut event_a =
-            ThreadEvent::new(thread_a.id, EventType::MemoryCreated, "a event", "agent_gamma");
+            ThreadEvent::new(thread_a.id, EventType::MemoryCreated, "a event", "agent_a");
         let event_b_id = Uuid::new_v4();
         event_a.link_to(event_b_id);
         thread_a.add_event(event_a);
@@ -196,7 +197,7 @@ mod tests {
             thread_id: thread_b.id,
             event_type: EventType::Decision,
             content: "b event".into(),
-            agent_id: "agent_alpha".into(),
+            agent_id: "agent_b".into(),
             timestamp: Utc::now(),
             linked_to: vec![],
         });

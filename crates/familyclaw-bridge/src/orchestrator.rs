@@ -168,7 +168,11 @@ pub struct TaskNode {
 
 impl TaskNode {
     /// Rakentaa solmun tunnisteella, otsikolla ja kuvauksella ilman rajoitteita.
-    pub fn new(id: impl Into<NodeId>, title: impl Into<String>, description: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<NodeId>,
+        title: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.into(),
             title: title.into(),
@@ -316,8 +320,7 @@ impl OrchestrationPlan {
     ///   tuntemattomaan solmuun (roikkuva dep).
     /// - [`FamilyClawError::InvalidInput`] jos verkossa on sykli.
     pub fn topo_order(&self) -> Result<Vec<NodeId>> {
-        let index: HashMap<&NodeId, &TaskNode> =
-            self.nodes.iter().map(|n| (&n.id, n)).collect();
+        let index: HashMap<&NodeId, &TaskNode> = self.nodes.iter().map(|n| (&n.id, n)).collect();
 
         // Lähtevien kaarien (dep → riippuva) muodostus + sisääntuloasteet.
         let mut in_degree: HashMap<&NodeId, usize> =
@@ -660,12 +663,9 @@ impl Orchestrator {
             plan_id: plan.id.clone(),
             node_count: completed.len(),
         };
-        let event = Event::with_payload(
-            EventKind::Custom(WORKFLOW_DONE.into()),
-            None,
-            &done_payload,
-        )
-        .unwrap_or_else(|_| Event::new(EventKind::Custom(WORKFLOW_DONE.into()), None));
+        let event =
+            Event::with_payload(EventKind::Custom(WORKFLOW_DONE.into()), None, &done_payload)
+                .unwrap_or_else(|_| Event::new(EventKind::Custom(WORKFLOW_DONE.into()), None));
         bus.publish(event);
 
         Ok(RunReport {
@@ -781,7 +781,10 @@ impl Orchestrator {
     /// suorittajalle sellaisenaan.
     fn turn_input(node: &TaskNode) -> serde_json::Value {
         let mut input = serde_json::Map::new();
-        input.insert("title".to_string(), serde_json::Value::String(node.title.clone()));
+        input.insert(
+            "title".to_string(),
+            serde_json::Value::String(node.title.clone()),
+        );
         input.insert(
             "description".to_string(),
             serde_json::Value::String(node.description.clone()),
@@ -881,10 +884,7 @@ mod tests {
     fn validate_rejects_duplicate_node_id() {
         let plan = OrchestrationPlan::new(
             "p",
-            vec![
-                TaskNode::new("a", "t", ""),
-                TaskNode::new("a", "t2", ""),
-            ],
+            vec![TaskNode::new("a", "t", ""), TaskNode::new("a", "t2", "")],
         );
         let err = plan.validate().expect_err("dup");
         assert!(matches!(err, FamilyClawError::InvalidInput(_)));
@@ -892,20 +892,15 @@ mod tests {
 
     #[test]
     fn validate_rejects_dangling_dependency() {
-        let plan = OrchestrationPlan::new(
-            "p",
-            vec![TaskNode::new("a", "t", "").with_deps(["ghost"])],
-        );
+        let plan =
+            OrchestrationPlan::new("p", vec![TaskNode::new("a", "t", "").with_deps(["ghost"])]);
         let err = plan.validate().expect_err("dangling");
         assert!(matches!(err, FamilyClawError::InvalidInput(_)));
     }
 
     #[test]
     fn validate_rejects_self_dependency() {
-        let plan = OrchestrationPlan::new(
-            "p",
-            vec![TaskNode::new("a", "t", "").with_deps(["a"])],
-        );
+        let plan = OrchestrationPlan::new("p", vec![TaskNode::new("a", "t", "").with_deps(["a"])]);
         let err = plan.validate().expect_err("self");
         assert!(matches!(err, FamilyClawError::InvalidInput(_)));
     }
@@ -999,8 +994,13 @@ mod tests {
         let now = ts(1000);
         // Agentilla on vain "browser"; vaaditaan myös "system.run" → ei kelpaa.
         let _weak = online_worker(&bridge, AgentRole::Executor, &["browser"], now).await;
-        let strong =
-            online_worker(&bridge, AgentRole::Executor, &["browser", "system.run"], now).await;
+        let strong = online_worker(
+            &bridge,
+            AgentRole::Executor,
+            &["browser", "system.run"],
+            now,
+        )
+        .await;
 
         let chosen = bridge_select(
             &bridge,
@@ -1289,7 +1289,10 @@ mod tests {
 
         let orch = Orchestrator::new(bridge.clone());
         let executor = MockTurnExecutor::new();
-        let report = orch.run_with(&plan, now, &executor).await.expect("run_with");
+        let report = orch
+            .run_with(&plan, now, &executor)
+            .await
+            .expect("run_with");
 
         assert_eq!(report.completed.len(), 2);
         assert_eq!(report.completed[0].0, NodeId::new("a"));
@@ -1324,7 +1327,10 @@ mod tests {
         let orch = Orchestrator::new(bridge.clone());
         // failing() tuottaa toimitteen ilman headline-kenttää → fulfill kaatuu.
         let executor = MockTurnExecutor::failing();
-        let report = orch.run_with(&plan, now, &executor).await.expect("run_with");
+        let report = orch
+            .run_with(&plan, now, &executor)
+            .await
+            .expect("run_with");
 
         // Mikään solmu ei valmistunut.
         assert!(report.completed.is_empty(), "no node should complete");
@@ -1392,7 +1398,9 @@ mod tests {
                 orch.run(&plan, now).await.expect("run")
             } else {
                 let executor = MockTurnExecutor::default();
-                orch.run_with(&plan, now, &executor).await.expect("run_with")
+                orch.run_with(&plan, now, &executor)
+                    .await
+                    .expect("run_with")
             };
             let mut out = Vec::new();
             for (node, task_id) in report.completed {
@@ -1425,7 +1433,10 @@ mod tests {
         let orch = Orchestrator::new(bridge.clone());
         let executor = MockTurnExecutor::with_failure(MockFailure::Error);
         // Ei roikkumista: kutsu palaa Ok-raportilla jossa ei valmistuneita.
-        let report = orch.run_with(&plan, now, &executor).await.expect("run_with");
+        let report = orch
+            .run_with(&plan, now, &executor)
+            .await
+            .expect("run_with");
         assert!(report.completed.is_empty(), "node must not complete on Err");
 
         // Tehtävä luotiin ja jäi ei-Done-tilaan.
@@ -1445,18 +1456,19 @@ mod tests {
 
         let plan = OrchestrationPlan::new(
             "ok",
-            vec![TaskNode::new(
-                "a",
-                "ta",
-                r#"{"brand":"DuckUps","audience":"founders"}"#,
-            )
-            .with_role(AgentRole::Executor)
-            .with_capability(homepage_capability())],
+            vec![
+                TaskNode::new("a", "ta", r#"{"brand":"DuckUps","audience":"founders"}"#)
+                    .with_role(AgentRole::Executor)
+                    .with_capability(homepage_capability()),
+            ],
         );
 
         let orch = Orchestrator::new(bridge.clone());
         let executor = MockTurnExecutor::new();
-        let report = orch.run_with(&plan, now, &executor).await.expect("run_with");
+        let report = orch
+            .run_with(&plan, now, &executor)
+            .await
+            .expect("run_with");
         assert_eq!(report.completed.len(), 1);
         let (_n, task_id) = &report.completed[0];
         let t = bridge.board().get(*task_id).await.expect("task");

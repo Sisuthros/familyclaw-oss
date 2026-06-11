@@ -16,7 +16,7 @@
 //! ## Vastuunjako
 //! - **Kuluttajapuoli (tämä moduuli):** sauman tyyppi + hermeettinen
 //!   [`MockTurnExecutor`] determinististä testausta ja paikallisajoa varten.
-//! - **Tuottajapuoli (myöhemmin):** agent_gamma toteuttaa `LiveTurnExecutor`:n
+//! - **Tuottajapuoli (myöhemmin):** Layer B -tuottaja toteuttaa `LiveTurnExecutor`:n
 //!   crateen `familyclaw-agent` **saman** [`TurnExecutor`]-trapin taakse, jolloin
 //!   se kytkee oikean LLM-/kuljetuskerroksen muuttamatta orkesteria lainkaan.
 //!
@@ -107,8 +107,8 @@ impl OrchestratedTurn {
 ///
 /// Tämä on **se sauma**: [`crate::orchestrator::Orchestrator`] riippuu tästä
 /// trapista, ei koskaan konkreettisesta agentista. Kuluttajapuoli (orkesteri +
-/// [`MockTurnExecutor`]) elää tässä cratessa; tuottajapuolen (agent_gamma
-/// `LiveTurnExecutor` cratessa `familyclaw-agent`) on tarkoitus toteuttaa
+/// [`MockTurnExecutor`]) elää tässä cratessa; tuottajapuolen (`LiveTurnExecutor`
+/// cratessa `familyclaw-agent`) on tarkoitus toteuttaa
 /// **sama** rajapinta, jolloin oikea LLM-/kuljetuskerros kytkeytyy muuttamatta
 /// orkesteria.
 ///
@@ -383,7 +383,10 @@ mod tests {
         board.accept(contract.id, ts(2)).await.expect("accept");
 
         let mock = MockTurnExecutor::new();
-        let turn = turn_with(json!({ "brand": "DuckUps", "audience": "founders" }), provider);
+        let turn = turn_with(
+            json!({ "brand": "DuckUps", "audience": "founders" }),
+            provider,
+        );
         let deliverable = mock.execute(turn).await.expect("execute");
 
         let fulfilled = board
@@ -400,10 +403,7 @@ mod tests {
         let turn = turn_with(json!({ "ping": "pong" }), assignee);
         let deliverable = mock.execute(turn).await.expect("execute");
         assert_eq!(deliverable.payload["result"], json!({ "ping": "pong" }));
-        assert_eq!(
-            deliverable.payload["assignee"],
-            json!(assignee.to_string())
-        );
+        assert_eq!(deliverable.payload["assignee"], json!(assignee.to_string()));
     }
 
     #[tokio::test]
@@ -469,8 +469,7 @@ mod tests {
     #[tokio::test]
     async fn dyn_trait_object_is_usable() {
         // Sauma on käytettävissä trait-objektina (orkesteri pitää Arc<dyn _>).
-        let exec: std::sync::Arc<dyn TurnExecutor> =
-            std::sync::Arc::new(MockTurnExecutor::new());
+        let exec: std::sync::Arc<dyn TurnExecutor> = std::sync::Arc::new(MockTurnExecutor::new());
         let assignee = AgentId::new();
         let deliverable = exec
             .execute(turn_with(json!({ "x": 1 }), assignee))

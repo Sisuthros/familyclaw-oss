@@ -74,8 +74,8 @@ pub use discord::DiscordChannel;
 
 #[cfg(feature = "discord")]
 pub use discord_interactions::{
-    verify_signature, DiscordInteraction, RESPONSE_CHANNEL_MESSAGE, RESPONSE_DEFERRED_CHANNEL_MESSAGE,
-    RESPONSE_PONG,
+    verify_signature, DiscordInteraction, RESPONSE_CHANNEL_MESSAGE,
+    RESPONSE_DEFERRED_CHANNEL_MESSAGE, RESPONSE_PONG,
 };
 
 #[cfg(feature = "telegram")]

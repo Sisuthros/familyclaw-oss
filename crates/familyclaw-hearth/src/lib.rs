@@ -186,6 +186,7 @@ pub const fn version() -> &'static str {
 mod tests {
     use super::*;
     use db::InMemoryHearthStore;
+    use emotional_state::EmotionalVector;
     use familyclaw_memory::LocalJsonStore;
 
     #[test]
@@ -237,7 +238,6 @@ mod tests {
         let store = InMemoryHearthStore::new(mem_store);
         let mut hearth = Hearth::new(store);
 
-        use emotional_state::EmotionalVector;
         hearth
             .set_emotional_state(
                 "agent_a",

@@ -3,13 +3,13 @@
 //!
 //! Tämä testi todistaa luotettavuustakuun jonka varaan koko silta rakentuu:
 //! **sama suunnitelma joka ajetaan tässä mock-suorittajalla ajaa myöhemmin
-//! agent_gamma `LiveTurnExecutor`:lla oikealla LLM:llä — ilman yhtäkään muutosta
+//! **Layer B `LiveTurnExecutor`:lla oikealla LLM:llä — ilman yhtäkään muutosta
 //! orkesteriin.** Orkesteri riippuu vain [`TurnExecutor`]-saumasta, ei
 //! konkreettisesta suorittajasta (ks. [`docs/HOMEPAGE_FACTORY.md`]).
 //!
 //! ## Skenaario
 //! Kolme agenttia tekevät yhteistyötä etusivun rakentamiseksi:
-//! - **agent_epsilon** ([`AgentRole::Strategy`]) — suunnittelija, mainostaa kykyä
+//! - **agent_alpha** ([`AgentRole::Strategy`]) — suunnittelija, mainostaa kykyä
 //!   `homepage_design`.
 //! - **agent_beta** ([`AgentRole::Scout`]) — orkesteroija/katselmoija.
 //! - **agent_gamma** ([`AgentRole::Executor`]) — julkaisija, kyky `deploy`.
@@ -102,12 +102,8 @@ fn homepage_design_capability() -> Capability {
 /// Tulosskeema ja jälkiehdot ovat identtiset täyden variantin kanssa, joten
 /// toimitteen todennus (`headline`, `sections`, `cta` + jälkiehdot) on sama.
 fn homepage_design_node_capability() -> Capability {
-    Capability::new(
-        "homepage_design",
-        Schema::empty(),
-        homepage_design_output(),
-    )
-    .with_postconditions(homepage_design_postconditions())
+    Capability::new("homepage_design", Schema::empty(), homepage_design_output())
+        .with_postconditions(homepage_design_postconditions())
 }
 
 /// `deploy`-kyky: tulos jolla on vähintään `url`-kenttä, jälkiehto
@@ -155,28 +151,36 @@ fn factory_plan() -> OrchestrationPlan {
     )
 }
 
-/// Rekisteröi tehtaan kolme agenttia (agent_epsilon/agent_beta/agent_gamma) onlineksi.
+/// Rekisteröi tehtaan kolme agenttia (agent_alpha/agent_beta/agent_gamma) onlineksi.
 async fn register_factory_agents(
     bridge: &FamilyBridge,
     now: Timestamp,
 ) -> (AgentId, AgentId, AgentId) {
     // Kiinteät id:t determinismin vuoksi.
-    let agent_epsilon = AgentId::from_uuid(uuid::Uuid::from_u128(0xA0));
+    let agent_alpha = AgentId::from_uuid(uuid::Uuid::from_u128(0xA0));
     let agent_beta = AgentId::from_uuid(uuid::Uuid::from_u128(0x10));
     let agent_gamma = AgentId::from_uuid(uuid::Uuid::from_u128(0xB0));
 
-    // agent_epsilon — suunnittelija (Strategy), mainostaa homepage_design-kyvyn.
+    // agent_alpha — suunnittelija (Strategy), mainostaa homepage_design-kyvyn.
     online_agent(
         bridge,
-        agent_epsilon,
-        "agent_epsilon",
+        agent_alpha,
+        "agent_alpha",
         AgentRole::Strategy,
         &["homepage_design"],
         now,
     )
     .await;
     // agent_beta — orkesteroija/katselmoija (Scout).
-    online_agent(bridge, agent_beta, "agent_beta", AgentRole::Scout, &["review"], now).await;
+    online_agent(
+        bridge,
+        agent_beta,
+        "agent_beta",
+        AgentRole::Scout,
+        &["review"],
+        now,
+    )
+    .await;
     // agent_gamma — julkaisija (Executor), kyky deploy.
     online_agent(
         bridge,
@@ -188,7 +192,7 @@ async fn register_factory_agents(
     )
     .await;
 
-    // agent_epsilon mainostaa kykynsä kykyrekisteriin (CapabilityRegistry.advertise).
+    // agent_alpha mainostaa kykynsä kykyrekisteriin (CapabilityRegistry.advertise).
     // FamilyBridge (KERROS A) ei vielä omista kykyrekisteriä, joten käytämme
     // erillistä rekisteriä todistaaksemme advertise-reitin toimivuuden.
     let registry = CapabilityRegistry::new();
@@ -197,10 +201,10 @@ async fn register_factory_agents(
     assert_eq!(
         registry.find_by_name("homepage_design").await.len(),
         1,
-        "agent_epsilon's homepage_design capability is advertised"
+        "agent_alpha's homepage_design capability is advertised"
     );
 
-    (agent_epsilon, agent_beta, agent_gamma)
+    (agent_alpha, agent_beta, agent_gamma)
 }
 
 // =============================================================================
@@ -211,7 +215,7 @@ async fn register_factory_agents(
 async fn homepage_factory_runs_end_to_end() {
     let bridge = FamilyBridge::new();
     let now = ts(1_700_000_000);
-    let (agent_epsilon, _agent_beta, _agent_gamma) = register_factory_agents(&bridge, now).await;
+    let (agent_alpha, _agent_beta, _agent_gamma) = register_factory_agents(&bridge, now).await;
 
     // Tilaa tapahtumaväylä ENNEN ajoa nähdäksemme step_assigned-järjestyksen.
     let mut events = bridge.subscribe();
@@ -250,7 +254,7 @@ async fn homepage_factory_runs_end_to_end() {
     }
 
     // --- design-toimite läpäisee homepage_design-sopimuksen (Fulfilled). ----
-    // Toistamme orkesterin sopimusrajan eksplisiittisesti: agent_epsilon suorittaa
+    // Toistamme orkesterin sopimusrajan eksplisiittisesti: agent_alpha suorittaa
     // saman vuoron, ja toimite ajetaan linkitetyn sopimuksen `fulfill`-
     // todennuksen läpi (tulosskeema + jälkiehdot). Linkki sopimuksesta
     // design-tehtävään asetetaan (Contract.link = Some(task_id)).
@@ -267,7 +271,7 @@ async fn homepage_factory_runs_end_to_end() {
 
     // propose validoi BrandBrief-syöteskeemaa vasten.
     let contract = board
-        .propose(&cap, agent_epsilon, agent_epsilon, brief.clone(), now)
+        .propose(&cap, agent_alpha, agent_alpha, brief.clone(), now)
         .await
         .expect("propose homepage_design contract");
     // Linkitä sopimus design-tehtävään.
@@ -276,12 +280,12 @@ async fn homepage_factory_runs_end_to_end() {
     board.insert(linked).await;
     board.accept(contract.id, now).await.expect("accept");
 
-    // agent_epsilon suorittaa vuoron mock-saumalla → HomepageDesign-toimite.
+    // agent_alpha suorittaa vuoron mock-saumalla → HomepageDesign-toimite.
     let turn = OrchestratedTurn::new(
         plan.id.clone(),
         NodeId::new("design"),
         *design_task,
-        agent_epsilon,
+        agent_alpha,
         "design the homepage",
         brief.to_string(),
         brief.clone(),
@@ -300,7 +304,11 @@ async fn homepage_factory_runs_end_to_end() {
         "design deliverable must pass output schema + postconditions"
     );
     // Sopimus on linkitetty design-tehtävään.
-    assert_eq!(fulfilled.link, Some(*design_task), "contract links to design task");
+    assert_eq!(
+        fulfilled.link,
+        Some(*design_task),
+        "contract links to design task"
+    );
     // Toimitteen muoto: headline ei-tyhjä, sections >= 1, cta läsnä.
     let payload = &deliverable.payload;
     assert!(
@@ -308,7 +316,9 @@ async fn homepage_factory_runs_end_to_end() {
         "headline non-empty"
     );
     assert!(
-        payload["sections"].as_array().is_some_and(|s| !s.is_empty()),
+        payload["sections"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty()),
         "sections has at least one entry"
     );
     assert!(payload["cta"].as_str().is_some(), "cta present");
@@ -343,7 +353,7 @@ async fn homepage_factory_runs_end_to_end() {
 async fn malformed_design_halts_factory_at_contract_boundary() {
     let bridge = FamilyBridge::new();
     let now = ts(1_700_000_000);
-    let (agent_epsilon, _agent_beta, _agent_gamma) = register_factory_agents(&bridge, now).await;
+    let (agent_alpha, _agent_beta, _agent_gamma) = register_factory_agents(&bridge, now).await;
 
     let mut events = bridge.subscribe();
 
@@ -367,7 +377,7 @@ async fn malformed_design_halts_factory_at_contract_boundary() {
     // --- design-tehtävä luotiin mutta EI ole Done (jäi Active-tilaan). ------
     let design_tasks: Vec<_> = bridge
         .board()
-        .list_for_assignee(agent_epsilon)
+        .list_for_assignee(agent_alpha)
         .await
         .into_iter()
         .filter(|t| t.title == "design the homepage")
@@ -397,7 +407,7 @@ async fn malformed_design_halts_factory_at_contract_boundary() {
 
     // --- design-sopimus menee Failed-tilaan fulfill():ssä (eksplisiittinen
     //     todistus samalla viallisella toimitteella). ------------------------
-    prove_malformed_design_fails_contract(agent_epsilon, &plan, design_tasks[0].id, &executor, now).await;
+    prove_malformed_design_fails_contract(agent_alpha, &plan, design_tasks[0].id, &executor, now).await;
 
     // --- Tapahtumat: vain design osoitettiin; review/deploy ei. -------------
     let mut assigned_nodes: Vec<String> = Vec::new();
@@ -430,7 +440,7 @@ async fn malformed_design_halts_factory_at_contract_boundary() {
 /// (2) sopimus päätyy [`ContractStatus::Failed`]-tilaan, (3) sama viallinen
 /// hyötykuorma ei läpäise tulosskeemaa erilliselläkään `is_valid`-tarkistuksella.
 async fn prove_malformed_design_fails_contract(
-    agent_epsilon: AgentId,
+    agent_alpha: AgentId,
     plan: &OrchestrationPlan,
     design_task: familyclaw_bridge::TaskId,
     executor: &MockTurnExecutor,
@@ -440,7 +450,7 @@ async fn prove_malformed_design_fails_contract(
     let brief = serde_json::json!({ "brand": "DuckUps", "audience": "founders" });
     let board = ContractBoard::new();
     let contract = board
-        .propose(&cap, agent_epsilon, agent_epsilon, brief.clone(), now)
+        .propose(&cap, agent_alpha, agent_alpha, brief.clone(), now)
         .await
         .expect("propose");
     board.accept(contract.id, now).await.expect("accept");
@@ -450,7 +460,7 @@ async fn prove_malformed_design_fails_contract(
         plan.id.clone(),
         NodeId::new("design"),
         design_task,
-        agent_epsilon,
+        agent_alpha,
         "design the homepage",
         brief.to_string(),
         brief.clone(),
@@ -481,7 +491,7 @@ async fn prove_malformed_design_fails_contract(
     );
 
     // Lisätodiste: sama viallinen hyötykuorma ei ole tulosskeeman mukainen.
-    let bad_deliverable = Deliverable::new(agent_epsilon, bad_payload, now);
+    let bad_deliverable = Deliverable::new(agent_alpha, bad_payload, now);
     assert!(
         !cap.output.is_valid(&bad_deliverable.payload),
         "malformed payload is not schema-valid (headline missing)"

@@ -134,12 +134,15 @@ impl ContractMessage {
     #[must_use]
     pub fn from_contract_status(contract: &Contract) -> Option<Self> {
         match contract.status {
-            ContractStatus::Fulfilled => contract.deliverable.clone().map(|deliverable| {
-                ContractMessage::Fulfill {
-                    contract_id: contract.id,
-                    deliverable,
-                }
-            }),
+            ContractStatus::Fulfilled => {
+                contract
+                    .deliverable
+                    .clone()
+                    .map(|deliverable| ContractMessage::Fulfill {
+                        contract_id: contract.id,
+                        deliverable,
+                    })
+            }
             ContractStatus::Rejected => Some(ContractMessage::Reject {
                 contract_id: contract.id,
                 provider: contract.provider,

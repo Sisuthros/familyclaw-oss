@@ -29,8 +29,8 @@
 //! polkuja. Agentin nimi, malli, sielu, kanava ja reply-kohde annetaan kaikki
 //! ajonaikaisesti kutsujalta (gateway lukee ne ympäristöstä — KERROS B).
 
-use std::sync::Arc;
 use std::env;
+use std::sync::Arc;
 
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, Agent, ErasedMemoryStore, LlmEndpointResolver, Soul,
@@ -38,8 +38,8 @@ use familyclaw_agent::{
 use familyclaw_bus::{BeingId, BusHandle, ResonanceBus, ResonanceMessage};
 use familyclaw_channels::Channel;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
-use familyclaw_durable::{DurableContext, FileJournal, InMemoryJournal, Journal};
 use familyclaw_dream::DreamCycle;
+use familyclaw_durable::{DurableContext, FileJournal, InMemoryJournal, Journal};
 use familyclaw_memory::LocalJsonStore;
 use ractor::ActorRef;
 
@@ -151,9 +151,8 @@ pub async fn build_family(
     } else {
         let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
         let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(InMemoryJournal::new());
-        let durable =
-            DurableContext::new(Arc::clone(&dream_j))
-                .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+        let durable = DurableContext::new(Arc::clone(&dream_j))
+            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
         (memory, durable, Some(dream_j))
     };
 
@@ -162,7 +161,9 @@ pub async fn build_family(
         let mut registry = familyclaw_hearth::anchor_registry::AnchorRegistry::new();
         if let Err(e) = registry.register(&agent_cfg.name, &soul.essence) {
             tracing::warn!("Anchor registration failed (non-fatal): {e}");
-        } else { tracing::info!("Identity anchor registered for {}", agent_cfg.name); }
+        } else {
+            tracing::info!("Identity anchor registered for {}", agent_cfg.name);
+        }
     }
 
     // 6. Rakenna agentti ja kytke reply-sink + staattinen reply-kohde.
@@ -225,7 +226,9 @@ pub async fn build_family(
                     let journal: &(dyn Journal + Send + Sync) = &*dream_journal;
                     let cycle = DreamCycle::new(store);
                     match cycle.run(journal, time::now()).await {
-                        Ok(report) => tracing::info!(target: "familyclaw::dream", scanned=report.scanned, merged=report.merged, dropped=report.dropped, strengthened=report.strengthened, archived=report.archived, absolutized=report.dates_absolutized, "Dream cycle completed"),
+                        Ok(report) => {
+                            tracing::info!(target: "familyclaw::dream", scanned=report.scanned, merged=report.merged, dropped=report.dropped, strengthened=report.strengthened, archived=report.archived, absolutized=report.dates_absolutized, "Dream cycle completed");
+                        }
                         Err(e) => tracing::warn!("Dream cycle failed: {e}"),
                     }
                 }

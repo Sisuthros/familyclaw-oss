@@ -5,6 +5,26 @@ All notable changes to FamilyClaw will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha.2] - 2026-06-11
+
+### Added
+- **dream-cron** — `familyclaw-dream` päiväkohtainen idempotentti cron-binääri
+- **Discord inbound** — `POST /discord/interactions` gatewayssä (Ed25519)
+- **scripts/public-demo.ps1** — geneerinen julkinen demo (minimal-gateway + test + bench)
+- **.env.example** — Kerros B -pohja repossa (tyhjät salaisuudet)
+- **docs/handoff/agent_gamma_LIVE_TURN_EXECUTOR.md** — agent_gamma omistaa agent/memory-live-executorin
+
+### Changed
+- **OSS sanitization** — testit ja kommentit käyttävät `agent_a` / `agent_alpha` eikä perhenimiä
+- **README / QUICKSTART / RUNBOOK** — julkinen polku ensin, perheversio Layer B:n ulkopuolella
+
+### Verified
+- `cargo test --workspace` — PASS
+- `cargo run -p familyclaw-bench --bin bench -- all` — 6/6 PASS
+- `scripts/public-demo.ps1` — PASS
+
+---
+
 ## [0.1.0-alpha] - 2026-06-09
 
 ### Added

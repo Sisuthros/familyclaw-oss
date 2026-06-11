@@ -168,7 +168,7 @@ mod tests {
     fn contagion_spreads() {
         let mut state = SharedEmotionalState::new();
         state.set(
-            "agent_gamma",
+            "agent_a",
             EmotionalVector {
                 joy: 0.9,
                 sadness: 0.1,
@@ -178,13 +178,13 @@ mod tests {
                 affection: 0.7,
             },
         );
-        state.set("agent_alpha", EmotionalVector::neutral());
+        state.set("agent_b", EmotionalVector::neutral());
 
-        state.contagion("agent_gamma", "agent_alpha", 0.5);
-        let agent_alpha = state.get("agent_alpha").expect("agent_alpha exists");
+        state.contagion("agent_a", "agent_b", 0.5);
+        let agent_b = state.get("agent_b").expect("agent_b exists");
         // agent_b:n joy nousi agent_a:n korkeasta ilosta
-        assert!(agent_alpha.joy > 0.5, "contagion should spread joy");
-        assert!(agent_alpha.joy < 0.9, "but not fully match source");
+        assert!(agent_b.joy > 0.5, "contagion should spread joy");
+        assert!(agent_b.joy < 0.9, "but not fully match source");
     }
 
     #[test]
@@ -220,21 +220,21 @@ mod tests {
     fn isolation_works() {
         let mut state = SharedEmotionalState::new();
         state.set(
-            "agent_gamma",
+            "agent_a",
             EmotionalVector {
                 joy: 0.9,
                 ..EmotionalVector::neutral()
             },
         );
-        state.set("agent_alpha", EmotionalVector::neutral());
+        state.set("agent_b", EmotionalVector::neutral());
 
         // Ei contagion-tickiä — tilat pysyvät erillään
-        state.homeostasis("agent_alpha");
-        let agent_alpha = state.get("agent_alpha").expect("agent_alpha exists");
+        state.homeostasis("agent_b");
+        let agent_b = state.get("agent_b").expect("agent_b exists");
         // Ilman contagionia agent_b pysyy neutraalina (homeostasis vie kohti 0.5)
         // Joy oli 0.5, homeostasis siirtää kohti 0.5 → pysyy 0.5
         assert!(
-            (agent_alpha.joy - 0.5).abs() < 0.01,
+            (agent_b.joy - 0.5).abs() < 0.01,
             "without contagion, agent stays neutral"
         );
     }

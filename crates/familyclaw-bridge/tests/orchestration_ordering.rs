@@ -28,7 +28,8 @@ async fn online_agent(
     caps: &[&str],
     now: familyclaw_core::time::Timestamp,
 ) {
-    let info = AgentInfo::new(id, name, role, HostKind::Local).with_capabilities(caps.iter().copied());
+    let info =
+        AgentInfo::new(id, name, role, HostKind::Local).with_capabilities(caps.iter().copied());
     bridge.register_agent(info).await.expect("register agent");
     bridge.heartbeat(id, now).await.expect("heartbeat");
 }
@@ -154,7 +155,10 @@ async fn dependent_node_blocks_when_predecessor_has_no_worker() {
     );
 
     let orch = Orchestrator::new(bridge.clone());
-    let err = orch.run(&plan, now).await.expect_err("A has no eligible worker");
+    let err = orch
+        .run(&plan, now)
+        .await
+        .expect_err("A has no eligible worker");
     assert!(matches!(err, familyclaw_core::FamilyClawError::NotFound(_)));
 
     // B:tä ei koskaan osoitettu: ainoalla online-agentilla ei ole tehtäviä.

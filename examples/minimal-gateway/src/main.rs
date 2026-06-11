@@ -29,7 +29,10 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "minimal-gateway", about = "FamilyClaw minimal demo — 1 agent + bus")]
+#[command(
+    name = "minimal-gateway",
+    about = "FamilyClaw minimal demo — 1 agent + bus"
+)]
 struct Cli {
     /// Kuinka kauan demo ajetaan sekunteina (0 = Ctrl-C:hen asti)
     #[arg(short, long, default_value = "10")]
@@ -40,7 +43,9 @@ struct Cli {
 async fn main() -> Result<()> {
     // Tracing init
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .init();
 
@@ -74,14 +79,19 @@ async fn main() -> Result<()> {
         channel_a,
         "mock-a".to_string(), // reply_target
         &resolver,
-    ).await?;
+    )
+    .await?;
 
     info!("✅ FamilyRuntime running (bus + agent + channel)");
 
     // 6. Inject a test message to agent_a
     info!("📤 Injecting test message to agent_a...");
-    let msg = InboundMessage::new("user", "demo-conversation", "Hello agent_a, remember this: FamilyClaw rocks!")
-        .map_err(FamilyClawError::from)?;
+    let msg = InboundMessage::new(
+        "user",
+        "demo-conversation",
+        "Hello agent_a, remember this: FamilyClaw rocks!",
+    )
+    .map_err(FamilyClawError::from)?;
     channel_a_clone.inject(msg).map_err(FamilyClawError::from)?;
 
     // 7. Wait a bit for message to propagate through bus → agent

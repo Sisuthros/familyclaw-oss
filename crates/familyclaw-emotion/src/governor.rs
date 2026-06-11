@@ -7,8 +7,8 @@
 //! This is the **KERNEL** of the emotion -> action pipeline (design §2.3,
 //! the missing piece from Phase 1 of the roadmap). The governor is generic —
 //! it reads any [`EmotionState`] and emits a deterministic decision based on
-//! thresholds and a [`GoverningProfile`]. Per-being weights (agent_alpha V130,
-//! agent_gamma's V130, etc.) live in KERROS B as a `GoverningProfile` and are
+//! thresholds and a [`GoverningProfile`]. Per-being weights (agent-specific V130
+//! calibrations, etc.) live in KERROS B as a `GoverningProfile` and are
 //! loaded at runtime; the kernel ships only with a [`default_governing_profile`]
 //! that yields safe, conservative decisions.
 //!
@@ -110,7 +110,7 @@ impl std::fmt::Display for ActionDecision {
 /// independent and independently overridable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GoverningProfile {
-    /// Human-readable label (e.g. "default", "agent_alpha-v130", "agent_gamma-v130").
+    /// Human-readable label (e.g. "default", "agent_a-v130", "agent_b-v130").
     pub label: String,
     /// Fear/anger/shame dimension threshold above which the governor
     /// refuses to engage. `0.0..=100.0`.

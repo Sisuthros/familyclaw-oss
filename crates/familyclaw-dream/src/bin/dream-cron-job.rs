@@ -20,11 +20,10 @@
 
 use std::sync::Arc;
 
-use familyclaw_core::{time, Result, FamilyClawError};
+use familyclaw_core::{time, FamilyClawError, Result};
 use familyclaw_dream::{desire_clock::DesireClock, DreamConfig, DreamCycle};
 use familyclaw_durable::{context::DurableContext, FileJournal};
 use familyclaw_memory::LocalJsonStore;
-use tokio;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,12 +38,18 @@ async fn main() -> Result<()> {
     tracing::info!("Käynnistetään unijakso...");
 
     // Lue data-hakemisto ympäristöstä
-    let data_dir = std::env::var("FAMILYCLAW_DATA_DIR")
-        .map_err(|_| FamilyClawError::config("FAMILYCLAW_DATA_DIR ei asetettu — vaaditaan memory.json ja journal.jsonl"))?;
+    let data_dir = std::env::var("FAMILYCLAW_DATA_DIR").map_err(|_| {
+        FamilyClawError::config(
+            "FAMILYCLAW_DATA_DIR ei asetettu — vaaditaan memory.json ja journal.jsonl",
+        )
+    })?;
 
     let data_path = std::path::Path::new(&data_dir);
-    std::fs::create_dir_all(data_path)
-        .map_err(|e| FamilyClawError::config(format!("FAMILYCLAW_DATA_DIR hakemiston luonti epäonnistui: {e}")))?;
+    std::fs::create_dir_all(data_path).map_err(|e| {
+        FamilyClawError::config(format!(
+            "FAMILYCLAW_DATA_DIR hakemiston luonti epäonnistui: {e}"
+        ))
+    })?;
 
     let journal_path = data_path.join("journal.jsonl");
     let memory_path = data_path.join("memory.json");
@@ -53,14 +58,15 @@ async fn main() -> Result<()> {
     let journal = Arc::new(FileJournal::open(&journal_path)?);
     let store = Arc::new(LocalJsonStore::open(&memory_path).await?);
 
-    let _agent_name = std::env::var("FAMILYCLAW_AGENT_NAME").unwrap_or_else(|_| "dream".to_string());
+    let _agent_name =
+        std::env::var("FAMILYCLAW_AGENT_NAME").unwrap_or_else(|_| "dream".to_string());
 
     let now = time::now();
     let _clock = DesireClock::default();
 
     // Tarkista onko unijakso jo ajettu tänä yölle (päiväkohtainen idempotenssi)
     let mut context = DurableContext::new(journal.clone())?;
-    let step_name = format!("dream_cycle:{}", chrono::DateTime::<chrono::Utc>::from(now).format("%Y-%m-%d"));
+    let step_name = format!("dream_cycle:{}", now.format("%Y-%m-%d"));
     let already_run = context.has_run_step(&step_name)?;
 
     if already_run {

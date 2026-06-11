@@ -67,13 +67,13 @@
 
 pub mod being;
 pub mod bus;
-pub mod message;
 pub mod latent_channel;
+pub mod message;
 
 pub use being::{BeingInfo, BeingSnapshot, CollectedLog, CollectorBeing, CollectorState};
 pub use bus::{BusHandle, BusOp, BusState, ResonanceBus};
-pub use message::{BeingId, BusMessage, MessageOrigin, ResonanceMessage, TaskEventKind};
 pub use latent_channel::BusLatentChannel;
+pub use message::{BeingId, BusMessage, MessageOrigin, ResonanceMessage, TaskEventKind};
 
 // Re-export ydinvirhetyypit, jotta kutsujan ei tarvitse riippua
 // `familyclaw-core`sta erikseen bussia käyttäessään.

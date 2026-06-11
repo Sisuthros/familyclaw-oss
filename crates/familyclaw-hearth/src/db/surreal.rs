@@ -7,11 +7,13 @@
 
 #[cfg(feature = "surreal")]
 pub mod surreal {
+    use crate::{
+        emotional_state::EmotionalVector, narrative::EventType, HearthStore, NarrativeThread,
+    };
+    use familyclaw_core::Result;
     use std::sync::Arc;
     use surrealdb::{engine::any::Any, Surreal};
     use uuid::Uuid;
-    use familyclaw_core::Result;
-    use crate::{HearthStore, NarrativeThread, emotional_state::EmotionalVector, narrative::EventType};
 
     /// SurrealDB-backed HearthStore implementation.
     #[derive(Clone)]
@@ -32,12 +34,21 @@ pub mod surreal {
         /// Returns error if connection or schema initialization fails.
         pub async fn connect(conn_str: &str) -> Result<Self> {
             // SurrealDB v3: use engine::any::connect which handles all endpoint types
-            let db = surrealdb::engine::any::connect(conn_str).await
-                .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("SurrealDB connect failed: {e}")))?;
+            let db = surrealdb::engine::any::connect(conn_str)
+                .await
+                .map_err(|e| {
+                    familyclaw_core::FamilyClawError::Memory(format!(
+                        "SurrealDB connect failed: {e}"
+                    ))
+                })?;
 
             // Use namespace/database
-            db.use_ns("familyclaw").use_db("hearth").await
-                .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("SurrealDB ns/db failed: {e}")))?;
+            db.use_ns("familyclaw")
+                .use_db("hearth")
+                .await
+                .map_err(|e| {
+                    familyclaw_core::FamilyClawError::Memory(format!("SurrealDB ns/db failed: {e}"))
+                })?;
 
             // Initialize schema
             Self::init_schema(&db).await?;
@@ -92,8 +103,9 @@ DEFINE FIELD protected ON anchor TYPE bool;
 DEFINE FIELD decay_class ON anchor TYPE string;
 "#;
 
-            db.query(schema_sql).await
-                .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("Schema init failed: {e}")))?;
+            db.query(schema_sql).await.map_err(|e| {
+                familyclaw_core::FamilyClawError::Memory(format!("Schema init failed: {e}"))
+            })?;
 
             Ok(())
         }
@@ -120,11 +132,15 @@ DEFINE FIELD decay_class ON anchor TYPE string;
                     .bind(("thread_id", thread_id.to_string()))
                     .await
                     .map_err(|e| {
-                        familyclaw_core::FamilyClawError::Memory(format!("SurrealDB query failed: {e}"))
+                        familyclaw_core::FamilyClawError::Memory(format!(
+                            "SurrealDB query failed: {e}"
+                        ))
                     })?
                     .take(0)
                     .map_err(|e| {
-                        familyclaw_core::FamilyClawError::Memory(format!("SurrealDB take failed: {e}"))
+                        familyclaw_core::FamilyClawError::Memory(format!(
+                            "SurrealDB take failed: {e}"
+                        ))
                     })?;
 
                 if rows.is_empty() {
@@ -135,7 +151,11 @@ DEFINE FIELD decay_class ON anchor TYPE string;
                 let thread = NarrativeThread {
                     id: Uuid::parse_str(row.get("id").and_then(|v| v.as_str()).unwrap_or(""))
                         .unwrap_or_else(|_| Uuid::nil()),
-                    title: row.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    title: row
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     participants: row
                         .get("participants")
                         .and_then(|v| v.as_array())
@@ -185,7 +205,8 @@ DEFINE FIELD decay_class ON anchor TYPE string;
         fn get_emotional_state(
             &self,
             agent_id: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<EmotionalVector>> + Send + '_>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<EmotionalVector>> + Send + '_>>
+        {
             let db = Arc::clone(&self.db);
             let agent_id = agent_id.to_string();
             Box::pin(async move {
@@ -194,11 +215,15 @@ DEFINE FIELD decay_class ON anchor TYPE string;
                     .bind(("agent_id", agent_id))
                     .await
                     .map_err(|e| {
-                        familyclaw_core::FamilyClawError::Memory(format!("SurrealDB query failed: {e}"))
+                        familyclaw_core::FamilyClawError::Memory(format!(
+                            "SurrealDB query failed: {e}"
+                        ))
                     })?
                     .take(0)
                     .map_err(|e| {
-                        familyclaw_core::FamilyClawError::Memory(format!("SurrealDB take failed: {e}"))
+                        familyclaw_core::FamilyClawError::Memory(format!(
+                            "SurrealDB take failed: {e}"
+                        ))
                     })?;
 
                 if rows.is_empty() {
@@ -211,7 +236,10 @@ DEFINE FIELD decay_class ON anchor TYPE string;
                     sadness: row.get("sadness").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
                     curiosity: row.get("curiosity").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
                     anxiety: row.get("anxiety").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                    confidence: row.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    confidence: row
+                        .get("confidence")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0) as f32,
                     affection: row.get("affection").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
                 })
             })
@@ -251,23 +279,32 @@ DEFINE FIELD decay_class ON anchor TYPE string;
 
         fn list_agents_with_emotion(
             &self,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send + '_>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send + '_>>
+        {
             let db = Arc::clone(&self.db);
             Box::pin(async move {
                 let rows: Vec<serde_json::Value> = db
                     .query("SELECT agent_id FROM emotional_state")
                     .await
                     .map_err(|e| {
-                        familyclaw_core::FamilyClawError::Memory(format!("SurrealDB query failed: {e}"))
+                        familyclaw_core::FamilyClawError::Memory(format!(
+                            "SurrealDB query failed: {e}"
+                        ))
                     })?
                     .take(0)
                     .map_err(|e| {
-                        familyclaw_core::FamilyClawError::Memory(format!("SurrealDB take failed: {e}"))
+                        familyclaw_core::FamilyClawError::Memory(format!(
+                            "SurrealDB take failed: {e}"
+                        ))
                     })?;
 
                 Ok(rows
                     .iter()
-                    .filter_map(|v| v.get("agent_id").and_then(|id| id.as_str()).map(String::from))
+                    .filter_map(|v| {
+                        v.get("agent_id")
+                            .and_then(|id| id.as_str())
+                            .map(String::from)
+                    })
                     .collect())
             })
         }

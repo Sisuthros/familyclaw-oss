@@ -102,8 +102,8 @@ mod tests {
 
     #[test]
     fn symmetric() {
-        let a = "agent_alpha built the bridge today";
-        let b = "the bridge was built by agent_alpha";
+        let a = "agent_a built the bridge today";
+        let b = "the bridge was built by agent_a";
         assert!((jaccard(a, b) - jaccard(b, a)).abs() < 1e-6);
     }
 

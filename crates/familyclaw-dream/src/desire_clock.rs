@@ -157,7 +157,7 @@ mod tests {
                 let expected = Utc.with_ymd_and_hms(2026, 6, 4, 3, 0, 0).unwrap();
                 assert_eq!(at, expected);
             }
-            _ => panic!("odotettiin Tonight, saatiin {:?}", next),
+            _ => panic!("odotettiin Tonight, saatiin {next:?}"),
         }
     }
 
@@ -171,7 +171,7 @@ mod tests {
                 let expected = Utc.with_ymd_and_hms(2026, 6, 5, 3, 0, 0).unwrap();
                 assert_eq!(at, expected);
             }
-            _ => panic!("odotettiin Tomorrow, saatiin {:?}", next),
+            _ => panic!("odotettiin Tomorrow, saatiin {next:?}"),
         }
     }
 
@@ -185,7 +185,7 @@ mod tests {
                 let expected = Utc.with_ymd_and_hms(2026, 6, 3, 3, 0, 0).unwrap();
                 assert_eq!(should_have_run_at, expected);
             }
-            _ => panic!("odotettiin Missed, saatiin {:?}", last),
+            _ => panic!("odotettiin Missed, saatiin {last:?}"),
         }
     }
 
@@ -199,7 +199,7 @@ mod tests {
                 let expected = Utc.with_ymd_and_hms(2026, 6, 4, 3, 0, 0).unwrap();
                 assert_eq!(at, expected);
             }
-            _ => panic!("odotettiin Tonight, saatiin {:?}", last),
+            _ => panic!("odotettiin Tonight, saatiin {last:?}"),
         }
     }
 }

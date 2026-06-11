@@ -192,7 +192,10 @@ mod tests {
         let from = AgentId::new();
         let to = AgentId::new();
         let task = bridge.create_task("t", Some(from)).await.expect("create");
-        bridge.handoff_task(task.id, from, to).await.expect("handoff");
+        bridge
+            .handoff_task(task.id, from, to)
+            .await
+            .expect("handoff");
 
         recorder.drain_once().await;
         assert_eq!(metrics.counter(COUNTER_TASKS_CREATED).get(), 1);

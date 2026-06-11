@@ -31,9 +31,8 @@ pub fn verify_signature(
     timestamp: &str,
     body: &[u8],
 ) -> ChannelResult<()> {
-    let pk = decode_hex(public_key_hex).map_err(|e| {
-        ChannelError::invalid_input(format!("invalid DISCORD_PUBLIC_KEY hex: {e}"))
-    })?;
+    let pk = decode_hex(public_key_hex)
+        .map_err(|e| ChannelError::invalid_input(format!("invalid DISCORD_PUBLIC_KEY hex: {e}")))?;
     let sig_bytes = decode_hex(signature_hex).map_err(|e| {
         ChannelError::invalid_input(format!("invalid X-Signature-Ed25519 hex: {e}"))
     })?;
@@ -75,11 +74,13 @@ pub struct DiscordInteraction {
 impl DiscordInteraction {
     /// Deserialisoi interaction JSON:sta.
     pub fn from_payload(payload: &serde_json::Value) -> ChannelResult<Self> {
-        let interaction_type = payload
-            .get("type")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| ChannelError::invalid_input("interaction missing type"))?
-            as u8;
+        let interaction_type = u8::try_from(
+            payload
+                .get("type")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| ChannelError::invalid_input("interaction missing type"))?,
+        )
+        .map_err(|_| ChannelError::invalid_input("interaction type out of range"))?;
 
         let data = payload.get("data");
         let command_name = data
@@ -118,9 +119,7 @@ impl DiscordInteraction {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| ChannelError::invalid_input("slash command message option empty"))?;
         let sender = self.user_id.unwrap_or_else(|| "discord-user".to_string());
-        let conversation = self
-            .channel_id
-            .unwrap_or_else(|| "discord".to_string());
+        let conversation = self.channel_id.unwrap_or_else(|| "discord".to_string());
         InboundMessage::new(sender, conversation, body)
     }
 
@@ -150,15 +149,12 @@ fn extract_message_option(data: &serde_json::Value) -> Option<String> {
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
-    if !s.len().is_multiple_of(2) {
+    if s.len() % 2 != 0 {
         return Err("odd hex length".into());
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16)
-                .map_err(|e| format!("byte at {i}: {e}"))
-        })
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("byte at {i}: {e}")))
         .collect()
 }
 

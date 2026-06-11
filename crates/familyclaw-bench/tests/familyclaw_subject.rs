@@ -152,12 +152,19 @@ async fn crash_after_journal_before_memory_resumes_with_memory() {
 
     // Resume should replay and persist memory for all recorded steps.
     let report = subject.restart(clock()).await.expect("restart");
-    assert!(report.resumed_clean, "resume must be clean after mid_write crash");
+    assert!(
+        report.resumed_clean,
+        "resume must be clean after mid_write crash"
+    );
 
     // Verify memory exists for all 3 steps (turn_key makes it idempotent).
     let hits = subject
         .recall("completed step", clock())
         .await
         .expect("recall");
-    assert_eq!(hits.len(), 3, "all 3 steps must have memory persisted after resume");
+    assert_eq!(
+        hits.len(),
+        3,
+        "all 3 steps must have memory persisted after resume"
+    );
 }

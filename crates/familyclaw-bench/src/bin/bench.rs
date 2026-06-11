@@ -275,7 +275,11 @@ fn write_comparison(comparison: &ComparativeScorecard) -> Result<()> {
     write_atomic(&out_dir.join("COMPARISON.md"), md.as_bytes())?;
 
     // Julkinen artefakti repon `docs/`-hakemistoon (rinnan SCORECARD.md:n kanssa).
-    if let Some(docs_dir) = root.parent().and_then(Path::parent).map(|ws| ws.join("docs")) {
+    if let Some(docs_dir) = root
+        .parent()
+        .and_then(Path::parent)
+        .map(|ws| ws.join("docs"))
+    {
         std::fs::create_dir_all(&docs_dir)?;
         write_atomic(&docs_dir.join("COMPARISON.md"), md.as_bytes())?;
     }

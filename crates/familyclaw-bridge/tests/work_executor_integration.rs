@@ -23,11 +23,7 @@ impl WorkExecutor for AlwaysFailingExecutor {
 
 /// Pieni driver: ajaa Active-tehtävän suorittajan läpi ja siirtää tilan
 /// lopputuloksen mukaan. Sauman kutsujapuoli — *suorittaja ei tee tätä*.
-async fn run_one(
-    board: &TaskBoard,
-    exec: &dyn WorkExecutor,
-    task: &Task,
-) -> WorkOutcome {
+async fn run_one(board: &TaskBoard, exec: &dyn WorkExecutor, task: &Task) -> WorkOutcome {
     let outcome = exec.execute(task).await.expect("execute task");
     let next = if outcome.succeeded {
         TaskStatus::Done

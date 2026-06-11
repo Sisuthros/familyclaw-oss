@@ -458,11 +458,7 @@ impl CapabilityRegistry {
     /// Palauttaa kaikki annetun nimiset kyvyt (tunnisteen mukaan järjestettynä).
     pub async fn find_by_name(&self, name: &str) -> Vec<Capability> {
         let guard = self.inner.read().await;
-        let mut out: Vec<Capability> = guard
-            .values()
-            .filter(|c| c.name == name)
-            .cloned()
-            .collect();
+        let mut out: Vec<Capability> = guard.values().filter(|c| c.name == name).cloned().collect();
         out.sort_by_key(|c| c.id);
         out
     }
@@ -1122,7 +1118,13 @@ mod tests {
         let board = ContractBoard::new();
         let cap = render_capability();
         let err = board
-            .propose(&cap, AgentId::new(), AgentId::new(), json!({ "script": "s" }), ts(1))
+            .propose(
+                &cap,
+                AgentId::new(),
+                AgentId::new(),
+                json!({ "script": "s" }),
+                ts(1),
+            )
             .await
             .expect_err("missing duration");
         assert!(matches!(err, ContractError::InputSchemaViolation(_)));
@@ -1153,7 +1155,10 @@ mod tests {
             json!({ "url": "https://x/v.mp4", "frames": 120 }),
             ts(3),
         );
-        let fulfilled = board.fulfill(c.id, deliverable, ts(3)).await.expect("fulfill");
+        let fulfilled = board
+            .fulfill(c.id, deliverable, ts(3))
+            .await
+            .expect("fulfill");
         assert_eq!(fulfilled.status, ContractStatus::Fulfilled);
         assert!(fulfilled.deliverable.is_some());
     }
@@ -1177,7 +1182,10 @@ mod tests {
 
         // Toimite: "frames" puuttuu → tulosskeema rikkoutuu.
         let bad = Deliverable::new(provider, json!({ "url": "https://x" }), ts(3));
-        let err = board.fulfill(c.id, bad, ts(3)).await.expect_err("schema breach");
+        let err = board
+            .fulfill(c.id, bad, ts(3))
+            .await
+            .expect_err("schema breach");
         assert!(matches!(err, ContractError::OutputSchemaViolation(_)));
 
         let after = board.get(c.id).await.expect("present");
@@ -1204,7 +1212,10 @@ mod tests {
         // Skeema OK (url on merkkijono, frames on numero) mutta jälkiehto
         // `non_empty(url)` rikkoutuu (tyhjä) ja `frames >= 1` rikkoutuu (0).
         let bad = Deliverable::new(provider, json!({ "url": "", "frames": 0 }), ts(3));
-        let err = board.fulfill(c.id, bad, ts(3)).await.expect_err("postcondition");
+        let err = board
+            .fulfill(c.id, bad, ts(3))
+            .await
+            .expect_err("postcondition");
         assert!(matches!(err, ContractError::PostconditionBreach(_)));
         let after = board.get(c.id).await.expect("present");
         assert_eq!(after.status, ContractStatus::Failed);
@@ -1249,7 +1260,10 @@ mod tests {
         assert_eq!(rejected.status, ContractStatus::Rejected);
 
         // Toinen reject → laiton siirtymä.
-        let err = board.reject(c.id, "again", ts(3)).await.expect_err("terminal");
+        let err = board
+            .reject(c.id, "again", ts(3))
+            .await
+            .expect_err("terminal");
         assert!(matches!(err, ContractError::IllegalTransition { .. }));
     }
 
@@ -1270,7 +1284,10 @@ mod tests {
             .expect("propose");
         // Yritä täyttää suoraan Proposed-tilasta → laiton.
         let d = Deliverable::new(provider, json!({ "url": "u", "frames": 1 }), ts(2));
-        let err = board.fulfill(c.id, d, ts(2)).await.expect_err("not accepted");
+        let err = board
+            .fulfill(c.id, d, ts(2))
+            .await
+            .expect_err("not accepted");
         assert!(matches!(err, ContractError::IllegalTransition { .. }));
     }
 
@@ -1283,7 +1300,13 @@ mod tests {
         let task = TaskId::new();
 
         let c1 = board
-            .propose(&cap, AgentId::new(), provider, json!({ "script": "a", "duration": 2 }), ts(1))
+            .propose(
+                &cap,
+                AgentId::new(),
+                provider,
+                json!({ "script": "a", "duration": 2 }),
+                ts(1),
+            )
             .await
             .expect("c1");
         let mut linked = c1.clone();
@@ -1291,14 +1314,23 @@ mod tests {
         board.insert(linked).await;
 
         let _c2 = board
-            .propose(&cap, AgentId::new(), other, json!({ "script": "b", "duration": 2 }), ts(1))
+            .propose(
+                &cap,
+                AgentId::new(),
+                other,
+                json!({ "script": "b", "duration": 2 }),
+                ts(1),
+            )
             .await
             .expect("c2");
 
         assert_eq!(board.len().await, 2);
         assert_eq!(board.list_for_provider(provider).await.len(), 1);
         assert_eq!(board.list_for_provider(other).await.len(), 1);
-        assert_eq!(board.list_by_status(ContractStatus::Proposed).await.len(), 2);
+        assert_eq!(
+            board.list_by_status(ContractStatus::Proposed).await.len(),
+            2
+        );
         assert_eq!(board.list_for_task(task).await.len(), 1);
     }
 
@@ -1309,7 +1341,10 @@ mod tests {
         let cap = render_capability();
         let id = reg.advertise(cap.clone()).await;
         assert_eq!(reg.len().await, 1);
-        assert_eq!(reg.get(id).await.map(|c| c.name), Some("render_video".into()));
+        assert_eq!(
+            reg.get(id).await.map(|c| c.name),
+            Some("render_video".into())
+        );
         assert_eq!(reg.find_by_name("render_video").await.len(), 1);
         assert!(reg.find_by_name("nope").await.is_empty());
     }

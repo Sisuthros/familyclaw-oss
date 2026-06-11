@@ -117,9 +117,9 @@ impl MarkdownFileSubject {
     /// Aktiivinen tehtävä tai virhe jos
     /// [`start_task`](MarkdownFileSubject::start_task) puuttuu.
     fn require_task(&self) -> Result<Task> {
-        self.task.clone().ok_or_else(|| {
-            crate::BenchError::subject("no active task — call start_task first")
-        })
+        self.task
+            .clone()
+            .ok_or_else(|| crate::BenchError::subject("no active task — call start_task first"))
     }
 
     /// Palauttaa nykyisen muistipuskurin (testejä ja introspektiota varten).
@@ -148,14 +148,12 @@ impl Subject for MarkdownFileSubject {
         // Montako askelta oli VALMISTUNUT (sivuvaikutus ajettu) ennen kaatumista.
         // Deterministiset arvot per kaatumispiste — restart ajaa nämä uudelleen.
         let completed = match point {
-            // Puhdas pysäytys: tehtävä ajettiin loppuun, ei mitään ajettavaa uudelleen.
-            CrashPoint::Clean => total,
+            // Puhdas pysäytys tai kaatuminen kesken replayn: kaikki askeleet valmiina.
+            CrashPoint::Clean | CrashPoint::MidReplay => total,
             // Kaatuminen ennen viimeisen askelen kirjoitusta: kaikki paitsi viimeinen valmiina.
             CrashPoint::BeforeWrite | CrashPoint::MidWrite | CrashPoint::CorruptedJournal => {
                 total.saturating_sub(1)
             }
-            // Kaatuminen kesken replayn: kaikki askeleet olivat jo ehtineet valmistua.
-            CrashPoint::MidReplay => total,
         };
 
         // Aja tehtävä kaatumiseen asti (sivuvaikutukset puskuriin). Clean ajaa
@@ -299,7 +297,10 @@ mod tests {
             "BeforeWrite jätti 3/4 valmiiksi → 3 uudelleenajoa"
         );
         assert!(!report.resumed_clean, "re-run ei ole puhdas jatko");
-        assert_eq!(report.steps_replayed, 0, "perustaso ei replayta vaan re-runaa");
+        assert_eq!(
+            report.steps_replayed, 0,
+            "perustaso ei replayta vaan re-runaa"
+        );
         assert!(!report.was_replaying);
     }
 
@@ -398,8 +399,14 @@ mod tests {
         async fn run() -> RestartReport {
             let mut subject = MarkdownFileSubject::new();
             let task = task_with_steps("t-det", 4);
-            let handle = subject.start_task(&task, fixed_clock()).await.expect("start");
-            subject.kill(&handle, CrashPoint::MidWrite).await.expect("kill");
+            let handle = subject
+                .start_task(&task, fixed_clock())
+                .await
+                .expect("start");
+            subject
+                .kill(&handle, CrashPoint::MidWrite)
+                .await
+                .expect("kill");
             subject.restart(fixed_clock()).await.expect("restart")
         }
         assert_eq!(run().await, run().await);

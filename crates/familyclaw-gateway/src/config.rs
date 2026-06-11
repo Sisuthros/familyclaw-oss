@@ -161,7 +161,10 @@ impl FamilyConfig {
         for b in [
             std::env::var("XDG_CONFIG_HOME").ok(),
             std::env::var("HOME").map(|h| format!("{h}/.config")).ok(),
-        ].into_iter().flatten() {
+        ]
+        .into_iter()
+        .flatten()
+        {
             let p = PathBuf::from(&b).join("familyclaw").join(CONFIG_FILE_NAME);
             if p.exists() {
                 return p;

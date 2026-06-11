@@ -79,13 +79,19 @@ impl RbacPolicy {
     /// Idempotentti: saman luvan lisääminen kahdesti ei muuta tilaa.
     #[must_use]
     pub fn allow(mut self, role: AgentRole, capability: impl Into<String>) -> Self {
-        self.allowed.entry(role).or_default().insert(capability.into());
+        self.allowed
+            .entry(role)
+            .or_default()
+            .insert(capability.into());
         self
     }
 
     /// Lisää luvan paikan päällä (ei-rakentaja-variantti).
     pub fn grant(&mut self, role: AgentRole, capability: impl Into<String>) {
-        self.allowed.entry(role).or_default().insert(capability.into());
+        self.allowed
+            .entry(role)
+            .or_default()
+            .insert(capability.into());
     }
 
     /// Poistaa luvan. Palauttaa `true` jos lupa oli olemassa.

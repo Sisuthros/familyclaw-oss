@@ -154,7 +154,7 @@ mod tests {
                 protected_core_intact: true,
             })
         }
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "stub_s5"
         }
     }

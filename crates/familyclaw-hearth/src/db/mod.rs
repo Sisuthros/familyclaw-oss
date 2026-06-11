@@ -363,10 +363,10 @@ mod tests {
             joy: 0.8,
             ..EmotionalVector::neutral()
         };
-        HearthStore::set_emotional_state(&store, "agent_gamma", state)
+        HearthStore::set_emotional_state(&store, "agent_a", state)
             .await
             .expect("set");
-        let got = HearthStore::get_emotional_state(&store, "agent_gamma")
+        let got = HearthStore::get_emotional_state(&store, "agent_a")
             .await
             .expect("get");
         assert!((got.joy - 0.8).abs() < f64::EPSILON);
@@ -374,7 +374,7 @@ mod tests {
         let agents = HearthStore::list_agents_with_emotion(&store)
             .await
             .expect("list");
-        assert!(agents.contains(&"agent_gamma".to_string()));
+        assert!(agents.contains(&"agent_a".to_string()));
     }
 
     #[tokio::test]

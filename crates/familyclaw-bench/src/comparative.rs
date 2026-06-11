@@ -139,8 +139,7 @@ impl ComparativeScorecard {
         let (Some(fc), Some(base)) = (fc, base) else {
             return false;
         };
-        let (Some(&fc_val), Some(&base_val)) =
-            (fc.metrics.get(metric), base.metrics.get(metric))
+        let (Some(&fc_val), Some(&base_val)) = (fc.metrics.get(metric), base.metrics.get(metric))
         else {
             return false;
         };
@@ -299,10 +298,8 @@ mod tests {
 
     #[test]
     fn markdown_is_byte_for_byte_reproducible() {
-        let cmp_a =
-            ComparativeScorecard::new(familyclaw_card(), baseline_card(), fixed_clock());
-        let cmp_b =
-            ComparativeScorecard::new(familyclaw_card(), baseline_card(), fixed_clock());
+        let cmp_a = ComparativeScorecard::new(familyclaw_card(), baseline_card(), fixed_clock());
+        let cmp_b = ComparativeScorecard::new(familyclaw_card(), baseline_card(), fixed_clock());
         assert_eq!(
             cmp_a.to_markdown(),
             cmp_b.to_markdown(),
