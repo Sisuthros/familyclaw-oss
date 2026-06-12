@@ -14,6 +14,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Layer B leak audit FIRST — fail fast before the slow build if any
+      # private content (souls, real family names, secrets) reached Layer A.
+      # Enforces the guarantee documented in SECURITY.md.
+      - name: Run Layer B leak audit
+        run: bash scripts/audit-layer-b.sh
+
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
