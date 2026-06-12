@@ -59,7 +59,7 @@ pub fn verify_signature(
 /// Parsittu Discord-interaction (MVP: slash-komennot).
 #[derive(Debug, Clone)]
 pub struct DiscordInteraction {
-    /// Discord interaction type (1 = PING, 2 = APPLICATION_COMMAND, …).
+    /// Discord interaction type (1 = PING, 2 = `APPLICATION_COMMAND`, …).
     pub interaction_type: u8,
     /// Slash-komennon nimi, jos type == 2.
     pub command_name: Option<String>,

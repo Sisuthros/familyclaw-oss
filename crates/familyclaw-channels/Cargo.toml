@@ -21,15 +21,28 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 
-# Discord/Telegram adapters: HTTP REST (lightweight, no gateway/teloxide SDK).
-# Discord sends via webhook URL; Telegram uses Bot API getUpdates/sendMessage.
+# Telegram adapter: HTTP REST (lightweight, no teloxide SDK) via Bot API
+# getUpdates/sendMessage. Discord webhook-interaktiot (discord_interactions.rs)
+# käyttävät reqwest + ed25519-dalek allekirjoitusten verifiointiin.
 reqwest = { workspace = true, optional = true }
 ed25519-dalek = { version = "2.2", optional = true }
+
+# Discord gateway -adapteri (discord.rs): serenity 0.12 gateway-yhteydellä.
+# default-features = false → kevein toimiva setti (ei cache/framework/utils);
+# rustls_backend välttää järjestelmän OpenSSL-riippuvuuden.
+serenity = { version = "0.12", default-features = false, features = [
+    "builder",
+    "client",
+    "gateway",
+    "http",
+    "model",
+    "rustls_backend",
+], optional = true }
 
 [features]
 # Default: runko + MockChannel only. Real adapters behind feature flags.
 default = []
-discord = ["dep:reqwest", "dep:ed25519-dalek"]
+discord = ["dep:reqwest", "dep:ed25519-dalek", "dep:serenity"]
 telegram = ["dep:reqwest"]
 whatsapp = []
 signal = []

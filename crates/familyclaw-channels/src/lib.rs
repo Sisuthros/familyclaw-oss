@@ -56,7 +56,7 @@ mod message;
 mod mock;
 
 #[cfg(feature = "discord")]
-mod discord;
+pub mod discord;
 
 #[cfg(feature = "discord")]
 mod discord_interactions;
