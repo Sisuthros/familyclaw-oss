@@ -222,6 +222,69 @@ impl DiscordChannel {
         Ok(())
     }
 
+    /// Rakentaa Discord-kanavan **webhook/HTTP-inbound-polkua** varten (gatewayn
+    /// `/inject` + `/discord/interactions`-reitit). Tässä mallissa saapuva
+    /// liikenne tulee [`DiscordChannel::inject`]:n kautta — serenity-gatewaytä ei
+    /// käynnistetä [`DiscordChannel::start`]:lla.
+    ///
+    /// `channel_id` on tämän kanavainstanssin vakaa tunniste (esim.
+    /// `"discord-main"`), ei välttämättä Discord-snowflake. Jos se on numeerinen,
+    /// se talletetaan myös `target_channel_id`:ksi lähetyksiä varten; muuten
+    /// lähetys kulkee bus-pumpun kautta (`inject`/`receive`).
+    ///
+    /// # Errors
+    /// [`ChannelError::InvalidInput`] jos `webhook_url` tai `channel_id` on tyhjä.
+    pub fn from_webhook(
+        webhook_url: impl Into<String>,
+        channel_id: impl Into<String>,
+    ) -> ChannelResult<Self> {
+        let webhook_url = webhook_url.into();
+        let channel_id = channel_id.into();
+
+        if webhook_url.trim().is_empty() {
+            return Err(ChannelError::invalid_input("webhook_url must not be empty"));
+        }
+        if channel_id.trim().is_empty() {
+            return Err(ChannelError::invalid_input("channel_id must not be empty"));
+        }
+
+        // Numeerinen channel_id → snowflake lähetyksiä varten; muuten 0
+        // (webhook-only, lähetys kulkee bus-pumpun läpi).
+        let target_channel_id = channel_id
+            .trim_start_matches("discord-")
+            .parse::<u64>()
+            .unwrap_or(0);
+        // Http-asiakas luodaan webhook-urlilla; sitä käytetään vain jos
+        // target_channel_id on aito snowflake.
+        let http = Arc::new(Http::new(&webhook_url));
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+
+        Ok(Self {
+            channel_id,
+            bot_token: webhook_url,
+            target_channel_id,
+            http,
+            inbound_rx: Mutex::new(Some(inbound_rx)),
+            inbound_tx,
+            shard_manager: Mutex::new(None),
+        })
+    }
+
+    /// Injektoi valmiin [`InboundEnvelope`]:n saapuvaan virtaan.
+    ///
+    /// Käytetään HTTP-inbound-poluissa (`/inject`, `/discord/interactions`):
+    /// työntää envelopen **samaan** `inbound_tx`:ään jota serenity-handler ja
+    /// [`Channel::receive`]-virta käyttävät — injektoidut ja gatewayn
+    /// vastaanottamat viestit jakavat yhden virran.
+    ///
+    /// # Errors
+    /// [`ChannelError::Receive`] jos vastaanotin on suljettu (stream pudotettu).
+    pub fn inject(&self, envelope: InboundEnvelope) -> ChannelResult<()> {
+        self.inbound_tx
+            .send(envelope)
+            .map_err(|e| ChannelError::receive(&self.channel_id, e.to_string()))
+    }
+
     /// Pilkkoo lähtevän viestin Discordin merkkirajaan ja lähettää palat
     /// järjestyksessä `Arc<Http>`:n kautta.
     async fn send_body(

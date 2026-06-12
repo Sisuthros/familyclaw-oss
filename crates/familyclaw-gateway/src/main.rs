@@ -82,7 +82,7 @@ const REPLY_TARGET_ENV: &str = "FAMILYCLAW_REPLY_TARGET";
 
 /// Valinnainen bearer-token, joka suojaa `POST /inject`:n (env). Käytetään
 /// vain virheviesteissä/dokumentaatiossa — varsinainen arvo luetaan
-/// `FamilyConfig`:n kautta. Vrt. OpenClawin `OPENCLAW_GATEWAY_TOKEN`.
+/// `FamilyConfig`:n kautta. Vrt. `OpenClaw`in `OPENCLAW_GATEWAY_TOKEN`.
 const GATEWAY_TOKEN_ENV: &str = "FAMILYCLAW_GATEWAY_TOKEN";
 
 /// Oletusarvot joita `FamilyConfig` käyttää (KERROS B).
@@ -136,7 +136,7 @@ struct GatewayState {
     discord_channel: Option<Arc<DiscordChannel>>,
     /// Valinnainen `POST /inject`-bearer-token. `Some` = endpoint vaatii
     /// `Authorization: Bearer <token>`:n; `None` = avoin loopback-only-oletus
-    /// (yhteensopiva aiemman käytöksen kanssa). Vrt. OpenClawin
+    /// (yhteensopiva aiemman käytöksen kanssa). Vrt. `OpenClaw`in
     /// `OPENCLAW_GATEWAY_TOKEN`.
     inject_token: Option<Arc<str>>,
     /// Discord Interactions Ed25519 public key (hex). `Some` → `/discord/interactions` aktiivinen.
@@ -217,7 +217,7 @@ fn check_inject_auth(
 }
 
 /// Injektoi ulkopuolisen viestin Discord-kanavaan.
-/// POST /inject — JSON: {"sender": "...", "chat_id": "...", "body": "..."}
+/// `POST /inject` — JSON: `{"sender": "...", "chat_id": "...", "body": "..."}`
 ///
 /// Jos [`GATEWAY_TOKEN_ENV`] on konfiguroitu, pyyntö vaatii otsikon
 /// `Authorization: Bearer <token>` (vakioaikainen täsmäys), muuten `401`.
@@ -229,14 +229,11 @@ async fn inject_discord(
     if let Err(code) = check_inject_auth(&state, &headers) {
         return (code, "unauthorized");
     }
-    let ch = match &state.discord_channel {
-        Some(c) => c,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "discord channel not configured",
-            )
-        }
+    let Some(ch) = &state.discord_channel else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "discord channel not configured",
+        );
     };
     let sender = payload
         .get("sender")
@@ -496,11 +493,11 @@ async fn start_runtime() -> Result<(
                 )));
             }
             let ch_id = cfg.discord_channel_id();
-            let dc = DiscordChannel::new(webhook_url.to_string(), ch_id.to_string())
+            let dc = DiscordChannel::from_webhook(webhook_url.to_string(), ch_id.to_string())
                 .map_err(FamilyClawError::from)?;
             let dc_arc = Arc::new(dc);
             let ch: Box<dyn Channel> = Box::new(
-                DiscordChannel::new(webhook_url.to_string(), ch_id.to_string())
+                DiscordChannel::from_webhook(webhook_url.to_string(), ch_id.to_string())
                     .map_err(FamilyClawError::from)?,
             );
             (ch, Some(dc_arc))
