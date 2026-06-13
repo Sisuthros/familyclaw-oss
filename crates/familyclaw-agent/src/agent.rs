@@ -225,6 +225,44 @@ impl Agent {
         self
     }
 
+    /// **Jatka ELÄVÄNÄ durable-replayn päältä** (gateway-restart-korjaus).
+    ///
+    /// Kun agentti rakennetaan olemassa olevan journalin päälle, sen
+    /// durable-konteksti on replay-tilassa: jokainen aiemmin kirjattu
+    /// `turn-{n}` (+ `turn-{n}-think`) on replay-vektorissa. Gateway kuitenkin
+    /// palvelee **uusia eläviä viestejä** — se EI syötä historiaa uudelleen.
+    /// Ilman tätä kutsua seuraava elävä vuoro:
+    /// 1. käyttäisi `turn_counter = 0`:aa → askelnimi `turn-0`, joka osuisi yhä
+    ///    avoinna olevaan replay-haaraan ja kaatuisi
+    ///    [`DurableError::NondeterministicReplay`]:hin (tai mykistäisi vuoron,
+    ///    koska `is_replaying()` gatettaa LLM-ajattelun ja reply:n), ja
+    /// 2. törmäisi muistin `turn_key`:ssä (`{name}:turn-0`) replayn duplikaattiin
+    ///    → uuden viestin muisti häviäisi (`MemoryStore` dedup).
+    ///
+    /// Tämä builder tekee KAKSI toisiinsa kytkettyä asiaa, jotka on tehtävä
+    /// yhdessä:
+    /// - **siirtää durable-kursorin replayn loppuun**
+    ///   ([`DurableContext::fast_forward_replay`](familyclaw_durable::DurableContext::fast_forward_replay))
+    ///   → seuraava askel menee tuore-ajo-haaraan oikealla sekvenssipaikalla, ja
+    ///   `is_replaying()` on `false` → agentti ajattelee ja vastaa taas, ja
+    /// - **palauttaa `turn_counter`:n** seuraavaan vapaaseen vuoropaikkaan
+    ///   ([`DurableContext::replayed_turn_count`](familyclaw_durable::DurableContext::replayed_turn_count))
+    ///   → uusi vuoro on `turn-{N}` (uniikki nimi + uniikki `turn_key`).
+    ///
+    /// Asetetaan **vain persistentillä, elävällä polulla** (runtimen
+    /// `build_family`, kun `FAMILYCLAW_DATA_DIR` on asetettu). In-memory-polku
+    /// (replay tyhjä → no-op) ja in-order-uudelleensyöttö (continuity-daemon /
+    /// replay-testit, jotka syöttävät saman historian järjestyksessä) EIVÄT
+    /// kutsu tätä — ne haluavat replayn täsmäävän askel askeleelta.
+    ///
+    /// Palauttaa `self` ketjutusta varten ([`Agent::new`]-signatuuri ei muutu).
+    #[must_use]
+    pub fn resume_live(mut self) -> Self {
+        self.turn_counter = self.durable.replayed_turn_count();
+        self.durable.fast_forward_replay();
+        self
+    }
+
     /// Aseta **sessio-isolaation alkuperä** (F4). Tämän jälkeen agentin
     /// käsittelemien vuorojen muistot tagataan
     /// [`MessageOrigin::session_tag`](crate::session::MessageOrigin::session_tag)

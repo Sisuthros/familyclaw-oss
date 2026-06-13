@@ -74,6 +74,28 @@ impl<J: Journal> DurableContext<J> {
         self.cursor
     }
 
+    /// **Ohita koko replay** — siirrä kursori tallennettujen rivien loppuun
+    /// **ajamatta** niitä uudelleen, niin että [`is_replaying`](Self::is_replaying)
+    /// palauttaa `false` ja seuraava [`step`](Self::step) menee tuore-ajo-haaraan.
+    ///
+    /// Tämä on **elävän jatkamisen** (live-resume) primitiivi: kun konteksti
+    /// rakennetaan olemassa olevan journalin päälle MUTTA kutsuja ei aio syöttää
+    /// historiaa uudelleen (esim. gateway-restart, joka palvelee VAIN uusia
+    /// viestejä), aiempaa replay-historiaa ei pidä toistaa askel askeleelta.
+    /// Ilman tätä ensimmäinen elävä askel (uusi nimi, esim. `turn-{N}`) osuisi
+    /// vielä avoinna olevaan replay-haaraan ja kaatuisi
+    /// [`DurableError::NondeterministicReplay`]:hin, koska tallennettu nimi
+    /// (`turn-0`) ei täsmää.
+    ///
+    /// Seuraava tuore askel saa sekvenssipaikan `replay.len()` (jatkaa lokin
+    /// perään), eikä yksikään tallennettu sivuvaikutus aja uudelleen.
+    ///
+    /// Vastinpari: in-order-uudelleensyöttö (continuity-daemon, replay-testit)
+    /// EI kutsu tätä — se haluaa nimenomaan toistaa historian askel askeleelta.
+    pub fn fast_forward_replay(&mut self) {
+        self.cursor = self.replay.len();
+    }
+
     /// Seuraavan askeleen sekvenssipaikka.
     #[must_use]
     pub fn next_step_id(&self) -> StepId {
@@ -188,6 +210,32 @@ impl<J: Journal> DurableContext<J> {
         &self.journal
     }
 
+    /// Montako **ylätason vuoroa** (`turn-{n}`) replay-vektorissa on.
+    ///
+    /// Agentin vuoronkäsittely kirjaa per vuoro KAKSI askelta: ylätason
+    /// `turn-{n}` ja sen ali-askeleen `turn-{n}-think`. Kun agentti rakennetaan
+    /// olemassa olevan journalin päälle (esim. gateway-restart), sen
+    /// `turn_counter` on alustettava tällä luvulla — muuten seuraava ELÄVÄ vuoro
+    /// alkaisi paikasta `turn-0`, osuisi replay-haaraan ja palauttaisi vanhan
+    /// lopputuloksen ajamatta uutta viestiä (restart-mykkyys + muistihäviö).
+    ///
+    /// Laskee **ali-askeleet pois** (`-think`): vain `turn-{n}` muotoiset nimet,
+    /// joissa `{n}` on pelkkä luku, lasketaan. Palauttaa suurimman vuoronumeron
+    /// **+ 1** (eli seuraavan vapaan vuoropaikan), tai `0` jos vuoroja ei ole.
+    /// `max+1` (eikä pelkkä laskuri) on kestävä myös aukoille lokissa.
+    ///
+    /// **Tämä EI muuta replay-kursoria** — se vain lukee replay-vektorin.
+    /// In-memory (ei-persistentti) polku, jossa replay on tyhjä, palauttaa `0`.
+    #[must_use]
+    pub fn replayed_turn_count(&self) -> u64 {
+        self.replay
+            .iter()
+            .filter_map(|e| e.step_name())
+            .filter_map(parse_top_level_turn)
+            .max()
+            .map_or(0, |max| max + 1)
+    }
+
     /// Tarkistaa onko annettu askel jo suoritettu.
     ///
     /// # Errors
@@ -203,6 +251,16 @@ impl<J: Journal> DurableContext<J> {
         }
         Ok(false)
     }
+}
+
+/// Jäsentää **ylätason vuoron** numeron askelnimestä, jos nimi on tasan
+/// `turn-{n}` (ei `turn-{n}-think` -ali-askel eikä muu askel).
+///
+/// Palauttaa `Some(n)` vain kun `{n}` on kelvollinen `u64` ilman lisäliitteitä;
+/// muuten `None`. Näin `replayed_turn_count` laskee per-vuoro vain kerran,
+/// vaikka jokainen vuoro kirjaa myös `-think`-ali-askeleen.
+fn parse_top_level_turn(step_name: &str) -> Option<u64> {
+    step_name.strip_prefix("turn-")?.parse::<u64>().ok()
 }
 
 /// Lyhyt diagnostiikkaleima ei-askel-rivilajille (snapshot/marker/tuleva laji).
@@ -543,6 +601,95 @@ mod tests {
         assert_eq!(b, 2);
         assert!(!ctx2.is_replaying());
         assert_eq!(ctx2.steps_taken(), 2);
+    }
+
+    #[test]
+    fn replayed_turn_count_counts_top_level_turns_only() {
+        // Simuloi agentin vuoroloki: per vuoro `turn-{n}` + `turn-{n}-think`.
+        let mut ctx = fresh();
+        let _ = ctx.step("turn-0", || Ok::<_, String>(0)).expect("t0");
+        let _ = ctx
+            .step("turn-0-think", || Ok::<_, String>("hi".to_string()))
+            .expect("t0-think");
+        let _ = ctx.step("turn-1", || Ok::<_, String>(1)).expect("t1");
+        let _ = ctx
+            .step("turn-1-think", || Ok::<_, String>(String::new()))
+            .expect("t1-think");
+        let journal = ctx.finish();
+
+        // Rakenna uudelleen → replay-vektorissa neljä askelta, mutta vain KAKSI
+        // ylätason vuoroa. Seuraava vapaa vuoropaikka = 2.
+        let ctx2 = DurableContext::new(journal).expect("ctx2");
+        assert_eq!(
+            ctx2.replayed_turn_count(),
+            2,
+            "kaksi ylätason vuoroa (turn-0, turn-1); -think-ali-askeleita ei lasketa"
+        );
+    }
+
+    #[test]
+    fn fast_forward_replay_skips_to_live_without_rerunning() {
+        // Aja kaksi askelta, "kaadu", rakenna uudelleen → replay-tila.
+        let effects = Cell::new(0u32);
+        let journal = {
+            let mut ctx = fresh();
+            let _ = ctx
+                .step("turn-0", || {
+                    effects.set(effects.get() + 1);
+                    Ok::<_, String>(0)
+                })
+                .expect("t0");
+            let _ = ctx
+                .step("turn-0-think", || {
+                    effects.set(effects.get() + 1);
+                    Ok::<_, String>(String::new())
+                })
+                .expect("t0-think");
+            ctx.finish()
+        };
+        assert_eq!(effects.get(), 2);
+
+        let mut ctx2 = DurableContext::new(journal).expect("ctx2");
+        assert!(ctx2.is_replaying(), "kaksi askelta lokissa");
+
+        // Elävä jatkaminen: ohita replay ajamatta sitä uudelleen.
+        ctx2.fast_forward_replay();
+        assert!(!ctx2.is_replaying(), "kursori siirtyi replayn loppuun");
+        assert_eq!(ctx2.steps_taken(), 2);
+
+        // Seuraava askel on TUORE (uusi nimi) eikä kaadu NondeterministicReplay:
+        // hin — se kirjautuu lokin perään sekvenssipaikalle 2.
+        let fresh_effect = Cell::new(0u32);
+        let out: i32 = ctx2
+            .step("turn-1", || {
+                fresh_effect.set(fresh_effect.get() + 1);
+                Ok(42)
+            })
+            .expect("uusi elävä askel ei kaadu");
+        assert_eq!(out, 42);
+        assert_eq!(fresh_effect.get(), 1, "uusi askel ajettiin tasan kerran");
+        assert_eq!(ctx2.next_step_id(), StepId::new(3));
+        // Replatut askeleet eivät ajaneet uudelleen.
+        assert_eq!(effects.get(), 2);
+    }
+
+    #[test]
+    fn replayed_turn_count_is_zero_for_empty_journal() {
+        // Tuore (ei-persistentti) polku: replay tyhjä → seuraava vuoro = 0.
+        let ctx = fresh();
+        assert_eq!(ctx.replayed_turn_count(), 0);
+    }
+
+    #[test]
+    fn replayed_turn_count_ignores_non_turn_steps() {
+        // Vieras askel ("warmup") ei saa vaikuttaa vuorolaskuriin.
+        let mut ctx = fresh();
+        let _ = ctx.step("warmup", || Ok::<_, String>(1)).expect("warmup");
+        let _ = ctx.step("turn-0", || Ok::<_, String>(0)).expect("t0");
+        let journal = ctx.finish();
+
+        let ctx2 = DurableContext::new(journal).expect("ctx2");
+        assert_eq!(ctx2.replayed_turn_count(), 1, "vain turn-0 lasketaan vuoroksi");
     }
 
     #[test]

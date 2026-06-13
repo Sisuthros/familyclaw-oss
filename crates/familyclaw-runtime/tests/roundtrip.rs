@@ -77,6 +77,10 @@ async fn spawn_mock_llm() -> String {
 /// kohteella, sisältö = mock-LLM:n kiinteä teksti.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
+    // Serialisoi muiden build_family-testien kanssa: restart-testi asettaa
+    // prosessin laajuisen FAMILYCLAW_DATA_DIR:n, joka EI saa vuotaa tähän
+    // in-memory-testiin (muuten viesti kirjautuisi väärään levypolkuun).
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
     // 1. Mock-LLM pystyyn (OpenAI-yhteensopiva, kiinteä vastaus).
     let api_base = spawn_mock_llm().await;
 
@@ -167,6 +171,8 @@ async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
 /// Ennen F1:tä Agent piti vain yhtä klienttiä → primaryn kuolema tappoi vuoron.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dead_primary_fails_over_to_live_fallback() {
+    // Serialisoi restart-testin env-mutaation kanssa (ks. roundtrip-testi).
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
     // 1. Elävä mock-LLM fallbackille (palauttaa kiinteän tekstin).
     let live_base = spawn_mock_llm().await;
 
@@ -273,6 +279,8 @@ async fn spawn_hanging_llm() -> String {
 /// TIMEOUTISTA, ei pelkästä ECONNREFUSED:ista.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timeout_primary_fails_over_to_live_fallback() {
+    // Serialisoi restart-testin env-mutaation kanssa (ks. roundtrip-testi).
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
     // 1. Elävä mock-LLM fallbackille + hyytyvä "primary".
     let live_base = spawn_mock_llm().await;
     let hanging_base = spawn_hanging_llm().await;
@@ -436,6 +444,9 @@ async fn two_origins_route_replies_to_correct_targets_no_leak() {
 /// jostain muusta lähteestä. (Negatiivinen kontrolli roundtrip-väitteelle.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_llm_no_reply_is_emitted() {
+    // Serialisoi restart-testin env-mutaation kanssa: tämä testi olettaa
+    // in-memory-polun (ei FAMILYCLAW_DATA_DIR) → ei saa vuotaa levypolkua.
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
     let channel = MockChannel::new("mock-nollm").expect("channel");
     let outbox_probe = channel.clone();
     channel
@@ -471,11 +482,140 @@ async fn without_llm_no_reply_is_emitted() {
     runtime.shutdown();
 }
 
+/// Serialisoi `FAMILYCLAW_DATA_DIR`-riippuvaiset testit: env-muuttuja on
+/// prosessin laajuinen, joten kaksi rinnakkaista testiä sotkisivat toisensa.
+///
+/// **Async** mutex (ei `std::sync::Mutex`): sen guard on `Send`, joten sitä voi
+/// pitää `.await`-pisteiden yli `multi_thread`-tokio-testissä ilman että future
+/// muuttuu `!Send`:ksi.
+static DATA_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Yksilöllinen väliaikaishakemisto tälle testiajolle (ei ulkoisia crateja).
+fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "familyclaw-runtime-restart-{tag}-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let _ = std::fs::remove_dir_all(&p);
+    p
+}
+
+/// Pystyttää persistentin runtimen annettuun data-hakemistoon, syöttää yhden
+/// viestin, odottaa että ketju käsittelee sen ja sammuttaa siististi. Palauttaa
+/// kuinka monta ulosmenevää vastausta kanavalle lähti.
+async fn run_one_persistent_turn(data_dir: &std::path::Path, body: &str, api_base: &str) -> usize {
+    let channel = MockChannel::new("mock-restart").expect("channel");
+    let outbox_probe = channel.clone();
+    channel
+        .inject(InboundMessage::new("the operator-id", "restart-chat", body).expect("inbound"))
+        .expect("inject");
+    channel.close_inbound();
+
+    let resolver = EnvEndpointResolver::new().with_provider(
+        "mock",
+        api_base.to_string(),
+        "FAMILYCLAW_RESTART_KEY_UNSET",
+    );
+    let agent_cfg = AgentConfig::new("agent_epsilon", ModelConfig::new("mock/agent_epsilon"));
+    let soul = familyclaw_agent::Soul::from_essence("generic being for restart test");
+
+    // Aseta data-dir tämän build_family-kutsun ajaksi (lukko pidetään kutsujalla;
+    // ei rinnakkaisia env-lukijoita). Edition 2021: `set_var` on turvallinen.
+    std::env::set_var("FAMILYCLAW_DATA_DIR", data_dir);
+    std::env::set_var("FAMILYCLAW_DREAM_DISABLED", "1");
+
+    let runtime = build_family(
+        Some(format!("restart-bus-{body}")),
+        agent_cfg,
+        soul,
+        Box::new(channel),
+        "restart-chat".to_string(),
+        &resolver,
+    )
+    .await
+    .expect("build_family");
+
+    // Pollaa outboxia: pump → handle_turn → think (HTTP) → reply → send.
+    let mut sent = Vec::new();
+    for _ in 0..80 {
+        sent = outbox_probe.sent();
+        if !sent.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Anna durable+muisti-kirjoituksen levähtää levylle ennen sammutusta.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    runtime.shutdown();
+    sent.len()
+}
+
+/// **Gateway-restart-todiste (blocker-regressio):** rakenna persistentti
+/// runtime, syötä viesti, sammuta, rakenna UUDELLEEN samasta
+/// `FAMILYCLAW_DATA_DIR`:stä ja syötä UUSI viesti. Ennen korjausta agentin
+/// `turn_counter` jäi nollaan ja durable-kursori oli yhä replay-tilassa →
+/// toinen elävä viesti osui replatuun `turn-0`:aan → agentti mykistyi (ei
+/// reply:tä) ja uuden viestin muisti hävisi (turn_key-törmäys → dedup).
+/// Korjauksen ([`Agent::resume_live`]) jälkeen toinen viesti käsitellään
+/// TUOREENA: uusi reply lähtee JA uusi muistorivi syntyy (yhteensä 2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_restart_processes_new_message_fresh_not_replayed_mute() {
+    use familyclaw_memory::{LocalJsonStore, MemoryStore};
+
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    let api_base = spawn_mock_llm().await;
+    let data_dir = unique_temp_dir("mute");
+
+    // --- Ajo 1: ensimmäinen viesti persistenttiin runtimeen. ---
+    let sent_1 = run_one_persistent_turn(&data_dir, "ensimmäinen viesti", &api_base).await;
+    assert_eq!(sent_1, 1, "ajo 1: ensimmäinen viesti tuottaa yhden vastauksen");
+
+    // Muistissa tasan yksi rivi ajon 1 jälkeen (levyltä luettuna).
+    let mem_after_1 = LocalJsonStore::open(data_dir.join("memory.json"))
+        .await
+        .expect("open mem 1");
+    assert_eq!(
+        mem_after_1.len().await.expect("len 1"),
+        1,
+        "ajo 1: yksi muistorivi"
+    );
+
+    // --- Ajo 2: UUSI viesti, sama data-dir → restart-skenaario. ---
+    let sent_2 = run_one_persistent_turn(&data_dir, "toinen UUSI viesti", &api_base).await;
+
+    // YDINVÄITE 1: uusi viesti EI mykisty replayhin — vastaus lähtee.
+    assert_eq!(
+        sent_2, 1,
+        "ajo 2: restartin jälkeen UUSI viesti käsitellään tuoreena (ei replay-mykkyyttä)"
+    );
+
+    // YDINVÄITE 2: uusi viesti tuottaa UUDEN muistorivin (ei turn_key-törmäystä).
+    let mem_after_2 = LocalJsonStore::open(data_dir.join("memory.json"))
+        .await
+        .expect("open mem 2");
+    assert_eq!(
+        mem_after_2.len().await.expect("len 2"),
+        2,
+        "ajo 2: toinen muistorivi syntyi (turn_key ei törmännyt replayn duplikaattiin)"
+    );
+
+    // Siivous (edition 2021: `remove_var` on turvallinen).
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
 /// Varmistaa erikseen että inbound todella **kulkee busin läpi agentille**
 /// (muisti saa merkinnän), riippumatta reply-pathista — toinen pää roundtripin
 /// todisteketjusta.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inbound_reaches_agent_over_bus() {
+    // Serialisoi restart-testin env-mutaation kanssa (in-memory-polku odotettu).
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
     let channel = MockChannel::new("mock-bus").expect("channel");
     channel
         .inject(InboundMessage::new("u", "c", "muistatko tämän viestin").expect("inbound"))

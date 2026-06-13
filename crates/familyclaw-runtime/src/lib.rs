@@ -121,6 +121,12 @@ pub async fn build_family(
     reply_target: String,
     resolver: &dyn LlmEndpointResolver,
 ) -> Result<FamilyRuntime> {
+    // 0. Lue persistointikonfiguraatio SYNKRONISESTI ennen ensimmäistä
+    //    `.await`-pistettä. Näin päätös (persistentti vs. in-memory) tehdään
+    //    yhdessä paikassa eikä riipu siitä, ehtiikö joku muuttaa
+    //    `FAMILYCLAW_DATA_DIR`-ympäristömuuttujaa busin käynnistyksen aikana.
+    let data_dir = env::var("FAMILYCLAW_DATA_DIR").ok();
+
     // 1. Käynnistä Resonance Bus (perheen affektiivinen hermosto).
     let bus = ResonanceBus::start(bus_name).await?;
 
@@ -136,25 +142,31 @@ pub async fn build_family(
     let failover = build_llm_chain(&agent_cfg.model, resolver).ok();
 
     // 4. Muisti (Eternal Thread, in-memory MVP) + durable-konteksti.
-    let (memory, durable, dream_journal) = if let Ok(data_dir) = env::var("FAMILYCLAW_DATA_DIR") {
-        let dir = std::path::PathBuf::from(&data_dir);
-        std::fs::create_dir_all(&dir).ok();
-        let journal = FileJournal::open(dir.join("journal.jsonl"))
-            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-        let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(journal);
-        let mem = LocalJsonStore::open(dir.join("memory.json"))
-            .await
-            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-        let dur = DurableContext::new(Arc::clone(&dream_j))
-            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-        (Arc::new(mem) as ErasedMemoryStore, dur, Some(dream_j))
-    } else {
-        let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
-        let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(InMemoryJournal::new());
-        let durable = DurableContext::new(Arc::clone(&dream_j))
-            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-        (memory, durable, Some(dream_j))
-    };
+    //
+    //    `persistent` kertoo, rakennettiinko durable-konteksti OLEMASSA OLEVAN
+    //    journalin päälle (FAMILYCLAW_DATA_DIR). Vain silloin on replay-historiaa
+    //    josta on jatkettava elävänä (askel 6, `resume_live`). In-memory-polulla
+    //    journal on aina tyhjä → ei replayta → ei resume-tarvetta.
+    let (memory, durable, dream_journal, persistent) =
+        if let Some(data_dir) = data_dir {
+            let dir = std::path::PathBuf::from(&data_dir);
+            std::fs::create_dir_all(&dir).ok();
+            let journal = FileJournal::open(dir.join("journal.jsonl"))
+                .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+            let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(journal);
+            let mem = LocalJsonStore::open(dir.join("memory.json"))
+                .await
+                .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+            let dur = DurableContext::new(Arc::clone(&dream_j))
+                .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+            (Arc::new(mem) as ErasedMemoryStore, dur, Some(dream_j), true)
+        } else {
+            let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
+            let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(InMemoryJournal::new());
+            let durable = DurableContext::new(Arc::clone(&dream_j))
+                .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+            (memory, durable, Some(dream_j), false)
+        };
 
     // 5. Ankkuroi identiteetti ennen agentin rakennusta.
     if env::var("FAMILYCLAW_HEARTH_ENABLED").is_ok() {
@@ -170,10 +182,22 @@ pub async fn build_family(
     //    LLM annetaan `None`:na konstruktorille ja KOKO failover-ketju
     //    kytketään erikseen [`Agent::with_failover`]:lla (jos se ratkesi).
     //    Näin agentti saa primary + fallbackit, ei vain primaryä.
+    //
+    //    **Gateway-restart-korjaus:** kun durable-konteksti rakennettiin
+    //    OLEMASSA OLEVAN journalin päälle (persistentti polku,
+    //    FAMILYCLAW_DATA_DIR), se on replay-tilassa. Gateway palvelee ELÄVIÄ
+    //    uusia viestejä — se EI syötä historiaa uudelleen. [`Agent::resume_live`]
+    //    siirtää durable-kursorin replayn loppuun JA palauttaa `turn_counter`:n
+    //    seuraavaan vapaaseen vuoropaikkaan, jotta seuraava elävä vuoro
+    //    (a) ei kaadu `NondeterministicReplay`:hin / mykisty (`is_replaying`),
+    //    eikä (b) törmää muistin `turn_key`:ssä replayn duplikaattiin. Tämä
+    //    tehdään vain persistentillä polulla — in-memory-journal on aina tyhjä.
     let dream_store = Arc::clone(&memory);
-    let mut agent = Agent::new(agent_cfg, soul, memory, durable, bus.clone(), None, None)
-        .with_reply_sink(sink)
-        .with_reply_target(reply_target);
+    let mut agent = Agent::new(agent_cfg, soul, memory, durable, bus.clone(), None, None);
+    if persistent {
+        agent = agent.resume_live();
+    }
+    agent = agent.with_reply_sink(sink).with_reply_target(reply_target);
     if let Some(failover) = failover {
         agent = agent.with_failover(failover);
     }
