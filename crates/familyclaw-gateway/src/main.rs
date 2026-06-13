@@ -55,8 +55,9 @@ use familyclaw_bus::BusHandle;
 mod config;
 use config::FamilyConfig;
 use familyclaw_channels::{
-    verify_signature, Channel, ChannelKind, DiscordChannel, DiscordInteraction, InboundMessage,
-    TelegramChannel, RESPONSE_DEFERRED_CHANNEL_MESSAGE, RESPONSE_PONG,
+    verify_signature, Channel, ChannelKind, ChannelResult, DiscordChannel, DiscordInteraction,
+    InboundMessage, MessageStream, OutboundMessage, SendFuture, TelegramChannel,
+    RESPONSE_DEFERRED_CHANNEL_MESSAGE, RESPONSE_PONG,
 };
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
 use familyclaw_runtime::{build_family, FamilyRuntime};
@@ -447,6 +448,44 @@ fn load_agent_soul(agent_name: &str) -> Soul {
     }
 }
 
+/// Jaettu-instanssi-adapteri: käärii `Arc<DiscordChannel>`:n `Channel`-trait-
+/// olioksi delegoimalla kaikki kutsut SAMAAN instanssiin.
+///
+/// **Miksi tämä on olemassa (dual-instance-bugin korjaus):** bus-pumppu
+/// ([`build_family`] → `channel.receive()`) ja inject-polut (`/inject`,
+/// `/discord/interactions` → `Arc<DiscordChannel>::inject`) on aiemmin
+/// rakennettu KAHDESTA erillisestä [`DiscordChannel::from_webhook`]-kutsusta.
+/// Kukin kutsu luo oman `mpsc`-parin (`inbound_tx`/`inbound_rx`), joten
+/// injektoidut viestit työnnettiin instanssiin #1:n `inbound_tx`:ään, jonka
+/// `inbound_rx`:ää kukaan ei koskaan kuluttanut — webhook-injektointi katosi
+/// mustaan aukkoon.
+///
+/// Tämä adapteri antaa rakentaa kanavan **kerran** (`Arc<DiscordChannel>`) ja
+/// jakaa SAMAN instanssin: bus saa adapterin (`Box<dyn Channel>`), inject saa
+/// `Arc`-kahvan. `receive()`/`send()`/`inject()` ottavat kaikki `&self`, joten
+/// ne operoivat yhden instanssin samaa `inbound_tx`/`inbound_rx`-paria
+/// vasten — juuri se yksi-virta-malli, jonka `DiscordChannel::inject`:n
+/// dokumentaatio jo lupaa.
+struct SharedDiscordChannel(Arc<DiscordChannel>);
+
+impl Channel for SharedDiscordChannel {
+    fn channel_id(&self) -> &str {
+        self.0.channel_id()
+    }
+
+    fn kind(&self) -> ChannelKind {
+        self.0.kind()
+    }
+
+    fn send(&self, message: OutboundMessage) -> SendFuture<'_> {
+        self.0.send(message)
+    }
+
+    fn receive(&self) -> ChannelResult<MessageStream> {
+        self.0.receive()
+    }
+}
+
 /// Käynnistää [`FamilyRuntime`]:n ympäristöstä luetulla kokoonpanolla
 /// (KERROS B). Lukee agentin nimen, mallin, sielun, Telegram-kanavan ja
 /// reply-kohteen env-muuttujista — mitään ei kovakoodata (KERROS A).
@@ -493,13 +532,16 @@ async fn start_runtime() -> Result<(
                 )));
             }
             let ch_id = cfg.discord_channel_id();
+            // Rakenna DiscordChannel TÄSMÄLLEEN KERRAN ja jaa sama instanssi.
+            // Bus-pumppu saa `SharedDiscordChannel`-adapterin (Box<dyn Channel>),
+            // inject-polut saavat `Arc`-kahvan — molemmat osoittavat samaan
+            // `inbound_tx`/`inbound_rx`-pariin. Aiempi koodi rakensi KAKSI
+            // erillistä instanssia, jolloin injektoidut viestit katosivat (dual-
+            // instance-mustaaukko); ks. SharedDiscordChannel-dokumentaatio.
             let dc = DiscordChannel::from_webhook(webhook_url.to_string(), ch_id.to_string())
                 .map_err(FamilyClawError::from)?;
             let dc_arc = Arc::new(dc);
-            let ch: Box<dyn Channel> = Box::new(
-                DiscordChannel::from_webhook(webhook_url.to_string(), ch_id.to_string())
-                    .map_err(FamilyClawError::from)?,
-            );
+            let ch: Box<dyn Channel> = Box::new(SharedDiscordChannel(Arc::clone(&dc_arc)));
             (ch, Some(dc_arc))
         } else {
             let token = cfg.telegram_token();
