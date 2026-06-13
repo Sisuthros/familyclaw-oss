@@ -1,10 +1,17 @@
 # FamilyClaw
 
-**Rust-native runtime for persistent AI agent families.**
+**Crash-proof memory + contract-verified multi-agent execution for AI agent families.**
 
 Most AI agents die between runs. FamilyClaw gives them continuity:
 durable replay, persistent memory, actor-based coordination, sleep-time consolidation,
 and private runtime profiles that never enter the repository.
+
+> **What this demo proves today:** crash-proof durable replay, 19-dimension emotion contagion,
+> nightly dream consolidation, persistent memory with Ebbinghaus decay, Discord inbound gateway
+> (Ed25519 verification), benchmarked continuity (6 scenarios, deterministic scorecard).
+>
+> **What's on the roadmap:** latent telepathy (hidden-state transfer), WASM sandbox safety,
+> contract-verified orchestration, additional channel adapters.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Rust 2021](https://img.shields.io/badge/Rust-2021%20edition-orange.svg)
@@ -100,7 +107,14 @@ paths, and ships unit tests in-module.
 | [`familyclaw-security`](crates/familyclaw-security) | Identity anchors + human-correction veto. Identity lives in the memory substrate, not a hash. | [![docs](https://docs.rs/familyclaw-security/badge.svg)](https://docs.rs/familyclaw-security) |
 | [`familyclaw-bridge`](crates/familyclaw-bridge) | Agent registry, task board, event bus — transport-independent Rust core. | [![docs](https://docs.rs/familyclaw-bridge/badge.svg)](https://docs.rs/familyclaw-bridge) |
 | [`familyclaw-agent`](crates/familyclaw-agent) | **Agent runtime** — composes all above into a living being. Ships demo binaries. | [![docs](https://docs.rs/familyclaw-agent/badge.svg)](https://docs.rs/familyclaw-agent) |
-| [`familyclaw-channels`](crates/familyclaw-channels) | Discord / Telegram / WhatsApp / Signal adapters bridged to the bus. | [![docs](https://docs.rs/familyclaw-channels/badge.svg)](https://docs.rs/familyclaw-channels) |
+| [`familyclaw-channels`](crates/familyclaw-channels) | Discord / Telegram / WhatsApp / Signal adapters bridged to the bus. Discord inbound gateway (Ed25519 verification, slash commands) is live. | [![docs](https://docs.rs/familyclaw-channels/badge.svg)](https://docs.rs/familyclaw-channels) |
+| [`familyclaw-acp`](crates/familyclaw-acp) | **ACP client** — spawn and control CLI agents (Claude, Gemini, Qoder) over stdio. | [![docs](https://docs.rs/familyclaw-acp/badge.svg)](https://docs.rs/familyclaw-acp) |
+| [`familyclaw-bench`](crates/familyclaw-bench) | **Continuity benchmark** — reproducible proof of crash-resume, retention and dreaming. | [![docs](https://docs.rs/familyclaw-bench/badge.svg)](https://docs.rs/familyclaw-bench) |
+| [`familyclaw-gateway`](crates/familyclaw-gateway) | **Gateway binary** — long-running process: HTTP health/readiness + Resonance Bus bootstrap. | [![docs](https://docs.rs/familyclaw-gateway/badge.svg)](https://docs.rs/familyclaw-gateway) |
+| [`familyclaw-gemu`](crates/familyclaw-gemu) | **Gemu CLI** — Gemini interface to FamilyClaw runtime. | [![docs](https://docs.rs/familyclaw-gemu/badge.svg)](https://docs.rs/familyclaw-gemu) |
+| [`familyclaw-hearth`](crates/familyclaw-hearth) | **The Hearth** — shared family memory, narratives, emotional state and anchors. | [![docs](https://docs.rs/familyclaw-hearth/badge.svg)](https://docs.rs/familyclaw-hearth) |
+| [`familyclaw-observability`](crates/familyclaw-observability) | **Observability** — metrics, event recording and per-role RBAC for the multi-agent fleet. | [![docs](https://docs.rs/familyclaw-observability/badge.svg)](https://docs.rs/familyclaw-observability) |
+| [`familyclaw-runtime`](crates/familyclaw-runtime) | **Runtime assembly** — wires bus + agents + channels + reply pump (`build_family`). | [![docs](https://docs.rs/familyclaw-runtime/badge.svg)](https://docs.rs/familyclaw-runtime) |
 
 ---
 
@@ -180,7 +194,7 @@ Proves: FileJournal + LocalJsonStore persist to disk, process restart reloads bo
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/... \
 cargo run -p familyclaw-agent --features familyclaw-channels/discord
 ```
-Inbound gateway: future work.
+Inbound gateway: live — Ed25519 signature verification, slash command parsing (`gateway/src/main.rs:269-379`).
 
 ---
 
