@@ -251,6 +251,36 @@ pub fn score(memory: &Memory, ctx: &RetrievalContext, at: Timestamp) -> Option<f
     Some(relevance.clamp(0.0, 1.0))
 }
 
+/// Pienin alkuperä-luottamuskerroin jonka matala-trust ulkoinen lähde voi
+/// saada retrieval-painotuksessa. Estää että myrkytetty (mutta portin läpi
+/// vuotanut tai porttia käyttämättä lisätty) ulkoinen muisto häviää täysin
+/// — se vain painuu pohjalle, jolloin audit voi yhä löytää sen.
+const PROVENANCE_TRUST_FLOOR: f32 = 0.1;
+
+/// Kuten [`score`], mutta painottaa lopputuloksen muiston alkuperän
+/// ([`Provenance`](crate::Provenance)) luottamuksella.
+///
+/// Suora kokemus ja johdetut muistot (`trust = 1.0`) säilyttävät
+/// pisteensä ennallaan. Matalan luottamuksen ulkoinen lähde laskee
+/// sijoitustaan kertoimella `0.1 + 0.9 · trust` (kts.
+/// [`PROVENANCE_TRUST_FLOOR`]): epäluotettava ulkoinen väite painuu
+/// hakutulosten pohjalle (Sleeper Memory Poisoning -suoja jälkikäteen,
+/// myös niille muistoille jotka eivät kulkeneet [`ProvenanceGate`]in läpi).
+///
+/// Palauttaa `None` samoissa tapauksissa kuin [`score`] (haudattu,
+/// poissuljettu arkistoitu, tägi-suodatus).
+#[must_use]
+pub fn score_with_provenance(
+    memory: &Memory,
+    ctx: &RetrievalContext,
+    at: Timestamp,
+) -> Option<f32> {
+    let base = score(memory, ctx, at)?;
+    let trust = memory.provenance.trust().clamp(0.0, 1.0);
+    let factor = PROVENANCE_TRUST_FLOOR + (1.0 - PROVENANCE_TRUST_FLOOR) * trust;
+    Some((base * factor).clamp(0.0, 1.0))
+}
+
 /// Confidence-painotettu retention retrievalia varten.
 ///
 /// Confirmed-muistot (confidence=1.0) säilyttävät täyden retentionin.
@@ -709,6 +739,43 @@ mod tests {
         // Yhden merkin "a" ja "x" karsiutuvat.
         assert!(!toks.contains(&"a".to_string()));
         assert!(!toks.contains(&"x".to_string()));
+    }
+
+    #[test]
+    fn provenance_weighting_demotes_low_trust_external() {
+        use crate::provenance::Provenance;
+        let now = time::now();
+        let ctx = RetrievalContext::new("report");
+
+        let direct = Memory::builder("the report content")
+            .factors(ImportanceFactors::new(0.5, 0.0, 0.0, 0.0))
+            .build();
+        let external = Memory::builder("the report content")
+            .factors(ImportanceFactors::new(0.5, 0.0, 0.0, 0.0))
+            .provenance(Provenance::external("web", 0.1))
+            .build();
+
+        let s_direct = score_with_provenance(&direct, &ctx, now).expect("direct scored");
+        let s_external = score_with_provenance(&external, &ctx, now).expect("external scored");
+        assert!(
+            s_external < s_direct,
+            "matala-trust ulkoinen {s_external} ei painunut alle suoran {s_direct}"
+        );
+        // Mutta ei nollaan — audit löytää sen yhä (trust floor).
+        assert!(s_external > 0.0);
+    }
+
+    #[test]
+    fn provenance_weighting_preserves_direct_experience() {
+        let now = time::now();
+        let ctx = RetrievalContext::new("report");
+        let m = Memory::builder("the report content")
+            .factors(ImportanceFactors::new(0.5, 0.0, 0.0, 0.0))
+            .build();
+        // DirectExperience (trust 1.0) → sama pistemäärä kuin paljas score.
+        let plain = score(&m, &ctx, now).expect("plain");
+        let weighted = score_with_provenance(&m, &ctx, now).expect("weighted");
+        assert!((plain - weighted).abs() < 1e-6);
     }
 
     #[test]
