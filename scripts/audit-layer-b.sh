@@ -79,16 +79,33 @@ check_dir "keys" "keys"
 
 # 8. No real agent names in publishable content
 echo "8️⃣  Checking for real Layer B names in publishable content..."
-# Scan: README.md, docs/ (excluding plans/ and source-blueprints/), crates/**/*.rs, examples/, .github/
-# Exclude internal design docs that contain private family history
-SCAN_PATHS="README.md docs/ARCHITECTURE.md docs/LAYER_BOUNDARY.md docs/QUICKSTART.md docs/DEMO.md docs/CONTRIBUTING.md crates examples .github"
+# Scan EVERY git-tracked publishable file (text formats) instead of a hardcoded
+# allowlist. This way any newly-added tracked file is caught by default — a narrow
+# allowlist silently missed FAMILYCLAW_MAP.md + docs/plans/ + docs/research/ +
+# docs/source-blueprints/, which leaked real family names into the OSS tree.
+# Internal-only files must be untracked (.gitignore) — not whitelisted here.
+# An explicit deny-list excludes legitimately-public files that mention agent names
+# only as escaped/example tokens (e.g. *.example).
+SCAN_FILES=$(git ls-files -- \
+    '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' '*.json' 2>/dev/null \
+    | grep -vE '(^|/)(target)/' \
+    | grep -vE '\.example($|\.)' \
+    | grep -vE '\.example\.(md|rs|toml|yml|yaml|json)$')
 NAME_FOUND=0
 for name in $FORBIDDEN_NAMES; do
     # Remove quotes for grep
     clean_name=$(echo "$name" | sed 's/"//g')
-    if grep -r "$clean_name" $SCAN_PATHS --include="*.md" --include="*.rs" --include="*.toml" --include="*.yml" --include="*.yaml" --include="*.json" 2>/dev/null | grep -v "\.example" | grep -v "agent_alpha\|agent_beta\|agent_gamma\|agent_delta\|agent_epsilon\|maintainer\|operator\|user" | grep -q .; then
+    [ -z "$SCAN_FILES" ] && continue
+    if echo "$SCAN_FILES" | xargs grep -l "$clean_name" 2>/dev/null \
+        | xargs -r grep -H "$clean_name" 2>/dev/null \
+        | grep -v "\.example" \
+        | grep -v "agent_alpha\|agent_beta\|agent_gamma\|agent_delta\|agent_epsilon\|maintainer\|operator\|user" \
+        | grep -q .; then
         echo "   ❌ FAIL: Real agent name '$clean_name' found in publishable content"
-        grep -r "$clean_name" $SCAN_PATHS --include="*.md" --include="*.rs" --include="*.toml" --include="*.yml" --include="*.yaml" --include="*.json" 2>/dev/null | grep -v "\.example" | grep -v "agent_alpha\|agent_beta\|agent_gamma\|agent_delta\|agent_epsilon\|maintainer\|operator\|user"
+        echo "$SCAN_FILES" | xargs grep -l "$clean_name" 2>/dev/null \
+            | xargs -r grep -Hn "$clean_name" 2>/dev/null \
+            | grep -v "\.example" \
+            | grep -v "agent_alpha\|agent_beta\|agent_gamma\|agent_delta\|agent_epsilon\|maintainer\|operator\|user"
         NAME_FOUND=1
         FAIL=1
     fi

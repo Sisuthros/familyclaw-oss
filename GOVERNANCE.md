@@ -99,7 +99,7 @@
 
 | KERROS A (OSS) | KERROS B (Private) |
 |----------------|-------------------|
-| `crates/familyclaw-*` | agent_gamma Amplifier, family secrets |
+| `crates/familyclaw-*` | Amplifier integration, family secrets |
 | No hardcoded names/keys/paths | Family member identities, API keys |
 | Config via env / `familyclaw.toml` | Injected at deploy time |
 | **MIT License** | Proprietary / internal |

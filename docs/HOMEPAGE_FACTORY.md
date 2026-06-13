@@ -97,7 +97,7 @@ pub trait TurnExecutor: Send + Sync {
 - **Today (consumer side, this crate):** `MockTurnExecutor` is hermetic and
   deterministic — no clock, no network, no randomness. Its payload is derived
   purely from the turn's input and assignee, so the factory test is reproducible.
-- **Tomorrow (producer side):** agent_gamma implements `LiveTurnExecutor` in
+- **Tomorrow (producer side):** the producer team implements `LiveTurnExecutor` in
   `familyclaw-agent` behind the **same** `TurnExecutor` trait, wiring a real free
   LLM (and transport). Swapping `MockTurnExecutor` for `LiveTurnExecutor` in the
   `run_with(...)` call makes the identical plan run against a live model — the

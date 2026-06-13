@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Discord inbound** — `POST /discord/interactions` gatewayssä (Ed25519)
 - **scripts/public-demo.ps1** — geneerinen julkinen demo (minimal-gateway + test + bench)
 - **.env.example** — Kerros B -pohja repossa (tyhjät salaisuudet)
-- **docs/handoff/agent_gamma_LIVE_TURN_EXECUTOR.md** — agent_gamma omistaa agent/memory-live-executorin
+- **LiveTurnExecutor handoff** — producer-tiimi omistaa agent/memory-live-executorin (sisäinen handoff Kerros B:ssä)
 
 ### Changed
 - **OSS sanitization** — testit ja kommentit käyttävät `agent_a` / `agent_alpha` eikä perhenimiä

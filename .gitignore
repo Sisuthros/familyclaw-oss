@@ -85,3 +85,22 @@ bridge.py
 .claude/night-nudger*.log
 .claude/night-nudger-stdout.log
 __pycache__/
+
+# ─────────────────────────────────────────────────────────────
+# KERROS B: sisäiset suunnittelu- ja tutkimusdokumentit
+# (EI julkaistavaksi — sisältävät perheen oikeat nimet + historiaa.
+#  Lisätty 2026-06-13 Layer-B-vuotoauditin jäljiltä, vrt. release blocker #1)
+# Tiedostot säilyvät levyllä paikallisesti — vain poistettu Gitin seurannasta.
+# ─────────────────────────────────────────────────────────────
+# Sisäinen arkkitehtuurikartta (oikeat perheenjäsenten nimet).
+FAMILYCLAW_MAP.md
+# Sisäiset suunnitelmat, tutkimus ja lähde-blueprintit.
+docs/plans/
+docs/research/
+docs/source-blueprints/
+# Sisäinen Layer-B-handoff (mainitsee perheen sielun + profiilipolut).
+docs/handoff/
+# Sisäiset yö-ajo- ja suunnitteludokumentit (.claude/) joissa perheen nimet.
+# HUOM: vain nimi-vuotavat suunnitelmat — tooling (.py, settings.json) säilyy.
+.claude/NIGHT_RUN_2026-06-11.md
+.claude/PLAN_HEARTH.md
