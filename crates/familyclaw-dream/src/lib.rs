@@ -59,20 +59,24 @@
 #![doc = include_str!("../README.md")]
 
 pub mod config;
+pub mod conflict;
 pub mod contradiction;
 pub mod cycle;
 pub mod dates;
 pub mod desire_clock;
 pub mod report;
 pub mod similarity;
+pub mod weekly;
 
 pub use config::DreamConfig;
+pub use conflict::{clear_conflict, is_conflicted, tag_conflict, ConflictTag, CONFLICT_TAG};
 pub use contradiction::{contradicted_ids, mark_contradicted, CONTRADICT_STEP};
 pub use cycle::DreamCycle;
 pub use dates::{absolutize, AbsolutizeResult};
 pub use desire_clock::DesireClock;
 pub use report::{DreamReport, Reflection, ReflectionKind};
 pub use similarity::{is_near_duplicate, jaccard};
+pub use weekly::{weekly_review, weekly_review_top_n, MemoryDigest, WeeklyReport};
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).
 #[must_use]
