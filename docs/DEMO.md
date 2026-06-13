@@ -73,7 +73,7 @@ cargo run -p familyclaw-agent --bin crash_replay
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/... cargo run -p familyclaw-agent --features familyclaw-channels/discord
 ```
 
-**Status:** Webhook **send only**. Inbound gateway (receiving messages) is **future work**.
+**Status:** Webhook send + **inbound gateway live** — Ed25519 signature verification, slash command parsing, route at `:389/discord/interactions` (`gateway/src/main.rs:269-379`, `channels/src/discord_interactions.rs` 199 lines).
 
 ---
 
