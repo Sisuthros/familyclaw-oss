@@ -121,3 +121,7 @@ FAMILYCLAW_TECHNICAL_PLAN.md
 research_data.md
 papers.txt
 write_papers.py
+# Lisätty 2026-06-14 (alpha.4-rinnakkaisajo): pakettibriefit + orkestrointi
+# mainitsevat perheen oikeat nimet (agentti-osoitus) → sisäisiä, ei Layer A:han.
+PAKETTI-*.md
+plans/PARALLEL_RUN_*.md

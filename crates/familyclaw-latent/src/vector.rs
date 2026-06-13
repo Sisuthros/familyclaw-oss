@@ -250,10 +250,10 @@ mod tests {
     #[test]
     fn cosine_handles_edge_cases_without_nan() {
         // Eri pituus, tyhjä, nollavektori, ei-äärellinen → 0.0 (ei NaN).
-        assert_eq!(cosine(&[1.0, 2.0], &[1.0]), 0.0);
-        assert_eq!(cosine(&[], &[]), 0.0);
-        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
-        assert_eq!(cosine(&[f32::NAN, 1.0], &[1.0, 1.0]), 0.0);
+        assert!(cosine(&[1.0, 2.0], &[1.0]).abs() < f32::EPSILON);
+        assert!(cosine(&[], &[]).abs() < f32::EPSILON);
+        assert!(cosine(&[0.0, 0.0], &[1.0, 1.0]).abs() < f32::EPSILON);
+        assert!(cosine(&[f32::NAN, 1.0], &[1.0, 1.0]).abs() < f32::EPSILON);
         assert!(!cosine(&[0.0], &[0.0]).is_nan());
     }
 

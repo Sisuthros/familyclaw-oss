@@ -114,6 +114,11 @@ impl FamilyRuntime {
 ///   tai durable-kontekstin rakennus epäonnistuu.
 /// - [`FamilyClawError::InvalidInput`] (kanavakerroksesta käännettynä) jos
 ///   kanavan saapuvaa virtaa ei voi avata.
+// Tämä on perheen kokoamisen yksi lineaarinen sekvenssi (bus → LLM → muisti →
+// durable → agentti → kanava → dream). Numeroidut askeleet luetaan ylhäältä alas;
+// paloittelu apufunktioihin hajottaisi tämän kokoamiskertomuksen ja kasvattaisi
+// argumenttien lankoja ilman selvyyshyötyä.
+#[allow(clippy::too_many_lines)]
 pub async fn build_family(
     bus_name: Option<String>,
     agent_cfg: AgentConfig,

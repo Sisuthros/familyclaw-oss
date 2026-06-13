@@ -258,9 +258,9 @@ mod tests {
     #[tokio::test]
     async fn top_n_limits_list() {
         let store = LocalJsonStore::in_memory();
-        for i in 0..10 {
+        for i in 0u8..10 {
             store
-                .add(mem(&format!("memory {i}"), 0.1 * i as f32))
+                .add(mem(&format!("memory {i}"), 0.1 * f32::from(i)))
                 .await
                 .expect("add");
         }
