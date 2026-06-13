@@ -2,23 +2,28 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
-  check:
-    name: Check, Build, and Test
+  layer-b-audit:
+    name: Layer B leak audit
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Layer B leak audit FIRST — fail fast before the slow build if any
-      # private content (souls, real family names, secrets) reached Layer A.
-      # Enforces the guarantee documented in SECURITY.md.
       - name: Run Layer B leak audit
         run: bash scripts/audit-layer-b.sh
+
+  check:
+    name: Check, Build, and Test
+    needs: layer-b-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -54,3 +59,98 @@ jobs:
         env:
           DISCORD_TEST_TOKEN: ${{ secrets.DISCORD_TEST_TOKEN }}
           DISCORD_TEST_CHANNEL_ID: ${{ secrets.DISCORD_TEST_CHANNEL_ID }}
+
+  msrv:
+    name: MSRV (1.85)
+    needs: layer-b-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo check --workspace
+        run: cargo check --workspace
+
+  all-features:
+    name: Test (all features)
+    needs: layer-b-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # familyclaw-gateway is binary-only; --workspace (not --lib) includes its tests.
+      - name: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features
+
+  windows:
+    name: Build and Test (Windows)
+    needs: layer-b-audit
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace (discord feature)
+        run: cargo build --workspace --features discord
+
+      - name: Run unit tests (discord feature)
+        run: cargo test --workspace --features discord
+
+  cargo-audit:
+    name: cargo audit
+    needs: layer-b-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        run: cargo audit
+
+  cargo-deny:
+    name: cargo deny
+    needs: layer-b-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Run cargo deny check
+        run: cargo deny check
