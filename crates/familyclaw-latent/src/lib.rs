@@ -54,6 +54,7 @@
 
 pub mod channel;
 pub mod link;
+pub mod translate;
 pub mod vector;
 
 pub use channel::{
@@ -62,7 +63,8 @@ pub use channel::{
 };
 pub use familyclaw_core::{FamilyClawError, Result};
 pub use link::{ProjectedLatent, ProjectionStrategy, RecursiveLink};
-pub use vector::LatentVector;
+pub use translate::{Projection, VectorTranslator};
+pub use vector::{blend, cosine, LatentVector};
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).
 #[must_use]
