@@ -67,13 +67,17 @@
 
 pub mod being;
 pub mod bus;
+pub mod coherence;
 pub mod latent_channel;
 pub mod message;
+pub mod uacp;
 
 pub use being::{BeingInfo, BeingSnapshot, CollectedLog, CollectorBeing, CollectorState};
 pub use bus::{BusHandle, BusOp, BusState, ResonanceBus};
+pub use coherence::{CoherenceTracker, MesiState, RemoteReadOutcome, RemoteWriteOutcome};
 pub use latent_channel::BusLatentChannel;
 pub use message::{BeingId, BusMessage, MessageOrigin, ResonanceMessage, TaskEventKind};
+pub use uacp::{AcpEnvelope, AcpVerb, ACP_MESSAGE_NAME};
 
 // Re-export ydinvirhetyypit, jotta kutsujan ei tarvitse riippua
 // `familyclaw-core`sta erikseen bussia käyttäessään.
