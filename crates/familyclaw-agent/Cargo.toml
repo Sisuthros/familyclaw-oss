@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 familyclaw-core = { workspace = true }
+familyclaw-bridge = { workspace = true }
 familyclaw-bus = { workspace = true }
 familyclaw-memory = { workspace = true }
 familyclaw-emotion = { workspace = true }
@@ -21,6 +22,7 @@ familyclaw-dream = { workspace = true }
 familyclaw-channels = { workspace = true }
 familyclaw-sandbox = { workspace = true }
 ractor = { workspace = true }
+async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
