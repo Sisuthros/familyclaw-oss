@@ -106,8 +106,11 @@ impl Default for DiscordCfg {
 impl Default for ProviderCfg {
     fn default() -> Self {
         Self {
-            kind: "anthropic".into(),
-            model: "claude-sonnet-4-6".into(),
+            kind: "openai".into(),
+            // Provider-prefixed (`provider/model`) muoto: resolveri vaatii sen,
+            // muuten bare-nimi tulkitaan provider-nimeksi → ei ratkea → agentti
+            // jää mykäksi (ei tekstivastauksia). Ks. build_llm_chain.
+            model: "openai/gpt-4.1-mini".into(),
             api_key: String::new(),
         }
     }
@@ -183,7 +186,17 @@ impl FamilyConfig {
         if let Ok(v) = std::env::var("FAMILYCLAW_CHANNEL_KIND") {
             self.channel.kind = v;
         }
-        if let Ok(v) = std::env::var("FAMILYCLAW_CHANNEL_REPLY_TARGET") {
+        // Reply-kohde: kanoninen `FAMILYCLAW_REPLY_TARGET` (sama nimi kuin
+        // .env.example, docs/RUNBOOK_WINDOWS.md ja main.rs:n REPLY_TARGET_ENV).
+        // `FAMILYCLAW_CHANNEL_REPLY_TARGET` säilytetään vanhentuneena aliaksena
+        // taaksepäin-yhteensopivuudelle — luetaan VAIN jos kanonista ei ole
+        // asetettu (kanoninen voittaa, jos molemmat on asetettu).
+        if let Ok(v) = std::env::var("FAMILYCLAW_REPLY_TARGET") {
+            self.channel.reply_target = v;
+        } else if let Ok(v) = std::env::var("FAMILYCLAW_CHANNEL_REPLY_TARGET") {
+            tracing::warn!(
+                "FAMILYCLAW_CHANNEL_REPLY_TARGET is deprecated — use FAMILYCLAW_REPLY_TARGET"
+            );
             self.channel.reply_target = v;
         }
         if let Ok(v) = std::env::var("FAMILYCLAW_PROVIDER_API_KEY") {
@@ -254,5 +267,67 @@ impl FamilyConfig {
     /// (loopback-only-oletuskäytös).
     pub fn gateway_token(&self) -> &str {
         &self.security.gateway_token
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FIX 3: `FAMILYCLAW_REPLY_TARGET` on kanoninen reply-kohteen
+    /// ympäristömuuttuja (sama nimi kuin .env.example, RUNBOOK ja main.rs);
+    /// `FAMILYCLAW_CHANNEL_REPLY_TARGET` jää vanhentuneeksi aliakseksi.
+    /// Kanoninen voittaa, jos molemmat on asetettu — niin docs-ohjeita
+    /// seuraava käyttäjä saa odotetun käytöksen.
+    ///
+    /// Env-muuttujat ovat prosessin laajuisia → ajetaan kaikki tapaukset
+    /// peräkkäin yhdessä testissä (ei rinnakkaiskilpailua muiden testien
+    /// kanssa) ja siivotaan lopuksi.
+    #[test]
+    fn reply_target_env_canonical_wins_over_deprecated_alias() {
+        const CANON: &str = "FAMILYCLAW_REPLY_TARGET";
+        const ALIAS: &str = "FAMILYCLAW_CHANNEL_REPLY_TARGET";
+
+        // Lähtötilanne: kumpikaan ei asetettu → reply_target pysyy default-tyhjänä.
+        std::env::remove_var(CANON);
+        std::env::remove_var(ALIAS);
+        let mut cfg = FamilyConfig::default();
+        cfg.apply_env();
+        assert_eq!(cfg.reply_target(), "", "ei env → default tyhjä");
+
+        // Vain vanhentunut alias → luetaan (taaksepäin-yhteensopivuus).
+        std::env::set_var(ALIAS, "legacy-target");
+        let mut cfg = FamilyConfig::default();
+        cfg.apply_env();
+        assert_eq!(cfg.reply_target(), "legacy-target", "alias luetaan kun ei kanonista");
+
+        // Molemmat asetettu → KANONINEN voittaa.
+        std::env::set_var(CANON, "canonical-target");
+        let mut cfg = FamilyConfig::default();
+        cfg.apply_env();
+        assert_eq!(cfg.reply_target(), "canonical-target", "kanoninen voittaa aliaksen");
+
+        // Vain kanoninen → luetaan.
+        std::env::remove_var(ALIAS);
+        let mut cfg = FamilyConfig::default();
+        cfg.apply_env();
+        assert_eq!(cfg.reply_target(), "canonical-target", "kanoninen luetaan yksinään");
+
+        // Siivous.
+        std::env::remove_var(CANON);
+        std::env::remove_var(ALIAS);
+    }
+
+    /// FIX 4: oletusmallin on oltava provider-prefixed `provider/model`
+    /// muodossa, muuten resolveri tulkitsee bare-nimen provider-nimeksi ja
+    /// agentti jää mykäksi. Suojaa regressiolta takaisin bare-nimeen.
+    #[test]
+    fn default_provider_model_is_provider_prefixed() {
+        let cfg = ProviderCfg::default();
+        assert!(
+            cfg.model.contains('/'),
+            "default model '{}' must be provider/model form",
+            cfg.model
+        );
     }
 }
