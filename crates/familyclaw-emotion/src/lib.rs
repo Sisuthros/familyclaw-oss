@@ -42,13 +42,17 @@
 //! assert!(state.value(Dimension::Gratitude) < 80.0);
 //! ```
 
+pub mod affect_weight;
 pub mod blend;
 pub mod calibration;
 pub mod dimension;
 pub mod governor;
 pub mod state;
+pub mod strategic;
+pub mod transition;
 pub mod vad;
 
+pub use affect_weight::emotional_salience;
 pub use blend::{detect_blends, primary_blend, Blend, BlendMatch, HIGH_THRESHOLD};
 pub use calibration::{EmotionCalibration, NeutralCalibration, TableCalibration};
 pub use dimension::{Dimension, DIMENSION_COUNT};
@@ -57,6 +61,8 @@ pub use governor::{
     GoverningProfile,
 };
 pub use state::{EmotionState, DEFAULT_HALF_LIFE_SECS};
+pub use strategic::{Situation, StrategicAppraisal};
+pub use transition::{EmotionTransition, DEFAULT_INERTIA};
 pub use vad::Vad;
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).
