@@ -20,11 +20,11 @@
 //! ulos testistä).
 //!
 //! ## Miksi mock-LLM HTTP-palvelimena
-//! `Agent::think()` kutsuu `LlmClient::complete()`:a, joka tekee OpenAI-
+//! `Agent::think()` kutsuu `LlmClient::complete()`:a, joka tekee `OpenAI`-
 //! yhteensopivan `POST /chat/completions`-pyynnön. Pystytämme pikkuruisen
 //! axum-palvelimen, joka palauttaa kiinteän choices[0].message.content-arvon,
 //! ja osoitamme `EnvEndpointResolver`-providerin sen base-URL:ään. Näin koko
-//! reply-path ajetaan oikeasti läpi (think → route_reply → sink → send) ilman
+//! reply-path ajetaan oikeasti läpi (think → `route_reply` → sink → send) ilman
 //! ulkoista API:a.
 
 use std::net::SocketAddr;
@@ -72,8 +72,8 @@ async fn spawn_mock_llm() -> String {
     format!("http://{addr}/v1")
 }
 
-/// **Roundtrip-todiste**: inbound → bus → Agent.think() (mock-LLM) →
-/// reply_sink → Channel::send. Yksi viesti sisään, yksi vastaus ulos oikealla
+/// **Roundtrip-todiste**: inbound → bus → `Agent.think()` (mock-LLM) →
+/// `reply_sink` → `Channel::send`. Yksi viesti sisään, yksi vastaus ulos oikealla
 /// kohteella, sisältö = mock-LLM:n kiinteä teksti.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {

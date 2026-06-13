@@ -404,8 +404,8 @@ mod tests {
         assert_eq!(cfg.model, "deepseek-v4-pro");
     }
 
-    /// TEHTÄVÄ C4 -hyväksyntä: FamilyConfig-JSON → agentti rakentuu ilman
-    /// paniikkia (primary LlmConfig saadaan config-kerroksesta + resolverista).
+    /// TEHTÄVÄ C4 -hyväksyntä: `FamilyConfig`-JSON → agentti rakentuu ilman
+    /// paniikkia (primary `LlmConfig` saadaan config-kerroksesta + resolverista).
     #[test]
     fn family_json_builds_agent_llm_config_without_panic() {
         let json = r#"{

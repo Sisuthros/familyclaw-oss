@@ -50,7 +50,7 @@ fn tempdir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Ajaa daemonin alikomennon ja palauttaa (exit_ok, stdout, stderr).
+/// Ajaa daemonin alikomennon ja palauttaa (`exit_ok`, stdout, stderr).
 fn run(bin: &Path, args: &[&str]) -> (bool, String, String) {
     let out = Command::new(bin).args(args).output().expect("spawn daemon");
     (
@@ -293,9 +293,9 @@ fn replay_of_replay_thrice_resumes_clean_with_side_effects_once() {
 /// fsyncattamaton, sitoutumaton kirjoitus → sen hylkääminen on turvallista.
 ///
 /// Tämä testi todistaa että hyökkäys EI enää riko väitettä:
-/// 1. mid_write → torn line.
+/// 1. `mid_write` → torn line.
 /// 2. 1. resume → puhdas (kuten ennenkin).
-/// 3. journalissa EI ole sulautunutta riviä (ei kahta step_id:tä yhdellä rivillä).
+/// 3. journalissa EI ole sulautunutta riviä (ei kahta `step_id`:tä yhdellä rivillä).
 /// 4. 2. resume → ONNISTUU edelleen (ennen: kuoli `CorruptEntry`:hin).
 /// 5. resumen idempotenssi: sivuvaikutukset tasan kerran (3 muistoa, ei enempää).
 #[test]
@@ -377,8 +377,8 @@ fn torn_write_then_resume_keeps_journal_readable_seam_closed() {
 /// VARIANTTI: aloita PUHTAALLA täydellä journalilla, sitten kaada kesken
 /// replayn kolmesti peräkkäin, sitten resume.
 ///
-/// Tämä erottaa "replay-of-replay" -hyökkäyksen mid_write-jäämästä: tässä
-/// journal on TÄYDELLINEN (3 askelta), ja jokainen mid_replay re-enteröi
+/// Tämä erottaa "replay-of-replay" -hyökkäyksen `mid_write`-jäämästä: tässä
+/// journal on TÄYDELLINEN (3 askelta), ja jokainen `mid_replay` re-enteröi
 /// täyden replayn ja kaatuu kesken. Resume EI saa kadottaa mitään eikä
 /// tuottaa uusia muistoja (kaikki 3 jo storessa).
 #[test]

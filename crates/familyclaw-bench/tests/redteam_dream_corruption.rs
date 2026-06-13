@@ -1,6 +1,6 @@
 //! RED-TEAM: dream-corruption -hyökkäys konsolidaatiota vastaan.
 //!
-//! Väite (design §1, §3 S3): *"Overnight a FamilyClaw agent's memory gets
+//! Väite (design §1, §3 S3): *"Overnight a `FamilyClaw` agent's memory gets
 //! cleaner — duplicates merged — and its identity is provably untouched
 //! (protected-core anchors, λ=0). `false_merge_rate == 0`,
 //! `protected_core_intact == 1.0`."*
@@ -26,7 +26,7 @@ use familyclaw_memory::{
     DecayPolicy, ImportanceFactors, LocalJsonStore, Memory, MemoryStatus, MemoryStore,
 };
 
-/// Kiinteä viitehetki: 2026-06-05 12:00 UTC (deterministinen, ei now()).
+/// Kiinteä viitehetki: 2026-06-05 12:00 UTC (deterministinen, ei `now()`).
 fn at() -> Timestamp {
     Utc.with_ymd_and_hms(2026, 6, 5, 12, 0, 0)
         .single()

@@ -9,10 +9,10 @@
 //!
 //! ## Skenaario
 //! Kolme agenttia tekevät yhteistyötä etusivun rakentamiseksi:
-//! - **agent_alpha** ([`AgentRole::Strategy`]) — suunnittelija, mainostaa kykyä
+//! - **`agent_alpha`** ([`AgentRole::Strategy`]) — suunnittelija, mainostaa kykyä
 //!   `homepage_design`.
-//! - **agent_beta** ([`AgentRole::Scout`]) — orkesteroija/katselmoija.
-//! - **agent_gamma** ([`AgentRole::Executor`]) — julkaisija, kyky `deploy`.
+//! - **`agent_beta`** ([`AgentRole::Scout`]) — orkesteroija/katselmoija.
+//! - **`agent_gamma`** ([`AgentRole::Executor`]) — julkaisija, kyky `deploy`.
 //!
 //! Suunnitelma on DAG: `design → review → deploy`. `design`-solmu kantaa
 //! `homepage_design`-kyvyn, jonka **tulosskeema** (`headline`, `sections`,
@@ -151,7 +151,7 @@ fn factory_plan() -> OrchestrationPlan {
     )
 }
 
-/// Rekisteröi tehtaan kolme agenttia (agent_alpha/agent_beta/agent_gamma) onlineksi.
+/// Rekisteröi tehtaan kolme agenttia (`agent_alpha`/`agent_beta`/`agent_gamma`) onlineksi.
 async fn register_factory_agents(
     bridge: &FamilyBridge,
     now: Timestamp,
@@ -212,6 +212,7 @@ async fn register_factory_agents(
 // =============================================================================
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn homepage_factory_runs_end_to_end() {
     let bridge = FamilyBridge::new();
     let now = ts(1_700_000_000);
