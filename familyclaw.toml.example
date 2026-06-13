@@ -30,7 +30,8 @@ kind = "telegram"
 
 # Where replies are routed by default when no per-message origin is present
 # (e.g. a chat/conversation ID). Leave empty to derive purely from the incoming
-# message origin. Env override: FAMILYCLAW_CHANNEL_REPLY_TARGET
+# message origin. Env override: FAMILYCLAW_REPLY_TARGET
+# (FAMILYCLAW_CHANNEL_REPLY_TARGET is a deprecated alias, still honoured).
 reply_target = ""
 
 [channel.discord]
@@ -50,9 +51,11 @@ channel_id = ""
 
 [provider]
 # LLM provider kind (free-form label your Layer B resolver understands).
-kind = "anthropic"
-# Model identifier. Env override: FAMILYCLAW_PROVIDER_MODEL
-model = "claude-sonnet-4-6"
+kind = "openai"
+# Model identifier — MUST be provider-prefixed `provider/model` form, otherwise
+# the resolver treats a bare name as a provider and the agent runs mute (no text
+# replies). Env override: FAMILYCLAW_PROVIDER_MODEL
+model = "openai/gpt-4.1-mini"
 # API key — ALWAYS leave empty in committed config. Supply at runtime via
 # env override: FAMILYCLAW_PROVIDER_API_KEY
 api_key = ""

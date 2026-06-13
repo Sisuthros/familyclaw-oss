@@ -140,7 +140,20 @@ pub async fn build_family(
     //    LLM:ää. Rakennetaan KOKO ketju (primary + fallbackit) — F1: primaryn
     //    kuolema (timeout/HTTP/rate) ei enää tapa vuoroa, vaan seuraavaa
     //    fallbackia kokeillaan järjestyksessä ([`Agent::think`]).
-    let failover = build_llm_chain(&agent_cfg.model, resolver).ok();
+    let failover = match build_llm_chain(&agent_cfg.model, resolver) {
+        Ok(chain) => Some(chain),
+        Err(e) => {
+            tracing::warn!(
+                target: "familyclaw::llm",
+                model = %agent_cfg.model.primary,
+                error = %e,
+                "LLM chain unresolved — agent will run MUTE (emotion/memory only, no text \
+                 replies). Set FAMILYCLAW_PROVIDERS or use provider/model form (e.g. \
+                 openai/gpt-4.1-mini)."
+            );
+            None
+        }
+    };
 
     // 4. Muisti (Eternal Thread, in-memory MVP) + durable-konteksti.
     //
@@ -250,18 +263,24 @@ pub async fn build_family(
         }
     });
 
-    if let Some(dream_journal) = dream_journal {
+    // 11. Dream-silmukka (valinnainen): spawnaa vain jos journal on olemassa
+    //     EIKÄ FAMILYCLAW_DREAM_DISABLED ole asetettu. Kahva talletetaan
+    //     `Option<JoinHandle>`:na ja työnnetään `tasks`-vektoriin, jotta
+    //     `shutdown()` OMISTAA ja keskeyttää sen (aiemmin bare `tokio::spawn`
+    //     pudotti kahvan → tausta­silmukka jäi orvoksi sammutuksessa).
+    let dream: Option<tokio::task::JoinHandle<()>> = if let Some(dream_journal) = dream_journal {
         let dream_disabled = env::var("FAMILYCLAW_DREAM_DISABLED")
             .ok()
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         if dream_disabled {
             tracing::info!(target: "familyclaw::dream", "runtime dream loop disabled (FAMILYCLAW_DREAM_DISABLED)");
+            None
         } else {
             let interval_secs: u64 = env::var("FAMILYCLAW_DREAM_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(6 * 3600);
-            tokio::spawn(async move {
+            let dream = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
                     let store: &dyn familyclaw_memory::MemoryStore = &*dream_store;
@@ -275,13 +294,22 @@ pub async fn build_family(
                     }
                 }
             });
+            Some(dream)
         }
+    } else {
+        None
+    };
+
+    // 12. Kokoa runtime — omistaa busin, agentin ja taustatehtävät. Dream-kahva
+    //     lisätään vain jos se spawnattiin (gated FAMILYCLAW_DREAM_DISABLED).
+    let mut tasks = vec![pump, drain];
+    if let Some(dream) = dream {
+        tasks.push(dream);
     }
-    // 10. Kokoa runtime — omistaa busin, agentin ja molemmat taskit.
     Ok(FamilyRuntime {
         bus,
         _agents: vec![actor],
-        tasks: vec![pump, drain],
+        tasks,
     })
 }
 
