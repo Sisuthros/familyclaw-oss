@@ -79,6 +79,11 @@ pub use llm_chain::{
 pub use session::{MessageOrigin, SESSION_TAG_PREFIX};
 pub use soul::{load_soul, resolve_profile_dir, Soul, PROFILE_DIR_ENV};
 
+// Re-export tunnemoottorin kalibrointityypit kutsujan (esim. runtime/gateway)
+// mukavuudeksi: `Agent::with_calibration` ottaa nämä, ja kalibrointi ladataan
+// ajonaikaisesti `calibration.json`:sta ([`TableCalibration::from_path`]).
+pub use familyclaw_emotion::{EmotionCalibration, NeutralCalibration, TableCalibration};
+
 // Re-export ydinvirhetyypit kutsujan mukavuudeksi.
 pub use familyclaw_core::{FamilyClawError, Result};
 
