@@ -50,20 +50,57 @@
 //!   [`SandboxError::FuelExhausted`]:lla.
 //! - **Determinismi:** sama [`SandboxRequest`] tuottaa saman tuloksen
 //!   (durable-replayn edellytys).
+//!
+//! ## Containment-vaatimukset (2604.23425) — missä crate pakottaa kunkin
+//!
+//! Paperi johtaa 698:n incidentin analyysistä viisi arkkitehtonista
+//! vaatimusta eristetylle koodisuoritukselle. Tämä crate kartoittuu niihin
+//! seuraavasti:
+//!
+//! 1. **Resurssirajat (resource limits)** — [`FuelLimit`] / [`FuelMeter`].
+//!    Polttoainebudjetti katkaisee ikuiset silmukat ja resurssien
+//!    väärinkäytön; ylitys palauttaa [`SandboxError::FuelExhausted`].
+//! 2. **Verkkoeristys (network isolation)** — [`CapabilitySet`]
+//!    ([`allows_network_host`](CapabilitySet::allows_network_host)).
+//!    Oletuksena ([`deny_all`](CapabilitySet::deny_all)) verkkoa ei ole;
+//!    pääsy vain eksplisiittisesti myönnettyihin isäntiin.
+//! 3. **Tiedostojärjestelmän eristys (filesystem sandboxing)** —
+//!    [`CapabilitySet`]
+//!    ([`allows_read_path`](CapabilitySet::allows_read_path)).
+//!    Komponenttitason etuliitevertailu rajaa luvun myönnettyihin
+//!    alipuihin; muu polkupääsy evätään.
+//! 4. **Kyvykkyyspääsy (capability access)** — [`Capability`] /
+//!    [`CapabilitySet`] kokonaisuutena: additiivinen "deny by default"
+//!    -malli, jonka [`validate`](CapabilitySet::validate) hylkää
+//!    huonosti muodostetut myönnöt.
+//! 5. **Tarkastusloki (audit logging)** — [`AuditLog`] /
+//!    [`AuditedCapabilities`]. Append-only-loki kirjaa jokaisen
+//!    kyvykkyystarkistuksen (myönnetty/evätty) sekä suoritusten alun ja
+//!    lopun. Kytketään **valinnaisena** koukkuna muuttamatta olemassa
+//!    olevien tyyppien julkista rajapintaa.
+//!
+//! Lisäksi [`replay`] toteuttaa LOOP-mekanismin (2605.14237): suoritus
+//! tallennetaan [`ExecutionTrace`]:ksi ja toistetaan deterministisesti
+//! pelkästä lokista, mikä mahdollistaa containment-tapahtumien bitintarkan
+//! jälkitarkastelun ilman alkuperäistä backendia.
 
+pub mod audit;
 pub mod capability;
 pub mod error;
 pub mod fuel;
 pub mod noop;
+pub mod replay;
 pub mod sandbox;
 
 #[cfg(feature = "wasmtime")]
 pub mod wasmtime_backend;
 
+pub use audit::{AuditEntry, AuditLog, AuditedCapabilities, CapabilityCheck};
 pub use capability::{Capability, CapabilitySet};
 pub use error::{Result, SandboxError};
 pub use fuel::{FuelLimit, FuelMeter};
 pub use noop::NoopSandbox;
+pub use replay::{replay, ExecutionTrace, Outcome, TraceEvent};
 pub use sandbox::{CodeSandbox, SandboxOutput, SandboxRequest, SandboxResult};
 
 #[cfg(feature = "wasmtime")]
