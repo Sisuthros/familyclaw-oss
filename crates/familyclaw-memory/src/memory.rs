@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::decay::DecayPolicy;
 use crate::importance::ImportanceFactors;
+use crate::provenance::Provenance;
 
 /// Muistin vahvuuden (`S`) ala- ja yläraja, kun se johdetaan tärkeydestä.
 ///
@@ -259,6 +260,15 @@ pub struct Memory {
     /// frekvenssilaskentaan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern_key: Option<String>,
+
+    /// Muiston alkuperä — mistä tämä tieto on peräisin ja kuinka luotettava
+    /// se on (Sleeper Memory Poisoning -suoja, kts. [`crate::provenance`]).
+    ///
+    /// `#[serde(default)]` → vanhat, ennen alkuperätietoa persistoidut
+    /// muistot deserialisoituvat [`Provenance::DirectExperience`]ksi
+    /// (taaksepäin-yhteensopiva).
+    #[serde(default)]
+    pub provenance: Provenance,
 }
 
 impl Memory {
@@ -433,6 +443,7 @@ pub struct MemoryBuilder {
     verification_status: VerificationStatus,
     evidence: Vec<Evidence>,
     pattern_key: Option<String>,
+    provenance: Provenance,
 }
 
 impl MemoryBuilder {
@@ -454,6 +465,8 @@ impl MemoryBuilder {
             embedding: None,
             evidence: Vec::new(),
             pattern_key: None,
+            // Oletus: suora kokemus (sama kuin Provenance::default()).
+            provenance: Provenance::DirectExperience,
         }
     }
 
@@ -521,6 +534,13 @@ impl MemoryBuilder {
         self
     }
 
+    /// Asettaa muiston alkuperän (oletus: [`Provenance::DirectExperience`]).
+    #[must_use]
+    pub fn provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
     /// Asettaa upotusvektorin semanttista haun varten.
     #[must_use]
     pub fn embedding(mut self, embedding: impl Into<Vec<f32>>) -> Self {
@@ -553,6 +573,7 @@ impl MemoryBuilder {
             confidence: 0.0, // Asetetaan promote-logiikalla add_evidence()-kutsujen kautta
             evidence: self.evidence,
             pattern_key: self.pattern_key,
+            provenance: self.provenance,
         }
     }
 }
