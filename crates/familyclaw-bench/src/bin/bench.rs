@@ -102,7 +102,13 @@ async fn main() -> Result<()> {
     if card.all_passed() {
         tracing::info!("benchmark complete: ALL PASSED");
     } else {
-        tracing::warn!("benchmark complete: SOME SCENARIOS FAILED");
+        // CI-portti: epäonnistunut scorecard MYÖS epäonnistuttaa prosessin
+        // (ei pelkkä varoitus) — muuten 6/6 → 0/6 jäisi vihreäksi CI:ssä,
+        // koska tämä exit-koodi on ainoa portti (ci.yml ei aja benchiä erikseen).
+        tracing::error!("benchmark complete: SOME SCENARIOS FAILED");
+        return Err(BenchError::scenario(
+            "benchmark failed: one or more scenarios did not pass",
+        ));
     }
 
     Ok(())
