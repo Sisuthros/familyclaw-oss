@@ -104,3 +104,11 @@ docs/handoff/
 # HUOM: vain nimi-vuotavat suunnitelmat — tooling (.py, settings.json) säilyy.
 .claude/NIGHT_RUN_2026-06-11.md
 .claude/PLAN_HEARTH.md
+# Juuritason suunnitelma- ja blueprint-dokumentit (perheen oikeat nimet +
+# tuotehistoria). Lisätty 2026-06-13 — nämä olivat untracked-vuotomiinoja.
+BLUEPRINT.md
+HUIPPUTUOTE_SUUNNITELMA.md
+KEHITYSSUUNNITELMA.md
+research_plan.md
+# Catch-all: mikä tahansa *SUUNNITELMA*.md on lähtökohtaisesti sisäinen.
+*SUUNNITELMA*.md

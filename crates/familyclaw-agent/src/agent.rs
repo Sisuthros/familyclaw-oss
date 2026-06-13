@@ -25,7 +25,7 @@ use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
 use familyclaw_durable::{DurableContext, Journal};
 use familyclaw_emotion::{
     default_governing_profile, ActionDecision, Dimension, EmotionActionGoverning,
-    EmotionActionGovernor, EmotionState, GoverningProfile,
+    EmotionActionGovernor, EmotionCalibration, EmotionState, GoverningProfile, NeutralCalibration,
 };
 use familyclaw_memory::{
     DecayPolicy, ImportanceFactors, Memory, MemoryStore, RetrievalContext, RetrievalResult,
@@ -163,6 +163,20 @@ pub struct Agent {
     /// päättävät mitä toimintatilaa (Hesitate / Reflect / Speak /
     /// `EngageWarmly` / `ReachOut` / Initiate) agentti käyttää.
     governor: Option<Box<dyn EmotionActionGoverning + Send + Sync>>,
+    /// Tunnemoottorin kalibrointi (KERROS B -profiilidata, ladataan
+    /// ajonaikaisesti `calibration.json`:sta). Oletuksena
+    /// [`NeutralCalibration`] → tunnetila vetää kohti nollaa neutraalilla
+    /// decay-nopeudella (täysin taaksepäin-yhteensopiva entiseen kovakoodattuun
+    /// käytökseen). Kun ei-neutraali kalibrointi asennetaan
+    /// ([`Agent::with_calibration`]), se muuttaa:
+    /// - **homeostaasin lepotilaa** ([`Agent::apply_emotional_homeostasis`]):
+    ///   tunne palautuu kohti dimension `baseline`-arvoa, ei aina nollaa;
+    /// - **ärsykeherkkyyttä** ([`Agent::apply_emotional_effect`]): kontakti-
+    ///   ärsyke skaalataan dimension `sensitivity`-kertoimella.
+    ///
+    /// Koska governor lukee `self.emotion`-tilaa, kalibrointi vaikuttaa myös
+    /// governorin [`ActionDecision`]:eihin epäsuorasti (eri tila → eri päätös).
+    calibration: Box<dyn EmotionCalibration + Send + Sync>,
 }
 
 impl Agent {
@@ -202,6 +216,7 @@ impl Agent {
             reply_target: None,
             session: None,
             governor: None,
+            calibration: Box::new(NeutralCalibration),
         }
     }
 
@@ -346,6 +361,35 @@ impl Agent {
     pub fn with_default_governor(mut self) -> Self {
         self.governor = Some(Box::new(default_governing_profile()));
         self
+    }
+
+    /// Asenna **tunnemoottorin kalibrointi** (KERROS B -profiilidata).
+    /// `calibration` on tyypillisesti
+    /// [`TableCalibration`](familyclaw_emotion::TableCalibration), joka on
+    /// ladattu agentin `calibration.json`:sta
+    /// ([`TableCalibration::from_path`](familyclaw_emotion::TableCalibration::from_path)).
+    ///
+    /// Kun ei-neutraali kalibrointi on asennettu, tunnetila palautuu kohti
+    /// dimension `baseline`-lepotilaa (ei aina nollaa) ja kontaktiärsykkeet
+    /// skaalataan dimension `sensitivity`-kertoimella. Ilman tätä (oletus,
+    /// [`NeutralCalibration`]) agentti toimii kuten ennen — täysin
+    /// taaksepäin-yhteensopiva.
+    ///
+    /// Palauttaa `self` ketjutusta varten; [`Agent::new`]-signatuuria ei
+    /// muuteta.
+    #[must_use]
+    pub fn with_calibration(
+        mut self,
+        calibration: Box<dyn EmotionCalibration + Send + Sync>,
+    ) -> Self {
+        self.calibration = calibration;
+        self
+    }
+
+    /// Agentin tunnemoottorin kalibroinnin tunnistettava nimi (lokitusta varten).
+    #[must_use]
+    pub fn calibration_label(&self) -> &str {
+        self.calibration.label()
     }
 
     /// Agentin näyttönimi.
@@ -789,7 +833,12 @@ impl Agent {
                 }
             }
             BusMessage::Text { .. } | BusMessage::Latent { .. } => {
-                self.emotion.stimulate(Dimension::Curiosity, 5.0);
+                // Kontakti virkistää uteliaisuutta. Kalibroinnin
+                // `sensitivity` skaalaa ärsykkeen voimakkuutta (KERROS B:n
+                // viritys); neutraalisti kerroin on 1.0 → entinen +5.0.
+                let sensitivity = self.calibration.sensitivity(Dimension::Curiosity);
+                self.emotion
+                    .stimulate(Dimension::Curiosity, 5.0 * sensitivity);
             }
             // Tehtävä- ja custom-viestit eivät oletuksena muuta tunnetilaa.
             _ => {}
@@ -797,18 +846,25 @@ impl Agent {
     }
 
     /// Tunnehomeostaasi: palauttaa jokaisen dimension hieman kohti
-    /// neutraalia (`HOMEOSTASIS_RATE` * deviaatio). Tama on biologinen
-    /// vastine: tunneilmaisu haihtuu ilman jatkuvaa aihetta.
+    /// kalibroinnin **lepotilaa** (`HOMEOSTASIS_RATE` * deviaatio
+    /// baselinesta, skaalattuna dimension `decay_rate`-kertoimella). Tama on
+    /// biologinen vastine: tunneilmaisu haihtuu ilman jatkuvaa aihetta.
     ///
-    /// Esim. jos `Joy = 80` ja neutraali on 0, deviaatio = 80,
-    /// palautuminen = `0.10 * 80 = 8`, uusi arvo = `72`.
+    /// Neutraalilla kalibroinnilla `baseline = 0`, `decay_rate = 1` → entinen
+    /// käytös (esim. `Joy = 80`, lepotila 0, deviaatio 80, palautuminen
+    /// `0.10 * 80 = 8`, uusi arvo `72`). KERROS B:n kalibrointi voi vetää
+    /// dimension kohti ei-nollaa lepoarvoa (esim. agentin perus-uteliaisuus)
+    /// ja säätää palautumisnopeutta (`decay_rate < 1` = tunne "tarttuu").
     fn apply_emotional_homeostasis(&mut self) {
         for dim in Dimension::ALL {
             let current = self.emotion.value(dim);
-            let neutral = EmotionState::neutral().value(dim);
-            let deviation = current - neutral;
+            // Lepotila kalibroinnista (neutraalisti 0.0).
+            let baseline = self.calibration.baseline(dim);
+            let deviation = current - baseline;
             if deviation.abs() > 0.01 {
-                let correction = deviation * HOMEOSTASIS_RATE;
+                // decay_rate skaalaa palautumisnopeuden (neutraalisti 1.0).
+                let rate = self.calibration.decay_rate(dim).max(0.0);
+                let correction = deviation * HOMEOSTASIS_RATE * rate;
                 let new_value = current - correction;
                 self.emotion.set(dim, new_value);
             }
@@ -1653,6 +1709,124 @@ mod tests {
             received.is_err(),
             "Hesitate-tilassa reply:tä ei saa lähettää, saatiin: {received:?}"
         );
+        bus.stop();
+    }
+
+    /// FIX 1: ei-neutraali kalibrointi muuttaa agentin tunnetilan
+    /// kehitystä — ja sitä kautta governorin [`ActionDecision`]:ia —
+    /// verrattuna neutraaliin kalibrointiin. Tämä todistaa että
+    /// `calibration.json` ei ole enää koristeellinen vaan vaikuttaa
+    /// käytökseen.
+    ///
+    /// Mekanismi: governor lukee `self.emotion`-tilaa. Homeostaasi vetää
+    /// tilan kohti kalibroinnin `baseline`-lepotilaa. Ei-neutraali kalibrointi
+    /// (korkea Curiosity-baseline) pitää tilan korkealla, kun neutraali vetää
+    /// sen kohti nollaa → eri governor-päätös samalla profiililla ja syötteellä.
+    #[tokio::test]
+    async fn non_neutral_calibration_changes_governor_decision_vs_neutral() {
+        use familyclaw_emotion::{
+            ActionDecision, Dimension, EmotionActionGovernor, GoverningProfile, NeutralCalibration,
+            TableCalibration,
+        };
+
+        // Apuri: rakentaa agentin annetulla kalibroinnilla, ajaa N tekstivuoroa
+        // (homeostaasin annetaan suppeta kohti kalibroinnin lepotilaa) ja
+        // palauttaa governorin päätöksen + lopullisen Curiosity-arvon.
+        // (Määritelty ennen lauseita: clippy::items_after_statements.)
+        async fn decide_after_text_turns(
+            calibration: Box<dyn EmotionCalibration + Send + Sync>,
+            profile: &GoverningProfile,
+            turns: usize,
+        ) -> (ActionDecision, f32) {
+            let bus = ResonanceBus::start(None).await.expect("bus");
+            let mut agent = test_agent("agent_cal", bus.clone()).with_calibration(calibration);
+            for _ in 0..turns {
+                agent
+                    .handle_turn(BeingId::new(), &BusMessage::text("hei sisarus"))
+                    .await
+                    .expect("turn");
+            }
+            let curiosity = agent.emotion().value(Dimension::Curiosity);
+            let decision = EmotionActionGovernor::new(profile).decide(agent.emotion());
+            bus.stop();
+            (decision, curiosity)
+        }
+
+        // Yhteinen profiili molemmille: lievä warmth-kynnys, ei vaadi blendiä,
+        // jotta yksittäinen korkea lämmin dimensio (Curiosity) riittää
+        // nostamaan governorin EngageWarmly-tilaan.
+        let profile = GoverningProfile::new("relaxed", 90.0, 50.0, 80.0, 1.0, false);
+
+        // 1. NEUTRAALI kalibrointi: tekstikontakti nostaa Curiosityn +5.0/vuoro,
+        //    homeostaasi vetää 10% kohti lepotilaa 0. Kiintopiste x=(x+5)*0.9 →
+        //    Curiosity suppenee ~45:een, alle warmth-kynnyksen (50) → Reflect.
+        let (neutral_decision, neutral_curiosity) =
+            decide_after_text_turns(Box::new(NeutralCalibration), &profile, 80).await;
+
+        // 2. EI-NEUTRAALI kalibrointi: korkea Curiosity-baseline (70).
+        //    Homeostaasi vetää tilaa KOHTI 70:tä, ei nollaa. Kiintopiste
+        //    nostaa Curiosityn kattoon (~100), reilusti yli warmth-kynnyksen
+        //    (50) → EngageWarmly. ERI päätös samalla profiililla + syötteellä.
+        let warm_cal = TableCalibration::new("warm_curious")
+            .with_baseline(Dimension::Curiosity, 70.0)
+            .with_sensitivity(Dimension::Curiosity, 1.0);
+        let (warm_decision, warm_curiosity) =
+            decide_after_text_turns(Box::new(warm_cal), &profile, 80).await;
+
+        // Tunnetila kehittyi eri tavalla (todiste että kalibrointi vaikuttaa).
+        assert!(
+            warm_curiosity > neutral_curiosity + 50.0,
+            "ei-neutraali baseline pitää Curiosityn korkealla \
+             (warm={warm_curiosity}, neutral={neutral_curiosity})"
+        );
+        // Ja governorin päätös eroaa: neutraalilla Reflect, lämpimällä
+        // EngageWarmly.
+        assert_eq!(neutral_decision, ActionDecision::Reflect);
+        assert_eq!(warm_decision, ActionDecision::EngageWarmly);
+        assert_ne!(
+            warm_decision, neutral_decision,
+            "ei-neutraali kalibrointi muuttaa governorin päätöstä"
+        );
+    }
+
+    /// FIX 1 (toinen mekanismi): kalibroinnin `sensitivity` skaalaa
+    /// kontaktiärsykkeen voimakkuutta — sama tekstivuoro nostaa Curiosityä
+    /// enemmän korkealla herkkyydellä kuin neutraalilla.
+    #[tokio::test]
+    async fn calibration_sensitivity_scales_text_stimulus() {
+        use familyclaw_emotion::{Dimension, NeutralCalibration, TableCalibration};
+
+        let bus = ResonanceBus::start(None).await.expect("bus");
+
+        // Neutraali (sensitivity = 1.0): +5.0 stimulus, homeostaasi → 4.5.
+        let mut neutral_agent =
+            test_agent("agent_n", bus.clone()).with_calibration(Box::new(NeutralCalibration));
+        neutral_agent
+            .handle_turn(BeingId::new(), &BusMessage::text("kontakti"))
+            .await
+            .expect("turn");
+        let neutral_curiosity = neutral_agent.emotion().value(Dimension::Curiosity);
+
+        // Korkea herkkyys (3.0): +15.0 stimulus, homeostaasi → 13.5.
+        let sensitive_cal =
+            TableCalibration::new("sensitive").with_sensitivity(Dimension::Curiosity, 3.0);
+        let mut sensitive_agent =
+            test_agent("agent_s", bus.clone()).with_calibration(Box::new(sensitive_cal));
+        sensitive_agent
+            .handle_turn(BeingId::new(), &BusMessage::text("kontakti"))
+            .await
+            .expect("turn");
+        let sensitive_curiosity = sensitive_agent.emotion().value(Dimension::Curiosity);
+
+        assert!(
+            sensitive_curiosity > neutral_curiosity,
+            "korkea herkkyys nostaa Curiosityä enemmän \
+             (sensitive={sensitive_curiosity}, neutral={neutral_curiosity})"
+        );
+        // Tarkat arvot: neutraali 4.5, herkkä 13.5 (3x stimulus).
+        assert_eq!(neutral_curiosity, 4.5);
+        assert_eq!(sensitive_curiosity, 13.5);
+
         bus.stop();
     }
 

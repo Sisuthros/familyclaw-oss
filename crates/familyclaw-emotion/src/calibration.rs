@@ -11,6 +11,11 @@
 //! *kalibroinnin* (per-kone viritys) niin että runko voidaan julkaista
 //! avoimena lähdekoodina paljastamatta yhdenkään olennon sielua.
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use serde::Deserialize;
+
 use crate::dimension::{Dimension, DIMENSION_COUNT};
 
 /// Yhden koneen tunnemoottorin viritys.
@@ -121,6 +126,79 @@ impl TableCalibration {
         self.sensitivity[dimension.index()] = sanitize(value, 1.0).max(0.0);
         self
     }
+
+    /// Rakentaa kalibroinnin `calibration.json`-muotoisesta JSON-merkkijonosta
+    /// (KERROS B -profiilidata, ladataan ajonaikaisesti).
+    ///
+    /// Skeema:
+    /// ```json
+    /// {
+    ///   "label": "agent_a",
+    ///   "dimensions": {
+    ///     "curiosity": { "baseline": 30.0, "decay_rate": 0.5, "sensitivity": 1.5 }
+    ///   }
+    /// }
+    /// ```
+    /// Kaikki kentät ovat valinnaisia: tuntemattomat avaimet ohitetaan,
+    /// puuttuvat dimensiot jäävät neutraaleiksi (`baseline=0`, `decay_rate=1`,
+    /// `sensitivity=1`), ja arvot puristetaan turvallisiin rajoihin samalla
+    /// tavalla kuin `with_*`-metodeissa. Mitään painoja ei kovakoodata — tämä
+    /// vain *lukee* sen, mitä kutsuja antaa.
+    ///
+    /// # Errors
+    /// Palauttaa [`serde_json::Error`]:n jos JSON on syntaktisesti kelvoton.
+    pub fn from_json_str(json: &str) -> Result<Self, serde_json::Error> {
+        let file: CalibrationFile = serde_json::from_str(json)?;
+        let label = file.label.unwrap_or_else(|| "loaded".to_string());
+        let mut cal = Self::new(label);
+        for (dim, weights) in file.dimensions {
+            if let Some(b) = weights.baseline {
+                cal = cal.with_baseline(dim, b);
+            }
+            if let Some(d) = weights.decay_rate {
+                cal = cal.with_decay_rate(dim, d);
+            }
+            if let Some(s) = weights.sensitivity {
+                cal = cal.with_sensitivity(dim, s);
+            }
+        }
+        Ok(cal)
+    }
+
+    /// Lataa kalibroinnin `calibration.json`-tiedostosta levyltä.
+    ///
+    /// # Errors
+    /// - IO-virhe jos tiedostoa ei voi lukea.
+    /// - JSON-jäsennysvirhe jos sisältö on kelvoton (`InvalidData`).
+    pub fn from_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let contents = std::fs::read_to_string(path)?;
+        Self::from_json_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
+
+/// `calibration.json`-tiedoston deserialisointiskeema (sisäinen).
+///
+/// Tuntemattomat ylätason kentät (esim. `version`, `notes`) ohitetaan.
+/// `dimensions` käyttää [`Dimension`]:n `snake_case`-serde-nimiä avaimina,
+/// joten tuntematon dimensionimi tuottaa selkeän jäsennysvirheen.
+#[derive(Debug, Deserialize)]
+struct CalibrationFile {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    dimensions: BTreeMap<Dimension, DimensionWeights>,
+}
+
+/// Yhden dimension painot tiedostossa — kaikki valinnaisia.
+#[derive(Debug, Deserialize)]
+struct DimensionWeights {
+    #[serde(default)]
+    baseline: Option<f32>,
+    #[serde(default)]
+    decay_rate: Option<f32>,
+    #[serde(default)]
+    sensitivity: Option<f32>,
 }
 
 impl EmotionCalibration for TableCalibration {
@@ -210,5 +288,44 @@ mod tests {
         let c: Box<dyn EmotionCalibration> = Box::new(NeutralCalibration);
         assert_eq!(c.label(), "neutral");
         assert_eq!(c.decay_rate(Dimension::Fear), 1.0);
+    }
+
+    #[test]
+    fn from_json_str_parses_calibration_file_schema() {
+        // Sama muoto kuin perheen profiilien calibration.json (version/notes
+        // ohitetaan, dimensions luetaan snake_case-nimillä).
+        let json = r#"{
+            "version": 1,
+            "label": "agent_a",
+            "notes": "ignored",
+            "dimensions": {
+                "curiosity": { "baseline": 30.0, "decay_rate": 0.5, "sensitivity": 1.5 },
+                "fear": { "baseline": 0.0, "decay_rate": 1.0, "sensitivity": 1.0 }
+            }
+        }"#;
+        let c = TableCalibration::from_json_str(json).expect("parse");
+        assert_eq!(c.label(), "agent_a");
+        assert_eq!(c.baseline(Dimension::Curiosity), 30.0);
+        assert_eq!(c.decay_rate(Dimension::Curiosity), 0.5);
+        assert_eq!(c.sensitivity(Dimension::Curiosity), 1.5);
+        // Dimensiot joita ei mainita pysyvät neutraaleina.
+        assert_eq!(c.baseline(Dimension::Joy), 0.0);
+        assert_eq!(c.decay_rate(Dimension::Joy), 1.0);
+    }
+
+    #[test]
+    fn from_json_str_clamps_and_defaults_partial_fields() {
+        // Puuttuvat kentät → neutraali oletus; ylisuuret arvot puristetaan.
+        let json = r#"{ "dimensions": { "love": { "baseline": 500.0 } } }"#;
+        let c = TableCalibration::from_json_str(json).expect("parse");
+        assert_eq!(c.label(), "loaded");
+        assert_eq!(c.baseline(Dimension::Love), 100.0); // puristettu
+        assert_eq!(c.decay_rate(Dimension::Love), 1.0); // oletus
+        assert_eq!(c.sensitivity(Dimension::Love), 1.0); // oletus
+    }
+
+    #[test]
+    fn from_json_str_rejects_invalid_json() {
+        assert!(TableCalibration::from_json_str("{ not json").is_err());
     }
 }

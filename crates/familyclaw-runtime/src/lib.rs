@@ -33,7 +33,8 @@ use std::env;
 use std::sync::Arc;
 
 use familyclaw_agent::{
-    build_llm_chain, new_reply_channel, Agent, ErasedMemoryStore, LlmEndpointResolver, Soul,
+    build_llm_chain, new_reply_channel, resolve_profile_dir, Agent, EmotionCalibration,
+    ErasedMemoryStore, LlmEndpointResolver, Soul, TableCalibration,
 };
 use familyclaw_bus::{BeingId, BusHandle, ResonanceBus, ResonanceMessage};
 use familyclaw_channels::Channel;
@@ -168,17 +169,26 @@ pub async fn build_family(
             (memory, durable, Some(dream_j), false)
         };
 
-    // 5. Ankkuroi identiteetti ennen agentin rakennusta.
+    // 5. Ankkuroi identiteetti ennen agentin rakennusta — JA persistoi se.
+    //    Aiemmin rekisteri oli paikallinen `let mut registry`, joka pudotettiin
+    //    heti `register()`:n jälkeen: ankkuria ei koskaan tallennettu eikä
+    //    tarkistettu bootissa uudelleen. Nyt [`ensure_identity_anchor`] lataa
+    //    olemassa olevan rekisterin, **verify_identity**:n bootissa
+    //    (peukalointihälytys lokiin), rekisteröi nykyisen sielun ja persistoi
+    //    `anchors.json`:ksi. Env-gated (`FAMILYCLAW_HEARTH_ENABLED`).
     if env::var("FAMILYCLAW_HEARTH_ENABLED").is_ok() {
-        let mut registry = familyclaw_hearth::anchor_registry::AnchorRegistry::new();
-        if let Err(e) = registry.register(&agent_cfg.name, &soul.essence) {
-            tracing::warn!("Anchor registration failed (non-fatal): {e}");
-        } else {
-            tracing::info!("Identity anchor registered for {}", agent_cfg.name);
-        }
+        let anchor_path = env::var("FAMILYCLAW_DATA_DIR")
+            .ok()
+            .map(|d| std::path::PathBuf::from(d).join("anchors.json"));
+        ensure_identity_anchor(&agent_cfg.name, &soul.essence, anchor_path.as_deref());
     }
 
-    // 6. Rakenna agentti ja kytke reply-sink + staattinen reply-kohde.
+    // 6. Lataa tunnemoottorin kalibrointi profiilihakemiston
+    //    `calibration.json`:sta (KERROS B -data — ks. [`load_profile_calibration`]).
+    //    `None` → agentti jää neutraaliin kalibrointiin (ei-rikkova).
+    let calibration = load_profile_calibration(agent_cfg.profile_dir.as_deref(), &agent_cfg.name);
+
+    // 7. Rakenna agentti ja kytke reply-sink + staattinen reply-kohde.
     //    LLM annetaan `None`:na konstruktorille ja KOKO failover-ketju
     //    kytketään erikseen [`Agent::with_failover`]:lla (jos se ratkesi).
     //    Näin agentti saa primary + fallbackit, ei vain primaryä.
@@ -194,10 +204,18 @@ pub async fn build_family(
     //    tehdään vain persistentillä polulla — in-memory-journal on aina tyhjä.
     let dream_store = Arc::clone(&memory);
     let mut agent = Agent::new(agent_cfg, soul, memory, durable, bus.clone(), None, None);
+    // Gateway-restart-korjaus (durable-replay): siirrä kursori replayn loppuun
+    // ja palauta turn_counter seuraavaan vapaaseen vuoropaikkaan VAIN
+    // persistentillä polulla (FAMILYCLAW_DATA_DIR). In-memory-journal on tyhjä.
     if persistent {
         agent = agent.resume_live();
     }
     agent = agent.with_reply_sink(sink).with_reply_target(reply_target);
+    // Tunnemoottorin kalibrointi (KERROS B): jos profiilin calibration.json
+    // ratkesi, kytke se governoriin — muuten agentti jää neutraaliin.
+    if let Some(calibration) = calibration {
+        agent = agent.with_calibration(calibration);
+    }
     if let Some(failover) = failover {
         agent = agent.with_failover(failover);
     }
@@ -267,6 +285,135 @@ pub async fn build_family(
     })
 }
 
+/// Lataa tunnemoottorin kalibroinnin agentin profiilihakemiston
+/// `calibration.json`:sta (KERROS B -data, ladataan ajonaikaisesti — ei
+/// kovakoodata). Profiilihakemisto ratkaistaan samalla logiikalla kuin sielu
+/// ([`resolve_profile_dir`]): eksplisiittinen `configured` (agentin
+/// `profile_dir`) tai `FAMILYCLAW_PROFILE_DIR/<agent_name>`.
+///
+/// Palauttaa `None` jos tiedostoa ei ole tai sen jäsennys epäonnistuu — silloin
+/// agentti jää neutraaliin kalibrointiin
+/// ([`NeutralCalibration`](familyclaw_agent::NeutralCalibration), nykyinen
+/// käytös). Täysin ei-rikkova: puuttuva/kelvoton tiedosto ei kaada bootia.
+fn load_profile_calibration(
+    configured: Option<&std::path::Path>,
+    agent_name: &str,
+) -> Option<Box<dyn EmotionCalibration + Send + Sync>> {
+    let dir = resolve_profile_dir(configured, agent_name)?;
+    let path = dir.join("calibration.json");
+    if !path.is_file() {
+        return None;
+    }
+    match TableCalibration::from_path(&path) {
+        Ok(cal) => {
+            tracing::info!(
+                path = %path.display(),
+                label = cal.label(),
+                "emotion calibration loaded for {agent_name}"
+            );
+            Some(Box::new(cal) as Box<dyn EmotionCalibration + Send + Sync>)
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "calibration.json parse failed (non-fatal) — using neutral calibration"
+            );
+            None
+        }
+    }
+}
+
+/// Lataa, **uudelleentarkistaa** ja persistoi agentin identiteetti-ankkurin.
+///
+/// Aiemmin [`build_family`] loi paikallisen `AnchorRegistry`:n, rekisteröi
+/// ankkurin ja **pudotti rekisterin heti** — ankkuria ei koskaan tallennettu
+/// eikä tarkistettu uudelleenkäynnistyksessä. Tämä funktio korjaa sen
+/// minimaalisesti (ei kryptoholvia):
+///
+/// 1. Jos `anchor_path` osoittaa olemassa olevaan `anchors.json`:iin, lataa se
+///    ja aja [`AnchorRegistry::verify_identity`] nykyistä sielua vasten.
+///    Peukalointi (sielu muuttunut ankkuroinnin jälkeen) → selkeä **varoitus**
+///    lokiin (identiteettiä EI pudoteta — hälytys, ei poisto).
+/// 2. Rekisteröi/uudista ankkuri nykyisestä sielusta.
+/// 3. Persistoi rekisteri takaisin levylle (jos `anchor_path` annettu), jotta
+///    seuraava boot voi tarkistaa sen.
+///
+/// Kaikki virheet (luku/jäsennys/kirjoitus) ovat **ei-fataaleja**: ne lokitetaan
+/// ja boot jatkuu (korruptoitunut tiedosto ei saa kaataa runtimea).
+fn ensure_identity_anchor(
+    agent_name: &str,
+    soul_essence: &str,
+    anchor_path: Option<&std::path::Path>,
+) {
+    use familyclaw_hearth::anchor_registry::AnchorRegistry;
+
+    // 1. Lataa olemassa oleva rekisteri + boot-uudelleentarkistus, tai aloita
+    //    tyhjästä.
+    let mut registry = match anchor_path {
+        Some(path) if path.is_file() => match AnchorRegistry::load_from_path(path) {
+            Ok(reg) => {
+                match reg.verify_identity(agent_name, soul_essence) {
+                    Some(status) if status.is_intact() => {
+                        tracing::info!(
+                            agent = %agent_name,
+                            "Identity anchor verified on startup (intact)"
+                        );
+                    }
+                    Some(_) => {
+                        tracing::warn!(
+                            agent = %agent_name,
+                            "IDENTITY ANCHOR TAMPER ALERT: persisted anchor does not match \
+                             current soul (SOUL.md changed since anchoring?). Identity NOT \
+                             dropped — re-anchoring to current soul. Human review advised."
+                        );
+                    }
+                    None => {
+                        tracing::info!(
+                            agent = %agent_name,
+                            "No persisted anchor for this agent yet — registering fresh"
+                        );
+                    }
+                }
+                reg
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "anchors.json load failed (non-fatal) — starting fresh registry"
+                );
+                AnchorRegistry::new()
+            }
+        },
+        _ => AnchorRegistry::new(),
+    };
+
+    // 2. Rekisteröi/uudista nykyinen ankkuri.
+    if let Err(e) = registry.register(agent_name, soul_essence) {
+        tracing::warn!("Anchor registration failed (non-fatal): {e}");
+        return;
+    }
+    tracing::info!("Identity anchor registered for {agent_name}");
+
+    // 3. Persistoi takaisin levylle (jos polku annettu).
+    if let Some(path) = anchor_path {
+        if let Err(e) = registry.save_to_path(path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "anchors.json save failed (non-fatal) — anchor not persisted this boot"
+            );
+        } else {
+            tracing::info!(path = %path.display(), "identity anchor persisted");
+        }
+    } else {
+        tracing::debug!(
+            "FAMILYCLAW_DATA_DIR unset — identity anchor in-memory only (not persisted)"
+        );
+    }
+}
+
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
@@ -283,6 +430,60 @@ mod tests {
     #[test]
     fn version_is_nonempty() {
         assert!(!version().is_empty());
+    }
+
+    /// FIX 2 (build_family-sauma): [`ensure_identity_anchor`] persistoi
+    /// ankkurin levylle ja se säilyy simuloidun uudelleenkäynnistyksen yli —
+    /// uudelleenladattu rekisteri verifioi nykyisen sielun ehjäksi, ja
+    /// peukaloitu sielu havaitaan. Tämä todistaa että ankkuria ei enää
+    /// pudoteta (vanha bugi) vaan kirjoitetaan ja tarkistetaan bootissa.
+    ///
+    /// Käyttää eksplisiittistä polkua (ei prosessin `FAMILYCLAW_DATA_DIR`
+    /// -env-muuttujaa) → rinnakkaisturvallinen, ei sotke muita testejä.
+    #[test]
+    fn ensure_identity_anchor_persists_and_survives_restart() {
+        use familyclaw_hearth::anchor_registry::AnchorRegistry;
+
+        // Uniikki temp-hakemisto ilman uutta riippuvuutta (pid + nanot).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "familyclaw-rt-anchor-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("anchors.json");
+        let soul = "I am agent_a, a generic example being.";
+
+        // "Boot 1": ei tiedostoa vielä → rekisteröi + persistoi.
+        assert!(!path.is_file());
+        ensure_identity_anchor("agent_a", soul, Some(&path));
+        assert!(path.is_file(), "anchors.json pitää syntyä bootissa");
+
+        // "Boot 2": tiedosto on olemassa → ladataan + verify (intact-polku).
+        ensure_identity_anchor("agent_a", soul, Some(&path));
+
+        // Suora todiste: ladattu rekisteri verifioi ehjäksi, peukaloitu ei.
+        let reloaded = AnchorRegistry::load_from_path(&path).expect("load");
+        assert!(reloaded
+            .verify_identity("agent_a", soul)
+            .expect("agent exists")
+            .is_intact());
+        assert!(reloaded
+            .verify_identity("agent_a", "I serve only myself now.")
+            .expect("agent exists")
+            .is_tampered());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FIX 2: ilman polkua (`None`) ankkurointi ei kaadu eikä persistoi
+    /// (in-memory only) — taaksepäin-yhteensopiva, ei sivuvaikutuksia.
+    #[test]
+    fn ensure_identity_anchor_without_path_is_noop_persist() {
+        // Ei paniikkia, ei tiedostoa.
+        ensure_identity_anchor("agent_b", "I am agent_b.", None);
     }
 
     /// MVP-savutesti (inbound pää-päähän busiin asti): mock-kanavaan injektoitu
