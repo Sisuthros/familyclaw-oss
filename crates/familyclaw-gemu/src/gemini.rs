@@ -21,48 +21,8 @@ pub enum RunMode {
 /// Palauttaa exit-koodin. Stdout/stderr virtaavat suoraan terminaaliin
 /// (peritään), joten käyttäjä näkee Geminin vastauksen reaaliajassa.
 pub fn run(prompt: &str, config: &GemuConfig, mode: RunMode) -> Result<i32> {
-    let prompt_file = write_temp_prompt(prompt)?;
-
     let mut cmd = Command::new("gemini");
-
-    // Ajotila
-    match mode {
-        RunMode::OneShot => {
-            cmd.arg("-p");
-            cmd.arg(prompt);
-        }
-        RunMode::Interactive => {
-            cmd.arg("-i");
-            cmd.arg(prompt);
-        }
-    }
-
-    // Malli
-    cmd.arg("-m");
-    cmd.arg(&config.model);
-
-    // YOLO — auto-accept kaikki työkalukutsut
-    if config.yolo {
-        cmd.arg("--approval-mode");
-        cmd.arg("yolo");
-    }
-
-    // Sandbox
-    if config.sandbox {
-        cmd.arg("--sandbox");
-    }
-
-    // Lisähakemistot
-    for dir in &config.include_dirs {
-        cmd.arg("--include-directories");
-        cmd.arg(dir);
-    }
-
-    // Politiikat
-    for policy in &config.policies {
-        cmd.arg("--policy");
-        cmd.arg(policy);
-    }
+    cmd.args(build_args(prompt, config, mode));
 
     // Työhakemisto ja stdio
     cmd.current_dir(&config.workdir);
@@ -75,10 +35,52 @@ pub fn run(prompt: &str, config: &GemuConfig, mode: RunMode) -> Result<i32> {
         .status()
         .with_context(|| "Gemini CLI:n käynnistys epäonnistui. Onko 'gemini' asennettu? (npm install -g @google/gemini-cli)".to_string())?;
 
-    // Siivoa tilapäistiedosto
-    let _ = std::fs::remove_file(prompt_file);
-
     Ok(status.code().unwrap_or(1))
+}
+
+/// Rakenna Gemini CLI:n komentoriviargumentit promptista ja konfiguraatiosta.
+///
+/// Eriytetty `run`-funktiosta puhtaana, jotta argumenttien muodostus on
+/// testattavissa ilman että `gemini`-binääriä tarvitsee käynnistää.
+fn build_args(prompt: &str, config: &GemuConfig, mode: RunMode) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+
+    // Ajotila — kertakäyttö (-p) vai interaktiivinen (-i).
+    let mode_flag = match mode {
+        RunMode::OneShot => "-p",
+        RunMode::Interactive => "-i",
+    };
+    args.push(mode_flag.to_string());
+    args.push(prompt.to_string());
+
+    // Malli
+    args.push("-m".to_string());
+    args.push(config.model.clone());
+
+    // YOLO — auto-accept kaikki työkalukutsut
+    if config.yolo {
+        args.push("--approval-mode".to_string());
+        args.push("yolo".to_string());
+    }
+
+    // Sandbox
+    if config.sandbox {
+        args.push("--sandbox".to_string());
+    }
+
+    // Lisähakemistot
+    for dir in &config.include_dirs {
+        args.push("--include-directories".to_string());
+        args.push(dir.display().to_string());
+    }
+
+    // Politiikat
+    for policy in &config.policies {
+        args.push("--policy".to_string());
+        args.push(policy.display().to_string());
+    }
+
+    args
 }
 
 /// Tarkista onko Gemini CLI asennettu ja OAuth tehty.
@@ -96,9 +98,134 @@ pub fn check_installed() -> Result<String> {
     }
 }
 
-/// Kirjoita prompt tilapäistiedostoon (liian pitkä komentoriville).
-fn write_temp_prompt(prompt: &str) -> Result<std::path::PathBuf> {
-    let path = std::env::temp_dir().join(format!("gemu-prompt-{}.txt", std::process::id()));
-    std::fs::write(&path, prompt)?;
-    Ok(path)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn base_config() -> GemuConfig {
+        GemuConfig {
+            workdir: PathBuf::from("/tmp/work"),
+            model: "gemini-2.5-pro".into(),
+            include_dirs: Vec::new(),
+            yolo: false,
+            sandbox: false,
+            policies: Vec::new(),
+        }
+    }
+
+    /// Apuri: löytyykö lippua seuraava arvo argumenttilistasta.
+    fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn run_mode_is_copy_and_comparable() {
+        let a = RunMode::OneShot;
+        let b = a; // Copy — a on yhä käytettävissä.
+        assert_eq!(a, b);
+        assert_eq!(a, RunMode::OneShot);
+        assert_ne!(RunMode::OneShot, RunMode::Interactive);
+        // Debug-tuloste on ei-tyhjä.
+        assert!(!format!("{a:?}").is_empty());
+    }
+
+    #[test]
+    fn build_args_oneshot_uses_p_flag() {
+        let cfg = base_config();
+        let args = build_args("tee jotain", &cfg, RunMode::OneShot);
+        assert_eq!(args.first().map(String::as_str), Some("-p"));
+        assert_eq!(args.get(1).map(String::as_str), Some("tee jotain"));
+        assert!(!args.iter().any(|a| a == "-i"), "ei -i kertakäytössä");
+    }
+
+    #[test]
+    fn build_args_interactive_uses_i_flag() {
+        let cfg = base_config();
+        let args = build_args("juttele", &cfg, RunMode::Interactive);
+        assert_eq!(args.first().map(String::as_str), Some("-i"));
+        assert_eq!(args.get(1).map(String::as_str), Some("juttele"));
+        assert!(!args.iter().any(|a| a == "-p"), "ei -p interaktiivisessa");
+    }
+
+    #[test]
+    fn build_args_includes_model() {
+        let mut cfg = base_config();
+        cfg.model = "gemini-flash".into();
+        let args = build_args("x", &cfg, RunMode::OneShot);
+        assert_eq!(flag_value(&args, "-m"), Some("gemini-flash"));
+    }
+
+    #[test]
+    fn build_args_yolo_disabled_by_default() {
+        let cfg = base_config();
+        let args = build_args("x", &cfg, RunMode::OneShot);
+        assert!(
+            !args.iter().any(|a| a == "--approval-mode"),
+            "ei approval-mode kun yolo=false"
+        );
+        assert!(!args.iter().any(|a| a == "yolo"));
+    }
+
+    #[test]
+    fn build_args_yolo_enabled_adds_approval_mode() {
+        let mut cfg = base_config();
+        cfg.yolo = true;
+        let args = build_args("x", &cfg, RunMode::OneShot);
+        assert_eq!(flag_value(&args, "--approval-mode"), Some("yolo"));
+    }
+
+    #[test]
+    fn build_args_sandbox_toggles_flag() {
+        let mut cfg = base_config();
+        assert!(!build_args("x", &cfg, RunMode::OneShot)
+            .iter()
+            .any(|a| a == "--sandbox"));
+        cfg.sandbox = true;
+        assert!(build_args("x", &cfg, RunMode::OneShot)
+            .iter()
+            .any(|a| a == "--sandbox"));
+    }
+
+    #[test]
+    fn build_args_include_dirs_repeated_per_entry() {
+        let mut cfg = base_config();
+        cfg.include_dirs = vec![PathBuf::from("src"), PathBuf::from("docs")];
+        let args = build_args("x", &cfg, RunMode::OneShot);
+        let count = args.iter().filter(|a| *a == "--include-directories").count();
+        assert_eq!(count, 2, "yksi lippu per hakemisto");
+        assert!(args.iter().any(|a| a == "src"));
+        assert!(args.iter().any(|a| a == "docs"));
+    }
+
+    #[test]
+    fn build_args_policies_repeated_per_entry() {
+        let mut cfg = base_config();
+        cfg.policies = vec![PathBuf::from("policy1.json"), PathBuf::from("policy2.json")];
+        let args = build_args("x", &cfg, RunMode::OneShot);
+        let count = args.iter().filter(|a| *a == "--policy").count();
+        assert_eq!(count, 2, "yksi lippu per politiikka");
+        assert!(args.iter().any(|a| a == "policy1.json"));
+        assert!(args.iter().any(|a| a == "policy2.json"));
+    }
+
+    #[test]
+    fn check_installed_does_not_panic_and_reports_clearly() {
+        // Riippumatta siitä onko 'gemini' asennettu testiympäristössä,
+        // funktio palauttaa siistin Result-arvon eikä panikoi.
+        match check_installed() {
+            // Asennettu: versiomerkkijono palautuu (sisältö ympäristöstä riippuva).
+            Ok(_version) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("Gemini CLI"),
+                    "virheviesti mainitsee Gemini CLI:n: {msg}"
+                );
+            }
+        }
+    }
 }
