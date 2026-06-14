@@ -39,7 +39,7 @@ use familyclaw_runtime::build_family;
 
 /// Kiinteä teksti, jonka mock-LLM aina palauttaa. Roundtripin "todiste":
 /// jos tämä teksti päätyy `MockChannel.outbox`-jonoon, koko ketju toimi.
-const FIXED_LLM_REPLY: &str = "agent_epsilon-REPLY-OK: hei, tämä tuli aivoista asti";
+const FIXED_LLM_REPLY: &str = "AGENT-A-REPLY-OK: hei, tämä tuli aivoista asti";
 
 /// Käynnistää OpenAI-yhteensopivan mock-LLM-palvelimen satunnaiselle portille.
 /// Palauttaa base-URL:n muodossa `http://127.0.0.1:<port>/v1` (resolverille).
@@ -87,12 +87,12 @@ async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
     // 2. Mock-kanava + injektoitu inbound-viesti. KLOONI talteen, jotta voimme
     //    tarkistaa outboxin sen jälkeen kun build_family on kuluttanut kanavan
     //    `Box<dyn Channel>`:nä (kloonit jakavat saman Arc<Inner>-tilan).
-    let channel = MockChannel::new("mock-agent_epsilon").expect("channel");
+    let channel = MockChannel::new("mock-agent-a").expect("channel");
     let outbox_probe = channel.clone();
 
     channel
         .inject(
-            InboundMessage::new("the operator-id", "agent_epsilon-chat", "generic being, are you there?")
+            InboundMessage::new("user-a", "conv-a", "generic being, are you there?")
                 .expect("inbound"),
         )
         .expect("inject");
@@ -106,14 +106,14 @@ async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
     let resolver =
         EnvEndpointResolver::new().with_provider("mock", api_base, "FAMILYCLAW_MOCK_LLM_KEY_UNSET");
 
-    // 4. Agentti käyttää mallia "mock/agent_epsilon" → resolveri ratkaisee sen
+    // 4. Agentti käyttää mallia "mock/agent-a" → resolveri ratkaisee sen
     //    mock-LLM:ään → Agent saa Some(llm) → think() tuottaa kiinteän tekstin.
-    let agent_cfg = AgentConfig::new("agent_epsilon", ModelConfig::new("mock/agent_epsilon"));
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("mock/agent-a"));
     let soul =
         familyclaw_agent::Soul::from_essence("I am a generic FamilyClaw being for this test.");
 
     // 5. Reply-kohde = se yksi keskustelu (MVP: staattinen target).
-    let reply_target = "agent_epsilon-chat".to_string();
+    let reply_target = "conv-a".to_string();
 
     // 6. KOKOA RUNTIME — sama kutsu jonka gateway tekee.
     let runtime = build_family(
@@ -191,7 +191,7 @@ async fn dead_primary_fails_over_to_live_fallback() {
     let channel = MockChannel::new("mock-failover").expect("channel");
     let outbox_probe = channel.clone();
     channel
-        .inject(InboundMessage::new("the operator-id", "fo-chat", "kestääkö ketju?").expect("inbound"))
+        .inject(InboundMessage::new("user-a", "fo-chat", "kestääkö ketju?").expect("inbound"))
         .expect("inject");
     channel.close_inbound();
 
@@ -202,7 +202,7 @@ async fn dead_primary_fails_over_to_live_fallback() {
 
     // 4. Primary = dead/model (kaatuu), fallback = live/model (onnistuu).
     let agent_cfg = AgentConfig::new(
-        "agent_epsilon",
+        "agent_a",
         ModelConfig::new("dead/model").with_fallback("live/model"),
     );
     let soul = familyclaw_agent::Soul::from_essence("generic being for failover test");
@@ -288,7 +288,7 @@ async fn timeout_primary_fails_over_to_live_fallback() {
     let channel = MockChannel::new("mock-timeout-fo").expect("channel");
     let outbox_probe = channel.clone();
     channel
-        .inject(InboundMessage::new("the operator-id", "to-chat", "jumittuuko ketju?").expect("inbound"))
+        .inject(InboundMessage::new("user-a", "to-chat", "jumittuuko ketju?").expect("inbound"))
         .expect("inject");
     channel.close_inbound();
 
@@ -304,7 +304,7 @@ async fn timeout_primary_fails_over_to_live_fallback() {
 
     // 3. Primary = hang/model (hyytyy → timeout), fallback = live/model (onnistuu).
     let agent_cfg = AgentConfig::new(
-        "agent_epsilon",
+        "agent_a",
         ModelConfig::new("hang/model").with_fallback("live/model"),
     );
     let soul = familyclaw_agent::Soul::from_essence("generic being for timeout-failover test");
@@ -386,14 +386,14 @@ async fn two_origins_route_replies_to_correct_targets_no_leak() {
 
     // 3. Agentti yhdella mallilla (mock-LLM) + reply-sink + STAATTINEN kohde
     //    joka EI ole kumpikaan keskustelu (todistaa etta origin voittaa).
-    let model = ModelConfig::new("mock/agent_epsilon");
+    let model = ModelConfig::new("mock/agent-a");
     let chain = build_llm_chain(&model, &resolver).expect("chain builds");
     let memory: Arc<dyn MemoryStore + Send + Sync> = Arc::new(LocalJsonStore::in_memory());
     let durable =
         DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
             .expect("durable");
     let agent = Agent::new(
-        AgentConfig::new("agent_epsilon", model),
+        AgentConfig::new("agent_a", model),
         Soul::from_essence("generic being for F2 origin routing test"),
         memory,
         durable,
@@ -456,7 +456,7 @@ async fn without_llm_no_reply_is_emitted() {
 
     // Tyhjä resolveri → provider ei ratkea → build_llm_chain Err → ei LLM:ää.
     let resolver = EnvEndpointResolver::new();
-    let agent_cfg = AgentConfig::new("agent_epsilon", ModelConfig::new("unknown/model"));
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("unknown/model"));
     let soul = familyclaw_agent::Soul::from_essence("generic being");
 
     let runtime = build_family(
@@ -511,7 +511,7 @@ async fn run_one_persistent_turn(data_dir: &std::path::Path, body: &str, api_bas
     let channel = MockChannel::new("mock-restart").expect("channel");
     let outbox_probe = channel.clone();
     channel
-        .inject(InboundMessage::new("the operator-id", "restart-chat", body).expect("inbound"))
+        .inject(InboundMessage::new("user-a", "restart-chat", body).expect("inbound"))
         .expect("inject");
     channel.close_inbound();
 
@@ -520,7 +520,7 @@ async fn run_one_persistent_turn(data_dir: &std::path::Path, body: &str, api_bas
         api_base.to_string(),
         "FAMILYCLAW_RESTART_KEY_UNSET",
     );
-    let agent_cfg = AgentConfig::new("agent_epsilon", ModelConfig::new("mock/agent_epsilon"));
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("mock/agent-a"));
     let soul = familyclaw_agent::Soul::from_essence("generic being for restart test");
 
     // Aseta data-dir tämän build_family-kutsun ajaksi (lukko pidetään kutsujalla;
@@ -623,7 +623,7 @@ async fn inbound_reaches_agent_over_bus() {
     channel.close_inbound();
 
     let resolver = EnvEndpointResolver::new();
-    let agent_cfg = AgentConfig::new("agent_epsilon", ModelConfig::new("provider/model"));
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
     let soul = familyclaw_agent::Soul::from_essence("generic being");
 
     let runtime = build_family(
@@ -641,7 +641,7 @@ async fn inbound_reaches_agent_over_bus() {
 
     let beings = runtime.bus().beings().await.expect("beings");
     assert_eq!(beings.len(), 1);
-    assert_eq!(beings[0].name, "agent_epsilon");
+    assert_eq!(beings[0].name, "agent_a");
 
     runtime.shutdown();
 }

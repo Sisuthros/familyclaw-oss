@@ -102,16 +102,18 @@ for name in $FORBIDDEN_NAMES; do
     # Remove quotes for grep
     clean_name=$(echo "$name" | sed 's/"//g')
     [ -z "$SCAN_FILES" ] && continue
-    if echo "$SCAN_FILES" | xargs grep -l "$clean_name" 2>/dev/null \
-        | xargs -r grep -H "$clean_name" 2>/dev/null \
+    # Case-INSENSITIVE: real names leaked lowercase (agent_epsilon/agent_beta/agent_gamma in a
+    # docs table) slipped past a case-sensitive scan. -i closes that gap.
+    if echo "$SCAN_FILES" | xargs grep -il "$clean_name" 2>/dev/null \
+        | xargs -r grep -Hi "$clean_name" 2>/dev/null \
         | grep -v "\.example" \
-        | grep -v "agent_alpha\|agent_beta\|agent_gamma\|agent_delta\|agent_epsilon\|maintainer\|operator\|user" \
+        | grep -vi "agent_alpha\|agent_beta\|agent_gamma\|agent_delta\|agent_epsilon\|maintainer\|operator\|user" \
         | grep -q .; then
         echo "   ❌ FAIL: Real agent name '$clean_name' found in publishable content"
-        echo "$SCAN_FILES" | xargs grep -l "$clean_name" 2>/dev/null \
-            | xargs -r grep -Hn "$clean_name" 2>/dev/null \
+        echo "$SCAN_FILES" | xargs grep -il "$clean_name" 2>/dev/null \
+            | xargs -r grep -Hni "$clean_name" 2>/dev/null \
             | grep -v "\.example" \
-            | grep -v "agent_alpha\|agent_beta\|agent_gamma\|agent_delta\|agent_epsilon\|maintainer\|operator\|user"
+            | grep -vi "agent_alpha\|agent_beta\|agent_gamma\|agent_delta\|agent_epsilon\|maintainer\|operator\|user"
         NAME_FOUND=1
         FAIL=1
     fi

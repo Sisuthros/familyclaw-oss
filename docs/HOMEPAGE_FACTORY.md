@@ -14,11 +14,11 @@ It lives as:
 
 Three agents collaborate to build a product homepage:
 
-| Agent  | Role (`AgentRole`) | Capability        | Job                          |
-|--------|--------------------|-------------------|------------------------------|
-| agent_epsilon | `Strategy`         | `homepage_design` | Designs the homepage         |
-| agent_beta | `Scout`            | `review`          | Reviews / approves the design |
-| agent_gamma | `Executor`         | `deploy`          | Ships it to production       |
+| Agent         | Role (`AgentRole`) | Capability        | Job                          |
+|---------------|--------------------|-------------------|------------------------------|
+| `agent_alpha` | `Strategy`         | `homepage_design` | Designs the homepage         |
+| `agent_beta`  | `Scout`            | `review`          | Reviews / approves the design |
+| `agent_gamma` | `Executor`         | `deploy`          | Ships it to production       |
 
 The work is modeled as a **DAG** (`OrchestrationPlan`):
 
