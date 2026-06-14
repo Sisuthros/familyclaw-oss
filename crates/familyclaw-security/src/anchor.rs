@@ -399,6 +399,61 @@ mod tests {
     }
 
     #[test]
+    fn retention_is_bounded_in_unit_interval() {
+        // retention pysyy aina välillä [0.0, 1.0] kaikilla kelvollisilla λ/t.
+        // (Erittäin suurella λ·t exp() voi alivuotaa täsmälleen nollaan — se on
+        // sallittu alaraja, ei virhe.)
+        for &lambda in &[0.0, 0.001, 0.5, 1.0, 10.0] {
+            let l = DecayLambda::new(lambda).expect("valid");
+            for &t in &[0.0, 1.0, 100.0, 1.0e6] {
+                let r = l.retention(t);
+                assert!(r >= 0.0, "retention {r} must not be negative (λ={lambda}, t={t})");
+                assert!(r <= 1.0, "retention {r} should not exceed one (λ={lambda}, t={t})");
+                assert!(!r.is_nan(), "retention must not be NaN (λ={lambda}, t={t})");
+            }
+        }
+        // Maltillisella λ·t retention pysyy aidosti positiivisena.
+        assert!(DecayLambda::new(0.001).expect("valid").retention(100.0) > 0.0);
+    }
+
+    #[test]
+    fn retention_monotonically_decreases_with_larger_lambda() {
+        // Samalla ajalla suurempi λ → pienempi retention (nopeampi unohtuminen).
+        let t = 10.0;
+        let slow = DecayLambda::new(0.1).expect("valid").retention(t);
+        let mid = DecayLambda::new(0.5).expect("valid").retention(t);
+        let fast = DecayLambda::new(1.0).expect("valid").retention(t);
+        assert!(slow > mid, "λ=0.1 should retain more than λ=0.5 at t={t}");
+        assert!(mid > fast, "λ=0.5 should retain more than λ=1.0 at t={t}");
+    }
+
+    #[test]
+    fn retention_half_life_math_holds() {
+        // λ = ln(2)/half_life → täsmälleen puolittumisajan jälkeen retention ≈ 0.5.
+        let half_life = 100.0;
+        let lambda = std::f64::consts::LN_2 / half_life;
+        let l = DecayLambda::new(lambda).expect("valid");
+        let r = l.retention(half_life);
+        assert!((r - 0.5).abs() < 1e-9, "half-life retention was {r}, expected 0.5");
+        // Kahden puolittumisajan jälkeen ≈ 0.25.
+        let r2 = l.retention(half_life * 2.0);
+        assert!((r2 - 0.25).abs() < 1e-9, "double half-life retention was {r2}");
+    }
+
+    #[test]
+    fn decay_lambda_partial_ord_compares_by_value() {
+        // DecayLambda johtaa PartialOrd:n → ikuinen (0.0) < mikä tahansa positiivinen.
+        let eternal = DecayLambda::ZERO;
+        let slow = DecayLambda::new(0.1).expect("valid");
+        let fast = DecayLambda::new(1.0).expect("valid");
+        assert!(eternal < slow);
+        assert!(slow < fast);
+        assert!(eternal < fast);
+        // Yhtäsuuruus.
+        assert_eq!(slow, DecayLambda::new(0.1).expect("valid"));
+    }
+
+    #[test]
     fn anchor_hash_of_content_is_64_lowercase_hex() {
         let h = AnchorHash::of_content(SOUL);
         assert_eq!(h.as_hex().len(), AnchorHash::HEX_LEN);
@@ -454,6 +509,69 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn constant_time_eq_unequal_lengths_never_match() {
+        // Pituusero → ei koskaan match, kummin päin tahansa.
+        assert!(!constant_time_eq(b"ab", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        // Tyhjä vs. ei-tyhjä.
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(!constant_time_eq(b"a", b""));
+        // Yhteinen etuliite mutta eri pituus.
+        assert!(!constant_time_eq(b"abcdef", b"abc"));
+    }
+
+    #[test]
+    fn constant_time_eq_equal_lengths_match_only_when_identical() {
+        // Samanpituiset, identtiset → match.
+        assert!(constant_time_eq(b"identical", b"identical"));
+        assert!(constant_time_eq(&[0u8; 32], &[0u8; 32]));
+        // Samanpituiset, eri → ei match.
+        assert!(!constant_time_eq(&[0u8; 32], &[1u8; 32]));
+    }
+
+    #[test]
+    fn constant_time_eq_detects_single_bit_difference() {
+        // Yhden bitin ero missä tahansa tavussa rikkoo vertailun.
+        let base = [0xAAu8; 8];
+
+        // Ensimmäinen tavu, yksi bitti (0xAA ^ 0x01 = 0xAB).
+        let mut first = base;
+        first[0] ^= 0x01;
+        assert!(!constant_time_eq(&base, &first));
+
+        // Keskimmäinen tavu, korkein bitti (0xAA ^ 0x80 = 0x2A).
+        let mut middle = base;
+        middle[4] ^= 0x80;
+        assert!(!constant_time_eq(&base, &middle));
+
+        // Viimeinen tavu, yksi bitti.
+        let mut last = base;
+        last[7] ^= 0x04;
+        assert!(!constant_time_eq(&base, &last));
+
+        // Identtinen kopio (ei eroa) → match — varmistaa ettei testi
+        // erehtyisi pitämään kaikkea erilaisena.
+        let same = base;
+        assert!(constant_time_eq(&base, &same));
+    }
+
+    #[test]
+    fn constant_time_eq_single_bit_difference_in_hash_hex() {
+        // Hash-tasolla: yhden heksamerkin muutos (= yksi nibble-ero) huomataan.
+        let h = AnchorHash::of_content(SOUL);
+        let original = h.as_hex().to_string();
+        let mut bytes = original.into_bytes();
+        // Muuta ensimmäinen heksamerkki toiseksi kelvolliseksi heksamerkiksi.
+        bytes[0] = if bytes[0] == b'0' { b'1' } else { b'0' };
+        let mutated = String::from_utf8(bytes).expect("ascii hex");
+        assert_ne!(mutated.as_str(), h.as_hex());
+        assert!(!constant_time_eq(
+            h.as_hex().as_bytes(),
+            mutated.as_bytes()
+        ));
     }
 
     #[test]
@@ -561,6 +679,79 @@ mod tests {
         let result = verify_identity(AgentId::new(), &anchors, |_| None);
         assert_eq!(result.len(), 1);
         assert!(result[0].1.is_tampered());
+    }
+
+    #[test]
+    fn verify_identity_missing_memory_reports_empty_content_hash() {
+        // Kadonneen muiston tapauksessa havaittu (actual) tiiviste on tyhjän
+        // sisällön tiiviste, ja odotettu (expected) on ankkurin alkuperäinen.
+        let anchor = IdentityAnchor::new("mem-gone", SOUL).expect("valid");
+        let anchors = vec![anchor];
+        let result = verify_identity(AgentId::new(), &anchors, |_| None);
+        assert_eq!(result.len(), 1);
+        match &result[0].1 {
+            IdentityStatus::Tampered {
+                memory_id,
+                expected,
+                actual,
+            } => {
+                assert_eq!(memory_id, "mem-gone");
+                assert_eq!(*expected, AnchorHash::of_content(SOUL));
+                assert_eq!(*actual, AnchorHash::of_content(""));
+                assert_ne!(expected, actual);
+            }
+            IdentityStatus::Intact => panic!("missing memory must be tampered"),
+        }
+    }
+
+    #[test]
+    fn verify_identity_mixed_missing_and_present() {
+        // Sekoitus: yksi ehjä, yksi muuttunut, yksi kadonnut → 2 peukaloitua.
+        let intact = IdentityAnchor::new("mem-ok", "soul ok").expect("valid");
+        let changed = IdentityAnchor::new("mem-changed", "soul orig").expect("valid");
+        let gone = IdentityAnchor::new("mem-gone", "soul gone").expect("valid");
+        let anchors = vec![intact, changed, gone];
+        let result = verify_identity(AgentId::new(), &anchors, |id| match id {
+            "mem-ok" => Some("soul ok".to_string()),
+            "mem-changed" => Some("soul DIFFERENT".to_string()),
+            // mem-gone → None (kadonnut).
+            _ => None,
+        });
+        assert_eq!(result.len(), 2);
+        let flagged: Vec<&str> = result.iter().map(|(a, _)| a.memory_id.as_str()).collect();
+        assert!(flagged.contains(&"mem-changed"));
+        assert!(flagged.contains(&"mem-gone"));
+        assert!(!flagged.contains(&"mem-ok"));
+    }
+
+    #[test]
+    fn anchor_stores_only_hash_and_id_never_soul_content() {
+        // KESKEINEN OSS-invariantti: ankkuri tallentaa vain SHA-256-tiivisteen +
+        // muisti-viittauksen — EI koskaan sielun sisältöä. Verifioi julkisten
+        // accessorien ja sarjallistetun muodon kautta.
+        let secret_soul = "SECRET_SOUL agent_a values honesty and protects the family";
+        let anchor = IdentityAnchor::new("mem-soul-x", secret_soul).expect("valid");
+
+        // 1. anchor_hash on tiiviste (64 heksamerkkiä), ei selkokielinen sisältö.
+        let hex = anchor.anchor_hash.as_hex();
+        assert_eq!(hex.len(), AnchorHash::HEX_LEN);
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!hex.contains("SECRET_SOUL"));
+        assert!(!hex.contains("honesty"));
+
+        // 2. memory_id on pelkkä viittaus, ei sisällä sisältöä.
+        assert_eq!(anchor.memory_id, "mem-soul-x");
+        assert!(!anchor.memory_id.contains("SECRET_SOUL"));
+
+        // 3. Koko sarjallistettu ankkuri ei sisällä sielun sisältöä missään.
+        let json = serde_json::to_string(&anchor).expect("serialize");
+        assert!(
+            !json.contains("SECRET_SOUL"),
+            "serialized anchor leaked soul content: {json}"
+        );
+        assert!(!json.contains("honesty"));
+        // Mutta tiiviste ON mukana (vahti tallessa).
+        assert!(json.contains(hex));
     }
 
     #[test]
