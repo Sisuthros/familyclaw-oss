@@ -247,4 +247,49 @@ mod tests {
         // Roolilla ilman lupia → tyhjä.
         assert!(policy.capabilities_for(AgentRole::Scout).is_empty());
     }
+
+    // --- Reunatapaukset ---
+
+    /// Tyhjä merkkijono on validi (mutta erillinen) kyvykkyystunniste:
+    /// se täytyy myöntää eksplisiittisesti, eikä se vuoda muille tunnisteille.
+    #[test]
+    fn empty_string_capability_is_distinct_and_must_be_granted() {
+        // Oletuksena (ei myönnetty) tyhjä kyvykkyys on kielletty.
+        let denied = RbacPolicy::new();
+        assert!(!denied.is_allowed(AgentRole::Executor, ""));
+        assert!(denied.check(AgentRole::Executor, "").is_err());
+
+        // Eksplisiittisesti myönnetty tyhjä kyvykkyys sallitaan, mutta se ei
+        // anna lupaa ei-tyhjään kyvykkyyteen (eikä päinvastoin).
+        let policy = RbacPolicy::new().allow(AgentRole::Executor, "");
+        assert!(policy.is_allowed(AgentRole::Executor, ""));
+        assert!(policy.check(AgentRole::Executor, "").is_ok());
+        assert!(!policy.is_allowed(AgentRole::Executor, "browser"));
+
+        let only_named = RbacPolicy::new().allow(AgentRole::Executor, "browser");
+        assert!(!only_named.is_allowed(AgentRole::Executor, ""));
+    }
+
+    /// Kyvykkyydet ovat tarkka (case-sensitive) `HashSet`-täsmäys:
+    /// `"Browser"` ei vastaa myönnettyä `"browser"`:ia.
+    #[test]
+    fn capability_match_is_case_sensitive() {
+        let policy = RbacPolicy::new().allow(AgentRole::Executor, "browser");
+
+        // Tarkka täsmäys sallitaan.
+        assert!(policy.is_allowed(AgentRole::Executor, "browser"));
+
+        // Eri kirjainkoko ei täsmää.
+        assert!(!policy.is_allowed(AgentRole::Executor, "Browser"));
+        assert!(!policy.is_allowed(AgentRole::Executor, "BROWSER"));
+        assert!(policy.check(AgentRole::Executor, "Browser").is_err());
+
+        // Revoke on myös kirjainkoolle herkkä: väärä koko ei poista mitään.
+        let mut mutable = RbacPolicy::new();
+        mutable.grant(AgentRole::Executor, "browser");
+        assert!(!mutable.revoke(AgentRole::Executor, "Browser"));
+        assert!(mutable.is_allowed(AgentRole::Executor, "browser"));
+        // Oikealla kirjainkoolla revoke onnistuu.
+        assert!(mutable.revoke(AgentRole::Executor, "browser"));
+    }
 }
