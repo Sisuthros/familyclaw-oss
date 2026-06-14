@@ -50,7 +50,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
 use axum::Router;
 use clap::{Parser, Subcommand};
-use familyclaw_agent::{resolve_profile_dir, EnvEndpointResolver, Soul};
+use familyclaw_agent::{resolve_profile_dir, EnvEndpointResolver, LiveTurnExecutor, Soul};
+use familyclaw_bridge::{
+    AgentInfo, AgentRole, FamilyBridge, HostKind, OrchestrationPlan, Orchestrator, TaskNode,
+};
 use familyclaw_bus::BusHandle;
 mod config;
 use config::FamilyConfig;
@@ -85,6 +88,11 @@ const REPLY_TARGET_ENV: &str = "FAMILYCLAW_REPLY_TARGET";
 /// vain virheviesteissä/dokumentaatiossa — varsinainen arvo luetaan
 /// `FamilyConfig`:n kautta. Vrt. `OpenClaw`in `OPENCLAW_GATEWAY_TOKEN`.
 const GATEWAY_TOKEN_ENV: &str = "FAMILYCLAW_GATEWAY_TOKEN";
+
+/// `orchestrate`-alikomennon suunnitelma JSON-muodossa. Tyhjä/asettamaton →
+/// pieni sisäänrakennettu savutesti-suunnitelma. Muoto:
+/// `{"id":"plan","nodes":[{"id":"n1","title":"...","description":"...","input":{...}}]}`.
+const PLAN_ENV: &str = "FAMILYCLAW_PLAN";
 
 /// Oletusarvot joita `FamilyConfig` käyttää (KERROS B).
 const DEFAULT_BUS_NAME: &str = "familyclaw-gateway-bus";
@@ -123,6 +131,21 @@ enum Command {
     /// ympäristömuuttujat. Salaisuuksista raportoidaan **vain läsnäolo**
     /// (asetettu/puuttuu) — arvoja ei koskaan tulosteta.
     Doctor,
+    /// Aja monivaiheinen orkesterointisuunnitelma kerran ja tulosta raportti.
+    ///
+    /// Tämä on multi-agent DAG -ajon **elävä sisäänkäynti**: kokoaa
+    /// [`FamilyBridge`]:n, rekisteröi työntekijät, valitsee mallin
+    /// ([`LiveTurnExecutor`] oikealla LLM-ketjulla [`build_resolver`]:n kautta)
+    /// ja ajaa [`Orchestrator::run_with`]:n. Suunnitelma luetaan
+    /// [`PLAN_ENV`]-ympäristömuuttujasta (JSON) tai käytetään pientä
+    /// sisäänrakennettua oletussuunnitelmaa savutestiksi.
+    ///
+    /// **Rehellinen rajaus:** ajaa bridgen omalla substraatilla
+    /// (`EventBus` + `AgentRegistry` + `TaskBoard`), EI [`FamilyRuntime`]:n
+    /// ractor-agenteilla/`ResonanceBus`illa. Tämä tekee DAG-orkesteroinnista
+    /// ajettavan oikeilla LLM-kutsuilla; fuusio eläviin runtime-agentteihin on
+    /// erillinen, isompi työ.
+    Orchestrate,
 }
 
 /// Gatewayn jaettu ajonaikainen tila, johon HTTP-handlerit viittaavat.
@@ -617,6 +640,7 @@ async fn main() -> Result<()> {
         Command::Serve => serve().await,
         Command::Status => status().await,
         Command::Doctor => doctor().await,
+        Command::Orchestrate => orchestrate().await,
     }
 }
 
@@ -826,6 +850,120 @@ async fn doctor() -> Result<()> {
     }
 }
 
+/// Jäsentää [`PLAN_ENV`]-suunnitelman tai palauttaa savutesti-oletuksen.
+///
+/// JSON-muoto on tarkoituksella pelkistetty: lista solmuja, joista kukin saa
+/// `id`/`title`/`description` ja valinnaisen `input`-objektin. Riippuvuudet,
+/// roolit ja kyvyt jätetään oletusarvoihin (yksinkertainen lineaarinen ajo),
+/// jotta sisäänkäynti pysyy ohuena — monimutkaisempi suunnittelu kuuluu
+/// kirjasto-API:lle ([`OrchestrationPlan`]).
+fn load_orchestration_plan() -> OrchestrationPlan {
+    let raw = std::env::var(PLAN_ENV).unwrap_or_default();
+    if raw.trim().is_empty() {
+        // Sisäänrakennettu savutesti: yksi solmu joka todistaa että ajo kulkee
+        // worker-valinnan + LiveTurnExecutorin läpi.
+        return OrchestrationPlan::new(
+            "smoke",
+            vec![TaskNode::new(
+                "n1",
+                "smoke turn",
+                "Produce a tiny JSON object proving the live orchestration path works.",
+            )],
+        );
+    }
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(v) => {
+            let plan_id = v.get("id").and_then(|x| x.as_str()).unwrap_or("plan");
+            let nodes: Vec<TaskNode> = v
+                .get("nodes")
+                .and_then(|n| n.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .enumerate()
+                        .map(|(i, node)| {
+                            let id = node
+                                .get("id")
+                                .and_then(|x| x.as_str())
+                                .map_or_else(|| format!("n{i}"), ToString::to_string);
+                            let title = node
+                                .get("title")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("turn")
+                                .to_string();
+                            let desc = node
+                                .get("description")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            TaskNode::new(id, title, desc)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            OrchestrationPlan::new(plan_id, nodes)
+        }
+        Err(e) => {
+            warn!(error = %e, "kelvoton {PLAN_ENV} JSON — käytetään savutesti-oletusta");
+            OrchestrationPlan::new(
+                "smoke",
+                vec![TaskNode::new("n1", "smoke turn", "fallback after invalid plan")],
+            )
+        }
+    }
+}
+
+/// Ajaa monivaiheisen orkesterointisuunnitelman kerran ja tulostaa raportin.
+///
+/// Kokoaa bridgen, rekisteröi yhden Executor-työntekijän (online heartbeatilla),
+/// rakentaa [`LiveTurnExecutor`]:n env-resolverista ja ajaa
+/// [`Orchestrator::run_with`]:n. Tulostaa [`RunReport`]:n JSON-muodossa.
+///
+/// # Errors
+/// [`FamilyClawError`] jos mallin ratkaisu, työntekijän rekisteröinti tai ajo
+/// epäonnistuu.
+async fn orchestrate() -> Result<()> {
+    let cfg = FamilyConfig::load()?;
+    let model = cfg.model().to_string();
+    info!(%model, "orchestrate: kootaan bridge + LiveTurnExecutor");
+
+    // 1. Bridge-substraatti (oma EventBus/AgentRegistry/TaskBoard).
+    let bridge = FamilyBridge::new();
+    let now = familyclaw_core::time::now();
+
+    // 2. Rekisteröi yksi Executor-työntekijä ja tee siitä online (heartbeat),
+    //    jotta select_worker näkee sen. Geneerinen nimi (KERROS A).
+    let worker_id = familyclaw_core::AgentId::new();
+    let worker = AgentInfo::new(worker_id, "worker-a", AgentRole::Executor, HostKind::Local);
+    bridge
+        .register_agent(worker)
+        .await
+        .map_err(|e| FamilyClawError::invalid_input(format!("orchestrate: register failed: {e}")))?;
+    bridge
+        .heartbeat(worker_id, now)
+        .await
+        .map_err(|e| FamilyClawError::invalid_input(format!("orchestrate: heartbeat failed: {e}")))?;
+
+    // 3. LiveTurnExecutor oikealla LLM-ketjulla (sama resolver kuin serve).
+    let resolver = build_resolver();
+    let executor = LiveTurnExecutor::from_model(&ModelConfig::new(&model), &resolver)?;
+    info!(primary = %executor.primary_model(), "LiveTurnExecutor valmis");
+
+    // 4. Aja suunnitelma.
+    let plan = load_orchestration_plan();
+    let orchestrator = Orchestrator::new(bridge);
+    let report = orchestrator.run_with(&plan, now, &executor).await?;
+
+    // 5. Raportti stdoutiin. RunReport ei johda Serializea (bridge-tyyppi,
+    //    jota emme muuta cross-crate), joten käytetään Debug-tulostusta +
+    //    pieni JSON-yhteenveto valmistuneista solmuista.
+    println!("{report:#?}");
+    info!(
+        plan = %report.plan_id,
+        "orchestrate: valmis"
+    );
+    Ok(())
+}
+
 /// Odottaa sammutussignaalia (`Ctrl-C`). Palaa kun signaali saapuu, mikä
 /// laukaisee axumin siistin sammutuksen.
 async fn shutdown_signal() {
@@ -920,6 +1058,35 @@ mod tests {
 
         let doctor = Cli::parse_from(["familyclaw-gateway", "doctor"]);
         assert!(matches!(doctor.command, Some(Command::Doctor)));
+
+        let orch = Cli::parse_from(["familyclaw-gateway", "orchestrate"]);
+        assert!(matches!(orch.command, Some(Command::Orchestrate)));
+    }
+
+    #[test]
+    fn plan_load_falls_back_to_smoke_without_env() {
+        // Ilman PLAN_ENV:iä → sisäänrakennettu yhden solmun savutesti.
+        // (Testi ei aseta env-muuttujaa, joten luetaan oletus.)
+        std::env::remove_var(PLAN_ENV);
+        let plan = load_orchestration_plan();
+        assert_eq!(plan.id, "smoke");
+        assert_eq!(plan.nodes.len(), 1);
+        assert_eq!(plan.nodes[0].id.as_str(), "n1");
+    }
+
+    #[test]
+    fn plan_load_parses_json_nodes() {
+        let json = r#"{"id":"p","nodes":[
+            {"id":"a","title":"A","description":"da"},
+            {"id":"b","title":"B","description":"db"}
+        ]}"#;
+        std::env::set_var(PLAN_ENV, json);
+        let plan = load_orchestration_plan();
+        std::env::remove_var(PLAN_ENV);
+        assert_eq!(plan.id, "p");
+        assert_eq!(plan.nodes.len(), 2);
+        assert_eq!(plan.nodes[1].id.as_str(), "b");
+        assert_eq!(plan.nodes[1].title, "B");
     }
 
     #[test]

@@ -22,6 +22,10 @@ familyclaw-core = { workspace = true }
 familyclaw-bus = { workspace = true }
 familyclaw-runtime = { workspace = true }
 familyclaw-agent = { workspace = true }
+# orchestrate-alikomennolle: Orchestrator + FamilyBridge + OrchestrationPlan.
+# Ei sykliä: bridge riippuu vain coresta. (familyclaw-agent re-exportaa vain
+# LiveTurnExecutorin, ei orkesteri-tyyppejä, joten bridge tarvitaan suoraan.)
+familyclaw-bridge = { workspace = true }
 familyclaw-channels = { workspace = true, features = ["telegram", "discord"] }
 tokio = { workspace = true }
 axum = { workspace = true }

@@ -1644,6 +1644,7 @@ dependencies = [
  "axum 0.7.9",
  "clap",
  "familyclaw-agent",
+ "familyclaw-bridge",
  "familyclaw-bus",
  "familyclaw-channels",
  "familyclaw-core",
