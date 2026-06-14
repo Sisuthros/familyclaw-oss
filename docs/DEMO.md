@@ -21,7 +21,7 @@ cargo run -p familyclaw-agent
 | 2 | Agent spawning | 2 agents register on bus, listed via `bus.beings()` |
 | 3 | MockChannel transport | Messages injected, envelope published to bus |
 | 4 | Message exchange + memory storage | 3 messages exchanged, `memory.len()` = expected count |
-| 5 | Emotion contagion | `agent_a` broadcasts pulse, `agent_b` state updated (verified via exact f32 comparison in tests) |
+| 5 | Emotion contagion | `agent_a` broadcasts pulse → bus delivers to siblings → `AffectiveBeing` absorbs it into its own `EmotionState` via `EmotionTransition::blend` (receive-side wired in alpha.5; verified by `pulse_over_real_bus_shifts_receiver_toward_sender`) |
 | 6 | Time jump / memory aging | **SIMULATED** — logs show retention percentages but no actual clock advance |
 | 7 | Dream cycle | **REAL EXECUTION** — `DreamCycle::run_without_journal()` merges 1 duplicate, logs `merged=1` |
 | 8 | Memory retrieval | `retrieve()` finds stored messages |
@@ -77,11 +77,47 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/... cargo run -p familyclaw
 
 ---
 
+### 4. Multi-Agent Orchestration (Live, alpha.5)
+
+**Command:**
+```bash
+# Built-in smoke plan (no LLM resolver needed to construct; LLM call needs FAMILYCLAW_PROVIDERS)
+cargo run -p familyclaw-gateway -- orchestrate
+
+# Custom DAG plan as JSON:
+FAMILYCLAW_PLAN='{"id":"p","nodes":[{"id":"n1","title":"...","description":"..."}]}' \
+  cargo run -p familyclaw-gateway -- orchestrate
+```
+
+**What This Proves:** The `orchestrate` subcommand assembles a `FamilyBridge`,
+registers an online `Executor` worker, builds a `LiveTurnExecutor` (real LLM
+chain via the same `build_resolver()` as `serve`), and runs
+`Orchestrator::run_with` over a plan — printing the `RunReport`. This is the
+**live entrypoint** for multi-agent DAG execution.
+
+**Honest boundary:** runs on the bridge's own substrate (`EventBus` +
+`AgentRegistry` + `TaskBoard`), **not** the `FamilyRuntime`'s ractor agents /
+`ResonanceBus`. It makes DAG orchestration runnable with real LLM turns; fusing
+it with the living runtime agents is separate, larger work.
+
+---
+
+### 5. Provenance-Gated Memory (alpha.4/.5)
+
+`familyclaw-memory` carries a `Provenance` on every memory
+(`DirectExperience` / `Derived` / `External{source, trust}`) and a
+`GatedMemoryStore` decorator that rejects low-trust `External` writes at
+ingestion (`ProvenanceGate::admit`) — a Sleeper-Memory-Poisoning defense
+(arXiv 2605.15338). `DirectExperience`/`Derived` always admit, so wrapping an
+existing store is backward-compatible. Proven by bench scenario `provenance_gate`.
+
+---
+
 ## What Is Still Experimental
 
 | Feature | Crate | Status |
 |---------|-------|--------|
-| Latent messaging (hidden-state channel) | `familyclaw-latent` | Prototype — simple pad/truncate/resize, no semantic projection |
+| Latent messaging (hidden-state channel) | `familyclaw-latent` / `familyclaw-bus` | Send-side `VectorTranslator` (scale/offset/matrix projection) wired into `BusLatentChannel` (alpha.6); **receive-side decode into agent cognition is intentionally deferred** (family-boundary: it would let a sibling's latent state flow into another being's cognition) |
 | WASM sandbox execution | `familyclaw-sandbox` | Compiles, fuel metering works, no integration tests |
 | Dream cycle with contradictions | `familyclaw-dream` | Works with journal, contradiction markers tested |
 | Emotion contagion scaling | `familyclaw-bus` | Manual HashMap iteration — O(n) per message (see architecture debt) |
