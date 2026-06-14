@@ -132,10 +132,17 @@ Run locally to verify everything works:
 # Full test suite (1209 tests)
 cargo test --workspace
 
-# Feature matrix (matches CI)
-cargo test --workspace --all-features
-cargo check -p familyclaw-channels --features discord
-cargo test -p familyclaw-sandbox --features wasmtime
+# Feature matrix (matches CI exactly — living features only)
+cargo test --workspace \
+  --features familyclaw-channels/discord \
+  --features familyclaw-channels/telegram \
+  --features familyclaw-channels/whatsapp \
+  --features familyclaw-channels/signal \
+  --features familyclaw-sandbox/wasmtime
+
+# NB: `--all-features` is intentionally NOT used — the `surreal` feature in
+# familyclaw-hearth is a deferred dead backend (8 compile errors against the
+# current SurrealDB API), excluded from CI until repaired or removed.
 
 # Code quality
 cargo fmt --all -- --check

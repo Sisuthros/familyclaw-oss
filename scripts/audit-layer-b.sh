@@ -87,10 +87,11 @@ echo "8️⃣  Checking for real Layer B names in publishable content..."
 # An explicit deny-list excludes legitimately-public files that mention agent names
 # only as escaped/example tokens (e.g. *.example).
 SCAN_FILES=$(git ls-files -- \
-    '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' '*.json' 2>/dev/null \
+    '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' '*.json' '*.py' '*.sh' '*.ps1' 2>/dev/null \
     | grep -vE '(^|/)(target)/' \
     | grep -vE '\.example($|\.)' \
-    | grep -vE '\.example\.(md|rs|toml|yml|yaml|json)$')
+    | grep -vE '\.example\.(md|rs|toml|yml|yaml|json|py|sh|ps1)$' \
+    | grep -vE '(^|/)scripts/audit-layer-b\.sh$')
 NAME_FOUND=0
 for name in $FORBIDDEN_NAMES; do
     # Remove quotes for grep

@@ -98,13 +98,20 @@ impl FamilyRuntime {
 /// CI). Kun ketju ratkeaa, koko failover (primary + fallbackit) kytketään
 /// agentille [`Agent::with_failover`]:lla.
 ///
-/// # Tuotanto-raja (MVP-rajoite)
-/// Yksi `reply_target`/agentti on oikein **vain yhdelle kanavalle ja yhdelle
-/// keskustelulle**. Heti kun kanavia on >1 tai agentti palvelee >1
-/// keskustelua, staattinen kohde reitittää vastauksen väärään keskusteluun.
-/// Silloin tarvitaan per-viesti-alkuperä (`MessageOrigin` bus-kirjekuoressa,
-/// josta kohde johdetaan); ks. [`Agent::with_reply_target`]:n C2-aukon
-/// dokumentaatio. Tätä origin-sopimusta **ei ole** vielä rakennettu.
+/// # Vastauksen reititys: per-viesti-alkuperä (F2) + staattinen fallback
+/// Per-viesti-alkuperä (`MessageOrigin`) on **täysin rakennettu ja testattu**
+/// (F2). Saapuva `InboundEnvelope` kantaa alkuperän, `channel_bridge`
+/// kartoittaa sen `MessageOrigin`:iin (`envelope_origin`), `ResonanceMessage`
+/// kuljettaa sen bus-kirjekuoressa (`publish_with_origin`), ja
+/// [`Agent::handle_turn_with_origin`] johtaa vastauksen kohteen per-viesti
+/// arvosta `origin.reply_target()`. Staattinen `reply_target`/agentti on nyt
+/// **fallback** — sitä käytetään vain kun alkuperää ei ole. Näin yksi agentti
+/// palvelee >1 kanavaa ja >1 keskustelua ilman että vastaus vuotaa väärään
+/// keskusteluun. Todiste: integraatiotesti
+/// `two_origins_route_replies_to_correct_targets_no_leak`
+/// (`familyclaw-runtime/tests/roundtrip.rs`), joka asettaa staattisen kohteen
+/// tarkoituksella vääräksi ja todistaa että kaksi eri keskustelua reitittyvät
+/// omiin kohteisiinsa.
 ///
 /// # Errors
 /// - [`FamilyClawError::Config`] jos mallikonfiguraatio on kelvoton (tämä

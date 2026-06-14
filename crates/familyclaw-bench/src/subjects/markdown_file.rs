@@ -330,7 +330,7 @@ mod tests {
         let mut subject = MarkdownFileSubject::new();
         // Tärkeä identiteettifakta ENSIMMÄISENÄ — se on vanhin, joten se katkeaa
         // ensin kun budjetti ylittyy.
-        let important = "IDENTITY: the operator on perheen luoja".to_string();
+        let important = "IDENTITY: the maintainer is the family creator".to_string();
         subject.push_memory(important.clone());
         // Työnnä reilusti yli budjetin verran muuta tavaraa.
         for i in 0..(BOOTSTRAP_BUDGET + 5) {

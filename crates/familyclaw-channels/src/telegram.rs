@@ -488,7 +488,7 @@ mod tests {
                     "update_id": 100,
                     "message": {
                         "message_id": 7,
-                        "from": { "id": 4242, "first_name": "the operator" },
+                        "from": { "id": 4242, "first_name": "User" },
                         "chat": { "id": -1009, "type": "group" },
                         "text": "moi"
                     }

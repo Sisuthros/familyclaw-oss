@@ -125,3 +125,13 @@ write_papers.py
 # mainitsevat perheen oikeat nimet (agentti-osoitus) → sisäisiä, ei Layer A:han.
 PAKETTI-*.md
 plans/PARALLEL_RUN_*.md
+.claude/night-nudger.py
+.claude/usage_meter.py
+.claude/PLAN_AAA.md
+.claude/PLAN_PERFECT.md
+agentit/
+core/
+ops/
+scripts/*.bak-*
+plans/
+research/

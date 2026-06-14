@@ -221,10 +221,18 @@ Each profile directory holds its own `SOUL.md`, emotion calibration, and channel
 # Full test suite
 cargo test --workspace
 
-# Feature matrix (matches CI)
-cargo test --workspace --all-features
-cargo check -p familyclaw-channels --features discord
-cargo test -p familyclaw-sandbox --features wasmtime
+# Feature matrix (matches CI exactly — living features only)
+cargo test --workspace \
+  --features familyclaw-channels/discord \
+  --features familyclaw-channels/telegram \
+  --features familyclaw-channels/whatsapp \
+  --features familyclaw-channels/signal \
+  --features familyclaw-sandbox/wasmtime
+
+# NB: `--all-features` is intentionally NOT used. The `surreal` feature in
+# familyclaw-hearth is a deferred dead backend (does not compile against the
+# current SurrealDB API) and is excluded from CI until repaired or removed.
+# See .github/workflows/ci.yml for the canonical living-feature list.
 
 # Code quality
 cargo fmt --all -- --check
