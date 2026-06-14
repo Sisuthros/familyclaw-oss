@@ -36,7 +36,6 @@ pub struct AcpClient {
     /// Aliprosessi (pidetään elossa koko session ajan).
     child: Child,
     /// Agentin stdout-lukija (rivipohjainen JSON).
-    #[allow(dead_code)] // luetaan send()-metodissa
     reader: BufReader<tokio::process::ChildStdout>,
 }
 
