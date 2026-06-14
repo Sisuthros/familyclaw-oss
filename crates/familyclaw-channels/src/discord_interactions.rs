@@ -196,4 +196,220 @@ mod tests {
         let err = verify_signature(&pk, &sig, "123", b"{}").unwrap_err();
         assert!(matches!(err, ChannelError::InvalidInput(_)));
     }
+
+    /// Pieni hex-enkooderi testidataa varten (`decode_hex`:n käänteisoperaatio).
+    fn encode_hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    #[test]
+    fn verify_accepts_valid_signature() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        // Deterministinen avain testiä varten (EI tuotantosalaisuus).
+        let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+
+        let timestamp = "1700000000";
+        let body = br#"{"type":1}"#;
+
+        // Discord allekirjoittaa `timestamp || raw_body`.
+        let mut message = Vec::new();
+        message.extend_from_slice(timestamp.as_bytes());
+        message.extend_from_slice(body);
+        let signature = signing_key.sign(&message);
+
+        let pk_hex = encode_hex(verifying_key.as_bytes());
+        let sig_hex = encode_hex(&signature.to_bytes());
+
+        let result = verify_signature(&pk_hex, &sig_hex, timestamp, body);
+        assert!(result.is_ok(), "valid signature must verify: {result:?}");
+    }
+
+    #[test]
+    fn verify_rejects_tampered_body_with_valid_key() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+
+        let timestamp = "1700000001";
+        let signed_body = br#"{"type":2}"#;
+
+        let mut message = Vec::new();
+        message.extend_from_slice(timestamp.as_bytes());
+        message.extend_from_slice(signed_body);
+        let signature = signing_key.sign(&message);
+
+        let pk_hex = encode_hex(verifying_key.as_bytes());
+        let sig_hex = encode_hex(&signature.to_bytes());
+
+        // Eri body kuin allekirjoitettu → verify epäonnistuu vaikka avain täsmää.
+        let tampered_body = br#"{"type":3}"#;
+        let err = verify_signature(&pk_hex, &sig_hex, timestamp, tampered_body).unwrap_err();
+        assert!(matches!(err, ChannelError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn verify_rejects_odd_length_hex() {
+        // Pariton hex-pituus → decode_hex palauttaa virheen (InvalidInput).
+        let err = verify_signature("abc", &"b".repeat(128), "1", b"{}").unwrap_err();
+        assert!(matches!(err, ChannelError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_length_public_key() {
+        // Validi hex mutta väärä tavumäärä (16 tavua eikä 32) → 32-tavun try_into epäonnistuu.
+        let short_pk = "a".repeat(32); // 16 tavua
+        let err = verify_signature(&short_pk, &"b".repeat(128), "1", b"{}").unwrap_err();
+        assert!(matches!(err, ChannelError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_length_signature() {
+        // Validi 32-tavun avain mutta liian lyhyt allekirjoitus (32 tavua eikä 64).
+        let pk = "a".repeat(64);
+        let short_sig = "b".repeat(64); // 32 tavua
+        let err = verify_signature(&pk, &short_sig, "1", b"{}").unwrap_err();
+        assert!(matches!(err, ChannelError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn from_payload_missing_type_errors() {
+        // Ei "type"-kenttää → InvalidInput ("interaction missing type").
+        let json = serde_json::json!({ "data": { "name": "x" } });
+        let err = DiscordInteraction::from_payload(&json).unwrap_err();
+        assert!(matches!(err, ChannelError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn from_payload_type_out_of_range_errors() {
+        // type > u8::MAX → u8::try_from epäonnistuu ("interaction type out of range").
+        let json = serde_json::json!({ "type": 300 });
+        let err = DiscordInteraction::from_payload(&json).unwrap_err();
+        assert!(matches!(err, ChannelError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn from_payload_non_numeric_type_errors() {
+        // type ei ole numero → as_u64() palauttaa None → InvalidInput.
+        let json = serde_json::json!({ "type": "ping" });
+        let err = DiscordInteraction::from_payload(&json).unwrap_err();
+        assert!(matches!(err, ChannelError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn from_payload_without_data_yields_none_fields() {
+        // Pelkkä type, ei dataa eikä käyttäjää/kanavaa → kaikki optiot None.
+        let json = serde_json::json!({ "type": 2 });
+        let ix = DiscordInteraction::from_payload(&json).expect("parse");
+        assert!(ix.is_application_command());
+        assert_eq!(ix.command_name, None);
+        assert_eq!(ix.message_text, None);
+        assert_eq!(ix.user_id, None);
+        assert_eq!(ix.channel_id, None);
+    }
+
+    #[test]
+    fn from_payload_falls_back_to_top_level_user_id() {
+        // member.user.id puuttuu → fallback user.id (DM-konteksti).
+        let json = serde_json::json!({
+            "type": 2,
+            "user": { "id": "dm-user-9" }
+        });
+        let ix = DiscordInteraction::from_payload(&json).expect("parse");
+        assert_eq!(ix.user_id.as_deref(), Some("dm-user-9"));
+    }
+
+    #[test]
+    fn into_inbound_uses_defaults_when_ids_missing() {
+        // user_id/channel_id puuttuvat → oletukset "discord-user" ja "discord".
+        let json = serde_json::json!({
+            "type": 2,
+            "data": {
+                "name": "fc",
+                "options": [{ "name": "message", "type": 3, "value": "hei" }]
+            }
+        });
+        let ix = DiscordInteraction::from_payload(&json).expect("parse");
+        let inbound = ix.into_inbound().expect("inbound");
+        assert_eq!(inbound.sender, "discord-user");
+        assert_eq!(inbound.conversation, "discord");
+        assert_eq!(inbound.body, "hei");
+    }
+
+    #[test]
+    fn into_inbound_empty_message_errors() {
+        // message-option on pelkkää whitespacea → filter pudottaa → InvalidInput.
+        let json = serde_json::json!({
+            "type": 2,
+            "data": {
+                "name": "fc",
+                "options": [{ "name": "message", "type": 3, "value": "   " }]
+            }
+        });
+        let ix = DiscordInteraction::from_payload(&json).expect("parse");
+        let err = ix.into_inbound().unwrap_err();
+        assert!(matches!(err, ChannelError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn into_inbound_no_message_option_errors() {
+        // Ei message_text:iä lainkaan → into_inbound antaa InvalidInput.
+        let json = serde_json::json!({ "type": 2, "data": { "name": "fc" } });
+        let ix = DiscordInteraction::from_payload(&json).expect("parse");
+        assert_eq!(ix.message_text, None);
+        let err = ix.into_inbound().unwrap_err();
+        assert!(matches!(err, ChannelError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn extract_message_option_ignores_non_message_options() {
+        // Vain "channel"-niminen option → message_text jää None:ksi.
+        let json = serde_json::json!({
+            "type": 2,
+            "data": {
+                "name": "fc",
+                "options": [{ "name": "channel", "type": 3, "value": "yleinen" }]
+            }
+        });
+        let ix = DiscordInteraction::from_payload(&json).expect("parse");
+        assert_eq!(ix.message_text, None);
+    }
+
+    #[test]
+    fn extract_message_option_skips_non_string_value() {
+        // message-option arvo ei ole string (numero) → as_str() None → ei poimita.
+        let json = serde_json::json!({
+            "type": 2,
+            "data": {
+                "name": "fc",
+                "options": [{ "name": "message", "type": 4, "value": 42 }]
+            }
+        });
+        let ix = DiscordInteraction::from_payload(&json).expect("parse");
+        assert_eq!(ix.message_text, None);
+    }
+
+    #[test]
+    fn extract_message_option_picks_message_among_many() {
+        // Useita optioita, message poimitaan oikein muiden joukosta.
+        let json = serde_json::json!({
+            "type": 2,
+            "data": {
+                "name": "fc",
+                "options": [
+                    { "name": "channel", "type": 3, "value": "yleinen" },
+                    { "name": "message", "type": 3, "value": "löytyi" }
+                ]
+            }
+        });
+        let ix = DiscordInteraction::from_payload(&json).expect("parse");
+        assert_eq!(ix.message_text.as_deref(), Some("löytyi"));
+    }
 }
