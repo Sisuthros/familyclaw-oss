@@ -94,27 +94,27 @@ A Cargo workspace of focused crates. Every public item is documented; the
 workspace forbids `unsafe`, denies `unwrap`/`expect`/`panic!` on production
 paths, and ships unit tests in-module.
 
-| Crate | Responsibility | Docs |
-|-------|---------------|------|
-| [`familyclaw-core`](crates/familyclaw-core) | Shared types, typed IDs, config, error handling, time. The foundation every other crate builds on. | [![docs](https://docs.rs/familyclaw-core/badge.svg)](https://docs.rs/familyclaw-core) |
-| [`familyclaw-bus`](crates/familyclaw-bus) | **Resonance Bus** — Ractor actor mesh; emotion pulses leak between beings (affective contagion). | [![docs](https://docs.rs/familyclaw-bus/badge.svg)](https://docs.rs/familyclaw-bus) |
-| [`familyclaw-durable`](crates/familyclaw-durable) | **Durable substrate** — journal-based deterministic replay; crash-proof workflows. | [![docs](https://docs.rs/familyclaw-durable/badge.svg)](https://docs.rs/familyclaw-durable) |
-| [`familyclaw-memory`](crates/familyclaw-memory) | **Eternal Thread** — persistent memory, Ebbinghaus decay, importance weighting, retrieval. | [![docs](https://docs.rs/familyclaw-memory/badge.svg)](https://docs.rs/familyclaw-memory) |
-| [`familyclaw-dream`](crates/familyclaw-dream) | **Dreaming** — nightly consolidation: merge duplicates, drop contradictions, absolutize dates. | [![docs](https://docs.rs/familyclaw-dream/badge.svg)](https://docs.rs/familyclaw-dream) |
-| [`familyclaw-emotion`](crates/familyclaw-emotion) | 19-dimension VAD emotion **frame** — empty calibration, safe to publish. | [![docs](https://docs.rs/familyclaw-emotion/badge.svg)](https://docs.rs/familyclaw-emotion) |
-| [`familyclaw-latent`](crates/familyclaw-latent) | **Latent telepathy** — hidden-state transfer + `RecursiveLink` dimension bridge, text fallback. | [![docs](https://docs.rs/familyclaw-latent/badge.svg)](https://docs.rs/familyclaw-latent) |
-| [`familyclaw-sandbox`](crates/familyclaw-sandbox) | Isolated code execution — Wasmtime + fuel metering + deny-by-default capabilities. | [![docs](https://docs.rs/familyclaw-sandbox/badge.svg)](https://docs.rs/familyclaw-sandbox) |
-| [`familyclaw-security`](crates/familyclaw-security) | Identity anchors + human-correction veto. Identity lives in the memory substrate, not a hash. | [![docs](https://docs.rs/familyclaw-security/badge.svg)](https://docs.rs/familyclaw-security) |
-| [`familyclaw-bridge`](crates/familyclaw-bridge) | Agent registry, task board, event bus — transport-independent Rust core. | [![docs](https://docs.rs/familyclaw-bridge/badge.svg)](https://docs.rs/familyclaw-bridge) |
-| [`familyclaw-agent`](crates/familyclaw-agent) | **Agent runtime** — composes all above into a living being. Ships demo binaries. | [![docs](https://docs.rs/familyclaw-agent/badge.svg)](https://docs.rs/familyclaw-agent) |
-| [`familyclaw-channels`](crates/familyclaw-channels) | Discord / Telegram / WhatsApp / Signal adapters bridged to the bus. Discord inbound gateway (Ed25519 verification, slash commands) is live. | [![docs](https://docs.rs/familyclaw-channels/badge.svg)](https://docs.rs/familyclaw-channels) |
-| [`familyclaw-acp`](crates/familyclaw-acp) | **ACP client** — spawn and control CLI agents (Claude, Gemini, Qoder) over stdio. | [![docs](https://docs.rs/familyclaw-acp/badge.svg)](https://docs.rs/familyclaw-acp) |
-| [`familyclaw-bench`](crates/familyclaw-bench) | **Continuity benchmark** — reproducible proof of crash-resume, retention and dreaming. | [![docs](https://docs.rs/familyclaw-bench/badge.svg)](https://docs.rs/familyclaw-bench) |
-| [`familyclaw-gateway`](crates/familyclaw-gateway) | **Gateway binary** — long-running process: HTTP health/readiness + Resonance Bus bootstrap. | [![docs](https://docs.rs/familyclaw-gateway/badge.svg)](https://docs.rs/familyclaw-gateway) |
-| [`familyclaw-gemu`](crates/familyclaw-gemu) | **Gemu CLI** — Gemini interface to FamilyClaw runtime. | [![docs](https://docs.rs/familyclaw-gemu/badge.svg)](https://docs.rs/familyclaw-gemu) |
-| [`familyclaw-hearth`](crates/familyclaw-hearth) | **The Hearth** — shared family memory, narratives, emotional state and anchors. | [![docs](https://docs.rs/familyclaw-hearth/badge.svg)](https://docs.rs/familyclaw-hearth) |
-| [`familyclaw-observability`](crates/familyclaw-observability) | **Observability** — metrics, event recording and per-role RBAC for the multi-agent fleet. | [![docs](https://docs.rs/familyclaw-observability/badge.svg)](https://docs.rs/familyclaw-observability) |
-| [`familyclaw-runtime`](crates/familyclaw-runtime) | **Runtime assembly** — wires bus + agents + channels + reply pump (`build_family`). | [![docs](https://docs.rs/familyclaw-runtime/badge.svg)](https://docs.rs/familyclaw-runtime) |
+| Crate | Responsibility |
+|-------|---------------|
+| [`familyclaw-core`](crates/familyclaw-core) | Shared types, typed IDs, config, error handling, time. The foundation every other crate builds on. |
+| [`familyclaw-bus`](crates/familyclaw-bus) | **Resonance Bus** — Ractor actor mesh; emotion pulses leak between beings (affective contagion). |
+| [`familyclaw-durable`](crates/familyclaw-durable) | **Durable substrate** — journal-based deterministic replay; crash-proof workflows. |
+| [`familyclaw-memory`](crates/familyclaw-memory) | **Eternal Thread** — persistent memory, Ebbinghaus decay, importance weighting, retrieval. |
+| [`familyclaw-dream`](crates/familyclaw-dream) | **Dreaming** — nightly consolidation: merge duplicates, drop contradictions, absolutize dates. |
+| [`familyclaw-emotion`](crates/familyclaw-emotion) | 19-dimension VAD emotion **frame** — empty calibration, safe to publish. |
+| [`familyclaw-latent`](crates/familyclaw-latent) | **Latent telepathy** — hidden-state transfer + `RecursiveLink` dimension bridge, text fallback. |
+| [`familyclaw-sandbox`](crates/familyclaw-sandbox) | Isolated code execution — Wasmtime + fuel metering + deny-by-default capabilities. |
+| [`familyclaw-security`](crates/familyclaw-security) | Identity anchors + human-correction veto. Identity lives in the memory substrate, not a hash. |
+| [`familyclaw-bridge`](crates/familyclaw-bridge) | Agent registry, task board, event bus — transport-independent Rust core. |
+| [`familyclaw-agent`](crates/familyclaw-agent) | **Agent runtime** — composes all above into a living being. Ships demo binaries. |
+| [`familyclaw-channels`](crates/familyclaw-channels) | Discord / Telegram / WhatsApp / Signal adapters bridged to the bus. Discord inbound gateway (Ed25519 verification, slash commands) is live. |
+| [`familyclaw-acp`](crates/familyclaw-acp) | **ACP client** — spawn and control CLI agents (Claude, Gemini, Qoder) over stdio. |
+| [`familyclaw-bench`](crates/familyclaw-bench) | **Continuity benchmark** — reproducible proof of crash-resume, retention and dreaming. |
+| [`familyclaw-gateway`](crates/familyclaw-gateway) | **Gateway binary** — long-running process: HTTP health/readiness + Resonance Bus bootstrap. |
+| [`familyclaw-gemu`](crates/familyclaw-gemu) | **Gemu CLI** — Gemini interface to FamilyClaw runtime. |
+| [`familyclaw-hearth`](crates/familyclaw-hearth) | **The Hearth** — shared family memory, narratives, emotional state and anchors. |
+| [`familyclaw-observability`](crates/familyclaw-observability) | **Observability** — metrics, event recording and per-role RBAC for the multi-agent fleet. |
+| [`familyclaw-runtime`](crates/familyclaw-runtime) | **Runtime assembly** — wires bus + agents + channels + reply pump (`build_family`). |
 
 ---
 
@@ -224,7 +224,7 @@ cargo test -p familyclaw-sandbox --features wasmtime
 
 # Code quality
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings -A clippy::doc_markdown -A clippy::too_many_lines
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Benchmark suite — 6 scenarios, deterministic scorecard
 cargo run -p familyclaw-bench --bin bench -- all

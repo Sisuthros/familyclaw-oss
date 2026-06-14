@@ -3,7 +3,29 @@
 
 [advisories]
 version = 2
-ignore = []
+# Perustellut poikkeukset (kukin: ei korjaavaa upstream-versiota TAI ei
+# FamilyClawn laukaisemaa koodipolkua). Bumpattavat advisoryt EI kuulu tänne —
+# ne korjattiin (esim. wasmtime 35→45 poisti 16 advisorya 2026-06-14).
+ignore = [
+    # rsa Marvin Attack — RSA-PKCS1v15-purun ajoituskanava. Ei korjaavaa
+    # upstream-versiota (transitiivinen jsonwebtoken-ketjusta). FamilyClaw ei
+    # tee RSA-PKCS1v15-purkua; JWT-polku käyttää ed25519/ES256.
+    "RUSTSEC-2023-0071",
+    # rustls-webpki — CRL/name-constraint-validoinnin viat PALVELIN-
+    # sertifikaateille. Tulevat vain `discord`-featuren transitiivisesta
+    # ketjusta serenity 0.12.5 → tokio-tungstenite 0.21 → rustls 0.22; ei
+    # korjaavaa serenity-versiota saatavilla. FamilyClaw on Discord-CLIENT,
+    # ei validoi näillä poluilla. Poistuu kun serenity päivittää rustlsin.
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    # atomic-polyfill — unmaintained (ei haavoittuvuus). Transitiivinen.
+    "RUSTSEC-2023-0089",
+    # number_prefix — unmaintained (ei haavoittuvuus). Transitiivinen
+    # (indicatif-ketju). Pieni, vakaa muotoilukirjasto.
+    "RUSTSEC-2025-0119",
+]
 
 [bans]
 multiple-versions = "warn"
