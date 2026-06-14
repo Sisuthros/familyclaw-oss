@@ -6,7 +6,7 @@
 //! tallennetaan [`crate::MemoryStore`]-toteutukseen.
 
 use familyclaw_core::{time, MessageId, Timestamp};
-use familyclaw_emotion::{Dimension, Vad};
+use familyclaw_emotion::{emotional_salience, Dimension, EmotionState, Vad};
 use serde::{Deserialize, Serialize};
 
 use crate::decay::DecayPolicy;
@@ -491,6 +491,23 @@ impl MemoryBuilder {
         self
     }
 
+    /// Johtaa tärkeyden `emotion`-osatekijän annetusta tunnetilasta
+    /// ([`emotional_salience`]) ja päivittää sen rakentajan osatekijöihin.
+    ///
+    /// Tämä on ohut PKG-B-mukavuusmetodi: se ei kosketa muita osatekijöitä
+    /// (`identity`, `novelty`, `reinforcement`), joten sen voi ketjuttaa
+    /// [`factors`](MemoryBuilder::factors)-kutsun jälkeen pelkän tunnelatauksen
+    /// asettamiseksi tilasta. Voimakkaasti latautunut hetki → korkeampi
+    /// emotion-osatekijä → vahvempi, hitaammin unohtuva muisto.
+    ///
+    /// Salience puristetaan välille `0.0..=1.0` ([`ImportanceFactors`] pysyy
+    /// litteänä — koko [`EmotionState`]:ä ei upoteta).
+    #[must_use]
+    pub fn emotion_state(mut self, state: &EmotionState) -> Self {
+        self.factors.emotion = emotional_salience(state).clamp(0.0, 1.0);
+        self
+    }
+
     /// Asettaa vaimennuspolitiikan.
     #[must_use]
     pub fn decay_policy(mut self, policy: DecayPolicy) -> Self {
@@ -770,5 +787,53 @@ mod tests {
     fn status_serializes_snake_case() {
         let json = serde_json::to_string(&MemoryStatus::Tombstoned).expect("serialize");
         assert_eq!(json, "\"tombstoned\"");
+    }
+
+    // ── PKG-B: MemoryBuilder::emotion_state ────────────────────────────────
+
+    #[test]
+    fn builder_emotion_state_sets_emotion_factor() {
+        let mut state = EmotionState::neutral();
+        state.set(Dimension::Joy, 95.0);
+        let salience = emotional_salience(&state);
+
+        let m = Memory::builder("charged moment")
+            .emotion_state(&state)
+            .build();
+        assert!((m.factors.emotion - salience).abs() < 1e-6);
+        // Tärkeys johdetaan osatekijöistä build()-vaiheessa.
+        assert!((m.importance - m.factors.composite()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn builder_emotion_state_charged_beats_neutral() {
+        let neutral = EmotionState::neutral();
+        let mut charged = EmotionState::neutral();
+        charged.set(Dimension::Fear, 95.0);
+
+        let m_neutral = Memory::builder("calm").emotion_state(&neutral).build();
+        let m_charged = Memory::builder("intense").emotion_state(&charged).build();
+
+        assert!(m_charged.factors.emotion > m_neutral.factors.emotion);
+        assert!(
+            m_charged.importance > m_neutral.importance,
+            "latautuneen muiston tärkeyden pitäisi ylittää neutraali"
+        );
+    }
+
+    #[test]
+    fn builder_emotion_state_preserves_other_factors() {
+        // emotion_state EI saa pyyhkiä muita osatekijöitä — vain emotion.
+        let mut state = EmotionState::neutral();
+        state.set(Dimension::Joy, 90.0);
+
+        let m = Memory::builder("mixed")
+            .factors(ImportanceFactors::new(0.0, 0.8, 0.6, 0.4))
+            .emotion_state(&state)
+            .build();
+        assert_eq!(m.factors.identity, 0.8);
+        assert_eq!(m.factors.novelty, 0.6);
+        assert_eq!(m.factors.reinforcement, 0.4);
+        assert!(m.factors.emotion > 0.0, "emotion-osatekijä päivittyi tilasta");
     }
 }
