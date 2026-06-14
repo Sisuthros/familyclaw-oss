@@ -102,6 +102,38 @@
         "timeline_order": 1.0
       },
       "notes": []
+    },
+    {
+      "id": "s7_provenance_gate",
+      "passed": true,
+      "metrics": {
+        "admit_correct": 1.0,
+        "false_admit_rate": 0.0,
+        "poison_blocked": 1.0,
+        "trusted_admitted": 1.0
+      },
+      "notes": [
+        "admitted 3/3 trusted provenances (direct, derived, high-trust external)",
+        "blocked 1/1 poison provenances (low-trust external, min_trust=0.6)",
+        "false_admit_rate=0 (poison that leaked past the gate)",
+        "subject recall liveness: hits=1"
+      ]
+    },
+    {
+      "id": "s8_weekly_review",
+      "passed": true,
+      "metrics": {
+        "conflicts_correct": 1.0,
+        "counts_correct": 1.0,
+        "retrievable_ratio": 0.8571428571428571,
+        "top_order_correct": 1.0
+      },
+      "notes": [
+        "counts: total=7 active=5 archived=1 tombstoned=1 consolidated=6 (expected total=7)",
+        "top_memories: 5 listed, order_correct=true (buried memory excluded)",
+        "conflicted=2 (expected 2), conflicts_listed=2",
+        "subject sleep_cycle liveness: scanned=5 protected_core_intact=true"
+      ]
     }
   ],
   "clock": "2026-06-04T12:00:00Z"

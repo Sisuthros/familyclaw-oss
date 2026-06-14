@@ -95,3 +95,31 @@
 | timeline_order | 1.0000 |
 
 
+## s7_provenance_gate — PASS
+
+| Metric | Value |
+|--------|-------|
+| admit_correct | 1.0000 |
+| false_admit_rate | 0.0000 |
+| poison_blocked | 1.0000 |
+| trusted_admitted | 1.0000 |
+
+- admitted 3/3 trusted provenances (direct, derived, high-trust external)
+- blocked 1/1 poison provenances (low-trust external, min_trust=0.6)
+- false_admit_rate=0 (poison that leaked past the gate)
+- subject recall liveness: hits=1
+
+## s8_weekly_review — PASS
+
+| Metric | Value |
+|--------|-------|
+| conflicts_correct | 1.0000 |
+| counts_correct | 1.0000 |
+| retrievable_ratio | 0.8571 |
+| top_order_correct | 1.0000 |
+
+- counts: total=7 active=5 archived=1 tombstoned=1 consolidated=6 (expected total=7)
+- top_memories: 5 listed, order_correct=true (buried memory excluded)
+- conflicted=2 (expected 2), conflicts_listed=2
+- subject sleep_cycle liveness: scanned=5 protected_core_intact=true
+

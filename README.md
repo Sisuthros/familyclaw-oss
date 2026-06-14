@@ -8,10 +8,14 @@ and private runtime profiles that never enter the repository.
 
 > **What this demo proves today:** crash-proof durable replay, 19-dimension emotion contagion,
 > nightly dream consolidation, persistent memory with Ebbinghaus decay, Discord inbound gateway
-> (Ed25519 verification), benchmarked continuity (6 scenarios, deterministic scorecard).
+> (Ed25519 verification), benchmarked continuity (8 scenarios, deterministic scorecard).
 >
-> **What's on the roadmap:** latent telepathy (hidden-state transfer), WASM sandbox safety,
-> contract-verified orchestration, additional channel adapters.
+> **Shipped (alpha.5/.6):** live multi-agent orchestration (`familyclaw-gateway
+> orchestrate` — Orchestrator + LiveTurnExecutor), provenance-gated memory,
+> emotion-contagion receive-side, send-side latent translation.
+> **What's on the roadmap:** receive-side latent telepathy (hidden-state transfer
+> into agent cognition — a family-boundary decision), deeper WASM sandbox safety,
+> additional channel adapters.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Rust 2021](https://img.shields.io/badge/Rust-2021%20edition-orange.svg)
@@ -226,7 +230,7 @@ cargo test -p familyclaw-sandbox --features wasmtime
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 
-# Benchmark suite — 6 scenarios, deterministic scorecard
+# Benchmark suite — 8 scenarios, deterministic scorecard
 cargo run -p familyclaw-bench --bin bench -- all
 # → outputs crates/familyclaw-bench/out/SCORECARD.md + scorecard.json
 
