@@ -5,6 +5,29 @@ All notable changes to FamilyClaw will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha.7] - 2026-06-14
+
+### Fixed
+- **CI all-features-job** — ei enää aktivoi kuollutta `surreal`-featurea (kytkemätön,
+  API-vanhentunut SurrealHearthStore kaatoi `--all-features`-buildin). Korvattu
+  eksplisiittisellä elävien featureiden joukolla.
+- **CI cargo-audit-job** — lisätty `--ignore`-liput (cargo-audit ei lue deny.tomlia)
+- **familyclaw-durable** — `FileJournal` mutex-poison-recovery (`read_all_entries` +
+  `append`): poistettu tuotantopolun `unwrap()` joka rikkoi craten omaa "ei panikia
+  tuotannossa" -lupausta
+
+### Added
+- **familyclaw-channels** — `verify_signature` SUCCESS-path-testi (Ed25519, vain
+  failure-haara oli aiemmin katettu) + `from_webhook`/interaction-reunaehtotestit (+22)
+
+### Changed
+- **familyclaw-acp** — poistettu turha `#[allow(dead_code)]` (kenttä on käytössä)
+
+### Verified
+- `cargo test --workspace` — 1209 PASS, 0 fail
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean
+- `cargo audit` (perustellut ignoret) — 0 vulnerabilities; Layer-B — PASS
+
 ## [0.1.0-alpha.6] - 2026-06-14
 
 ### Added
@@ -23,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **familyclaw-gemu** — kuolleen temp-prompt-polun poisto + käyttämättömien
   riippuvuuksien karsinta
+
+### Verified
+- `cargo test --workspace` — 1186 PASS, 0 fail
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean
+- `cargo run -p familyclaw-bench --bin bench -- all` — 8/8 skenaariota PASS
+- Layer-B — PASS
 
 ## [0.1.0-alpha.5] - 2026-06-14
 

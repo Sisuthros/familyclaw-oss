@@ -73,7 +73,7 @@ cargo run -p familyclaw-agent --bin crash_replay
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/... cargo run -p familyclaw-agent --features familyclaw-channels/discord
 ```
 
-**Status:** Webhook send + **inbound gateway live** — Ed25519 signature verification, slash command parsing, route at `:389/discord/interactions` (`gateway/src/main.rs:269-379`, `channels/src/discord_interactions.rs` 199 lines).
+**Status:** Webhook send + **inbound gateway live** — Ed25519 signature verification, slash command parsing, route at `/discord/interactions` (default listen `127.0.0.1:8787`; see `handle_discord_interaction` in `gateway/src/main.rs`, `channels/src/discord_interactions.rs`). Success-path signature verification is regression-tested (alpha.7).
 
 ---
 
@@ -129,7 +129,7 @@ existing store is backward-compatible. Proven by bench scenario `provenance_gate
 Run locally to verify everything works:
 
 ```bash
-# Full test suite (1186 tests)
+# Full test suite (1209 tests)
 cargo test --workspace
 
 # Feature matrix (matches CI)

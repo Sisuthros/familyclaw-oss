@@ -88,7 +88,7 @@ nervous system flows over the bus; latent is the bus's highest form of speech.**
      nightly consolidation reads the durable log → heals memory
 ```
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full technical overview and [`docs/plans/2026-06-03-familyclaw-v2-design.md`](docs/plans/2026-06-03-familyclaw-v2-design.md) for the design rationale.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full technical overview.
 
 ---
 
