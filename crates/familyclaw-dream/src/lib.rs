@@ -69,7 +69,9 @@ pub mod similarity;
 pub mod weekly;
 
 pub use config::DreamConfig;
-pub use conflict::{clear_conflict, is_conflicted, tag_conflict, ConflictTag, CONFLICT_TAG};
+pub use conflict::{
+    clear_conflict, detect_conflicts, is_conflicted, tag_conflict, ConflictTag, CONFLICT_TAG,
+};
 pub use contradiction::{contradicted_ids, mark_contradicted, CONTRADICT_STEP};
 pub use cycle::DreamCycle;
 pub use dates::{absolutize, AbsolutizeResult};
