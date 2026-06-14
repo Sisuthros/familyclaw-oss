@@ -82,7 +82,15 @@ impl FileJournal {
     /// Lukee ja jäsentää kaikki rivit, sietäen vajaan viimeisen rivin
     /// (kaatumisen jälki). Palautuvat rivit ovat tiedostojärjestyksessä.
     fn read_all_entries(&self) -> Result<Vec<JournalEntry>> {
-        let _file = self.file.lock().unwrap();
+        // Poison-recovery sen sijaan että `unwrap()` paniikkaisi: jos jokin toinen
+        // säie paniikkasi pitäessään lukkoa, file-kahva on silti validi (mitään ei
+        // jätetä puolitiehen `read_all_entries`-polulla). `into_inner()` ottaa
+        // kahvan haltuun ilman paniikkia → ei rikota error.rs:5 invarianttia
+        // ("ei unwrap/expect/panic tuotantopolulla").
+        let _file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Create a new file handle for reading since we can't hold the lock
         let file = File::open(&self.path)?;
         let reader = BufReader::new(file);
@@ -234,7 +242,14 @@ impl Journal for FileJournal {
         // Sarjallista ensin: jos serde epäonnistuu, levyä ei kosketa.
         let mut line = serde_json::to_string(&entry)?;
         line.push('\n');
-        let mut file = self.file.lock().unwrap();
+        // Poison-recovery: jos lukon haltija paniikkasi, file-kahva on yhä validi
+        // (append on atominen write_all + flush + fsync, ei osittaista tilaa joka
+        // vaatisi mutex-poisonin kunnioittamista). `into_inner()` palauttaa kahvan
+        // paniikkaamatta → noudattaa error.rs:5 invarianttia.
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         file.write_all(line.as_bytes())?;
         file.flush()?;
         // fsync: takaa että rivi on fyysisesti levyllä ennen paluuta — tämä on
@@ -505,5 +520,39 @@ mod tests {
         let tmp = TempPath::new("path");
         let j = FileJournal::open(tmp.path()).expect("open");
         assert_eq!(j.path(), tmp.path());
+    }
+
+    /// REGRESSIO (error.rs:5 invariantti "ei unwrap/expect/panic tuotantopolulla"):
+    /// kun toinen säie paniikkaa pitäessään file-mutexia, lukko myrkyttyy.
+    /// `append` ja `read_all_entries`/`replay_all` käyttävät nyt
+    /// `unwrap_or_else(|e| e.into_inner())` → ne TOIPUVAT myrkystä eivätkä
+    /// paniikkaa. File-kahva pysyy validina, joten round-trip onnistuu.
+    #[test]
+    fn append_and_replay_recover_from_poisoned_mutex() {
+        use std::sync::Arc;
+
+        let tmp = TempPath::new("poison-recovery");
+        let j = Arc::new(FileJournal::open(tmp.path()).expect("open"));
+        // Yksi ehjä askel ennen myrkytystä.
+        j.append(JournalEntry::completed(StepId::ZERO, "a", json!(1)))
+            .expect("append a");
+
+        // Myrkytä mutex: paniikkaa toisessa säikeessä lukon ollessa hallussa.
+        let poisoner = Arc::clone(&j);
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner.file.lock().expect("acquire lock to poison");
+            panic!("intentional panic to poison the file mutex");
+        });
+        assert!(handle.join().is_err(), "poisoning thread must have panicked");
+
+        // append TOIPUU myrkystä — ei paniikkaa, palauttaa Ok.
+        j.append(JournalEntry::completed(StepId::new(1), "b", json!(2)))
+            .expect("append must recover from poisoned mutex");
+
+        // replay_all (→ read_all_entries) TOIPUU myös ja näkee molemmat askeleet.
+        let all = j.replay_all().expect("replay must recover from poisoned mutex");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].step_name(), Some("a"));
+        assert_eq!(all[1].step_name(), Some("b"));
     }
 }
