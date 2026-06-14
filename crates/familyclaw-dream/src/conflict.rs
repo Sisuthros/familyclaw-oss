@@ -25,6 +25,7 @@
 //! - [`clear_conflict`] — poista ristiriitatägi yhdestä muistosta (ratkaisun
 //!   jälkeen).
 
+use crate::similarity::is_near_duplicate;
 use familyclaw_core::{MessageId, Result, Timestamp};
 use familyclaw_memory::{Memory, MemoryStore};
 use serde::{Deserialize, Serialize};
@@ -156,6 +157,51 @@ where
     }
     store.update(memory).await?;
     Ok(true)
+}
+
+/// Etsii lähes-identtiset muistoparit ja palauttaa kustakin [`ConflictTag`]:n
+/// **mutatoimatta mitään** — puhdas, sivuvaikutukseton havaintofunktio.
+///
+/// Tämä on [`tag_conflict`]:n lukuversio: missä `tag_conflict` *kirjoittaa*
+/// tägin tallennukseen, tämä vain *raportoi* mitkä parit kannattaa tutkia.
+/// Käy läpi muistot sisäkkäisellä `i < j`-silmukalla (kukin pari kerran),
+/// ohittaa ei-haettavat muistot ([`Memory::is_retrievable`]) ja vertaa parin
+/// `content`-kentät [`is_near_duplicate`]-funktiolla annetulla kynnyksellä.
+/// Osumasta syntyy [`ConflictTag::new`] kahdesta id:stä ja `detected`-hetkestä.
+///
+/// **Tulos on KANDIDAATTI-lista tutkittavia lähes-duplikaattipareja, EI
+/// todistettuja ristiriitoja.** Samankaltaisuus on leksikaalinen Jaccard
+/// (sananjoukko-päällekkäisyys, [`similarity`](crate::similarity)) — kaksi
+/// melkein samasanaista muistoa voi silti väittää eri asiaa, ja kaksi eri
+/// sanoin kirjoitettua muistoa voi väittää saman. Käytä tulosta
+/// konsolidaation tai myöhemmän todistepohjaisen ratkaisun *syötteenä*, älä
+/// käskynä haudata.
+///
+/// Järjestys on deterministinen: parit tuotetaan syötteen järjestyksessä
+/// (`i` kasvaa ulompana, `j` sisempänä), joten sama syöte tuottaa aina saman
+/// listan samassa järjestyksessä. `detected` annetaan parametrina (ei
+/// järjestelmäkellosta), kuten muuallakin tässä moduulissa.
+#[must_use]
+pub fn detect_conflicts(
+    memories: &[Memory],
+    threshold: f32,
+    detected: Timestamp,
+) -> Vec<ConflictTag> {
+    let mut tags = Vec::new();
+    for i in 0..memories.len() {
+        if !memories[i].is_retrievable() {
+            continue;
+        }
+        for other in memories.iter().skip(i + 1) {
+            if !other.is_retrievable() {
+                continue;
+            }
+            if is_near_duplicate(&memories[i].content, &other.content, threshold) {
+                tags.push(ConflictTag::new(memories[i].id, other.id, detected));
+            }
+        }
+    }
+    tags
 }
 
 #[cfg(test)]
@@ -293,5 +339,82 @@ mod tests {
         assert!(!clear_conflict(&store, MessageId::new())
             .await
             .expect("clear ghost"));
+    }
+
+    // ── detect_conflicts (puhdas, mutatoimaton havaintofunktio) ───────────
+
+    #[test]
+    fn detect_conflicts_empty_input_is_empty() {
+        assert!(detect_conflicts(&[], 0.5, at()).is_empty());
+    }
+
+    #[test]
+    fn detect_conflicts_no_near_dups_is_empty() {
+        // Täysin erilliset sananjoukot → ei pareja.
+        let mems = [mem("alpha beta gamma"), mem("delta epsilon zeta")];
+        assert!(detect_conflicts(&mems, 0.5, at()).is_empty());
+    }
+
+    #[test]
+    fn detect_conflicts_two_near_dups_gives_one_pair() {
+        let m1 = mem("agent_a shipped the release today");
+        let m2 = mem("agent_a shipped the release today");
+        let (id1, id2) = (m1.id, m2.id);
+        let mems = [m1, m2];
+
+        let tags = detect_conflicts(&mems, 0.8, at());
+        assert_eq!(tags.len(), 1);
+        // Merkintä koskee molempia, vakautetussa järjestyksessä, oikealla hetkellä.
+        assert!(tags[0].involves(id1));
+        assert!(tags[0].involves(id2));
+        assert_eq!(tags[0], ConflictTag::new(id1, id2, at()));
+        assert_eq!(tags[0].detected, at());
+    }
+
+    #[test]
+    fn detect_conflicts_skips_non_retrievable() {
+        // Kaksi identtistä muistoa, mutta toinen haudattu → ei ole haettavissa,
+        // joten paria ei synny.
+        let m1 = mem("agent_a is in city a");
+        let mut m2 = mem("agent_a is in city a");
+        assert!(m2.tombstone(), "ei-suojattu muisto pitää voida haudata");
+        assert!(!m2.is_retrievable());
+        let mems = [m1, m2];
+
+        assert!(
+            detect_conflicts(&mems, 0.8, at()).is_empty(),
+            "haudattu osapuoli ohitetaan"
+        );
+    }
+
+    #[test]
+    fn detect_conflicts_threshold_gates_pairs() {
+        // Jaccard("the cat sat", "the cat ran") = 0.5.
+        let m1 = mem("the cat sat");
+        let m2 = mem("the cat ran");
+        let mems = [m1, m2];
+
+        // 0.5-kynnyksellä pari kelpaa, 0.6-kynnyksellä ei.
+        assert_eq!(detect_conflicts(&mems, 0.5, at()).len(), 1);
+        assert!(detect_conflicts(&mems, 0.6, at()).is_empty());
+    }
+
+    #[test]
+    fn detect_conflicts_is_deterministic_and_ordered() {
+        // Kolme lähes-identtistä → kolme paria (0,1), (0,2), (1,2)
+        // syötteen järjestyksessä; sama syöte → sama lista joka ajolla.
+        let m0 = mem("agent_a finished the migration");
+        let m1 = mem("agent_a finished the migration");
+        let m2 = mem("agent_a finished the migration");
+        let (id0, id1, id2) = (m0.id, m1.id, m2.id);
+        let mems = [m0, m1, m2];
+
+        let first = detect_conflicts(&mems, 0.9, at());
+        let second = detect_conflicts(&mems, 0.9, at());
+        assert_eq!(first, second, "deterministinen: sama syöte → sama lista");
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0], ConflictTag::new(id0, id1, at()));
+        assert_eq!(first[1], ConflictTag::new(id0, id2, at()));
+        assert_eq!(first[2], ConflictTag::new(id1, id2, at()));
     }
 }
