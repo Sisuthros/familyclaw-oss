@@ -28,7 +28,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 use familyclaw_bench::scenarios::{
-    CrashMatrix, DreamQuality, EmotionalContagion, EternalThread, RetentionCurve, SemanticRetrieval,
+    CrashMatrix, DreamQuality, EmotionalContagion, EternalThread, ProvenanceGateScenario,
+    RetentionCurve, SemanticRetrieval, WeeklyReviewScenario,
 };
 use familyclaw_bench::{
     BenchError, ComparativeScorecard, FamilyClawSubject, Harness, MarkdownFileSubject, Result,
@@ -179,17 +180,21 @@ fn select_scenarios(id: &str) -> Result<Vec<Box<dyn Scenario>>> {
     let s4 = || -> Box<dyn Scenario> { Box::new(EmotionalContagion::new()) };
     let s5 = || -> Box<dyn Scenario> { Box::new(SemanticRetrieval::new()) };
     let s6 = || -> Box<dyn Scenario> { Box::new(EternalThread::new()) };
+    let s7 = || -> Box<dyn Scenario> { Box::new(ProvenanceGateScenario::new()) };
+    let s8 = || -> Box<dyn Scenario> { Box::new(WeeklyReviewScenario::new()) };
 
     match id {
-        "all" => Ok(vec![s1(), s2(), s3(), s4(), s5(), s6()]),
+        "all" => Ok(vec![s1(), s2(), s3(), s4(), s5(), s6(), s7(), s8()]),
         "s1" | "s1_crash_matrix" => Ok(vec![s1()]),
         "s2" | "s2_retention_curve" => Ok(vec![s2()]),
         "s3" | "s3_dream_quality" => Ok(vec![s3()]),
         "s4" | "s4_emotional_contagion" => Ok(vec![s4()]),
         "s5" | "s5_semantic_retrieval" => Ok(vec![s5()]),
         "s6" | "s6_eternal_thread" => Ok(vec![s6()]),
+        "s7" | "s7_provenance_gate" => Ok(vec![s7()]),
+        "s8" | "s8_weekly_review" => Ok(vec![s8()]),
         other => Err(BenchError::scenario(format!(
-            "unknown scenario '{other}' (expected: all, s1, s2, s3, s4, s5, s6)"
+            "unknown scenario '{other}' (expected: all, s1, s2, s3, s4, s5, s6, s7, s8)"
         ))),
     }
 }
