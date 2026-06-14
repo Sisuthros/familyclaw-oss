@@ -63,9 +63,30 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## Esimerkki: tunne → tärkeys -silta (PKG-B)
+//! Voimakkaasti latautunut hetki johtaa korkeampaan tärkeyteen kuin
+//! neutraali. `EmotionState` ja `emotional_salience` ovat re-exportattuina,
+//! joten silta toimii ilman erillistä `familyclaw-emotion`-riippuvuutta.
+//! ```
+//! use familyclaw_memory::{emotional_salience, EmotionState, Memory};
+//! use familyclaw_emotion::Dimension;
+//!
+//! let mut charged = EmotionState::neutral();
+//! charged.set(Dimension::Joy, 95.0);
+//! let neutral = EmotionState::neutral();
+//!
+//! // Salience-johdettu emotion-osatekijä erottaa latautuneen neutraalista.
+//! assert!(emotional_salience(&charged) > emotional_salience(&neutral));
+//!
+//! let strong = Memory::builder("a charged moment").emotion_state(&charged).build();
+//! let calm = Memory::builder("an ordinary moment").emotion_state(&neutral).build();
+//! assert!(strong.importance > calm.importance);
+//! ```
 #![doc = include_str!("../README.md")]
 
 pub mod decay;
+pub mod gated_store;
 pub mod importance;
 pub mod memory;
 pub mod oracle;
@@ -74,6 +95,7 @@ pub mod retrieval;
 pub mod store;
 
 pub use decay::DecayPolicy;
+pub use gated_store::GatedMemoryStore;
 pub use importance::{
     ImportanceFactors, WEIGHT_EMOTION, WEIGHT_IDENTITY, WEIGHT_NOVELTY, WEIGHT_REINFORCEMENT,
 };
@@ -90,7 +112,12 @@ pub use store::{DecayReport, DecayThresholds, LocalJsonStore, MemoryStore};
 
 // Re-export tunnetyypit jotta käyttäjän ei tarvitse riippua
 // familyclaw-emotionista suoraan muistia käyttäessään.
-pub use familyclaw_emotion::{Dimension, Vad};
+//
+// PKG-B: [`EmotionState`] + [`emotional_salience`] re-exportataan
+// [`Dimension`]/[`Vad`]:n rinnalle, jotta tunne → tärkeys -silta
+// ([`ImportanceFactors::from_emotion_state`], [`MemoryBuilder::emotion_state`])
+// on käytettävissä ilman erillistä riippuvuutta familyclaw-emotioniin.
+pub use familyclaw_emotion::{emotional_salience, Dimension, EmotionState, Vad};
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).
 #[must_use]

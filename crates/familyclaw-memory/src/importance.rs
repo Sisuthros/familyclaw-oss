@@ -22,6 +22,7 @@
 //! identiteetille tärkeitä) ei kovakoodata tähän — osatekijät annetaan
 //! sisään valmiiksi laskettuina.
 
+use familyclaw_emotion::{emotional_salience, EmotionState};
 use serde::{Deserialize, Serialize};
 
 /// Tunnelatauksen paino tärkeydessä.
@@ -73,6 +74,31 @@ impl ImportanceFactors {
             novelty: unit(novelty),
             reinforcement: unit(reinforcement),
         }
+    }
+
+    /// Rakentaa osatekijät tunnetilasta: `emotion`-osatekijä johdetaan
+    /// [`emotional_salience`]-funktiolla annetusta [`EmotionState`]:stä, muut
+    /// kolme osatekijää annetaan sisään valmiiksi laskettuina.
+    ///
+    /// Tämä on PKG-B-silta tunnemoottorin ja muistin tärkeyden välillä:
+    /// voimakkaasti latautunut hetki (korkea salience) johtaa korkeampaan
+    /// emotion-osatekijään ja siten vahvempaan, hitaammin unohtuvaan muistoon
+    /// (Dynamic Affective Memory, arXiv 2510.27418).
+    ///
+    /// [`ImportanceFactors`] pysyy tahallaan "litteänä" (`Copy + serde`): tila
+    /// projisoidaan yhdeksi `f32`:ksi eikä koko [`EmotionState`]:ä upoteta
+    /// osatekijöihin. Kaikki neljä arvoa puristetaan välille `0.0..=1.0`
+    /// ([`new`]-semantiikalla; NaN → 0.0).
+    ///
+    /// [`new`]: ImportanceFactors::new
+    #[must_use]
+    pub fn from_emotion_state(
+        state: &EmotionState,
+        identity: f32,
+        novelty: f32,
+        reinforcement: f32,
+    ) -> Self {
+        Self::new(emotional_salience(state), identity, novelty, reinforcement)
     }
 
     /// Laskee painotetun yhdistelmätärkeyden, puristettuna `0.0..=1.0`.
@@ -250,6 +276,75 @@ mod tests {
     #[test]
     fn serde_roundtrip() {
         let f = ImportanceFactors::new(0.3, 0.7, 0.1, 0.9);
+        let json = serde_json::to_string(&f).expect("serialize");
+        let back: ImportanceFactors = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(f, back);
+    }
+
+    // ── PKG-B: tunne → tärkeys -silta ──────────────────────────────────────
+
+    #[test]
+    fn from_emotion_state_derives_emotion_factor_from_salience() {
+        use familyclaw_emotion::{Dimension, EmotionState};
+
+        let mut state = EmotionState::neutral();
+        state.set(Dimension::Joy, 95.0);
+        let salience = emotional_salience(&state);
+
+        let f = ImportanceFactors::from_emotion_state(&state, 0.2, 0.3, 0.4);
+        // emotion-osatekijä = salience (puristettuna).
+        assert!((f.emotion - salience).abs() < 1e-6);
+        // Muut kentät tulevat suoraan parametreista.
+        assert_eq!(f.identity, 0.2);
+        assert_eq!(f.novelty, 0.3);
+        assert_eq!(f.reinforcement, 0.4);
+    }
+
+    #[test]
+    fn salience_derived_importance_differs_from_neutral() {
+        use familyclaw_emotion::{Dimension, EmotionState};
+
+        // Voimakkaasti latautunut hetki vs. neutraali — samat muut osatekijät.
+        let neutral = EmotionState::neutral();
+        let mut charged = EmotionState::neutral();
+        charged.set(Dimension::Joy, 95.0);
+
+        let f_neutral = ImportanceFactors::from_emotion_state(&neutral, 0.0, 0.0, 0.0);
+        let f_charged = ImportanceFactors::from_emotion_state(&charged, 0.0, 0.0, 0.0);
+
+        // Latautunut hetki saa korkeamman emotion-osatekijän → korkeamman
+        // yhdistelmätärkeyden kuin neutraali.
+        assert!(f_charged.emotion > f_neutral.emotion);
+        assert!(
+            f_charged.composite() > f_neutral.composite(),
+            "salienssista johdetun tärkeyden pitäisi ylittää neutraali"
+        );
+    }
+
+    #[test]
+    fn from_emotion_state_sanitizes_other_factors() {
+        use familyclaw_emotion::EmotionState;
+
+        // Kelvottomat muut osatekijät puristetaan (new-semantiikka).
+        let state = EmotionState::neutral();
+        let f = ImportanceFactors::from_emotion_state(&state, 5.0, -3.0, f32::NAN);
+        assert_eq!(f.identity, 1.0);
+        assert_eq!(f.novelty, 0.0);
+        assert_eq!(f.reinforcement, 0.0);
+        assert!((0.0..=1.0).contains(&f.emotion));
+    }
+
+    #[test]
+    fn from_emotion_state_is_copy_and_serde() {
+        use familyclaw_emotion::{Dimension, EmotionState};
+
+        let mut state = EmotionState::neutral();
+        state.set(Dimension::Fear, 90.0);
+        let f = ImportanceFactors::from_emotion_state(&state, 0.5, 0.5, 0.5);
+        // Copy: kopio ei kuluta alkuperäistä.
+        let copy = f;
+        assert_eq!(f, copy);
+        // Serde-roundtrip säilyy (litteä tyyppi, ei upotettua EmotionStatea).
         let json = serde_json::to_string(&f).expect("serialize");
         let back: ImportanceFactors = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(f, back);
