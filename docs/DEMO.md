@@ -129,7 +129,7 @@ existing store is backward-compatible. Proven by bench scenario `provenance_gate
 Run locally to verify everything works:
 
 ```bash
-# Full test suite (1209 tests)
+# Full test suite (default features)
 cargo test --workspace
 
 # Feature matrix (matches CI exactly — living features only)

@@ -86,8 +86,13 @@ echo "8️⃣  Checking for real Layer B names in publishable content..."
 # Internal-only files must be untracked (.gitignore) — not whitelisted here.
 # An explicit deny-list excludes legitimately-public files that mention agent names
 # only as escaped/example tokens (e.g. *.example).
+# Extension-based formats PLUS extensionless tracked text files that a future
+# OSS release must also be clean of (.gitignore/.dockerignore/Dockerfile can carry
+# private-name comments). Extension-only scanning silently missed these.
 SCAN_FILES=$(git ls-files -- \
-    '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' '*.json' '*.py' '*.sh' '*.ps1' 2>/dev/null \
+    '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' '*.json' '*.py' '*.sh' '*.ps1' \
+    '.gitignore' '**/.gitignore' '.dockerignore' '**/.dockerignore' \
+    'Dockerfile' '**/Dockerfile' 'Containerfile' '**/Containerfile' 2>/dev/null \
     | grep -vE '(^|/)(target)/' \
     | grep -vE '\.example($|\.)' \
     | grep -vE '\.example\.(md|rs|toml|yml|yaml|json|py|sh|ps1)$' \
@@ -118,14 +123,18 @@ fi
 # 9. Check example agent names specifically (must be agent_a, agent_b, example_family)
 echo "9️⃣  Checking example agent names..."
 EXAMPLE_REAL_NAMES="agent_alpha agent_beta agent_delta agent_gamma agent_epsilon the operator"
+EXAMPLE_NAME_FOUND=0
 for name in $EXAMPLE_REAL_NAMES; do
     if grep -r "$name" --include="*.rs" examples/ 2>/dev/null | grep -q .; then
         echo "   ❌ FAIL: Real agent name '$name' found in examples/"
         grep -r "$name" --include="*.rs" examples/
+        EXAMPLE_NAME_FOUND=1
         FAIL=1
     fi
 done
-if [ $FAIL -eq 0 ] || [ $NAME_FOUND -eq 0 ]; then
+# Use this check's OWN counter — NOT NAME_FOUND (which belongs to check #8) — so a
+# real example leak cannot be masked by a clean #8 result.
+if [ $EXAMPLE_NAME_FOUND -eq 0 ]; then
     echo "   ✅ PASS: No real agent names in examples"
 fi
 

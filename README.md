@@ -236,7 +236,7 @@ cargo test --workspace \
 
 # Code quality
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features discord -- -D warnings
 
 # Benchmark suite — 8 scenarios, deterministic scorecard
 cargo run -p familyclaw-bench --bin bench -- all
