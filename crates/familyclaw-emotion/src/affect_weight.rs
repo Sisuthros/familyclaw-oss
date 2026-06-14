@@ -8,14 +8,12 @@
 //! viritys yhdistettynä selvään valenssin etumerkkiin — ovat
 //! tärkeämpiä säilyttää kuin laimeat, neutraalit hetket.
 //!
-//! ## Cross-crate-kytkentä (TODO)
-//! Tämä crate **ei** kutsu mitään muuta cratea. `familyclaw-memory` voi
-//! MYÖHEMMIN kutsua [`emotional_salience`]-funktiota painottaakseen
-//! muistojen tärkeyttä (importance weight) — mutta sitä kytkentää **ei**
-//! tehdä täällä. Tarjolla on vain puhdas funktio.
-//!
-//! TODO(memory): `familyclaw-memory` voi kutsua tätä
-//! importance-painona muistin tallennuksessa / decayssa.
+//! ## Cross-crate-kytkentä
+//! Tämä crate **ei** kutsu mitään muuta cratea — tarjolla on vain puhdas
+//! funktio. `familyclaw-memory` kytkee tämän importance-painoksi omalla
+//! puolellaan (`ImportanceFactors::from_emotion_state` +
+//! `MemoryBuilder::emotion_state`, alpha.5), joten riippuvuussuunta pysyy
+//! oikeana (memory → emotion, ei päinvastoin).
 
 use crate::state::EmotionState;
 
