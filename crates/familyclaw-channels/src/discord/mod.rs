@@ -474,4 +474,57 @@ mod tests {
             "stop() before start() is idempotent"
         );
     }
+
+    #[test]
+    fn from_webhook_rejects_empty_webhook_url() {
+        assert!(DiscordChannel::from_webhook("", "discord-main").is_err());
+        assert!(DiscordChannel::from_webhook("   ", "discord-main").is_err());
+    }
+
+    #[test]
+    fn from_webhook_rejects_empty_channel_id() {
+        assert!(DiscordChannel::from_webhook("https://example.invalid/wh", "").is_err());
+        assert!(DiscordChannel::from_webhook("https://example.invalid/wh", "  ").is_err());
+    }
+
+    #[test]
+    fn from_webhook_parses_discord_prefixed_snowflake() {
+        // "discord-<snowflake>" → prefiksi karsitaan, numero parsitaan target_channel_id:ksi.
+        let ch =
+            DiscordChannel::from_webhook("https://example.invalid/wh", "discord-123456").expect("channel");
+        assert_eq!(ch.channel_id(), "discord-123456");
+        assert_eq!(ch.target_channel_id, 123_456);
+    }
+
+    #[test]
+    fn from_webhook_parses_bare_numeric_channel_id() {
+        // Pelkkä numeerinen id (ilman prefiksiä) parsitaan suoraan.
+        let ch = DiscordChannel::from_webhook("https://example.invalid/wh", "987654").expect("channel");
+        assert_eq!(ch.channel_id(), "987654");
+        assert_eq!(ch.target_channel_id, 987_654);
+    }
+
+    #[test]
+    fn from_webhook_non_numeric_channel_id_defaults_target_to_zero() {
+        // Ei-numeerinen id (esim. nimetty kanava) → target_channel_id = 0 (webhook-only).
+        let ch =
+            DiscordChannel::from_webhook("https://example.invalid/wh", "discord-main").expect("channel");
+        assert_eq!(ch.channel_id(), "discord-main");
+        assert_eq!(ch.target_channel_id, 0);
+        assert_eq!(ch.kind(), ChannelKind::Discord);
+    }
+
+    #[test]
+    fn from_webhook_debug_does_not_leak_url() {
+        // bot_token-kenttään talletettu webhook_url ei saa näkyä Debug-tulosteessa.
+        let ch =
+            DiscordChannel::from_webhook("https://example.invalid/SECRET-WEBHOOK", "discord-main")
+                .expect("channel");
+        let dbg = format!("{ch:?}");
+        assert!(dbg.contains("DiscordChannel"));
+        assert!(
+            !dbg.contains("SECRET-WEBHOOK"),
+            "webhook url must not appear in Debug output"
+        );
+    }
 }
