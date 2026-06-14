@@ -16,8 +16,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-# API-letku
-reqwest = { workspace = true, features = ["json"] }
+# Sarjallistus + async-ajoaika
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -25,19 +24,9 @@ tokio = { workspace = true }
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Tunnista kooditiedostoja
-ignore = "0.4"
-
-# Tokenien lasku context-managementtiin
-tiktoken-rs = "0.6"
-
 # Virheet
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-
-# Tyyli
-colored = "3"
-indicatif = "0.17"
 
 # Sisäiset (vain tyyppejä jos tarvitaan)
 familyclaw-core = { workspace = true }
