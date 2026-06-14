@@ -666,4 +666,141 @@ req_seconds_count 3
         assert!(out.contains("# TYPE dup counter"));
         assert_eq!(reg.len(), 1);
     }
+
+    // --- Rinnakkaisuustodisteet (kilpailutestit, ei ajoituksen varassa) ---
+
+    /// Säikeiden lukumäärä rinnakkaisuustesteissä.
+    const CONCURRENCY_THREADS: usize = 16;
+    /// Inkrementtien lukumäärä per säie.
+    const CONCURRENCY_ITERS: u64 = 10_000;
+
+    /// `Counter::inc` ei menetä päivityksiä kun monta säiettä kilpailee samasta
+    /// jaetusta kahvasta. Kaikki säikeet vapautetaan yhtä aikaa
+    /// [`std::sync::Barrier`]:lla, jotta kilpailu tapahtuu varmasti. Lopputulos
+    /// on tarkka deterministinen summa (`N * M`), joten testi ei voi olla
+    /// epävakaa (flaky) — joko atomi pitää tai ei.
+    #[test]
+    fn counter_inc_no_lost_updates_under_contention() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let counter = Counter::new();
+        let barrier = Arc::new(Barrier::new(CONCURRENCY_THREADS));
+        let mut handles = Vec::with_capacity(CONCURRENCY_THREADS);
+
+        for _ in 0..CONCURRENCY_THREADS {
+            let c = counter.clone();
+            let b = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                b.wait();
+                for _ in 0..CONCURRENCY_ITERS {
+                    c.inc();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let expected = CONCURRENCY_THREADS as u64 * CONCURRENCY_ITERS;
+        assert_eq!(counter.get(), expected);
+    }
+
+    /// Sama kilpailutodiste mutta rekisterin kautta haetulle laskurille:
+    /// `MetricsRegistry::counter` palauttaa get-or-create-kahvan ja kaikki
+    /// säikeet inkrementoivat *samaa* atomia. Tarkka summa todistaa ettei
+    /// rekisterin haku eikä atomi-inkrementti menetä päivityksiä.
+    #[test]
+    fn registry_counter_no_lost_updates_under_contention() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let reg = MetricsRegistry::new();
+        let barrier = Arc::new(Barrier::new(CONCURRENCY_THREADS));
+        let mut handles = Vec::with_capacity(CONCURRENCY_THREADS);
+
+        for _ in 0..CONCURRENCY_THREADS {
+            let reg = reg.clone();
+            let b = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let c = reg.counter("shared_hits");
+                b.wait();
+                for _ in 0..CONCURRENCY_ITERS {
+                    c.inc();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let expected = CONCURRENCY_THREADS as u64 * CONCURRENCY_ITERS;
+        assert_eq!(reg.counter("shared_hits").get(), expected);
+        // Yksi nimi → yksi rekisteröity mittari, ei duplikaatteja.
+        assert_eq!(reg.len(), 1);
+    }
+
+    /// `Histogram::observe` säilyttää tarkan kokonaismäärän ja per-ämpäri-
+    /// laskurit kilpailun alla. Jokainen havainto (`1.0`) osuu kaikkiin
+    /// äärellisiin ämpäreihin (`>= 1.0`) ja `+Inf`:iin. Summa ja
+    /// kumulatiiviset ämpärit ovat tarkkoja → ei epävakautta.
+    #[test]
+    fn histogram_observe_no_lost_updates_under_contention() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let hist = Histogram::with_buckets(&[1.0, 2.0, 5.0]);
+        let barrier = Arc::new(Barrier::new(CONCURRENCY_THREADS));
+        let mut handles = Vec::with_capacity(CONCURRENCY_THREADS);
+
+        for _ in 0..CONCURRENCY_THREADS {
+            let h = hist.clone();
+            let b = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                b.wait();
+                for _ in 0..CONCURRENCY_ITERS {
+                    h.observe(1.0);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let total = CONCURRENCY_THREADS as u64 * CONCURRENCY_ITERS;
+        assert_eq!(hist.count(), total);
+        // total * 1.0 = total. Vältetään leveä `u64 as f64` -kasti käyttämällä
+        // tarkkaa `u32`→`f64`-muunnosta (160 000 mahtuu `u32`:een ja on tarkka
+        // `f64`:nä); jokainen havainto on `1.0` joten summa == total.
+        let total_u32 = u32::try_from(total).expect("total fits in u32");
+        let expected_sum = f64::from(total_u32);
+        assert!((hist.sum() - expected_sum).abs() < 1e-6);
+        // 1.0 <= jokainen raja {1,2,5} → jokainen kumulatiivinen ämpäri == total.
+        let buckets = hist.cumulative_buckets();
+        assert_eq!(buckets[0], (BucketBound::Le(1.0), total));
+        assert_eq!(buckets[1], (BucketBound::Le(2.0), total));
+        assert_eq!(buckets[2], (BucketBound::Le(5.0), total));
+        assert_eq!(buckets[3], (BucketBound::PosInf, total));
+    }
+
+    // --- Reunatapaukset ---
+
+    /// `Histogram::observe(0.0)` lasketaan kelvolliseksi havainnoksi: se osuu
+    /// pienimpään ämpäriin (kaikki rajat ovat `> 0.0`), kasvattaa
+    /// kokonaismäärää eikä muuta summaa.
+    #[test]
+    fn histogram_observe_zero_lands_in_lowest_bucket_and_counts() {
+        let h = Histogram::with_buckets(&[0.5, 1.0, 2.0]);
+        h.observe(0.0);
+
+        assert_eq!(h.count(), 1);
+        assert!((h.sum() - 0.0).abs() < 1e-9);
+
+        let buckets = h.cumulative_buckets();
+        // 0.0 <= 0.5 → osuu pienimpään (ja kumulatiivisesti kaikkiin) ämpäriin.
+        assert_eq!(buckets[0], (BucketBound::Le(0.5), 1));
+        assert_eq!(buckets[1], (BucketBound::Le(1.0), 1));
+        assert_eq!(buckets[2], (BucketBound::Le(2.0), 1));
+        assert_eq!(buckets[3], (BucketBound::PosInf, 1));
+    }
 }
