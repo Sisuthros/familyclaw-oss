@@ -85,3 +85,100 @@ impl AcpAgentConfig {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_derives_name_from_binary_file_stem() {
+        let config = AcpAgentConfig::new("agent_a");
+        assert_eq!(config.name, "agent_a");
+    }
+
+    #[test]
+    fn new_strips_extension_from_name() {
+        let config = AcpAgentConfig::new("agent_a.exe");
+        assert_eq!(config.name, "agent_a");
+    }
+
+    #[test]
+    fn new_derives_name_from_absolute_path_file_stem() {
+        let mut path = std::env::temp_dir();
+        path.push("bin");
+        path.push("agent_a.exe");
+        let config = AcpAgentConfig::new(path.clone());
+        assert_eq!(config.name, "agent_a");
+        // binary säilyttää koko polun, vain name on file_stem.
+        assert_eq!(config.binary, path);
+    }
+
+    #[test]
+    fn new_falls_back_to_agent_when_no_file_stem() {
+        // Tyhjä polku ei tuota file_stemiä → fallback "agent".
+        let config = AcpAgentConfig::new("");
+        assert_eq!(config.name, "agent");
+    }
+
+    #[test]
+    fn new_default_timeout_is_120_secs() {
+        let config = AcpAgentConfig::new("agent_a");
+        assert_eq!(config.timeout_secs, 120);
+    }
+
+    #[test]
+    fn new_defaults_args_empty_and_working_dir_none() {
+        let config = AcpAgentConfig::new("agent_a");
+        assert!(config.args.is_empty());
+        assert!(config.working_dir.is_none());
+    }
+
+    #[test]
+    fn with_permission_mode_yields_exact_flag() {
+        let config = AcpAgentConfig::new("agent_a").with_permission_mode("bypass_permissions");
+        assert_eq!(config.args, vec!["--permission-mode=bypass_permissions"]);
+    }
+
+    #[test]
+    fn with_model_yields_exact_flag() {
+        let config = AcpAgentConfig::new("agent_a").with_model("model_x");
+        assert_eq!(config.args, vec!["--model=model_x"]);
+    }
+
+    #[test]
+    fn with_arg_appends_raw_argument() {
+        let config = AcpAgentConfig::new("agent_a").with_arg("--yolo");
+        assert_eq!(config.args, vec!["--yolo"]);
+    }
+
+    #[test]
+    fn builder_chain_preserves_arg_accumulation_order() {
+        let config = AcpAgentConfig::new("agent_a")
+            .with_arg("--first")
+            .with_permission_mode("default")
+            .with_model("model_x")
+            .with_arg("--last");
+        assert_eq!(
+            config.args,
+            vec![
+                "--first",
+                "--permission-mode=default",
+                "--model=model_x",
+                "--last",
+            ]
+        );
+    }
+
+    #[test]
+    fn with_timeout_overrides_default() {
+        let config = AcpAgentConfig::new("agent_a").with_timeout(45);
+        assert_eq!(config.timeout_secs, 45);
+    }
+
+    #[test]
+    fn with_working_dir_sets_some_path() {
+        let dir = std::env::temp_dir();
+        let config = AcpAgentConfig::new("agent_a").with_working_dir(dir.clone());
+        assert_eq!(config.working_dir, Some(dir));
+    }
+}
