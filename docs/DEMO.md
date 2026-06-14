@@ -146,7 +146,7 @@ cargo test --workspace \
 
 # Code quality
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings -A clippy::doc_markdown -A clippy::too_many_lines
+cargo clippy --workspace --all-targets --features discord -- -D warnings
 
 # Demos
 cargo run -p familyclaw-agent                # Living Seed

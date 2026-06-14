@@ -390,9 +390,24 @@ impl Channel for DiscordChannel {
 
     fn send(&self, message: OutboundMessage) -> SendFuture<'_> {
         let http = Arc::clone(&self.http);
-        let target = ChannelId::new(self.target_channel_id);
+        let target_id = self.target_channel_id;
         let channel_id = self.channel_id.clone();
-        Box::pin(async move { Self::send_body(&http, target, &channel_id, &message.body).await })
+        Box::pin(async move {
+            // target_channel_id == 0 tarkoittaa webhook/inbound-only-instanssia
+            // (`from_webhook` ei-numeerisella channel_id:llä): lähtevälle viestille
+            // ei ole aitoa Discord-snowflakea. Palauta SELKEÄ virhe sen sijaan että
+            // yrittäisi lähettää kanavalle 0 (joka epäonnistuisi hämärästi).
+            // Lähtevä liikenne kulkee tällöin bus-pumpun / oikean send-kanavan kautta.
+            if target_id == 0 {
+                return Err(ChannelError::invalid_input(format!(
+                    "channel '{channel_id}' is inbound-only (no numeric Discord channel id); \
+                     outbound send is not supported on a webhook-only instance — \
+                     construct DiscordChannel::new(bot_token, target_channel_id) for sending"
+                )));
+            }
+            let target = ChannelId::new(target_id);
+            Self::send_body(&http, target, &channel_id, &message.body).await
+        })
     }
 
     fn receive(&self) -> ChannelResult<MessageStream> {
@@ -512,6 +527,31 @@ mod tests {
         assert_eq!(ch.channel_id(), "discord-main");
         assert_eq!(ch.target_channel_id, 0);
         assert_eq!(ch.kind(), ChannelKind::Discord);
+    }
+
+    #[tokio::test]
+    async fn send_on_inbound_only_webhook_returns_clear_error() {
+        // Webhook-only-instanssi (target_channel_id == 0) ei voi lähettää: send()
+        // palauttaa SELKEÄN InvalidInput-virheen sen sijaan että yrittäisi
+        // hämärästi lähettää Discord-kanavalle 0. (P1: outbound impossible to misunderstand.)
+        let ch =
+            DiscordChannel::from_webhook("https://example.invalid/wh", "discord-main").expect("channel");
+        assert_eq!(ch.target_channel_id, 0);
+
+        let err = ch
+            .send(OutboundMessage::new("discord-main", "hello").expect("msg"))
+            .await
+            .expect_err("inbound-only webhook must reject outbound send");
+
+        assert!(
+            matches!(err, ChannelError::InvalidInput(_)),
+            "expected InvalidInput, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inbound-only"),
+            "error must explain inbound-only nature, got: {msg}"
+        );
     }
 
     #[test]

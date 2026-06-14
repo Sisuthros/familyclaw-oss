@@ -1,0 +1,81 @@
+# .dockerignore — keep the build context minimal AND keep Layer B out of the
+# image entirely. Anything matched here is never sent to the Docker daemon,
+# so it can neither slow the build nor leak into a layer.
+
+# --- Build artifacts (rebuilt inside the builder stage) --------------------
+target/
+**/target/
+
+# --- VCS / CI metadata -----------------------------------------------------
+.git/
+.gitignore
+.github/
+
+# --- Layer B: private, runtime-only material — NEVER ship in the image -----
+# Sourced at runtime from FAMILYCLAW_PROFILE_DIR / FAMILYCLAW_DATA_DIR.
+.env
+.env.*
+profiles/
+data/
+hearth/
+keys/
+*.soul
+*.soul.md
+SOUL.md
+**/SOUL.md
+*.calibration.json
+calibration.json
+**/calibration.json
+*.pem
+
+# --- Docs, plans, research (not needed to build the binary) ----------------
+# NOTE: do NOT blanket-exclude "*.md". Several crates embed their own README
+# at COMPILE time via `#![doc = include_str!("../README.md")]`
+# (familyclaw-bus, -agent, -dream, -memory). Excluding those READMEs would
+# break `cargo build`. We exclude only top-level docs and known root-level
+# markdown that are NOT compile inputs, and keep crate-local README.md files.
+docs/
+plans/
+research/
+papers.txt
+research_data.md
+research_plan.md
+# Root-level planning / narrative markdown (not build inputs):
+/BLUEPRINT.md
+/CHANGELOG.md
+/CONTRIBUTING.md
+/FAMILYCLAW_FINAL_PLAN.md
+/FAMILYCLAW_MASTER_PLAN.md
+/GOVERNANCE.md
+/HUIPPUTUOTE_SUUNNITELMA.md
+/KEHITYSSUUNNITELMA.md
+/SECURITY.md
+/PAKETTI-*.md
+
+# --- Layer B / internal-only dirs + files (never enter the build context) --
+# (docs/ above already excludes docs/source-blueprints, docs/plans, docs/handoff)
+agentit/
+ops/
+core/
+FAMILYCLAW_MAP.md
+*SUUNNITELMA*.md
+recv.py
+bridge.py
+write_papers.py
+
+# --- Test fixtures / test trees (not needed for the release build) ---------
+tests/
+**/tests/fixtures/
+
+# --- Local editor / OS cruft -----------------------------------------------
+.vscode/
+.idea/
+.claude/
+.git/
+**/__pycache__/
+*.log
+.DS_Store
+
+# --- The Docker files themselves -------------------------------------------
+Dockerfile
+.dockerignore
