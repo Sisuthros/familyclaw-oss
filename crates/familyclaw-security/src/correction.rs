@@ -282,6 +282,71 @@ mod tests {
     }
 
     #[test]
+    fn decay_class_lambda_matches_half_life_definition() {
+        // λ = ln(2)/half_life → puolittumisajan jälkeen retention ≈ 0.5 per luokka.
+        let cases = [
+            (DecayClass::Slow, 60.0 * 60.0 * 24.0 * 90.0),
+            (DecayClass::Normal, 60.0 * 60.0 * 24.0 * 7.0),
+            (DecayClass::Fast, 60.0 * 60.0),
+        ];
+        for (class, half_life) in cases {
+            let r = class.lambda().retention(half_life);
+            assert!(
+                (r - 0.5).abs() < 1e-9,
+                "{class:?} retention at half-life was {r}, expected 0.5"
+            );
+        }
+        // Eternal ei koskaan vaimene.
+        assert_eq!(DecayClass::Eternal.lambda().retention(1.0e9), 1.0);
+    }
+
+    #[test]
+    fn effective_score_negative_age_treated_as_fresh() {
+        // Negatiivinen ikä → retention klampataan nollaan → pistemäärä = prioriteetti.
+        let c = HumanCorrection::new("veto").expect("valid");
+        let score = c.effective_score(-100.0);
+        assert!((score - 1.0).abs() < 1e-9, "score was {score}");
+    }
+
+    #[test]
+    fn effective_score_scales_with_priority() {
+        // Pienempi prioriteetti → suoraan verrannollisesti pienempi tuore pistemäärä.
+        let mut half = HumanCorrection::new("veto").expect("valid");
+        half.priority = CorrectionPriority::new(0.5).expect("valid");
+        assert!((half.effective_score(0.0) - 0.5).abs() < 1e-9);
+
+        let mut zero = HumanCorrection::new("veto").expect("valid");
+        zero.priority = CorrectionPriority::MIN;
+        assert_eq!(zero.effective_score(0.0), 0.0);
+        // Nolla-prioriteetti ei voita edes nolla-kilpailijaa aidosti
+        // (vain täsmälleen yhtä suuren, koska wins_against käyttää >=).
+        assert!(zero.wins_against(0.0, 0.0));
+        assert!(!zero.wins_against(0.0001, 0.0));
+    }
+
+    #[test]
+    fn wins_against_boundary_uses_greater_or_equal() {
+        // Tasapelin tarkka raja: yhtä suuri → voittaa; hitusen suurempi → häviää.
+        let c = HumanCorrection::new("veto").expect("valid");
+        let score = c.effective_score(0.0);
+        assert!(c.wins_against(score, 0.0), "equal score must win (>=)");
+        assert!(
+            !c.wins_against(score + f64::EPSILON, 0.0),
+            "strictly larger competitor must win"
+        );
+    }
+
+    #[test]
+    fn correction_stores_only_generic_content_field() {
+        // Sisältö on geneeristä tekstiä; sarjallistettu muoto sisältää sen
+        // sellaisenaan (runko ei piilota mitään), mutta ei API-avaimia tms.
+        let c = HumanCorrection::new("agent_a prefers concise answers").expect("valid");
+        let json = serde_json::to_string(&c).expect("serialize");
+        assert!(json.contains("agent_a prefers concise answers"));
+        assert!(json.contains("slow")); // decay-luokka snake_case
+    }
+
+    #[test]
     fn correction_score_decays_slowly_but_monotonically() {
         let c = HumanCorrection::new("rule").expect("valid");
         let month = 60.0 * 60.0 * 24.0 * 30.0;
