@@ -309,7 +309,11 @@ impl LlmClient {
             .into_iter()
             .next()
             .and_then(|c| c.message.content)
-            .ok_or_else(|| LlmError::Parse("no content in response".into()))
+            // Empty choices / null content = the model produced nothing this turn.
+            // That is RETRYABLE (another model in the chain may produce content),
+            // so classify it as NoContent — NOT Parse (which is terminal and would
+            // defeat failover). [F1 invariant: see LlmError::is_retryable]
+            .ok_or(LlmError::NoContent)
     }
 
     /// Completes a chat conversation and returns both text and tool calls.
@@ -364,7 +368,9 @@ impl LlmClient {
             .choices
             .into_iter()
             .next()
-            .ok_or_else(|| LlmError::Parse("no choices in response".into()))?;
+            // Empty choices = retryable NoContent (another model may answer),
+            // NOT terminal Parse — keeps failover working. [F1 invariant]
+            .ok_or(LlmError::NoContent)?;
 
         let content = choice.message.content;
         let tool_calls = choice.message.tool_calls;
@@ -721,5 +727,48 @@ mod tests {
             "expected retryable Timeout, got {err:?}"
         );
         assert!(err.is_retryable(), "timeout must be retryable for failover");
+    }
+
+    #[tokio::test]
+    async fn empty_choices_is_retryable_nocontent_not_parse() {
+        // FIX-1 regression: a 200 OK whose `choices` is empty means the model
+        // produced nothing. That MUST classify as retryable NoContent (so failover
+        // tries the next model) — NOT terminal Parse (which would kill the chain).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await; // consume request
+                let body = r#"{"choices":[]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let cfg = LlmConfig::new(format!("http://{addr}/v1"), "k", "m")
+            .with_request_timeout_ms(2000)
+            .with_connect_timeout_ms(2000);
+        let client = LlmClient::new(cfg);
+
+        let err = client
+            .complete(&[LlmMessage::user("hei")])
+            .await
+            .expect_err("empty choices must be an error");
+        assert!(
+            matches!(err, LlmError::NoContent),
+            "empty choices must be retryable NoContent (not terminal Parse), got {err:?}"
+        );
+        assert!(err.is_retryable(), "NoContent must be retryable for failover");
     }
 }

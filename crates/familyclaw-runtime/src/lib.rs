@@ -62,9 +62,15 @@ use ractor::ActorRef;
 /// bounded-wrapper tai backpressure-mittari drain-puolelle.
 pub struct FamilyRuntime {
     bus: BusHandle,
-    /// Spawnatut agentti-actorit. Pidetään elossa (drop = actor pysähtyy).
-    _agents: Vec<ActorRef<ResonanceMessage>>,
-    /// Taustatehtävät: channel→bus -pumppu ja reply→channel -tyhjennys.
+    /// Spawnatut agentti-actorit. Pidetään elossa (drop = actor pysähtyy →
+    /// reply-sink dropataan → drain-task valuu loppuun luonnostaan).
+    agents: Vec<ActorRef<ResonanceMessage>>,
+    /// Reply→channel -tyhjennys. Pidetään ERILLÄÄN abortoitavista taskeista:
+    /// tämä kantaa in-flight-vastauksia, joten se DRAINATAAN loppuun (ei
+    /// abortoida) sammutuksessa, ettei puskuroitu vastaus katoa.
+    drain: tokio::task::JoinHandle<()>,
+    /// Abortoitavat taustatehtävät: channel→bus -pumppu (+ dream). Nämä EIVÄT
+    /// kanna in-flight-vastauksia, joten ne voi keskeyttää suoraan.
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -75,13 +81,25 @@ impl FamilyRuntime {
         &self.bus
     }
 
-    /// Sammuttaa kokoonpanon siististi: keskeyttää taustatehtävät ja pysäyttää
-    /// busin. Korvaa gatewayn suoran `bus.stop()`-kutsun.
-    pub fn shutdown(self) {
+    /// Sammuttaa kokoonpanon siististi: **ei pudota in-flight-vastauksia.**
+    ///
+    /// Järjestys on tarkoituksellinen:
+    /// 1. Pysäytä bus + pudota agentit → reply-tuotanto loppuu ja reply-sink
+    ///    dropataan → drain-taskin `reply_rx.recv()` palauttaa `None`.
+    /// 2. Abortoi pump (+ dream) — ne eivät kanna vastauksia.
+    /// 3. **Odota drain loppuun** (rajattu timeout) → puskuroidut vastaukset
+    ///    ehtivät kanavalle ennen paluuta. Aiemmin drain abortoitiin → viimeiset
+    ///    vastaukset katosivat ("siisti sammutus" -lupauksen rikko).
+    pub async fn shutdown(self) {
+        // 1. Lopeta reply-tuotanto: bus seis + agentit pois (pudottaa sinkin).
+        self.bus.stop();
+        drop(self.agents);
+        // 2. Abortoi vastauksia kantamattomat taustatehtävät.
         for t in self.tasks {
             t.abort();
         }
-        self.bus.stop();
+        // 3. Anna drainin valua loppuun (rajattu, ettei sammutus jää roikkumaan).
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.drain).await;
     }
 }
 
@@ -312,15 +330,18 @@ pub async fn build_family(
         None
     };
 
-    // 12. Kokoa runtime — omistaa busin, agentin ja taustatehtävät. Dream-kahva
+    // 12. Kokoa runtime — omistaa busin, agentin ja taustatehtävät. `drain`
+    //     pidetään ERILLÄÄN abortoitavista taskeista, jotta sammutus voi valuttaa
+    //     sen loppuun (in-flight-vastaukset) abortoinnin sijaan. Dream-kahva
     //     lisätään vain jos se spawnattiin (gated FAMILYCLAW_DREAM_DISABLED).
-    let mut tasks = vec![pump, drain];
+    let mut tasks = vec![pump];
     if let Some(dream) = dream {
         tasks.push(dream);
     }
     Ok(FamilyRuntime {
         bus,
-        _agents: vec![actor],
+        agents: vec![actor],
+        drain,
         tasks,
     })
 }
@@ -570,7 +591,7 @@ mod tests {
         assert_eq!(beings.len(), 1, "agentti rekisteröityi busiin");
         assert_eq!(beings[0].name, "agent_a");
 
-        runtime.shutdown();
+        runtime.shutdown().await;
     }
 
     /// `build_family` kelpaa myös LLM:n kanssa konfiguroituna (resolveri tuntee
@@ -604,6 +625,6 @@ mod tests {
         .expect("runtime builds with provider");
 
         assert_eq!(runtime.bus().count().await.expect("count"), 1);
-        runtime.shutdown();
+        runtime.shutdown().await;
     }
 }

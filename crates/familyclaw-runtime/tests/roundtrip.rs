@@ -162,7 +162,7 @@ async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
         "vastauksen sisältö on TASAN se mitä Agent.think() sai mock-LLM:ltä"
     );
 
-    runtime.shutdown();
+    runtime.shutdown().await;
 }
 
 /// **F1-failover-todiste**: kun primary-endpoint on kuollut (yhteys
@@ -241,7 +241,7 @@ async fn dead_primary_fails_over_to_live_fallback() {
         "vastaus tuli fallback-mallilta (live mock-LLM)"
     );
 
-    runtime.shutdown();
+    runtime.shutdown().await;
 }
 
 /// Käynnistää **hyytyvän** (slow-loris) HTTP-endpointin: hyväksyy TCP-yhteyden
@@ -345,7 +345,7 @@ async fn timeout_primary_fails_over_to_live_fallback() {
         "vastaus tuli fallback-mallilta (live mock-LLM) timeoutin jälkeen"
     );
 
-    runtime.shutdown();
+    runtime.shutdown().await;
 }
 
 /// Vahvistaa että ilman LLM:ää (provider tuntematon → ei think-tekstiä) ketju
@@ -479,7 +479,7 @@ async fn without_llm_no_reply_is_emitted() {
         "ilman LLM:ää think() palauttaa None → ei ulosmenevää vastausta"
     );
 
-    runtime.shutdown();
+    runtime.shutdown().await;
 }
 
 /// Serialisoi `FAMILYCLAW_DATA_DIR`-riippuvaiset testit: env-muuttuja on
@@ -550,7 +550,7 @@ async fn run_one_persistent_turn(data_dir: &std::path::Path, body: &str, api_bas
     }
     // Anna durable+muisti-kirjoituksen levähtää levylle ennen sammutusta.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    runtime.shutdown();
+    runtime.shutdown().await;
     sent.len()
 }
 
@@ -643,5 +643,5 @@ async fn inbound_reaches_agent_over_bus() {
     assert_eq!(beings.len(), 1);
     assert_eq!(beings[0].name, "agent_a");
 
-    runtime.shutdown();
+    runtime.shutdown().await;
 }

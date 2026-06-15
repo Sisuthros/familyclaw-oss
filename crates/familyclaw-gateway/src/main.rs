@@ -686,7 +686,7 @@ async fn serve() -> Result<()> {
     // Sammutus: pysäytä runtime siististi (keskeyttää taskit + pysäyttää busin)
     // riippumatta palvelun lopputuloksesta.
     info!("gateway sammuu — pysäytetään FamilyRuntime");
-    runtime.shutdown();
+    runtime.shutdown().await;
 
     serve_result.map_err(|e| FamilyClawError::bus(format!("gateway serve error: {e}")))?;
     info!("familyclaw-gateway pysähtyi siististi");

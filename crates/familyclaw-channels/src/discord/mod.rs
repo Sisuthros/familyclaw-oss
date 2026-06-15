@@ -293,7 +293,17 @@ impl DiscordChannel {
         channel_id: &str,
         body: &str,
     ) -> ChannelResult<()> {
-        for chunk in split_message(body, DISCORD_MAX_MESSAGE_CHARS) {
+        // split_message returns an EMPTY Vec for an empty/whitespace-only body.
+        // Without this guard the loop sends nothing yet still logs "message sent"
+        // — a silent drop that lies in the logs. Reject it with a clear error so
+        // an empty outbound is impossible to mistake for success.
+        let chunks = split_message(body, DISCORD_MAX_MESSAGE_CHARS);
+        if chunks.is_empty() {
+            return Err(ChannelError::invalid_input(format!(
+                "refusing to send empty/whitespace-only message body to '{channel_id}'"
+            )));
+        }
+        for chunk in chunks {
             let message = CreateMessage::new().content(chunk);
             channel
                 .send_message(http, message)

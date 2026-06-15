@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
 
     // 10. Clean shutdown
     info!("🛑 Shutting down...");
-    runtime.shutdown();
+    runtime.shutdown().await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     info!("✅ FamilyClaw minimal-gateway stopped cleanly");

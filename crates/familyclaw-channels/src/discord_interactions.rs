@@ -31,6 +31,10 @@ pub fn verify_signature(
     timestamp: &str,
     body: &[u8],
 ) -> ChannelResult<()> {
+    // Replay-protection freshness window (declared up-front to satisfy clippy's
+    // items-after-statements). Discord guidance: ~5 min.
+    const MAX_TIMESTAMP_SKEW_SECS: i64 = 300;
+
     let pk = decode_hex(public_key_hex)
         .map_err(|e| ChannelError::invalid_input(format!("invalid DISCORD_PUBLIC_KEY hex: {e}")))?;
     let sig_bytes = decode_hex(signature_hex).map_err(|e| {
@@ -53,7 +57,22 @@ pub fn verify_signature(
 
     verifying_key
         .verify_strict(&message, &signature)
-        .map_err(|_| ChannelError::invalid_input("discord signature verification failed"))
+        .map_err(|_| ChannelError::invalid_input("discord signature verification failed"))?;
+
+    // Replay protection: a valid signature alone lets a captured request be
+    // replayed forever. Reject requests whose (now-authenticated) timestamp is
+    // outside the freshness window. Checked AFTER verify_strict so the timestamp
+    // is proven authentic before we trust it.
+    let ts_secs: i64 = timestamp.trim().parse().map_err(|_| {
+        ChannelError::invalid_input("discord X-Signature-Timestamp is not a unix-seconds integer")
+    })?;
+    let now_secs = chrono::Utc::now().timestamp();
+    if (now_secs - ts_secs).abs() > MAX_TIMESTAMP_SKEW_SECS {
+        return Err(ChannelError::invalid_input(
+            "discord interaction timestamp outside freshness window (possible replay)",
+        ));
+    }
+    Ok(())
 }
 
 /// Parsittu Discord-interaction (MVP: slash-komennot).
@@ -215,7 +234,9 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[0u8; 32]);
         let verifying_key = signing_key.verifying_key();
 
-        let timestamp = "1700000000";
+        // FRESH timestamp: replay-suoja vaatii että aikaleima on freshness-ikkunan
+        // sisällä, joten käytetään nyt-hetkeä (kiinteä menneisyys hylättäisiin).
+        let timestamp = chrono::Utc::now().timestamp().to_string();
         let body = br#"{"type":1}"#;
 
         // Discord allekirjoittaa `timestamp || raw_body`.
@@ -227,8 +248,34 @@ mod tests {
         let pk_hex = encode_hex(verifying_key.as_bytes());
         let sig_hex = encode_hex(&signature.to_bytes());
 
-        let result = verify_signature(&pk_hex, &sig_hex, timestamp, body);
-        assert!(result.is_ok(), "valid signature must verify: {result:?}");
+        let result = verify_signature(&pk_hex, &sig_hex, &timestamp, body);
+        assert!(result.is_ok(), "valid fresh signature must verify: {result:?}");
+    }
+
+    #[test]
+    fn verify_rejects_stale_timestamp_replay() {
+        // FIX-4 regression: a perfectly-signed request with an OLD timestamp must
+        // be rejected (replay protection), even though the Ed25519 signature is valid.
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+
+        // 1 hour in the past — well outside the 5-min freshness window.
+        let stale_ts = (chrono::Utc::now().timestamp() - 3600).to_string();
+        let body = br#"{"type":1}"#;
+
+        let mut message = Vec::new();
+        message.extend_from_slice(stale_ts.as_bytes());
+        message.extend_from_slice(body);
+        let signature = signing_key.sign(&message); // genuinely valid signature
+
+        let pk_hex = encode_hex(verifying_key.as_bytes());
+        let sig_hex = encode_hex(&signature.to_bytes());
+
+        let err = verify_signature(&pk_hex, &sig_hex, &stale_ts, body)
+            .expect_err("stale-timestamp replay must be rejected even with a valid signature");
+        assert!(matches!(err, ChannelError::InvalidInput(_)));
     }
 
     #[test]
