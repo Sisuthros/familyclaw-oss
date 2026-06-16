@@ -119,11 +119,7 @@ where
 ///
 /// # Errors
 /// [`familyclaw_core::FamilyClawError`] jos muistitallennuksen luku epäonnistuu.
-pub async fn weekly_review_top_n<S>(
-    store: &S,
-    now: Timestamp,
-    top_n: usize,
-) -> Result<WeeklyReport>
+pub async fn weekly_review_top_n<S>(store: &S, now: Timestamp, top_n: usize) -> Result<WeeklyReport>
 where
     S: MemoryStore + ?Sized,
 {
@@ -154,8 +150,7 @@ where
     }
 
     // Top-importance: vain haettavat (haudattuja ei nosteta esiin).
-    let mut retrievable: Vec<&Memory> =
-        memories.iter().filter(|m| m.is_retrievable()).collect();
+    let mut retrievable: Vec<&Memory> = memories.iter().filter(|m| m.is_retrievable()).collect();
     // Laskeva tärkeys; tasapelin ratkaisee pienempi id (deterministinen).
     retrievable.sort_by(|a, b| {
         b.importance
@@ -171,7 +166,10 @@ where
 
     // Ristiriidat id-järjestyksessä (vakaa esitys).
     conflicts.sort_by_key(|a| a.id);
-    report.conflicts = conflicts.into_iter().map(MemoryDigest::from_memory).collect();
+    report.conflicts = conflicts
+        .into_iter()
+        .map(MemoryDigest::from_memory)
+        .collect();
 
     Ok(report)
 }
@@ -264,9 +262,7 @@ mod tests {
                 .await
                 .expect("add");
         }
-        let report = weekly_review_top_n(&store, at(), 3)
-            .await
-            .expect("review");
+        let report = weekly_review_top_n(&store, at(), 3).await.expect("review");
         assert_eq!(report.total, 10);
         assert_eq!(report.top_memories.len(), 3, "top_n rajoittaa listan");
     }
@@ -274,8 +270,14 @@ mod tests {
     #[tokio::test]
     async fn detected_conflicts_are_summarized() {
         let store = LocalJsonStore::in_memory();
-        let a = store.add(mem("agent_a is in city a", 0.5)).await.expect("a");
-        let b = store.add(mem("agent_a is in city b", 0.5)).await.expect("b");
+        let a = store
+            .add(mem("agent_a is in city a", 0.5))
+            .await
+            .expect("a");
+        let b = store
+            .add(mem("agent_a is in city b", 0.5))
+            .await
+            .expect("b");
         store.add(mem("unrelated fact", 0.5)).await.expect("c");
 
         tag_conflict(&store, a, b, at()).await.expect("tag");
@@ -299,7 +301,10 @@ mod tests {
         let report = weekly_review(&store, at()).await.expect("review");
         let digest = &report.top_memories[0];
         // 120 merkkiä + '…'.
-        assert_eq!(digest.content.chars().count(), MemoryDigest::CONTENT_CLAMP + 1);
+        assert_eq!(
+            digest.content.chars().count(),
+            MemoryDigest::CONTENT_CLAMP + 1
+        );
         assert!(digest.content.ends_with('…'));
     }
 

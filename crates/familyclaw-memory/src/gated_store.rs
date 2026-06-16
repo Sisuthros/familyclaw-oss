@@ -213,7 +213,10 @@ mod tests {
     async fn admits_direct_experience_write() {
         let store = GatedMemoryStore::new(LocalJsonStore::in_memory(), ProvenanceGate::new(0.6));
         let m = mem_with("my own observation", Provenance::DirectExperience);
-        let id = store.add(m).await.expect("direct experience must be admitted");
+        let id = store
+            .add(m)
+            .await
+            .expect("direct experience must be admitted");
         // Kirjoitus päätyi sisempään tallennukseen.
         assert_eq!(store.len().await.expect("len"), 1);
         assert!(store.get(id).await.expect("get").is_some());
@@ -238,7 +241,10 @@ mod tests {
     #[tokio::test]
     async fn admits_high_trust_external_write() {
         let store = GatedMemoryStore::new(LocalJsonStore::in_memory(), ProvenanceGate::new(0.6));
-        let m = mem_with("well-sourced external fact", Provenance::external("web", 0.9));
+        let m = mem_with(
+            "well-sourced external fact",
+            Provenance::external("web", 0.9),
+        );
         store
             .add(m)
             .await

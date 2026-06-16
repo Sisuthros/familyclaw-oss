@@ -191,26 +191,25 @@ pub async fn build_family(
     //    journalin päälle (FAMILYCLAW_DATA_DIR). Vain silloin on replay-historiaa
     //    josta on jatkettava elävänä (askel 6, `resume_live`). In-memory-polulla
     //    journal on aina tyhjä → ei replayta → ei resume-tarvetta.
-    let (memory, durable, dream_journal, persistent) =
-        if let Some(data_dir) = data_dir {
-            let dir = std::path::PathBuf::from(&data_dir);
-            std::fs::create_dir_all(&dir).ok();
-            let journal = FileJournal::open(dir.join("journal.jsonl"))
-                .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-            let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(journal);
-            let mem = LocalJsonStore::open(dir.join("memory.json"))
-                .await
-                .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-            let dur = DurableContext::new(Arc::clone(&dream_j))
-                .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-            (Arc::new(mem) as ErasedMemoryStore, dur, Some(dream_j), true)
-        } else {
-            let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
-            let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(InMemoryJournal::new());
-            let durable = DurableContext::new(Arc::clone(&dream_j))
-                .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-            (memory, durable, Some(dream_j), false)
-        };
+    let (memory, durable, dream_journal, persistent) = if let Some(data_dir) = data_dir {
+        let dir = std::path::PathBuf::from(&data_dir);
+        std::fs::create_dir_all(&dir).ok();
+        let journal = FileJournal::open(dir.join("journal.jsonl"))
+            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+        let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(journal);
+        let mem = LocalJsonStore::open(dir.join("memory.json"))
+            .await
+            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+        let dur = DurableContext::new(Arc::clone(&dream_j))
+            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+        (Arc::new(mem) as ErasedMemoryStore, dur, Some(dream_j), true)
+    } else {
+        let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
+        let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(InMemoryJournal::new());
+        let durable = DurableContext::new(Arc::clone(&dream_j))
+            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+        (memory, durable, Some(dream_j), false)
+    };
 
     // 5. Ankkuroi identiteetti ennen agentin rakennusta — JA persistoi se.
     //    Aiemmin rekisteri oli paikallinen `let mut registry`, joka pudotettiin

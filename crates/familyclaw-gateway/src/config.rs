@@ -299,19 +299,31 @@ mod tests {
         std::env::set_var(ALIAS, "legacy-target");
         let mut cfg = FamilyConfig::default();
         cfg.apply_env();
-        assert_eq!(cfg.reply_target(), "legacy-target", "alias luetaan kun ei kanonista");
+        assert_eq!(
+            cfg.reply_target(),
+            "legacy-target",
+            "alias luetaan kun ei kanonista"
+        );
 
         // Molemmat asetettu → KANONINEN voittaa.
         std::env::set_var(CANON, "canonical-target");
         let mut cfg = FamilyConfig::default();
         cfg.apply_env();
-        assert_eq!(cfg.reply_target(), "canonical-target", "kanoninen voittaa aliaksen");
+        assert_eq!(
+            cfg.reply_target(),
+            "canonical-target",
+            "kanoninen voittaa aliaksen"
+        );
 
         // Vain kanoninen → luetaan.
         std::env::remove_var(ALIAS);
         let mut cfg = FamilyConfig::default();
         cfg.apply_env();
-        assert_eq!(cfg.reply_target(), "canonical-target", "kanoninen luetaan yksinään");
+        assert_eq!(
+            cfg.reply_target(),
+            "canonical-target",
+            "kanoninen luetaan yksinään"
+        );
 
         // Siivous.
         std::env::remove_var(CANON);

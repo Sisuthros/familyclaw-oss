@@ -249,7 +249,10 @@ mod tests {
         let sig_hex = encode_hex(&signature.to_bytes());
 
         let result = verify_signature(&pk_hex, &sig_hex, &timestamp, body);
-        assert!(result.is_ok(), "valid fresh signature must verify: {result:?}");
+        assert!(
+            result.is_ok(),
+            "valid fresh signature must verify: {result:?}"
+        );
     }
 
     #[test]

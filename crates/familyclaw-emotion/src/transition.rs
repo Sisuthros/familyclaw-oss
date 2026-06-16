@@ -171,7 +171,10 @@ mod tests {
         let next = EmotionTransition::balanced().blend(&prev, &observed);
         for dim in Dimension::ALL {
             let v = next.value(dim);
-            assert!((0.0..=100.0).contains(&v), "arvo {v} ulkona rajoista: {dim}");
+            assert!(
+                (0.0..=100.0).contains(&v),
+                "arvo {v} ulkona rajoista: {dim}"
+            );
         }
     }
 

@@ -195,7 +195,10 @@ mod tests {
         let mut cfg = base_config();
         cfg.include_dirs = vec![PathBuf::from("src"), PathBuf::from("docs")];
         let args = build_args("x", &cfg, RunMode::OneShot);
-        let count = args.iter().filter(|a| *a == "--include-directories").count();
+        let count = args
+            .iter()
+            .filter(|a| *a == "--include-directories")
+            .count();
         assert_eq!(count, 2, "yksi lippu per hakemisto");
         assert!(args.iter().any(|a| a == "src"));
         assert!(args.iter().any(|a| a == "docs"));

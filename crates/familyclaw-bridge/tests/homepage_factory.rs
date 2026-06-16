@@ -408,7 +408,8 @@ async fn malformed_design_halts_factory_at_contract_boundary() {
 
     // --- design-sopimus menee Failed-tilaan fulfill():ssä (eksplisiittinen
     //     todistus samalla viallisella toimitteella). ------------------------
-    prove_malformed_design_fails_contract(agent_alpha, &plan, design_tasks[0].id, &executor, now).await;
+    prove_malformed_design_fails_contract(agent_alpha, &plan, design_tasks[0].id, &executor, now)
+        .await;
 
     // --- Tapahtumat: vain design osoitettiin; review/deploy ei. -------------
     let mut assigned_nodes: Vec<String> = Vec::new();

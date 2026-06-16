@@ -572,7 +572,10 @@ async fn gateway_restart_processes_new_message_fresh_not_replayed_mute() {
 
     // --- Ajo 1: ensimmäinen viesti persistenttiin runtimeen. ---
     let sent_1 = run_one_persistent_turn(&data_dir, "ensimmäinen viesti", &api_base).await;
-    assert_eq!(sent_1, 1, "ajo 1: ensimmäinen viesti tuottaa yhden vastauksen");
+    assert_eq!(
+        sent_1, 1,
+        "ajo 1: ensimmäinen viesti tuottaa yhden vastauksen"
+    );
 
     // Muistissa tasan yksi rivi ajon 1 jälkeen (levyltä luettuna).
     let mem_after_1 = LocalJsonStore::open(data_dir.join("memory.json"))

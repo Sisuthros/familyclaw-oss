@@ -769,6 +769,9 @@ mod tests {
             matches!(err, LlmError::NoContent),
             "empty choices must be retryable NoContent (not terminal Parse), got {err:?}"
         );
-        assert!(err.is_retryable(), "NoContent must be retryable for failover");
+        assert!(
+            err.is_retryable(),
+            "NoContent must be retryable for failover"
+        );
     }
 }

@@ -515,8 +515,8 @@ mod tests {
     #[test]
     fn from_webhook_parses_discord_prefixed_snowflake() {
         // "discord-<snowflake>" → prefiksi karsitaan, numero parsitaan target_channel_id:ksi.
-        let ch =
-            DiscordChannel::from_webhook("https://example.invalid/wh", "discord-123456").expect("channel");
+        let ch = DiscordChannel::from_webhook("https://example.invalid/wh", "discord-123456")
+            .expect("channel");
         assert_eq!(ch.channel_id(), "discord-123456");
         assert_eq!(ch.target_channel_id, 123_456);
     }
@@ -524,7 +524,8 @@ mod tests {
     #[test]
     fn from_webhook_parses_bare_numeric_channel_id() {
         // Pelkkä numeerinen id (ilman prefiksiä) parsitaan suoraan.
-        let ch = DiscordChannel::from_webhook("https://example.invalid/wh", "987654").expect("channel");
+        let ch =
+            DiscordChannel::from_webhook("https://example.invalid/wh", "987654").expect("channel");
         assert_eq!(ch.channel_id(), "987654");
         assert_eq!(ch.target_channel_id, 987_654);
     }
@@ -532,8 +533,8 @@ mod tests {
     #[test]
     fn from_webhook_non_numeric_channel_id_defaults_target_to_zero() {
         // Ei-numeerinen id (esim. nimetty kanava) → target_channel_id = 0 (webhook-only).
-        let ch =
-            DiscordChannel::from_webhook("https://example.invalid/wh", "discord-main").expect("channel");
+        let ch = DiscordChannel::from_webhook("https://example.invalid/wh", "discord-main")
+            .expect("channel");
         assert_eq!(ch.channel_id(), "discord-main");
         assert_eq!(ch.target_channel_id, 0);
         assert_eq!(ch.kind(), ChannelKind::Discord);
@@ -544,8 +545,8 @@ mod tests {
         // Webhook-only-instanssi (target_channel_id == 0) ei voi lähettää: send()
         // palauttaa SELKEÄN InvalidInput-virheen sen sijaan että yrittäisi
         // hämärästi lähettää Discord-kanavalle 0. (P1: outbound impossible to misunderstand.)
-        let ch =
-            DiscordChannel::from_webhook("https://example.invalid/wh", "discord-main").expect("channel");
+        let ch = DiscordChannel::from_webhook("https://example.invalid/wh", "discord-main")
+            .expect("channel");
         assert_eq!(ch.target_channel_id, 0);
 
         let err = ch

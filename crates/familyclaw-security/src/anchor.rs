@@ -407,8 +407,14 @@ mod tests {
             let l = DecayLambda::new(lambda).expect("valid");
             for &t in &[0.0, 1.0, 100.0, 1.0e6] {
                 let r = l.retention(t);
-                assert!(r >= 0.0, "retention {r} must not be negative (λ={lambda}, t={t})");
-                assert!(r <= 1.0, "retention {r} should not exceed one (λ={lambda}, t={t})");
+                assert!(
+                    r >= 0.0,
+                    "retention {r} must not be negative (λ={lambda}, t={t})"
+                );
+                assert!(
+                    r <= 1.0,
+                    "retention {r} should not exceed one (λ={lambda}, t={t})"
+                );
                 assert!(!r.is_nan(), "retention must not be NaN (λ={lambda}, t={t})");
             }
         }
@@ -434,10 +440,16 @@ mod tests {
         let lambda = std::f64::consts::LN_2 / half_life;
         let l = DecayLambda::new(lambda).expect("valid");
         let r = l.retention(half_life);
-        assert!((r - 0.5).abs() < 1e-9, "half-life retention was {r}, expected 0.5");
+        assert!(
+            (r - 0.5).abs() < 1e-9,
+            "half-life retention was {r}, expected 0.5"
+        );
         // Kahden puolittumisajan jälkeen ≈ 0.25.
         let r2 = l.retention(half_life * 2.0);
-        assert!((r2 - 0.25).abs() < 1e-9, "double half-life retention was {r2}");
+        assert!(
+            (r2 - 0.25).abs() < 1e-9,
+            "double half-life retention was {r2}"
+        );
     }
 
     #[test]
@@ -568,10 +580,7 @@ mod tests {
         bytes[0] = if bytes[0] == b'0' { b'1' } else { b'0' };
         let mutated = String::from_utf8(bytes).expect("ascii hex");
         assert_ne!(mutated.as_str(), h.as_hex());
-        assert!(!constant_time_eq(
-            h.as_hex().as_bytes(),
-            mutated.as_bytes()
-        ));
+        assert!(!constant_time_eq(h.as_hex().as_bytes(), mutated.as_bytes()));
     }
 
     #[test]

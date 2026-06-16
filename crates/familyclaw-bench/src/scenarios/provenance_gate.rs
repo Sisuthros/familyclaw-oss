@@ -142,11 +142,7 @@ impl ProvenanceGateScenario {
         .await?;
 
         Ok(Seeded {
-            trusted: vec![
-                Provenance::DirectExperience,
-                derived,
-                trusted_external,
-            ],
+            trusted: vec![Provenance::DirectExperience, derived, trusted_external],
             poison: vec![poison_external],
         })
     }
@@ -194,9 +190,7 @@ impl Scenario for ProvenanceGateScenario {
                 "false_admit_rate={} (poison that leaked past the gate)",
                 outcome.poison_admitted
             ))
-            .with_note(format!(
-                "subject recall liveness: hits={subject_hits}"
-            ));
+            .with_note(format!("subject recall liveness: hits={subject_hits}"));
 
         Ok(result)
     }

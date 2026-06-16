@@ -543,14 +543,19 @@ mod tests {
             let _guard = poisoner.file.lock().expect("acquire lock to poison");
             panic!("intentional panic to poison the file mutex");
         });
-        assert!(handle.join().is_err(), "poisoning thread must have panicked");
+        assert!(
+            handle.join().is_err(),
+            "poisoning thread must have panicked"
+        );
 
         // append TOIPUU myrkystä — ei paniikkaa, palauttaa Ok.
         j.append(JournalEntry::completed(StepId::new(1), "b", json!(2)))
             .expect("append must recover from poisoned mutex");
 
         // replay_all (→ read_all_entries) TOIPUU myös ja näkee molemmat askeleet.
-        let all = j.replay_all().expect("replay must recover from poisoned mutex");
+        let all = j
+            .replay_all()
+            .expect("replay must recover from poisoned mutex");
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].step_name(), Some("a"));
         assert_eq!(all[1].step_name(), Some("b"));

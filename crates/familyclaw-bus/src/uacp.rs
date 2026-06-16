@@ -103,12 +103,7 @@ impl AcpEnvelope {
     }
 
     /// Rakentaa yhdelle olennolle suunnatun kirjekuoren.
-    pub fn directed(
-        verb: AcpVerb,
-        from: BeingId,
-        to: BeingId,
-        payload: impl Into<String>,
-    ) -> Self {
+    pub fn directed(verb: AcpVerb, from: BeingId, to: BeingId, payload: impl Into<String>) -> Self {
         Self {
             verb,
             from,

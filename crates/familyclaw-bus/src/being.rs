@@ -374,7 +374,11 @@ mod tests {
 
         on_pulse(&mut own, &incoming, EmotionTransition::new(0.0));
         assert_eq!(own.value(Dimension::Hope), 80.0);
-        assert_eq!(own.value(Dimension::Anger), 0.0, "havainto syrjäyttää vanhan");
+        assert_eq!(
+            own.value(Dimension::Anger),
+            0.0,
+            "havainto syrjäyttää vanhan"
+        );
     }
 
     #[test]
@@ -416,7 +420,11 @@ mod tests {
 
         {
             let got = emotion.lock().expect("lock");
-            assert_eq!(got.value(Dimension::Joy), 50.0, "oma Joy liikkui puoliväliin");
+            assert_eq!(
+                got.value(Dimension::Joy),
+                50.0,
+                "oma Joy liikkui puoliväliin"
+            );
         }
 
         actor.stop(None);

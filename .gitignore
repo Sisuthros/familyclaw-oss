@@ -132,3 +132,4 @@ ops/
 scripts/*.bak-*
 plans/
 research/
+_stray-backup/

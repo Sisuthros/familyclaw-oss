@@ -108,7 +108,10 @@ mod tests {
             let mut s = EmotionState::neutral();
             s.set(dim, 100.0);
             let v = emotional_salience(&s);
-            assert!((0.0..=1.0).contains(&v), "salience {v} ulkona rajoista: {dim}");
+            assert!(
+                (0.0..=1.0).contains(&v),
+                "salience {v} ulkona rajoista: {dim}"
+            );
         }
     }
 

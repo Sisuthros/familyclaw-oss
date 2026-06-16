@@ -834,6 +834,9 @@ mod tests {
         assert_eq!(m.factors.identity, 0.8);
         assert_eq!(m.factors.novelty, 0.6);
         assert_eq!(m.factors.reinforcement, 0.4);
-        assert!(m.factors.emotion > 0.0, "emotion-osatekijä päivittyi tilasta");
+        assert!(
+            m.factors.emotion > 0.0,
+            "emotion-osatekijä päivittyi tilasta"
+        );
     }
 }

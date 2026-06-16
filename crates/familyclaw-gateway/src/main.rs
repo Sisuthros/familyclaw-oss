@@ -906,7 +906,11 @@ fn load_orchestration_plan() -> OrchestrationPlan {
             warn!(error = %e, "kelvoton {PLAN_ENV} JSON — käytetään savutesti-oletusta");
             OrchestrationPlan::new(
                 "smoke",
-                vec![TaskNode::new("n1", "smoke turn", "fallback after invalid plan")],
+                vec![TaskNode::new(
+                    "n1",
+                    "smoke turn",
+                    "fallback after invalid plan",
+                )],
             )
         }
     }
@@ -934,14 +938,12 @@ async fn orchestrate() -> Result<()> {
     //    jotta select_worker näkee sen. Geneerinen nimi (KERROS A).
     let worker_id = familyclaw_core::AgentId::new();
     let worker = AgentInfo::new(worker_id, "worker-a", AgentRole::Executor, HostKind::Local);
-    bridge
-        .register_agent(worker)
-        .await
-        .map_err(|e| FamilyClawError::invalid_input(format!("orchestrate: register failed: {e}")))?;
-    bridge
-        .heartbeat(worker_id, now)
-        .await
-        .map_err(|e| FamilyClawError::invalid_input(format!("orchestrate: heartbeat failed: {e}")))?;
+    bridge.register_agent(worker).await.map_err(|e| {
+        FamilyClawError::invalid_input(format!("orchestrate: register failed: {e}"))
+    })?;
+    bridge.heartbeat(worker_id, now).await.map_err(|e| {
+        FamilyClawError::invalid_input(format!("orchestrate: heartbeat failed: {e}"))
+    })?;
 
     // 3. LiveTurnExecutor oikealla LLM-ketjulla (sama resolver kuin serve).
     let resolver = build_resolver();
