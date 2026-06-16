@@ -127,6 +127,36 @@ jobs:
       - name: Run unit tests (discord feature)
         run: cargo test --workspace --features discord
 
+  windows-msvc-lint:
+    # Phase 0 (v1.0 roadmap): the per-phase "green on MSVC" gate must be enforced
+    # by ONE machine. The `check` job runs clippy/doc on ubuntu; the `windows` job
+    # runs only build+test. This job closes that gap: clippy (pedantic, -D warnings)
+    # AND doc (-D warnings) on windows-latest (MSVC stable), with the SAME feature
+    # set the ubuntu `check` job uses. Add each future phase's feature flag here so
+    # no Windows-only lint/doc break behind a new feature can pass CI.
+    name: Clippy + Doc (Windows / MSVC)
+    needs: layer-b-audit
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (discord feature, pedantic -D warnings)
+        run: cargo clippy --workspace --all-targets --features discord -- -D warnings
+
+      - name: Generate documentation (discord feature)
+        run: cargo doc --no-deps --features discord
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
   cargo-audit:
     name: cargo audit
     needs: layer-b-audit

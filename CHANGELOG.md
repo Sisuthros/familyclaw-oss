@@ -5,6 +5,26 @@ All notable changes to FamilyClaw will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha.8] - 2026-06-16
+
+### Added
+- **familyclaw-actions** (UUSI crate, KERROS A / OSS) — toiminta-/skill-ajoaika joka
+  toteuttaa putken `observe → plan → approve → execute → verify → persist proof →
+  remember → report`. Sisältää geneerisen skill-rekisterin, kyvykkyyspolitiikan,
+  hyväksyntäportin, redaktoivat todistepaketit (proof bundles) ja audit-lokin.
+  Vain mock-skillejä — ei oikeita Gmail/GitHub-verkkokutsuja, ei providereita,
+  sieluja eikä avaimia. 161 yksikkötestiä, mukaan lukien redaktio-todiste
+  (synteettinen avain-mallinen syöte korvautuu `[REDACTED]`-merkinnällä).
+- Juuren `Cargo.toml`: `familyclaw-actions` lisätty `[workspace.dependencies]`-listaan
+  (aakkosjärjestyksessä).
+
+### Verified
+- `bash scripts/audit-layer-b.sh` — PASS (ei sieluja/avaimia/nimivuotoja)
+- `cargo build --workspace` ja `--features discord` — PASS
+- `cargo clippy --workspace --all-targets --features discord -- -D warnings` (pedantic) — clean
+- `cargo test --workspace --features discord` — kaikki PASS (familyclaw-actions: 161)
+- `cargo doc -p familyclaw-actions --no-deps` (RUSTDOCFLAGS=-D warnings) — clean
+
 ## [0.1.0-alpha.7] - 2026-06-14
 
 ### Fixed
