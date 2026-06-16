@@ -1,0 +1,33 @@
+[package]
+name = "familyclaw-actions"
+description = "Skill-, hyväksyntä-, suoritus- ja todistepino agenttien toiminnoille (KERROS A, OSS)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "familyclaw-actions-cli"
+path = "src/bin/familyclaw-actions-cli.rs"
+
+[dependencies]
+familyclaw-core = { workspace = true }
+familyclaw-bridge = { workspace = true }
+familyclaw-security = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { version = "0.8" }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread"] }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

@@ -1438,6 +1438,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "familyclaw-actions"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "familyclaw-bridge",
+ "familyclaw-core",
+ "familyclaw-security",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "uuid",
+]
+
+[[package]]
 name = "familyclaw-agent"
 version = "0.1.0"
 dependencies = [
@@ -1735,6 +1753,17 @@ name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+
+[[package]]
+name = "fc-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "nanoid",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+]
 
 [[package]]
 name = "ff"
@@ -3016,6 +3045,15 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nanoid"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ffa00dec017b5b1a8b7cf5e2c008bfda1aa7e0697ac1508b491fdf2622fb4d8"
+dependencies = [
+ "rand 0.8.6",
 ]
 
 [[package]]
@@ -5410,6 +5448,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
