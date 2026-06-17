@@ -207,6 +207,53 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// A tool the model is allowed to call.
+///
+/// Serialized into the `OpenAI` tools-array shape
+/// (`{"type":"function","function":{"name","description","parameters"}}`) when
+/// attached to a request. The `input_schema` is a JSON Schema describing the
+/// tool's arguments; it becomes the `function.parameters` field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolDefinition {
+    /// Tool name the model uses to invoke this tool.
+    pub name: String,
+    /// Human-readable description of what the tool does.
+    pub description: String,
+    /// JSON Schema for the tool's arguments (becomes `function.parameters`).
+    pub input_schema: serde_json::Value,
+}
+
+/// `OpenAI` tools-array wire shape: `{"type":"function","function":{...}}`.
+///
+/// Kept private — callers build [`ToolDefinition`]s; this is the serialization
+/// envelope the API expects. Borrows from the [`ToolDefinition`] to avoid clones.
+#[derive(Serialize)]
+struct ToolEnvelope<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ToolFunction<'a>,
+}
+
+#[derive(Serialize)]
+struct ToolFunction<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a serde_json::Value,
+}
+
+impl<'a> From<&'a ToolDefinition> for ToolEnvelope<'a> {
+    fn from(def: &'a ToolDefinition) -> Self {
+        Self {
+            kind: "function",
+            function: ToolFunction {
+                name: &def.name,
+                description: &def.description,
+                parameters: &def.input_schema,
+            },
+        }
+    }
+}
+
 /// LLM client — stateless HTTP caller for OpenAI-compatible APIs.
 pub struct LlmClient {
     config: LlmConfig,
@@ -270,6 +317,10 @@ impl LlmClient {
             model: &self.config.model,
             messages,
             max_tokens: self.config.max_tokens,
+            // Empty tools + no tool_choice → these fields are skipped, so this
+            // request serializes byte-identically to the pre-tools version.
+            tools: Vec::new(),
+            tool_choice: None,
         };
 
         let response = self
@@ -316,13 +367,20 @@ impl LlmClient {
             .ok_or(LlmError::NoContent)
     }
 
-    /// Completes a chat conversation and returns both text and tool calls.
+    /// Completes a chat conversation, advertising the given `tools`, and returns
+    /// both text and any tool calls the model chose to make.
+    ///
+    /// When `tools` is empty this advertises no tools (and the wire request is
+    /// identical to [`Self::complete`] plus the tool-aware response parse).
+    /// `tool_choice` is set to `"auto"` whenever tools are present, letting the
+    /// model decide whether to call one.
     ///
     /// # Errors
     /// Returns an error if the HTTP request fails or the response is invalid.
     pub async fn complete_with_tools(
         &self,
         messages: &[LlmMessage],
+        tools: &[ToolDefinition],
     ) -> Result<CompletionResult, LlmError> {
         let endpoint = Self::build_endpoint(&self.config.api_base);
 
@@ -330,6 +388,8 @@ impl LlmClient {
             model: &self.config.model,
             messages,
             max_tokens: self.config.max_tokens,
+            tools: tools.iter().map(ToolEnvelope::from).collect(),
+            tool_choice: if tools.is_empty() { None } else { Some("auto") },
         };
 
         let response = self
@@ -480,6 +540,13 @@ struct ChatCompletionsRequest<'a, 'b> {
     model: &'a str,
     messages: &'b [LlmMessage],
     max_tokens: u32,
+    /// Tools the model may call. Absent (`skip_serializing_if`) when empty, so
+    /// existing tool-less requests serialize byte-identically to before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ToolEnvelope<'a>>,
+    /// Tool-choice hint (e.g. `"auto"`). Absent when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
 }
 
 #[derive(Deserialize)]
@@ -593,6 +660,79 @@ mod tests {
     fn test_build_endpoint_no_trailing_slash() {
         let endpoint = LlmClient::build_endpoint("https://api.openai.com/v1");
         assert_eq!(endpoint, "https://api.openai.com/v1/chat/completions");
+    }
+
+    // ── 1A: tool schema + request serialization ─────────────────────────────
+
+    #[test]
+    fn test_tool_definition_serializes_to_openai_envelope() {
+        let def = ToolDefinition {
+            name: "fs_read".into(),
+            description: "Read a file".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+        };
+        let envelope = ToolEnvelope::from(&def);
+        let json = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(json["type"], "function");
+        assert_eq!(json["function"]["name"], "fs_read");
+        assert_eq!(json["function"]["description"], "Read a file");
+        // input_schema becomes function.parameters (OpenAI shape).
+        assert_eq!(json["function"]["parameters"]["required"][0], "path");
+    }
+
+    #[test]
+    fn test_request_without_tools_omits_tool_fields() {
+        // The byte-identical invariant: a tool-less request must NOT emit
+        // `tools` or `tool_choice` keys.
+        let messages = vec![LlmMessage::user("hi")];
+        let req = ChatCompletionsRequest {
+            model: "m",
+            messages: &messages,
+            max_tokens: 100,
+            tools: Vec::new(),
+            tool_choice: None,
+        };
+        let json = serde_json::to_value(&req).expect("serialize");
+        assert!(json.get("tools").is_none(), "tools must be omitted when empty");
+        assert!(json.get("tool_choice").is_none(), "tool_choice must be omitted when None");
+        assert_eq!(json["model"], "m");
+        assert_eq!(json["max_tokens"], 100);
+    }
+
+    #[test]
+    fn test_request_with_tools_includes_them() {
+        let messages = vec![LlmMessage::user("hi")];
+        let def = ToolDefinition {
+            name: "echo".into(),
+            description: "Echo".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let req = ChatCompletionsRequest {
+            model: "m",
+            messages: &messages,
+            max_tokens: 100,
+            tools: vec![ToolEnvelope::from(&def)],
+            tool_choice: Some("auto"),
+        };
+        let json = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(json["tools"][0]["function"]["name"], "echo");
+        assert_eq!(json["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn test_tool_definition_roundtrip() {
+        let def = ToolDefinition {
+            name: "t".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let json = serde_json::to_string(&def).expect("serialize");
+        let back: ToolDefinition = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(def, back);
     }
 
     #[test]
