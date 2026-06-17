@@ -223,6 +223,41 @@ pub struct ToolDefinition {
     pub input_schema: serde_json::Value,
 }
 
+impl ToolDefinition {
+    /// Validates that this definition is safe to advertise to the model.
+    ///
+    /// Tool names must match `^[A-Za-z0-9_-]{1,64}$` — a name that works in one
+    /// provider but breaks another (or injects unexpected characters) is a
+    /// portability and safety hazard, so it is rejected at the boundary rather
+    /// than silently sent. The `input_schema` root must be a JSON object (a
+    /// scalar/array schema is not a valid `function.parameters` shape).
+    ///
+    /// # Errors
+    /// Returns [`LlmError::InvalidTool`] if the name is malformed or the schema
+    /// root is not an object.
+    pub fn validate(&self) -> Result<(), LlmError> {
+        let name_ok = !self.name.is_empty()
+            && self.name.len() <= 64
+            && self
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !name_ok {
+            return Err(LlmError::InvalidTool(format!(
+                "tool name {:?} must match ^[A-Za-z0-9_-]{{1,64}}$",
+                self.name
+            )));
+        }
+        if !self.input_schema.is_object() {
+            return Err(LlmError::InvalidTool(format!(
+                "tool {:?} input_schema root must be a JSON object",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// `OpenAI` tools-array wire shape: `{"type":"function","function":{...}}`.
 ///
 /// Kept private — callers build [`ToolDefinition`]s; this is the serialization
@@ -382,6 +417,12 @@ impl LlmClient {
         messages: &[LlmMessage],
         tools: &[ToolDefinition],
     ) -> Result<CompletionResult, LlmError> {
+        // Validate every tool BEFORE sending — a malformed name/schema is a
+        // deterministic config error, caught at the boundary, not on the wire.
+        for tool in tools {
+            tool.validate()?;
+        }
+
         let endpoint = Self::build_endpoint(&self.config.api_base);
 
         let request_body = ChatCompletionsRequest {
@@ -435,6 +476,16 @@ impl LlmClient {
         let content = choice.message.content;
         let tool_calls = choice.message.tool_calls;
 
+        // A choice with NEITHER content NOR tool calls is a silent "succeeded
+        // but did nothing" state. For the tool loop (1B) that is a trap — the
+        // loop has no text to reply with and no call to dispatch. Classify it
+        // as retryable NoContent so failover tries the next model instead of
+        // surfacing an empty result. [F1 invariant — mirrors `complete`.]
+        let has_tool_calls = tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+        if content.is_none() && !has_tool_calls {
+            return Err(LlmError::NoContent);
+        }
+
         Ok(CompletionResult {
             content,
             tool_calls,
@@ -478,6 +529,9 @@ pub enum LlmError {
     Parse(String),
     /// No content in response
     NoContent,
+    /// A tool definition advertised to the model is malformed (bad name or
+    /// non-object schema). Deterministic config error → **not** retryable.
+    InvalidTool(String),
 }
 
 impl LlmError {
@@ -499,7 +553,9 @@ impl LlmError {
     pub const fn is_retryable(&self) -> bool {
         match self {
             LlmError::Timeout(_) | LlmError::Http(_) | LlmError::NoContent => true,
-            LlmError::Parse(_) => false,
+            // Parse + InvalidTool are deterministic: the same request would fail
+            // identically, so do not grind the whole chain.
+            LlmError::Parse(_) | LlmError::InvalidTool(_) => false,
         }
     }
 
@@ -527,6 +583,7 @@ impl std::fmt::Display for LlmError {
             LlmError::Timeout(msg) => write!(f, "Timeout error: {msg}"),
             LlmError::Parse(msg) => write!(f, "Parse error: {msg}"),
             LlmError::NoContent => write!(f, "No content in response"),
+            LlmError::InvalidTool(msg) => write!(f, "Invalid tool definition: {msg}"),
         }
     }
 }
@@ -733,6 +790,84 @@ mod tests {
         let json = serde_json::to_string(&def).expect("serialize");
         let back: ToolDefinition = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(def, back);
+    }
+
+    #[test]
+    fn test_tool_less_request_exact_string_serialization() {
+        // GPT-5.5 review: prove the "byte-identical" invariant at the STRING
+        // level, not just value level — the tool-less request must serialize to
+        // exactly the pre-tools shape with no tools/tool_choice keys.
+        let messages = vec![LlmMessage::user("hi")];
+        let req = ChatCompletionsRequest {
+            model: "m",
+            messages: &messages,
+            max_tokens: 100,
+            tools: Vec::new(),
+            tool_choice: None,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":100}"#
+        );
+    }
+
+    #[test]
+    fn test_tool_definition_validate_rejects_bad_name() {
+        let bad_chars = ToolDefinition {
+            name: "fs read!".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        assert!(matches!(bad_chars.validate(), Err(LlmError::InvalidTool(_))));
+
+        let empty = ToolDefinition {
+            name: String::new(),
+            description: "d".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        assert!(matches!(empty.validate(), Err(LlmError::InvalidTool(_))));
+
+        let too_long = ToolDefinition {
+            name: "a".repeat(65),
+            description: "d".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        assert!(matches!(too_long.validate(), Err(LlmError::InvalidTool(_))));
+    }
+
+    #[test]
+    fn test_tool_definition_validate_rejects_non_object_schema() {
+        let scalar = ToolDefinition {
+            name: "echo".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!("not an object"),
+        };
+        assert!(matches!(scalar.validate(), Err(LlmError::InvalidTool(_))));
+
+        let array = ToolDefinition {
+            name: "echo".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!([1, 2, 3]),
+        };
+        assert!(matches!(array.validate(), Err(LlmError::InvalidTool(_))));
+    }
+
+    #[test]
+    fn test_tool_definition_validate_accepts_good() {
+        let good = ToolDefinition {
+            name: "fs_read-v1".into(),
+            description: "Read a file".into(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        };
+        assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn test_invalid_tool_is_not_retryable() {
+        // A malformed tool definition is deterministic — must NOT trigger
+        // failover (would just fail identically on every model).
+        assert!(!LlmError::InvalidTool("bad".into()).is_retryable());
     }
 
     #[test]
