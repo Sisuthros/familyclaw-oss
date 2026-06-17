@@ -89,9 +89,11 @@ pub use mcp::{
 pub use proof::{
     build_proof, redact_value, sha256_hex, ProofBundle, RedactionReport, VerificationResult,
 };
+#[allow(deprecated)]
+pub use skills::MockSkill;
 pub use skills::{
     DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, GithubIssueDraftMock, MemoryRecord,
-    MockSkill, Pipeline, PipelineOutcome,
+    Pipeline, PipelineOutcome, Skill,
 };
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).

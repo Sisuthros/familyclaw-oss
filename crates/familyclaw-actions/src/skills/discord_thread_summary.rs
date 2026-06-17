@@ -16,7 +16,7 @@ use crate::ids::SkillId;
 use crate::manifest::SkillManifest;
 use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 
-use super::MockSkill;
+use super::Skill;
 
 /// Geneerinen kanava (KERROS A — ei oikea kanava).
 pub const CHANNEL: &str = "general";
@@ -135,7 +135,7 @@ impl ActionExecutor for DiscordThreadSummaryMock {
     }
 }
 
-impl MockSkill for DiscordThreadSummaryMock {
+impl Skill for DiscordThreadSummaryMock {
     fn manifest(&self) -> SkillManifest {
         SkillManifest {
             id: Self::skill_id(),

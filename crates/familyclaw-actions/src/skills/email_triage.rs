@@ -16,7 +16,7 @@ use crate::ids::SkillId;
 use crate::manifest::SkillManifest;
 use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 
-use super::MockSkill;
+use super::Skill;
 
 /// Taidon kiinteä tunniste, jotta rekisteröinti ja haku ovat toistettavia.
 const SKILL_UUID: uuid::Uuid = uuid::uuid!("22222222-2222-4222-8222-222222222222");
@@ -136,7 +136,7 @@ impl ActionExecutor for EmailTriageMock {
     }
 }
 
-impl MockSkill for EmailTriageMock {
+impl Skill for EmailTriageMock {
     fn manifest(&self) -> SkillManifest {
         SkillManifest {
             id: Self::skill_id(),

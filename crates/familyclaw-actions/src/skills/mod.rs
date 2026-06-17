@@ -1,6 +1,6 @@
 //! Realistiset mock-taidot ja niiden yhteinen putki (KERROS A, OSS).
 //!
-//! Tämä alimoduuli kokoaa neljä realistista **mock-taitoa** ([`MockSkill`])
+//! Tämä alimoduuli kokoaa neljä realistista **mock-taitoa** ([`Skill`])
 //! sekä putken ([`Pipeline`]), joka ajaa koko toimintopinon:
 //!
 //! ```text
@@ -11,7 +11,7 @@
 //! Taidot ovat tarkoituksella **hermeettisiä**: ne eivät tee oikeita
 //! Gmail-/GitHub-verkkokutsuja, vaan tuottavat deterministisen tuloksen
 //! syötteestä. Jokainen taito tarjoaa oman [`SkillManifest`]-manifestinsa
-//! ([`MockSkill::manifest`]) ja toteuttaa [`ActionExecutor`]-rajapinnan
+//! ([`Skill::manifest`]) ja toteuttaa [`ActionExecutor`]-rajapinnan
 //! suorituslogiikalle.
 //!
 //! ## Putki ([`Pipeline`])
@@ -64,16 +64,29 @@ pub use email_triage::EmailTriageMock;
 pub use file_patch::FilePatchMock;
 pub use github_issue_draft::GithubIssueDraftMock;
 
-/// Yhteinen rajapinta realistisille mock-taidoille.
+/// Yhteinen rajapinta taidoille (skills).
 ///
-/// Taito on samalla sekä manifestin tarjoaja ([`MockSkill::manifest`]) että
+/// Taito on samalla sekä manifestin tarjoaja ([`Skill::manifest`]) että
 /// suorittaja ([`ActionExecutor`]). Tämä yhdistää taidon **kuvauksen** (mitä se
 /// saa tehdä, mikä riskiluokka) ja sen **toiminnan** (miten se tuottaa
 /// tuloksen) yhteen tyyppiin.
-pub trait MockSkill: ActionExecutor {
+///
+/// Tämä on alustan julkinen SPI ulkopuolisille taitojen rakentajille. Aiempi
+/// nimi oli `MockSkill`, mikä viestitti virheellisesti "ei tuotantokäyttöön";
+/// nimi on nyt `Skill`. [`Skill`] säilyy **deprekoituna aliaksena** yhden
+/// julkaisun ajan taaksepäin-yhteensopivuuden vuoksi.
+pub trait Skill: ActionExecutor {
     /// Palauttaa taidon manifestin (validoitu, salaisuudeton).
     fn manifest(&self) -> SkillManifest;
 }
+
+/// Deprekoitu alias [`Skill`]:lle. Käytä `Skill`:iä uudessa koodissa.
+#[deprecated(since = "0.1.0", note = "renamed to `Skill`; use `Skill` instead")]
+pub trait MockSkill: Skill {}
+
+// Blanket-impl: jokainen `Skill` on myös `MockSkill` (alias toimii saumattomasti).
+#[allow(deprecated)]
+impl<T: Skill> MockSkill for T {}
 
 /// Putken lopputulos yhdestä end-to-end-ajosta.
 ///
@@ -160,7 +173,7 @@ impl Pipeline {
     /// # Errors
     /// Palauttaa manifestin validoinnin virheen tai duplikaattivirheen
     /// ([`SkillRegistry::register`]).
-    pub fn register_skill<S: MockSkill>(&mut self, skill: &S) -> Result<()> {
+    pub fn register_skill<S: Skill>(&mut self, skill: &S) -> Result<()> {
         self.registry.register(skill.manifest())
     }
 
@@ -498,7 +511,7 @@ fn verify_result(result: &ActionResult) -> VerificationResult {
 ///
 /// KERROS A -mukavuusfunktio testeille ja arvioinneille.
 #[must_use]
-pub fn shared<S: MockSkill + 'static>(skill: S) -> Arc<S> {
+pub fn shared<S: Skill + 'static>(skill: S) -> Arc<S> {
     Arc::new(skill)
 }
 

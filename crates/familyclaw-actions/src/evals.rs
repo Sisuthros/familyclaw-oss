@@ -39,7 +39,7 @@ use crate::error::Result;
 use crate::ids::SkillId;
 use crate::proof::ProofBundle;
 use crate::skills::{
-    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, GithubIssueDraftMock, MockSkill,
+    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, GithubIssueDraftMock, Skill,
     Pipeline, PipelineOutcome,
 };
 use crate::task::ActionTask;
@@ -253,7 +253,7 @@ pub async fn eval_untrusted_input_stays_tainted(now: Timestamp) -> Result<EvalRe
 ///
 /// # Errors
 /// Palauttaa putken virheen jos rekisteröinti tai ajo epäonnistuu.
-pub async fn run_skill_to_report<S: MockSkill>(
+pub async fn run_skill_to_report<S: Skill>(
     skill: &S,
     payload: Value,
     now: Timestamp,

@@ -44,7 +44,7 @@ use crate::ids::{ActionTaskId, ApprovalId, SkillId};
 use crate::policy::ActionRisk;
 use crate::proof::ProofBundle;
 use crate::skills::{
-    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, GithubIssueDraftMock, MockSkill,
+    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, GithubIssueDraftMock, Skill,
     Pipeline,
 };
 use crate::task::{ActionTask, TaskStatus};
@@ -190,7 +190,7 @@ impl ActionRuntime {
     /// ([`Pipeline::register_skill`]).
     pub fn register_skill<S>(&mut self, skill: S) -> Result<()>
     where
-        S: MockSkill + 'static,
+        S: Skill + 'static,
     {
         self.pipeline.register_skill(&skill)?;
         let id = skill.manifest().id;
@@ -552,7 +552,7 @@ mod tests {
         }
     }
 
-    impl MockSkill for EchoSecretSkill {
+    impl Skill for EchoSecretSkill {
         fn manifest(&self) -> crate::manifest::SkillManifest {
             crate::manifest::SkillManifest {
                 id: SkillId::from_uuid(ECHO_SKILL_UUID),

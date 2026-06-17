@@ -20,7 +20,7 @@ use crate::ids::SkillId;
 use crate::manifest::SkillManifest;
 use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 
-use super::MockSkill;
+use super::Skill;
 
 /// Geneerinen kohderepo (KERROS A — ei oikea repo).
 pub const EXAMPLE_REPO: &str = "example-org/example-repo";
@@ -125,7 +125,7 @@ impl ActionExecutor for GithubIssueDraftMock {
     }
 }
 
-impl MockSkill for GithubIssueDraftMock {
+impl Skill for GithubIssueDraftMock {
     fn manifest(&self) -> SkillManifest {
         SkillManifest {
             id: Self::skill_id(),
