@@ -105,7 +105,7 @@ impl FamilyRuntime {
 
 /// C5-kokooja: rakentaa elävän [`FamilyRuntime`]:n yhdellä kutsulla.
 ///
-/// Kytkee `Channel::receive()` → [`pump_channel_to_bus`] → bus → `Agent`
+/// Kytkee `Channel::receive()` → [`familyclaw_agent::pump_channel_to_bus`] → bus → `Agent`
 /// (spawn) → `route_reply` → reply-jono → `Channel::send`. MVP: yksi agentti,
 /// yksi kanava, staattinen reply-kohde.
 ///

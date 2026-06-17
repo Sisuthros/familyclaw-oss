@@ -33,6 +33,8 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! [`EventBus`]: familyclaw_bridge::EventBus
 
 use familyclaw_bridge::{EventKind, EventSubscriber, FamilyBridge};
 

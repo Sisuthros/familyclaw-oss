@@ -89,8 +89,8 @@ impl SandboxError {
 impl From<SandboxError> for familyclaw_core::FamilyClawError {
     /// Muuntaa sandbox-virheen alustan keskitettyyn virhetyyppiin.
     ///
-    /// Kaikki sandbox-virheet kartoittuvat [`FamilyClawError::Bus`]:iin tai
-    /// [`FamilyClawError::InvalidInput`]:iin sopivimmin: polttoaine ja
+    /// Kaikki sandbox-virheet kartoittuvat [`familyclaw_core::FamilyClawError::Bus`]:iin tai
+    /// [`familyclaw_core::FamilyClawError::InvalidInput`]:iin sopivimmin: polttoaine ja
     /// suoritusvirheet ovat ajonaikaisia (Bus), kyvykkyys- ja
     /// toteutusvirheet kelpaavat syöte-/kelpoisuusvirheiksi.
     fn from(err: SandboxError) -> Self {

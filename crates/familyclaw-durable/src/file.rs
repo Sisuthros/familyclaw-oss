@@ -7,7 +7,7 @@
 //!
 //! ## Kaatumiskestävyys
 //! Jos prosessi kaatuu kesken rivin kirjoituksen, viimeinen rivi voi jäädä
-//! vajaaksi (ei `\n`-päätettä, tai typistynyt JSON). [`replay_from`] sietää
+//! vajaaksi (ei `\n`-päätettä, tai typistynyt JSON). [`replay_from`](crate::Journal::replay_from) sietää
 //! **tasan tämän yhden tapauksen**: tiedoston *viimeinen* rivi jonka jäsennys
 //! epäonnistuu JA jolta puuttuu rivinvaihto hylätään hiljaisesti vajaana
 //! kirjoituksena. Mikä tahansa *aiempi* vioittunut rivi on aito korruptio ja

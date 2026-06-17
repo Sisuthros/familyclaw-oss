@@ -323,7 +323,7 @@ impl BusHandle {
     }
 
     /// Julkaisee hyötykuorman **per-viesti-alkuperän** kanssa (F2): kirjekuori
-    /// kantaa [`MessageOrigin`]:n, josta vastaanottava agentti johtaa
+    /// kantaa [`crate::message::MessageOrigin`]:n, josta vastaanottava agentti johtaa
     /// vastauksen kohteen per viesti. Käytetään kanavakerroksen sillassa, kun
     /// saapuva viesti tulee ulkomaailmasta tunnetusta keskustelusta.
     ///

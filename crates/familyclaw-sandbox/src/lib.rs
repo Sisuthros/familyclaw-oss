@@ -21,7 +21,7 @@
 //!
 //! ## Feature-flagit
 //! - **`wasmtime`** (ei oletuksena): kytkee
-//!   [`WasmtimeSandbox`](crate::WasmtimeSandbox)-toteutuksen. wasmtime on iso
+//!   `WasmtimeSandbox`-toteutuksen. wasmtime on iso
 //!   riippuvuus (Cranelift + JIT), joten se on optional ettei se hidasta koko
 //!   workspacen buildia. Ilman tätä featurea vain [`NoopSandbox`] on saatavilla.
 //!
@@ -79,7 +79,7 @@
 //!    lopun. Kytketään **valinnaisena** koukkuna muuttamatta olemassa
 //!    olevien tyyppien julkista rajapintaa.
 //!
-//! Lisäksi [`replay`] toteuttaa LOOP-mekanismin (2605.14237): suoritus
+//! Lisäksi [`replay`](mod@replay) toteuttaa LOOP-mekanismin (2605.14237): suoritus
 //! tallennetaan [`ExecutionTrace`]:ksi ja toistetaan deterministisesti
 //! pelkästä lokista, mikä mahdollistaa containment-tapahtumien bitintarkan
 //! jälkitarkastelun ilman alkuperäistä backendia.
@@ -115,7 +115,7 @@ pub const fn version() -> &'static str {
 /// Palauttaa oletussandboxin laatikoituna trait-objektina.
 ///
 /// `wasmtime`-featuren kanssa tämä on
-/// [`WasmtimeSandbox`](crate::WasmtimeSandbox); ilman sitä
+/// `WasmtimeSandbox`; ilman sitä
 /// [`NoopSandbox`]. Tämä antaa kutsujalle backend-riippumattoman tavan saada
 /// "paras saatavilla oleva" sandbox.
 ///

@@ -1,7 +1,7 @@
 //! Desire Clock — yöllinen uniajastin (Anthropic §2.3.1).
 //!
 //! Tämä moduuli tarjoaa [`DesireClock`]in, joka määrittää kellonajat jolloin
-//! [`familyclaw_dream::DreamCycle`] tulisi ajaa. Se noudattaa Anthropicin
+//! [`crate::DreamCycle`] tulisi ajaa. Se noudattaa Anthropicin
 //! Dreaming-mallin (design §2.3.1) mukaista käytäntöä:
 //!
 //! - **3AM-local reflection** — unijakso käynnistyy aina klo 03:00 paikka-aikavyöhykkeellä

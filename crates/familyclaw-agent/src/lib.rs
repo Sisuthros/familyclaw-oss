@@ -28,7 +28,7 @@
 //!
 //! ## SOUL-lataus (design §1, KERROS A / KERROS B -raja)
 //! Sielut ladataan ajonaikaisesti geneerisestä profiilihakemistosta
-//! ([`soul::PROFILE_DIR_ENV`] / [`AgentConfig::profile_dir`]). **Mitään
+//! ([`soul::PROFILE_DIR_ENV`] / [`AgentConfig::profile_dir`](familyclaw_core::AgentConfig::profile_dir)). **Mitään
 //! perheenjäsenen sielua, mallinimeä, avainta tai polkua ei kovakoodata**
 //! tähän crateen. Esimerkit (ks. binääri `familyclaw`) käyttävät geneerisiä
 //! nimiä (`agent_a`, `agent_b`).

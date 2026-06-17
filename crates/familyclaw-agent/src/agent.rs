@@ -249,7 +249,7 @@ impl Agent {
     /// Ilman tätä kutsua seuraava elävä vuoro:
     /// 1. käyttäisi `turn_counter = 0`:aa → askelnimi `turn-0`, joka osuisi yhä
     ///    avoinna olevaan replay-haaraan ja kaatuisi
-    ///    [`DurableError::NondeterministicReplay`]:hin (tai mykistäisi vuoron,
+    ///    [`DurableError::NondeterministicReplay`](familyclaw_durable::DurableError::NondeterministicReplay):hin (tai mykistäisi vuoron,
     ///    koska `is_replaying()` gatettaa LLM-ajattelun ja reply:n), ja
     /// 2. törmäisi muistin `turn_key`:ssä (`{name}:turn-0`) replayn duplikaattiin
     ///    → uuden viestin muisti häviäisi (`MemoryStore` dedup).

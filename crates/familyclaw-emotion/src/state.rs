@@ -2,7 +2,7 @@
 //!
 //! Tila on 19 liukulukuarvoa (`0.0..=100.0`), yksi kutakin
 //! [`Dimension`]-akselia kohti. Tilasta voidaan johtaa matala-ulotteinen
-//! [`Vad`]-yhteenveto ja tunnistaa nimettyjä [`Blend`]-yhdistelmiä, ja se
+//! [`Vad`]-yhteenveto ja tunnistaa nimettyjä [`Blend`](crate::blend::Blend)-yhdistelmiä, ja se
 //! vaimenee ajan myötä ([`EmotionState::decay`]) kohti kalibroinnin
 //! määräämää lepotilaa.
 
@@ -113,7 +113,7 @@ impl EmotionState {
         Vad::new(v / total_weight, a / total_weight, d / total_weight)
     }
 
-    /// Voimakkain läsnä oleva nimetty [`Blend`] tässä tilassa, tai `None`.
+    /// Voimakkain läsnä oleva nimetty [`Blend`](crate::blend::Blend) tässä tilassa, tai `None`.
     ///
     /// Kts. [`crate::blend::detect_blends`] kun haluat kaikki blendit.
     #[must_use]

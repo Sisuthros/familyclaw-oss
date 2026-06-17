@@ -3,18 +3,18 @@
 //! [`GatedMemoryStore`] kietoo minkä tahansa [`MemoryStore`]-toteutuksen ja
 //! pakottaa [`ProvenanceGate`]-myrkytyssuojan **kirjoitushetkellä**: ennen kuin
 //! muisto pääsee sisempään tallennukseen, sen alkuperä punnitaan portilla.
-//! Matalan luottamuksen ulkoinen lähde ([`Provenance::External`] jonka `trust`
+//! Matalan luottamuksen ulkoinen lähde ([`Provenance::External`](crate::Provenance::External) jonka `trust`
 //! alittaa portin kynnyksen) hylätään, jolloin se ei pääse saastuttamaan
 //! myöhempää haetua (*Sleeper Memory Poisoning* -suoja, kts.
 //! [`crate::provenance`]).
 //!
-//! Suora kokemus ([`Provenance::DirectExperience`]) ja johdetut muistot
-//! ([`Provenance::Derived`]) pääsevät aina läpi — vain ulkoiset väitteet
+//! Suora kokemus ([`Provenance::DirectExperience`](crate::Provenance::DirectExperience)) ja johdetut muistot
+//! ([`Provenance::Derived`](crate::Provenance::Derived)) pääsevät aina läpi — vain ulkoiset väitteet
 //! punnitaan.
 //!
 //! ## Suunnittelu
 //! - **Additiivinen:** ei muuta [`MemoryStore`]-traitia eikä
-//!   [`LocalJsonStore`]-toteutusta. Vahti on uusi, valinnainen kerros.
+//!   [`LocalJsonStore`](crate::LocalJsonStore)-toteutusta. Vahti on uusi, valinnainen kerros.
 //! - **Läpinäkyvä:** kaikki muut metodit ([`get`](MemoryStore::get),
 //!   [`retrieve`](MemoryStore::retrieve), [`run_decay`](MemoryStore::run_decay)
 //!   jne.) delegoidaan sellaisenaan sisempään tallennukseen.

@@ -8,7 +8,7 @@
 //! Oletuksena (kun [`BusLatentChannel::new`] luo kanavan) lähetyspolku tekee
 //! pelkän [`RecursiveLink`]-dimensiosovituksen (pad/truncate/resize) — sama
 //! käyttäytyminen kuin ennen. Jos kanavalle annetaan
-//! [`VectorTranslator`](familyclaw_latent::translate::VectorTranslator)
+//! [`VectorTranslator`]
 //! ([`with_translator`](BusLatentChannel::with_translator)), lähtevä vektori
 //! *käännetään* vastaanottajan avaruuteen ennen toimitusta:
 //!

@@ -6,7 +6,7 @@
 //!
 //! Skeema on `SurrealDB` v3 -syntaksia (`DEFINE TABLE ... SCHEMAFULL`,
 //! `array<float>`, `HNSW`-indeksit). Sitä sovelletaan kerran tietokannan
-//! alustuksessa [`crate::db::surreal::SurrealHearthStore`]:n toimesta.
+//! alustuksessa `SurrealHearthStore`:n toimesta (`surreal`-feature).
 
 /// SurrealDB-skeema The Hearthille.
 pub const HEARTH_SCHEMA: &str = r"

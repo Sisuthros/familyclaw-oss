@@ -8,7 +8,7 @@
 //!
 //! Tämä on C5-saumassa luvattu `build_family`-kokoojan **ohut kuori**:
 //! [`build_family`] (`FamilyRuntime`) korvaa aiemman suoran
-//! [`ResonanceBus::start`]-kutsun **yhdellä** kutsulla. HTTP-/sammutuskuori
+//! `ResonanceBus::start`-kutsun **yhdellä** kutsulla. HTTP-/sammutuskuori
 //! pysyi muuttumattomana — bus-kahva luovutetaan `GatewayState`:lle ja
 //! `Ctrl-C` laukaisee [`FamilyRuntime::shutdown`]:n (entisen `bus.stop()`:n
 //! sijaan).
@@ -920,7 +920,7 @@ fn load_orchestration_plan() -> OrchestrationPlan {
 ///
 /// Kokoaa bridgen, rekisteröi yhden Executor-työntekijän (online heartbeatilla),
 /// rakentaa [`LiveTurnExecutor`]:n env-resolverista ja ajaa
-/// [`Orchestrator::run_with`]:n. Tulostaa [`RunReport`]:n JSON-muodossa.
+/// [`Orchestrator::run_with`]:n. Tulostaa `RunReport`:n JSON-muodossa.
 ///
 /// # Errors
 /// [`FamilyClawError`] jos mallin ratkaisu, työntekijän rekisteröinti tai ajo

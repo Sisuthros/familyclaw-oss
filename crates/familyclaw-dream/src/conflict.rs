@@ -9,7 +9,7 @@
 //! natiiviksi: ristiriita on signaali tutkia, ei käsky tuhota.
 //!
 //! ## Miksi tägi eikä uusi elinkaaritila
-//! `Conflicted` EI ole [`MemoryStatus`]-variantti: elinkaari
+//! `Conflicted` EI ole [`familyclaw_memory::MemoryStatus`]-variantti: elinkaari
 //! (`Active → Archived → Tombstoned`) elää [`familyclaw_memory`]-cratessa
 //! (tämän paketin ulkopuolella) ja kuvaa *säilyvyyttä*, ei *luotettavuutta*.
 //! Ristiriita on ortogonaalinen totuus — muisto voi olla yhtä aikaa `Active` ja

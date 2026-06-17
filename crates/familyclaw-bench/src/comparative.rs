@@ -158,7 +158,7 @@ impl ComparativeScorecard {
     ///
     /// Tuloste on tavu-tavulta deterministinen: kentät kiinteässä
     /// järjestyksessä, skenaariot tunnisteen mukaan, mittarit
-    /// [`KEY_METRICS`]-järjestyksessä, kello injektoidusta arvosta.
+    /// `KEY_METRICS`-järjestyksessä, kello injektoidusta arvosta.
     #[must_use]
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();

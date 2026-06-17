@@ -13,7 +13,7 @@
 //! - [`SharedEmotionalState`] — monen agentin tunnetila tartunnalla
 //! - [`AnchorRegistry`] — identiteetti-ankkurien suojaus
 //! - [`HearthStore`] — laajennettu tallennusabstraktio (narrative + emotional)
-//! - [`InMemoryHearthStore`] — kevyt oletustoteutus ilman tietokantaa
+//! - [`db::InMemoryHearthStore`] — kevyt oletustoteutus ilman tietokantaa
 //!
 //! ## OSS-raja (KERROS A)
 //! Tämä crate on julkaistava. Se ei sisällä:

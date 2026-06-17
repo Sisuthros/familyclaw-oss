@@ -1,7 +1,7 @@
 //! Ankkurirekisteri — agenttien identiteetti-ankkurien hallinta.
 //!
 //! [`AnchorRegistry`] suojaa agenttien ydinidentiteettiä käyttäen
-//! `familyclaw-security`-craten [`IdentityAnchor`](familyclaw_security::IdentityAnchor)-
+//! `familyclaw-security`-craten [`IdentityAnchor`]-
 //! mekanismia. Jokainen rekisteröity agentti saa suojatun, ikuisen
 //! (decay λ=0) ankkurin, jonka eheys voidaan tarkistaa milloin tahansa.
 
