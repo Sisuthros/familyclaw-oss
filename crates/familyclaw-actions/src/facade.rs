@@ -41,11 +41,12 @@ use crate::approval::Approval;
 use crate::error::{ActionError, Result};
 use crate::executor::ActionExecutor;
 use crate::ids::{ActionTaskId, ApprovalId, SkillId};
-use crate::policy::ActionRisk;
+use crate::mcp::McpToolDescriptor;
+use crate::policy::{ActionRisk, SkillPermission};
 use crate::proof::ProofBundle;
 use crate::skills::{
-    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, GithubIssueDraftMock, Skill,
-    Pipeline,
+    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, FsReadAllowlisted,
+    GithubIssueDraftMock, Pipeline, Skill,
 };
 use crate::task::{ActionTask, TaskStatus};
 
@@ -163,12 +164,19 @@ impl ActionRuntime {
         Self::default()
     }
 
-    /// Luo ajoympäristön jossa kaikki neljä KERROS A -mock-taitoa on
-    /// rekisteröity valmiiksi.
+    /// Luo ajoympäristön jossa kaikki viisi KERROS A -taitoa on rekisteröity
+    /// valmiiksi.
     ///
     /// Tämä on operaattorin oletuskokoonpano: [`EmailTriageMock`],
-    /// [`GithubIssueDraftMock`], [`DiscordThreadSummaryMock`] ja
-    /// [`FilePatchMock`].
+    /// [`GithubIssueDraftMock`], [`DiscordThreadSummaryMock`], [`FilePatchMock`]
+    /// ja lippulaiva [`FsReadAllowlisted`].
+    ///
+    /// [`FsReadAllowlisted`] rekisteröidään **tyhjällä allowlistilla**
+    /// (fail-closed): se on luettelossa ja julkaistaan MCP-työkaluna, mutta
+    /// hylkää kaikki polut kunnes operaattori antaa allowlistin
+    /// ([`FsReadAllowlisted::with_config`]) ja rekisteröi sen
+    /// [`ActionRuntime::register_skill`]:llä. Näin oletuskokoonpano ei kovakoodaa
+    /// yhtään polkua ja pysyy geneerisenä.
     ///
     /// # Errors
     /// Palauttaa manifestin validoinnin tai duplikaattirekisteröinnin virheen,
@@ -179,6 +187,7 @@ impl ActionRuntime {
         runtime.register_skill(GithubIssueDraftMock::new())?;
         runtime.register_skill(DiscordThreadSummaryMock::new())?;
         runtime.register_skill(FilePatchMock::new())?;
+        runtime.register_skill(FsReadAllowlisted::new())?;
         Ok(runtime)
     }
 
@@ -221,6 +230,87 @@ impl ActionRuntime {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
         out
+    }
+
+    /// Palauttaa **raa'at** MCP-työkalukuvaukset jokaista rekisteröityä taitoa
+    /// kohti — juuri se data jonka agentti tarvitsee rakentaakseen LLM:lle
+    /// tarjottavat työkalumääritelmät.
+    ///
+    /// ## Kerrosvastuu (tarkoituksellinen)
+    /// Tämä julkisivu **ei** tunne `familyclaw-agent`-kerrosta eikä rakenna
+    /// lopullista LLM-`ToolDefinition`-arvoa. Se paljastaa vain
+    /// [`McpToolDescriptor`]-kuvaukset (nimi, kuvaus, syöteskeema, vaadittu
+    /// oikeus, luotettavuus); agentti kokoaa niistä oman muotonsa ja reitittää
+    /// työkalukutsun takaisin taitoon [`ActionRuntime::map_name_to_skill`]:lla.
+    /// Näin riippuvuus kulkee vain suuntaan agentti → actions, ei takaisin.
+    ///
+    /// ## Johdanto manifestista
+    /// Jokainen kuvaus johdetaan taidon validoidusta
+    /// [`crate::manifest::SkillManifest`]-manifestista:
+    /// - `name` ← manifestin nimi (sama jolla [`ActionRuntime::map_name_to_skill`]
+    ///   reitittää kutsun takaisin),
+    /// - `description` ← manifestin kuvaus,
+    /// - `input_schema` ← manifestin koneluettava syöteskeema
+    ///   ([`crate::manifest::SkillManifest::input_schema`]); juuri on aina
+    ///   JSON-objekti (validointi takaa tämän), joten se kelpaa LLM:n työkalun
+    ///   `parameters`-kentäksi sellaisenaan,
+    /// - `required_permission` ← manifestin oikeuksista **tiukin** yksittäinen
+    ///   oikeus (sivuvaikutuksiltaan vakavin); jos taito ei vaadi oikeuksia,
+    ///   oletus on [`SkillPermission::ReadFiles`] (kaikkein vähiten oikeuttava),
+    /// - `trusted` ← aina `false`: taidosta johdetun työkalun tuloste
+    ///   käsitellään oletuksena epäluotettavana, kuten muuallakin cratessa.
+    ///
+    /// Järjestys on nimen mukaan vakautettu (sama kuin
+    /// [`ActionRuntime::list_skills`]), tasapeli ratkaistaan tunnisteella, jotta
+    /// tuloste on toistettava.
+    ///
+    /// Tuloste ei koskaan sisällä salaisuuksia — manifesti on validoitu
+    /// salaisuudettomaksi jo rekisteröintihetkellä.
+    #[must_use]
+    pub fn tool_definitions(&self) -> Vec<McpToolDescriptor> {
+        let mut out: Vec<(SkillId, McpToolDescriptor)> = self
+            .pipeline
+            .registry()
+            .list()
+            .into_iter()
+            .map(|m| {
+                let descriptor = McpToolDescriptor::new(
+                    m.name.clone(),
+                    m.description.clone(),
+                    m.input_schema.clone(),
+                    strictest_permission(&m.permissions),
+                );
+                (m.id, descriptor)
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.1.name
+                .cmp(&b.1.name)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out.into_iter().map(|(_, d)| d).collect()
+    }
+
+    /// Reitittää työkalun nimen takaisin sitä vastaavaan taidon tunnisteeseen.
+    ///
+    /// Agentti kutsuu tätä kun LLM valitsee työkalun nimellä (sama nimi jonka
+    /// [`ActionRuntime::tool_definitions`] julkaisi): nimestä saadaan
+    /// [`SkillId`], jolla tehtävän voi lähettää eteenpäin
+    /// [`ActionRuntime::submit_task`]:lle. Palauttaa `None`, jos millään
+    /// rekisteröidyllä taidolla ei ole tätä nimeä.
+    ///
+    /// Haku on tarkka merkkijonovertailu manifestin nimeen. Jos kaksi taitoa
+    /// jakaisi saman nimen, palautetaan vakautetusti pienin tunniste, jotta
+    /// reititys on deterministinen (käytännössä nimet ovat uniikkeja).
+    #[must_use]
+    pub fn map_name_to_skill(&self, name: &str) -> Option<SkillId> {
+        self.pipeline
+            .registry()
+            .list()
+            .into_iter()
+            .filter(|m| m.name == name)
+            .map(|m| m.id)
+            .min()
     }
 
     /// Lähettää tehtävän annetulle taidolle ja ajaa putken.
@@ -366,6 +456,46 @@ impl ActionRuntime {
     }
 }
 
+/// Valitsee joukosta oikeuksia **tiukimman** yksittäisen oikeuden, jolla
+/// taidosta johdettu MCP-työkalu portitetaan
+/// ([`McpToolDescriptor::required_permission`] on yksiarvoinen).
+///
+/// Taidon manifesti voi ilmoittaa useita oikeuksia, mutta työkalukuvaus
+/// gettaa vain yhdellä. Valitaan kaikkein eniten oikeuttava (sivuvaikutuksiltaan
+/// vakavin), jotta agentti vaatii kutsujalta vahvimman tarvittavan capabilityn —
+/// fail-safe: koskaan ei aliarvioida vaadittua oikeutta. Vakavuusjärjestys
+/// kasvavasti:
+///
+/// ```text
+/// ReadFiles < NetworkRead < WriteLocalFiles < SendMessage
+///           < ExecuteCode < WriteExternal < SpendMoney
+/// ```
+///
+/// Jos lista on tyhjä (taito ei vaadi oikeuksia), palautetaan kaikkein vähiten
+/// oikeuttava [`SkillPermission::ReadFiles`].
+fn strictest_permission(permissions: &[SkillPermission]) -> SkillPermission {
+    permissions
+        .iter()
+        .copied()
+        .max_by_key(|p| permission_severity(*p))
+        .unwrap_or(SkillPermission::ReadFiles)
+}
+
+/// Yksittäisen oikeuden vakavuusaste (suurempi = enemmän oikeuttava /
+/// sivuvaikutuksiltaan vakavampi). Käytetään [`strictest_permission`]:ssa
+/// valitsemaan tiukin oikeus deterministisesti.
+const fn permission_severity(permission: SkillPermission) -> u8 {
+    match permission {
+        SkillPermission::ReadFiles => 0,
+        SkillPermission::NetworkRead => 1,
+        SkillPermission::WriteLocalFiles => 2,
+        SkillPermission::SendMessage => 3,
+        SkillPermission::ExecuteCode => 4,
+        SkillPermission::WriteExternal => 5,
+        SkillPermission::SpendMoney => 6,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,7 +511,7 @@ mod tests {
     fn default_skills_are_listed_without_secrets() {
         let runtime = ActionRuntime::with_default_skills().expect("default skills");
         let skills = runtime.list_skills();
-        assert_eq!(skills.len(), 4, "all four mock skills registered");
+        assert_eq!(skills.len(), 5, "all five default skills registered");
 
         // Nimet aakkostettu → deterministinen järjestys.
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
@@ -393,6 +523,119 @@ mod tests {
         let rendered = serde_json::to_string(&skills).expect("serialize summaries");
         assert!(!rendered.contains("sk-"));
         assert!(!rendered.contains("Bearer "));
+    }
+
+    #[test]
+    fn tool_definitions_mirror_skills_sorted_without_secrets() {
+        let runtime = ActionRuntime::with_default_skills().expect("default skills");
+        let tools = runtime.tool_definitions();
+        assert_eq!(tools.len(), 5, "one descriptor per registered skill");
+
+        // Sama vakautettu nimijärjestys kuin list_skills.
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        let skill_names: Vec<String> = runtime
+            .list_skills()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(tool_names, skill_names);
+
+        // Jokaisen kuvauksen syöteskeema on manifestin skeema (juuri objekti) ja
+        // lähde on oletuksena epäluotettu.
+        for tool in &tools {
+            let id = runtime
+                .map_name_to_skill(&tool.name)
+                .expect("tool name maps to a skill");
+            let manifest = runtime
+                .pipeline
+                .registry()
+                .get(&id)
+                .expect("mapped skill in registry");
+            assert_eq!(tool.input_schema, manifest.input_schema);
+            assert!(
+                tool.input_schema.is_object(),
+                "schema root must be a JSON object for LLM parameters"
+            );
+            assert!(!tool.trusted, "skill-derived tools default to untrusted");
+            assert!(!tool.description.is_empty());
+        }
+
+        // Ei salaisuuksia tulosteessa.
+        let rendered = serde_json::to_string(&tools).expect("serialize descriptors");
+        assert!(!rendered.contains("sk-"));
+        assert!(!rendered.contains("Bearer "));
+    }
+
+    #[test]
+    fn map_name_to_skill_roundtrips_with_tool_definitions() {
+        let runtime = ActionRuntime::with_default_skills().expect("default skills");
+
+        // Jokainen julkaistu työkalunimi reitittyy takaisin taidon tunnisteeseen.
+        for tool in runtime.tool_definitions() {
+            let id = runtime
+                .map_name_to_skill(&tool.name)
+                .expect("known tool name maps to a skill");
+            // Tunniste vastaa rekisterin manifestin tunnistetta.
+            let manifest = runtime
+                .pipeline
+                .registry()
+                .get(&id)
+                .expect("mapped id exists in registry");
+            assert_eq!(manifest.name, tool.name);
+        }
+    }
+
+    #[test]
+    fn map_name_to_skill_unknown_is_none() {
+        let runtime = ActionRuntime::with_default_skills().expect("default skills");
+        assert!(runtime.map_name_to_skill("does_not_exist").is_none());
+    }
+
+    #[test]
+    fn tool_definition_required_permission_is_strictest() {
+        // GitHub issue draft -taito kirjoittaa ulkoiseen järjestelmään →
+        // tiukimman oikeuden on oltava write_external (ei esim. network_read).
+        let runtime = ActionRuntime::with_default_skills().expect("default skills");
+        let id = GithubIssueDraftMock::skill_id();
+        let manifest = runtime
+            .pipeline
+            .registry()
+            .get(&id)
+            .expect("github skill registered");
+        let expected = super::strictest_permission(&manifest.permissions);
+
+        let tool = runtime
+            .tool_definitions()
+            .into_iter()
+            .find(|t| t.name == manifest.name)
+            .expect("github tool published");
+        assert_eq!(tool.required_permission, expected);
+    }
+
+    #[test]
+    fn strictest_permission_picks_most_privileged() {
+        // Tyhjä lista → vähiten oikeuttava oletus.
+        assert_eq!(
+            super::strictest_permission(&[]),
+            SkillPermission::ReadFiles
+        );
+        // Sekalainen joukko → tiukin (spend_money).
+        assert_eq!(
+            super::strictest_permission(&[
+                SkillPermission::ReadFiles,
+                SkillPermission::SpendMoney,
+                SkillPermission::NetworkRead,
+            ]),
+            SkillPermission::SpendMoney
+        );
+        // Write_external voittaa send_messagen.
+        assert_eq!(
+            super::strictest_permission(&[
+                SkillPermission::SendMessage,
+                SkillPermission::WriteExternal,
+            ]),
+            SkillPermission::WriteExternal
+        );
     }
 
     #[tokio::test]
@@ -564,6 +807,7 @@ mod tests {
                 approval_policy: crate::policy::ApprovalPolicy::AutoIfReadOnly,
                 input_hint: None,
                 output_hint: None,
+                input_schema: crate::manifest::default_input_schema(),
             }
         }
     }

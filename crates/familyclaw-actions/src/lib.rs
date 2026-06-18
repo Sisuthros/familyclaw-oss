@@ -92,8 +92,8 @@ pub use proof::{
 #[allow(deprecated)]
 pub use skills::MockSkill;
 pub use skills::{
-    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, GithubIssueDraftMock, MemoryRecord,
-    Pipeline, PipelineOutcome, Skill,
+    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, FsReadAllowlisted, FsReadConfig,
+    GithubIssueDraftMock, MemoryRecord, Pipeline, PipelineOutcome, Skill,
 };
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).

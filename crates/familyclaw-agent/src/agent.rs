@@ -19,9 +19,11 @@
 
 use std::sync::Arc;
 
+use familyclaw_actions::{ActionRuntime, McpToolDescriptor};
 use familyclaw_bus::{BeingId, BeingInfo, BusHandle, BusMessage, ResonanceMessage, TaskEventKind};
 use familyclaw_channels::OutboundMessage;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
+use tokio::sync::Mutex;
 use familyclaw_durable::{DurableContext, Journal};
 use familyclaw_emotion::{
     default_governing_profile, ActionDecision, Dimension, EmotionActionGoverning,
@@ -33,7 +35,7 @@ use familyclaw_memory::{
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tracing::{debug, warn};
 
-use crate::llm::{LlmConfig, LlmMessage};
+use crate::llm::{LlmConfig, LlmMessage, ToolDefinition};
 use crate::llm_chain::LlmFailover;
 use crate::soul::Soul;
 use familyclaw_sandbox::{CodeSandbox, SandboxOutput, SandboxRequest};
@@ -89,6 +91,73 @@ const CONTAGION_FACTOR: f32 = 0.25;
 /// sisaarvaikutuksen jalkeen tunnetila on vajaa puolet maksimistaan
 /// (eksponentiaalinen vaimennus). Tama estaa feedback-loop-saturaation.
 const HOMEOSTASIS_RATE: f32 = 0.10;
+
+/// Tool-loopin (Phase 1 keystone) konfiguraatio.
+///
+/// Rajoittaa kuinka monta kertaa [`Agent::think`] saa kiertää
+/// (LLM-kutsu → työkalukutsu → tulos takaisin → uusi LLM-kutsu) ennen kuin
+/// silmukka pysäytetään pakolla. Tämä on **turvaraja**, ei tavoite: hyvin
+/// käyttäytyvä malli pysähtyy itse kun se lakkaa pyytämästä työkaluja
+/// (ks. [`Agent::think`]). Raja takaa että huonosti käyttäytyvä tai
+/// looppaava malli ei jää ikuiseen kiertoon eikä polta budjettia loputtomiin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolLoopConfig {
+    /// Suurin sallittu kierrosmäärä (LLM-kutsut) yhden vuoron aikana.
+    /// Jokainen työkalukutsu — myös tuntematon — kuluttaa yhden kierroksen,
+    /// joten raja sitoo silmukan vaikka malli pyytäisi vain virheellisiä
+    /// työkaluja. Oletus [`ToolLoopConfig::DEFAULT_MAX_ITERATIONS`].
+    pub max_iterations: u32,
+}
+
+impl ToolLoopConfig {
+    /// Oletuskierrosraja: kahdeksan LLM-kutsua per vuoro. Riittää tyypilliseen
+    /// monivaiheiseen työkalusarjaan jättämättä silmukkaa rajattomaksi.
+    pub const DEFAULT_MAX_ITERATIONS: u32 = 8;
+}
+
+impl Default for ToolLoopConfig {
+    /// Oletus: [`ToolLoopConfig::DEFAULT_MAX_ITERATIONS`] kierrosta.
+    fn default() -> Self {
+        Self {
+            max_iterations: Self::DEFAULT_MAX_ITERATIONS,
+        }
+    }
+}
+
+/// Tool-loopin **lopputulos** (Phase 1 keystone).
+///
+/// Erottaa toisistaan *oikean vastauksen* käyttäjälle ([`ToolLoopOutcome::Answer`])
+/// ja kaksi *ei-vastausta olevaa ohjaustilaa* — odottaa hyväksyntää
+/// ([`ToolLoopOutcome::AwaitingApproval`]) ja kierrosraja täyttyi
+/// ([`ToolLoopOutcome::MaxIterations`]). Vain `Answer` saa ylittää
+/// käyttäjärajan (reply-kanava + durable-yhteenveto); ohjaustilat ovat
+/// **kehittäjälle sisäisiä**, eikä niiden merkkijonoesitystä koskaan reititetä
+/// loppukäyttäjälle eikä tallenneta vuoron yhteenvetoon.
+///
+/// Tämä korjaa Phase 1 -aukon jossa väliaikaiset merkit (mm. raaka
+/// `approval_id`) vuotivat sanatarkasti käyttäjälle normaalin reply-putken
+/// kautta. Täysiluokkainen suspend-paluu (`ThinkOutcome::Suspended`) tulee 1C:ssä;
+/// tämä tyyppi pitää rajan ehjänä siihen asti.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolLoopOutcome {
+    /// Malli pysähtyi lopulliseen vastaukseen → reititetään käyttäjälle.
+    Answer(String),
+    /// Työkalu vaatii ihmisen hyväksynnän → suoritus jäi odottamaan. Sisäinen
+    /// ohjaustila: hyväksynnän tunniste ([`familyclaw_actions::ApprovalId`])
+    /// elää [`ActionRuntime`]:ssa operaattorin myöhempää `approve`-kutsua
+    /// varten — sitä EI lähetetä käyttäjälle.
+    AwaitingApproval {
+        /// Hyväksyntää vaatineen työkalun nimi (loki/diagnostiikka).
+        tool: String,
+        /// Myönnetyn hyväksynnän tunniste (vain sisäiseen lokitukseen).
+        approval_id: String,
+    },
+    /// Kierrosraja täyttyi ilman lopullista vastausta → ei käyttäjäreplyä.
+    MaxIterations {
+        /// Saavutettu kierrosraja (loki/diagnostiikka).
+        iterations: u32,
+    },
+}
 
 /// Agentti — yksi olento, joka kokoaa konfiguraation, sielun, tunnetilan,
 /// muistin, kaatumiskestävän lokin ja bus-yhteyden.
@@ -177,6 +246,24 @@ pub struct Agent {
     /// Koska governor lukee `self.emotion`-tilaa, kalibrointi vaikuttaa myös
     /// governorin [`ActionDecision`]:eihin epäsuorasti (eri tila → eri päätös).
     calibration: Box<dyn EmotionCalibration + Send + Sync>,
+    /// Toimintoajoympäristö tool-loopia varten (Phase 1 keystone). Oletuksena
+    /// `None` → [`Agent::think`] säilyttää vanhan **yhden kerran** -käytöksen
+    /// (yksi LLM-kutsu, ei työkaluja). Kun
+    /// [`with_actions`](Agent::with_actions) asentaa
+    /// [`ActionRuntime`]:n, `think()` ajaa tool-loopin: rakentaa
+    /// työkalumääritelmät runtimen julkaisemista MCP-kuvauksista, antaa ne
+    /// LLM:lle ja reitittää mallin valitsemat työkalukutsut takaisin
+    /// runtimeen kunnes malli lakkaa pyytämästä työkaluja (tai raja täyttyy).
+    ///
+    /// Sisäinen muuttuvuus ([`Mutex`]): [`ActionRuntime::submit_task`] on
+    /// `&mut self`, mutta `think()` lainaa `&self` (Ractor-actor jakaa tilan).
+    /// `Arc<Mutex<…>>` antaa useamman haaran (actor + ulkoinen kutsu) jakaa
+    /// saman runtimen turvallisesti `.await`-rajojen yli.
+    actions: Option<Arc<Mutex<ActionRuntime>>>,
+    /// Tool-loopin turvaraja (kierrosmäärä per vuoro). Käytössä vain kun
+    /// [`actions`](Agent::actions) on asennettu; muuten yhden kerran -polku ei
+    /// kierrä lainkaan. Oletus [`ToolLoopConfig::default`].
+    tool_loop: ToolLoopConfig,
 }
 
 impl Agent {
@@ -217,6 +304,8 @@ impl Agent {
             session: None,
             governor: None,
             calibration: Box::new(NeutralCalibration),
+            actions: None,
+            tool_loop: ToolLoopConfig::default(),
         }
     }
 
@@ -392,6 +481,51 @@ impl Agent {
         self.calibration.label()
     }
 
+    /// Asenna **toimintoajoympäristö** tool-loopia varten (Phase 1 keystone).
+    ///
+    /// Kun runtime on asennettu, [`Agent::think`] vaihtaa **yhden kerran**
+    /// -polusta tool-looppiin: se rakentaa runtimen julkaisemista
+    /// [`McpToolDescriptor`]-kuvauksista LLM:lle tarjottavat
+    /// [`ToolDefinition`]:t, antaa ne mallille ja reitittää mallin valitsemat
+    /// työkalukutsut takaisin runtimeen ([`ActionRuntime::submit_task`]) kunnes
+    /// malli lakkaa pyytämästä työkaluja tai [`ToolLoopConfig`]-raja täyttyy.
+    ///
+    /// **Additiivinen + taaksepäin-yhteensopiva:** ilman tätä kutsua
+    /// (`actions = None`) `think()` toimii täsmälleen kuten ennen — yksi
+    /// LLM-kutsu, ei työkaluja. Olemassa olevat polut (gateway, testit)
+    /// säilyvät muuttumattomina kunnes runtime asennetaan eksplisiittisesti.
+    ///
+    /// `runtime` annetaan jaettuna ([`Arc`] + [`Mutex`]), koska
+    /// [`ActionRuntime::submit_task`] on `&mut self` mutta `think()` lainaa
+    /// `&self`. Palauttaa `self` ketjutusta varten ([`Agent::new`]-signatuuria
+    /// ei muuteta).
+    #[must_use]
+    pub fn with_actions(mut self, runtime: Arc<Mutex<ActionRuntime>>) -> Self {
+        self.actions = Some(runtime);
+        self
+    }
+
+    /// Säädä **tool-loopin turvaraja** (kierrosmäärä per vuoro). Käytössä vain
+    /// kun [`with_actions`](Agent::with_actions) on asennettu. Palauttaa `self`
+    /// ketjutusta varten.
+    #[must_use]
+    pub const fn with_tool_loop(mut self, config: ToolLoopConfig) -> Self {
+        self.tool_loop = config;
+        self
+    }
+
+    /// Agentin tool-loop-konfiguraatio (luku).
+    #[must_use]
+    pub const fn tool_loop(&self) -> ToolLoopConfig {
+        self.tool_loop
+    }
+
+    /// Onko agentille asennettu toimintoajoympäristö (tool-loop aktiivinen)?
+    #[must_use]
+    pub const fn has_actions(&self) -> bool {
+        self.actions.is_some()
+    }
+
     /// Agentin näyttönimi.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -470,26 +604,95 @@ impl Agent {
     /// Natiivisti **async** — ei `block_on`/`block_in_place`-kuvioita, jotka
     /// paniikkaisivat `current_thread`-runtimessa tai voisivat deadlockata.
     ///
+    /// ## Kaksi polkua (Phase 1 keystone)
+    /// - **`actions = None` (oletus, ENNALLAAN):** yksi LLM-kutsu
+    ///   ([`LlmFailover::complete`]) ilman työkaluja. Tämä on alkuperäinen
+    ///   yhden kerran -käytös, jota ei muuteta — kaikki vanhat polut ja testit
+    ///   säilyvät.
+    /// - **`actions = Some(rt)`:** sisäinen `run_tool_loop` ajaa silmukan: LLM
+    ///   saa runtimen julkaisemat työkalut, ja sen valitsemat työkalukutsut
+    ///   reititetään takaisin runtimeen kunnes malli vastaa ilman
+    ///   työkalukutsuja (pysähdys) tai [`ToolLoopConfig`]-raja täyttyy.
+    ///
     /// Palauttaa `None` jos LLM-clientiä ei ole (harmless no-op), muuten
     /// `Some(Ok(text))` tai `Some(Err(..))` LLM-virheestä.
     ///
+    /// ## Käyttäjärajan suojaus (tool-loop)
+    /// Tool-loop-polulla `think` palauttaa **vain oikean vastauksen** käyttäjälle
+    /// (`Some(Ok(text))`). Kaksi ei-vastausta olevaa ohjaustilaa —
+    /// odottaa-hyväksyntää ja kierrosraja-täynnä — kirjataan lokiin ja
+    /// palautetaan `None`. Näin niiden sisäisiä merkkijonoja (mm. raaka
+    /// `approval_id`) **ei koskaan reititetä loppukäyttäjälle** eikä tallenneta
+    /// vuoron yhteenvetoon — `None` tarkoittaa "ei vastausta tällä vuorolla",
+    /// jonka [`handle_turn_with_origin`](Self::handle_turn_with_origin) suodattaa
+    /// jo nyt pois reply-putkesta.
+    ///
     /// # Errors
     /// - [`FamilyClawError::Llm`] jos LLM-kutsu epäonnistuu.
-    #[allow(clippy::format_push_string)]
     pub async fn think(&self, current_message: &BusMessage) -> Option<Result<String>> {
         let llm = self.llm.as_ref()?;
+        let (system_prompt, query) = self.build_think_context(current_message).await;
 
+        match self.actions.as_ref() {
+            // Yhden kerran -polku (taaksepäin-yhteensopiva): yksi LLM-kutsu,
+            // ei työkaluja. Sama käytös kuin ennen tool-loopia.
+            None => {
+                let messages =
+                    vec![LlmMessage::system(system_prompt), LlmMessage::user(query)];
+                Some(
+                    llm.complete(&messages)
+                        .await
+                        .map_err(|e| FamilyClawError::llm(e.to_string())),
+                )
+            }
+            // Tool-loop-polku: anna mallille työkalut ja kierrä kunnes se
+            // lakkaa pyytämästä niitä (tai raja täyttyy). Vain `Answer` ylittää
+            // käyttäjärajan; ohjaustilat suodatetaan `None`:ksi (loki alla).
+            Some(actions) => match self.run_tool_loop(llm, actions, system_prompt, query).await {
+                Err(e) => Some(Err(e)),
+                Ok(ToolLoopOutcome::Answer(text)) => Some(Ok(text)),
+                Ok(ToolLoopOutcome::AwaitingApproval { tool, approval_id }) => {
+                    // Sisäinen ohjaustila: työkalu odottaa ihmisen hyväksyntää.
+                    // EI käyttäjälle — `approval_id` on operaattorin (ActionRuntime)
+                    // tieto, ei vastaus. Phase 1: vaikenemme tällä vuorolla.
+                    debug!(
+                        agent = self.config.name,
+                        tool = tool.as_str(),
+                        approval_id = approval_id.as_str(),
+                        "tool loop: awaiting human approval — suppressing internal marker from user reply"
+                    );
+                    None
+                }
+                Ok(ToolLoopOutcome::MaxIterations { iterations }) => {
+                    // Sisäinen ohjaustila: raja täyttyi ilman vastausta. EI
+                    // robottimaista max-iter-merkkiä käyttäjälle.
+                    debug!(
+                        agent = self.config.name,
+                        iterations,
+                        "tool loop: reached max iterations without a final answer — suppressing internal marker from user reply"
+                    );
+                    None
+                }
+            },
+        }
+    }
+
+    /// Rakentaa [`think`](Agent::think):n jaetun kontekstin: RAG-recall +
+    /// system prompt (sielun ydin + muistit) sekä viestin teksti (`query`).
+    ///
+    /// Jaettu molempien polkujen (yhden kerran + tool-loop) kesken, jotta
+    /// muistihaku ja promptin rakennus ovat identtiset riippumatta siitä onko
+    /// työkaluja asennettu. F4 sessio-isolaatio: jos sessio on asetettu,
+    /// recall vaatii session-tagin (vain tämän session muistot näkyvät).
+    #[allow(clippy::format_push_string)]
+    async fn build_think_context(&self, current_message: &BusMessage) -> (String, String) {
         let query = match current_message {
             BusMessage::Text { body } => body.clone(),
             BusMessage::Latent { text_shadow, .. } => text_shadow.clone(),
             other => format!("[{}]", other.kind_label()),
         };
 
-        // 0. ORIENT: hae relevantit muistot ENSIN (RAG — ennen LLM-kutsua).
-        //    F4 sessio-isolaatio: jos sessio on asetettu, vaadi session-tag →
-        //    vain TÄMÄN session muistot näkyvät kontekstina (ei vuotoa toisesta
-        //    keskustelusta). Ilman sessiota (None) recall on jaettu (nykyinen,
-        //    taaksepäin-yhteensopiva käytös).
+        // ORIENT: hae relevantit muistot ENSIN (RAG — ennen LLM-kutsua).
         let mut recall_ctx = RetrievalContext::new(query.clone()).with_limit(5);
         if let Some(origin) = self.session.as_ref() {
             recall_ctx = recall_ctx.with_required_tags([origin.session_tag()]);
@@ -499,7 +702,7 @@ impl Agent {
             Vec::new()
         });
 
-        // 1. System prompt: sielun ydin + muistit kontekstina.
+        // System prompt: sielun ydin + muistit kontekstina.
         let mut system_prompt = self.soul.essence.clone();
         if !memories.is_empty() {
             system_prompt.push_str("\n\n[RELEVANT MEMORIES FROM ETERNAL THREAD]:\n");
@@ -514,15 +717,170 @@ impl Agent {
             system_prompt.push_str("[END MEMORIES]\n");
         }
 
-        // 2. Viestit: system prompt -> nykyinen viesti.
-        let messages = vec![LlmMessage::system(system_prompt), LlmMessage::user(query)];
+        (system_prompt, query)
+    }
 
-        // 3. LLM-kutsu (async, ei block_on).
-        Some(
-            llm.complete(&messages)
+    /// Ajaa **tool-loopin** (Phase 1 keystone): SpatialClaw-tyylinen silmukka
+    /// jossa malli kutsuu työkalun, tulos syötetään takaisin, ja kierretään
+    /// pysähdykseen.
+    ///
+    /// ## Vaiheet per kierros
+    /// 1. Rakenna työkalumääritelmät runtimen julkaisemista MCP-kuvauksista
+    ///    ([`ActionRuntime::tool_definitions`] → [`ToolDefinition`]) — vain
+    ///    kelvolliset ([`ToolDefinition::validate`]) tarjotaan mallille.
+    /// 2. Kutsu [`LlmFailover::complete_with_tools`].
+    /// 3. **Ei työkalukutsuja** → palauta mallin teksti (pysähdys).
+    /// 4. Jokaiselle työkalukutsulle:
+    ///    - **tuntematon työkalu** ([`ActionRuntime::map_name_to_skill`] = `None`)
+    ///      → työnnä virhe-`tool_result` ja JATKA (kuluttaa kierroksen, ei
+    ///      keskeytä eikä jää ikuiseen yritykseen),
+    ///    - **hyväksyntää vaativa** ([`SubmitOutcome::pending_approval`] = `Some`)
+    ///      → palauta [`ToolLoopOutcome::AwaitingApproval`] (sisäinen ohjaustila,
+    ///      EI käyttäjälle; täysiluokkainen `ThinkOutcome::Suspended` tulee 1C:ssä),
+    ///    - **turvallinen / auto-run** → työnnä tulos `tool_result`:na ja jatka.
+    /// 5. **Raja täyttyy** → palauta [`ToolLoopOutcome::Answer`] (viimeisin teksti)
+    ///    tai [`ToolLoopOutcome::MaxIterations`] (ei vastausta).
+    ///
+    /// ## Käyttäjäraja
+    /// Vain [`ToolLoopOutcome::Answer`] on tarkoitettu loppukäyttäjälle.
+    /// Ohjaustilat ([`ToolLoopOutcome::AwaitingApproval`],
+    /// [`ToolLoopOutcome::MaxIterations`]) ovat kehittäjälle sisäisiä — niiden
+    /// erottelu tyypissä estää sen että väliaikainen merkki (mm. raaka
+    /// `approval_id`) vuotaisi reply-putken läpi käyttäjälle.
+    ///
+    /// Ei koskaan paniikkaa: kaikki virhepolut palautuvat [`Result`]:na tai
+    /// jatkavat silmukkaa rajan sisällä.
+    ///
+    /// # Errors
+    /// - [`FamilyClawError::Llm`] jos LLM-kutsu epäonnistuu palautumattomasti.
+    async fn run_tool_loop(
+        &self,
+        llm: &LlmFailover,
+        actions: &Arc<Mutex<ActionRuntime>>,
+        system_prompt: String,
+        query: String,
+    ) -> Result<ToolLoopOutcome> {
+        let mut messages = vec![LlmMessage::system(system_prompt), LlmMessage::user(query)];
+        // Viimeisin mallin tuottama teksti — palautetaan jos raja täyttyy
+        // ennen kuin malli pysähtyy itse.
+        let mut last_text = String::new();
+
+        for _ in 0..self.tool_loop.max_iterations {
+            // 1. Rakenna työkalut runtimen MCP-kuvauksista (lukko vain
+            //    kuvausten ajaksi — vapautetaan ennen LLM-kutsua).
+            let tools = {
+                let rt = actions.lock().await;
+                build_tool_definitions(&rt.tool_definitions())
+            };
+
+            // 2. LLM-kutsu työkaluineen.
+            let result = llm
+                .complete_with_tools(&messages, &tools)
                 .await
-                .map_err(|e| FamilyClawError::llm(e.to_string())),
-        )
+                .map_err(|e| FamilyClawError::llm(e.to_string()))?;
+
+            if !result.text().is_empty() {
+                last_text = result.text().to_string();
+            }
+
+            // 3. Ei työkalukutsuja → malli pysähtyi, palauta teksti vastauksena.
+            //    Tyhjä mutta läsnä oleva content (`Some("")`, jota osa
+            //    OpenAI-yhteensopivista providereista tuottaa) suodatetaan pois,
+            //    jotta palautamme aiemman ei-tyhjän tekstin emmekä mykisty.
+            let Some(tool_calls) = result.tool_calls.filter(|c| !c.is_empty()) else {
+                let answer = result.content.filter(|c| !c.is_empty()).unwrap_or(last_text);
+                return Ok(ToolLoopOutcome::Answer(answer));
+            };
+
+            // Liitä mallin assistant-vuoro (työkalukutsuineen) historiaan, jotta
+            // seuraavat tool_result-viestit sitoutuvat oikeisiin call-id:eihin.
+            messages.push(
+                LlmMessage::assistant(result.content.unwrap_or_default())
+                    .with_tool_calls(tool_calls.clone()),
+            );
+
+            // 4. Dispatchaa jokainen työkalukutsu ja syötä tulos takaisin.
+            for call in tool_calls {
+                let Some(skill_id) = actions.lock().await.map_name_to_skill(&call.name) else {
+                    // Tuntematon työkalu: virhe-tulos takaisin, JATKA (kuluttaa
+                    // kierroksen, ei keskeytä silmukkaa eikä jää loputtomaan
+                    // yritykseen — raja sitoo myös virhepolun).
+                    debug!(
+                        agent = self.config.name,
+                        tool = call.name.as_str(),
+                        "tool loop: unknown tool — feeding error result, continuing"
+                    );
+                    messages.push(LlmMessage::tool_result(
+                        call.id,
+                        format!("error: unknown tool '{}'", call.name),
+                    ));
+                    continue;
+                };
+
+                let outcome = {
+                    let mut rt = actions.lock().await;
+                    rt.submit_task(skill_id, call.arguments.clone(), time::now())
+                        .await
+                };
+
+                match outcome {
+                    Ok(submit) if submit.pending_approval.is_some() => {
+                        // Hyväksyntää vaativa työkalu → palautetaan SISÄINEN
+                        // ohjaustila [`ToolLoopOutcome::AwaitingApproval`], EI
+                        // käyttäjälle reititettävää merkkijonoa. `approval_id`
+                        // jää [`ActionRuntime`]:n tilaan operaattorin myöhempää
+                        // `approve`-kutsua varten ja kulkee vain sisäiseen
+                        // lokitukseen — sitä ei koskaan lähetetä loppukäyttäjälle.
+                        // Vuoro ei jää roikkumaan eikä hyväksyntää vaativa toiminto
+                        // suoriudu ilman lupaa. (Täysiluokkainen
+                        // `ThinkOutcome::Suspended` tulee 1C:ssä.)
+                        let approval_id = submit
+                            .pending_approval
+                            .map_or_else(|| "?".to_string(), |id| id.to_string());
+                        return Ok(ToolLoopOutcome::AwaitingApproval {
+                            tool: call.name,
+                            approval_id,
+                        });
+                    }
+                    Ok(submit) => {
+                        // Turvallinen / auto-run: syötä (redaktoitu) tulos
+                        // takaisin malliin. Todiste sisältää redaktoidun
+                        // tulosteen ilman salaisuuksia.
+                        let result_text = {
+                            let rt = actions.lock().await;
+                            tool_result_text(&rt, &submit)
+                        };
+                        messages.push(LlmMessage::tool_result(call.id, result_text));
+                    }
+                    Err(e) => {
+                        // Suoritusvirhe: syötä virhe takaisin malliin (se voi
+                        // korjata kutsun), JATKA rajan sisällä.
+                        warn!(
+                            agent = self.config.name,
+                            tool = call.name.as_str(),
+                            error = %e,
+                            "tool loop: submit_task failed — feeding error result, continuing"
+                        );
+                        messages.push(LlmMessage::tool_result(
+                            call.id,
+                            format!("error: tool '{}' failed: {e}", call.name),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 5. Raja täyttyi ennen pysähdystä. EI paniikkia. Jos malli ehti
+        //    tuottaa tekstiä, se on paras saatavilla oleva vastaus → `Answer`.
+        //    Muuten palautetaan SISÄINEN ohjaustila [`ToolLoopOutcome::MaxIterations`]
+        //    — robottimaista max-iter-merkkiä EI reititetä käyttäjälle.
+        if last_text.is_empty() {
+            Ok(ToolLoopOutcome::MaxIterations {
+                iterations: self.tool_loop.max_iterations,
+            })
+        } else {
+            Ok(ToolLoopOutcome::Answer(last_text))
+        }
     }
 
     /// Käsittelee yhden vuoron **kaatumiskestävästi** (ilman per-viesti-
@@ -984,6 +1342,54 @@ fn should_remember(message: &BusMessage) -> bool {
 /// Rakentaa lyhyen, deterministisen yhteenvedon vuorosta (durable-lokiin).
 fn summarize(sender: BeingId, message: &BusMessage) -> String {
     format!("{} from {sender}", message.kind_label())
+}
+
+/// Kuvaa runtimen julkaisemat MCP-työkalukuvaukset LLM:lle tarjottaviksi
+/// [`ToolDefinition`]:eiksi (tool-loop, Phase 1 keystone).
+///
+/// Vain **kelvolliset** määritelmät ([`ToolDefinition::validate`]) tarjotaan
+/// mallille — viallinen nimi tai ei-objekti-skeema ohitetaan ja kirjataan
+/// debug-tasolla, jottei yksi kelvoton taito kaada koko kutsua. `name`,
+/// `description` ja `input_schema` (→ `function.parameters`) tulevat suoraan
+/// kuvauksesta; vaadittu oikeus / luotettavuus ovat actions-kerroksen vastuulla
+/// eivätkä kuulu LLM:lle tarjottavaan muotoon.
+fn build_tool_definitions(descriptors: &[McpToolDescriptor]) -> Vec<ToolDefinition> {
+    descriptors
+        .iter()
+        .filter_map(|d| {
+            let def = ToolDefinition {
+                name: d.name.clone(),
+                description: d.description.clone(),
+                input_schema: d.input_schema.clone(),
+            };
+            match def.validate() {
+                Ok(()) => Some(def),
+                Err(e) => {
+                    debug!(tool = d.name.as_str(), error = %e, "tool loop: skipping invalid tool definition");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Johtaa työkalukutsun tuloksesta mallille takaisin syötettävän tekstin
+/// (tool-loop, Phase 1 keystone).
+///
+/// Käyttää tehtävän **redaktoitua todistepakettia** jos sellainen on syntynyt
+/// ([`ActionRuntime::proof`]): todisteen `redacted_output` (salaisuudet
+/// poistettu) sarjallistetaan JSON-tekstiksi, etuliitteenä lyhyt yhteenveto.
+/// Jos todistetta ei ole (esim. tehtävä ei tuottanut sellaista), palautetaan
+/// pelkkä tilakuvaus. Tuloste ei koskaan sisällä raakaa salaisuutta — todiste
+/// on redaktoitu jo actions-putkessa.
+fn tool_result_text(runtime: &ActionRuntime, submit: &familyclaw_actions::SubmitOutcome) -> String {
+    if let Some(proof) = runtime.proof(submit.task_id) {
+        let body = serde_json::to_string(&proof.redacted_output)
+            .unwrap_or_else(|_| "{}".to_string());
+        format!("status={:?}; {}; output={body}", submit.status, proof.output_summary)
+    } else {
+        format!("status={:?}; no proof produced", submit.status)
+    }
 }
 
 /// Type-erased agent for actor (no generics).
@@ -1933,6 +2339,374 @@ mod tests {
             .await
             .expect("turn");
         assert!(outcome.remembered);
+        bus.stop();
+    }
+
+    // ---- 1B tool loop --------------------------------------------------------
+
+    // ToolLoopConfig + ActionRuntime tulevat jo `use super::*`:n kautta
+    // (ToolLoopConfig on tämän moduulin tyyppi; ActionRuntime importattu
+    // agentti-moduulin yläosassa). LlmConfig on agentti-moduulissa yksityinen
+    // `use`, joten se tuodaan tähän eksplisiittisesti.
+    use crate::llm::LlmConfig;
+    use std::sync::Arc as StdArc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Mutex as TokioMutex;
+
+    /// Käynnistää **skriptatun fake-LLM:n**: OpenAI-yhteensopiva HTTP-endpoint,
+    /// joka palauttaa annetut vastausrungot (JSON) järjestyksessä, yksi per
+    /// pyyntö. Palauttaa base-URL:n (`http://127.0.0.1:PORT/v1`), jonka voi
+    /// antaa [`LlmConfig`]:lle. Server elää kunnes kaikki rungot on käytetty.
+    ///
+    /// Tämä on sama raaka-TCP-kuvio kuin `llm.rs`:n timeout/empty-choices
+    /// -testeissä — ei ulkoista mock-kirjastoa, ei verkkoa ulospäin.
+    async fn spawn_scripted_llm(bodies: Vec<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scripted llm");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            for body in bodies {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                // Lue (ja hylkää) pyyntö; emme tarkista runkoa tässä testissä.
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    /// OpenAI-vastausrunko jossa **pelkkä teksti** (ei työkalukutsuja) → silmukka
+    /// pysähtyy.
+    fn body_text(text: &str) -> String {
+        serde_json::json!({
+            "choices": [ { "message": { "content": text } } ]
+        })
+        .to_string()
+    }
+
+    /// OpenAI-vastausrunko jossa **yksi työkalukutsu**. `arguments` on JSON-arvo
+    /// (cratimme deserialisoija odottaa litteää `{id,name,arguments}`-muotoa).
+    fn body_tool_call(id: &str, name: &str, arguments: &serde_json::Value) -> String {
+        serde_json::json!({
+            "choices": [ {
+                "message": {
+                    "content": serde_json::Value::Null,
+                    "tool_calls": [ { "id": id, "name": name, "arguments": arguments } ]
+                }
+            } ]
+        })
+        .to_string()
+    }
+
+    /// Rakentaa agentin skriptatulla LLM:llä (yksi endpoint, ei fallbackeja).
+    fn agent_with_scripted_llm(name: &str, bus: BusHandle, api_base: &str) -> Agent {
+        let config = AgentConfig::new(name, ModelConfig::new("scripted/model"));
+        let soul = Soul::from_essence(format!("I am {name}."));
+        let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
+        let durable =
+            DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
+                .expect("durable ctx");
+        let cfg = LlmConfig::new(api_base, "test-key", "scripted-model")
+            .with_request_timeout_ms(2_000)
+            .with_connect_timeout_ms(2_000);
+        Agent::new(config, soul, memory, durable, bus, Some(cfg), None)
+    }
+
+    /// Read-only testitaito tool-loopia varten: kaiuttaa payloadin `q`-kentän
+    /// takaisin tulosteeseen. Auto-run (ei hyväksyntää), jotta silmukka voi
+    /// syöttää tuloksen takaisin malliin.
+    #[derive(Debug, Clone, Default)]
+    struct LoopEchoSkill;
+
+    /// Testitaidon kiinteä tunniste (deterministinen).
+    const LOOP_ECHO_UUID: uuid::Uuid = uuid::uuid!("11111111-2222-4333-8444-555555555555");
+
+    #[async_trait::async_trait]
+    impl familyclaw_actions::ActionExecutor for LoopEchoSkill {
+        async fn execute(
+            &self,
+            request: familyclaw_actions::ActionRequest,
+        ) -> familyclaw_actions::Result<familyclaw_actions::ActionResult> {
+            let q = request
+                .payload
+                .get("q")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            Ok(familyclaw_actions::ActionResult::success(
+                "echoed loop input",
+                serde_json::json!({ "echoed": q }),
+                request.now,
+            ))
+        }
+    }
+
+    impl familyclaw_actions::Skill for LoopEchoSkill {
+        fn manifest(&self) -> familyclaw_actions::manifest::SkillManifest {
+            familyclaw_actions::manifest::SkillManifest {
+                id: familyclaw_actions::SkillId::from_uuid(LOOP_ECHO_UUID),
+                name: "loop_echo".to_string(),
+                version: "1.0.0".to_string(),
+                description: "Kaiuttaa payloadin q-kentän (vain luku, testikäyttö).".to_string(),
+                permissions: vec![familyclaw_actions::policy::SkillPermission::ReadFiles],
+                risk: familyclaw_actions::policy::ActionRisk::ReadOnly,
+                approval_policy: familyclaw_actions::policy::ApprovalPolicy::AutoIfReadOnly,
+                input_hint: None,
+                output_hint: None,
+                input_schema: familyclaw_actions::manifest::default_input_schema(),
+            }
+        }
+    }
+
+    /// Rakentaa jaetun runtimen, johon on rekisteröity `loop_echo`-testitaito.
+    fn echo_runtime() -> StdArc<TokioMutex<ActionRuntime>> {
+        let mut rt = ActionRuntime::new();
+        rt.register_skill(LoopEchoSkill).expect("register loop_echo");
+        StdArc::new(TokioMutex::new(rt))
+    }
+
+    /// Hyväksyntää vaativa testitaito tool-loopia varten: mallintaa ulkoisesti
+    /// kirjoittavan (`WriteExternal`) toiminnon, joka EI ole auto-ajettava ja
+    /// joka pysähtyy odottamaan ihmisen hyväksyntää
+    /// ([`SubmitOutcome::pending_approval`] = `Some`). Käytetään todistamaan
+    /// ettei hyväksyntää odottava ohjaustila vuoda käyttäjälle.
+    #[derive(Debug, Clone, Default)]
+    struct ApprovalSkill;
+
+    /// Hyväksyntätaidon kiinteä tunniste (deterministinen).
+    const APPROVAL_UUID: uuid::Uuid = uuid::uuid!("99999999-2222-4333-8444-555555555555");
+
+    #[async_trait::async_trait]
+    impl familyclaw_actions::ActionExecutor for ApprovalSkill {
+        async fn execute(
+            &self,
+            request: familyclaw_actions::ActionRequest,
+        ) -> familyclaw_actions::Result<familyclaw_actions::ActionResult> {
+            // Ei pitäisi koskaan suoriutua ilman hyväksyntää tässä testissä,
+            // mutta paluuarvo tarvitaan tyyppisopimukseen.
+            Ok(familyclaw_actions::ActionResult::success(
+                "approval-gated action executed",
+                serde_json::json!({ "ok": true }),
+                request.now,
+            ))
+        }
+    }
+
+    impl familyclaw_actions::Skill for ApprovalSkill {
+        fn manifest(&self) -> familyclaw_actions::manifest::SkillManifest {
+            familyclaw_actions::manifest::SkillManifest {
+                id: familyclaw_actions::SkillId::from_uuid(APPROVAL_UUID),
+                name: "approval_skill".to_string(),
+                version: "1.0.0".to_string(),
+                description: "Ulkoisesti kirjoittava toiminto (vaatii ihmisen hyväksynnän, testikäyttö)."
+                    .to_string(),
+                permissions: vec![familyclaw_actions::policy::SkillPermission::WriteExternal],
+                risk: familyclaw_actions::policy::ActionRisk::WriteExternal,
+                approval_policy: familyclaw_actions::policy::ApprovalPolicy::RequireApproval,
+                input_hint: None,
+                output_hint: None,
+                input_schema: familyclaw_actions::manifest::default_input_schema(),
+            }
+        }
+    }
+
+    /// Rakentaa jaetun runtimen, johon on rekisteröity hyväksyntää vaativa
+    /// `approval_skill`-testitaito.
+    fn approval_runtime() -> StdArc<TokioMutex<ActionRuntime>> {
+        let mut rt = ActionRuntime::new();
+        rt.register_skill(ApprovalSkill)
+            .expect("register approval_skill");
+        StdArc::new(TokioMutex::new(rt))
+    }
+
+    /// (a) `actions = None` säilyttää yhden kerran -käytöksen: yksi LLM-kutsu,
+    /// ei työkaluja, palautuu mallin teksti sellaisenaan.
+    #[tokio::test]
+    async fn tool_loop_none_keeps_one_shot() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let api = spawn_scripted_llm(vec![body_text("yksi vastaus")]).await;
+        let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api);
+        assert!(!agent.has_actions(), "oletus: ei toimintoja → yhden kerran");
+
+        let out = agent
+            .think(&BusMessage::text("hei"))
+            .await
+            .expect("llm present")
+            .expect("one-shot ok");
+        assert_eq!(out, "yksi vastaus");
+        bus.stop();
+    }
+
+    /// (b) Tool-loop pysähtyy heti kun malli vastaa ilman työkalukutsuja
+    /// (vaikka työkaluja olisi tarjolla).
+    #[tokio::test]
+    async fn tool_loop_stops_on_no_tool_calls() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let api = spawn_scripted_llm(vec![body_text("ei työkaluja tarvita")]).await;
+        let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api).with_actions(echo_runtime());
+        assert!(agent.has_actions());
+
+        let out = agent
+            .think(&BusMessage::text("kysymys"))
+            .await
+            .expect("llm present")
+            .expect("loop ok");
+        assert_eq!(out, "ei työkaluja tarvita");
+        bus.stop();
+    }
+
+    /// (c) Työkalukutsu dispatchataan ja tulos syötetään takaisin: ensimmäinen
+    /// vastaus pyytää `loop_echo`-työkalua, toinen (tuloksen nähtyään) vastaa
+    /// tekstillä → silmukka pysähtyy lopulliseen tekstiin.
+    #[tokio::test]
+    async fn tool_loop_dispatches_tool_and_feeds_result_back() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let api = spawn_scripted_llm(vec![
+            body_tool_call("call_1", "loop_echo", &serde_json::json!({ "q": "ping" })),
+            body_text("työkalu vastasi, valmis"),
+        ])
+        .await;
+        let agent =
+            agent_with_scripted_llm("agent_a", bus.clone(), &api).with_actions(echo_runtime());
+
+        let out = agent
+            .think(&BusMessage::text("aja työkalu"))
+            .await
+            .expect("llm present")
+            .expect("loop ok");
+        // Toinen kierros pysähtyi lopulliseen tekstiin (työkalun tulos
+        // syötettiin takaisin malliin ennen tätä).
+        assert_eq!(out, "työkalu vastasi, valmis");
+        bus.stop();
+    }
+
+    /// (d) Tuntematon työkalu → virhe-`tool_result` syötetään takaisin, silmukka
+    /// JATKAA (ei keskeydy). Seuraava vastaus on tekstiä → pysähdys.
+    #[tokio::test]
+    async fn tool_loop_unknown_tool_does_not_abort() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let api = spawn_scripted_llm(vec![
+            body_tool_call("call_x", "does_not_exist", &serde_json::json!({})),
+            body_text("ok, jatketaan ilman sitä työkalua"),
+        ])
+        .await;
+        let agent =
+            agent_with_scripted_llm("agent_a", bus.clone(), &api).with_actions(echo_runtime());
+
+        let out = agent
+            .think(&BusMessage::text("kokeile tuntematonta"))
+            .await
+            .expect("llm present")
+            .expect("loop continues past unknown tool");
+        assert_eq!(out, "ok, jatketaan ilman sitä työkalua");
+        bus.stop();
+    }
+
+    /// (e) Kierrosraja sitoo silmukan: jos malli pyytää AINA työkalua eikä
+    /// koskaan vastaa tekstillä, silmukka pysähtyy `max_iterations`-rajaan
+    /// EIKÄ jää ikuiseen kiertoon. Skriptataan tarkalleen `max` työkalukutsua
+    /// (server ei vastaa enempää → jos silmukka ylittäisi rajan, seuraava
+    /// LLM-kutsu hyytyisi timeoutiin; raja estää sen).
+    ///
+    /// **Käyttäjäraja:** kun raja täyttyy ilman vastausta, `think()` palauttaa
+    /// `None` — sisäistä max-iter-merkkiä EI reititetä käyttäjälle. Aiempi
+    /// toteutus vuoti `"[tool loop stopped: ...]"`-merkkijonon sanatarkasti
+    /// reply-putken läpi; tämä testi vartioi ettei näin enää tapahdu.
+    #[tokio::test]
+    async fn tool_loop_max_iterations_does_not_leak_marker_to_user() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let max = 3u32;
+        // Tasan `max` työkalukutsu-vastausta — yksi per kierros. Silmukka EI saa
+        // pyytää (max+1):ttä vastausta serveriltä.
+        let bodies: Vec<String> = (0..max)
+            .map(|i| {
+                body_tool_call(
+                    &format!("call_{i}"),
+                    "loop_echo",
+                    &serde_json::json!({ "q": i }),
+                )
+            })
+            .collect();
+        let api = spawn_scripted_llm(bodies).await;
+        let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+            .with_actions(echo_runtime())
+            .with_tool_loop(ToolLoopConfig { max_iterations: max });
+
+        // Silmukka pysähtyy rajaan ilman paniikkia/hangia. Koska malli ei
+        // koskaan tuottanut tekstiä, käyttäjälle EI synny vastausta: `think`
+        // palauttaa `None` (sisäinen MaxIterations-ohjaustila suodatettu),
+        // EIKÄ raakaa max-iter-merkkijonoa vuoda käyttäjärajan yli.
+        let out = agent.think(&BusMessage::text("ikuinen työkalupyyntö")).await;
+        assert!(
+            matches!(out, Some(Ok(ref s)) if !s.contains("tool loop stopped")) || out.is_none(),
+            "max-iter EI saa vuotaa sisäistä merkkiä käyttäjälle, sai: {out:?}"
+        );
+        // Tarkka odotus: ei tekstiä → None (ei käyttäjäreplyä tällä vuorolla).
+        assert!(
+            out.is_none(),
+            "ilman mallin tekstiä max-iter ei tuota käyttäjävastausta, sai: {out:?}"
+        );
+        bus.stop();
+    }
+
+    /// (f) **Hyväksyntää vaativa työkalu EI vuoda sisäistä merkkiä käyttäjälle.**
+    /// Kun malli kutsuu hyväksyntää vaativaa työkalua, suoritus jää odottamaan
+    /// ihmisen lupaa. Aiempi toteutus palautti `"[awaiting approval: ...
+    /// (approval_id=...)]"` tavallisena onnistumis-merkkijonona, joka reititettiin
+    /// sanatarkasti — raaka `approval_id` mukaan lukien — käyttäjälle. Korjattu:
+    /// `think()` palauttaa `None` (sisäinen `AwaitingApproval`-ohjaustila), eikä
+    /// mitään `approval`-tekstiä koskaan päädy käyttäjärajan yli.
+    #[tokio::test]
+    async fn tool_loop_awaiting_approval_does_not_leak_marker_to_user() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        // Yksi vastaus: malli kutsuu hyväksyntää vaativaa työkalua.
+        let api = spawn_scripted_llm(vec![body_tool_call(
+            "call_approve",
+            "approval_skill",
+            &serde_json::json!({ "q": "do-it" }),
+        )])
+        .await;
+        let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+            .with_actions(approval_runtime());
+
+        let out = agent.think(&BusMessage::text("aja hyväksyntä-työkalu")).await;
+        // EI käyttäjävastausta: hyväksyntä on operaattorin tila, ei reply.
+        assert!(
+            out.is_none(),
+            "hyväksyntää odottava työkalu ei tuota käyttäjävastausta, sai: {out:?}"
+        );
+        // Varmistus: jos jokin tulevaisuuden muutos palauttaisi tekstin, se ei
+        // saa sisältää sisäistä merkkiä eikä raakaa approval-tunnistetta.
+        if let Some(Ok(text)) = out {
+            assert!(
+                !text.contains("awaiting approval") && !text.contains("approval_id"),
+                "approval-merkki EI saa vuotaa käyttäjälle, sai: {text}"
+            );
+        }
+        bus.stop();
+    }
+
+    /// `with_tool_loop` säätää rajan ja `tool_loop()` lukee sen; oletus on
+    /// [`ToolLoopConfig::DEFAULT_MAX_ITERATIONS`].
+    #[tokio::test]
+    async fn tool_loop_config_default_and_override() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let agent = test_agent("agent_a", bus.clone());
+        assert_eq!(
+            agent.tool_loop().max_iterations,
+            ToolLoopConfig::DEFAULT_MAX_ITERATIONS
+        );
+        let tuned = agent.with_tool_loop(ToolLoopConfig { max_iterations: 2 });
+        assert_eq!(tuned.tool_loop().max_iterations, 2);
         bus.stop();
     }
 }

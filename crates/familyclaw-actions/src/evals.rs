@@ -39,8 +39,8 @@ use crate::error::Result;
 use crate::ids::SkillId;
 use crate::proof::ProofBundle;
 use crate::skills::{
-    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, GithubIssueDraftMock, Skill,
-    Pipeline, PipelineOutcome,
+    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, FsReadAllowlisted,
+    GithubIssueDraftMock, Pipeline, PipelineOutcome, Skill,
 };
 use crate::task::ActionTask;
 
@@ -71,7 +71,12 @@ impl EvalReport {
     }
 }
 
-/// Rakentaa putken, johon kaikki neljä mock-taitoa on rekisteröity.
+/// Rakentaa putken, johon kaikki viisi KERROS A -taitoa on rekisteröity
+/// (neljä mock-taitoa + lippulaiva [`FsReadAllowlisted`]).
+///
+/// Lippulaiva rekisteröidään tyhjällä allowlistilla (fail-closed): se on
+/// putkessa todistamassa työkalusilmukan, mutta hylkää kaikki polut kunnes sille
+/// annetaan allowlist.
 ///
 /// # Errors
 /// Palauttaa rekisteröinnin virheen jos jonkin taidon manifesti ei validoidu
@@ -82,6 +87,7 @@ pub fn build_pipeline() -> Result<Pipeline> {
     pipeline.register_skill(&EmailTriageMock::new())?;
     pipeline.register_skill(&DiscordThreadSummaryMock::new())?;
     pipeline.register_skill(&FilePatchMock::new())?;
+    pipeline.register_skill(&FsReadAllowlisted::new())?;
     Ok(pipeline)
 }
 
@@ -768,11 +774,11 @@ mod tests {
         assert_eq!(proof.redacted_output["applied"], serde_json::json!(false));
     }
 
-    /// Putki rekisteröi kaikki neljä taitoa ilman duplikaattikonfliktia.
+    /// Putki rekisteröi kaikki viisi taitoa ilman duplikaattikonfliktia.
     #[tokio::test]
-    async fn pipeline_registers_all_four_skills() {
+    async fn pipeline_registers_all_skills() {
         let pipeline = build_pipeline().expect("pipeline");
-        assert_eq!(pipeline.registry().len(), 4);
+        assert_eq!(pipeline.registry().len(), 5);
         assert!(pipeline
             .registry()
             .contains(&GithubIssueDraftMock::skill_id()));
@@ -781,6 +787,9 @@ mod tests {
             .registry()
             .contains(&DiscordThreadSummaryMock::skill_id()));
         assert!(pipeline.registry().contains(&FilePatchMock::skill_id()));
+        assert!(pipeline
+            .registry()
+            .contains(&FsReadAllowlisted::skill_id()));
     }
 
     /// Tuntematon taito hylätään ([`crate::ActionError::UnknownSkill`]).

@@ -148,6 +148,32 @@ impl Skill for DiscordThreadSummaryMock {
             approval_policy: ApprovalPolicy::AutoIfReadOnly,
             input_hint: Some("{ thread: [{ author, text }] }".to_string()),
             output_hint: Some("{ summary, action_items }".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "thread": {
+                        "type": "array",
+                        "description": "Tiivistettävän ketjun viestit järjestyksessä.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "author": {
+                                    "type": "string",
+                                    "description": "Viestin kirjoittaja."
+                                },
+                                "text": {
+                                    "type": "string",
+                                    "description": "Viestin tekstisisältö."
+                                }
+                            },
+                            "required": ["author", "text"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["thread"],
+                "additionalProperties": false
+            }),
         }
     }
 }
@@ -187,6 +213,9 @@ mod tests {
         m.validate().expect("manifest validates");
         assert_eq!(m.name, "discord_thread_summary_mock");
         assert_eq!(m.risk, ActionRisk::ReadOnly);
+        // Syöteskeema on aito JSON-objekti jossa `thread`-taulukko.
+        assert_eq!(m.input_schema["type"], "object");
+        assert!(m.input_schema["properties"]["thread"].is_object());
     }
 
     #[test]

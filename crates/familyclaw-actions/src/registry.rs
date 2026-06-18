@@ -102,6 +102,7 @@ mod tests {
             approval_policy: ApprovalPolicy::AutoIfReadOnly,
             input_hint: None,
             output_hint: None,
+            input_schema: crate::manifest::default_input_schema(),
         }
     }
 
@@ -165,6 +166,7 @@ mod tests {
             approval_policy: ApprovalPolicy::AutoIfReadOnly,
             input_hint: None,
             output_hint: None,
+            input_schema: crate::manifest::default_input_schema(),
         };
         let err = reg
             .register(malicious)

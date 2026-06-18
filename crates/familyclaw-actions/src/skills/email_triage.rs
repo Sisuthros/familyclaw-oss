@@ -150,6 +150,36 @@ impl Skill for EmailTriageMock {
             approval_policy: ApprovalPolicy::AutoIfReadOnly,
             input_hint: Some("{ emails: [{ from, subject, body }] }".to_string()),
             output_hint: Some("{ categorized: [{ id, category, action }] }".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "emails": {
+                        "type": "array",
+                        "description": "Luokiteltavat sähköpostit.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from": {
+                                    "type": "string",
+                                    "description": "Lähettäjän osoite."
+                                },
+                                "subject": {
+                                    "type": "string",
+                                    "description": "Viestin aihe."
+                                },
+                                "body": {
+                                    "type": "string",
+                                    "description": "Viestin runko."
+                                }
+                            },
+                            "required": ["from", "subject", "body"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["emails"],
+                "additionalProperties": false
+            }),
         }
     }
 }

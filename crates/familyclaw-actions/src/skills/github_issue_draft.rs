@@ -138,6 +138,17 @@ impl Skill for GithubIssueDraftMock {
             approval_policy: ApprovalPolicy::RequireApproval,
             input_hint: Some("{ bug_report: string }".to_string()),
             output_hint: Some("{ title, body, repo }".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "bug_report": {
+                        "type": "string",
+                        "description": "Käyttäjän kirjoittama vapaamuotoinen bugiraportti."
+                    }
+                },
+                "required": ["bug_report"],
+                "additionalProperties": false
+            }),
         }
     }
 }
@@ -160,6 +171,9 @@ mod tests {
         assert_eq!(m.risk, ActionRisk::WriteExternal);
         assert!(m.permissions.contains(&SkillPermission::WriteExternal));
         assert!(m.approval_policy.can_require_approval());
+        // Syöteskeema vaatii `bug_report`-merkkijonon.
+        assert_eq!(m.input_schema["type"], "object");
+        assert_eq!(m.input_schema["required"][0], "bug_report");
     }
 
     #[test]

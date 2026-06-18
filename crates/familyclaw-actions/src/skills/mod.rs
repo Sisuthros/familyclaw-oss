@@ -57,11 +57,13 @@ pub(crate) const SCAFFOLDED: bool = true;
 pub mod discord_thread_summary;
 pub mod email_triage;
 pub mod file_patch;
+pub mod fs_read;
 pub mod github_issue_draft;
 
 pub use discord_thread_summary::DiscordThreadSummaryMock;
 pub use email_triage::EmailTriageMock;
 pub use file_patch::FilePatchMock;
+pub use fs_read::{FsReadAllowlisted, FsReadConfig};
 pub use github_issue_draft::GithubIssueDraftMock;
 
 /// Yhteinen rajapinta taidoille (skills).

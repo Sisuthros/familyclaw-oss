@@ -1462,6 +1462,7 @@ dependencies = [
  "async-trait",
  "base64",
  "clap",
+ "familyclaw-actions",
  "familyclaw-bridge",
  "familyclaw-bus",
  "familyclaw-channels",

@@ -7,13 +7,16 @@
 //! ([`SkillManifest::validate`]) torjuu:
 //! - tyhjän tai `nil`-tunnisteen,
 //! - tyhjän nimen tai version,
-//! - salaisuudelta näyttävät arvot missä tahansa tekstikentässä,
+//! - salaisuudelta näyttävät arvot missä tahansa tekstikentässä (myös
+//!   [`SkillManifest::input_schema`]-skeeman tekstiarvoissa),
+//! - [`SkillManifest::input_schema`]-skeeman jonka juuri ei ole JSON-objekti,
 //! - ulkoisen kirjoituksen ([`SkillPermission::WriteExternal`]) ilman
 //!   hyväksyntää aidosti vaativaa käytäntöä.
 //!
 //! Tuntemattomat riskiluokat hylkää jo serde (enum-validointi).
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::{ActionError, Result};
 use crate::ids::SkillId;
@@ -24,12 +27,26 @@ use crate::policy::{detect_secret_like, ActionRisk, ApprovalPolicy, SkillPermiss
 /// Säilytetään, jotta [`crate::all_modules_scaffolded`] kääntyy edelleen.
 pub(crate) const SCAFFOLDED: bool = true;
 
+/// Manifestin oletusarvoinen syöteskeema: tyhjä JSON-objekti `{"type":"object"}`.
+///
+/// Käytetään kahdessa paikassa: serde-deserialisoinnin oletuksena (vanhat
+/// tallennetut manifestit ilman `input_schema`-kenttää latautuvat tällä) sekä
+/// [`SkillManifest`]-rakentajien lähtöarvona. Juuri on AINA objekti, jotta
+/// skeema kelpaa LLM:lle työkalun `parameters`-kentäksi sellaisenaan.
+#[must_use]
+pub fn default_input_schema() -> Value {
+    serde_json::json!({ "type": "object" })
+}
+
 /// Yhden taidon manifesti: kaikki tieto jonka rekisteri ja käytäntökerros
 /// tarvitsevat ennen kuin taitoa voidaan suunnitella tai suorittaa.
 ///
 /// Manifesti on puhtaasti dataa (ei suoritettavaa logiikkaa) ja sarjallistuu
 /// TOML- ja JSON-muotoon ilman muunnoksia.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `PartialEq` (ei `Eq`) johtuu [`SkillManifest::input_schema`]-kentästä:
+/// `serde_json::Value` toteuttaa vain `PartialEq`:n (liukulukujen vuoksi).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillManifest {
     /// Taidon yksilöivä tunniste rekisterissä.
     pub id: SkillId,
@@ -46,14 +63,65 @@ pub struct SkillManifest {
     /// Hyväksyntäkäytäntö (vaaditaanko ihmisen hyväksyntä).
     pub approval_policy: ApprovalPolicy,
     /// Vapaamuotoinen vihje odotetusta syötteen muodosta (esim. skeema-nimi).
+    ///
+    /// Tarkoitettu ihmisluettavaksi näytöksi; rakenteellisen, koneluettavan
+    /// version tarjoaa [`SkillManifest::input_schema`].
     #[serde(default)]
     pub input_hint: Option<String>,
     /// Vapaamuotoinen vihje odotetusta tuloksen muodosta.
     #[serde(default)]
     pub output_hint: Option<String>,
+    /// Koneluettava JSON Schema -kuvaus taidon syötteestä.
+    ///
+    /// Tällä taito voidaan mainostaa LLM:lle aitona työkaluna: skeema siirtyy
+    /// sellaisenaan työkalun `parameters`-kentäksi. Juuren TÄYTYY olla
+    /// JSON-objekti (skalaari/taulukko ei kelpaa); validointi
+    /// ([`SkillManifest::validate`]) torjuu muut. Kun arvoa ei anneta, serde
+    /// täyttää sen [`default_input_schema`]-funktiolla (`{"type":"object"}`),
+    /// jotta vanhat ilman tätä kenttää tallennetut manifestit latautuvat yhä.
+    #[serde(default = "default_input_schema")]
+    pub input_schema: Value,
 }
 
 impl SkillManifest {
+    /// Asettaa koneluettavan syöteskeeman ja palauttaa muokatun manifestin
+    /// (rakentaja-tyylinen ketjutus).
+    ///
+    /// Skeema ei korvaa [`SkillManifest::input_hint`]-vihjettä — molemmat
+    /// säilyvät: `input_hint` ihmisnäyttöä, `input_schema` LLM:lle. Arvoa EI
+    /// validoida tässä; juuren objektivaatimus ja salaisuustarkistus tehdään
+    /// vasta [`SkillManifest::validate`]-kutsussa.
+    ///
+    /// # Examples
+    /// ```
+    /// use familyclaw_actions::manifest::SkillManifest;
+    /// # use familyclaw_actions::ids::SkillId;
+    /// # use familyclaw_actions::policy::{ActionRisk, ApprovalPolicy};
+    /// # let base = SkillManifest {
+    /// #     id: SkillId::new(),
+    /// #     name: "demo".into(),
+    /// #     version: "1.0.0".into(),
+    /// #     description: "demo".into(),
+    /// #     permissions: vec![],
+    /// #     risk: ActionRisk::ReadOnly,
+    /// #     approval_policy: ApprovalPolicy::AutoIfReadOnly,
+    /// #     input_hint: None,
+    /// #     output_hint: None,
+    /// #     input_schema: serde_json::json!({ "type": "object" }),
+    /// # };
+    /// let m = base.with_input_schema(serde_json::json!({
+    ///     "type": "object",
+    ///     "properties": { "text": { "type": "string" } },
+    ///     "required": ["text"]
+    /// }));
+    /// assert_eq!(m.input_schema["type"], "object");
+    /// ```
+    #[must_use]
+    pub fn with_input_schema(mut self, input_schema: Value) -> Self {
+        self.input_schema = input_schema;
+        self
+    }
+
     /// Jäsentää manifestin TOML-merkkijonosta.
     ///
     /// # Errors
@@ -84,10 +152,11 @@ impl SkillManifest {
     ///
     /// # Errors
     /// - [`ActionError::ManifestValidation`] jos tunniste on `nil`, tai nimi/
-    ///   versio on tyhjä, tai ulkoinen kirjoitus on ilman hyväksyntää vaativaa
+    ///   versio on tyhjä, tai [`SkillManifest::input_schema`]-skeeman juuri ei
+    ///   ole JSON-objekti, tai ulkoinen kirjoitus on ilman hyväksyntää vaativaa
     ///   käytäntöä.
-    /// - [`ActionError::SecretInManifest`] jos jokin tekstikenttä sisältää
-    ///   salaisuudelta näyttävän arvon.
+    /// - [`ActionError::SecretInManifest`] jos jokin tekstikenttä tai
+    ///   syöteskeeman tekstiarvo sisältää salaisuudelta näyttävän arvon.
     pub fn validate(&self) -> Result<()> {
         if self.id.is_nil() {
             return Err(ActionError::ManifestValidation(
@@ -103,6 +172,14 @@ impl SkillManifest {
             ));
         }
 
+        // Syöteskeeman juuren on oltava JSON-objekti, jotta se kelpaa LLM:n
+        // työkalun `parameters`-kentäksi sellaisenaan (skalaari/taulukko ei).
+        if !self.input_schema.is_object() {
+            return Err(ActionError::ManifestValidation(
+                "input_schema juuren on oltava JSON-objekti".to_string(),
+            ));
+        }
+
         // Turvatarkistus: mikään tekstikenttä ei saa sisältää salaisuutta.
         for (field, value) in self.text_fields() {
             if detect_secret_like(value) {
@@ -110,6 +187,14 @@ impl SkillManifest {
                     "kenttä '{field}' näyttää sisältävän salaisuuden"
                 )));
             }
+        }
+
+        // Sama turvatarkistus syöteskeemalle: skeema on rakenteinen, joten
+        // läpikäydään sen kaikki merkkijonosolmut (avaimet ja arvot).
+        if let Some(secret_path) = first_secret_in_json(&self.input_schema, "input_schema") {
+            return Err(ActionError::SecretInManifest(format!(
+                "input_schema-polku '{secret_path}' näyttää sisältävän salaisuuden"
+            )));
         }
 
         // Ulkoinen kirjoitus vaatii käytännön joka aidosti voi vaatia hyväksynnän.
@@ -171,6 +256,41 @@ impl SkillManifest {
     }
 }
 
+/// Etsii ensimmäisen salaisuudelta näyttävän merkkijonon JSON-arvosta.
+///
+/// Käy rekursiivisesti läpi objektien avaimet ja arvot sekä taulukoiden alkiot,
+/// ja palauttaa [`Some`]-polun (esim. `input_schema.properties.token`)
+/// ensimmäiseen solmuun, jonka tekstiarvo läpäisee
+/// [`detect_secret_like`]-tarkistuksen. Palauttaa [`None`], jos salaisuuksia ei
+/// löydy. `path` on kutsujan antama juuriprefiksi (esim. `"input_schema"`).
+///
+/// Tämä laajentaa manifestin salaisuusvapaus-takuun kattamaan myös
+/// rakenteisen [`SkillManifest::input_schema`]-skeeman, ei vain tasaisia
+/// tekstikenttiä.
+fn first_secret_in_json(value: &Value, path: &str) -> Option<String> {
+    match value {
+        Value::String(s) => {
+            if detect_secret_like(s) {
+                Some(path.to_string())
+            } else {
+                None
+            }
+        }
+        Value::Object(map) => map.iter().find_map(|(key, child)| {
+            if detect_secret_like(key) {
+                return Some(format!("{path}.{key} (avain)"));
+            }
+            first_secret_in_json(child, &format!("{path}.{key}"))
+        }),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .find_map(|(idx, child)| first_secret_in_json(child, &format!("{path}[{idx}]"))),
+        // Numerot, boolit ja null eivät voi olla salaisuuksia.
+        Value::Number(_) | Value::Bool(_) | Value::Null => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +307,7 @@ mod tests {
             approval_policy: ApprovalPolicy::RequireApproval,
             input_hint: Some("text".to_string()),
             output_hint: Some("ack".to_string()),
+            input_schema: default_input_schema(),
         }
     }
 
@@ -208,6 +329,8 @@ approval_policy = "auto_if_read_only"
         assert_eq!(manifest.id, id);
         assert_eq!(manifest.name, "read-doc");
         assert_eq!(manifest.risk, ActionRisk::ReadOnly);
+        // input_schema puuttui lähteestä → serde-oletus täyttää sen.
+        assert_eq!(manifest.input_schema, default_input_schema());
         manifest.validate().expect("valid manifest validates");
     }
 
@@ -228,6 +351,8 @@ approval_policy = "auto_if_read_only"
         let manifest = SkillManifest::from_json(&json_src).expect("json parses");
         assert_eq!(manifest.id, id);
         assert_eq!(manifest.approval_policy, ApprovalPolicy::AutoIfReadOnly);
+        // Vanha serialisoitu manifesti ilman input_schemaa latautuu yhä.
+        assert_eq!(manifest.input_schema, default_input_schema());
         manifest.validate().expect("valid manifest validates");
     }
 
@@ -341,5 +466,71 @@ approval_policy = "auto_if_read_only"
         let json = m.to_json().expect("serialize");
         let back = SkillManifest::from_json(&json).expect("deserialize");
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn json_roundtrip_preserves_custom_input_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "viesti" },
+                "count": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["text"]
+        });
+        let m = valid_manifest().with_input_schema(schema.clone());
+        m.validate().expect("custom schema validates");
+        let back = SkillManifest::from_json(&m.to_json().expect("serialize"))
+            .expect("deserialize");
+        assert_eq!(back.input_schema, schema);
+        assert_eq!(m, back);
+    }
+
+    #[test]
+    fn default_input_schema_is_empty_object() {
+        let schema = default_input_schema();
+        assert!(schema.is_object());
+        assert_eq!(schema["type"], "object");
+    }
+
+    #[test]
+    fn with_input_schema_keeps_input_hint() {
+        let m = valid_manifest()
+            .with_input_schema(serde_json::json!({ "type": "object" }));
+        // input_hint säilyy ihmisnäyttöä varten skeeman rinnalla.
+        assert_eq!(m.input_hint.as_deref(), Some("text"));
+    }
+
+    #[test]
+    fn non_object_input_schema_rejected() {
+        let mut m = valid_manifest();
+        m.input_schema = serde_json::json!("not an object");
+        let err = m
+            .validate()
+            .expect_err("scalar input_schema root must be rejected");
+        assert!(matches!(err, ActionError::ManifestValidation(_)));
+
+        m.input_schema = serde_json::json!([1, 2, 3]);
+        let err = m
+            .validate()
+            .expect_err("array input_schema root must be rejected");
+        assert!(matches!(err, ActionError::ManifestValidation(_)));
+    }
+
+    #[test]
+    fn secret_in_input_schema_value_rejected() {
+        let mut m = valid_manifest();
+        // Salaisuus rakennetaan ajonaikana (ei pitkää literaalia lähteessä).
+        let fake = format!("sk-{}", "live".repeat(4));
+        m.input_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "key": { "type": "string", "default": fake }
+            }
+        });
+        let err = m
+            .validate()
+            .expect_err("secret-looking value inside schema must be rejected");
+        assert!(matches!(err, ActionError::SecretInManifest(_)));
     }
 }

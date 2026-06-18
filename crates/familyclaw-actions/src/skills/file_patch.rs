@@ -123,6 +123,21 @@ impl Skill for FilePatchMock {
             approval_policy: ApprovalPolicy::AlwaysRequireApproval,
             input_hint: Some("{ file_content, requested_edit }".to_string()),
             output_hint: Some("{ patch }".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_content": {
+                        "type": "string",
+                        "description": "Tiedoston nykyinen sisältö."
+                    },
+                    "requested_edit": {
+                        "type": "string",
+                        "description": "Luonnollisella kielellä kuvattu pyydetty muutos."
+                    }
+                },
+                "required": ["file_content", "requested_edit"],
+                "additionalProperties": false
+            }),
         }
     }
 }

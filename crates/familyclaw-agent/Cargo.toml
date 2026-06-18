@@ -15,6 +15,11 @@ workspace = true
 familyclaw-core = { workspace = true }
 familyclaw-bridge = { workspace = true }
 familyclaw-bus = { workspace = true }
+# Tool loop (Phase 1 keystone): agentti rakentaa LLM:lle tarjottavat
+# ToolDefinitionit actionsin julkaisemista MCP-kuvauksista ja reitittää
+# työkalukutsut takaisin tänne. Riippuvuus kulkee VAIN agent → actions
+# (ei sykliä — actions ei riipu agentista).
+familyclaw-actions = { workspace = true }
 familyclaw-memory = { workspace = true }
 familyclaw-emotion = { workspace = true }
 familyclaw-durable = { workspace = true }
