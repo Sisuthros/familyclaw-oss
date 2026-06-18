@@ -10,14 +10,29 @@
 //! poistuu exit-koodilla 137 (SIGKILL-tyyli) juuri siinä ikkunassa, ja toinen
 //! prosessi yrittää jatkaa. Kello injektoidaan → deterministinen.
 //!
-//! ## Kaksi väitettä
+//! ## Kaksi ikkunaa, molemmat todistettu prosessirajan yli
+//! - **COMMITTED-ikkuna** (`crash` → `resume`): outbox on jo täysin kirjoitettu
+//!   (intent + committed), vain agenttikerroksen journal-rivi puuttuu. Replay
+//!   palauttaa **arvo-identtisen** lopputuloksen ajamatta sivuvaikutusta uudelleen
+//!   → **exactly-once**.
+//! - **INTENT-ONLY-ikkuna** (`crash_intent` → `resume_intent`): prosessi tapetaan
+//!   `record_intent`:n JA sivuvaikutuksen jälkeen mutta ENNEN `record_committed`:ä.
+//!   Replay näkee `InProgress` → `submit_task_idempotent` palauttaa `PolicyDenied`
+//!   fail-closed, eikä sivuvaikutus aja uudelleen → **at-most-once**. Tämä on se
+//!   aidosti vaarallinen ikkuna jonka GPT-5.5 nosti esiin; aiemmin se oli
+//!   todistettu vain saman prosessin sisäisellä yksikkötestillä.
+//!
+//! ## Kolme väitettä
 //! - **Vanha polku (`--mode old`, `submit_task_as` ilman outboxia):** bugi ON
 //!   olemassa → sivuvaikutuslaskuri = 2 (double-fire), lopputulos ei identtinen.
 //!   Tämä todistaa että testi PALJASTAA bugin (epäonnistuisi korjaamattomalla
 //!   koodilla).
-//! - **Uusi polku (`--mode new`, `submit_task_idempotent` + kaatumiskestävä
-//!   outbox):** bugi KORJATTU → sivuvaikutuslaskuri = 1 (tasan kerran), ja
-//!   jatkettu lopputulos on **arvo-identtinen** kaatuneen kanssa (sama `task_id`).
+//! - **Uusi polku, COMMITTED-ikkuna (`--mode new`, `submit_task_idempotent` +
+//!   kaatumiskestävä outbox):** bugi KORJATTU → sivuvaikutuslaskuri = 1 (tasan
+//!   kerran), ja jatkettu lopputulos on **arvo-identtinen** kaatuneen kanssa
+//!   (sama `task_id`).
+//! - **Uusi polku, INTENT-ONLY-ikkuna:** kaatuminen intentin jälkeen ennen
+//!   committedia → replay on `PolicyDenied` ja laskuri pysyy 1:ssä (at-most-once).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -61,6 +76,27 @@ fn tempdir(tag: &str) -> PathBuf {
 fn run(bin: &Path, args: &[&str]) -> (bool, String, String) {
     let out = Command::new(bin).args(args).output().expect("spawn harness");
     (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Ajaa harness-prosessin annetuilla ympäristömuuttujilla ja palauttaa
+/// (`exit_code`, `exit_ok`, stdout, stderr).
+///
+/// Tarvitaan intent-only-kaatumiseen, joka aseistetaan
+/// `FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1`:llä. `exit_code` palautetaan
+/// erikseen jotta voidaan vaatia tasan 137 (SIGKILL-tyyli).
+fn run_env(bin: &Path, args: &[&str], envs: &[(&str, &str)]) -> (Option<i32>, bool, String, String) {
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn harness");
+    (
+        out.status.code(),
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -200,6 +236,116 @@ fn new_path_side_effect_exactly_once_and_value_identical() {
         report["value_identical"],
         serde_json::Value::Bool(true),
         "NEW path resume must return the value-identical SubmitOutcome (same task_id)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ympäristömuuttuja joka aseistaa intent-only-kaatumiskoukun harness-binäärissä.
+const CRASH_AFTER_INTENT_ENV: &str = "FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT";
+
+/// Lukee outbox-journalin raakana (tyhjä jos tiedostoa ei ole).
+fn read_outbox(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// **INTENT-ONLY-IKKUNA todistaa at-most-once fail-closed AIDON prosessirajan yli.**
+///
+/// Tämä sulkee sen kaveatin jonka GPT-5.5:n adversariaalinen katselmointi nosti
+/// esiin: aiempi `crash`-vaihe poistui VASTA `record_committed`:n jälkeen (hyvänlaatuinen
+/// committed-replay-kohta). Aidosti vaarallinen ikkuna on `record_intent`:n JA
+/// sivuvaikutuksen jälkeen mutta ENNEN `record_committed`:ä — siellä replayn ON
+/// palautettava `InProgress` → `PolicyDenied`, eikä sivuvaikutus saa laueta toiste.
+///
+/// Vaihe 1 (`crash_intent`, koukku aseistettu): `record_intent` levylle, sivuvaikutus
+/// laukeaa (laskuri = 1), sitten prosessi abortoi `record_committed`:n alussa →
+/// poistuu 137. Levyllä: intent-marker LÄSNÄ, committed-marker POISSA.
+///
+/// Vaihe 2 (`resume_intent`, sama avain): outbox-lookup näkee intentin ilman
+/// committedia → `InProgress` → `submit_task_idempotent` palauttaa `PolicyDenied`.
+/// Laskuri PYSYY 1:ssä (sivuvaikutus EI aja uudelleen) → at-most-once.
+///
+/// Testi epäonnistuisi jos järjestys olisi väärin: jos `record_intent` tulisi
+/// sivuvaikutuksen JÄLKEEN, replay ei havaitsisi keskeneräisyyttä ja
+/// double-firaisi (tai re-runaisi hiljaa) → tämä testi pyydystää sen.
+#[test]
+fn intent_window_crash_is_at_most_once() {
+    let bin = harness_bin();
+    let dir = tempdir("intent-window");
+    let outbox = dir.join("outbox.jsonl");
+    let counter = dir.join("counter.txt");
+    let outcome = dir.join("outcome.json");
+    let (ob, ct, oc) = (
+        outbox.to_string_lossy().into_owned(),
+        counter.to_string_lossy().into_owned(),
+        outcome.to_string_lossy().into_owned(),
+    );
+
+    // Vaihe 1 (crash_intent): aseistettu koukku → abort record_committed:n alussa.
+    let (code1, ok1, _o1, e1) = run_env(
+        &bin,
+        &phase_args("new", "crash_intent", &ob, &ct, &oc),
+        &[(CRASH_AFTER_INTENT_ENV, "1")],
+    );
+    assert!(!ok1, "crash_intent phase must NOT exit success. stderr={e1}");
+    assert_eq!(
+        code1,
+        Some(137),
+        "crash_intent must exit 137 (SIGKILL-style) from the crash hook. stderr={e1}"
+    );
+
+    // Sivuvaikutus laukesi TASAN KERRAN ennen kaatumista (CountingExecutorin ulkoinen
+    // levymerkki). Tämä todistaa että kaatuminen tapahtui sivuvaikutuksen JÄLKEEN.
+    assert_eq!(
+        read_counter(&counter),
+        1,
+        "side effect fired exactly once before the intent-only crash"
+    );
+
+    // Levyllä: intent-marker LÄSNÄ, committed-marker POISSA → todennettu
+    // intent-only-tila aidon prosessirajan yli (ei in-process-simulaatio).
+    let on_disk = read_outbox(&outbox);
+    assert!(
+        on_disk.contains("dispatch_intent"),
+        "intent marker must be present on disk after intent-only crash. disk={on_disk:?}"
+    );
+    assert!(
+        !on_disk.contains("dispatch_committed"),
+        "committed marker must be ABSENT on disk (crash hit before record_committed). \
+         disk={on_disk:?}"
+    );
+
+    // Vaihe 2 (resume_intent): tuore prosessi, sama avain → InProgress →
+    // PolicyDenied fail-closed, eikä sivuvaikutus aja uudelleen.
+    let (code2, ok2, o2, e2) = run_env(
+        &bin,
+        &phase_args("new", "resume_intent", &ob, &ct, &oc),
+        // EI aseistusta resumessa — koukkua ei käytetä resume_intent-vaiheessa.
+        &[],
+    );
+    assert!(
+        ok2,
+        "resume_intent phase must exit success (code={code2:?}). stderr={e2}"
+    );
+    let report = result_json(&o2);
+    eprintln!("[intent-window resume] {report}");
+
+    // AT-MOST-ONCE TODISTE 1: replay on PolicyDenied fail-closed (ei hiljainen re-run).
+    assert_eq!(
+        report["policy_denied"],
+        serde_json::Value::Bool(true),
+        "INTENT-ONLY replay must be PolicyDenied (fail-closed), not a silent re-run"
+    );
+
+    // AT-MOST-ONCE TODISTE 2: laskuri PYSYY 1:ssä — sivuvaikutus EI lauennut toiste.
+    assert_eq!(
+        report["side_effect_count"], 1,
+        "INTENT-ONLY replay must NOT re-fire the side effect (at-most-once)"
+    );
+    assert_eq!(
+        read_counter(&counter),
+        1,
+        "disk counter confirms the side effect fired AT MOST once (1, never 2)"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
