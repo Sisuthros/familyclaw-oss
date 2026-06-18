@@ -289,6 +289,100 @@ fn redact_inner(value: &Value, parent_key: Option<&str>, report: &mut RedactionR
     }
 }
 
+/// Redaktoi salaisuudelta näyttävät arvot **syvällä** rekursiivisesti annetusta
+/// [`serde_json::Value`]-rakenteesta — myös vapaamuotoiseen tekstiin **upotetut**
+/// salaisuudet.
+///
+/// Ero [`redact_value`]:hin: siinä missä [`redact_value`] redaktoi merkkijonon
+/// vain jos (a) sen kentän nimi on tunnettu salaisuusavain tai (b) **koko**
+/// merkkijono näyttää salaisuudelta, tämä variantti ajaa lisäksi
+/// `redact_text`-osajono­pass:in jokaiselle merkkijonolehdelle, joka ei jo
+/// mennyt kokonaan redaktoiduksi. Näin esim. vapaamuotoinen työkaluargumentti
+/// `{"prompt":"deploy using sk-livelivelivelive then ..."}` ei vuoda raakaa
+/// tokenia levylle, vaikka kentän nimi (`prompt`) ei ole salaisuusavain eikä
+/// koko arvo ole pelkkä token.
+///
+/// Käytetään jatkettavan vuoron ([`crate::ApprovalId`]-avaimella tallennettava
+/// resumable-turn) **levylle persistoitavan** viestipinon työkaluargumenteille,
+/// joissa salaisuus voi piillä mallin tuottaman vapaatekstin sisällä.
+///
+/// Palauttaa redaktoidun kopion sekä [`RedactionReport`]-yhteenvedon. Alkuperäistä
+/// syötettä ei muteta, eikä raportti koskaan kanna raakoja salaisia arvoja.
+#[must_use]
+pub fn redact_value_deep(value: &Value) -> (Value, RedactionReport) {
+    let mut report = RedactionReport::default();
+    let redacted = redact_inner_deep(value, None, &mut report);
+    report.patterns_found.sort_unstable();
+    report.patterns_found.dedup();
+    (redacted, report)
+}
+
+/// Kuten [`redact_inner`], mutta merkkijonolehdille ajetaan lisäksi
+/// [`redact_text`]-osajono­pass, jotta vapaamuotoiseen tekstiin upotetut
+/// salaisuudet (esim. `"deploy using sk-live..."`) eivät jää redaktoimatta.
+fn redact_inner_deep(value: &Value, parent_key: Option<&str>, report: &mut RedactionReport) -> Value {
+    match value {
+        Value::String(s) => {
+            // 1. Avainnimipohjainen redaktointi: kentän nimi paljastaa salaisuuden.
+            if let Some(key) = parent_key {
+                if is_secret_key_name(key) && !s.is_empty() {
+                    report.redacted_count += 1;
+                    report
+                        .patterns_found
+                        .push(format!("secret-key:{}", key.to_ascii_lowercase()));
+                    return Value::String(REDACTED.to_string());
+                }
+            }
+            // 2. Arvopohjainen redaktointi: koko merkkijono näyttää salaisuudelta.
+            if let Some(pattern) = match_secret_pattern(s) {
+                report.redacted_count += 1;
+                report.patterns_found.push(pattern.to_string());
+                return Value::String(REDACTED.to_string());
+            }
+            // 3. Osajono­pass: salaisuus UPOTETTUNA vapaamuotoiseen tekstiin.
+            //    Pilkkoo tyhjämerkeillä ja redaktoi yksittäiset salaisuussanat +
+            //    `Bearer …`/`avain=arvo`-muodot. Jos mikään ei osu, teksti palautuu
+            //    sellaisenaan (ei turhaa kopiota merkitykseltään).
+            Value::String(redact_text(s, report))
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_inner_deep(item, None, report))
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), redact_inner_deep(v, Some(k), report));
+            }
+            Value::Object(out)
+        }
+        // Luvut, totuusarvot ja null eivät voi olla salaisuuksia.
+        other => other.clone(),
+    }
+}
+
+/// Redaktoi salaisuudelta näyttävät osajonot vapaamuotoisesta **tekstistä**
+/// (ei JSON-rakenteesta).
+///
+/// Tämä on julkinen kääre `redact_text`-osajono­passille, jotta `familyclaw-agent`
+/// voi redaktoida jatkettavan vuoron viestipinon **tekstisisällön** (system-/user-/
+/// tool-viestien `content`) ennen levylle persistointia. Pilkkoo tekstin
+/// tyhjämerkeillä ja redaktoi yksittäiset salaisuussanat sekä `Bearer <token>`-
+/// ja `avain=arvo`-muodot, joissa avain on tunnettu salaisuusavain.
+///
+/// Palauttaa redaktoidun tekstin sekä [`RedactionReport`]-yhteenvedon. Raportti
+/// kantaa vain kuvioiden **nimet**, ei koskaan raakoja arvoja.
+#[must_use]
+pub fn redact_free_text(text: &str) -> (String, RedactionReport) {
+    let mut report = RedactionReport::default();
+    let redacted = redact_text(text, &mut report);
+    report.patterns_found.sort_unstable();
+    report.patterns_found.dedup();
+    (redacted, report)
+}
+
 /// Laskee syötteen SHA-256-tiivisteen heksamerkkijonona.
 ///
 /// Syöte sarjallistetaan ensin kanoniseen JSON-muotoon. Tiiviste tallennetaan
@@ -526,6 +620,73 @@ mod tests {
         let serialized = serde_json::to_string(&out).expect("serialize");
         assert!(!serialized.contains(&secret));
         assert!(serialized.contains(REDACTED));
+    }
+
+    #[test]
+    fn redact_value_misses_secret_embedded_in_free_text_but_deep_catches_it() {
+        // Tämä on juuri se aukko jonka defect #2 raportoi: salaisuus piilee
+        // SUUREMMAN vapaatekstin sisällä, kentän nimi EI ole salaisuusavain,
+        // eikä koko arvo ole pelkkä token. `redact_value` jättää sen raakana.
+        let secret = fake_secret();
+        let input = json!({ "prompt": format!("deploy using {secret} then ship") });
+
+        // Vanha (matala) redaktointi EI nappaa upotettua salaisuutta.
+        let (shallow, shallow_report) = redact_value(&input);
+        let shallow_json = serde_json::to_string(&shallow).expect("serialize");
+        assert!(
+            shallow_json.contains(&secret),
+            "redact_value is documented as missing embedded secrets (regression sentinel)"
+        );
+        assert!(!shallow_report.any_redacted());
+
+        // Uusi (syvä) redaktointi nappaa sen.
+        let (deep, deep_report) = redact_value_deep(&input);
+        let deep_json = serde_json::to_string(&deep).expect("serialize");
+        assert!(
+            !deep_json.contains(&secret),
+            "redact_value_deep must redact secrets embedded in free-text args"
+        );
+        assert!(deep_json.contains(REDACTED));
+        assert!(deep_report.any_redacted());
+        // Ympäröivä vaaraton teksti säilyy luettavana.
+        assert!(deep_json.contains("deploy using"));
+        assert!(deep_json.contains("then ship"));
+    }
+
+    #[test]
+    fn redact_value_deep_still_redacts_keyed_and_whole_value_secrets() {
+        // Syvä variantti EI saa heikentää matalan redaktoinnin takeita:
+        // avainnimi- ja koko-arvo-redaktointi toimivat edelleen.
+        let secret = fake_secret();
+        let input = json!({ "api_key": "x", "note": secret.clone(), "ok": "general" });
+        let (out, report) = redact_value_deep(&input);
+        assert_eq!(out["api_key"], json!(REDACTED), "key-name redaction intact");
+        assert_eq!(out["note"], json!(REDACTED), "whole-value redaction intact");
+        assert_eq!(out["ok"], json!("general"), "innocent value preserved");
+        assert!(report.any_redacted());
+    }
+
+    #[test]
+    fn redact_free_text_masks_embedded_secret_in_message_content() {
+        // user/system-viestin sisältö voi kantaa salaisuuden vapaatekstinä.
+        let secret = fake_secret();
+        let content = format!("here is my key {secret} please use it");
+        let (redacted, report) = redact_free_text(&content);
+        assert!(
+            !redacted.contains(&secret),
+            "redact_free_text must mask secrets embedded in message content"
+        );
+        assert!(redacted.contains(REDACTED));
+        assert!(report.any_redacted());
+        // Vaaraton teksti säilyy.
+        assert!(redacted.contains("here is my key"));
+    }
+
+    #[test]
+    fn redact_free_text_leaves_innocent_text_untouched() {
+        let (redacted, report) = redact_free_text("draft a github issue about login");
+        assert_eq!(redacted, "draft a github issue about login");
+        assert!(!report.any_redacted());
     }
 
     #[test]

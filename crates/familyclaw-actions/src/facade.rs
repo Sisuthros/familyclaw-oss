@@ -37,18 +37,18 @@ use serde_json::Value;
 
 use familyclaw_core::time::Timestamp;
 
-use crate::approval::Approval;
 use crate::error::{ActionError, Result};
 use crate::executor::ActionExecutor;
 use crate::ids::{ActionTaskId, ApprovalId, SkillId};
 use crate::mcp::McpToolDescriptor;
+use crate::pending_store::{InMemoryPendingStore, PendingApprovalStore, PendingRecord};
 use crate::policy::{ActionRisk, SkillPermission};
 use crate::proof::ProofBundle;
 use crate::skills::{
     DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, FsReadAllowlisted,
     GithubIssueDraftMock, Pipeline, Skill,
 };
-use crate::task::{ActionTask, TaskStatus};
+use crate::task::{ActionTask, DurableTaskQueue, TaskQueue, TaskStatus};
 
 /// Moduulin valmiusaste — säilytetään, jotta [`crate::all_modules_scaffolded`]
 /// kääntyy edelleen muiden moduulien rinnalla.
@@ -111,18 +111,6 @@ pub struct PendingApproval {
     pub task_id: ActionTaskId,
 }
 
-/// Odottavan hyväksynnän sisäinen kirjaus (julkisivun oma tila).
-///
-/// Säilyttää tehtävän tunnisteen ja itse hyväksynnän, jotta `approve` voi
-/// kuluttaa sen tehtävän tallennettua payloadia vasten.
-#[derive(Debug, Clone)]
-struct PendingEntry {
-    /// Tehtävä jota hyväksyntä koskee.
-    task_id: ActionTaskId,
-    /// Myönnetty hyväksyntä (payload-sidottu).
-    approval: Approval,
-}
-
 /// Toimintoajoympäristön julkisivu: ohut operaattoripinta koko putken päälle.
 ///
 /// Omistaa putken ([`Pipeline`]), taitojen suorittajat, syntyneet todisteet ja
@@ -134,7 +122,15 @@ struct PendingEntry {
 ///
 /// [`Debug`] toteutetaan käsin: suorittajat ([`ActionExecutor`]-trait-objektit)
 /// eivät toteuta [`Debug`]:ia, joten niistä tulostetaan vain lukumäärä.
-#[derive(Default)]
+///
+/// ## Odottavien hyväksyntöjen tallennus
+/// Odottavat hyväksynnät eivät elä enää pelkässä `HashMap`:ssa vaan
+/// [`PendingApprovalStore`]-traitin takana (sisäinen `pending`-kenttä).
+/// Oletus on [`InMemoryPendingStore`] (sama käyttäytyminen kuin ennen), mutta
+/// operaattori voi vaihtaa tilalle kaatumiskestävän
+/// [`crate::pending_store::JournalPendingStore`]:n
+/// ([`ActionRuntime::with_pending_store`]), jolloin `submit-task`:n ja
+/// `approve`:n välinen kaatuminen **ei** enää menetä odottavaa hyväksyntää.
 pub struct ActionRuntime {
     /// Koko toimintopinon putki (rekisteri + jono + ledger + audit).
     pipeline: Pipeline,
@@ -142,8 +138,31 @@ pub struct ActionRuntime {
     executors: HashMap<SkillId, Arc<dyn ActionExecutor>>,
     /// Tehtävän tunniste → syntynyt redaktoitu todistepaketti.
     proofs: HashMap<ActionTaskId, ProofBundle>,
-    /// Odottavat hyväksynnät tunnisteen mukaan.
-    pending: HashMap<ApprovalId, PendingEntry>,
+    /// Odottavien hyväksyntöjen tallennuspinta (oletuksena muistinvarainen,
+    /// vaihdettavissa kaatumiskestäväksi).
+    pending: Box<dyn PendingApprovalStore>,
+    /// **Kaatumiskestävä tehtäväjono** (valinnainen). Kun asetettu
+    /// ([`ActionRuntime::with_durable_stores`]), jokainen `submit-task`:n ja
+    /// `approve`:n tuottama tehtävän tilannekuva mirroroidaan tähän JSONL-
+    /// lokiin, ja uudelleenkäynnistyksessä putken jono rekonstruoidaan siitä —
+    /// niin että hyväksyntää odottava tehtävä on yhä `approve`-kelpoinen vaikka
+    /// prosessi olisi kaatunut `submit-task`:n ja `approve`:n välissä.
+    /// `None` → in-memory-jono (ei selviä kaatumisesta), kuten oletuksena.
+    durable_queue: Option<DurableTaskQueue>,
+}
+
+impl Default for ActionRuntime {
+    /// Oletus: tyhjä ajoympäristö jonka odottavat hyväksynnät elävät
+    /// muistinvaraisessa pinnassa ([`InMemoryPendingStore`]).
+    fn default() -> Self {
+        Self {
+            pipeline: Pipeline::default(),
+            executors: HashMap::new(),
+            proofs: HashMap::new(),
+            pending: Box::new(InMemoryPendingStore::new()),
+            durable_queue: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for ActionRuntime {
@@ -152,16 +171,115 @@ impl std::fmt::Debug for ActionRuntime {
             .field("pipeline", &self.pipeline)
             .field("executor_count", &self.executors.len())
             .field("proofs", &self.proofs.len())
-            .field("pending", &self.pending.len())
+            .field("pending_count", &self.pending.len().unwrap_or(0))
+            .field("durable_queue", &self.durable_queue)
             .finish()
     }
 }
 
 impl ActionRuntime {
     /// Luo uuden tyhjän ajoympäristön ilman rekisteröityjä taitoja.
+    ///
+    /// Odottavat hyväksynnät elävät oletuksena muistinvaraisessa pinnassa
+    /// ([`InMemoryPendingStore`]) — käytä [`ActionRuntime::with_pending_store`]:a
+    /// kaatumiskestävään tallennukseen.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Luo tyhjän ajoympäristön annetulla **odottavien hyväksyntöjen
+    /// tallennuspinnalla**.
+    ///
+    /// Tämä on koukku kaatumiskestävyyteen: anna
+    /// [`crate::pending_store::JournalPendingStore`], niin
+    /// `submit-task`:n myöntämä mutta vielä hyväksymätön toiminto **säilyy
+    /// prosessin kaatumisen yli** ja on yhä [`ActionRuntime::approve`]-kelpoinen
+    /// uudelleenkäynnistyksen jälkeen. Oletustallennus ([`ActionRuntime::new`])
+    /// on muistinvarainen eikä selviä kaatumisesta.
+    #[must_use]
+    pub fn with_pending_store(pending: Box<dyn PendingApprovalStore>) -> Self {
+        Self {
+            pending,
+            ..Self::default()
+        }
+    }
+
+    /// Luo ajoympäristön **täysin kaatumiskestävällä** suspend/resume-tilalla:
+    /// kaatumiskestävä odottavien hyväksyntöjen pinta **ja** kaatumiskestävä
+    /// tehtäväjono, molemmat rekonstruoituina annetuista durable-tiedostoista.
+    ///
+    /// Tämä on suspend/resume-sillan (roadmap §6) actions-puolen
+    /// kaatumiskestävyys: pelkkä [`ActionRuntime::with_pending_store`] säilyttää
+    /// odottavan **hyväksynnän**, mutta `approve` tarvitsee myös tehtävän
+    /// (payload + tila) putken jonossa ja itse hyväksynnän ledgerissä. Kaikki
+    /// kolme menetetään prosessin kaatuessa, ellei niitä persistoida. Tämä
+    /// konstruktori:
+    ///
+    /// 1. rakentaa kaatumiskestävän **pending-pinnan** annetusta polusta
+    ///    ([`crate::pending_store::JournalPendingStore`]),
+    /// 2. rekonstruoi **tehtäväjonon** durable-jonosta
+    ///    ([`DurableTaskQueue::reload`] → [`TaskQueue::from_map`]),
+    /// 3. **palauttaa ledgeriin** jokaisen odottavan hyväksynnän durable-
+    ///    pinnalta ([`crate::pending_store::PendingRecord::approval`]), jotta
+    ///    `approve` voi kuluttaa sen samalla payload-sidonnalla,
+    /// 4. mirroroi jatkossa jokaisen tehtävän tilannekuvan durable-jonoon, jotta
+    ///    uudelleenkäynnistys löytää sen.
+    ///
+    /// Taidot rekisteröidään tämän jälkeen normaalisti
+    /// ([`ActionRuntime::register_skill`]); ne ovat puhdasta koodia eivätkä
+    /// tarvitse persistointia.
+    ///
+    /// # Errors
+    /// - [`ActionError::Proof`] jos pending- tai task-journalin avaus/luku
+    ///   epäonnistuu.
+    pub async fn with_durable_stores(
+        pending_path: impl AsRef<std::path::Path>,
+        task_queue_path: impl Into<std::path::PathBuf>,
+    ) -> Result<Self> {
+        let pending: Box<dyn PendingApprovalStore> =
+            Box::new(crate::pending_store::JournalPendingStore::open(pending_path)?);
+        let durable_queue = DurableTaskQueue::new(task_queue_path);
+
+        // Rekonstruoi tehtäväjono levyltä → putki palautetulla jonolla.
+        let task_map = durable_queue.reload().await?;
+        let queue = TaskQueue::from_map(task_map);
+        let mut pipeline = Pipeline::with_restored_queue(queue);
+
+        // Palauta odottavat hyväksynnät ledgeriin, jotta `approve` löytää ne.
+        for record in pending.list()? {
+            pipeline.reinstate_approval(record.approval);
+        }
+
+        Ok(Self {
+            pipeline,
+            executors: HashMap::new(),
+            proofs: HashMap::new(),
+            pending,
+            durable_queue: Some(durable_queue),
+        })
+    }
+
+    /// Snapshottaa tehtävän nykytilan kaatumiskestävään jonoon, jos sellainen on
+    /// asetettu ([`ActionRuntime::with_durable_stores`]). No-op in-memory-tilassa.
+    ///
+    /// Best-effort: snapshotin epäonnistuminen **ei** kaada itse toimintoa (se
+    /// onnistui jo putkessa), mutta se vaarantaa kaatumiskestävyyden. Palauttaa
+    /// `Ok(())` myös no-op-tilassa; kutsuja voi jättää virheen huomiotta tai
+    /// propagoida sen. Actions-crate ei riipu lokituskirjastosta, joten virhe
+    /// palautetaan eikä logiteta tässä.
+    ///
+    /// # Errors
+    /// [`ActionError::Proof`] jos durable-jonoon kirjoitus epäonnistuu.
+    async fn snapshot_task_if_durable(&self, task_id: ActionTaskId) -> Result<()> {
+        let Some(durable) = self.durable_queue.as_ref() else {
+            return Ok(());
+        };
+        // Lue tehtävän nykytila putken jonosta ja liitä se durable-lokiin.
+        if let Some(task) = self.pipeline.queue().get(task_id).await {
+            durable.append(&task).await?;
+        }
+        Ok(())
     }
 
     /// Luo ajoympäristön jossa kaikki viisi KERROS A -taitoa on rekisteröity
@@ -354,10 +472,19 @@ impl ActionRuntime {
                 Duration::minutes(DEFAULT_APPROVAL_TTL_MINUTES),
             )?;
             let approval_id = approval.id;
-            self.pending
-                .insert(approval_id, PendingEntry { task_id, approval });
+            // Redaktoitu tiivistelmä: vain taidon nimi ja tunnisteet — EI raakaa
+            // payloadia. Tallennetaan kaatumiskestävälle pinnalle jos sellainen on.
+            let summary = self.pending_summary(skill_id);
+            let record = PendingRecord::new(task_id, approval, summary, now);
+            self.pending.insert(record)?;
+            // Kaatumiskestävyys: persistoi tehtävän NeedsApproval-tilannekuva,
+            // jotta `approve` löytää tehtävän (payload + tila) myös restartin yli.
+            self.snapshot_task_if_durable(task_id).await?;
             Some(approval_id)
         } else {
+            // Auto-run-tehtävä eteni loppuun — snapshot durable-jonoon jos asetettu
+            // (Done-tila), jottei jää roikkumaan NeedsApproval-rivinä restartissa.
+            self.snapshot_task_if_durable(task_id).await?;
             None
         };
 
@@ -387,8 +514,7 @@ impl ActionRuntime {
     ) -> Result<SubmitOutcome> {
         let entry = self
             .pending
-            .get(&approval_id)
-            .cloned()
+            .get(approval_id)?
             .ok_or_else(|| ActionError::ApprovalMissing(approval_id.to_string()))?;
 
         let task = self
@@ -408,8 +534,12 @@ impl ActionRuntime {
             .run_after_approval(executor.as_ref(), entry.task_id, &entry.approval, now)
             .await?;
 
-        // Hyväksyntä on nyt kulutettu — poista se odottavista.
-        self.pending.remove(&approval_id);
+        // Hyväksyntä on nyt kulutettu — poista se odottavista (pysyvästi, myös
+        // kaatumiskestävältä pinnalta).
+        self.pending.remove(approval_id)?;
+        // Kaatumiskestävyys: persistoi tehtävän lopullinen (Done/Failed) tila
+        // durable-jonoon, jotta restart ei näe sitä enää NeedsApproval-rivinä.
+        self.snapshot_task_if_durable(entry.task_id).await?;
 
         if let Some(proof) = outcome.proof {
             self.proofs.insert(entry.task_id, proof);
@@ -440,19 +570,101 @@ impl ActionRuntime {
     /// Luettelee odottavat hyväksynnät (salaisuudettomat tiivistelmät).
     ///
     /// Järjestys vakautetaan hyväksynnän tunnisteen mukaan toistettavuuden
-    /// vuoksi.
+    /// vuoksi. Jos tallennuspinnan luku epäonnistuu (esim. levyvirhe
+    /// kaatumiskestävällä pinnalla), palautetaan **tyhjä luettelo** — operaattorin
+    /// listaus ei koskaan panikoi. Käytä [`ActionRuntime::try_pending_approvals`]:a
+    /// jos haluat virheen propagoituvan.
     #[must_use]
     pub fn pending_approvals(&self) -> Vec<PendingApproval> {
+        self.try_pending_approvals().unwrap_or_default()
+    }
+
+    /// Kuten [`ActionRuntime::pending_approvals`], mutta propagoi tallennuspinnan
+    /// lukuvirheen sen sijaan että palauttaisi tyhjän luettelon.
+    ///
+    /// # Errors
+    /// Tallennuspinnan ([`PendingApprovalStore::list`]) lukuvirhe — käytännössä
+    /// vain kaatumiskestävällä pinnalla, jos journalia ei voi lukea.
+    pub fn try_pending_approvals(&self) -> Result<Vec<PendingApproval>> {
         let mut out: Vec<PendingApproval> = self
             .pending
-            .values()
-            .map(|e| PendingApproval {
-                approval_id: e.approval.id,
-                task_id: e.task_id,
+            .list()?
+            .into_iter()
+            .map(|record| PendingApproval {
+                approval_id: record.approval_id(),
+                task_id: record.task_id,
             })
             .collect();
         out.sort_by_key(|a| a.approval_id);
-        out
+        Ok(out)
+    }
+
+    /// Häätää tallennuspinnalta kaikki annettuun hetkeen `now` mennessä
+    /// vanhentuneet odottavat hyväksynnät ja palauttaa häädettyjen lukumäärän.
+    ///
+    /// Käyttää samaa fail-closed-vanhentumisrajaa kuin [`crate::approval`]
+    /// (`now > expires_at`). Operaattori voi kutsua tätä jaksoittain pitääkseen
+    /// odottavien jonon siistinä; vanhentunutta hyväksyntää ei voi enää kuluttaa.
+    ///
+    /// # Errors
+    /// Tallennuspinnan ([`PendingApprovalStore::evict_expired`]) virhe.
+    pub fn evict_expired_approvals(&self, now: Timestamp) -> Result<usize> {
+        self.pending.evict_expired(now)
+    }
+
+    /// Palauttaa odottavan hyväksynnän **redaktoidun, operaattorille
+    /// turvallisen tiivistelmän** tunnisteella; `None` jos hyväksyntää ei (enää)
+    /// odoteta tai tallennuspinnan luku epäonnistuu.
+    ///
+    /// Tämä on se sama merkkijono jonka `submit-task` tallensi odottavaan
+    /// kirjaukseen ([`crate::pending_store::PendingRecord::redacted_summary`]) —
+    /// johdettu vain taidon nimestä ja tunnisteista, **ei koskaan raakaa
+    /// payloadia eikä salaisuuksia**. Sen voi näyttää operaattorille tai
+    /// säilyttää resumea varten sellaisenaan.
+    ///
+    /// Käytetään mm. agenttikerroksen `ThinkOutcome::Suspended`-polulla:
+    /// kun työkalu pysähtyy odottamaan hyväksyntää, agentti tallentaa tämän
+    /// turvallisen tiivistelmän (+ `approval_id`:n) vuoron durable-tilaan
+    /// resumea varten — sen sijaan että vuotaisi raakaa hyväksyntätietoa
+    /// reply-putkeen.
+    #[must_use]
+    pub fn pending_summary_for(&self, approval_id: ApprovalId) -> Option<String> {
+        self.pending
+            .get(approval_id)
+            .ok()
+            .flatten()
+            .map(|record| record.redacted_summary)
+    }
+
+    /// Palauttaa odottavan hyväksynnän **vanhentumishetken**
+    /// ([`crate::approval::Approval::expires_at`]) tunnisteella; `None` jos
+    /// hyväksyntää ei (enää) odoteta tai tallennuspinnan luku epäonnistuu.
+    ///
+    /// Tämä on salaisuudeton aikaleima (ei payloadia eikä tiivistettä), jonka
+    /// agenttikerros tarvitsee sitoakseen **jatkettavan vuoron**
+    /// ([`crate::pending_store::PendingRecord`]:n päälle rakennetun resume-tilan)
+    /// TTL:n täsmälleen samaan vanhentumiseen kuin myönnetty hyväksyntä. Näin
+    /// jatkettava vuoro vanhenee samalla hetkellä kuin lupa, jolla se voitaisiin
+    /// kuluttaa — ei aiemmin eikä myöhemmin.
+    #[must_use]
+    pub fn pending_expiry_for(&self, approval_id: ApprovalId) -> Option<Timestamp> {
+        self.pending
+            .get(approval_id)
+            .ok()
+            .flatten()
+            .map(|record| record.expires_at())
+    }
+
+    /// Muodostaa odottavalle hyväksynnälle **redaktoidun** tiivistelmän
+    /// tallennettavaksi: vain taidon nimi (tai tunniste) — ei koskaan raakaa
+    /// payloadia eikä salaisuuksia.
+    fn pending_summary(&self, skill_id: SkillId) -> String {
+        let name = self
+            .pipeline
+            .registry()
+            .get(&skill_id)
+            .map_or_else(|| skill_id.to_string(), |m| m.name.clone());
+        format!("taito '{name}' odottaa ihmisen hyväksyntää")
     }
 }
 

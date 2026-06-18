@@ -476,7 +476,7 @@ async fn without_llm_no_reply_is_emitted() {
     assert_eq!(
         outbox_probe.sent_count(),
         0,
-        "ilman LLM:ää think() palauttaa None → ei ulosmenevää vastausta"
+        "ilman LLM:ää think() palauttaa ThinkOutcome::NoReply → ei ulosmenevää vastausta"
     );
 
     runtime.shutdown().await;
@@ -610,6 +610,83 @@ async fn gateway_restart_processes_new_message_fresh_not_replayed_mute() {
     std::env::remove_var("FAMILYCLAW_DATA_DIR");
     std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
     let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// **Defect #1 -todiste (suspend/resume-kaatumiskestävyys tuotantopolulla):**
+/// kun `build_family` ajetaan persistentillä polulla (`FAMILYCLAW_DATA_DIR`
+/// asetettu), agentin jatkettavien vuorojen pinta kytketään
+/// KAATUMISKESTÄVÄKSI `JournalResumableStore`:ksi `<data_dir>/resumable.jsonl`:iin
+/// — ei oletukseksi jäävää muistinvaraista pintaa. Ennen korjausta ainoa
+/// tuotantopolku (`build_family`, jonka gateway kutsuu) jätti agentin oletukseen
+/// (`InMemoryResumableStore`), joten jokainen odottava resumable-vuoro katosi
+/// restartissa.
+///
+/// Todiste on tarkoituksella tiukka mutta epäsuora: emme pääse agentin sisäiseen
+/// pintaan (agentti siirtyy actoriin), mutta `JournalResumableStore::open` LUO
+/// journal-tiedoston avatessaan. Persistentillä polulla tiedoston on synnyttävä;
+/// in-memory-polulla (sama testi ilman data-diriä) sitä ei saa syntyä. Saman
+/// data-dirin uudelleenavaus (restart) säilyttää tiedoston — pinta on jaettu ja
+/// pysyvä, ei per-prosessi.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_family_wires_durable_resumable_store_on_persistent_path() {
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    let api_base = spawn_mock_llm().await;
+    let data_dir = unique_temp_dir("resumable");
+    let resumable_path = data_dir.join("resumable.jsonl");
+
+    // --- Persistentti polku: resumable.jsonl on synnyttävä. ---
+    let sent = run_one_persistent_turn(&data_dir, "viesti yksi", &api_base).await;
+    assert_eq!(sent, 1, "persistentti vuoro tuottaa vastauksen");
+    assert!(
+        resumable_path.is_file(),
+        "build_family wires JournalResumableStore on persistent path → resumable.jsonl must exist at {}",
+        resumable_path.display()
+    );
+
+    // --- Restart (sama data-dir): tiedosto säilyy, ei katoa prosessin yli. ---
+    let sent_2 = run_one_persistent_turn(&data_dir, "viesti kaksi", &api_base).await;
+    assert_eq!(sent_2, 1, "restartin jälkeinen vuoro tuottaa vastauksen");
+    assert!(
+        resumable_path.is_file(),
+        "durable resumable journal survives restart (shared, persistent — not per-process)"
+    );
+
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// **Defect #1 -vastaparitodiste (in-memory-polku):** ilman
+/// `FAMILYCLAW_DATA_DIR`:iä agentti jää muistinvaraiseen oletukseen eikä mitään
+/// resumable-journalia kirjoiteta levylle — taaksepäin-yhteensopiva, ei
+/// sivuvaikutuksia tiedostojärjestelmään.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_family_in_memory_path_writes_no_resumable_journal() {
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    // Varmista ettei aiempi testi jättänyt env-muuttujaa voimaan.
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+
+    let channel = MockChannel::new("mock-inmem-resumable").expect("channel");
+    channel.close_inbound();
+    let resolver = EnvEndpointResolver::new();
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul = familyclaw_agent::Soul::from_essence("generic being");
+
+    let runtime = build_family(
+        None,
+        agent_cfg,
+        soul,
+        Box::new(channel),
+        "c".to_string(),
+        &resolver,
+    )
+    .await
+    .expect("build_family");
+
+    // Bus käynnissä, yksi olento — kokoonpano rakentui in-memory-pinnoilla.
+    assert_eq!(runtime.bus().count().await.expect("count"), 1);
+    runtime.shutdown().await;
 }
 
 /// Varmistaa erikseen että inbound todella **kulkee busin läpi agentille**

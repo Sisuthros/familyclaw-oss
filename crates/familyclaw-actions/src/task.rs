@@ -295,6 +295,21 @@ impl TaskQueue {
         Self::default()
     }
 
+    /// Rakentaa jonon **valmiiksi täytettynä** annetusta tunniste→tehtävä
+    /// -kartasta (esim. [`DurableTaskQueue::reload`]:n tuloksesta).
+    ///
+    /// Tämä on kaatumiskestävyyden palautuspolku: uudelleenkäynnistyksessä jono
+    /// rekonstruoidaan levyltä luetusta tilasta, jotta hyväksyntää odottavat
+    /// tehtävät ([`TaskStatus::NeedsApproval`]) ovat yhä ajettavissa
+    /// (`run_after_approval`). Tehtäviä ei validoida uudelleen tässä — ne
+    /// validoitiin jo kirjoitusvaiheessa ([`DurableTaskQueue::append`]).
+    #[must_use]
+    pub fn from_map(tasks: HashMap<ActionTaskId, ActionTask>) -> Self {
+        Self {
+            inner: Mutex::new(tasks),
+        }
+    }
+
     /// Lisää tehtävän jonoon.
     ///
     /// Tehtävä validoidaan ([`ActionTask::validate`]) ennen tallennusta, ja

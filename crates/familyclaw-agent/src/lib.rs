@@ -67,10 +67,17 @@ pub mod channel_bridge;
 pub mod live_executor;
 pub mod llm;
 pub mod llm_chain;
+pub mod resumable;
 pub mod session;
 pub mod soul;
 
-pub use agent::{new_reply_channel, Agent, AgentActor, ErasedMemoryStore, ReplySink, TurnOutcome};
+pub use agent::{
+    new_reply_channel, Agent, AgentActor, ErasedMemoryStore, ReplySink, ThinkOutcome, TurnOutcome,
+};
+pub use resumable::{
+    InMemoryResumableStore, JournalResumableStore, ResumableError, ResumableTurn,
+    ResumableTurnStore,
+};
 pub use channel_bridge::{
     envelope_origin, envelope_to_bus_message, publish_envelope, pump_channel_to_bus,
 };

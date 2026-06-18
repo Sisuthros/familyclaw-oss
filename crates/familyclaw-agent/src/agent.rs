@@ -19,9 +19,10 @@
 
 use std::sync::Arc;
 
-use familyclaw_actions::{ActionRuntime, McpToolDescriptor};
+use familyclaw_actions::{ActionRuntime, ApprovalId, McpToolDescriptor};
 use familyclaw_bus::{BeingId, BeingInfo, BusHandle, BusMessage, ResonanceMessage, TaskEventKind};
 use familyclaw_channels::OutboundMessage;
+use familyclaw_core::time::Timestamp;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
 use tokio::sync::Mutex;
 use familyclaw_durable::{DurableContext, Journal};
@@ -37,6 +38,7 @@ use tracing::{debug, warn};
 
 use crate::llm::{LlmConfig, LlmMessage, ToolDefinition};
 use crate::llm_chain::LlmFailover;
+use crate::resumable::{InMemoryResumableStore, ResumableTurn, ResumableTurnStore};
 use crate::soul::Soul;
 use familyclaw_sandbox::{CodeSandbox, SandboxOutput, SandboxRequest};
 
@@ -86,6 +88,14 @@ pub struct TurnOutcome {
 /// per-kone kalibrointi (KERROS B) voi säätää tätä myöhemmin.
 const CONTAGION_FACTOR: f32 = 0.25;
 
+/// Jatkettavan vuoron oletus-TTL minuutteina, kun odottavan hyväksynnän
+/// vanhentumishetkeä ei jostain syystä saada [`ActionRuntime`]:lta (esim. lupa
+/// jo häädetty). Pidetään yhtä suurena kuin actions-kerroksen
+/// `DEFAULT_APPROVAL_TTL_MINUTES`, jotta jatkettava vuoro ei elä lupaa
+/// pidempään. Käytännössä expiry johdetaan suoraan odottavasta hyväksynnästä
+/// ([`ActionRuntime::pending_expiry_for`]); tätä käytetään vain fallbackina.
+const RESUMABLE_DEFAULT_TTL_MINUTES: i64 = 60;
+
 /// Jokaisen vuoron jalkeen tunnetila palautuu talla prosentilla kohti
 /// neutraalia. Arvo 0.10 (10 %) tarkoittaa: 10 vuoroa jatkuvan
 /// sisaarvaikutuksen jalkeen tunnetila on vajaa puolet maksimistaan
@@ -124,39 +134,137 @@ impl Default for ToolLoopConfig {
     }
 }
 
-/// Tool-loopin **lopputulos** (Phase 1 keystone).
+/// Tool-loopin **sisäinen lopputulos** (Phase 1 keystone).
 ///
-/// Erottaa toisistaan *oikean vastauksen* käyttäjälle ([`ToolLoopOutcome::Answer`])
-/// ja kaksi *ei-vastausta olevaa ohjaustilaa* — odottaa hyväksyntää
-/// ([`ToolLoopOutcome::AwaitingApproval`]) ja kierrosraja täyttyi
-/// ([`ToolLoopOutcome::MaxIterations`]). Vain `Answer` saa ylittää
-/// käyttäjärajan (reply-kanava + durable-yhteenveto); ohjaustilat ovat
-/// **kehittäjälle sisäisiä**, eikä niiden merkkijonoesitystä koskaan reititetä
-/// loppukäyttäjälle eikä tallenneta vuoron yhteenvetoon.
+/// Tämä on [`Agent::run_tool_loop`]:n oma ohjaustyyppi: se erottaa silmukan
+/// kolme mahdollista päättymistapaa toisistaan tyypitettynä. Se on tahallaan
+/// `enum`-yksityinen (ei `pub`) — se on silmukan *mekanismi*, ei agentin
+/// *julkinen sopimus*. Julkinen sopimus on [`ThinkOutcome`], johon [`think`]
+/// kääntää tämän:
 ///
-/// Tämä korjaa Phase 1 -aukon jossa väliaikaiset merkit (mm. raaka
-/// `approval_id`) vuotivat sanatarkasti käyttäjälle normaalin reply-putken
-/// kautta. Täysiluokkainen suspend-paluu (`ThinkOutcome::Suspended`) tulee 1C:ssä;
-/// tämä tyyppi pitää rajan ehjänä siihen asti.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// | `ToolLoopOutcome`         | → | [`ThinkOutcome`]                 |
+/// |---------------------------|---|----------------------------------|
+/// | [`Answer`](Self::Answer)  | → | [`Reply`](ThinkOutcome::Reply)   |
+/// | [`AwaitingApproval`](Self::AwaitingApproval) | → | [`Suspended`](ThinkOutcome::Suspended) |
+/// | [`MaxIterations`](Self::MaxIterations) | → | [`NoReply`](ThinkOutcome::NoReply) |
+///
+/// Vain `Answer` → `Reply` saa ylittää käyttäjärajan (reply-kanava + durable-
+/// yhteenveto). `AwaitingApproval` ja `MaxIterations` ovat **ei-vastauksia
+/// olevia ohjaustiloja**: niiden sisäisiä merkkijonoja (mm. raaka `approval_id`)
+/// ei koskaan reititetä loppukäyttäjälle. Tämä erottelu korjaa Phase 1 (1B)
+/// -aukon, jossa väliaikaiset merkit vuotivat sanatarkasti reply-putken kautta.
+///
+/// [`think`]: Agent::think
+///
+/// `PartialEq` (ei `Eq`): `AwaitingApproval` kantaa viestipinon
+/// ([`LlmMessage`], vain `PartialEq`) ja raa'at argumentit
+/// (`serde_json::Value`, vain `PartialEq`).
+#[derive(Debug, Clone, PartialEq)]
 enum ToolLoopOutcome {
     /// Malli pysähtyi lopulliseen vastaukseen → reititetään käyttäjälle.
     Answer(String),
     /// Työkalu vaatii ihmisen hyväksynnän → suoritus jäi odottamaan. Sisäinen
-    /// ohjaustila: hyväksynnän tunniste ([`familyclaw_actions::ApprovalId`])
-    /// elää [`ActionRuntime`]:ssa operaattorin myöhempää `approve`-kutsua
-    /// varten — sitä EI lähetetä käyttäjälle.
+    /// ohjaustila: hyväksynnän tunniste ([`ApprovalId`]) elää
+    /// [`ActionRuntime`]:ssa operaattorin myöhempää `approve`-kutsua varten —
+    /// sitä EI lähetetä käyttäjälle. Kääntyy
+    /// [`ThinkOutcome::Suspended`]:ksi [`think`](Agent::think):ssä.
+    ///
+    /// **Resume-silta (roadmap §6):** tämä variantti kantaa myös sen tilan,
+    /// jonka jatkaminen (resume) tarvitsee — viestipinon, keskeyttäneen
+    /// työkalukutsun tunnisteen, nimen ja argumentit. [`think`](Agent::think)
+    /// tallentaa niistä salaisuudettoman [`ResumableTurn`]:n durable-pinnalle
+    /// avaimella `approval_id` ennen kuin se palauttaa
+    /// [`ThinkOutcome::Suspended`]:n.
     AwaitingApproval {
-        /// Hyväksyntää vaatineen työkalun nimi (loki/diagnostiikka).
+        /// Hyväksyntää vaatineen työkalun nimi (loki/diagnostiikka + resume).
         tool: String,
-        /// Myönnetyn hyväksynnän tunniste (vain sisäiseen lokitukseen).
-        approval_id: String,
+        /// Myönnetyn hyväksynnän **tyypitetty** tunniste. Tällä operaattori
+        /// (tai resume-polku) jatkaa pysähtyneen tehtävän suorituksen.
+        approval_id: ApprovalId,
+        /// Operaattorille turvallinen, redaktoitu tiivistelmä siitä mitä
+        /// hyväksyntä koskee (taidon nimi + tunnisteet). **Ei salaisuuksia,
+        /// ei raakaa payloadia** — johdettu odottavan kirjauksen redaktoidusta
+        /// tiivistelmästä ([`ActionRuntime::pending_summary_for`]).
+        redacted_summary: String,
+        /// Tool-loopin viestipino keskeytyshetkellä (system + user +
+        /// siihenastiset assistant/tool-viestit). Resume jatkaa tästä.
+        messages: Vec<LlmMessage>,
+        /// Keskeyttäneen työkalukutsun LLM-tunniste (tuleva `tool_result`
+        /// sitoutuu tähän jatkettaessa).
+        tool_call_id: String,
+        /// Keskeyttäneen työkalukutsun raa'at argumentit. **Vain
+        /// argumenttien tiivistämistä varten** ([`ResumableTurn::new`] laskee
+        /// niistä SHA-256-tiivisteen eikä tallenna itse arvoa) — ei koskaan
+        /// levylle raakana eikä käyttäjälle.
+        arguments: serde_json::Value,
     },
     /// Kierrosraja täyttyi ilman lopullista vastausta → ei käyttäjäreplyä.
     MaxIterations {
         /// Saavutettu kierrosraja (loki/diagnostiikka).
         iterations: u32,
     },
+}
+
+/// [`Agent::think`]:n **julkinen lopputulos** (1C, roadmap amendment 3).
+///
+/// > **Suspend on TILA, ei merkkijono.** Tämä enum tekee siitä
+/// > ensiluokkaisen: kolme toisensa poissulkevaa lopputulosta, joista vain
+/// > yksi ([`Reply`](Self::Reply)) on tarkoitettu loppukäyttäjälle.
+///
+/// Tämä korvaa aiemman `Option<Result<String>>`-paluun, jossa kaksi
+/// eri merkitystä — "ei vastausta tällä vuorolla" ja "vastaus = `text`" —
+/// pakattiin `None`/`Some(Ok(text))`:iin, ja suspend jouduttiin **mykistämään
+/// `None`:ksi**. `None` ei kuitenkaan kantanut suspend-tilaa, joten resume
+/// (myöhempi `approve`) menetti kontekstin. Nyt suspend on oma varianttinsa,
+/// joka kantaa juuri sen tiedon jonka resume tarvitsee — eikä koskaan vuoda
+/// reply-putkeen (se oli 1B-vuoto).
+///
+/// ## Käyttäjärajan invariantti
+/// - [`Reply`](Self::Reply) → reititetään käyttäjälle (reply-kanava) ja
+///   liitetään vuoron durable-yhteenvetoon.
+/// - [`Suspended`](Self::Suspended) → **EI KOSKAAN** reply-putkeen. Kutsuja
+///   kirjaa suspendin vuoron durable-tilaan (id + redaktoitu tiivistelmä)
+///   resumea varten ja vaikenee tällä vuorolla.
+/// - [`NoReply`](Self::NoReply) → ei tehdä mitään (ei tekstiä, ei suspendia).
+///
+/// Kutsuja, joka aiemmin suodatti `None`:n pois reply-putkesta, käsittelee nyt
+/// `Suspended`/`NoReply` samalla tavalla "ei käyttäjäreplyä tällä vuorolla" —
+/// mutta `Suspended` säilyttää lisäksi resume-tilan.
+///
+/// ## Salaisuusinvariantti
+/// [`Suspended::redacted_summary`](Self::Suspended) on **operaattorille
+/// turvallinen** merkkijono: vain taidon nimi ja tunnisteet, ei raakaa
+/// hyväksyntäsisältöä, ei salaisuuksia, ei KERROS B -dataa. Se johdetaan
+/// odottavan kirjauksen redaktoidusta tiivistelmästä
+/// ([`ActionRuntime::pending_summary_for`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThinkOutcome {
+    /// Malli tuotti lopullisen tekstivastauksen → reititetään käyttäjälle.
+    ///
+    /// Syntyy kahdesta polusta: yhden kerron -polun ([`Agent::think`] ilman
+    /// `actions`) tekstistä **ja** tool-loopin `Answer`-pysähdyksestä.
+    Reply(String),
+    /// Työkalu vaati ihmisen hyväksynnän → vuoro **keskeytyi** (suspended)
+    /// odottamaan lupaa. **EI KOSKAAN** reply-putkeen.
+    ///
+    /// Kantaa juuri sen tiedon jonka resume tarvitsee: hyväksynnän tyypitetyn
+    /// tunnisteen (jolla `approve` jatkaa suorituksen) ja operaattorille
+    /// turvallisen redaktoidun tiivistelmän siitä mitä hyväksyntä koskee.
+    Suspended {
+        /// Myönnetyn hyväksynnän tunniste. Resume jatkaa tällä
+        /// ([`ActionRuntime::approve`]).
+        approval_id: ApprovalId,
+        /// Redaktoitu, operaattorille turvallinen tiivistelmä (ei salaisuuksia,
+        /// ei raakaa payloadia). Säilytetään vuoron durable-tilaan resumea ja
+        /// operaattorin näyttöä varten.
+        redacted_summary: String,
+    },
+    /// Ei vastausta tällä vuorolla — ei tekstiä eikä suspendia.
+    ///
+    /// Syntyy kun: LLM-clientiä ei ole (harmless no-op), tool-loop täytti
+    /// kierrosrajan ilman tekstiä (`MaxIterations`), tai malli ei tuottanut
+    /// tekstiä. Kutsuja ei reititä mitään.
+    NoReply,
 }
 
 /// Agentti — yksi olento, joka kokoaa konfiguraation, sielun, tunnetilan,
@@ -264,6 +372,20 @@ pub struct Agent {
     /// [`actions`](Agent::actions) on asennettu; muuten yhden kerran -polku ei
     /// kierrä lainkaan. Oletus [`ToolLoopConfig::default`].
     tool_loop: ToolLoopConfig,
+    /// **Jatkettavien vuorojen tallennuspinta** (suspend/resume-silta, roadmap §6).
+    ///
+    /// Kun tool-loop keskeytyy odottamaan ihmisen hyväksyntää, agentti
+    /// tallentaa keskeytyksen tilan ([`ResumableTurn`]) tänne avaimella
+    /// `approval_id`, jotta [`Agent::resume_approved`] voi ladata sen myöhemmin
+    /// (myös prosessin uudelleenkäynnistyksen jälkeen, jos pinta on
+    /// kaatumiskestävä [`crate::resumable::JournalResumableStore`]) ja jatkaa
+    /// suorituksen siitä mihin se jäi.
+    ///
+    /// Oletus on muistinvarainen [`InMemoryResumableStore`] (sama
+    /// taaksepäin-yhteensopiva käytös: suspend tallentuu, mutta ei selviä
+    /// kaatumisesta). Operaattori/runtime vaihtaa kaatumiskestävän pinnan
+    /// [`Agent::with_resumable_store`]:lla.
+    resumable: Arc<dyn ResumableTurnStore>,
 }
 
 impl Agent {
@@ -306,6 +428,7 @@ impl Agent {
             calibration: Box::new(NeutralCalibration),
             actions: None,
             tool_loop: ToolLoopConfig::default(),
+            resumable: Arc::new(InMemoryResumableStore::new()),
         }
     }
 
@@ -520,6 +643,29 @@ impl Agent {
         self.tool_loop
     }
 
+    /// Asenna **jatkettavien vuorojen tallennuspinta** (suspend/resume-silta,
+    /// roadmap §6).
+    ///
+    /// Anna kaatumiskestävä [`crate::resumable::JournalResumableStore`], niin
+    /// tool-loopin keskeyttäneen vuoron tila **säilyy prosessin kaatumisen yli**
+    /// ja [`Agent::resume_approved`] voi jatkaa sen loppuun
+    /// uudelleenkäynnistyksen jälkeen, kun hyväksyntä myönnetään. Oletuspinta
+    /// ([`Agent::new`]) on muistinvarainen eikä selviä kaatumisesta.
+    ///
+    /// Palauttaa `self` ketjutusta varten ([`Agent::new`]-signatuuria ei muuteta).
+    #[must_use]
+    pub fn with_resumable_store(mut self, store: Arc<dyn ResumableTurnStore>) -> Self {
+        self.resumable = store;
+        self
+    }
+
+    /// Agentin jatkettavien vuorojen tallennuspinta (jaettu kahva esim. ulkoiseen
+    /// tarkasteluun tai operaattorin pintaan).
+    #[must_use]
+    pub fn resumable_store(&self) -> Arc<dyn ResumableTurnStore> {
+        Arc::clone(&self.resumable)
+    }
+
     /// Onko agentille asennettu toimintoajoympäristö (tool-loop aktiivinen)?
     #[must_use]
     pub const fn has_actions(&self) -> bool {
@@ -614,66 +760,171 @@ impl Agent {
     ///   reititetään takaisin runtimeen kunnes malli vastaa ilman
     ///   työkalukutsuja (pysähdys) tai [`ToolLoopConfig`]-raja täyttyy.
     ///
-    /// Palauttaa `None` jos LLM-clientiä ei ole (harmless no-op), muuten
-    /// `Some(Ok(text))` tai `Some(Err(..))` LLM-virheestä.
+    /// Palauttaa [`ThinkOutcome`]:n (1C, roadmap amendment 3): suspend on TILA,
+    /// ei merkkijono. Aiempi `Option<Result<String>>`-paluu on korvattu — ks.
+    /// [`ThinkOutcome`]:n dokumentaatio migraation perusteista.
+    ///
+    /// - LLM-clientiä ei ole → [`ThinkOutcome::NoReply`] (harmless no-op).
+    /// - Yhden kerran -polku → mallin teksti [`ThinkOutcome::Reply`]:nä.
+    /// - Tool-loop `Answer` → [`ThinkOutcome::Reply`].
+    /// - Tool-loop `AwaitingApproval` → [`ThinkOutcome::Suspended`]
+    ///   (id + redaktoitu tiivistelmä).
+    /// - Tool-loop `MaxIterations` / ei tekstiä → [`ThinkOutcome::NoReply`].
+    ///
+    /// (`Answer`/`AwaitingApproval`/`MaxIterations` ovat tool-loopin sisäisen
+    /// `ToolLoopOutcome`-tyypin variantteja — yksityisiä mekanismeja, jotka
+    /// `think` kääntää yllä olevaan julkiseen [`ThinkOutcome`]:en.)
     ///
     /// ## Käyttäjärajan suojaus (tool-loop)
-    /// Tool-loop-polulla `think` palauttaa **vain oikean vastauksen** käyttäjälle
-    /// (`Some(Ok(text))`). Kaksi ei-vastausta olevaa ohjaustilaa —
-    /// odottaa-hyväksyntää ja kierrosraja-täynnä — kirjataan lokiin ja
-    /// palautetaan `None`. Näin niiden sisäisiä merkkijonoja (mm. raaka
-    /// `approval_id`) **ei koskaan reititetä loppukäyttäjälle** eikä tallenneta
-    /// vuoron yhteenvetoon — `None` tarkoittaa "ei vastausta tällä vuorolla",
-    /// jonka [`handle_turn_with_origin`](Self::handle_turn_with_origin) suodattaa
-    /// jo nyt pois reply-putkesta.
+    /// Vain [`ThinkOutcome::Reply`] on tarkoitettu loppukäyttäjälle.
+    /// [`ThinkOutcome::Suspended`] **ei koskaan** kulje reply-putken kautta —
+    /// se kirjataan vuoron durable-tilaan resumea varten
+    /// ([`handle_turn_with_origin`](Self::handle_turn_with_origin)) — ja sen
+    /// sisäisiä tunnisteita (mm. raaka `approval_id`) ei reititetä käyttäjälle.
+    /// Tämä korjaa 1B-vuodon, jossa väliaikaiset merkit vuotivat sanatarkasti.
     ///
     /// # Errors
     /// - [`FamilyClawError::Llm`] jos LLM-kutsu epäonnistuu.
-    pub async fn think(&self, current_message: &BusMessage) -> Option<Result<String>> {
-        let llm = self.llm.as_ref()?;
+    pub async fn think(&self, current_message: &BusMessage) -> Result<ThinkOutcome> {
+        self.think_with_origin(current_message, None).await
+    }
+
+    /// Kuten [`think`](Self::think), mutta tietää **vuoron alkuperän** (resume-
+    /// silta, roadmap §6): kun tool-loop keskeytyy hyväksyntää odottamaan,
+    /// jatkettavaan vuoroon ([`ResumableTurn`]) tallennetaan `conversation_origin`,
+    /// jotta resume osaa reitittää vastauksen oikeaan keskusteluun.
+    ///
+    /// [`think`](Self::think) on tämän kuori `origin = None`:lla (staattinen
+    /// reply-kohde).
+    ///
+    /// ## Suspend persistoi jatkettavan vuoron (TASAN KERRAN)
+    /// `AwaitingApproval`-haarassa tämä metodi rakentaa salaisuudettoman
+    /// [`ResumableTurn`]:n (viestipino + tiivistetyt argumentit + tunnisteet) ja
+    /// tallentaa sen jatkettavien vuorojen pinnalle
+    /// ([`resumable_store`](Self::resumable_store)) **ennen** kuin
+    /// palauttaa [`ThinkOutcome::Suspended`]:n. Kutsuja ajaa `think_with_origin`:n
+    /// vain TUOREESSA vuorossa (ei replayssa), joten put tapahtuu tasan kerran.
+    ///
+    /// **Determinismi (D1):** kello luetaan **kerran** (`time::now()`) tämän
+    /// metodin alussa ja injektoidaan koko tool-loopiin sekä jatkettavan vuoron
+    /// `created_at`-kenttään — silmukkalogiikka ei lue kelloa itse.
+    ///
+    /// # Errors
+    /// - [`FamilyClawError::Llm`] jos LLM-kutsu epäonnistuu.
+    pub async fn think_with_origin(
+        &self,
+        current_message: &BusMessage,
+        origin: Option<&familyclaw_bus::MessageOrigin>,
+    ) -> Result<ThinkOutcome> {
+        // Ei LLM-clientiä → ei vastausta tällä vuorolla (harmless no-op).
+        let Some(llm) = self.llm.as_ref() else {
+            return Ok(ThinkOutcome::NoReply);
+        };
         let (system_prompt, query) = self.build_think_context(current_message).await;
 
         match self.actions.as_ref() {
             // Yhden kerran -polku (taaksepäin-yhteensopiva): yksi LLM-kutsu,
-            // ei työkaluja. Sama käytös kuin ennen tool-loopia.
+            // ei työkaluja. Sama käytös kuin ennen tool-loopia → teksti Reply:nä.
             None => {
                 let messages =
                     vec![LlmMessage::system(system_prompt), LlmMessage::user(query)];
-                Some(
-                    llm.complete(&messages)
-                        .await
-                        .map_err(|e| FamilyClawError::llm(e.to_string())),
-                )
+                let text = llm
+                    .complete(&messages)
+                    .await
+                    .map_err(|e| FamilyClawError::llm(e.to_string()))?;
+                Ok(ThinkOutcome::Reply(text))
             }
             // Tool-loop-polku: anna mallille työkalut ja kierrä kunnes se
-            // lakkaa pyytämästä niitä (tai raja täyttyy). Vain `Answer` ylittää
-            // käyttäjärajan; ohjaustilat suodatetaan `None`:ksi (loki alla).
-            Some(actions) => match self.run_tool_loop(llm, actions, system_prompt, query).await {
-                Err(e) => Some(Err(e)),
-                Ok(ToolLoopOutcome::Answer(text)) => Some(Ok(text)),
-                Ok(ToolLoopOutcome::AwaitingApproval { tool, approval_id }) => {
-                    // Sisäinen ohjaustila: työkalu odottaa ihmisen hyväksyntää.
-                    // EI käyttäjälle — `approval_id` on operaattorin (ActionRuntime)
-                    // tieto, ei vastaus. Phase 1: vaikenemme tällä vuorolla.
-                    debug!(
-                        agent = self.config.name,
-                        tool = tool.as_str(),
-                        approval_id = approval_id.as_str(),
-                        "tool loop: awaiting human approval — suppressing internal marker from user reply"
-                    );
-                    None
+            // lakkaa pyytämästä niitä (tai raja täyttyy). Vain `Answer` → `Reply`
+            // ylittää käyttäjärajan; ohjaustilat kääntyvät Suspended/NoReply:ksi.
+            //
+            // D1: kello luetaan KERRAN tähän, injektoidaan tool-loopiin.
+            Some(actions) => {
+                let now = time::now();
+                match self
+                    .run_tool_loop(llm, actions, system_prompt, query, now)
+                    .await?
+                {
+                    ToolLoopOutcome::Answer(text) => Ok(ThinkOutcome::Reply(text)),
+                    ToolLoopOutcome::AwaitingApproval {
+                        tool,
+                        approval_id,
+                        redacted_summary,
+                        messages,
+                        tool_call_id,
+                        arguments,
+                    } => {
+                        // Suspend on TILA: työkalu odottaa ihmisen hyväksyntää.
+                        // EI käyttäjälle — `approval_id` on operaattorin
+                        // (ActionRuntime) tieto. Palautamme sen ensiluokkaisena
+                        // Suspended-tilana, jonka kutsuja kirjaa durable-tilaan
+                        // resumea varten (ei reply-putkeen).
+                        //
+                        // Resume-silta (roadmap §6): tallenna jatkettava vuoro
+                        // pysyvästi, jotta `resume_approved` voi jatkaa silmukan
+                        // siitä mihin se jäi — myös prosessin kaatumisen yli, jos
+                        // pinta on kaatumiskestävä. `arguments` annetaan VAIN
+                        // tiivistettäväksi (ResumableTurn::new laskee SHA-256:n,
+                        // ei tallenna raakaa). `now` (D1) on jatkettavan vuoron
+                        // `created_at`; TTL johdetaan odottavan hyväksynnän
+                        // vanhentumisesta, jos se tunnetaan.
+                        let expires_at = self
+                            .pending_expiry_for(actions, approval_id)
+                            .await
+                            .unwrap_or_else(|| {
+                                now + chrono::Duration::minutes(RESUMABLE_DEFAULT_TTL_MINUTES)
+                            });
+                        // Salaisuusinvariantti: redaktoi viestipinon
+                        // työkalukutsujen argumentit ennen levylle tallennusta —
+                        // raaka payload/avaimet eivät koskaan päädy durable-pinnalle.
+                        let safe_messages = redact_messages_for_resume(&messages);
+                        let resumable = ResumableTurn::new(
+                            approval_id,
+                            self.being_id.to_string(),
+                            origin.cloned(),
+                            safe_messages,
+                            tool_call_id,
+                            tool.clone(),
+                            &arguments,
+                            redacted_summary.clone(),
+                            now,
+                            expires_at,
+                        )
+                        .with_policy_snapshot(format!("tool '{tool}' requires human approval"))
+                        .with_durable_position(self.turn_counter, 0);
+                        if let Err(e) = self.resumable.put(resumable) {
+                            // Persistoinnin epäonnistuminen ei saa kaataa vuoroa,
+                            // mutta resume ei silloin onnistu → loki varoituksena.
+                            warn!(
+                                agent = self.config.name,
+                                %approval_id,
+                                error = %e,
+                                "resumable turn persist failed — resume will not be possible for this approval"
+                            );
+                        }
+                        debug!(
+                            agent = self.config.name,
+                            tool = tool.as_str(),
+                            %approval_id,
+                            "tool loop: awaiting human approval — suspending turn (resumable persisted, not routed to user)"
+                        );
+                        Ok(ThinkOutcome::Suspended {
+                            approval_id,
+                            redacted_summary,
+                        })
+                    }
+                    ToolLoopOutcome::MaxIterations { iterations } => {
+                        // Ohjaustila: raja täyttyi ilman vastausta. EI
+                        // robottimaista max-iter-merkkiä käyttäjälle → NoReply.
+                        debug!(
+                            agent = self.config.name,
+                            iterations,
+                            "tool loop: reached max iterations without a final answer — no user reply"
+                        );
+                        Ok(ThinkOutcome::NoReply)
+                    }
                 }
-                Ok(ToolLoopOutcome::MaxIterations { iterations }) => {
-                    // Sisäinen ohjaustila: raja täyttyi ilman vastausta. EI
-                    // robottimaista max-iter-merkkiä käyttäjälle.
-                    debug!(
-                        agent = self.config.name,
-                        iterations,
-                        "tool loop: reached max iterations without a final answer — suppressing internal marker from user reply"
-                    );
-                    None
-                }
-            },
+            }
         }
     }
 
@@ -735,8 +986,10 @@ impl Agent {
     ///      → työnnä virhe-`tool_result` ja JATKA (kuluttaa kierroksen, ei
     ///      keskeytä eikä jää ikuiseen yritykseen),
     ///    - **hyväksyntää vaativa** ([`SubmitOutcome::pending_approval`] = `Some`)
-    ///      → palauta [`ToolLoopOutcome::AwaitingApproval`] (sisäinen ohjaustila,
-    ///      EI käyttäjälle; täysiluokkainen `ThinkOutcome::Suspended` tulee 1C:ssä),
+    ///      → palauta [`ToolLoopOutcome::AwaitingApproval`] (sisäinen ohjaustila
+    ///      tyypitetyllä `approval_id`:llä + redaktoidulla tiivistelmällä, EI
+    ///      käyttäjälle); [`think`](Self::think) kääntää sen
+    ///      [`ThinkOutcome::Suspended`]:ksi,
     ///    - **turvallinen / auto-run** → työnnä tulos `tool_result`:na ja jatka.
     /// 5. **Raja täyttyy** → palauta [`ToolLoopOutcome::Answer`] (viimeisin teksti)
     ///    tai [`ToolLoopOutcome::MaxIterations`] (ei vastausta).
@@ -759,13 +1012,54 @@ impl Agent {
         actions: &Arc<Mutex<ActionRuntime>>,
         system_prompt: String,
         query: String,
+        now: Timestamp,
     ) -> Result<ToolLoopOutcome> {
-        let mut messages = vec![LlmMessage::system(system_prompt), LlmMessage::user(query)];
-        // Viimeisin mallin tuottama teksti — palautetaan jos raja täyttyy
-        // ennen kuin malli pysähtyy itse.
-        let mut last_text = String::new();
+        let messages = vec![LlmMessage::system(system_prompt), LlmMessage::user(query)];
+        // Aja silmukka tuoreesta viestipinosta täydellä kierrosbudjetilla.
+        // `now` injektoidaan (D1): kelloa ei lueta silmukkalogiikan sisällä,
+        // jotta tehtävien lähetys käyttää samaa, journaloitavaa aikaleimaa.
+        self.drive_tool_loop(
+            llm,
+            actions,
+            messages,
+            String::new(),
+            self.tool_loop.max_iterations,
+            now,
+        )
+        .await
+    }
 
-        for _ in 0..self.tool_loop.max_iterations {
+    /// Tool-loopin **jaettu moottori**: ajaa silmukan annetusta viestipinosta
+    /// kunnes malli pysähtyy, työkalu vaatii hyväksynnän tai kierrosbudjetti
+    /// täyttyy.
+    ///
+    /// Jaettu kahden sisääntulon kesken, jotta logiikka on tasan yksi:
+    /// - [`run_tool_loop`](Self::run_tool_loop) — tuore vuoro (system + user).
+    /// - [`resume_approved`](Self::resume_approved) — jatkettava vuoro: palautettu
+    ///   viestipino + jo syötetty hyväksytyn työkalun tulos.
+    ///
+    /// `budget` on jäljellä oleva kierrosmäärä (resume jatkaa samalla
+    /// kokonaisrajalla, ei nollaa sitä). `last_text` on viimeisin mallin teksti
+    /// (resumessa tyypillisesti tyhjä). Käyttäytyminen on muuten identtinen
+    /// alkuperäisen `run_tool_loop`:n kanssa — ks. sen vaihekuvaus.
+    ///
+    /// **Determinismi (D1):** `now` injektoidaan — kelloa **ei** lueta
+    /// silmukkalogiikan sisällä, vaan kaikki tehtävänlähetykset käyttävät tätä
+    /// samaa aikaleimaa. Näin kutsuja voi journaloida aikaleiman askeleen
+    /// sisällä (arvo identtinen replayssa) eikä silmukka ole epädeterministinen.
+    ///
+    /// # Errors
+    /// - [`FamilyClawError::Llm`] jos LLM-kutsu epäonnistuu palautumattomasti.
+    async fn drive_tool_loop(
+        &self,
+        llm: &LlmFailover,
+        actions: &Arc<Mutex<ActionRuntime>>,
+        mut messages: Vec<LlmMessage>,
+        mut last_text: String,
+        budget: u32,
+        now: Timestamp,
+    ) -> Result<ToolLoopOutcome> {
+        for _ in 0..budget {
             // 1. Rakenna työkalut runtimen MCP-kuvauksista (lukko vain
             //    kuvausten ajaksi — vapautetaan ennen LLM-kutsua).
             let tools = {
@@ -819,8 +1113,9 @@ impl Agent {
 
                 let outcome = {
                     let mut rt = actions.lock().await;
-                    rt.submit_task(skill_id, call.arguments.clone(), time::now())
-                        .await
+                    // D1: injektoitu `now` (ei `time::now()` silmukan sisällä) —
+                    // sama aikaleima joka voidaan journaloida deterministisesti.
+                    rt.submit_task(skill_id, call.arguments.clone(), now).await
                 };
 
                 match outcome {
@@ -829,17 +1124,46 @@ impl Agent {
                         // ohjaustila [`ToolLoopOutcome::AwaitingApproval`], EI
                         // käyttäjälle reititettävää merkkijonoa. `approval_id`
                         // jää [`ActionRuntime`]:n tilaan operaattorin myöhempää
-                        // `approve`-kutsua varten ja kulkee vain sisäiseen
-                        // lokitukseen — sitä ei koskaan lähetetä loppukäyttäjälle.
-                        // Vuoro ei jää roikkumaan eikä hyväksyntää vaativa toiminto
-                        // suoriudu ilman lupaa. (Täysiluokkainen
-                        // `ThinkOutcome::Suspended` tulee 1C:ssä.)
-                        let approval_id = submit
-                            .pending_approval
-                            .map_or_else(|| "?".to_string(), |id| id.to_string());
+                        // `approve`-kutsua varten — sitä ei koskaan lähetetä
+                        // loppukäyttäjälle. Vuoro ei jää roikkumaan eikä
+                        // hyväksyntää vaativa toiminto suoriudu ilman lupaa.
+                        // [`think`](Self::think) kääntää tämän ensiluokkaiseksi
+                        // [`ThinkOutcome::Suspended`]:ksi.
+                        //
+                        // `pending_approval` on `Some` tässä haarassa (haaran
+                        // ehto takaa sen), joten luemme tyypitetyn id:n suoraan.
+                        // Redaktoitu, operaattorille turvallinen tiivistelmä
+                        // haetaan odottavalta kirjaukselta — johdettu vain taidon
+                        // nimestä ja tunnisteista, ei salaisuuksista. Jos tiivistelmä
+                        // ei jostain syystä löydy, käytämme neutraalia korviketta
+                        // (ei koskaan raakaa payloadia/argumentteja).
+                        let Some(approval_id) = submit.pending_approval else {
+                            // Saavuttamaton (haaran ehto = is_some), mutta emme
+                            // panikoi tuotantopolulla — jatka silmukkaa.
+                            continue;
+                        };
+                        let redacted_summary = {
+                            let rt = actions.lock().await;
+                            rt.pending_summary_for(approval_id).unwrap_or_else(|| {
+                                format!("tool '{}' awaiting human approval", call.name)
+                            })
+                        };
+                        // Resume-tila (roadmap §6): viestipino on TÄSSÄ tilassa
+                        // juuri oikea jatkamista varten — assistant-vuoro
+                        // (työkalukutsuineen) on jo liitetty (yllä), mutta TÄMÄN
+                        // kutsun `tool_result` EI vielä ole. Resume injektoi
+                        // hyväksytyn työkalun tuloksen `tool_call_id`:hen ja jatkaa
+                        // pinosta. `arguments` annetaan vain tiivistettäväksi
+                        // ([`ResumableTurn::new`] laskee SHA-256:n, ei tallenna
+                        // raakaa). Kloonaamme pinon, koska itse silmukan `messages`
+                        // siirtyy ulos vasta tämän returnin myötä.
                         return Ok(ToolLoopOutcome::AwaitingApproval {
-                            tool: call.name,
+                            tool: call.name.clone(),
                             approval_id,
+                            redacted_summary,
+                            messages: messages.clone(),
+                            tool_call_id: call.id.clone(),
+                            arguments: call.arguments.clone(),
                         });
                     }
                     Ok(submit) => {
@@ -874,12 +1198,203 @@ impl Agent {
         //    tuottaa tekstiä, se on paras saatavilla oleva vastaus → `Answer`.
         //    Muuten palautetaan SISÄINEN ohjaustila [`ToolLoopOutcome::MaxIterations`]
         //    — robottimaista max-iter-merkkiä EI reititetä käyttäjälle.
+        //    `iterations` raportoi tälle ajolle annetun budjetin (resume jatkaa
+        //    jäljellä olevalla budjetilla, joten luku heijastaa oikeaa rajaa).
         if last_text.is_empty() {
-            Ok(ToolLoopOutcome::MaxIterations {
-                iterations: self.tool_loop.max_iterations,
-            })
+            Ok(ToolLoopOutcome::MaxIterations { iterations: budget })
         } else {
             Ok(ToolLoopOutcome::Answer(last_text))
+        }
+    }
+
+    /// Hakee odottavan hyväksynnän vanhentumishetken [`ActionRuntime`]:lta
+    /// (lukko vain haun ajaksi). `None` jos lupaa ei (enää) odoteta.
+    async fn pending_expiry_for(
+        &self,
+        actions: &Arc<Mutex<ActionRuntime>>,
+        approval_id: ApprovalId,
+    ) -> Option<Timestamp> {
+        let rt = actions.lock().await;
+        rt.pending_expiry_for(approval_id)
+    }
+
+    /// **Jatkaa keskeytetyn vuoron, kun hyväksyntä on myönnetty** (suspend/resume-
+    /// silta, roadmap §6 — resume-puoli).
+    ///
+    /// Kun [`think`](Self::think)/[`think_with_origin`](Self::think_with_origin):n
+    /// tool-loop keskeytyi hyväksyntää odottamaan, jatkettavan vuoron tila
+    /// ([`ResumableTurn`]) tallennettiin jatkettavien vuorojen pinnalle
+    /// ([`resumable_store`](Self::resumable_store)).
+    /// Tämä metodi:
+    ///
+    /// 1. **lataa** jatkettavan vuoron `approval_id`:llä (fail-closed: tuntematon
+    ///    tai vanhentunut → virhe, ei paniikki, ei sivuvaikutuksia),
+    /// 2. **kuluttaa hyväksynnän** ([`ActionRuntime::approve`]) → keskeyttänyt
+    ///    toiminto suoritetaan loppuun **tasan kerran** (payload-sidottu,
+    ///    kertakäyttöinen — ks. [`familyclaw_actions::approval::ApprovalLedger::consume`]),
+    /// 3. **injektoi** hyväksytyn työkalun (redaktoidun) tuloksen takaisin
+    ///    palautettuun viestipinoon `tool_call_id`:hen sidottuna,
+    /// 4. **jatkaa tool-loopin** siitä mihin se jäi
+    ///    (sisäinen tool-loop-moottori) — malli voi nyt vastata
+    ///    lopullisesti tai pyytää lisää työkaluja (mahdollisesti uusi suspend),
+    /// 5. **kuluttaa jatkettavan vuoron** (poistaa pinnalta) onnistuneen
+    ///    `approve`:n jälkeen, jottei sitä voi jatkaa toiseen kertaan.
+    ///
+    /// Palauttaa [`ThinkOutcome`]:n:
+    /// - [`Reply`](ThinkOutcome::Reply) kun malli tuotti lopullisen vastauksen,
+    /// - [`Suspended`](ThinkOutcome::Suspended) kun jatko vaati **uuden**
+    ///   hyväksynnän (uusi jatkettava vuoro on tällöin jo tallennettu),
+    /// - [`NoReply`](ThinkOutcome::NoReply) kun jatko täytti kierrosrajan ilman
+    ///   tekstiä tai LLM-clientiä ei ole.
+    ///
+    /// ## Determinismi (D1)
+    /// `now` **injektoidaan** — kelloa ei lueta tämän metodin sisällä. Sama
+    /// aikaleima ohjaa hyväksynnän kulutuksen vanhentumistarkistuksen JA
+    /// jatketun tool-loopin tehtävälähetykset, joten kutsuja voi journaloida sen
+    /// askeleen sisällä (arvo identtinen replayssa).
+    ///
+    /// ## Käyttäjäraja + salaisuudet
+    /// Vain `Reply` on tarkoitettu käyttäjälle. Jatkettavaan vuoroon ei koskaan
+    /// tallennettu raakoja salaisuuksia (ks. [`ResumableTurn`]), ja injektoitu
+    /// tool-tulos johdetaan **redaktoidusta** todisteesta.
+    ///
+    /// # Errors
+    /// - [`FamilyClawError::InvalidInput`] jos `approval_id`:lle ei ole
+    ///   jatkettavaa vuoroa (tuntematon/kulutettu), se on vanhentunut, agentille
+    ///   ei ole asennettu toimintoajoympäristöä
+    ///   ([`with_actions`](Self::with_actions)), tai hyväksynnän kulutus
+    ///   ([`ActionRuntime::approve`]) epäonnistuu (esim. payload-mismatch) —
+    ///   kaikki fail-closed, ei paniikkia.
+    /// - [`FamilyClawError::Llm`] jos jatkettu LLM-kutsu epäonnistuu.
+    pub async fn resume_approved(
+        &self,
+        approval_id: ApprovalId,
+        now: Timestamp,
+    ) -> Result<ThinkOutcome> {
+        // 1. Lataa jatkettava vuoro fail-closed. Tuntematon/kulutettu → virhe
+        //    (ei paniikkia, ei sivuvaikutuksia).
+        let turn = self
+            .resumable
+            .get(approval_id)
+            .map_err(|e| FamilyClawError::invalid_input(format!("resumable load failed: {e}")))?
+            .ok_or_else(|| {
+                FamilyClawError::invalid_input(format!(
+                    "no resumable turn for approval {approval_id} (unknown or already resumed)"
+                ))
+            })?;
+
+        // Vanhentunut jatkettava vuoro evätään fail-closed (sama raja kuin
+        // hyväksynnällä) — ei kuluteta lupaa, ei ajeta sivuvaikutusta.
+        if turn.is_expired(now) {
+            return Err(FamilyClawError::invalid_input(format!(
+                "resumable turn for approval {approval_id} expired"
+            )));
+        }
+
+        // Resume vaatii toimintoajoympäristön (sama runtime joka myönsi luvan).
+        let Some(actions) = self.actions.as_ref() else {
+            return Err(FamilyClawError::invalid_input(
+                "resume_approved requires an ActionRuntime (call with_actions first)".to_string(),
+            ));
+        };
+
+        // 2. Kuluta hyväksyntä → keskeyttänyt toiminto suoritetaan loppuun TASAN
+        //    KERRAN (payload-sidottu, kertakäyttöinen). `now` injektoitu (D1).
+        let submit = {
+            let mut rt = actions.lock().await;
+            rt.approve(approval_id, now)
+                .await
+                .map_err(|e| FamilyClawError::invalid_input(format!("approve failed: {e}")))?
+        };
+
+        // 3. Injektoi hyväksytyn työkalun (redaktoitu) tulos palautettuun
+        //    viestipinoon, sidottuna alkuperäiseen tool_call_id:hen.
+        let mut messages = turn.messages;
+        let result_text = {
+            let rt = actions.lock().await;
+            tool_result_text(&rt, &submit)
+        };
+        messages.push(LlmMessage::tool_result(turn.tool_call_id, result_text));
+
+        // Hyväksyntä kulutettu onnistuneesti → kuluta jatkettava vuoro
+        // (kertakäyttö: ei voi jatkaa kahdesti). Tehdään ENNEN silmukan jatkoa,
+        // jotta mahdollinen uusi suspend tallentaa OMAN jatkettavan vuoronsa
+        // ilman että vanha jää roikkumaan.
+        if let Err(e) = self.resumable.remove(approval_id) {
+            warn!(
+                agent = self.config.name,
+                %approval_id,
+                error = %e,
+                "resumable remove after approve failed (non-fatal) — turn already advanced"
+            );
+        }
+
+        // 4. Jatka tool-loop palautetusta pinosta. Ei LLM:ää → NoReply.
+        let Some(llm) = self.llm.as_ref() else {
+            return Ok(ThinkOutcome::NoReply);
+        };
+        // Jatketaan TÄYDELLÄ kierrosbudjetilla: resume on uusi "jakso" jossa malli
+        // saa taas tilaa edetä. Turvaraja sitoo silti loputtoman kierron.
+        let outcome = self
+            .drive_tool_loop(
+                llm,
+                actions,
+                messages,
+                String::new(),
+                self.tool_loop.max_iterations,
+                now,
+            )
+            .await?;
+
+        match outcome {
+            ToolLoopOutcome::Answer(text) => Ok(ThinkOutcome::Reply(text)),
+            ToolLoopOutcome::AwaitingApproval {
+                tool,
+                approval_id: next_id,
+                redacted_summary,
+                messages,
+                tool_call_id,
+                arguments,
+            } => {
+                // Jatko vaati UUDEN hyväksynnän → tallenna uusi jatkettava vuoro
+                // (sama invariantti kuin alkuperäisessä suspendissä). Säilytetään
+                // alkuperäinen alkuperä, jotta vastaus reitittyy samaan
+                // keskusteluun myös ketjutetun hyväksynnän jälkeen.
+                let expires_at = self
+                    .pending_expiry_for(actions, next_id)
+                    .await
+                    .unwrap_or_else(|| {
+                        now + chrono::Duration::minutes(RESUMABLE_DEFAULT_TTL_MINUTES)
+                    });
+                let safe_messages = redact_messages_for_resume(&messages);
+                let next_turn = ResumableTurn::new(
+                    next_id,
+                    self.being_id.to_string(),
+                    turn.conversation_origin,
+                    safe_messages,
+                    tool_call_id,
+                    tool.clone(),
+                    &arguments,
+                    redacted_summary.clone(),
+                    now,
+                    expires_at,
+                )
+                .with_policy_snapshot(format!("tool '{tool}' requires human approval"))
+                .with_durable_position(self.turn_counter, 0);
+                if let Err(e) = self.resumable.put(next_turn) {
+                    warn!(
+                        agent = self.config.name,
+                        approval_id = %next_id,
+                        error = %e,
+                        "chained resumable turn persist failed — further resume not possible"
+                    );
+                }
+                Ok(ThinkOutcome::Suspended {
+                    approval_id: next_id,
+                    redacted_summary,
+                })
+            }
+            ToolLoopOutcome::MaxIterations { .. } => Ok(ThinkOutcome::NoReply),
         }
     }
 
@@ -1012,6 +1527,13 @@ impl Agent {
             let gov = EmotionActionGovernor::new(g);
             gov.decide(&self.emotion) == ActionDecision::Hesitate
         });
+        // `thought_response` = mallin tekstivastaus (jos `ThinkOutcome::Reply`),
+        // `suspend` = vuoron keskeytys hyväksyntää varten (jos
+        // `ThinkOutcome::Suspended`). Ne ovat toisensa poissulkevia: yksi vuoro
+        // tuottaa korkeintaan toisen. `Suspended` EI mene reply-putkeen — se
+        // kirjataan vuoron durable-tilaan resumea varten (id + redaktoitu
+        // tiivistelmä), eikä koskaan reititetä käyttäjälle.
+        let mut suspend: Option<(ApprovalId, String)> = None;
         let thought_response: Option<String> = if self.llm.is_none() {
             None
         } else if governor_filtered_pulse {
@@ -1044,8 +1566,11 @@ impl Agent {
                 .filter(|s| !s.is_empty())
         } else {
             // Tuore vuoro: aja LLM async-kontekstissa, tallenna tulos askeleeseen.
-            match self.think(message).await {
-                Some(Ok(text)) => self
+            // Origin annetaan eteenpäin, jotta mahdollinen suspend tallentaa
+            // jatkettavaan vuoroon oikean keskustelu-alkuperän (resume reitittää
+            // vastauksen samaan keskusteluun).
+            match self.think_with_origin(message, origin).await {
+                Ok(ThinkOutcome::Reply(text)) => self
                     .durable
                     .step(&think_step, {
                         let text = text.clone();
@@ -1053,11 +1578,38 @@ impl Agent {
                     })
                     .ok()
                     .filter(|s| !s.is_empty()),
-                Some(Err(e)) => {
+                Ok(ThinkOutcome::Suspended {
+                    approval_id,
+                    redacted_summary,
+                }) => {
+                    // Suspend on TILA: vuoro keskeytyi odottamaan hyväksyntää.
+                    // EI reply-putkeen. Tallenna turvallinen tiivistelmä durable-
+                    // askeleeseen ("{step}-suspend") jotta resume (myöhempi
+                    // `approve`) ja replay löytävät keskeytyksen. Tallennettava
+                    // muoto on `"<approval_id>|<redacted_summary>"` — EI raakaa
+                    // payloadia, EI salaisuuksia (redacted_summary on jo
+                    // operaattorille turvallinen). Reply-tekstiä ei synny → None.
+                    let suspend_step = format!("{step_name}-suspend");
+                    let payload = format!("{approval_id}|{redacted_summary}");
+                    if let Err(e) = self.durable.step(&suspend_step, {
+                        let payload = payload.clone();
+                        move || Ok(payload)
+                    }) {
+                        warn!("durable suspend step failed (non-fatal): {e}");
+                    }
+                    debug!(
+                        agent = self.config.name,
+                        %approval_id,
+                        "turn suspended awaiting approval — recorded in durable turn, no user reply"
+                    );
+                    suspend = Some((approval_id, redacted_summary));
+                    None
+                }
+                Ok(ThinkOutcome::NoReply) => None,
+                Err(e) => {
                     warn!("think failed (non-fatal): {e}");
                     None
                 }
-                None => None,
             }
         };
 
@@ -1114,15 +1666,26 @@ impl Agent {
             }
         }
 
-        // Liitä LLM-ajattelun tiivistelmä vuoron yhteenvetoon (jos saatu).
-        let recorded = match thought_response {
-            Some(thought) if !thought.is_empty() => {
+        // Liitä LLM-ajattelun tiivistelmä TAI suspend-merkintä vuoron
+        // yhteenvetoon. Reply ja Suspended ovat poissulkevia: korkeintaan toinen
+        // näistä on `Some`. Suspend-merkintä kantaa vain redaktoidun,
+        // operaattorille turvallisen tiivistelmän + hyväksynnän tunnisteen —
+        // EI raakaa payloadia eikä salaisuuksia (resume-/auditointikonteksti).
+        let recorded = match (thought_response, suspend) {
+            (Some(thought), _) if !thought.is_empty() => {
                 let snippet: String = thought.chars().take(160).collect();
                 TurnOutcome {
                     summary: format!("{} | thought: {snippet}", recorded.summary),
                     ..recorded
                 }
             }
+            (_, Some((approval_id, redacted_summary))) => TurnOutcome {
+                summary: format!(
+                    "{} | suspended(approval={approval_id}): {redacted_summary}",
+                    recorded.summary
+                ),
+                ..recorded
+            },
             _ => recorded,
         };
 
@@ -1368,6 +1931,65 @@ fn build_tool_definitions(descriptors: &[McpToolDescriptor]) -> Vec<ToolDefiniti
                     debug!(tool = d.name.as_str(), error = %e, "tool loop: skipping invalid tool definition");
                     None
                 }
+            }
+        })
+        .collect()
+}
+
+/// Redaktoi viestipinon **jatkettavaa vuoroa varten** ennen levylle
+/// tallennusta (suspend/resume-silta, salaisuusinvariantti).
+///
+/// Koska jatkettava vuoro persistoidaan levylle, **jokaisen** viestin koko
+/// salaisuuspinta on redaktoitava — ei vain työkalukutsujen argumentteja, vaan
+/// myös viestien tekstisisältö (`content`), johon salaisuus voi piillä
+/// vapaatekstinä. Aiempi versio redaktoi vain `tool_calls`-argumentit ja vain
+/// "koko arvo / tunnettu avainnimi" -tasolla, jolloin (a) system-/user-/
+/// assistant-viestien `content` ja (b) salaisuus **upotettuna** mallin tuottaman
+/// argumentin vapaatekstiin pääsivät levylle raakana. Tämä funktio sulkee
+/// molemmat aukot:
+///
+/// - **Viestien `content`** ajetaan [`familyclaw_actions::redact_free_text`]:n
+///   läpi (osajono­pass: yksittäiset salaisuussanat + `Bearer …` + `avain=arvo`).
+///   Tool-viestien sisältö on jo redaktoitu actions-putkessa
+///   (`proof.redacted_output`), mutta tämä pass on idempotentti ja toimii
+///   puolustuksena syvyydessä myös system-/user-/assistant-teksteille.
+/// - **Työkalukutsujen `arguments`** ([`crate::llm::ToolCall::arguments`]) on
+///   mallin tuottamaa raakaa JSON:ia. Ne ajetaan **syvän** redaktorin
+///   ([`familyclaw_actions::redact_value_deep`]) läpi, joka redaktoi sekä koko
+///   arvon / tunnetun avainnimen ETTÄ vapaatekstiin upotetut salaisuudet.
+///
+/// Resumen kannalta tämä on turvallista: hyväksytty toiminto on jo suoritettu
+/// (payload-sidottu odottavaan hyväksyntään actions-kerroksessa), joten
+/// replayttu assistant-viesti tarvitsee vain työkalukutsun **tunnisteen ja
+/// nimen** sitoakseen `tool_result`:n oikeaan kutsuun — ei raakoja argumentteja.
+///
+/// Palauttaa redaktoidun kopion (alkuperäistä elävää pinoa ei muteta).
+fn redact_messages_for_resume(messages: &[LlmMessage]) -> Vec<LlmMessage> {
+    messages
+        .iter()
+        .map(|m| {
+            // 1. Tekstisisältö: redaktoi vapaatekstiin upotetut salaisuudet
+            //    jokaisesta viestistä (system/user/assistant/tool).
+            let (redacted_content, _) = familyclaw_actions::redact_free_text(&m.content);
+            // 2. Työkalukutsujen argumentit: syvä redaktointi (sis. upotetut).
+            let redacted_calls = m.tool_calls.as_ref().map(|calls| {
+                calls
+                    .iter()
+                    .map(|c| {
+                        let (redacted_args, _) =
+                            familyclaw_actions::redact_value_deep(&c.arguments);
+                        crate::llm::ToolCall {
+                            id: c.id.clone(),
+                            name: c.name.clone(),
+                            arguments: redacted_args,
+                        }
+                    })
+                    .collect()
+            });
+            LlmMessage {
+                content: redacted_content,
+                tool_calls: redacted_calls,
+                ..m.clone()
             }
         })
         .collect()
@@ -2528,6 +3150,61 @@ mod tests {
         StdArc::new(TokioMutex::new(rt))
     }
 
+    /// Kuten [`ApprovalSkill`], mutta laskee jokaisen suorituksen **per-instanssi**
+    /// jaettuun laskuriin. Per-instanssi (ei globaali) laskuri pitää
+    /// rinnakkaiset testit erillään — kukin testi rakentaa oman laskurinsa.
+    /// Käytetään todistamaan resumen "side effect runs exactly once" -invariantti.
+    #[derive(Debug, Clone)]
+    struct CountingApprovalSkill {
+        /// Jaettu suorituslaskuri (kloonataan testin oman kahvan kanssa).
+        count: StdArc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingApprovalSkill {
+        /// Rakentaa taidon, joka kasvattaa annettua jaettua laskuria joka
+        /// suorituksella.
+        fn new(count: StdArc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self { count }
+        }
+    }
+
+    /// Laskevan hyväksyntätaidon kiinteä tunniste.
+    const COUNTING_APPROVAL_UUID: uuid::Uuid =
+        uuid::uuid!("99999999-3333-4444-8555-666666666666");
+
+    #[async_trait::async_trait]
+    impl familyclaw_actions::ActionExecutor for CountingApprovalSkill {
+        async fn execute(
+            &self,
+            request: familyclaw_actions::ActionRequest,
+        ) -> familyclaw_actions::Result<familyclaw_actions::ActionResult> {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(familyclaw_actions::ActionResult::success(
+                "counting approval action executed",
+                serde_json::json!({ "executed": true }),
+                request.now,
+            ))
+        }
+    }
+
+    impl familyclaw_actions::Skill for CountingApprovalSkill {
+        fn manifest(&self) -> familyclaw_actions::manifest::SkillManifest {
+            familyclaw_actions::manifest::SkillManifest {
+                id: familyclaw_actions::SkillId::from_uuid(COUNTING_APPROVAL_UUID),
+                name: "approval_skill".to_string(),
+                version: "1.0.0".to_string(),
+                description: "Laskeva ulkoisesti kirjoittava toiminto (vaatii hyväksynnän, testikäyttö)."
+                    .to_string(),
+                permissions: vec![familyclaw_actions::policy::SkillPermission::WriteExternal],
+                risk: familyclaw_actions::policy::ActionRisk::WriteExternal,
+                approval_policy: familyclaw_actions::policy::ApprovalPolicy::RequireApproval,
+                input_hint: None,
+                output_hint: None,
+                input_schema: familyclaw_actions::manifest::default_input_schema(),
+            }
+        }
+    }
+
     /// (a) `actions = None` säilyttää yhden kerran -käytöksen: yksi LLM-kutsu,
     /// ei työkaluja, palautuu mallin teksti sellaisenaan.
     #[tokio::test]
@@ -2540,9 +3217,8 @@ mod tests {
         let out = agent
             .think(&BusMessage::text("hei"))
             .await
-            .expect("llm present")
             .expect("one-shot ok");
-        assert_eq!(out, "yksi vastaus");
+        assert_eq!(out, ThinkOutcome::Reply("yksi vastaus".to_string()));
         bus.stop();
     }
 
@@ -2558,9 +3234,8 @@ mod tests {
         let out = agent
             .think(&BusMessage::text("kysymys"))
             .await
-            .expect("llm present")
             .expect("loop ok");
-        assert_eq!(out, "ei työkaluja tarvita");
+        assert_eq!(out, ThinkOutcome::Reply("ei työkaluja tarvita".to_string()));
         bus.stop();
     }
 
@@ -2581,11 +3256,10 @@ mod tests {
         let out = agent
             .think(&BusMessage::text("aja työkalu"))
             .await
-            .expect("llm present")
             .expect("loop ok");
         // Toinen kierros pysähtyi lopulliseen tekstiin (työkalun tulos
         // syötettiin takaisin malliin ennen tätä).
-        assert_eq!(out, "työkalu vastasi, valmis");
+        assert_eq!(out, ThinkOutcome::Reply("työkalu vastasi, valmis".to_string()));
         bus.stop();
     }
 
@@ -2605,9 +3279,11 @@ mod tests {
         let out = agent
             .think(&BusMessage::text("kokeile tuntematonta"))
             .await
-            .expect("llm present")
             .expect("loop continues past unknown tool");
-        assert_eq!(out, "ok, jatketaan ilman sitä työkalua");
+        assert_eq!(
+            out,
+            ThinkOutcome::Reply("ok, jatketaan ilman sitä työkalua".to_string())
+        );
         bus.stop();
     }
 
@@ -2618,9 +3294,9 @@ mod tests {
     /// LLM-kutsu hyytyisi timeoutiin; raja estää sen).
     ///
     /// **Käyttäjäraja:** kun raja täyttyy ilman vastausta, `think()` palauttaa
-    /// `None` — sisäistä max-iter-merkkiä EI reititetä käyttäjälle. Aiempi
-    /// toteutus vuoti `"[tool loop stopped: ...]"`-merkkijonon sanatarkasti
-    /// reply-putken läpi; tämä testi vartioi ettei näin enää tapahdu.
+    /// [`ThinkOutcome::NoReply`] — sisäistä max-iter-merkkiä EI reititetä
+    /// käyttäjälle. Aiempi toteutus vuoti `"[tool loop stopped: ...]"`-merkkijonon
+    /// sanatarkasti reply-putken läpi; tämä testi vartioi ettei näin enää tapahdu.
     #[tokio::test]
     async fn tool_loop_max_iterations_does_not_leak_marker_to_user() {
         let bus = ResonanceBus::start(None).await.expect("bus");
@@ -2643,30 +3319,33 @@ mod tests {
 
         // Silmukka pysähtyy rajaan ilman paniikkia/hangia. Koska malli ei
         // koskaan tuottanut tekstiä, käyttäjälle EI synny vastausta: `think`
-        // palauttaa `None` (sisäinen MaxIterations-ohjaustila suodatettu),
-        // EIKÄ raakaa max-iter-merkkijonoa vuoda käyttäjärajan yli.
-        let out = agent.think(&BusMessage::text("ikuinen työkalupyyntö")).await;
-        assert!(
-            matches!(out, Some(Ok(ref s)) if !s.contains("tool loop stopped")) || out.is_none(),
-            "max-iter EI saa vuotaa sisäistä merkkiä käyttäjälle, sai: {out:?}"
-        );
-        // Tarkka odotus: ei tekstiä → None (ei käyttäjäreplyä tällä vuorolla).
-        assert!(
-            out.is_none(),
+        // palauttaa `ThinkOutcome::NoReply` (sisäinen MaxIterations-ohjaustila
+        // käännetty), EIKÄ raakaa max-iter-merkkijonoa vuoda käyttäjärajan yli.
+        let out = agent
+            .think(&BusMessage::text("ikuinen työkalupyyntö"))
+            .await
+            .expect("max-iter ei saa palauttaa virhettä");
+        // Ydinväite: ei käyttäjäreplyä eikä sisäistä merkkiä — NoReply.
+        // (Erityisesti EI Reply joka voisi kantaa max-iter-merkkijonon.)
+        assert_eq!(
+            out,
+            ThinkOutcome::NoReply,
             "ilman mallin tekstiä max-iter ei tuota käyttäjävastausta, sai: {out:?}"
         );
         bus.stop();
     }
 
-    /// (f) **Hyväksyntää vaativa työkalu EI vuoda sisäistä merkkiä käyttäjälle.**
-    /// Kun malli kutsuu hyväksyntää vaativaa työkalua, suoritus jää odottamaan
-    /// ihmisen lupaa. Aiempi toteutus palautti `"[awaiting approval: ...
-    /// (approval_id=...)]"` tavallisena onnistumis-merkkijonona, joka reititettiin
-    /// sanatarkasti — raaka `approval_id` mukaan lukien — käyttäjälle. Korjattu:
-    /// `think()` palauttaa `None` (sisäinen `AwaitingApproval`-ohjaustila), eikä
-    /// mitään `approval`-tekstiä koskaan päädy käyttäjärajan yli.
+    /// (f) **Hyväksyntää vaativa työkalu palauttaa [`ThinkOutcome::Suspended`]
+    /// — EI käyttäjäreplyä.** Kun malli kutsuu hyväksyntää vaativaa työkalua,
+    /// suoritus jää odottamaan ihmisen lupaa. Aiempi (1B) toteutus palautti
+    /// `"[awaiting approval: ... (approval_id=...)]"` tavallisena
+    /// onnistumis-merkkijonona, joka reititettiin sanatarkasti — raaka
+    /// `approval_id` mukaan lukien — käyttäjälle. 1C: `think()` palauttaa
+    /// ensiluokkaisen `Suspended`-tilan, joka kantaa **tyypitetyn** `approval_id`:n
+    /// ja redaktoidun tiivistelmän — eikä se ole `Reply`, joten se ei koskaan
+    /// reitity reply-putkeen.
     #[tokio::test]
-    async fn tool_loop_awaiting_approval_does_not_leak_marker_to_user() {
+    async fn tool_loop_awaiting_approval_returns_suspended_not_reply() {
         let bus = ResonanceBus::start(None).await.expect("bus");
         // Yksi vastaus: malli kutsuu hyväksyntää vaativaa työkalua.
         let api = spawn_scripted_llm(vec![body_tool_call(
@@ -2678,20 +3357,79 @@ mod tests {
         let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
             .with_actions(approval_runtime());
 
-        let out = agent.think(&BusMessage::text("aja hyväksyntä-työkalu")).await;
-        // EI käyttäjävastausta: hyväksyntä on operaattorin tila, ei reply.
-        assert!(
-            out.is_none(),
-            "hyväksyntää odottava työkalu ei tuota käyttäjävastausta, sai: {out:?}"
-        );
-        // Varmistus: jos jokin tulevaisuuden muutos palauttaisi tekstin, se ei
-        // saa sisältää sisäistä merkkiä eikä raakaa approval-tunnistetta.
-        if let Some(Ok(text)) = out {
-            assert!(
-                !text.contains("awaiting approval") && !text.contains("approval_id"),
-                "approval-merkki EI saa vuotaa käyttäjälle, sai: {text}"
-            );
+        let out = agent
+            .think(&BusMessage::text("aja hyväksyntä-työkalu"))
+            .await
+            .expect("approval-polku ei saa palauttaa virhettä");
+
+        // Ydinväite: tulos on Suspended (EI Reply) ja kantaa approval_id:n.
+        match out {
+            ThinkOutcome::Suspended {
+                approval_id,
+                redacted_summary,
+            } => {
+                // approval_id on aito (ei nil) → operaattori voi `approve`:lla.
+                assert!(
+                    !approval_id.is_nil(),
+                    "Suspended kantaa aidon hyväksyntätunnisteen"
+                );
+                // Redaktoitu tiivistelmä ei saa vuotaa raakaa payloadia
+                // ("do-it") eikä salaisuuksia — vain neutraalia metatietoa.
+                assert!(
+                    !redacted_summary.contains("do-it"),
+                    "redaktoitu tiivistelmä ei saa sisältää raakaa payloadia, sai: {redacted_summary}"
+                );
+                assert!(
+                    !redacted_summary.is_empty(),
+                    "redaktoitu tiivistelmä ei saa olla tyhjä"
+                );
+            }
+            other => panic!("odotettiin Suspended, sai: {other:?}"),
         }
+        bus.stop();
+    }
+
+    /// (f2) **Suspended EI tuota käyttäjäreplyä koko vuoron läpi.** Tämä ajaa
+    /// suspendin `handle_turn`:n kautta reply-sinkin kanssa ja todistaa että
+    /// kanavan recv-pää **ei saa mitään** — suspend kirjataan vuoron durable-
+    /// tilaan, ei reply-putkeen (1B-vuodon regressiovahti).
+    #[tokio::test]
+    async fn suspended_turn_produces_no_user_reply() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let api = spawn_scripted_llm(vec![body_tool_call(
+            "call_approve",
+            "approval_skill",
+            &serde_json::json!({ "q": "do-it" }),
+        )])
+        .await;
+        let (sink, mut rx) = new_reply_channel();
+        let mut agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+            .with_actions(approval_runtime())
+            .with_reply_sink(sink)
+            .with_reply_target("discord:general-1");
+
+        let outcome = agent
+            .handle_turn(BeingId::new(), &BusMessage::text("aja hyväksyntä-työkalu"))
+            .await
+            .expect("vuoro ei saa kaatua suspendiin");
+
+        // Kanavan recv-pää EI saa mitään — suspend ei vuoda reply-putkeen.
+        assert!(
+            rx.try_recv().is_err(),
+            "suspended-vuoro ei saa lähettää käyttäjäreplyä"
+        );
+        // Vuoron yhteenveto kirjaa suspendin (resume-/auditointikonteksti),
+        // mutta EI raakaa payloadia.
+        assert!(
+            outcome.summary.contains("suspended(approval="),
+            "vuoron yhteenvedon pitäisi merkitä suspend, sai: {}",
+            outcome.summary
+        );
+        assert!(
+            !outcome.summary.contains("do-it"),
+            "suspend-yhteenveto ei saa sisältää raakaa payloadia, sai: {}",
+            outcome.summary
+        );
         bus.stop();
     }
 
@@ -2707,6 +3445,427 @@ mod tests {
         );
         let tuned = agent.with_tool_loop(ToolLoopConfig { max_iterations: 2 });
         assert_eq!(tuned.tool_loop().max_iterations, 2);
+        bus.stop();
+    }
+
+    // ---- 1C suspend/resume bridge (roadmap §6) -----------------------------
+
+    use crate::resumable::{
+        InMemoryResumableStore, JournalResumableStore, ResumableTurnStore,
+    };
+    use familyclaw_actions::{JournalPendingStore, PendingApprovalStore};
+
+    /// RAII-temp-hakemisto durable-pintojen kirjoituksia varten (ei ulkoisia
+    /// crateja). Antaa kaksi tiedostopolkua: pending- ja resumable-journalit.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "familyclaw-resume-bridge-{tag}-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+            std::fs::create_dir_all(&p).expect("create temp dir");
+            Self(p)
+        }
+        fn pending_path(&self) -> std::path::PathBuf {
+            self.0.join("pending.jsonl")
+        }
+        fn task_queue_path(&self) -> std::path::PathBuf {
+            self.0.join("tasks.jsonl")
+        }
+        fn resumable_path(&self) -> std::path::PathBuf {
+            self.0.join("resumable.jsonl")
+        }
+    }
+
+    /// Rakentaa **täysin kaatumiskestävän** jaetun runtimen laskevalla
+    /// hyväksyntätaidolla: durable pending + durable task queue (rekonstruoituna
+    /// annetuista tiedostoista) + per-testi laskuri.
+    async fn durable_counting_runtime(
+        pending_path: std::path::PathBuf,
+        task_queue_path: std::path::PathBuf,
+        count: StdArc<std::sync::atomic::AtomicUsize>,
+    ) -> StdArc<TokioMutex<ActionRuntime>> {
+        let mut rt = ActionRuntime::with_durable_stores(pending_path, task_queue_path)
+            .await
+            .expect("durable stores open");
+        rt.register_skill(CountingApprovalSkill::new(count))
+            .expect("register counting approval_skill");
+        StdArc::new(TokioMutex::new(rt))
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Rakentaa jaetun runtimen LASKEVALLA hyväksyntätaidolla + annetulla
+    /// odottavien hyväksyntöjen tallennuspinnalla (durable tai in-memory).
+    /// `count` on per-testi jaettu laskuri (rinnakkaisuus-isolaatio).
+    fn counting_runtime_with_pending(
+        pending: Box<dyn PendingApprovalStore>,
+        count: StdArc<std::sync::atomic::AtomicUsize>,
+    ) -> StdArc<TokioMutex<ActionRuntime>> {
+        let mut rt = ActionRuntime::with_pending_store(pending);
+        rt.register_skill(CountingApprovalSkill::new(count))
+            .expect("register counting approval_skill");
+        StdArc::new(TokioMutex::new(rt))
+    }
+
+    /// (a) **Suspend persistoi jatkettavan vuoron.** Kun tool-loop keskeytyy
+    /// hyväksyntää odottamaan, jatkettava vuoro tallennetaan resumable-pinnalle
+    /// oikealla `approval_id`:llä, eikä se sisällä raakaa payloadia/salaisuuksia.
+    #[tokio::test]
+    async fn suspend_persists_resumable_turn_without_secrets() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let api = spawn_scripted_llm(vec![body_tool_call(
+            "call_approve",
+            "approval_skill",
+            &serde_json::json!({ "q": "do-it", "api_key": "sk-livelivelive" }),
+        )])
+        .await;
+        let store: StdArc<dyn ResumableTurnStore> = StdArc::new(InMemoryResumableStore::new());
+        let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+            .with_actions(approval_runtime())
+            .with_resumable_store(StdArc::clone(&store));
+
+        let out = agent
+            .think(&BusMessage::text("aja hyväksyntä-työkalu"))
+            .await
+            .expect("suspend ok");
+
+        let approval_id = match out {
+            ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+            other => panic!("odotettiin Suspended, sai: {other:?}"),
+        };
+
+        // Jatkettava vuoro on pinnalla oikealla avaimella.
+        assert_eq!(store.len().expect("len"), 1);
+        let turn = store
+            .get(approval_id)
+            .expect("get")
+            .expect("resumable persisted with the right approval_id");
+        assert_eq!(turn.approval_id, approval_id);
+        assert_eq!(turn.tool_name, "approval_skill");
+        // Viestipino tallessa (system + user + assistant-tool-call).
+        assert!(turn.messages.len() >= 2, "message stack persisted");
+
+        // EI raakaa SALAISUUTTA missään kentässä — viestipinon työkalukutsujen
+        // argumentit redaktoidaan ennen tallennusta.
+        let json = serde_json::to_string(&turn).expect("serialize turn");
+        assert!(
+            !json.contains("sk-livelivelive"),
+            "resumable turn must not contain the raw secret"
+        );
+        // Argumenttien tiivistämä kenttä EI saa kantaa raakoja argumentteja:
+        // redacted_arguments on neutraali tiivistelmä, arguments_hash on SHA-256.
+        assert!(
+            !turn.redacted_arguments.contains("sk-livelivelive")
+                && !turn.redacted_arguments.contains("do-it"),
+            "redacted_arguments must not carry raw args/secrets, got: {}",
+            turn.redacted_arguments
+        );
+        assert_eq!(turn.arguments_hash.len(), 64, "sha256 hex present");
+        // Tiiviste sitoo täsmälleen alkuperäisiin (ei-redaktoituihin) argumentteihin
+        // (payload-sidonta resumea varten).
+        let expected_hash = familyclaw_actions::approval::sha256_hex(
+            &serde_json::to_vec(&serde_json::json!({ "q": "do-it", "api_key": "sk-livelivelive" }))
+                .unwrap(),
+        );
+        assert_eq!(turn.arguments_hash, expected_hash);
+        bus.stop();
+    }
+
+    /// (a2) **Suspend ei vuoda salaisuutta UPOTETTUNA vapaatekstiin** — ei
+    /// työkaluargumentin sisään eikä käyttäjäviestiin. Tämä on defect #2:n
+    /// nimenomainen aukko: vanha redaktointi maskasi vain koko-arvo- ja
+    /// tunnettu-avainnimi-salaisuudet, joten salaisuus suuremman merkkijonon
+    /// SISÄLLÄ (tai user-viestissä) päätyi levylle raakana. Asetus käyttää
+    /// kaatumiskestävää [`JournalResumableStore`]:a ja lukee TIEDOSTON sisällön
+    /// suoraan: jos salaisuus olisi levyllä, se näkyisi `.jsonl`:ssä.
+    #[tokio::test]
+    async fn suspend_does_not_persist_secret_embedded_in_free_text() {
+        let dir = TempDir::new("embedded");
+        let secret = format!("sk-{}", "live".repeat(4));
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        // Työkaluargumentti, jossa salaisuus on UPOTETTU vapaatekstiin (kentän
+        // nimi `prompt` EI ole salaisuusavain, eikä koko arvo ole pelkkä token).
+        let api = spawn_scripted_llm(vec![body_tool_call(
+            "call_approve",
+            "approval_skill",
+            &serde_json::json!({ "prompt": format!("deploy using {secret} then ship") }),
+        )])
+        .await;
+        let resumable: StdArc<dyn ResumableTurnStore> =
+            StdArc::new(JournalResumableStore::open(dir.resumable_path()).expect("resumable"));
+        let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+            .with_actions(approval_runtime())
+            .with_resumable_store(StdArc::clone(&resumable));
+
+        // Käyttäjäviesti, joka itse kantaa salaisuuden vapaatekstinä.
+        let out = agent
+            .think(&BusMessage::text(format!(
+                "use my key {secret} to deploy"
+            )))
+            .await
+            .expect("suspend ok");
+        let approval_id = match out {
+            ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+            other => panic!("odotettiin Suspended, sai: {other:?}"),
+        };
+
+        // 1. Levylle persistoidussa journalissa EI saa olla raakaa salaisuutta.
+        let on_disk = std::fs::read_to_string(dir.resumable_path()).expect("read journal");
+        assert!(
+            !on_disk.contains(&secret),
+            "persisted resumable journal leaked an embedded secret:\n{on_disk}"
+        );
+        // 2. Eikä rekonstruoidussa vuorossa (argumentit + viestipinon content).
+        let turn = resumable.get(approval_id).expect("get").expect("present");
+        let turn_json = serde_json::to_string(&turn).expect("serialize turn");
+        assert!(
+            !turn_json.contains(&secret),
+            "resumable turn leaked an embedded secret: {turn_json}"
+        );
+        // Redaktiomaski ON läsnä (todiste että pass laukesi), ja vaaraton
+        // ympäröivä teksti säilyi (deploy/ship) — ei pelkkä koko-arvo-pyyhintä.
+        assert!(turn_json.contains("[REDACTED]"), "redaction mask present");
+        bus.stop();
+    }
+
+    /// (b) **`resume_approved` lataa, hyväksyy ja vie vuoron loppuun (Reply) —
+    /// sivuvaikutus ajetaan TASAN KERRAN.** Ensin malli kutsuu hyväksyntää
+    /// vaativaa työkalua (suspend). Resume kuluttaa hyväksynnän (= taito
+    /// suoritetaan kerran), syöttää tuloksen takaisin, ja malli vastaa
+    /// lopullisella tekstillä.
+    #[tokio::test]
+    async fn resume_approved_completes_turn_side_effect_runs_once() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        // Pyyntö 1: kutsu hyväksyntätyökalua (suspend).
+        // Pyyntö 2 (resumen aikana): nähtyään työkalun tuloksen, vastaa tekstillä.
+        let api = spawn_scripted_llm(vec![
+            body_tool_call("call_approve", "approval_skill", &serde_json::json!({ "q": "ship" })),
+            body_text("hyväksytty toiminto valmis"),
+        ])
+        .await;
+        let store: StdArc<dyn ResumableTurnStore> = StdArc::new(InMemoryResumableStore::new());
+        let count = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = counting_runtime_with_pending(
+            Box::new(familyclaw_actions::InMemoryPendingStore::new()),
+            StdArc::clone(&count),
+        );
+        let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+            .with_actions(StdArc::clone(&runtime))
+            .with_resumable_store(StdArc::clone(&store));
+
+        // Vaihe 1: suspend.
+        let out = agent
+            .think(&BusMessage::text("ship it"))
+            .await
+            .expect("suspend ok");
+        let approval_id = match out {
+            ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+            other => panic!("odotettiin Suspended, sai: {other:?}"),
+        };
+        // Ennen hyväksyntää taito EI ole suoriutunut.
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "approval-gated action must NOT run before approve"
+        );
+
+        // Vaihe 2: resume → hyväksy ja vie loppuun.
+        let now = time::now();
+        let resumed = agent
+            .resume_approved(approval_id, now)
+            .await
+            .expect("resume_approved ok");
+        assert_eq!(
+            resumed,
+            ThinkOutcome::Reply("hyväksytty toiminto valmis".to_string()),
+            "resume jatkaa loopin lopulliseen vastaukseen"
+        );
+
+        // Sivuvaikutus ajettiin TASAN KERRAN.
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "approval-gated side effect must run exactly once"
+        );
+        // Jatkettava vuoro kulutettu (poistettu pinnalta).
+        assert!(
+            store.get(approval_id).expect("get").is_none(),
+            "resumable turn consumed after resume"
+        );
+        bus.stop();
+    }
+
+    /// (c) **RESTART-survival.** Persistoi jatkettava vuoro JA odottava
+    /// hyväksyntä kaatumiskestäthe operator pinnoille, **pudota** koko runtime + agentti,
+    /// rakenna ne UUDELLEEN samoista durable-tiedostoista, ja todista että
+    /// `resume_approved` yhä toimii (vie vuoron loppuun, sivuvaikutus kerran).
+    #[tokio::test]
+    async fn restart_survival_resume_after_rebuild_from_durable_dir() {
+        let dir = TempDir::new("restart");
+        // Jaettu suorituslaskuri kulkee "kaatumisen" yli: todistaa että
+        // sivuvaikutus ajetaan tasan kerran KOKO elinkaaren yli.
+        let count = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // ----- Ennen "kaatumista": suspend, joka persistoituu levylle. -----
+        let approval_id = {
+            let bus = ResonanceBus::start(None).await.expect("bus 1");
+            let api = spawn_scripted_llm(vec![body_tool_call(
+                "call_approve",
+                "approval_skill",
+                &serde_json::json!({ "q": "deploy" }),
+            )])
+            .await;
+            // Täysin kaatumiskestävä runtime (durable pending + durable task
+            // queue) + durable resumable pinta.
+            let runtime = durable_counting_runtime(
+                dir.pending_path(),
+                dir.task_queue_path(),
+                StdArc::clone(&count),
+            )
+            .await;
+            let resumable: StdArc<dyn ResumableTurnStore> =
+                StdArc::new(JournalResumableStore::open(dir.resumable_path()).expect("resumable 1"));
+            let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+                .with_actions(runtime)
+                .with_resumable_store(resumable);
+
+            let out = agent
+                .think(&BusMessage::text("deploy it"))
+                .await
+                .expect("suspend ok");
+            let id = match out {
+                ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+                other => panic!("odotettiin Suspended, sai: {other:?}"),
+            };
+            assert_eq!(
+                count.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "ei suoritusta ennen hyväksyntää"
+            );
+            bus.stop();
+            id
+            // bus/api/runtime/agent/resumable PUDOTETAAN tässä = "prosessi kaatuu".
+        };
+
+        // ----- "Restart": rakenna kaikki UUDELLEEN samoista tiedostoista. -----
+        let bus2 = ResonanceBus::start(None).await.expect("bus 2");
+        // Resumen jatkokierros vastaa tekstillä (yksi pyyntö riittää).
+        let api2 = spawn_scripted_llm(vec![body_text("deploy valmis restartin jälkeen")]).await;
+        // Tarkista että odottava hyväksyntä säilyi durable-pinnalla restartin yli.
+        {
+            let probe = JournalPendingStore::open(dir.pending_path()).expect("pending probe");
+            assert_eq!(probe.len().expect("len"), 1, "pending approval survived restart");
+        }
+        // Avaa SAMAT durable-tiedostot uudelleen — runtime rekonstruoituu
+        // (pending + task queue + ledger) lokeista.
+        let runtime2 = durable_counting_runtime(
+            dir.pending_path(),
+            dir.task_queue_path(),
+            StdArc::clone(&count),
+        )
+        .await;
+        let resumable2: StdArc<dyn ResumableTurnStore> =
+            StdArc::new(JournalResumableStore::open(dir.resumable_path()).expect("resumable 2"));
+        // Jatkettava vuoro säilyi restartin yli.
+        assert!(
+            resumable2.get(approval_id).expect("get").is_some(),
+            "resumable turn survived restart"
+        );
+        let agent2 = agent_with_scripted_llm("agent_a", bus2.clone(), &api2)
+            .with_actions(runtime2)
+            .with_resumable_store(StdArc::clone(&resumable2));
+
+        // Resume yhä toimii: vie vuoron loppuun, sivuvaikutus tasan kerran.
+        let now = time::now();
+        let resumed = agent2
+            .resume_approved(approval_id, now)
+            .await
+            .expect("resume after restart ok");
+        assert_eq!(
+            resumed,
+            ThinkOutcome::Reply("deploy valmis restartin jälkeen".to_string())
+        );
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "side effect runs exactly once across the restart"
+        );
+        // Vuoro kulutettu durable-pinnalta.
+        assert!(resumable2.get(approval_id).expect("get").is_none());
+        bus2.stop();
+    }
+
+    /// (d) **Tuntematon / vanhentunut `approval_id` epäonnistuu fail-closed
+    /// (ei paniikkia, ei sivuvaikutusta).**
+    #[tokio::test]
+    async fn resume_unknown_or_expired_fails_closed() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        // Per-testi laskuri: fail-closed-polut eivät saa ajaa sivuvaikutusta.
+        let count = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // --- Tuntematon approval_id (mitään ei persistoitu) ---
+        let api = spawn_scripted_llm(vec![body_text("ei pitäisi koskaan ajaa")]).await;
+        let store: StdArc<dyn ResumableTurnStore> = StdArc::new(InMemoryResumableStore::new());
+        let runtime = counting_runtime_with_pending(
+            Box::new(familyclaw_actions::InMemoryPendingStore::new()),
+            StdArc::clone(&count),
+        );
+        let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+            .with_actions(runtime)
+            .with_resumable_store(StdArc::clone(&store));
+
+        let err = agent
+            .resume_approved(ApprovalId::new(), time::now())
+            .await
+            .expect_err("unknown approval must fail closed");
+        assert!(
+            matches!(err, FamilyClawError::InvalidInput(_)),
+            "tuntematon approval → InvalidInput (fail-closed), sai: {err:?}"
+        );
+
+        // --- Vanhentunut jatkettava vuoro ---
+        let now = time::now();
+        let expired_id = ApprovalId::new();
+        let expired = crate::resumable::ResumableTurn::new(
+            expired_id,
+            "00000000-0000-4000-8000-000000000002",
+            None,
+            vec![LlmMessage::system("s"), LlmMessage::user("u")],
+            "call_x",
+            "approval_skill",
+            &serde_json::json!({ "q": "x" }),
+            "approval_skill awaiting human approval",
+            now - chrono::Duration::minutes(120),
+            now - chrono::Duration::minutes(60), // expires_at menneisyydessä
+        );
+        store.put(expired).expect("put expired");
+
+        let err2 = agent
+            .resume_approved(expired_id, now)
+            .await
+            .expect_err("expired resumable must fail closed");
+        assert!(
+            matches!(err2, FamilyClawError::InvalidInput(_)),
+            "vanhentunut jatkettava vuoro → InvalidInput (fail-closed), sai: {err2:?}"
+        );
+
+        // Kumpikaan polku ei ajanut sivuvaikutusta.
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "fail-closed-polut eivät saa ajaa sivuvaikutusta"
+        );
         bus.stop();
     }
 }

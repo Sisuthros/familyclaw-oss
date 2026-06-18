@@ -34,7 +34,8 @@ use std::sync::Arc;
 
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, resolve_profile_dir, Agent, EmotionCalibration,
-    ErasedMemoryStore, LlmEndpointResolver, Soul, TableCalibration,
+    ErasedMemoryStore, JournalResumableStore, LlmEndpointResolver, ResumableTurnStore, Soul,
+    TableCalibration,
 };
 use familyclaw_bus::{BeingId, BusHandle, ResonanceBus, ResonanceMessage};
 use familyclaw_channels::Channel;
@@ -191,7 +192,15 @@ pub async fn build_family(
     //    journalin päälle (FAMILYCLAW_DATA_DIR). Vain silloin on replay-historiaa
     //    josta on jatkettava elävänä (askel 6, `resume_live`). In-memory-polulla
     //    journal on aina tyhjä → ei replayta → ei resume-tarvetta.
-    let (memory, durable, dream_journal, persistent) = if let Some(data_dir) = data_dir {
+    //
+    //    `resumable` on jatkettavien vuorojen (suspend/resume-silta, roadmap §6)
+    //    KAATUMISKESTÄVÄ tallennuspinta. Se rakennetaan **vain** persistentillä
+    //    polulla: silloin hyväksyntää odottava, keskeytynyt tool-loop-vuoro
+    //    säilyy levyllä prosessin uudelleenkäynnistyksen yli (ks. askel 7).
+    //    In-memory-polulla agentti jää oletukseensa
+    //    ([`InMemoryResumableStore`]) — ei levyä, ei kaatumiskestävyyttä, kuten
+    //    muullakin in-memory-tilalla.
+    let (memory, durable, dream_journal, persistent, resumable) = if let Some(data_dir) = data_dir {
         let dir = std::path::PathBuf::from(&data_dir);
         std::fs::create_dir_all(&dir).ok();
         let journal = FileJournal::open(dir.join("journal.jsonl"))
@@ -202,13 +211,23 @@ pub async fn build_family(
             .map_err(|e| FamilyClawError::bus(e.to_string()))?;
         let dur = DurableContext::new(Arc::clone(&dream_j))
             .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-        (Arc::new(mem) as ErasedMemoryStore, dur, Some(dream_j), true)
+        // Kaatumiskestävä jatkettavien vuorojen pinta `<data_dir>/resumable.jsonl`.
+        let store = JournalResumableStore::open(dir.join("resumable.jsonl"))
+            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+        let resumable: Arc<dyn ResumableTurnStore> = Arc::new(store);
+        (
+            Arc::new(mem) as ErasedMemoryStore,
+            dur,
+            Some(dream_j),
+            true,
+            Some(resumable),
+        )
     } else {
         let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
         let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(InMemoryJournal::new());
         let durable = DurableContext::new(Arc::clone(&dream_j))
             .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-        (memory, durable, Some(dream_j), false)
+        (memory, durable, Some(dream_j), false, None)
     };
 
     // 5. Ankkuroi identiteetti ennen agentin rakennusta — JA persistoi se.
@@ -251,6 +270,16 @@ pub async fn build_family(
     // persistentillä polulla (FAMILYCLAW_DATA_DIR). In-memory-journal on tyhjä.
     if persistent {
         agent = agent.resume_live();
+    }
+    // Kaatumiskestävä jatkettavien vuorojen pinta (suspend/resume-silta): kun se
+    // rakennettiin (persistentti polku), kytke se agenttiin oletuksen
+    // ([`InMemoryResumableStore`]) tilalle. Näin hyväksyntää odottava,
+    // keskeytynyt tool-loop-vuoro säilyy levyllä prosessin kaatumisen yli ja
+    // [`Agent::resume_approved`] voi viedä sen loppuun restartin jälkeen. Ilman
+    // tätä tuotannon daemon menettäisi jokaisen odottavan resumable-vuoron
+    // restartissa (oletus on muistinvarainen).
+    if let Some(resumable) = resumable {
+        agent = agent.with_resumable_store(resumable);
     }
     agent = agent.with_reply_sink(sink).with_reply_target(reply_target);
     // Tunnemoottorin kalibrointi (KERROS B): jos profiilin calibration.json

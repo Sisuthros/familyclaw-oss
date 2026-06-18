@@ -123,7 +123,12 @@ pub enum LlmRole {
 }
 
 /// A message for the LLM chat completions API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` (not `Eq`) because [`ToolCall::arguments`] is a
+/// `serde_json::Value`, which is only `PartialEq` (it may contain floats).
+/// This lets the resumable-turn state ([`crate::resumable::ResumableTurn`]) and
+/// the tool-loop control type compare message stacks in tests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmMessage {
     /// Role of the message sender
     pub role: LlmRole,
@@ -197,7 +202,10 @@ impl LlmMessage {
 }
 
 /// A tool call request from the LLM.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` (not `Eq`) because [`arguments`](Self::arguments) is a
+/// `serde_json::Value` (only `PartialEq` — may contain floats).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Unique ID for this tool call
     pub id: String,

@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use familyclaw_core::time::Timestamp;
@@ -101,7 +102,16 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 ///
 /// Hyväksyntä on TTL-rajattu, kertakäyttöinen ([`Approval::consumed`]) ja sidottu
 /// toiminnon payloadin SHA-256-tiivisteeseen ([`Approval::payload_hash`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// ## Salaisuusinvariantti (durable-persistointi)
+/// Tämä tyyppi toteuttaa [`Serialize`]/[`Deserialize`]:n, jotta odottava
+/// hyväksyntä voidaan kirjata kaatumiskestävään journaliin
+/// ([`crate::pending_store`]). **Yksikään kenttä ei ole raaka salaisuus eikä
+/// KERROS B -dataa:** [`Approval::payload_hash`] on payloadin SHA-256-tiiviste
+/// (ei itse payload), ja loput kentät ovat tunnisteita, aikaleimoja ja
+/// boolean-lippu. Näin hyväksynnän voi tallentaa levylle rikkomatta
+/// "ei salaisuuksia levylle" -periaatetta.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Approval {
     /// Hyväksynnän yksilöivä tunniste.
     pub id: ApprovalId,
@@ -286,6 +296,24 @@ impl ApprovalLedger {
             ActionAuditEvent::new(AuditAction::ApprovalDenied, action_id, None, now, reason);
         self.audit.append(event.clone());
         event
+    }
+
+    /// **Palauttaa olemassa olevan hyväksynnän rekisteriin** (kaatumiskestävyys).
+    ///
+    /// Uudelleenkäynnistyksessä in-memory-ledger on tyhjä, mutta odottava
+    /// hyväksyntä on säilynyt kaatumiskestävällä tallennuspinnalla
+    /// ([`crate::pending_store::JournalPendingStore`]) täydellisenä
+    /// [`Approval`]-arvona (payload-tiivisteineen ja `consumed`-lippuineen).
+    /// Tämä metodi rekisteröi sen takaisin, jotta [`ApprovalLedger::consume`]
+    /// löytää sen ja voi kuluttaa sen samalla payload-sidonnalla kuin ennen
+    /// kaatumista — ei uutta myöntöä (tunniste, TTL ja sidonta säilyvät
+    /// muuttumattomina).
+    ///
+    /// Idempotentti: saman tunnisteen uudelleenasetus korvaa aiemman kopion.
+    /// Ei kirjaa audit-tapahtumaa (kyseessä ei ole uusi myöntö vaan saman
+    /// myönnön palautus muistiin).
+    pub fn reinstate(&mut self, approval: Approval) {
+        self.approvals.insert(approval.id, approval);
     }
 
     /// Hakee hyväksynnän tunnisteella (vain luku); `None` jos ei löydy.

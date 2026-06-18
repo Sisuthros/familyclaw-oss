@@ -170,6 +170,34 @@ impl Pipeline {
         Self::default()
     }
 
+    /// Rakentaa putken **palautetulla tehtäväjonolla** (kaatumiskestävyys).
+    ///
+    /// Käytetään uudelleenkäynnistyksessä: jono rekonstruoidaan levyltä
+    /// ([`crate::task::DurableTaskQueue::reload`] → [`TaskQueue::from_map`]) niin
+    /// että hyväksyntää odottavat tehtävät ovat yhä ajettavissa. Rekisteri,
+    /// ledger ja audit alkavat tyhjinä; taidot rekisteröidään uudelleen
+    /// ([`Pipeline::register_skill`]) ja odottavat hyväksynnät palautetaan
+    /// ledgeriin ([`Pipeline::reinstate_approval`]).
+    #[must_use]
+    pub fn with_restored_queue(queue: TaskQueue) -> Self {
+        Self {
+            registry: SkillRegistry::default(),
+            queue,
+            ledger: ApprovalLedger::new(),
+            audit: AuditCollector::default(),
+        }
+    }
+
+    /// Palauttaa olemassa olevan hyväksynnän ledgeriin (kaatumiskestävyys).
+    ///
+    /// Ohut välitys [`ApprovalLedger::reinstate`]:lle: uudelleenkäynnistyksessä
+    /// kaatumiskestävältä pinnalta luettu [`Approval`] rekisteröidään takaisin,
+    /// jotta [`Pipeline::run_after_approval`] voi kuluttaa sen samalla
+    /// payload-sidonnalla kuin ennen kaatumista.
+    pub fn reinstate_approval(&mut self, approval: Approval) {
+        self.ledger.reinstate(approval);
+    }
+
     /// Rekisteröi taidon manifestin putken rekisteriin.
     ///
     /// # Errors

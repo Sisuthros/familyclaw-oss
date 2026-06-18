@@ -49,6 +49,7 @@
 //! - [`executor`] — hyväksytyn toiminnon suoritus.
 //! - [`proof`] — redaktoitu todistepaketti.
 //! - [`mcp`] — taitojen julkaisu MCP-työkaluina.
+//! - [`pending_store`] — odottavien hyväksyntöjen kaatumiskestävä tallennuspinta.
 //! - [`skills`] — realistiset mock-taidot + koko putken ([`skills::Pipeline`]).
 //! - [`facade`] — operaattoripinta ([`ActionRuntime`]) koko putken päälle.
 //! - [`evals`] — end-to-end-arvioinnit.
@@ -69,6 +70,7 @@ pub mod facade;
 pub mod ids;
 pub mod manifest;
 pub mod mcp;
+pub mod pending_store;
 pub mod policy;
 pub mod proof;
 pub mod registry;
@@ -86,8 +88,13 @@ pub use mcp::{
     call_with_policy, McpToolCall, McpToolDescriptor, McpToolProvider, McpToolResult,
     MockMcpProvider,
 };
+pub use pending_store::{
+    DangerousToolRateLimiter, InMemoryPendingStore, JournalPendingStore, PendingApprovalStore,
+    PendingCapacity, PendingRecord,
+};
 pub use proof::{
-    build_proof, redact_value, sha256_hex, ProofBundle, RedactionReport, VerificationResult,
+    build_proof, redact_free_text, redact_value, redact_value_deep, sha256_hex, ProofBundle,
+    RedactionReport, VerificationResult,
 };
 #[allow(deprecated)]
 pub use skills::MockSkill;
@@ -118,6 +125,7 @@ pub const fn all_modules_scaffolded() -> bool {
         && executor::SCAFFOLDED
         && proof::SCAFFOLDED
         && mcp::SCAFFOLDED
+        && pending_store::SCAFFOLDED
         && skills::SCAFFOLDED
         && facade::SCAFFOLDED
         && evals::SCAFFOLDED

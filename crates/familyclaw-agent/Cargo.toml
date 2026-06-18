@@ -28,6 +28,9 @@ familyclaw-channels = { workspace = true }
 familyclaw-sandbox = { workspace = true }
 ractor = { workspace = true }
 async-trait = { workspace = true }
+# Resumable-turn TTL: now + Duration jatkettavan vuoron vanhentumiseen
+# (suspend/resume-silta). chrono on jo transitiivinen riippuvuus (core).
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
