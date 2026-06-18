@@ -63,6 +63,7 @@
 
 pub mod approval;
 pub mod audit;
+pub mod dispatch_outbox;
 pub mod error;
 pub mod evals;
 pub mod executor;
@@ -79,6 +80,10 @@ pub mod task;
 
 pub use audit::{
     ActionAuditEvent, AuditAction, AuditCollector, AuditKind, AuditLog, ExecAuditEvent,
+};
+pub use dispatch_outbox::{
+    DispatchLookup, DispatchOutboxStore, DispatchedOutcome, InMemoryDispatchOutbox,
+    JournalDispatchOutbox,
 };
 pub use error::{ActionError, Result};
 pub use executor::{ActionExecutor, ActionRequest, ActionResult, ActionStatus, MockActionExecutor};
@@ -121,6 +126,7 @@ pub const fn all_modules_scaffolded() -> bool {
         && policy::SCAFFOLDED
         && approval::SCAFFOLDED
         && audit::SCAFFOLDED
+        && dispatch_outbox::SCAFFOLDED
         && task::SCAFFOLDED
         && executor::SCAFFOLDED
         && proof::SCAFFOLDED

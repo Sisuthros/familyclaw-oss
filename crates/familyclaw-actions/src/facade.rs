@@ -37,6 +37,9 @@ use serde_json::Value;
 
 use familyclaw_core::time::Timestamp;
 
+use crate::dispatch_outbox::{
+    DispatchLookup, DispatchOutboxStore, DispatchedOutcome, InMemoryDispatchOutbox,
+};
 use crate::error::{ActionError, Result};
 use crate::executor::ActionExecutor;
 use crate::ids::{ActionTaskId, ApprovalId, SkillId};
@@ -202,6 +205,20 @@ pub struct ActionRuntime {
     /// [`ActionRuntime::with_being_id`]:tä asettaaksesi tämän ajoympäristön
     /// oletusolennon.
     being_id: String,
+    /// **Lähetyksen idempotenssi-outbox** (exactly-once-rajan kivijalka).
+    ///
+    /// [`ActionRuntime::submit_task_idempotent`] kytkee jokaiseen lähetykseen
+    /// kutsujan johtaman vakaan avaimen ja kirjaa lähetyksen kaksivaiheisesti
+    /// (intent ennen sivuvaikutusta, committed sen jälkeen) tähän outboxiin. Kun
+    /// sama avain nähdään uudelleen (replay/restart), jo sitoutunut lähetys
+    /// palautuu **arvo-identtisenä ajamatta sivuvaikutusta uudelleen** — riippumatta
+    /// siitä mihin agenttikerroksen oma journal-append-ikkuna kaatumisessa osui.
+    ///
+    /// Oletus on [`InMemoryDispatchOutbox`] (ei selviä kaatumisesta, sama
+    /// käyttäytyminen kuin ennen outboxia); kaatumiskestävyyteen anna
+    /// [`crate::dispatch_outbox::JournalDispatchOutbox`]
+    /// ([`ActionRuntime::with_dispatch_outbox`]).
+    dispatch_outbox: Box<dyn DispatchOutboxStore>,
 }
 
 impl Default for ActionRuntime {
@@ -219,6 +236,7 @@ impl Default for ActionRuntime {
                 DEFAULT_DANGEROUS_TOOL_LIMIT,
             ),
             being_id: DEFAULT_BEING_ID.to_string(),
+            dispatch_outbox: Box::new(InMemoryDispatchOutbox::new()),
         }
     }
 }
@@ -233,6 +251,7 @@ impl std::fmt::Debug for ActionRuntime {
             .field("durable_queue", &self.durable_queue)
             .field("rate_limiter", &self.rate_limiter)
             .field("being_id", &self.being_id)
+            .field("dispatch_outbox", &self.dispatch_outbox)
             .finish()
     }
 }
@@ -359,7 +378,31 @@ impl ActionRuntime {
                 DEFAULT_DANGEROUS_TOOL_LIMIT,
             ),
             being_id: DEFAULT_BEING_ID.to_string(),
+            dispatch_outbox: Box::new(InMemoryDispatchOutbox::new()),
         })
+    }
+
+    /// Vaihtaa ajoympäristön **lähetyksen idempotenssi-outboxin** annettuun
+    /// toteutukseen ja palauttaa itsensä (builder-tyyli).
+    ///
+    /// Tämä on exactly-once-takuun kytkentäkohta. Oletus
+    /// ([`ActionRuntime::new`]) on muistinvarainen
+    /// ([`InMemoryDispatchOutbox`]) eikä selviä kaatumisesta; anna
+    /// [`crate::dispatch_outbox::JournalDispatchOutbox`] saadaksesi takuun:
+    /// `submit_task`:n sivuvaikutus suoritetaan korkeintaan kerran SIGKILL-
+    /// kaatumisen yli, ja jo sitoutunut lähetys palautuu arvo-identtisenä.
+    ///
+    /// ```
+    /// # use familyclaw_actions::ActionRuntime;
+    /// # use familyclaw_actions::dispatch_outbox::InMemoryDispatchOutbox;
+    /// let runtime = ActionRuntime::new()
+    ///     .with_dispatch_outbox(Box::new(InMemoryDispatchOutbox::new()));
+    /// let _ = runtime;
+    /// ```
+    #[must_use]
+    pub fn with_dispatch_outbox(mut self, outbox: Box<dyn DispatchOutboxStore>) -> Self {
+        self.dispatch_outbox = outbox;
+        self
     }
 
     /// Snapshottaa tehtävän nykytilan kaatumiskestävään jonoon, jos sellainen on
@@ -642,6 +685,96 @@ impl ActionRuntime {
             status: outcome.status,
             pending_approval,
         })
+    }
+
+    /// Lähettää tehtävän **idempotentisti** kutsujan johtaman vakaan avaimen
+    /// (`key`) suojassa — exactly-once-takuun kivijalka.
+    ///
+    /// Tämä on [`ActionRuntime::submit_task_as`]:n kaatumiskestävä kääre. Se
+    /// sulkee ikkunan sivuvaikutuksen suorituksen ja sen journaloinnin välissä:
+    /// kun sama avain nähdään uudelleen (agenttikerroksen replay tai prosessin
+    /// restart), lähetys **ei suorita sivuvaikutusta uudelleen** vaan palauttaa
+    /// aiemman lopputuloksen arvo-identtisenä (sama `task_id` / `ApprovalId`).
+    ///
+    /// ## Kaksivaiheinen sitoutuminen outboxiin
+    /// 1. **lookup(key)** — jos avain on jo:
+    ///    - **committed** → palauta tallennettu lopputulos heti, ÄLÄ aja
+    ///      sivuvaikutusta.
+    ///    - **in-progress** (intent kirjattu, committed ei) → prosessi kaatui
+    ///      kesken aiemman sivuvaikutuksen. Palautusperiaate on **eksplisiittinen
+    ///      ja fail-closed** ([`ActionError::PolicyDenied`]): kutsua EI ajeta
+    ///      uudelleen, koska sivuvaikutus on voinut tapahtua osittain.
+    ///    - **not-started** → jatka.
+    /// 2. **`record_intent`** — kirjaa aie outboxiin (fsync) ENNEN sivuvaikutusta.
+    /// 3. aja sivuvaikutus ([`ActionRuntime::submit_task_as`]).
+    /// 4. **`record_committed`** — kirjaa lopputulos outboxiin sen
+    ///    jälkeen (fsync). Vasta tämä tekee lähetyksestä replay-palautuvan.
+    ///
+    /// `submit_task`:n virhe tallennetaan committed-rivinä virheenä, jotta sekin
+    /// palautuu samana eikä aja sivuvaikutusta uudelleen.
+    ///
+    /// ## Takuun raja (rehellisesti)
+    /// Taattu prosessin kaatumisen / SIGKILL:n yli kun outbox on kaatumiskestävä
+    /// ([`crate::dispatch_outbox::JournalDispatchOutbox`]). Muistinvaraisella
+    /// oletus-outboxilla takuu kattaa vain saman prosessin sisäisen replayn (ei
+    /// restartia). Power-loss / hakemiston metadata-fsync -takuu on yhtä vahva
+    /// kuin alla oleva tiedostojärjestelmä — sitä ei yliluvata.
+    ///
+    /// # Errors
+    /// - [`ActionError::PolicyDenied`] jos avain on jäänyt kesken (in-progress)
+    ///   aiemmassa kaatumisessa.
+    /// - [`ActionError::ExecutionFailed`] jos tallennettu (committed) lähetys oli
+    ///   virhe (replay-palautus).
+    /// - [`ActionError::Proof`] jos outboxin luku/kirjoitus epäonnistuu.
+    /// - [`ActionRuntime::submit_task_as`]:n virheet tuoreessa ajossa.
+    pub async fn submit_task_idempotent(
+        &mut self,
+        key: &str,
+        being: &str,
+        skill_id: SkillId,
+        payload: Value,
+        now: Timestamp,
+    ) -> Result<SubmitOutcome> {
+        // 1) Idempotenssi-tarkistus: onko avain jo aloitettu/sitoutunut?
+        match self.dispatch_outbox.lookup(key)? {
+            DispatchLookup::Committed(outcome) => {
+                // Jo sitoutunut → palauta arvo-identtinen lopputulos ajamatta
+                // sivuvaikutusta uudelleen. TÄMÄ on double-firen sulkeva haara.
+                return outcome.into_result();
+            }
+            DispatchLookup::InProgress => {
+                // Aie kirjattu mutta ei sitoutumista → kaatui kesken sivuvaikutuksen.
+                // Fail-closed: älä aja uudelleen (sivuvaikutus voi olla osittainen).
+                return Err(ActionError::PolicyDenied(format!(
+                    "lähetys '{key}' jäi kesken aiemmassa kaatumisessa (intent ilman \
+                     committed) — ei ajeta uudelleen kaksoislaukaisun estämiseksi"
+                )));
+            }
+            DispatchLookup::NotStarted => {}
+        }
+
+        // 2) Kirjaa AIE ENNEN sivuvaikutusta (fsync kaatumiskestävällä outboxilla).
+        self.dispatch_outbox.record_intent(key)?;
+
+        // 3) Suorita sivuvaikutus tasan kerran.
+        let result = self.submit_task_as(being, skill_id, payload, now).await;
+
+        // 4) Kirjaa SITOUTUMINEN sivuvaikutuksen jälkeen — onnistui tai virhe.
+        //    Virhetapaus tallennetaan committed-virheenä, jotta replay palauttaa
+        //    saman virheen ajamatta sivuvaikutusta uudelleen (ei kaksoislaukaisua
+        //    osittain edenneestä lähetyksestä).
+        match &result {
+            Ok(outcome) => {
+                self.dispatch_outbox
+                    .record_committed(key, &DispatchedOutcome::from_submit(outcome))?;
+            }
+            Err(e) => {
+                self.dispatch_outbox
+                    .record_committed(key, &DispatchedOutcome::from_error(e.to_string()))?;
+            }
+        }
+
+        result
     }
 
     /// Kuluttaa (merkitsee käytetyksi) odottavan hyväksynnän ja ajaa pysähtyneen

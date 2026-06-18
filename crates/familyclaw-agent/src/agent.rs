@@ -1146,6 +1146,13 @@ impl Agent {
     /// (yleensä 0 tuoreelle vuorolle); se jatkaa `-dispatch-{k}`-numerointia
     /// oikeasta kohdasta replayssa.
     ///
+    /// `being_id` on **tämän olennon** tunniste (yleensä [`Agent::being_id`]:n
+    /// merkkijonomuoto). Se välitetään
+    /// [`ActionRuntime::submit_task_as`]:lle, jotta vaarallisten (hyväksyntää
+    /// vaativien) työkalukutsujen **per-olento-rate-limit** kohdistuu oikeaan
+    /// olentoon eikä romahda runtimen geneeriseen oletukseen — näin yksi olento
+    /// ei voi kuluttaa toisen olennon kiintiötä saman jaetun runtimen kautta.
+    ///
     /// # Errors
     /// - [`FamilyClawError::Llm`] jos LLM-kutsu epäonnistuu palautumattomasti.
     /// - [`FamilyClawError::Bus`] jos durable-askel epäonnistuu (käärittynä).
@@ -1157,6 +1164,7 @@ impl Agent {
         turn: u64,
         dispatch_base: u32,
         agent_name: &str,
+        being_id: &str,
         turn_audit: Option<&Arc<AuditCollector>>,
         mut messages: Vec<LlmMessage>,
         mut last_text: String,
@@ -1271,9 +1279,30 @@ impl Agent {
                     // async-kontekstissa, ja kirjaa sen tulos askeleeseen. Emme aja
                     // sitä `step`-sulkimen sisällä (suljin on synkroninen) — ajamme
                     // sen ennen kääräisyä ja journaloimme valmiin tuloksen.
+                    //
+                    // 🔑 KEYSTONE (exactly-once SIGKILL-rajalla): lähetys ajetaan
+                    // **idempotentisti** ajoympäristön outboxin kautta, avaimena
+                    // sama deterministinen `dispatch_step`-nimi. Tämä sulkee ikkunan
+                    // sivuvaikutuksen (`submit_task`) suorituksen ja ALLA olevan
+                    // `durable.step`-journaloinnin VÄLISSÄ: jos prosessi tapetaan
+                    // siinä, sivuvaikutus on jo outboxissa committed, joten restart/
+                    // replay palauttaa saman lopputuloksen ajamatta sivuvaikutusta
+                    // uudelleen — riippumatta siitä ehtikö journal-rivi syntyä.
+                    // (`submit_task_as` yksin ei suojaa tätä ikkunaa.)
                     let outcome = {
                         let mut rt = actions.lock().await;
-                        rt.submit_task(skill_id, call.arguments.clone(), now).await
+                        // Lähetä tehtävä TÄMÄN olennon (`being_id`) nimissä, jotta
+                        // hyväksyntää vaativien työkalujen per-olento-rate-limit
+                        // kohdistuu oikein eikä romahda runtimen geneeriseen
+                        // oletusolentoon.
+                        rt.submit_task_idempotent(
+                            &dispatch_step,
+                            being_id,
+                            skill_id,
+                            call.arguments.clone(),
+                            now,
+                        )
+                        .await
                     };
                     let record = DispatchRecord::from_outcome(&outcome);
                     durable
@@ -1401,12 +1430,17 @@ impl Agent {
         origin: Option<&familyclaw_bus::MessageOrigin>,
         turn: u64,
     ) -> Result<(Option<String>, Option<(ApprovalId, String)>)> {
-        if self.llm.is_none() || self.actions.is_none() {
+        // Fail-closed: jos LLM:ää tai toimintoajoympäristöä ei ole asennettu,
+        // tämä polku on no-op (yhden kerran -polku hoitaa vastauksen). EI
+        // `expect`/paniikkia tuotantopolulla — palautetaan vaaraton "ei vastausta"
+        // (sama semantiikka kuin entinen `is_none`-vartija, mutta ilman erillistä
+        // `expect`-purkua jälkikäteen).
+        let Some(actions) = self.actions.as_ref() else {
             return Ok((None, None));
-        }
+        };
         // Klooni jaetut kahvat ennen `&mut self.durable`-lainaa, jotta
         // disjoint-borrow toimii (Arc-kahvat + omistetut arvot, ei `&self`).
-        let actions = Arc::clone(self.actions.as_ref().expect("actions present"));
+        let actions = Arc::clone(actions);
         let max_iterations = self.tool_loop.max_iterations;
         let agent_name = self.config.name.clone();
         let being_id = self.being_id;
@@ -1431,13 +1465,22 @@ impl Agent {
         // LLM-kahva on `LlmFailover` (ei `Clone`); luetaan se `self`:stä
         // erikseen samaan aikaan kuin `&mut self.durable` — disjoint field
         // borrow toimii koska `llm` ja `durable` ovat eri kenttiä.
+        //
+        // Fail-closed: jos LLM-kahvaa ei (enää) ole, palaa vaarattomasti ilman
+        // vastausta — EI `expect`/paniikkia tuotantopolulla. (Ylempi `actions`-
+        // vartija ei takaa LLM:n läsnäoloa, joten tämä tarkistetaan erikseen
+        // juuri ennen kahvan lainaa.)
+        let Some(llm) = self.llm.as_ref() else {
+            return Ok((None, None));
+        };
         let outcome = Self::drive_tool_loop_durable(
-            self.llm.as_ref().expect("llm present"),
+            llm,
             &actions,
             &mut self.durable,
             turn,
             0,
             &agent_name,
+            &being_id.to_string(),
             turn_audit.as_ref(),
             messages,
             String::new(),
@@ -1718,7 +1761,16 @@ impl Agent {
                     let mut rt = actions.lock().await;
                     // D1: injektoitu `now` (ei `time::now()` silmukan sisällä) —
                     // sama aikaleima joka voidaan journaloida deterministisesti.
-                    rt.submit_task(skill_id, call.arguments.clone(), now).await
+                    // Lähetä TÄMÄN olennon (`being_id`) nimissä, jotta hyväksyntää
+                    // vaativien työkalujen per-olento-rate-limit kohdistuu oikein
+                    // eikä romahda runtimen geneeriseen oletusolentoon.
+                    rt.submit_task_as(
+                        &self.being_id.to_string(),
+                        skill_id,
+                        call.arguments.clone(),
+                        now,
+                    )
+                    .await
                 };
 
                 match outcome {
@@ -4505,7 +4557,7 @@ mod tests {
     use crate::resumable::{
         InMemoryResumableStore, JournalResumableStore, ResumableTurnStore,
     };
-    use familyclaw_actions::{JournalPendingStore, PendingApprovalStore};
+    use familyclaw_actions::{DangerousToolRateLimiter, JournalPendingStore, PendingApprovalStore};
 
     /// RAII-temp-hakemisto durable-pintojen kirjoituksia varten (ei ulkoisia
     /// crateja). Antaa kaksi tiedostopolkua: pending- ja resumable-journalit.
@@ -5114,6 +5166,196 @@ mod tests {
         assert!(
             store.get(approval_id).expect("get").is_none(),
             "jatkettava vuoro kulutettu oikean omistajan resumen jälkeen"
+        );
+
+        bus.stop();
+    }
+
+    /// (d3) **Vaarallisten työkalujen per-olento-rate-limit kytkeytyy agentin
+    /// tool-loopiin OIKEALLA olentotunnisteella — ei runtimen geneerisellä
+    /// oletuksella.**
+    ///
+    /// Regressiovahti GPT-5.5:n löydökselle: agentti lähetti tehtävät
+    /// [`ActionRuntime::submit_task`]:lla, joka käyttää runtimen oletusolentoa,
+    /// jolloin kaikki olennot saman jaetun runtimen takana romahtivat samaan
+    /// kiintiöön (väärä jako). Korjattu välittämällä agentin oma
+    /// [`Agent::being_id`] [`ActionRuntime::submit_task_as`]:lle, jolloin
+    /// kullakin olennolla on **oma** kiintiö.
+    ///
+    /// Asetelma: yksi JAETTU runtime, jonka rajoitin sallii **korkeintaan yhden**
+    /// hyväksyntää vaativan toiminnon per olento. Kaksi ERI olentoa (A ja B):
+    /// - A:n 1. hyväksyntää vaativa kutsu → `Suspended` (A:n kiintiön sisällä),
+    /// - B:n 1. hyväksyntää vaativa kutsu → `Suspended` (B:n OMAN kiintiön
+    ///   sisällä — todistaa että kiintiöt eivät jakaudu väärin; ennen korjausta
+    ///   tämä olisi hylätty, koska A oli jo täyttänyt JAETUN oletuskiintiön),
+    /// - A:n 2. hyväksyntää vaativa kutsu → rate-limit hylkää sen
+    ///   ([`ActionError::PolicyDenied`]), virhe syötetään malliin, ja malli
+    ///   vastaa tekstillä → `Reply` (todistaa että A:n OMA kiintiö todella
+    ///   ehtyy — limitti on aito, ei pelkkä eristys).
+    #[tokio::test]
+    async fn per_being_rate_limit_applies_through_agent_loop_with_real_being_id() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+
+        // Yksi JAETTU runtime: rajoitin = korkeintaan 1 hyväksyntää vaativa
+        // toiminto per olento (iso ikkuna, jottei aika häädä kirjauksia kesken).
+        let runtime: StdArc<TokioMutex<ActionRuntime>> = {
+            let mut rt = ActionRuntime::new()
+                .with_rate_limiter(DangerousToolRateLimiter::new(3_600, 1));
+            rt.register_skill(ApprovalSkill)
+                .expect("register approval_skill");
+            StdArc::new(TokioMutex::new(rt))
+        };
+
+        // --- Olento A: yksi hyväksyntää vaativa kutsu → odotetaan Suspendia ---
+        let api_a = spawn_scripted_llm(vec![body_tool_call(
+            "call_a1",
+            "approval_skill",
+            &serde_json::json!({ "q": "alpha-1" }),
+        )])
+        .await;
+        let agent_a = agent_with_scripted_llm("being_alpha", bus.clone(), &api_a)
+            .with_actions(StdArc::clone(&runtime));
+
+        // --- Olento B: ERI olento (oma being_id), jakaa SAMAN runtimen ---
+        let api_b = spawn_scripted_llm(vec![body_tool_call(
+            "call_b1",
+            "approval_skill",
+            &serde_json::json!({ "q": "beta-1" }),
+        )])
+        .await;
+        let agent_b = agent_with_scripted_llm("being_beta", bus.clone(), &api_b)
+            .with_actions(StdArc::clone(&runtime));
+
+        assert_ne!(
+            agent_a.being_id(),
+            agent_b.being_id(),
+            "kahden olennon tunnisteiden on oltava erilliset"
+        );
+
+        // A:n 1. kutsu → Suspended (A:n kiintiön sisällä).
+        let out_a = agent_a
+            .think(&BusMessage::text("aja hyväksyntä-työkalu (A)"))
+            .await
+            .expect("A:n suspend ei saa palauttaa virhettä");
+        assert!(
+            matches!(out_a, ThinkOutcome::Suspended { .. }),
+            "A:n ensimmäinen hyväksyntää vaativa kutsu jää odottamaan lupaa, sai: {out_a:?}"
+        );
+
+        // B:n 1. kutsu → Suspended (B:n OMAN kiintiön sisällä). Tämä on ydin:
+        // jos kiintiö jakautuisi väärin (kuten ennen korjausta), B hylättäisiin.
+        let out_b = agent_b
+            .think(&BusMessage::text("aja hyväksyntä-työkalu (B)"))
+            .await
+            .expect("B:n suspend ei saa palauttaa virhettä");
+        assert!(
+            matches!(out_b, ThinkOutcome::Suspended { .. }),
+            "B:llä on OMA kiintiö → sen ensimmäinen kutsu suspendoituu A:sta riippumatta, sai: {out_b:?}"
+        );
+
+        // A:n 2. kutsu → A:n OMA kiintiö (1) on nyt täynnä → rate-limit hylkää.
+        // Virhe syötetään malliin, joka vastaa tekstillä → Reply (limitti aito).
+        let api_a2 = spawn_scripted_llm(vec![
+            body_tool_call(
+                "call_a2",
+                "approval_skill",
+                &serde_json::json!({ "q": "alpha-2" }),
+            ),
+            body_text("selvä, en aja sitä työkalua"),
+        ])
+        .await;
+        let agent_a2 = agent_with_scripted_llm_id(
+            agent_a.being_id().agent_id(),
+            "being_alpha",
+            bus.clone(),
+            &api_a2,
+        )
+        .with_actions(StdArc::clone(&runtime));
+        // Sama olentotunniste kuin agent_a → jakaa A:n kiintiön.
+        assert_eq!(
+            agent_a2.being_id(),
+            agent_a.being_id(),
+            "agent_a2 on SAMA olento kuin agent_a (jakaa kiintiön)"
+        );
+
+        let out_a2 = agent_a2
+            .think(&BusMessage::text("aja hyväksyntä-työkalu uudelleen (A)"))
+            .await
+            .expect("A:n toinen kutsu palautuu (virhe syötetään malliin)");
+        assert_eq!(
+            out_a2,
+            ThinkOutcome::Reply("selvä, en aja sitä työkalua".to_string()),
+            "A:n kiintiö on ehtynyt → rate-limit hylkää, malli vastaa tekstillä, sai: {out_a2:?}"
+        );
+
+        bus.stop();
+    }
+
+    /// (d4) **Sama per-olento-rate-limit pätee myös DURABLE-tool-loopin läpi**
+    /// ([`Agent::handle_turn`] → [`Agent::think_actions_durable`] →
+    /// [`Agent::drive_tool_loop_durable`]).
+    ///
+    /// Tämä kattaa korjauksen toisen kytkentäkohdan (durable-haaran lähetys):
+    /// myös siellä `being_id` välitetään [`ActionRuntime::submit_task_as`]:lle.
+    /// Asetelma kuten edellä: jaettu runtime, raja = 1 per olento, kaksi ERI
+    /// olentoa. A:n vuoro suspendoituu, ja B:n vuoro suspendoituu B:n OMASTA
+    /// kiintiöstä (todistaa kiintiöiden erillisyyden durable-polulla).
+    #[tokio::test]
+    async fn per_being_rate_limit_applies_through_durable_loop() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+
+        let runtime: StdArc<TokioMutex<ActionRuntime>> = {
+            let mut rt = ActionRuntime::new()
+                .with_rate_limiter(DangerousToolRateLimiter::new(3_600, 1));
+            rt.register_skill(ApprovalSkill)
+                .expect("register approval_skill");
+            StdArc::new(TokioMutex::new(rt))
+        };
+
+        // Olento A: hyväksyntää vaativa kutsu → durable-vuoro suspendoituu.
+        let api_a = spawn_scripted_llm(vec![body_tool_call(
+            "call_a1",
+            "approval_skill",
+            &serde_json::json!({ "q": "alpha-1" }),
+        )])
+        .await;
+        let mut agent_a = agent_with_scripted_llm("being_alpha", bus.clone(), &api_a)
+            .with_actions(StdArc::clone(&runtime));
+
+        // Olento B: ERI olento, jakaa SAMAN runtimen.
+        let api_b = spawn_scripted_llm(vec![body_tool_call(
+            "call_b1",
+            "approval_skill",
+            &serde_json::json!({ "q": "beta-1" }),
+        )])
+        .await;
+        let mut agent_b = agent_with_scripted_llm("being_beta", bus.clone(), &api_b)
+            .with_actions(StdArc::clone(&runtime));
+
+        assert_ne!(agent_a.being_id(), agent_b.being_id());
+
+        // A:n durable-vuoro suspendoituu (oma kiintiö).
+        let out_a = agent_a
+            .handle_turn(BeingId::new(), &BusMessage::text("aja työkalu (A)"))
+            .await
+            .expect("A:n durable-vuoro ei saa kaatua");
+        assert!(
+            out_a.summary.contains("suspended(approval="),
+            "A:n durable-vuoron pitäisi suspendoitua, sai: {}",
+            out_a.summary
+        );
+
+        // B:n durable-vuoro suspendoituu B:n OMASTA kiintiöstä — ennen korjausta
+        // (jaettu oletusolento) tämä OLISI hylätty, koska A täytti jaetun
+        // kiintiön. Korjauksen jälkeen B:llä on oma kiintiö.
+        let out_b = agent_b
+            .handle_turn(BeingId::new(), &BusMessage::text("aja työkalu (B)"))
+            .await
+            .expect("B:n durable-vuoro ei saa kaatua");
+        assert!(
+            out_b.summary.contains("suspended(approval="),
+            "B:llä on OMA kiintiö → durable-vuoro suspendoituu A:sta riippumatta, sai: {}",
+            out_b.summary
         );
 
         bus.stop();
