@@ -1612,6 +1612,7 @@ version = "0.1.0"
 dependencies = [
  "axum 0.7.9",
  "clap",
+ "familyclaw-actions",
  "familyclaw-agent",
  "familyclaw-bridge",
  "familyclaw-bus",
@@ -1701,6 +1702,7 @@ name = "familyclaw-runtime"
 version = "0.1.0"
 dependencies = [
  "axum 0.7.9",
+ "familyclaw-actions",
  "familyclaw-agent",
  "familyclaw-bus",
  "familyclaw-channels",

@@ -655,6 +655,25 @@ impl ActionRuntime {
             .map(|record| record.expires_at())
     }
 
+    /// Palauttaa odottavan hyväksynnän **luontihetken**
+    /// ([`crate::pending_store::PendingRecord::created_at`]) tunnisteella; `None`
+    /// jos hyväksyntää ei (enää) odoteta tai tallennuspinnan luku epäonnistuu.
+    ///
+    /// Tämä on salaisuudeton auditointiaikaleima (ei payloadia, ei tiivistettä,
+    /// ei salaisuuksia), jonka operaattoripinta (esim. gatewayn
+    /// `GET /approvals/pending`) näyttää kertoakseen **milloin** hyväksyntää on
+    /// odotettu. Se vastaa tarkalleen [`PendingApproval`]:n rinnalla näytettävää
+    /// metatietoa eikä paljasta mitään siitä **mitä** hyväksyntä koskee yli sen
+    /// mitä [`ActionRuntime::pending_summary_for`] jo redaktoidusti kertoo.
+    #[must_use]
+    pub fn pending_created_at_for(&self, approval_id: ApprovalId) -> Option<Timestamp> {
+        self.pending
+            .get(approval_id)
+            .ok()
+            .flatten()
+            .map(|record| record.created_at)
+    }
+
     /// Muodostaa odottavalle hyväksynnälle **redaktoidun** tiivistelmän
     /// tallennettavaksi: vain taidon nimi (tai tunniste) — ei koskaan raakaa
     /// payloadia eikä salaisuuksia.
@@ -918,6 +937,27 @@ mod tests {
             runtime.status(submitted.task_id).await,
             Some(TaskStatus::Done)
         );
+    }
+
+    #[tokio::test]
+    async fn pending_created_at_for_returns_record_creation_time() {
+        // Odottava hyväksyntä → luontihetki on haettavissa tunnisteella ja
+        // vastaa `submit_task`:lle annettua `now`-aikaleimaa (deterministinen).
+        let mut runtime = ActionRuntime::with_default_skills().expect("default skills");
+        let now = at(1_700_000_000);
+        let submitted = runtime
+            .submit_task(
+                GithubIssueDraftMock::skill_id(),
+                json!({ "bug_report": "Button does nothing" }),
+                now,
+            )
+            .await
+            .expect("submit");
+        let approval_id = submitted.pending_approval.expect("approval granted");
+
+        assert_eq!(runtime.pending_created_at_for(approval_id), Some(now));
+        // Tuntematon tunniste → None (fail-closed, ei paniikkia).
+        assert!(runtime.pending_created_at_for(ApprovalId::new()).is_none());
     }
 
     #[tokio::test]

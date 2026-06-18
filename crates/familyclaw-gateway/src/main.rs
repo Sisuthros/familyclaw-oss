@@ -40,21 +40,46 @@
 //! curl -i http://127.0.0.1:8787/healthz   # 200 OK
 //! curl -i http://127.0.0.1:8787/readyz    # 200 OK (bus käynnissä)
 //! ```
+//!
+//! ## Operaattorin hyväksyntäpinta (suspend/resume-silta, roadmap §6 D2)
+//! Kun agentin tool-loop keskeytyy odottamaan ihmisen hyväksyntää
+//! ([`ThinkOutcome::Suspended`](familyclaw_agent::ThinkOutcome::Suspended)),
+//! käyttäjälle EI lähde vastausta — keskeytys on **operaattorin** asia. Gateway
+//! tarjoaa kaksi bearer-suojattua reittiä (sama [`GATEWAY_TOKEN_ENV`]-token
+//! kuin `/inject`):
+//! - `GET /approvals/pending` — listaa odottavat hyväksynnät **redaktoituina**
+//!   (`approval_id`, `redacted_summary`, `created_at`) — ei koskaan raakaa
+//!   payloadia eikä salaisuuksia.
+//! - `POST /approvals/{approval_id}/approve` — myöntää hyväksynnän ja ajaa
+//!   keskeytyneen toiminnon loppuun (payload-sidottu, kertakäyttöinen).
+//!
+//! ```bash
+//! TOKEN=...   # FAMILYCLAW_GATEWAY_TOKEN
+//! curl -s -H "Authorization: Bearer $TOKEN" \
+//!   http://127.0.0.1:8787/approvals/pending
+//! # → [{"approval_id":"…","redacted_summary":"taito '…' odottaa …","created_at":"…"}]
+//! curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+//!   http://127.0.0.1:8787/approvals/<approval_id>/approve
+//! # → {"approval_id":"…","task_id":"…","status":"done","awaiting_further_approval":false}
+//! ```
 
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Json, State};
+use axum::extract::{Json, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
 use axum::Router;
 use clap::{Parser, Subcommand};
+use familyclaw_actions::{ActionRuntime, ApprovalId, AuditCollector};
 use familyclaw_agent::{resolve_profile_dir, EnvEndpointResolver, LiveTurnExecutor, Soul};
 use familyclaw_bridge::{
     AgentInfo, AgentRole, FamilyBridge, HostKind, OrchestrationPlan, Orchestrator, TaskNode,
 };
 use familyclaw_bus::BusHandle;
+use tokio::sync::Mutex;
 mod config;
 use config::FamilyConfig;
 use familyclaw_channels::{
@@ -165,6 +190,51 @@ struct GatewayState {
     inject_token: Option<Arc<str>>,
     /// Discord Interactions Ed25519 public key (hex). `Some` → `/discord/interactions` aktiivinen.
     discord_public_key: Option<Arc<str>>,
+    /// **Jaettu toimintoajoympäristö** operaattorin hyväksyntäpinnalle
+    /// (`GET /approvals/pending`, `POST /approvals/{id}/approve`).
+    ///
+    /// Sama [`Arc<Mutex<ActionRuntime>>`] jonka [`FamilyRuntime`] kytki agentin
+    /// tool-looppiin ([`FamilyRuntime::actions`]) — operaattori ja agentti
+    /// jakavat SAMAN lukitun tilan, joten gateway näkee tarkalleen ne odottavat
+    /// hyväksynnät jotka agentin keskeytynyt vuoro jätti, ja `approve` ajaa
+    /// keskeytyneen toiminnon loppuun samassa tilassa.
+    ///
+    /// `Some` palvelevassa gatewayssa (aina, [`build_family`] luo
+    /// toimintoajoympäristön); `None` vain tiloissa joissa runtimea ei ole
+    /// kytketty (esim. testit, jotka eivät tarvitse hyväksyntäpintaa). Kun
+    /// `None`, hyväksyntäreitit vastaavat `503 Service Unavailable`.
+    actions: Option<Arc<Mutex<ActionRuntime>>>,
+    /// **Jaettu turn-audit-keräin** havainnoitavalle tool-loop-jäljelle
+    /// (`GET /turns/audit`, TURN-AUDIT roadmap §6 D6).
+    ///
+    /// Sama [`Arc<AuditCollector>`] jonka [`build_family`] kytki agentin
+    /// tool-looppiin ([`FamilyRuntime::turn_audit`]) — operaattori näkee
+    /// tarkalleen ne tapahtumat jotka agentin vuorot kirjasivat (vuoron alku,
+    /// työkalukutsut **redaktoituina**, suspend/resume, `stop_reason`).
+    ///
+    /// `Some` palvelevassa gatewayssa; `None` tiloissa joissa runtimea ei ole
+    /// kytketty (esim. testit). Kun `None`, audit-reitti vastaa
+    /// `503 Service Unavailable`.
+    turn_audit: Option<Arc<AuditCollector>>,
+}
+
+/// Yhden odottavan hyväksynnän **operaattorille turvallinen, redaktoitu**
+/// esitys `GET /approvals/pending`:n JSON-vastaukseen.
+///
+/// Tämä on tarkoituksella oma tyyppinsä eikä `familyclaw-actions`:n
+/// sisäinen rakenne: se kantaa **vain** kolme salaisuudetonta kenttää jotka
+/// operaattori tarvitsee päättääkseen hyväksynnästä — **ei koskaan raakaa
+/// payloadia, työkaluargumentteja eikä salaisuuksia**. `redacted_summary` tulee
+/// suoraan [`ActionRuntime::pending_summary_for`]:lta (johdettu vain taidon
+/// nimestä + tunnisteista), ja `created_at` on auditointiaikaleima.
+#[derive(serde::Serialize)]
+struct PendingApprovalView {
+    /// Hyväksynnän tunniste (`POST /approvals/{approval_id}/approve` jatkaa).
+    approval_id: String,
+    /// Redaktoitu ihmisluettava tiivistelmä (ei payloadia, ei salaisuuksia).
+    redacted_summary: String,
+    /// Hetki jolloin odottava kirjaus luotiin (RFC 3339 -aikaleima).
+    created_at: String,
 }
 
 /// Elinvoimatarkistus: vastaa aina `200 OK` kun prosessi pystyy palvelemaan
@@ -401,13 +471,265 @@ async fn handle_discord_interaction(
     )
 }
 
+/// `GET /approvals/pending` — listaa operaattorille **redaktoituina** ne vuorot
+/// jotka odottavat ihmisen hyväksyntää (suspend/resume-silta, roadmap §6 D2).
+///
+/// Vastaus on JSON-lista [`PendingApprovalView`]-objekteja, kukin sisältäen
+/// **vain** kolme salaisuudetonta kenttää: `approval_id`, `redacted_summary` ja
+/// `created_at`. **Raakaa payloadia, työkaluargumentteja tai salaisuuksia ei
+/// koskaan palauteta** — lähde on [`ActionRuntime::try_pending_approvals`] +
+/// [`ActionRuntime::pending_summary_for`]/[`ActionRuntime::pending_created_at_for`],
+/// jotka kaikki johtavat tiedon vain redaktoidusta `PendingRecord`:stä
+/// (actions-kerroksen salaisuudeton tallennusmuoto).
+///
+/// Suojaus on sama kuin `POST /inject`:llä: jos [`GATEWAY_TOKEN_ENV`] on
+/// konfiguroitu, pyyntö vaatii otsikon `Authorization: Bearer <token>`
+/// (vakioaikainen täsmäys), muuten `401`.
+///
+/// Tilakoodit:
+/// - `200 OK` + JSON-lista (myös tyhjä lista, jos mikään ei odota),
+/// - `401 Unauthorized` jos bearer-token vaaditaan eikä se täsmää,
+/// - `503 Service Unavailable` jos toimintoajoympäristöä ei ole kytketty
+///   ([`GatewayState::actions`] = `None`).
+async fn list_pending_approvals(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if check_inject_auth(&state, &headers).is_err() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        );
+    }
+    let Some(actions) = state.actions.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "action runtime not configured" })),
+        );
+    };
+
+    // Lukko vain listauksen ajaksi. `try_pending_approvals` palauttaa vain
+    // (approval_id, task_id); rikastamme sen redaktoidulla tiivistelmällä ja
+    // luontihetkellä SAMAN lukon alla, jottei tila ehdi muuttua välissä.
+    let rt = actions.lock().await;
+    let pending = match rt.try_pending_approvals() {
+        Ok(p) => p,
+        Err(e) => {
+            // Tallennuspinnan lukuvirhe (käytännössä vain kaatumiskestävällä
+            // pinnalla). Ei vuoda yksityiskohtia operaattorin ulkopuolelle.
+            warn!("approvals: pending-listan luku epäonnistui: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "failed to read pending approvals" })),
+            );
+        }
+    };
+    let views: Vec<PendingApprovalView> = pending
+        .iter()
+        .map(|p| {
+            // Redaktoitu tiivistelmä + luontihetki samalta tallennuspinnalta.
+            // `None` (kilpa: kulutettiin lukon ulkopuolella) → neutraali oletus,
+            // ei koskaan raakaa dataa.
+            let redacted_summary = rt
+                .pending_summary_for(p.approval_id)
+                .unwrap_or_else(|| "odottaa ihmisen hyväksyntää".to_string());
+            let created_at = rt
+                .pending_created_at_for(p.approval_id)
+                .map_or_else(String::new, |t| t.to_rfc3339());
+            PendingApprovalView {
+                approval_id: p.approval_id.to_string(),
+                redacted_summary,
+                created_at,
+            }
+        })
+        .collect();
+    drop(rt);
+
+    info!(count = views.len(), "approvals: listattiin odottavat hyväksynnät (redaktoituina)");
+    let body = serde_json::to_value(&views).unwrap_or_else(|_| serde_json::json!([]));
+    (StatusCode::OK, Json(body))
+}
+
+/// `POST /approvals/{approval_id}/approve` — myöntää hyväksynnän annetulle
+/// `approval_id`:lle ja **ajaa keskeytyneen toiminnon loppuun** (suspend/resume-
+/// silta, roadmap §6 D2).
+///
+/// Rungolla ei ole pakollista sisältöä (valinnainen). Hyväksyntä kulutetaan
+/// tehtävän tallennettua payloadia vasten (payload-sidonta + kertakäyttö
+/// [`ActionRuntime::approve`]:ssa), joten muutettu payload ei voi käyttää
+/// hyväksyntää — eikä runko siksi voi vuotaa salaisuuksia suoritukseen.
+///
+/// Suojaus on sama kuin `POST /inject`:llä (bearer-token jos konfiguroitu).
+///
+/// Tilakoodit (**fail-closed, ei paniikkia**):
+/// - `200 OK` + JSON-yhteenveto resumen lopputuloksesta (tehtävän tunniste +
+///   tila, esim. `done`/`needs_approval` jos jatko vaati uuden hyväksynnän),
+/// - `400 Bad Request` jos `approval_id` ei jäsenny kelvolliseksi tunnisteeksi,
+/// - `401 Unauthorized` jos bearer-token vaaditaan eikä täsmää,
+/// - `404 Not Found` jos tunnistetta ei (enää) odota hyväksyntä (tuntematon tai
+///   jo kulutettu),
+/// - `410 Gone` jos hyväksyntä on vanhentunut (TTL umpeutunut),
+/// - `503 Service Unavailable` jos toimintoajoympäristöä ei ole kytketty.
+async fn approve_pending(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(approval_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if check_inject_auth(&state, &headers).is_err() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        );
+    }
+    let Some(actions) = state.actions.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "action runtime not configured" })),
+        );
+    };
+
+    // Jäsennä tunniste (UUID). Kelvoton muoto = 400, ei 404 — eri syy.
+    let Ok(id) = ApprovalId::from_str(approval_id.trim()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid approval id" })),
+        );
+    };
+
+    // Determinismi (D1): aikaleima injektoidaan tähän yhteen pisteeseen ja ohjaa
+    // sekä vanhentumistarkistuksen että keskeytyneen toiminnon suorituksen.
+    let now = familyclaw_core::time::now();
+
+    // Esitarkistus SAMAN lukon alla kuin approve: erotellaan "tuntematon" (404)
+    // ja "vanhentunut" (410) ennen kuin yritämme kuluttaa hyväksynnän — muuten
+    // molemmat näkyisivät `ActionRuntime::approve`:n ApprovalMissing-virheenä,
+    // emmekä voisi erottaa 404:ää 410:stä fail-closed-tarkkuudella.
+    let mut rt = actions.lock().await;
+    match rt.pending_expiry_for(id) {
+        None => {
+            // Tunnistetta ei odota hyväksyntä (tuntematon tai jo kulutettu).
+            warn!(approval = %id, "approvals: approve hylätty 404 — tuntematon tai kulutettu");
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "no such pending approval" })),
+            );
+        }
+        Some(expires_at) if now > expires_at => {
+            // Vanhentunut → 410 Gone (fail-closed, ei kuluteta sivuvaikutusta).
+            warn!(approval = %id, "approvals: approve hylätty 410 — hyväksyntä vanhentunut");
+            return (
+                StatusCode::GONE,
+                Json(serde_json::json!({ "error": "approval expired" })),
+            );
+        }
+        Some(_) => {}
+    }
+
+    // Myönnä hyväksyntä ja aja keskeytynyt toiminto loppuun. Tämä on resumen
+    // toiminto-puoli: payload-sidottu, kertakäyttöinen suoritus.
+    match rt.approve(id, now).await {
+        Ok(outcome) => {
+            drop(rt);
+            // Operaattorille palautetaan VAIN tehtävän tunniste + tila — ei
+            // todistepakettia, ei payloadia. `status` kertoo onnistuiko resume
+            // loppuun asti vai vaatiko jatko uuden hyväksynnän.
+            let status = format!("{:?}", outcome.status).to_lowercase();
+            info!(
+                task = %outcome.task_id,
+                status = %status,
+                "approvals: hyväksyntä myönnetty, keskeytynyt toiminto ajettu"
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "approval_id": approval_id,
+                    "task_id": outcome.task_id.to_string(),
+                    "status": status,
+                    "awaiting_further_approval": outcome.awaiting_approval(),
+                })),
+            )
+        }
+        Err(e) => {
+            drop(rt);
+            // Esitarkistus ohitti tuntemattoman/vanhentuneen; jäljelle jää lähinnä
+            // payload-mismatch tai putken virhe. Fail-closed 409, ei paniikkia,
+            // ei salaisuuksia virheviestiin.
+            warn!(approval = %id, error = %e, "approvals: approve epäonnistui putkessa");
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "approval could not be granted" })),
+            )
+        }
+    }
+}
+
+/// `GET /turns/audit` — palauttaa **havainnoitavan tool-loop-jäljen**
+/// operaattorille (TURN-AUDIT, roadmap §6 D6).
+///
+/// Vastaus on JSON-lista [`familyclaw_actions::ExecAuditEvent`]-tapahtumia
+/// lisäysjärjestyksessä: kukin kantaa vuoron korrelaatiotunnisteen
+/// (`action_id`), tapahtumatyypin (`kind`: `turn_started` / `tool_dispatched`
+/// / `turn_suspended` / `turn_resumed` / `turn_answered` /
+/// `turn_max_iterations`), aikaleiman (`at`) ja **redaktoidun** selitteen
+/// (`detail`). **Raakaa payloadia, työkaluargumentteja tai salaisuuksia ei
+/// koskaan palauteta** — `detail` redaktoitiin jo agentin kirjaushetkellä.
+///
+/// Operaattori voi ryhmitellä jäljen `action_id`:n mukaan saadakseen yhden
+/// vuoron koko elinkaaren (alku → työkalukutsut → suspend/resume →
+/// `stop_reason`). Suuremmalla volyymilla suodatus/sivutus kuuluu myöhempään
+/// laajennukseen — tämä reitti palauttaa nykyisen kirjatun jäljen sellaisenaan.
+///
+/// Suojaus on sama kuin `POST /inject`:llä: jos [`GATEWAY_TOKEN_ENV`] on
+/// konfiguroitu, pyyntö vaatii otsikon `Authorization: Bearer <token>`
+/// (vakioaikainen täsmäys), muuten `401`.
+///
+/// Tilakoodit:
+/// - `200 OK` + JSON-lista (myös tyhjä, jos mitään ei ole vielä kirjattu),
+/// - `401 Unauthorized` jos bearer-token vaaditaan eikä se täsmää,
+/// - `503 Service Unavailable` jos turn-auditia ei ole kytketty
+///   ([`GatewayState::turn_audit`] = `None`).
+async fn list_turn_audit(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if check_inject_auth(&state, &headers).is_err() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        );
+    }
+    let Some(audit) = state.turn_audit.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "turn audit not configured" })),
+        );
+    };
+
+    // Tapahtumat ovat jo redaktoituja (agentti redaktoi `detail`:n
+    // kirjaushetkellä). Serialisoidaan sellaisenaan — ei lisäkäsittelyä.
+    let events = audit.list();
+    info!(count = events.len(), "turns: listattiin redaktoitu tool-loop-audit-jälki");
+    let body = serde_json::to_value(&events).unwrap_or_else(|_| serde_json::json!([]));
+    (StatusCode::OK, Json(body))
+}
+
 /// Rakentaa gatewayn HTTP-reitityksen jaetulla tilalla.
 fn build_router(state: Arc<GatewayState>) -> Router {
     use axum::routing::post;
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/inject", post(inject_discord));
+        .route("/inject", post(inject_discord))
+        // Operaattorin hyväksyntäpinta (suspend/resume-silta, roadmap §6 D2).
+        // Rekisteröidään aina; kun toimintoajoympäristöä ei ole kytketty
+        // ([`GatewayState::actions`] = `None`), handlerit vastaavat 503.
+        // Bearer-suojaus on sama kuin /inject:llä (`check_inject_auth`).
+        .route("/approvals/pending", get(list_pending_approvals))
+        .route("/approvals/{approval_id}/approve", post(approve_pending))
+        // Havainnoitava tool-loop-jälki (TURN-AUDIT, roadmap §6 D6). Rekisteröidään
+        // aina; kun turn-auditia ei ole kytketty ([`GatewayState::turn_audit`] =
+        // `None`), handler vastaa 503. Bearer-suojaus on sama kuin /inject:llä.
+        .route("/turns/audit", get(list_turn_audit));
     if state.discord_public_key.is_some() && state.discord_channel.is_some() {
         router = router.route("/discord/interactions", post(handle_discord_interaction));
     }
@@ -662,12 +984,24 @@ async fn serve() -> Result<()> {
     let (runtime, discord_ch, inject_token, discord_public_key) = start_runtime().await?;
     info!("FamilyRuntime käynnissä (bus + agentti + kanava)");
 
+    // Operaattorin hyväksyntäpinta jakaa SAMAN Arc<Mutex<ActionRuntime>>-kahvan
+    // jonka build_family kytki agentin tool-looppiin — odottavat hyväksynnät
+    // (suspend) ja niiden myöntäminen (resume) tapahtuvat samassa lukitussa
+    // tilassa. Vrt. roadmap §6 D2.
+    let actions = Some(runtime.actions());
+    // Havainnoitava tool-loop-jälki (TURN-AUDIT, roadmap §6 D6): sama
+    // Arc<AuditCollector> jonka build_family kytki agentin tool-looppiin.
+    let turn_audit = Some(runtime.turn_audit());
+
     let state = Arc::new(GatewayState {
         bus: Some(runtime.bus().clone()),
         discord_channel: discord_ch,
         inject_token,
         discord_public_key,
+        actions,
+        turn_audit,
     });
+    info!("operaattorin hyväksyntäpinta valmis — GET /approvals/pending, POST /approvals/{{id}}/approve");
     let app = build_router(state);
 
     let listener = TcpListener::bind(addr)
@@ -1004,6 +1338,8 @@ mod tests {
             discord_channel: None,
             inject_token: None,
             discord_public_key: None,
+            actions: None,
+            turn_audit: None,
         });
         let (status, _) = readyz(State(not_ready)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1015,6 +1351,8 @@ mod tests {
             discord_channel: None,
             inject_token: None,
             discord_public_key: None,
+            actions: None,
+            turn_audit: None,
         });
         let (status, _) = readyz(State(ready)).await;
         assert_eq!(status, StatusCode::OK);
@@ -1029,6 +1367,8 @@ mod tests {
             discord_channel: None,
             inject_token: None,
             discord_public_key: None,
+            actions: None,
+            turn_audit: None,
         }));
     }
 
@@ -1137,6 +1477,8 @@ mod tests {
             discord_channel: None,
             inject_token: None,
             discord_public_key: None,
+            actions: None,
+            turn_audit: None,
         };
         assert!(check_inject_auth(&state, &HeaderMap::new()).is_ok());
         // Ylimääräinen otsikko ei haittaa kun suojausta ei ole.
@@ -1151,6 +1493,8 @@ mod tests {
             discord_channel: None,
             inject_token: Some(Arc::from("s3cret-token")),
             discord_public_key: None,
+            actions: None,
+            turn_audit: None,
         };
         assert!(check_inject_auth(&state, &headers_with_auth("Bearer s3cret-token")).is_ok());
     }
@@ -1163,6 +1507,8 @@ mod tests {
             discord_channel: None,
             inject_token: Some(Arc::from("s3cret-token")),
             discord_public_key: None,
+            actions: None,
+            turn_audit: None,
         };
         // Väärä token.
         assert_eq!(
@@ -1184,5 +1530,160 @@ mod tests {
             check_inject_auth(&state, &headers_with_auth("Bearer ")),
             Err(StatusCode::UNAUTHORIZED)
         );
+    }
+
+    // ---- Operaattorin hyväksyntäpinta (suspend/resume-silta, roadmap §6 D2) ----
+
+    /// Apuri: gateway-tila jossa on **kytketty** toimintoajoympäristö (oletustaidot)
+    /// eikä bearer-suojausta. Palauttaa myös jaetun kahvan tehtävien lähetykseen.
+    fn state_with_actions() -> (Arc<GatewayState>, Arc<Mutex<ActionRuntime>>) {
+        let rt = ActionRuntime::with_default_skills().expect("default skills");
+        let actions = Arc::new(Mutex::new(rt));
+        let state = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: Some(Arc::clone(&actions)),
+            turn_audit: None,
+        });
+        (state, actions)
+    }
+
+    /// Apuri: lähettää write-external-tehtävän → odottava hyväksyntä syntyy.
+    /// Palauttaa myönnetyn hyväksynnän tunnisteen merkkijonona (route-muoto).
+    async fn submit_pending(actions: &Arc<Mutex<ActionRuntime>>) -> String {
+        use familyclaw_actions::GithubIssueDraftMock;
+        let now = familyclaw_core::time::now();
+        let mut rt = actions.lock().await;
+        let submitted = rt
+            .submit_task(
+                GithubIssueDraftMock::skill_id(),
+                serde_json::json!({ "bug_report": "Button does nothing" }),
+                now,
+            )
+            .await
+            .expect("submit");
+        submitted
+            .pending_approval
+            .expect("write-external requires approval")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn pending_route_503_without_action_runtime() {
+        // Ilman kytkettyä toimintoajoympäristöä → 503 (ei paniikkia).
+        let state = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: None,
+            turn_audit: None,
+        });
+        let (status, _) = list_pending_approvals(State(state), HeaderMap::new()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn pending_route_lists_redacted_without_payload() {
+        let (state, actions) = state_with_actions();
+        submit_pending(&actions).await;
+
+        let (status, Json(body)) = list_pending_approvals(State(state), HeaderMap::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = body.as_array().expect("array body");
+        assert_eq!(arr.len(), 1, "yksi odottava hyväksyntä");
+        let item = &arr[0];
+        // Vain kolme salaisuudetonta kenttää.
+        assert!(item.get("approval_id").and_then(|v| v.as_str()).is_some());
+        assert!(item.get("redacted_summary").and_then(|v| v.as_str()).is_some());
+        assert!(item.get("created_at").and_then(|v| v.as_str()).is_some());
+        // EI raakaa payloadia ("bug_report"/"Button does nothing") eikä payload-kenttää.
+        let rendered = serde_json::to_string(&body).expect("serialize");
+        assert!(!rendered.contains("bug_report"));
+        assert!(!rendered.contains("Button does nothing"));
+        assert!(!rendered.contains("payload"));
+    }
+
+    #[tokio::test]
+    async fn pending_route_requires_bearer_when_configured() {
+        // Token konfiguroitu mutta ei otsikkoa → 401, ei vuoda listaa.
+        let (mut_state, actions) = state_with_actions();
+        submit_pending(&actions).await;
+        // Rakenna uusi tila samalla runtimella mutta token päällä.
+        let state = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: Some(Arc::from("s3cret-token")),
+            discord_public_key: None,
+            actions: mut_state.actions.clone(),
+            turn_audit: None,
+        });
+        let (status, _) = list_pending_approvals(State(state), HeaderMap::new()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn approve_route_invalid_id_is_400() {
+        let (state, _actions) = state_with_actions();
+        let (status, _) = approve_pending(
+            State(state),
+            HeaderMap::new(),
+            Path("not-a-uuid".to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn approve_route_unknown_id_is_404() {
+        let (state, _actions) = state_with_actions();
+        // Kelvollinen UUID mutta ei odottavaa hyväksyntää → 404 (fail-closed).
+        let unknown = ApprovalId::new().to_string();
+        let (status, _) =
+            approve_pending(State(state), HeaderMap::new(), Path(unknown)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn approve_route_503_without_action_runtime() {
+        let state = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: None,
+            turn_audit: None,
+        });
+        let (status, _) = approve_pending(
+            State(state),
+            HeaderMap::new(),
+            Path(ApprovalId::new().to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn approve_route_grants_and_runs_to_completion() {
+        // Täysi polku: submit → odottava → approve → keskeytynyt toiminto ajetaan
+        // loppuun (status done), ei vaadi uutta hyväksyntää.
+        let (state, actions) = state_with_actions();
+        let id = submit_pending(&actions).await;
+
+        let (status, Json(body)) =
+            approve_pending(State(Arc::clone(&state)), HeaderMap::new(), Path(id.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.get("status").and_then(|v| v.as_str()), Some("done"));
+        assert_eq!(
+            body.get("awaiting_further_approval")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+
+        // Hyväksyntä kulutettu → ei enää odottavissa, ja toinen approve = 404.
+        let (status2, _) = approve_pending(State(state), HeaderMap::new(), Path(id)).await;
+        assert_eq!(status2, StatusCode::NOT_FOUND, "kertakäyttö: ei voi hyväksyä uudelleen");
     }
 }

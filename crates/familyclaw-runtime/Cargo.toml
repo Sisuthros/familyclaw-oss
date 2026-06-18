@@ -15,6 +15,10 @@ workspace = true
 familyclaw-core = { workspace = true }
 familyclaw-bus = { workspace = true }
 familyclaw-agent = { workspace = true }
+# Toimintoajoympäristö (ActionRuntime): agentin tool-loop ajaa työkalukutsut
+# tämän läpi, ja operaattorin hyväksyntäpinta (gateway /approvals) jakaa SAMAN
+# Arc<Mutex<ActionRuntime>>-kahvan suspend/resume-siltaa varten.
+familyclaw-actions = { workspace = true }
 familyclaw-channels = { workspace = true }
 familyclaw-memory = { workspace = true }
 familyclaw-durable = { workspace = true }

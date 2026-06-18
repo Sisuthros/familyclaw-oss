@@ -17,6 +17,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (synteettinen avain-mallinen syöte korvautuu `[REDACTED]`-merkinnällä).
 - Juuren `Cargo.toml`: `familyclaw-actions` lisätty `[workspace.dependencies]`-listaan
   (aakkosjärjestyksessä).
+- **familyclaw-gateway operaattorin hyväksyntäpinta** (suspend/resume-silta,
+  roadmap §6 D1/D2) — kaksi bearer-suojattua HTTP-reittiä (sama
+  `FAMILYCLAW_GATEWAY_TOKEN` kuin `/inject`, vakioaikainen täsmäys):
+  - `GET /approvals/pending` — listaa odottavat hyväksynnät **redaktoituina**
+    (`approval_id`, `redacted_summary`, `created_at`); ei koskaan raakaa
+    payloadia, työkaluargumentteja eikä salaisuuksia.
+  - `POST /approvals/{approval_id}/approve` — myöntää hyväksynnän ja ajaa
+    keskeytyneen toiminnon loppuun (payload-sidottu, kertakäyttöinen).
+
+  Reitit rekisteröidään aina; kun toimintoajoympäristöä ei ole kytketty,
+  handlerit vastaavat `503`. Bearer-tokenin puuttuessa `401`.
+- **familyclaw-gateway turn-audit-reitti** (TURN-AUDIT, roadmap §6 D6) —
+  `GET /turns/audit` palauttaa operaattorille havainnoitavan tool-loop-jäljen
+  JSON-listana (`familyclaw_actions::ExecAuditEvent`): vuoron korrelaatiotunniste
+  (`action_id`), tapahtumatyyppi (`turn_started` / `tool_dispatched` /
+  `turn_suspended` / `turn_resumed` / `turn_answered` / `turn_max_iterations`),
+  aikaleima (`at`) ja **redaktoitu** selite (`detail`, redaktoitu jo
+  kirjaushetkellä). Sama bearer-suojaus kuin `/inject`; `503` jos turn-auditia
+  ei ole kytketty.
+- **familyclaw-runtime jaetut operaattorikahvat** — `FamilyRuntime::actions()`
+  (`Arc<Mutex<ActionRuntime>>`) ja `FamilyRuntime::turn_audit()`
+  (`Arc<AuditCollector>`) altistavat saman lukitun toimintoajoympäristön ja
+  vain-lisäävän turn-audit-keräimen jotka agentin tool-loop omistaa — gateway
+  lukee odottavat hyväksynnät ja tool-loop-jäljen jakamatta agentin sisuksia.
 
 ### Verified
 - `bash scripts/audit-layer-b.sh` — PASS (ei sieluja/avaimia/nimivuotoja)

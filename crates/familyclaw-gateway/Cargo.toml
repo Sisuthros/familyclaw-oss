@@ -26,6 +26,10 @@ familyclaw-agent = { workspace = true }
 # Ei sykliä: bridge riippuu vain coresta. (familyclaw-agent re-exportaa vain
 # LiveTurnExecutorin, ei orkesteri-tyyppejä, joten bridge tarvitaan suoraan.)
 familyclaw-bridge = { workspace = true }
+# Operaattorin hyväksyntäpinta (GET /approvals/pending, POST /approvals/{id}/approve):
+# jakaa runtimen Arc<Mutex<ActionRuntime>>-kahvan listatakseen odottavat
+# hyväksynnät redaktoituina ja myöntääkseen hyväksynnän (suspend/resume-silta).
+familyclaw-actions = { workspace = true }
 familyclaw-channels = { workspace = true, features = ["telegram", "discord"] }
 tokio = { workspace = true }
 axum = { workspace = true }

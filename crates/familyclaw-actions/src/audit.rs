@@ -183,6 +183,26 @@ pub enum AuditKind {
     TaintMarked,
     /// Käytäntö (policy) esti toiminnon.
     PolicyDenied,
+    /// **Agentin vuoro (turn) alkoi** — tool-loopin ensimmäinen kierros
+    /// käynnistyi. (TURN-AUDIT, roadmap §6 D6.)
+    TurnStarted,
+    /// **Työkalukutsu lähetettiin** tool-loopin sisällä (taidon nimi +
+    /// redaktoitu tulos `detail`-kentässä, ei koskaan raakaa payloadia).
+    /// (TURN-AUDIT, roadmap §6 D6.)
+    ToolDispatched,
+    /// **Vuoro keskeytyi** odottamaan ihmisen hyväksyntää (suspend):
+    /// `detail` kantaa hyväksynnän tunnisteen + redaktoidun tiivistelmän.
+    /// (TURN-AUDIT, roadmap §6 D6.)
+    TurnSuspended,
+    /// **Keskeytetty vuoro jatkettiin** (resume) hyväksynnän myöntämisen
+    /// jälkeen. (TURN-AUDIT, roadmap §6 D6.)
+    TurnResumed,
+    /// **Vuoro päättyi lopulliseen vastaukseen** (`stop_reason` = answered).
+    /// (TURN-AUDIT, roadmap §6 D6.)
+    TurnAnswered,
+    /// **Vuoro saavutti kierrosrajan** ilman vastausta
+    /// (`stop_reason` = max-iter). (TURN-AUDIT, roadmap §6 D6.)
+    TurnMaxIterations,
 }
 
 /// Suorituspinon yksittäinen audit-tapahtuma.
@@ -273,6 +293,27 @@ impl AuditCollector {
         }
     }
 
+    /// Palauttaa tietyn [`ActionId`]:n kaikki tapahtumat lisäysjärjestyksessä
+    /// (kopio).
+    ///
+    /// Käytetään mm. **turn-auditin** (roadmap §6 D6) operaattorihaussa: yksi
+    /// agentin vuoro tunnistetaan yhdellä [`ActionId`]:llä, joten yhden vuoron
+    /// koko audit-jälki (alku → työkalukutsut → suspend/resume → `stop_reason`)
+    /// saadaan suodattamalla tällä tunnisteella. Tuloste ei koskaan sisällä
+    /// raakoja salaisuuksia — `detail` redaktoidaan jo kirjaushetkellä.
+    #[must_use]
+    pub fn events_for(&self, action_id: ActionId) -> Vec<ExecAuditEvent> {
+        let guard = match self.events.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .iter()
+            .filter(|e| e.action_id == action_id)
+            .cloned()
+            .collect()
+    }
+
     /// Kirjattujen tapahtumien lukumäärä.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -332,6 +373,57 @@ mod tests {
         assert_eq!(json, "\"approval_granted\"");
         let back: AuditAction = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, AuditAction::ApprovalGranted);
+    }
+
+    #[test]
+    fn turn_audit_kinds_serde_snake_case() {
+        // TURN-AUDIT-variantit sarjallistuvat snake_caseen koneellista
+        // suodatusta varten (operaattorin näkymä).
+        for (kind, expected) in [
+            (AuditKind::TurnStarted, "\"turn_started\""),
+            (AuditKind::ToolDispatched, "\"tool_dispatched\""),
+            (AuditKind::TurnSuspended, "\"turn_suspended\""),
+            (AuditKind::TurnResumed, "\"turn_resumed\""),
+            (AuditKind::TurnAnswered, "\"turn_answered\""),
+            (AuditKind::TurnMaxIterations, "\"turn_max_iterations\""),
+        ] {
+            let json = serde_json::to_string(&kind).expect("serialize");
+            assert_eq!(json, expected, "{kind:?} serializes to {expected}");
+            let back: AuditKind = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, kind);
+        }
+    }
+
+    #[test]
+    fn collector_events_for_filters_by_action_id() {
+        let collector = AuditCollector::new();
+        let turn_a = ActionId::new();
+        let turn_b = ActionId::new();
+        collector.record(ExecAuditEvent::new(
+            AuditKind::TurnStarted,
+            turn_a,
+            ts(),
+            "turn a alkoi",
+        ));
+        collector.record(ExecAuditEvent::new(
+            AuditKind::TurnStarted,
+            turn_b,
+            ts(),
+            "turn b alkoi",
+        ));
+        collector.record(ExecAuditEvent::new(
+            AuditKind::TurnAnswered,
+            turn_a,
+            ts(),
+            "turn a vastasi",
+        ));
+
+        let a_events = collector.events_for(turn_a);
+        assert_eq!(a_events.len(), 2, "vain turn a:n tapahtumat");
+        assert!(a_events.iter().all(|e| e.action_id == turn_a));
+        assert_eq!(collector.events_for(turn_b).len(), 1);
+        // Tuntematon tunniste → tyhjä.
+        assert!(collector.events_for(ActionId::new()).is_empty());
     }
 
     #[test]

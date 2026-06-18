@@ -32,6 +32,7 @@
 use std::env;
 use std::sync::Arc;
 
+use familyclaw_actions::{ActionRuntime, AuditCollector};
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, resolve_profile_dir, Agent, EmotionCalibration,
     ErasedMemoryStore, JournalResumableStore, LlmEndpointResolver, ResumableTurnStore, Soul,
@@ -44,6 +45,7 @@ use familyclaw_dream::DreamCycle;
 use familyclaw_durable::{DurableContext, FileJournal, InMemoryJournal, Journal};
 use familyclaw_memory::LocalJsonStore;
 use ractor::ActorRef;
+use tokio::sync::Mutex;
 
 /// Ajonaikainen kokoonpano: bus + spawnatut agentit + reply-pumppu + kanavat.
 ///
@@ -63,6 +65,29 @@ use ractor::ActorRef;
 /// bounded-wrapper tai backpressure-mittari drain-puolelle.
 pub struct FamilyRuntime {
     bus: BusHandle,
+    /// **Jaettu toimintoajoympäristö** (suspend/resume-silta, roadmap §6 D2).
+    ///
+    /// Sama [`Arc<Mutex<ActionRuntime>>`] joka kytkettiin agentin tool-looppiin
+    /// ([`Agent::with_actions`]). Runtime pitää tästä OMAN kahvansa, jotta
+    /// operaattoripinta (gateway `GET /approvals/pending` + `POST
+    /// /approvals/{id}/approve`) voi lukea odottavat hyväksynnät ja myöntää
+    /// hyväksynnän jakamatta agentin sisuksia. Mutex on `tokio::sync::Mutex`,
+    /// koska [`ActionRuntime::approve`] on `async` + `&mut self`.
+    ///
+    /// Lukko otetaan **vain** yksittäisen operaation ajaksi (lista/approve);
+    /// agentin tool-loop ottaa saman lukon omille kutsuilleen — kilpailu
+    /// ratkeaa lukon kautta, ei jaetun tilan kopioinnilla.
+    actions: Arc<Mutex<ActionRuntime>>,
+    /// **Jaettu turn-audit-keräin** (TURN-AUDIT, roadmap §6 D6).
+    ///
+    /// Sama [`Arc<AuditCollector>`] joka kytkettiin agentin tool-looppiin
+    /// ([`Agent::with_turn_audit`](familyclaw_agent::Agent::with_turn_audit)).
+    /// Runtime pitää tästä OMAN kahvansa, jotta operaattoripinta (esim. gatewayn
+    /// reitti) voi lukea havainnoitavan tool-loop-jäljen (vuoron alku,
+    /// työkalukutsut redaktoituina, suspend/resume, `stop_reason`) jakamatta
+    /// agentin sisuksia. Keräin on säikeenturvallinen ja vain-lisäävä
+    /// (tamper-evident); `detail`-kentät on redaktoitu jo kirjaushetkellä.
+    turn_audit: Arc<AuditCollector>,
     /// Spawnatut agentti-actorit. Pidetään elossa (drop = actor pysähtyy →
     /// reply-sink dropataan → drain-task valuu loppuun luonnostaan).
     agents: Vec<ActorRef<ResonanceMessage>>,
@@ -80,6 +105,39 @@ impl FamilyRuntime {
     #[must_use]
     pub fn bus(&self) -> &BusHandle {
         &self.bus
+    }
+
+    /// **Jaettu toimintoajoympäristön kahva** operaattoripinnalle.
+    ///
+    /// Palauttaa kloonin samasta [`Arc<Mutex<ActionRuntime>>`]:stä jonka agentin
+    /// tool-loop omistaa ([`Agent::with_actions`]). Gateway tallettaa tämän
+    /// `GatewayState`-tilaansa ja käyttää sitä:
+    /// - `GET /approvals/pending` → [`ActionRuntime::try_pending_approvals`] +
+    ///   [`ActionRuntime::pending_summary_for`] (redaktoidut tiivistelmät),
+    /// - `POST /approvals/{id}/approve` → [`ActionRuntime::approve`] (myöntää
+    ///   hyväksynnän ja ajaa keskeytyneen toiminnon loppuun).
+    ///
+    /// Kahva on aina läsnä: [`build_family`] luo toimintoajoympäristön
+    /// (oletustaidoilla) jokaiselle perheelle ja kytkee saman kahvan sekä
+    /// agentille että runtimelle. Lukko otetaan vain operaation ajaksi.
+    #[must_use]
+    pub fn actions(&self) -> Arc<Mutex<ActionRuntime>> {
+        Arc::clone(&self.actions)
+    }
+
+    /// **Jaettu turn-audit-keräimen kahva** operaattoripinnalle (TURN-AUDIT,
+    /// roadmap §6 D6).
+    ///
+    /// Palauttaa kloonin samasta [`Arc<AuditCollector>`]:sta jonka agentin
+    /// tool-loop omistaa ([`Agent::with_turn_audit`](familyclaw_agent::Agent::with_turn_audit)).
+    /// Gateway voi tallettaa tämän tilaansa ja näyttää operaattorille
+    /// havainnoitavan tool-loop-jäljen ([`AuditCollector::list`] /
+    /// [`AuditCollector::events_for`]) — vuoron alku, työkalukutsut
+    /// **redaktoituina**, suspend/resume ja `stop_reason`. Tuloste ei koskaan
+    /// sisällä raakoja salaisuuksia.
+    #[must_use]
+    pub fn turn_audit(&self) -> Arc<AuditCollector> {
+        Arc::clone(&self.turn_audit)
     }
 
     /// Sammuttaa kokoonpanon siististi: **ei pudota in-flight-vastauksia.**
@@ -291,6 +349,36 @@ pub async fn build_family(
         agent = agent.with_failover(failover);
     }
 
+    // 7b. Toimintoajoympäristö (ActionRuntime) — tool-loop + operaattorin
+    //     hyväksyntäpinta jakavat SAMAN Arc<Mutex<ActionRuntime>>-kahvan.
+    //
+    //     Tämä on suspend/resume-sillan (roadmap §6 D2) kytkentäpiste: ilman
+    //     toimintoajoympäristöä agentin `think` ei voi koskaan keskeytyä
+    //     hyväksyntää odottamaan (ei työkaluja → ei `Suspended`), joten ei myös
+    //     mitään mitä operaattorin pinta voisi näyttää tai hyväksyä. Luodaan
+    //     oletustaidoilla ([`ActionRuntime::with_default_skills`]) — kaikki ovat
+    //     KERROS A -geneerisiä mockeja, eivät oikeita providereita. Jos taitojen
+    //     rekisteröinti epäonnistuisi (ei pitäisi — sisäänrakennetut manifestit
+    //     on validoitu), kaadutaan kontrolloidusti virheeseen ennen spawnia.
+    //
+    //     Sama kahva annetaan agentille `with_actions`:lla (tool-loop aktivoituu)
+    //     JA talletetaan runtimeen ([`FamilyRuntime::actions`]) operaattoripintaa
+    //     varten — molemmat osoittavat samaan lukittuun tilaan.
+    let action_runtime = ActionRuntime::with_default_skills().map_err(|e| {
+        FamilyClawError::config(format!("action runtime build failed: {e}"))
+    })?;
+    let actions: Arc<Mutex<ActionRuntime>> = Arc::new(Mutex::new(action_runtime));
+    agent = agent.with_actions(Arc::clone(&actions));
+
+    // 7c. Turn-audit-keräin (TURN-AUDIT, roadmap §6 D6): tool-loopin elinkaari
+    //     muuttuu havainnoitavaksi. Agentti kirjoittaa jäljen (vuoron alku,
+    //     työkalukutsut redaktoituina, suspend/resume, stop_reason), ja runtime
+    //     pitää SAMASTA Arc<AuditCollector>:sta oman kahvansa operaattoripintaa
+    //     varten ([`FamilyRuntime::turn_audit`]). Molemmat osoittavat samaan
+    //     säikeenturvalliseen, vain-lisäävään pintaan.
+    let turn_audit: Arc<AuditCollector> = Arc::new(AuditCollector::new());
+    agent = agent.with_turn_audit(Arc::clone(&turn_audit));
+
     // 7. Spawnaa agentti actorina (rekisteröi busiin).
     let actor = agent.spawn().await?;
 
@@ -368,6 +456,8 @@ pub async fn build_family(
     }
     Ok(FamilyRuntime {
         bus,
+        actions,
+        turn_audit,
         agents: vec![actor],
         drain,
         tasks,
