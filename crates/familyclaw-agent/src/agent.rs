@@ -1890,13 +1890,21 @@ impl Agent {
     /// tallennettu raakoja salaisuuksia (ks. [`ResumableTurn`]), ja injektoitu
     /// tool-tulos johdetaan **redaktoidusta** todisteesta.
     ///
+    /// ## Olentojen välinen eristys (syvyyspuolustus)
+    /// Jatkettava vuoro kuuluu sille olennolle, joka sen tallensi. Resume
+    /// **kieltäytyy** jatkamasta vuoroa, jonka [`ResumableTurn::being_id`]
+    /// poikkeaa tämän agentin omasta tunnisteesta — yksi olento ei voi jatkaa
+    /// toisen olennon keskeytettyä vuoroa eikä kuluttaa sen hyväksyntää.
+    /// Tarkistus tehdään **ennen** hyväksynnän kulutusta, joten epätäsmäys ei jätä
+    /// jälkeä (fail-closed: ei kulutusta, ei poistoa, ei sivuvaikutusta).
+    ///
     /// # Errors
     /// - [`FamilyClawError::InvalidInput`] jos `approval_id`:lle ei ole
-    ///   jatkettavaa vuoroa (tuntematon/kulutettu), se on vanhentunut, agentille
-    ///   ei ole asennettu toimintoajoympäristöä
-    ///   ([`with_actions`](Self::with_actions)), tai hyväksynnän kulutus
-    ///   ([`ActionRuntime::approve`]) epäonnistuu (esim. payload-mismatch) —
-    ///   kaikki fail-closed, ei paniikkia.
+    ///   jatkettavaa vuoroa (tuntematon/kulutettu), se kuuluu **toiselle
+    ///   olennolle** (omistajuus-epätäsmäys), se on vanhentunut, agentille ei ole
+    ///   asennettu toimintoajoympäristöä ([`with_actions`](Self::with_actions)),
+    ///   tai hyväksynnän kulutus ([`ActionRuntime::approve`]) epäonnistuu (esim.
+    ///   payload-mismatch) — kaikki fail-closed, ei paniikkia.
     /// - [`FamilyClawError::Llm`] jos jatkettu LLM-kutsu epäonnistuu.
     // Resume on yhtenäinen sekvenssi (lataa → kuluta hyväksyntä → injektoi tulos
     // → turn-audit resumed → jatka tool-loop → mappaa outcome + stop_reason).
@@ -1919,6 +1927,33 @@ impl Agent {
                     "no resumable turn for approval {approval_id} (unknown or already resumed)"
                 ))
             })?;
+
+        // 1b. OMISTAJUUSTARKISTUS (eristysinvariantti, syvyyspuolustus).
+        //
+        // Jatkettava vuoro kuuluu tasan sille olennolle, joka sen keskeytyksessä
+        // tallensi ([`ResumableTurn::being_id`]). Tallennuspinta on jaettavissa
+        // useamman olennon kesken, ja avaimena toimii pelkkä `approval_id` —
+        // joten ilman tätä tarkistusta yksi olento voisi jatkaa **toisen olennon**
+        // keskeytetyn vuoron (ja kuluttaa sen hyväksynnän + ajaa sen
+        // sivuvaikutuksen omassa kontekstissaan). Se rikkoisi olentojen välisen
+        // eristyksen.
+        //
+        // **Invariantti:** `turn.being_id == self.being_id`. Tämä on
+        // syvyyspuolustusta — kutsujan pitäisi reitittää resume oikealle
+        // olennolle jo ennen tänne tuloa, mutta tässä se varmistetaan vielä
+        // rajalla, jossa hyväksyntä oltaisiin kuluttamassa.
+        //
+        // **Fail-closed:** epätäsmäys → virhe ENNEN hyväksynnän kulutusta ja
+        // ennen mitään tool-loopin ajoa. Hyväksyntää EI kuluteta, jatkettavaa
+        // vuoroa EI poisteta, sivuvaikutusta EI ajeta — vieras olento poistuu
+        // tyhjin käsin eikä jätä jälkeä. Ei paniikkia.
+        let self_being = self.being_id.to_string();
+        if turn.being_id != self_being {
+            return Err(FamilyClawError::invalid_input(format!(
+                "resumable turn for approval {approval_id} belongs to another being \
+                 (owner mismatch) — refusing to resume across beings"
+            )));
+        }
 
         // Vanhentunut jatkettava vuoro evätään fail-closed (sama raja kuin
         // hyväksynnällä) — ei kuluteta lupaa, ei ajeta sivuvaikutusta.
@@ -3828,6 +3863,35 @@ mod tests {
         Agent::new(config, soul, memory, durable, bus, Some(cfg), None)
     }
 
+    /// Kuten [`agent_with_scripted_llm`], mutta **kiinteällä** `AgentId`:llä.
+    ///
+    /// Tarpeen kaatumiskestävyys-testeissä, joissa SAMA olento rakennetaan
+    /// uudelleen "restartin" jälkeen: tuotannossa olennon `config.id` (ja siitä
+    /// johdettu [`Agent::being_id`]) on vakaa yli uudelleenkäynnistyksen, koska
+    /// gateway johtaa sen deterministisesti nimestä
+    /// (`AgentConfig::new_with_stable_id` → `AgentId::from_name`), joten resumen
+    /// omistajuustarkistus täsmää. Plain [`AgentConfig::new`] arpoo id:n
+    /// satunnaisesti — restart-simulaatiossa se antaisi VÄÄRÄN, eri olennon, joten
+    /// tämä helper kiinnittää id:n eksplisiittisesti vastaamaan tuotannon vakautta.
+    fn agent_with_scripted_llm_id(
+        id: familyclaw_core::AgentId,
+        name: &str,
+        bus: BusHandle,
+        api_base: &str,
+    ) -> Agent {
+        let mut config = AgentConfig::new(name, ModelConfig::new("scripted/model"));
+        config.id = id;
+        let soul = Soul::from_essence(format!("I am {name}."));
+        let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
+        let durable =
+            DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
+                .expect("durable ctx");
+        let cfg = LlmConfig::new(api_base, "test-key", "scripted-model")
+            .with_request_timeout_ms(2_000)
+            .with_connect_timeout_ms(2_000);
+        Agent::new(config, soul, memory, durable, bus, Some(cfg), None)
+    }
+
     /// Read-only testitaito tool-loopia varten: kaiuttaa payloadin `q`-kentän
     /// takaisin tulosteeseen. Auto-run (ei hyväksyntää), jotta silmukka voi
     /// syöttää tuloksen takaisin malliin.
@@ -4777,6 +4841,10 @@ mod tests {
         // Jaettu suorituslaskuri kulkee "kaatumisen" yli: todistaa että
         // sivuvaikutus ajetaan tasan kerran KOKO elinkaaren yli.
         let count = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        // SAMA olennon tunniste molemmissa elinkaaren vaiheissa: restart =
+        // sama olento herää uudelleen, joten `being_id` säilyy (tuotannossa
+        // `config.id` on vakaa). Tämä on edellytys resumen omistajuustarkistukselle.
+        let being_id = familyclaw_core::AgentId::new();
 
         // ----- Ennen "kaatumista": suspend, joka persistoituu levylle. -----
         let approval_id = {
@@ -4797,7 +4865,7 @@ mod tests {
             .await;
             let resumable: StdArc<dyn ResumableTurnStore> =
                 StdArc::new(JournalResumableStore::open(dir.resumable_path()).expect("resumable 1"));
-            let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+            let agent = agent_with_scripted_llm_id(being_id, "agent_a", bus.clone(), &api)
                 .with_actions(runtime)
                 .with_resumable_store(resumable);
 
@@ -4843,7 +4911,8 @@ mod tests {
             resumable2.get(approval_id).expect("get").is_some(),
             "resumable turn survived restart"
         );
-        let agent2 = agent_with_scripted_llm("agent_a", bus2.clone(), &api2)
+        // Sama olennon tunniste → resumen omistajuustarkistus täsmää.
+        let agent2 = agent_with_scripted_llm_id(being_id, "agent_a", bus2.clone(), &api2)
             .with_actions(runtime2)
             .with_resumable_store(StdArc::clone(&resumable2));
 
@@ -4927,6 +4996,126 @@ mod tests {
             0,
             "fail-closed-polut eivät saa ajaa sivuvaikutusta"
         );
+        bus.stop();
+    }
+
+    /// (d2) **Olentojen välinen eristys (syvyyspuolustus):** olento, joka
+    /// keskeytti OMAN vuoronsa, voi jatkaa sen (perustapaus säilyy); mutta TOINEN
+    /// olento, joka jakaa saman jatkettavien vuorojen pinnan, EI voi jatkaa
+    /// ensimmäisen olennon keskeytettyä vuoroa — `resume_approved` kieltäytyy
+    /// fail-closed (omistajuus-epätäsmäys), eikä kuluta hyväksyntää, poista
+    /// vuoroa pinnalta tai aja sivuvaikutusta.
+    #[tokio::test]
+    async fn resume_rejects_cross_being_owner_mismatch_fails_closed() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+
+        // Yksi JAETTU jatkettavien vuorojen pinta kahdelle olennolle.
+        let store: StdArc<dyn ResumableTurnStore> = StdArc::new(InMemoryResumableStore::new());
+
+        // --- Olento A: keskeyttää oman vuoronsa (suspend) ---
+        let count_a = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        let api_a = spawn_scripted_llm(vec![
+            body_tool_call("call_approve", "approval_skill", &serde_json::json!({ "q": "ship" })),
+            body_text("alkuperäisen olennon vastaus"),
+        ])
+        .await;
+        let runtime_a = counting_runtime_with_pending(
+            Box::new(familyclaw_actions::InMemoryPendingStore::new()),
+            StdArc::clone(&count_a),
+        );
+        let agent_a = agent_with_scripted_llm("being_alpha", bus.clone(), &api_a)
+            .with_actions(StdArc::clone(&runtime_a))
+            .with_resumable_store(StdArc::clone(&store));
+
+        // --- Olento B: ERI olento (oma being_id), oma runtime, jakaa STOREN ---
+        let count_b = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        let api_b = spawn_scripted_llm(vec![body_text("ei saa koskaan ajaa olennolle B")]).await;
+        let runtime_b = counting_runtime_with_pending(
+            Box::new(familyclaw_actions::InMemoryPendingStore::new()),
+            StdArc::clone(&count_b),
+        );
+        let agent_b = agent_with_scripted_llm("being_beta", bus.clone(), &api_b)
+            .with_actions(StdArc::clone(&runtime_b))
+            .with_resumable_store(StdArc::clone(&store));
+
+        // Eri olennot → eri tunnisteet (lähtöoletus tarkistukselle).
+        assert_ne!(
+            agent_a.being_id(),
+            agent_b.being_id(),
+            "kahden olennon tunnisteiden on oltava erilliset"
+        );
+
+        // Vaihe 1: olento A keskeyttää vuoronsa.
+        let out = agent_a
+            .think(&BusMessage::text("ship it"))
+            .await
+            .expect("suspend ok");
+        let approval_id = match out {
+            ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+            other => panic!("odotettiin Suspended, sai: {other:?}"),
+        };
+        // Jatkettava vuoro on pinnalla, ja se kuuluu olennolle A.
+        let stored = store.get(approval_id).expect("get").expect("present");
+        assert_eq!(
+            stored.being_id,
+            agent_a.being_id().to_string(),
+            "jatkettava vuoro kuuluu sen keskeyttäneelle olennolle (A)"
+        );
+
+        // Vaihe 2: olento B YRITTÄÄ jatkaa A:n vuoroa → fail-closed.
+        let now = time::now();
+        let err = agent_b
+            .resume_approved(approval_id, now)
+            .await
+            .expect_err("cross-being resume must fail closed");
+        assert!(
+            matches!(err, FamilyClawError::InvalidInput(_)),
+            "vieras olento → InvalidInput (omistajuus-epätäsmäys), sai: {err:?}"
+        );
+
+        // Eristysinvariantti: B:n yritys ei jättänyt JÄLKEÄ.
+        // (i) kummankaan sivuvaikutus EI ajanut.
+        assert_eq!(
+            count_a.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "A:n hyväksyntää ei kulutettu vieraan resumen kautta"
+        );
+        assert_eq!(
+            count_b.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "B ei ajanut mitään sivuvaikutusta"
+        );
+        // (ii) jatkettava vuoro on YHÄ pinnalla (ei kulutettu/poistettu).
+        let still = store.get(approval_id).expect("get").expect("still present");
+        assert_eq!(
+            still.being_id,
+            agent_a.being_id().to_string(),
+            "A:n jatkettava vuoro säilyi koskemattomana hylätyn yrityksen jälkeen"
+        );
+
+        // Vaihe 3: oikea omistaja (A) jatkaa OMAN vuoronsa → onnistuu
+        // (perustapaus säilyy). Tämä todistaa että tarkistus ei riko laillista
+        // resumea.
+        let resumed = agent_a
+            .resume_approved(approval_id, now)
+            .await
+            .expect("oikean omistajan resume ok");
+        assert_eq!(
+            resumed,
+            ThinkOutcome::Reply("alkuperäisen olennon vastaus".to_string()),
+            "oikea omistaja vie vuoron loppuun"
+        );
+        // A:n sivuvaikutus ajettiin nyt TASAN KERRAN, vuoro kulutettu.
+        assert_eq!(
+            count_a.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "oikean omistajan resume ajaa sivuvaikutuksen tasan kerran"
+        );
+        assert!(
+            store.get(approval_id).expect("get").is_none(),
+            "jatkettava vuoro kulutettu oikean omistajan resumen jälkeen"
+        );
+
         bus.stop();
     }
 
@@ -5019,7 +5208,34 @@ mod tests {
         journal_path: &std::path::Path,
         memory: ErasedMemoryStore,
     ) -> Agent {
-        let config = AgentConfig::new(name, ModelConfig::new("scripted/model"));
+        agent_over_file_journal_id(
+            familyclaw_core::AgentId::new(),
+            name,
+            bus,
+            api_base,
+            journal_path,
+            memory,
+        )
+    }
+
+    /// Kuten [`agent_over_file_journal`], mutta **kiinteällä** `AgentId`:llä.
+    ///
+    /// Restart-yli-resume-todisteessa SAMA olento rakennetaan uudelleen
+    /// durable-tiedostoista — sen `being_id`:n on säilyttävä, jotta resumen
+    /// omistajuustarkistus täsmää. Tuotannossa `config.id` on vakaa yli
+    /// uudelleenkäynnistyksen, koska gateway johtaa sen nimestä
+    /// (`AgentConfig::new_with_stable_id`); vain testin plain
+    /// [`AgentConfig::new`] arpoisi sen, joten tämä helper kiinnittää id:n.
+    fn agent_over_file_journal_id(
+        id: familyclaw_core::AgentId,
+        name: &str,
+        bus: BusHandle,
+        api_base: &str,
+        journal_path: &std::path::Path,
+        memory: ErasedMemoryStore,
+    ) -> Agent {
+        let mut config = AgentConfig::new(name, ModelConfig::new("scripted/model"));
+        config.id = id;
         let soul = Soul::from_essence(format!("I am {name}."));
         let journal = FileJournal::open(journal_path).expect("open file journal");
         let durable = DurableContext::new(Arc::new(journal) as Arc<dyn Journal + Send + Sync>)
@@ -5266,6 +5482,9 @@ mod tests {
             // Erilliset laskurit tälle vaiheelle (oma elinkaari).
             let auto2 = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
             let approval2 = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+            // Sama olennon tunniste yli "restartin" — resumen omistajuustarkistus
+            // täsmää vain jos `being_id` säilyy (kuten tuotannossa vakaa config.id).
+            let r_being_id = familyclaw_core::AgentId::new();
 
             // --- Ennen kaatumista: suspend, joka persistoituu durable-pinnoille. ---
             let approval_id = {
@@ -5288,7 +5507,8 @@ mod tests {
                 let resumable: StdArc<dyn ResumableTurnStore> = StdArc::new(
                     JournalResumableStore::open(&resumable_path).expect("resumable open"),
                 );
-                let mut agent = agent_over_file_journal(
+                let mut agent = agent_over_file_journal_id(
+                    r_being_id,
                     "agent_a",
                     bus.clone(),
                     &api,
@@ -5335,7 +5555,8 @@ mod tests {
                 resumable.get(approval_id).expect("get").is_some(),
                 "pending resumable turn survived restart"
             );
-            let agent = agent_over_file_journal(
+            let agent = agent_over_file_journal_id(
+                r_being_id,
                 "agent_a",
                 bus.clone(),
                 &api,

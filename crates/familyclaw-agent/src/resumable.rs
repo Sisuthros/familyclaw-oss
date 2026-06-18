@@ -359,6 +359,18 @@ const RESUMABLE_PUT: &str = "resumable_turn_put";
 /// Journal-rivin looginen nimi jatkettavan vuoron poistolle (tombstone).
 const RESUMABLE_DELETE: &str = "resumable_turn_delete";
 
+/// Tiivistyksen oletuskerroin: loki tiivistetään automaattisesti kun fyysisten
+/// rivien määrä ylittää `AUTO_COMPACT_FACTOR * elävien_vuorojen_määrä`.
+///
+/// Kerroin 2 = "tiivistä kun vähintään puolet riveistä on kuolleita". Rajaa
+/// kuolleiden rivien kertymisen vakiokertoimeen elävää kohti, joten lokin koko
+/// ja replayn O(n)-kustannus pysyvät elävän tilan kokoluokassa.
+const AUTO_COMPACT_FACTOR: usize = 2;
+
+/// Pienin fyysinen rivimäärä jolla auto-tiivistys ylipäänsä harkitaan (estää
+/// turhan tiivistyksen pienillä lokeilla).
+const AUTO_COMPACT_MIN_ROWS: usize = 64;
+
 /// Kaatumiskestävä tallennuspinta [`FileJournal`]:n päällä.
 ///
 /// Append-only-loki: jokainen tallennus kirjoitetaan `resumable_turn_put`-
@@ -373,14 +385,32 @@ const RESUMABLE_DELETE: &str = "resumable_turn_delete";
 /// myöntämisen jälkeen vuoron voi jatkaa loppuun vaikka prosessi olisi
 /// käynnistynyt välissä uudelleen.
 ///
+/// ## Tiivistys (compaction) — rajaton kasvu kuriin
+/// Koska loki on append-only, jokainen poisto ([`remove`](ResumableTurnStore::remove)
+/// / [`evict_expired`](ResumableTurnStore::evict_expired)) ja saman tunnisteen
+/// korvaus jättää **kuolleita rivejä** lokiin: tila on oikea (myöhempi rivi
+/// voittaa), mutta tiedosto kasvaa rajatta ja replay muuttuu O(n):ksi
+/// rivimäärässä. [`compact`](JournalResumableStore::compact) kirjoittaa lokin
+/// uudelleen sisältämään **vain elävät vuorot** atomisesti
+/// [`FileJournal::rewrite`]:n kautta (temp + fsync + rename) — elävä tila säilyy
+/// bitilleen eikä keskeytyminen menetä eläviä vuoroja. Tiivistys laukeaa joko
+/// operaattorin kutsumana tai **automaattisesti** tallennuksen ja häädön
+/// yhteydessä kun kuolleiden rivien osuus ylittää kynnyksen (ks.
+/// `AUTO_COMPACT_FACTOR` ja [`with_auto_compact_factor`](JournalResumableStore::with_auto_compact_factor)).
+///
 /// ## Salaisuusinvariantti
 /// Levylle kirjoitetaan vain [`ResumableTurn`]:n salaisuudettomat kentät (ks.
 /// [`ResumableTurn`]) — ei koskaan raakoja työkaluargumentteja eikä salaisuuksia.
+/// Tiivistys säilyttää tämän: uudelleenkirjoitettu loki sisältää samat
+/// salaisuudettomat `resumable_turn_put`-rivit.
 pub struct JournalResumableStore {
     /// Append-only-loki johon tallennukset ja poistot kirjataan.
     journal: FileJournal,
     /// Seuraavan rivin sekvenssipaikka (monotoninen).
     next_step: Mutex<StepId>,
+    /// Auto-tiivistyksen kerroin: tiivistä kun `rivit > factor * elävät`.
+    /// `0` poistaa auto-tiivistyksen käytöstä (vain manuaalinen `compact`).
+    auto_compact_factor: usize,
 }
 
 impl std::fmt::Debug for JournalResumableStore {
@@ -410,7 +440,21 @@ impl JournalResumableStore {
         Ok(Self {
             journal,
             next_step: Mutex::new(next),
+            auto_compact_factor: AUTO_COMPACT_FACTOR,
         })
+    }
+
+    /// Asettaa auto-tiivistyksen kertoimen (ketjutus).
+    ///
+    /// Loki tiivistetään automaattisesti kun fyysisten rivien määrä ylittää
+    /// `factor * elävien_vuorojen_määrä` (ja rivejä on vähintään
+    /// `AUTO_COMPACT_MIN_ROWS`). Oletus on `AUTO_COMPACT_FACTOR` (2). Arvo `0`
+    /// **poistaa** auto-tiivistyksen käytöstä — loki tiivistetään vain
+    /// [`compact`](Self::compact)-kutsulla.
+    #[must_use]
+    pub const fn with_auto_compact_factor(mut self, factor: usize) -> Self {
+        self.auto_compact_factor = factor;
+        self
     }
 
     /// Palauttaa lokin tiedostopolun.
@@ -444,6 +488,20 @@ impl JournalResumableStore {
             .journal
             .replay_all()
             .map_err(|e| ResumableError::Journal(format!("replay resumable journal failed: {e}")))?;
+        Self::reconstruct_state(entries)
+    }
+
+    /// Rakentaa nykytilan annetuista journal-riveistä (puhdas funktio, ei I/O).
+    ///
+    /// Toisto käy rivit järjestyksessä: `resumable_turn_put` lisää/korvaa vuoron,
+    /// `resumable_turn_delete` poistaa sen (tombstone). Myöhempi rivi voittaa.
+    /// Eriytetty [`replay_state`](Self::replay_state):stä jotta sekä levyltä lukeva
+    /// replay että [`compact`](Self::compact):n [`FileJournal::compact_with`]-suljin
+    /// rakentavat tilan **samalla logiikalla** — jälkimmäinen saa rivit valmiiksi
+    /// luettuina lukon alta, eikä saa lukea journalia uudelleen (deadlock).
+    fn reconstruct_state(
+        entries: Vec<JournalEntry>,
+    ) -> Result<HashMap<ApprovalId, ResumableTurn>> {
         let mut state: HashMap<ApprovalId, ResumableTurn> = HashMap::new();
         for entry in entries {
             let EntryKind::Marker { name, payload } = entry.kind else {
@@ -467,13 +525,120 @@ impl JournalResumableStore {
         }
         Ok(state)
     }
+
+    /// Fyysisten journal-rivien määrä (eläviä + kuolleita). Dead-row-suhteen
+    /// mittauspohja; eroaa [`len`](ResumableTurnStore::len):stä joka palauttaa
+    /// vain elävien vuorojen määrän.
+    fn physical_row_count(&self) -> Result<usize> {
+        self.journal
+            .len()
+            .map_err(|e| ResumableError::Journal(format!("read resumable journal len failed: {e}")))
+    }
+
+    /// Kirjoittaa lokin uudelleen sisältämään **vain elävät vuorot** (tiivistys),
+    /// pudottaen kaikki kuolleet rivit (tombstonet ja korvatut `put`-rivit).
+    /// Palauttaa pudotettujen kuolleiden rivien määrän.
+    ///
+    /// Elävä tila säilyy bitilleen: tiivistyksen jälkeen täsmälleen samat vuorot
+    /// ovat [`get`](ResumableTurnStore::get)-haettavissa, ja uudelleenlatauksesta
+    /// (restart) rekonstruoituu identtinen tila. Tiivistys on **atominen**
+    /// ([`FileJournal::rewrite`]: temp + fsync + rename) — jos prosessi kaatuu
+    /// kesken, elävä tiedosto on yhä ehjässä vanhassa tilassaan eikä yhtään
+    /// elävää vuoroa katoa.
+    ///
+    /// Rivit uudelleennumeroidaan tiiviiksi `0..N`-sekvenssiksi ja sisäinen
+    /// sekvenssikursori asetetaan vastaamaan, jotta tulevat tallennukset jatkavat
+    /// oikealta paikalta.
+    ///
+    /// # Errors
+    /// [`ResumableError::Serde`] jos jonkin vuoron sarjallistus epäonnistuu;
+    /// [`ResumableError::Journal`] jos lokin luku tai atominen uudelleenkirjoitus
+    /// epäonnistuu. Virhetilanteessa elävä loki jätetään entiselleen.
+    pub fn compact(&self) -> Result<usize> {
+        // Atominen tiivistys appendeja vastaan: [`FileJournal::compact_with`]
+        // pitää saman file-lukon koko luku→suodatus→swap-operaation ajan, joten
+        // rinnakkainen tallennus/poisto ei voi laskeutua aukkoon ja kadota
+        // (TOCTOU-korjaus). `build`-suljin saa luetut rivit, rekonstruoi elävän
+        // tilan ja palauttaa uudelleennumeroidut elävät RESUMABLE_PUT-rivit.
+        //
+        // Elävien rivien määrä smugletaan sulkimesta `Cell`:llä, jotta
+        // sekvenssikursori voidaan asettaa swapin jälkeen (suljin EI saa lukita
+        // journalia uudelleen → ei voi lukea kursoria omalta polultaan).
+        let live_count = std::cell::Cell::new(0usize);
+        let dropped = self
+            .journal
+            .compact_with(|entries| {
+                // Rekonstruoi elävä tila valmiiksi luetuista riveistä (sama
+                // logiikka kuin replayssa, mutta EI uudelleenlukua — uudelleenluku
+                // lukitsisi journalin ja deadlockkaisi). ResumableError kääritään
+                // DurableError-tekstiksi jotta tyyppi sopii compact_with-sopimukseen.
+                let state = Self::reconstruct_state(entries).map_err(|e| {
+                    familyclaw_durable::DurableError::step_failed(
+                        "compact_reconstruct",
+                        e.to_string(),
+                    )
+                })?;
+                // Yksi RESUMABLE_PUT-rivi per elävä vuoro, uudelleennumeroituna 0..N.
+                let mut kept = Vec::with_capacity(state.len());
+                let mut step = StepId::ZERO;
+                for turn in state.values() {
+                    let payload = serde_json::to_value(turn)?;
+                    kept.push(JournalEntry::marker(step, RESUMABLE_PUT, payload));
+                    step = step.next();
+                }
+                live_count.set(kept.len());
+                Ok(kept)
+            })
+            .map_err(|e| ResumableError::Journal(format!("compact resumable journal failed: {e}")))?;
+
+        // Sekvenssikursori osoittamaan tiivistetyn lokin perään (= elävien määrä,
+        // koska rivit uudelleennumeroitiin tiiviisti 0..N).
+        {
+            let mut guard = self
+                .next_step
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = StepId::new(u64::try_from(live_count.get()).unwrap_or(u64::MAX));
+        }
+
+        Ok(dropped)
+    }
+
+    /// Tiivistää lokin **jos** kuolleiden rivien osuus ylittää kynnyksen.
+    ///
+    /// Laukaisuehto: `auto_compact_factor > 0` JA fyysisiä rivejä on vähintään
+    /// [`AUTO_COMPACT_MIN_ROWS`] JA `rivit > factor * elävät`. Kutsutaan
+    /// tallennuksen ja häädön jälkeen. Auto-tiivistyksen epäonnistuminen **ei**
+    /// kaada kutsujaa: data on jo turvallisesti lokissa, joten tiivistys on pelkkä
+    /// optimointi — virhe niellään (loki vain pysyy tiivistämättömänä tällä
+    /// kertaa).
+    fn maybe_auto_compact(&self) {
+        if self.auto_compact_factor == 0 {
+            return;
+        }
+        let Ok(rows) = self.physical_row_count() else {
+            return;
+        };
+        if rows < AUTO_COMPACT_MIN_ROWS {
+            return;
+        }
+        let Ok(live) = self.replay_state().map(|s| s.len()) else {
+            return;
+        };
+        if rows > self.auto_compact_factor.saturating_mul(live) {
+            let _ = self.compact();
+        }
+    }
 }
 
 impl ResumableTurnStore for JournalResumableStore {
     fn put(&self, turn: ResumableTurn) -> Result<()> {
         let payload = serde_json::to_value(&turn)
             .map_err(|e| ResumableError::Serde(format!("encode resumable turn failed: {e}")))?;
-        self.append_marker(RESUMABLE_PUT, payload)
+        self.append_marker(RESUMABLE_PUT, payload)?;
+        // Korvaus jätti kuolleen rivin (vanha put) → harkitse auto-tiivistystä.
+        self.maybe_auto_compact();
+        Ok(())
     }
 
     fn get(&self, approval_id: ApprovalId) -> Result<Option<ResumableTurn>> {
@@ -488,6 +653,8 @@ impl ResumableTurnStore for JournalResumableStore {
                 ResumableError::Serde(format!("encode resumable delete id failed: {e}"))
             })?;
             self.append_marker(RESUMABLE_DELETE, payload)?;
+            // Tombstone on kuollut rivi → harkitse auto-tiivistystä.
+            self.maybe_auto_compact();
         }
         Ok(existing)
     }
@@ -508,6 +675,10 @@ impl ResumableTurnStore for JournalResumableStore {
                 ResumableError::Serde(format!("encode resumable delete id failed: {e}"))
             })?;
             self.append_marker(RESUMABLE_DELETE, payload)?;
+        }
+        if !expired.is_empty() {
+            // Häätö tuotti tombstoneja (kuolleita rivejä) → harkitse tiivistystä.
+            self.maybe_auto_compact();
         }
         Ok(expired.len())
     }
@@ -703,5 +874,229 @@ mod tests {
     fn get_unknown_is_none() {
         let store = InMemoryResumableStore::new();
         assert!(store.get(ApprovalId::new()).expect("get").is_none());
+    }
+
+    // ---- Compaction ----
+
+    /// Laskee fyysiset (eläviä + kuolleita) journal-rivit lukemalla tiedoston.
+    fn physical_rows(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .map_or(0, |s| s.lines().filter(|l| !l.trim().is_empty()).count())
+    }
+
+    /// Apuri: tallenna `n` vuoroa, palauta niiden tunnisteet.
+    fn put_n(store: &JournalResumableStore, now: Timestamp, n: usize) -> Vec<ApprovalId> {
+        let args = serde_json::json!({ "x": 1 });
+        let mut ids = Vec::with_capacity(n);
+        for _ in 0..n {
+            let turn = turn_at(now, Duration::minutes(60), &args);
+            ids.push(turn.approval_id);
+            store.put(turn).expect("put");
+        }
+        ids
+    }
+
+    #[test]
+    fn compact_drops_dead_rows_keeps_live_turns() {
+        let tmp = TempPath::new("compact-basic");
+        let now = at(1_700_000_000);
+        let store = JournalResumableStore::open(tmp.path())
+            .expect("open")
+            .with_auto_compact_factor(0);
+
+        let ids = put_n(&store, now, 10);
+        for id in ids.iter().take(5) {
+            store.remove(*id).expect("remove");
+        }
+        assert_eq!(physical_rows(tmp.path()), 15, "10 put + 5 tombstone");
+        assert_eq!(store.len().expect("len"), 5);
+
+        let dropped = store.compact().expect("compact");
+        assert_eq!(dropped, 10, "15 rows → 5 live = 10 dropped");
+        assert_eq!(physical_rows(tmp.path()), 5);
+        assert_eq!(store.len().expect("len"), 5);
+
+        for id in ids.iter().take(5) {
+            assert!(store.get(*id).expect("get").is_none(), "removed gone");
+        }
+        for id in ids.iter().skip(5) {
+            assert!(store.get(*id).expect("get").is_some(), "live present");
+        }
+    }
+
+    #[test]
+    fn compact_preserves_exact_state_across_reload() {
+        let tmp = TempPath::new("compact-reload");
+        let now = at(1_700_000_000);
+
+        let ids = {
+            let store = JournalResumableStore::open(tmp.path())
+                .expect("open 1")
+                .with_auto_compact_factor(0);
+            let ids = put_n(&store, now, 6);
+            for id in ids.iter().take(3) {
+                store.remove(*id).expect("remove");
+            }
+            store.compact().expect("compact");
+            ids
+        };
+
+        // Restart pelkästä tiivistetystä tiedostosta → identtinen tila.
+        let resumed = JournalResumableStore::open(tmp.path()).expect("open 2");
+        assert_eq!(resumed.len().expect("len"), 3);
+        for id in ids.iter().take(3) {
+            assert!(resumed.get(*id).expect("get").is_none(), "removed stay removed");
+        }
+        for id in ids.iter().skip(3) {
+            assert!(resumed.get(*id).expect("get").is_some(), "live stay live");
+        }
+        assert_eq!(physical_rows(tmp.path()), 3);
+    }
+
+    #[test]
+    fn compact_is_atomic_temp_then_rename() {
+        let tmp = TempPath::new("compact-atomic");
+        let now = at(1_700_000_000);
+        let store = JournalResumableStore::open(tmp.path())
+            .expect("open")
+            .with_auto_compact_factor(0);
+
+        let ids = put_n(&store, now, 8);
+        for id in &ids {
+            store.remove(*id).expect("remove");
+        }
+        let live = put_n(&store, now, 1);
+        store.compact().expect("compact");
+
+        // Jokainen levyllä oleva rivi jäsentyy ehjäksi (ei puolikasta renamesta).
+        let on_disk = std::fs::read_to_string(tmp.path()).expect("read");
+        for line in on_disk.lines().filter(|l| !l.trim().is_empty()) {
+            serde_json::from_str::<JournalEntry>(line).expect("intact json line");
+        }
+        assert_eq!(store.len().expect("len"), 1);
+        assert!(store.get(live[0]).expect("get").is_some());
+
+        // Ei orpoa temp-tiedostoa tämän lokin nimellä.
+        let dir = tmp.path().parent().expect("parent");
+        let own = tmp
+            .path()
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        let leftover: Vec<_> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&own) && n.contains(".compact-") && n.contains(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "no temp left: {leftover:?}");
+    }
+
+    #[test]
+    fn compact_drops_expired_turns() {
+        let tmp = TempPath::new("compact-expired");
+        let now = at(1_700_000_000);
+        let store = JournalResumableStore::open(tmp.path())
+            .expect("open")
+            .with_auto_compact_factor(0);
+
+        let args = serde_json::json!({ "x": 1 });
+        let short = turn_at(now, Duration::seconds(60), &args);
+        let short_id = short.approval_id;
+        let long = turn_at(now, Duration::seconds(3600), &args);
+        let long_id = long.approval_id;
+        store.put(short).expect("put short");
+        store.put(long).expect("put long");
+
+        assert_eq!(store.evict_expired(at(1_700_000_120)).expect("evict"), 1);
+        store.compact().expect("compact");
+
+        assert!(store.get(short_id).expect("get").is_none());
+        assert!(store.get(long_id).expect("get").is_some());
+        assert_eq!(physical_rows(tmp.path()), 1, "only the live turn remains");
+        let on_disk = std::fs::read_to_string(tmp.path()).expect("read");
+        assert!(!on_disk.contains(&short_id.to_string()), "expired id gone from disk");
+    }
+
+    #[test]
+    fn auto_compact_triggers_when_dead_rows_exceed_threshold() {
+        let tmp = TempPath::new("auto-compact");
+        let now = at(1_700_000_000);
+        let store = JournalResumableStore::open(tmp.path()).expect("open"); // default factor
+        let args = serde_json::json!({ "x": 1 });
+
+        // Yksi pysyvä elävä.
+        let keeper = turn_at(now, Duration::minutes(60), &args);
+        let keeper_id = keeper.approval_id;
+        store.put(keeper).expect("put keeper");
+
+        // 100 put+remove paria → ilman tiivistystä 201 riviä.
+        for _ in 0..100 {
+            let t = turn_at(now, Duration::minutes(60), &args);
+            let id = t.approval_id;
+            store.put(t).expect("put churn");
+            store.remove(id).expect("remove churn");
+        }
+
+        let rows = physical_rows(tmp.path());
+        assert!(rows < 50, "auto-compaction should keep log small, got {rows}");
+        assert!(store.get(keeper_id).expect("get").is_some());
+        assert_eq!(store.len().expect("len"), 1);
+    }
+
+    #[test]
+    fn compact_on_empty_log_is_noop() {
+        let tmp = TempPath::new("compact-empty");
+        let store = JournalResumableStore::open(tmp.path()).expect("open");
+        assert_eq!(store.compact().expect("compact"), 0);
+        assert!(store.is_empty().expect("empty"));
+        assert_eq!(physical_rows(tmp.path()), 0);
+    }
+
+    /// TOCTOU-aukon sulkemisen regressio: tiivistys lukee tilan ja kirjoittaa
+    /// lokin uudelleen **saman file-lukon alla** ([`FileJournal::compact_with`]),
+    /// joten rinnakkainen tallennus ei voi laskeutua aukkoon ja kadota. Tässä ei
+    /// aja oikeaa rinnakkaisuutta (race on epädeterministinen) — todistetaan
+    /// rakenteesta seuraava havaittava invariantti: tiivistyksen PALUUN JÄLKEEN
+    /// tehty tallennus laskeutuu tiivistettyjen elävien vuorojen PERÄÄN, ja
+    /// uudelleenlataus tuottaa täsmälleen oikean tilan. Concurrent-append-
+    /// turvallisuus seuraa nyt yhden-lukon-pidosta.
+    #[test]
+    fn compact_then_put_does_not_lose_post_compact_turn() {
+        let tmp = TempPath::new("compact-toctou");
+        let now = at(1_700_000_000);
+        let store = JournalResumableStore::open(tmp.path())
+            .expect("open")
+            .with_auto_compact_factor(0);
+
+        let ids = put_n(&store, now, 6);
+        for id in ids.iter().take(3) {
+            store.remove(*id).expect("remove");
+        }
+        assert_eq!(store.len().expect("len"), 3, "3 live before compact");
+
+        let dropped = store.compact().expect("compact");
+        assert_eq!(dropped, 6, "9 rows (6 put + 3 tombstone) → 3 live = 6 dropped");
+        assert_eq!(physical_rows(tmp.path()), 3, "only live rows after compact");
+
+        // Tiivistyksen JÄLKEEN tallennettu vuoro laskeutuu elävien PERÄÄN.
+        let args = serde_json::json!({ "x": 2 });
+        let post = turn_at(now, Duration::minutes(60), &args);
+        let post_id = post.approval_id;
+        store.put(post).expect("put after compact");
+        assert_eq!(store.len().expect("len"), 4, "3 live + 1 post-compact");
+        assert!(store.get(post_id).expect("get").is_some());
+
+        // Uudelleenlataus tuottaa täsmälleen oikean tilan.
+        let resumed = JournalResumableStore::open(tmp.path()).expect("reopen");
+        assert_eq!(resumed.len().expect("len"), 4);
+        for id in ids.iter().take(3) {
+            assert!(resumed.get(*id).expect("get").is_none(), "removed stay removed");
+        }
+        for id in ids.iter().skip(3) {
+            assert!(resumed.get(*id).expect("get").is_some(), "live stay live");
+        }
+        assert!(resumed.get(post_id).expect("get").is_some(), "post-compact survives reload");
     }
 }

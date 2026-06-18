@@ -39,10 +39,16 @@
 //!   kirjaukset poistetaan käyttäen täsmälleen samaa fail-closed-vanhentumista
 //!   kuin [`crate::approval`] (`now > expires_at`). Vanhentunutta hyväksyntää ei
 //!   voi enää kuluttaa, joten sen säilyttäminen olisi pelkkää roskaa.
-//! - **Rate-limit-koukku** ([`DangerousToolRateLimiter`]): per-olento-laskuri
+//! - **Per-olento-rate-limit** ([`DangerousToolRateLimiter`]): laskuri
 //!   vaarallisten (hyväksyntää vaativien) työkalukutsujen rajoittamiseen
-//!   liukuvalla aikaikkunalla. Koukku on valinnainen ja deterministinen
-//!   (aikaleima injektoidaan).
+//!   liukuvalla aikaikkunalla. **Kytketty hyväksyntäpolkuun**
+//!   ([`crate::facade::ActionRuntime::submit_task`]): kun tehtävä jäisi
+//!   odottamaan ihmisen hyväksyntää, julkisivu kysyy ensin tältä rajoittimelta
+//!   onko olennolla vielä tilaa — jos ei, hyväksyntää ei myönnetä vaan kutsu
+//!   hylätään fail-closed ([`ActionError::PolicyDenied`]). Globaali
+//!   kapasiteettikatto rajaa koko jonon; tämä lisää siihen **per-olento**-katon.
+//!   Auto-run-tehtäviä (luku / paikallinen kirjoitus) ei rate-limititä.
+//!   Deterministinen: aikaleima injektoidaan.
 //!
 //! ## Determinismi
 //! Kaikki aikaa lukeva logiikka ottaa aikaleiman injektoituna
@@ -194,9 +200,11 @@ impl Default for PendingCapacity {
 /// Liukuva aikaikkuna: kullekin olennolle (`being`) sallitaan korkeintaan
 /// `max_per_window` kirjausta `window_secs` sekunnin ikkunassa (molemmat
 /// annetaan [`DangerousToolRateLimiter::new`]:lle). Tämä on tallennuspinnasta
-/// riippumaton koukku jonka julkisivu voi kysyä ennen kuin se myöntää uuden
-/// hyväksynnän — fail-closed-suoja sille, ettei yksi olento voi tulvittaa
-/// odottavien jonoa vaarallisilla pyynnöillä.
+/// riippumaton koukku jonka julkisivu ([`crate::facade::ActionRuntime`]) kysyy
+/// `submit-task`:ssa **ennen** kuin se myöntää uuden hyväksynnän — fail-closed-
+/// suoja sille, ettei yksi olento voi tulvittaa odottavien jonoa vaarallisilla
+/// pyynnöillä. Globaali kapasiteettikatto ([`PendingCapacity`]) rajaa koko jonon;
+/// tämä lisää siihen **per-olento**-katon.
 ///
 /// ## Determinismi
 /// Aikaleima injektoidaan ([`DangerousToolRateLimiter::check_and_record`]); kelloa
@@ -469,6 +477,22 @@ const PENDING_PUT: &str = "pending_approval_put";
 /// Journal-rivin looginen nimi odottavan kirjauksen poistolle (tombstone).
 const PENDING_DELETE: &str = "pending_approval_delete";
 
+/// Tiivistyksen oletuskerroin: loki tiivistetään automaattisesti kun fyysisten
+/// rivien määrä ylittää `AUTO_COMPACT_FACTOR * elävien_kirjausten_määrä`.
+///
+/// Kerroin 2 tarkoittaa "tiivistä kun vähintään puolet riveistä on kuolleita"
+/// (poistettuja tai korvattuja). Tämä rajaa kuolleiden rivien kertymisen
+/// vakiokertoimeen elävää kohti, joten lokin koko ja replayn O(n)-kustannus
+/// pysyvät elävän tilan kokoluokassa rajattoman kasvun sijaan.
+const AUTO_COMPACT_FACTOR: usize = 2;
+
+/// Pienin fyysinen rivimäärä jolla auto-tiivistys ylipäänsä harkitaan.
+///
+/// Estää turhan tiivistyksen pienillä lokeilla (esim. 1 elävä + 1 tombstone =
+/// 2 riviä laukaisisi muuten heti). Vasta kun rivejä on tämän verran,
+/// dead-row-suhdetta aletaan valvoa.
+const AUTO_COMPACT_MIN_ROWS: usize = 64;
+
 /// Kaatumiskestävä tallennuspinta [`familyclaw_durable::FileJournal`]:n päällä.
 ///
 /// Append-only-loki: jokainen lisäys kirjoitetaan `pending_approval_put`-markerina
@@ -483,10 +507,26 @@ const PENDING_DELETE: &str = "pending_approval_delete";
 /// loki säilyy luettavana. Näin **odottava hyväksyntä selviää
 /// `submit-task`:n ja `approve`:n välisestä kaatumisesta**.
 ///
+/// ## Tiivistys (compaction) — rajaton kasvu kuriin
+/// Koska loki on append-only, jokainen poisto ([`remove`](PendingApprovalStore::remove)
+/// / [`evict_expired`](PendingApprovalStore::evict_expired)) ja saman tunnisteen
+/// korvaus jättää **kuolleita rivejä** lokiin: tila on yhä oikea (myöhempi rivi
+/// voittaa replayssa), mutta tiedosto kasvaa rajatta ja replay muuttuu O(n):ksi
+/// rivimäärässä — ei elävien kirjausten määrässä.
+/// [`compact`](JournalPendingStore::compact) kirjoittaa lokin uudelleen
+/// sisältämään **vain elävät kirjaukset** (kuolleet/tombstonatut/korvatut rivit
+/// pudotetaan) atomisesti [`FileJournal::rewrite`]:n kautta — elävä tila säilyy
+/// bitilleen, eikä keskeytyminen koskaan menetä eläviä rivejä (rename-pohjainen
+/// swap). Tiivistys laukeaa joko operaattorin kutsumana
+/// ([`compact`](JournalPendingStore::compact)) tai **automaattisesti** lisäyksen
+/// ja häädön yhteydessä kun kuolleiden rivien osuus ylittää kynnyksen (ks.
+/// `AUTO_COMPACT_FACTOR` ja [`with_auto_compact_factor`](JournalPendingStore::with_auto_compact_factor)).
+///
 /// ## Salaisuusinvariantti
 /// Levylle kirjoitetaan vain [`PendingRecord`]:n salaisuudettomat kentät
 /// (payloadin tiiviste, tunnisteet, redaktoitu tiivistelmä, aikaleimat) — ei
-/// koskaan raakaa payloadia.
+/// koskaan raakaa payloadia. Tiivistys säilyttää tämän: uudelleenkirjoitettu loki
+/// sisältää samat salaisuudettomat `pending_approval_put`-rivit.
 pub struct JournalPendingStore {
     /// Append-only-loki johon lisäykset ja poistot kirjataan.
     journal: FileJournal,
@@ -494,6 +534,9 @@ pub struct JournalPendingStore {
     next_step: Mutex<StepId>,
     /// Kapasiteettikatto.
     capacity: PendingCapacity,
+    /// Auto-tiivistyksen kerroin: tiivistä kun `rivit > factor * elävät`.
+    /// `0` poistaa auto-tiivistyksen käytöstä (vain manuaalinen `compact`).
+    auto_compact_factor: usize,
 }
 
 impl std::fmt::Debug for JournalPendingStore {
@@ -539,7 +582,21 @@ impl JournalPendingStore {
             journal,
             next_step: Mutex::new(next),
             capacity,
+            auto_compact_factor: AUTO_COMPACT_FACTOR,
         })
+    }
+
+    /// Asettaa auto-tiivistyksen kertoimen (ketjutus).
+    ///
+    /// Loki tiivistetään automaattisesti kun fyysisten rivien määrä ylittää
+    /// `factor * elävien_kirjausten_määrä` (ja rivejä on vähintään
+    /// `AUTO_COMPACT_MIN_ROWS`). Oletus on `AUTO_COMPACT_FACTOR` (2). Arvo `0`
+    /// **poistaa** auto-tiivistyksen käytöstä — tällöin loki tiivistetään vain
+    /// [`compact`](Self::compact)-kutsulla.
+    #[must_use]
+    pub const fn with_auto_compact_factor(mut self, factor: usize) -> Self {
+        self.auto_compact_factor = factor;
+        self
     }
 
     /// Palauttaa lokin tiedostopolun.
@@ -577,6 +634,22 @@ impl JournalPendingStore {
             .journal
             .replay_all()
             .map_err(|e| ActionError::Proof(format!("replay pending journal failed: {e}")))?;
+        Self::reconstruct_state(entries)
+    }
+
+    /// Rakentaa nykytilan annetuista journal-riveistä (puhdas funktio, ei I/O).
+    ///
+    /// Toisto käy rivit järjestyksessä: `pending_approval_put` lisää/korvaa
+    /// kirjauksen, `pending_approval_delete` poistaa sen (tombstone). Muut rivit
+    /// ohitetaan. Myöhempi rivi voittaa, joten poisto kumoaa aiemman lisäyksen.
+    /// Eriytetty [`replay_state`](Self::replay_state):stä jotta sekä levyltä
+    /// lukeva replay että [`compact`](Self::compact):n
+    /// [`FileJournal::compact_with`]-suljin voivat rakentaa tilan **samalla
+    /// logiikalla** — jälkimmäinen saa rivit valmiiksi luettuina lukon alta, eikä
+    /// saa lukea journalia uudelleen (deadlock).
+    fn reconstruct_state(
+        entries: Vec<JournalEntry>,
+    ) -> Result<HashMap<ApprovalId, PendingRecord>> {
         let mut state: HashMap<ApprovalId, PendingRecord> = HashMap::new();
         for entry in entries {
             let EntryKind::Marker { name, payload } = entry.kind else {
@@ -600,6 +673,116 @@ impl JournalPendingStore {
         }
         Ok(state)
     }
+
+    /// Fyysisten journal-rivien määrä (eläviä + kuolleita). Tämä on se luku jota
+    /// vasten dead-row-suhde mitataan; eroaa [`len`](PendingApprovalStore::len):
+    /// stä joka palauttaa vain elävien kirjausten määrän.
+    fn physical_row_count(&self) -> Result<usize> {
+        self.journal
+            .len()
+            .map_err(|e| ActionError::Proof(format!("read pending journal len failed: {e}")))
+    }
+
+    /// Kirjoittaa lokin uudelleen sisältämään **vain elävät kirjaukset**
+    /// (tiivistys), pudottaen kaikki kuolleet rivit (tombstonet ja korvatut
+    /// `put`-rivit). Palauttaa pudotettujen kuolleiden rivien määrän.
+    ///
+    /// Elävä tila säilyy bitilleen: tiivistyksen jälkeen täsmälleen samat
+    /// hyväksynnät ovat [`get`](PendingApprovalStore::get)-haettavissa, ja
+    /// uudelleenlatauksesta (restart) rekonstruoituu identtinen tila. Tiivistys
+    /// on **atominen** ([`FileJournal::rewrite`]: temp + fsync + rename) — jos
+    /// prosessi kaatuu kesken, elävä tiedosto on yhä ehjässä vanhassa tilassaan
+    /// eikä yhtään elävää hyväksyntää katoa.
+    ///
+    /// Rivit uudelleennumeroidaan tiiviiksi `0..N`-sekvenssiksi, ja sisäinen
+    /// sekvenssikursori asetetaan vastaamaan, jotta tulevat lisäykset jatkavat
+    /// oikealta paikalta.
+    ///
+    /// # Errors
+    /// [`ActionError::Proof`] jos lokin luku, rivien sarjallistus tai atominen
+    /// uudelleenkirjoitus epäonnistuu. Virhetilanteessa elävä loki jätetään
+    /// entiselleen (rewrite ei koske elävään tiedostoon ennen kuin temp on ehjä).
+    pub fn compact(&self) -> Result<usize> {
+        // Atominen tiivistys appendeja vastaan: [`FileJournal::compact_with`]
+        // pitää saman file-lukon koko luku→suodatus→swap-operaation ajan, joten
+        // rinnakkainen lisäys/poisto ei voi laskeutua aukkoon ja kadota
+        // (TOCTOU-korjaus). `build`-suljin saa luetut rivit, rekonstruoi elävän
+        // tilan ja palauttaa uudelleennumeroidut elävät PENDING_PUT-rivit.
+        //
+        // Sekvenssikursorin asetus tehdään ERIKSEEN sulkimen ulkopuolella: suljin
+        // EI saa lukita journalia uudelleen, mutta `next_step` on eri mutex kuin
+        // file-lukko, joten sen päivittäminen sulkimen sisältä OLISI turvallista —
+        // mutta tehdään se silti `compact_with`:n PALUUN jälkeen jotta kursori
+        // päivittyy vain kun swap tosiasiassa onnistui.
+        // Elävien rivien määrä smugletaan sulkimesta `Cell`:llä, jotta
+        // sekvenssikursori voidaan asettaa swapin jälkeen (suljin EI saa lukita
+        // journalia uudelleen → ei voi lukea kursoria omalta polultaan).
+        let live_count = std::cell::Cell::new(0usize);
+        let dropped = self
+            .journal
+            .compact_with(|entries| {
+                // Rekonstruoi elävä tila valmiiksi luetuista riveistä (sama
+                // logiikka kuin replayssa, mutta EI uudelleenlukua — uudelleenluku
+                // lukitsisi journalin ja deadlockkaisi). ActionError kääritään
+                // DurableError-tekstiksi jotta tyyppi sopii compact_with-sopimukseen.
+                let state = Self::reconstruct_state(entries).map_err(|e| {
+                    familyclaw_durable::DurableError::step_failed(
+                        "compact_reconstruct",
+                        e.to_string(),
+                    )
+                })?;
+                // Yksi PENDING_PUT-rivi per elävä kirjaus, uudelleennumeroituna 0..N.
+                let mut kept = Vec::with_capacity(state.len());
+                let mut step = StepId::ZERO;
+                for record in state.values() {
+                    let payload = serde_json::to_value(record)?;
+                    kept.push(JournalEntry::marker(step, PENDING_PUT, payload));
+                    step = step.next();
+                }
+                live_count.set(kept.len());
+                Ok(kept)
+            })
+            .map_err(|e| ActionError::Proof(format!("compact pending journal failed: {e}")))?;
+
+        // Sekvenssikursori osoittamaan tiivistetyn lokin perään (= elävien määrä,
+        // koska rivit uudelleennumeroitiin tiiviisti 0..N).
+        {
+            let mut guard = self
+                .next_step
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = StepId::new(u64::try_from(live_count.get()).unwrap_or(u64::MAX));
+        }
+
+        Ok(dropped)
+    }
+
+    /// Tiivistää lokin **jos** kuolleiden rivien osuus ylittää kynnyksen.
+    ///
+    /// Laukaisuehto: `auto_compact_factor > 0` JA fyysisiä rivejä on vähintään
+    /// [`AUTO_COMPACT_MIN_ROWS`] JA `rivit > factor * elävät`. Muuten ei tee
+    /// mitään. Kutsutaan lisäyksen ja häädön jälkeen, jotta kuolleet rivit eivät
+    /// kerry rajatta. Auto-tiivistyksen epäonnistuminen **ei** kaada kutsujaa:
+    /// data on jo turvallisesti lokissa, joten tiivistys on pelkkä optimointi —
+    /// virhe niellään (loki vain pysyy tiivistämättömänä tällä kertaa).
+    fn maybe_auto_compact(&self) {
+        if self.auto_compact_factor == 0 {
+            return;
+        }
+        let Ok(rows) = self.physical_row_count() else {
+            return;
+        };
+        if rows < AUTO_COMPACT_MIN_ROWS {
+            return;
+        }
+        let Ok(live) = self.replay_state().map(|s| s.len()) else {
+            return;
+        };
+        if rows > self.auto_compact_factor.saturating_mul(live) {
+            // Tiivistä; virhe niellään (data on jo lokissa, tiivistys on optimointi).
+            let _ = self.compact();
+        }
+    }
 }
 
 impl PendingApprovalStore for JournalPendingStore {
@@ -616,7 +799,10 @@ impl PendingApprovalStore for JournalPendingStore {
         }
         let payload = serde_json::to_value(&record)
             .map_err(|e| ActionError::Proof(format!("encode pending record failed: {e}")))?;
-        self.append_marker(PENDING_PUT, payload)
+        self.append_marker(PENDING_PUT, payload)?;
+        // Korvaus jätti kuolleen rivin (vanha put) → harkitse auto-tiivistystä.
+        self.maybe_auto_compact();
+        Ok(())
     }
 
     fn get(&self, approval_id: ApprovalId) -> Result<Option<PendingRecord>> {
@@ -631,6 +817,8 @@ impl PendingApprovalStore for JournalPendingStore {
                 ActionError::Proof(format!("encode pending delete id failed: {e}"))
             })?;
             self.append_marker(PENDING_DELETE, payload)?;
+            // Tombstone on kuollut rivi → harkitse auto-tiivistystä.
+            self.maybe_auto_compact();
         }
         Ok(existing)
     }
@@ -655,6 +843,10 @@ impl PendingApprovalStore for JournalPendingStore {
                 ActionError::Proof(format!("encode pending delete id failed: {e}"))
             })?;
             self.append_marker(PENDING_DELETE, payload)?;
+        }
+        if !expired.is_empty() {
+            // Häätö tuotti tombstoneja (kuolleita rivejä) → harkitse tiivistystä.
+            self.maybe_auto_compact();
         }
         Ok(expired.len())
     }
@@ -960,6 +1152,269 @@ mod tests {
         assert!(resumed.get(short_id).expect("get").is_none());
         assert!(resumed.get(long_id).expect("get").is_some());
         assert_eq!(resumed.len().expect("len"), 1);
+    }
+
+    // ---- Compaction ----
+
+    /// Laskee fyysiset (eläviä + kuolleita) journal-rivit lukemalla tiedoston.
+    fn physical_rows(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .map_or(0, |s| s.lines().filter(|l| !l.trim().is_empty()).count())
+    }
+
+    #[test]
+    fn compact_drops_dead_rows_keeps_live_entries() {
+        let tmp = TempPath::new("compact-basic");
+        let now = at(1_700_000_000);
+        // Auto-tiivistys pois päältä, jotta hallitaan tiivistys käsin.
+        let store = JournalPendingStore::open(tmp.path())
+            .expect("open")
+            .with_auto_compact_factor(0);
+
+        // Kirjaa N kirjausta, poista puolet → kuolleita rivejä kertyy.
+        let mut ids = Vec::new();
+        for _ in 0..10 {
+            let record = record_at(now, Duration::minutes(60));
+            ids.push(record.approval_id());
+            store.insert(record).expect("insert");
+        }
+        // Poista ensimmäiset 5 (10 put + 5 delete = 15 fyysistä riviä).
+        for id in ids.iter().take(5) {
+            store.remove(*id).expect("remove");
+        }
+        assert_eq!(physical_rows(tmp.path()), 15, "10 put + 5 tombstone");
+        assert_eq!(store.len().expect("len"), 5, "5 live remain");
+
+        // Tiivistä: 10 kuollutta riviä (5 poistettua put + 5 tombstone) pudotetaan.
+        let dropped = store.compact().expect("compact");
+        assert_eq!(dropped, 10, "15 rows → 5 live rows = 10 dropped");
+        assert_eq!(physical_rows(tmp.path()), 5, "only live rows remain on disk");
+        assert_eq!(store.len().expect("len"), 5, "live count unchanged");
+
+        // Kaikki elävät kirjaukset yhä haettavissa, poistetut eivät.
+        for id in ids.iter().take(5) {
+            assert!(store.get(*id).expect("get").is_none(), "removed gone");
+        }
+        for id in ids.iter().skip(5) {
+            assert!(store.get(*id).expect("get").is_some(), "live still present");
+        }
+    }
+
+    #[test]
+    fn compact_preserves_exact_state_across_reload() {
+        let tmp = TempPath::new("compact-reload");
+        let now = at(1_700_000_000);
+
+        let live_ids = {
+            let store = JournalPendingStore::open(tmp.path())
+                .expect("open 1")
+                .with_auto_compact_factor(0);
+            let mut ids = Vec::new();
+            for _ in 0..6 {
+                let record = record_at(now, Duration::minutes(60));
+                ids.push(record.approval_id());
+                store.insert(record).expect("insert");
+            }
+            // Poista kolme.
+            for id in ids.iter().take(3) {
+                store.remove(*id).expect("remove");
+            }
+            store.compact().expect("compact");
+            ids
+        };
+
+        // Restart pelkästä tiivistetystä tiedostosta → identtinen tila.
+        let resumed = JournalPendingStore::open(tmp.path()).expect("open 2");
+        assert_eq!(resumed.len().expect("len"), 3, "3 live survive compaction+reload");
+        for id in live_ids.iter().take(3) {
+            assert!(resumed.get(*id).expect("get").is_none(), "removed stay removed");
+        }
+        for id in live_ids.iter().skip(3) {
+            assert!(resumed.get(*id).expect("get").is_some(), "live stay live");
+        }
+        // Vain elävät rivit levyllä.
+        assert_eq!(physical_rows(tmp.path()), 3);
+    }
+
+    #[test]
+    fn compact_is_atomic_temp_then_rename() {
+        // Tiivistys EI saa jättää temp-tiedostoa lojumaan eikä turmella elävää
+        // tiedostoa: rewrite kirjoittaa temppiin, fsyncaa, ja vasta sitten
+        // nimeää atomisesti. Jokainen rivi tiivistyksen jälkeen on ehjä JSON.
+        let tmp = TempPath::new("compact-atomic");
+        let now = at(1_700_000_000);
+        let store = JournalPendingStore::open(tmp.path())
+            .expect("open")
+            .with_auto_compact_factor(0);
+
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            let record = record_at(now, Duration::minutes(60));
+            ids.push(record.approval_id());
+            store.insert(record).expect("insert");
+        }
+        for id in &ids {
+            store.remove(*id).expect("remove");
+        }
+        // Lisää yksi elävä takaisin.
+        let live = record_at(now, Duration::minutes(60));
+        let live_id = live.approval_id();
+        store.insert(live).expect("insert live");
+
+        store.compact().expect("compact");
+
+        // Jokainen levyllä oleva rivi jäsentyy ehjäksi (ei puolikasta renamesta).
+        let on_disk = std::fs::read_to_string(tmp.path()).expect("read");
+        for line in on_disk.lines().filter(|l| !l.trim().is_empty()) {
+            serde_json::from_str::<JournalEntry>(line).expect("intact json line");
+        }
+        // Vain elävä kirjaus jäljellä, haettavissa.
+        assert_eq!(store.len().expect("len"), 1);
+        assert!(store.get(live_id).expect("get").is_some());
+
+        // Ei orpoa temp-tiedostoa tämän lokin nimellä.
+        let dir = tmp.path().parent().expect("parent");
+        let own = tmp
+            .path()
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        let leftover: Vec<_> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&own) && n.contains(".compact-") && n.contains(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "no temp left: {leftover:?}");
+    }
+
+    #[test]
+    fn compact_drops_expired_entries() {
+        // Tiivistys EI itse häädä vanhentuneita, mutta evict_expired tombstonaa
+        // ne ja sitä seuraava tiivistys pudottaa sekä tombstonet että kuolleet
+        // put-rivit — joten vanhentuneet katoavat levyltä tiivistyksessä.
+        let tmp = TempPath::new("compact-expired");
+        let now = at(1_700_000_000);
+        let store = JournalPendingStore::open(tmp.path())
+            .expect("open")
+            .with_auto_compact_factor(0);
+
+        let short = record_at(now, Duration::seconds(60));
+        let short_id = short.approval_id();
+        let long = record_at(now, Duration::seconds(3600));
+        let long_id = long.approval_id();
+        store.insert(short).expect("insert short");
+        store.insert(long).expect("insert long");
+
+        // Häädä vanhentunut → tombstone. Sitten tiivistä.
+        assert_eq!(store.evict_expired(at(1_700_000_120)).expect("evict"), 1);
+        store.compact().expect("compact");
+
+        // Vanhentunut on poissa sekä tilasta että levyltä; voimassa oleva säilyy.
+        assert!(store.get(short_id).expect("get").is_none());
+        assert!(store.get(long_id).expect("get").is_some());
+        assert_eq!(physical_rows(tmp.path()), 1, "only the live entry remains");
+        // Vanhentuneen tiivistetiiviste/tunniste ei näy enää levyllä.
+        let on_disk = std::fs::read_to_string(tmp.path()).expect("read");
+        assert!(!on_disk.contains(&short_id.to_string()), "expired id gone from disk");
+    }
+
+    #[test]
+    fn auto_compact_triggers_when_dead_rows_exceed_threshold() {
+        // Oletuskerroin (2) + insert/remove-sykli kasvattaa kuolleita rivejä,
+        // kunnes auto-tiivistys laukeaa ja kutistaa lokin elävän tilan tasolle.
+        let tmp = TempPath::new("auto-compact");
+        let now = at(1_700_000_000);
+        let store = JournalPendingStore::open(tmp.path()).expect("open"); // default factor
+
+        // Pidä vain muutama elävä, mutta tee paljon insert/remove-pareja → kun
+        // fyysisiä rivejä > 2*elävät JA >= AUTO_COMPACT_MIN_ROWS, tiivistys laukeaa.
+        // Yksi pysyvä elävä:
+        let keeper = record_at(now, Duration::minutes(60));
+        let keeper_id = keeper.approval_id();
+        store.insert(keeper).expect("insert keeper");
+
+        // 100 insert+remove paria = 200 kuollutta riviä jos ei tiivistystä.
+        for _ in 0..100 {
+            let r = record_at(now, Duration::minutes(60));
+            let id = r.approval_id();
+            store.insert(r).expect("insert churn");
+            store.remove(id).expect("remove churn");
+        }
+
+        // Auto-tiivistyksen ansiosta fyysisiä rivejä on PALJON vähemmän kuin 201.
+        let rows = physical_rows(tmp.path());
+        assert!(
+            rows < 50,
+            "auto-compaction should keep the log small, got {rows} rows"
+        );
+        // Elävä keeper säilyi koko ajan.
+        assert!(store.get(keeper_id).expect("get").is_some());
+        assert_eq!(store.len().expect("len"), 1);
+    }
+
+    #[test]
+    fn compact_on_empty_log_is_noop() {
+        let tmp = TempPath::new("compact-empty");
+        let store = JournalPendingStore::open(tmp.path()).expect("open");
+        assert_eq!(store.compact().expect("compact"), 0);
+        assert!(store.is_empty().expect("empty"));
+        assert_eq!(physical_rows(tmp.path()), 0);
+    }
+
+    /// TOCTOU-aukon sulkemisen regressio: tiivistys lukee tilan ja kirjoittaa
+    /// lokin uudelleen **saman file-lukon alla** ([`FileJournal::compact_with`]),
+    /// joten rinnakkainen lisäys ei voi laskeutua aukkoon ja kadota. Tässä ei aja
+    /// oikeaa rinnakkaisuutta (race on epädeterministinen) — todistetaan sen
+    /// sijaan rakenteesta seuraava havaittava invariantti: tiivistyksen PALUUN
+    /// JÄLKEEN tehty lisäys laskeutuu tiivistettyjen elävien rivien PERÄÄN, ja
+    /// uudelleenlataus tuottaa täsmälleen oikean tilan (sekä tiivistetyt elävät
+    /// ETTÄ tiivistyksen jälkeen lisätty). Concurrent-append-turvallisuus seuraa
+    /// nyt yhden-lukon-pidosta, ei vapaaehtoisesta ajoituksesta.
+    #[test]
+    fn compact_then_append_does_not_lose_post_compact_insert() {
+        let tmp = TempPath::new("compact-toctou");
+        let now = at(1_700_000_000);
+        let store = JournalPendingStore::open(tmp.path())
+            .expect("open")
+            .with_auto_compact_factor(0);
+
+        // Kuusi lisäystä, poista kolme → kuolleita rivejä kertyy.
+        let mut ids = Vec::new();
+        for _ in 0..6 {
+            let record = record_at(now, Duration::minutes(60));
+            ids.push(record.approval_id());
+            store.insert(record).expect("insert");
+        }
+        for id in ids.iter().take(3) {
+            store.remove(*id).expect("remove");
+        }
+        assert_eq!(store.len().expect("len"), 3, "3 live before compact");
+
+        // Tiivistä (atominen, yhden lukon alla).
+        let dropped = store.compact().expect("compact");
+        assert_eq!(dropped, 6, "9 rows (6 put + 3 tombstone) → 3 live = 6 dropped");
+        assert_eq!(physical_rows(tmp.path()), 3, "only live rows after compact");
+
+        // Tiivistyksen JÄLKEEN lisätty kirjaus laskeutuu elävien PERÄÄN (ei katoa).
+        let post = record_at(now, Duration::minutes(60));
+        let post_id = post.approval_id();
+        store.insert(post).expect("insert after compact");
+        assert_eq!(store.len().expect("len"), 4, "3 live + 1 post-compact");
+        assert!(store.get(post_id).expect("get").is_some(), "post-compact insert present");
+
+        // Uudelleenlataus tuottaa TÄSMÄLLEEN oikean tilan: tiivistetyt elävät +
+        // tiivistyksen jälkeen lisätty; poistetut pysyvät poissa.
+        let resumed = JournalPendingStore::open(tmp.path()).expect("reopen");
+        assert_eq!(resumed.len().expect("len"), 4);
+        for id in ids.iter().take(3) {
+            assert!(resumed.get(*id).expect("get").is_none(), "removed stay removed");
+        }
+        for id in ids.iter().skip(3) {
+            assert!(resumed.get(*id).expect("get").is_some(), "live stay live");
+        }
+        assert!(resumed.get(post_id).expect("get").is_some(), "post-compact survives reload");
     }
 
     // ---- Rate limiter ----

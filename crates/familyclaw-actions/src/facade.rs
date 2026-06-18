@@ -41,7 +41,9 @@ use crate::error::{ActionError, Result};
 use crate::executor::ActionExecutor;
 use crate::ids::{ActionTaskId, ApprovalId, SkillId};
 use crate::mcp::McpToolDescriptor;
-use crate::pending_store::{InMemoryPendingStore, PendingApprovalStore, PendingRecord};
+use crate::pending_store::{
+    DangerousToolRateLimiter, InMemoryPendingStore, PendingApprovalStore, PendingRecord,
+};
 use crate::policy::{ActionRisk, SkillPermission};
 use crate::proof::ProofBundle;
 use crate::skills::{
@@ -57,6 +59,33 @@ pub(crate) const SCAFFOLDED: bool = true;
 /// Hyväksyntäpyynnön oletus-TTL kun operaattori myöntää hyväksynnän
 /// (`submit-task` jättää tehtävän odottamaan; hyväksyntä on voimassa tämän ajan).
 const DEFAULT_APPROVAL_TTL_MINUTES: i64 = 60;
+
+/// Vaarallisten (hyväksyntää vaativien) työkalukutsujen per-olento-rate-limitin
+/// **liukuvan ikkunan** oletuspituus sekunteina (1 tunti).
+///
+/// Yhdessä [`DEFAULT_DANGEROUS_TOOL_LIMIT`]:n kanssa tämä muodostaa
+/// tarkoituksella **sallivan oletuksen**: ihmissilmukassa yksi olento ei
+/// käytännössä lähetä satoja hyväksyntää vaativia toimintoja tunnissa, joten
+/// oletus ei häiritse normaalia käyttöä mutta katkaisee selvän tulvituksen.
+const DEFAULT_DANGEROUS_TOOL_WINDOW_SECS: i64 = 3_600;
+
+/// Vaarallisten työkalukutsujen per-olento-rate-limitin **oletuskatto** yhdessä
+/// ikkunassa ([`DEFAULT_DANGEROUS_TOOL_WINDOW_SECS`]).
+///
+/// Saliva oletus (256 hyväksyntää vaativaa toimintoa per olento per tunti):
+/// reilusti normaalin ihmissilmukan yläpuolella mutta rajaa silti yhden olennon
+/// kyvyn tulvittaa hyväksyntöjen jonoa. Operaattori voi tiukentaa tätä
+/// ([`ActionRuntime::with_rate_limiter`]).
+const DEFAULT_DANGEROUS_TOOL_LIMIT: usize = 256;
+
+/// Geneerinen oletus-olentotunniste rate-limit-laskennassa, kun kutsuja ei anna
+/// nimenomaista olentoa ([`ActionRuntime::submit_task`]).
+///
+/// Tarkoituksella neutraali (**ei** perheenjäsenen nimeä): kaikki saman
+/// ajoympäristön kautta nimettömästi lähetetyt vaaralliset toiminnot jakavat
+/// tämän kiintiön. Anna oikea olento [`ActionRuntime::submit_task_as`]:lla, kun
+/// useampi olento jakaa saman ajoympäristön ja kullekin halutaan oma kiintiö.
+const DEFAULT_BEING_ID: &str = "operator";
 
 /// Yhden taidon tiivistetty kuvaus operaattorin luettelointia varten.
 ///
@@ -149,6 +178,30 @@ pub struct ActionRuntime {
     /// prosessi olisi kaatunut `submit-task`:n ja `approve`:n välissä.
     /// `None` → in-memory-jono (ei selviä kaatumisesta), kuten oletuksena.
     durable_queue: Option<DurableTaskQueue>,
+    /// **Per-olento-rate-limit vaarallisille (hyväksyntää vaativille)
+    /// työkalukutsuille.** Tarkistetaan `submit-task`:ssa **ennen** hyväksynnän
+    /// myöntämistä: jos olento on jo käyttänyt kiintiönsä liukuvassa ikkunassa,
+    /// `submit-task` hylkää fail-closed ([`ActionError::PolicyDenied`]) myöntämättä
+    /// hyväksyntää eikä jätä tehtävää odottamaan.
+    ///
+    /// Kapasiteettikatto ([`crate::pending_store::PendingCapacity`]) on **globaali**
+    /// (koko jono); tämä rajoitin lisää siihen **per-olento**-katon, jottei yksi
+    /// olento voi yksin täyttää jonoa. Auto-run-tehtäviä (luku / paikallinen
+    /// kirjoitus) ei rate-limititä — vain ne jotka jäisivät odottamaan ihmisen
+    /// hyväksyntää.
+    ///
+    /// Oletus on **salliva** ([`DEFAULT_DANGEROUS_TOOL_WINDOW_SECS`] /
+    /// [`DEFAULT_DANGEROUS_TOOL_LIMIT`]); operaattori voi tiukentaa sen
+    /// [`ActionRuntime::with_rate_limiter`]:lla.
+    rate_limiter: DangerousToolRateLimiter,
+    /// **Oletus-olentotunniste** rate-limit-laskennassa kun
+    /// [`ActionRuntime::submit_task`]:ia kutsutaan ilman nimenomaista olentoa.
+    ///
+    /// Oletus on geneerinen [`DEFAULT_BEING_ID`] (ei perheenjäsenen nimeä). Käytä
+    /// [`ActionRuntime::submit_task_as`]:ia antaaksesi olennon per kutsu, tai
+    /// [`ActionRuntime::with_being_id`]:tä asettaaksesi tämän ajoympäristön
+    /// oletusolennon.
+    being_id: String,
 }
 
 impl Default for ActionRuntime {
@@ -161,6 +214,11 @@ impl Default for ActionRuntime {
             proofs: HashMap::new(),
             pending: Box::new(InMemoryPendingStore::new()),
             durable_queue: None,
+            rate_limiter: DangerousToolRateLimiter::new(
+                DEFAULT_DANGEROUS_TOOL_WINDOW_SECS,
+                DEFAULT_DANGEROUS_TOOL_LIMIT,
+            ),
+            being_id: DEFAULT_BEING_ID.to_string(),
         }
     }
 }
@@ -173,6 +231,8 @@ impl std::fmt::Debug for ActionRuntime {
             .field("proofs", &self.proofs.len())
             .field("pending_count", &self.pending.len().unwrap_or(0))
             .field("durable_queue", &self.durable_queue)
+            .field("rate_limiter", &self.rate_limiter)
+            .field("being_id", &self.being_id)
             .finish()
     }
 }
@@ -203,6 +263,43 @@ impl ActionRuntime {
             pending,
             ..Self::default()
         }
+    }
+
+    /// Vaihtaa ajoympäristön **vaarallisten työkalukutsujen rate-limitin**
+    /// (per-olento, liukuva ikkuna) annettuun rajoittimeen ja palauttaa itsensä
+    /// (builder-tyyli).
+    ///
+    /// Tämä on operaattorin koukku tiukentaa (tai löysentää) sallivaa oletusta
+    /// (`DEFAULT_DANGEROUS_TOOL_WINDOW_SECS` / `DEFAULT_DANGEROUS_TOOL_LIMIT`).
+    /// Rajoitin tarkistetaan `submit-task`:ssa **ennen** hyväksynnän myöntämistä
+    /// vain niille tehtäthe operator jotka jäisivät odottamaan ihmisen hyväksyntää —
+    /// auto-run-tehtäviä (luku / paikallinen kirjoitus) ei rate-limititä.
+    ///
+    /// ```
+    /// # use familyclaw_actions::ActionRuntime;
+    /// # use familyclaw_actions::pending_store::DangerousToolRateLimiter;
+    /// // Korkeintaan 3 hyväksyntää vaativaa toimintoa per olento per 60 s.
+    /// let runtime = ActionRuntime::new()
+    ///     .with_rate_limiter(DangerousToolRateLimiter::new(60, 3));
+    /// let _ = runtime;
+    /// ```
+    #[must_use]
+    pub fn with_rate_limiter(mut self, rate_limiter: DangerousToolRateLimiter) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
+    /// Asettaa ajoympäristön **oletus-olentotunnisteen** rate-limit-laskentaa
+    /// varten ja palauttaa itsensä (builder-tyyli).
+    ///
+    /// Tätä olentoa käytetään kun [`ActionRuntime::submit_task`]:ia kutsutaan
+    /// ilman nimenomaista olentoa. Käytä geneeristä, **ei-henkilökohtaista**
+    /// tunnistetta (esim. `"agent-a"` / `"operator"`). Per-kutsu-olennon voi antaa
+    /// suoraan [`ActionRuntime::submit_task_as`]:lla ilman tätä asetusta.
+    #[must_use]
+    pub fn with_being_id(mut self, being_id: impl Into<String>) -> Self {
+        self.being_id = being_id.into();
+        self
     }
 
     /// Luo ajoympäristön **täysin kaatumiskestävällä** suspend/resume-tilalla:
@@ -257,6 +354,11 @@ impl ActionRuntime {
             proofs: HashMap::new(),
             pending,
             durable_queue: Some(durable_queue),
+            rate_limiter: DangerousToolRateLimiter::new(
+                DEFAULT_DANGEROUS_TOOL_WINDOW_SECS,
+                DEFAULT_DANGEROUS_TOOL_LIMIT,
+            ),
+            being_id: DEFAULT_BEING_ID.to_string(),
         })
     }
 
@@ -431,7 +533,9 @@ impl ActionRuntime {
             .min()
     }
 
-    /// Lähettää tehtävän annetulle taidolle ja ajaa putken.
+    /// Lähettää tehtävän annetulle taidolle ja ajaa putken **tämän
+    /// ajoympäristön oletusolennon** ([`ActionRuntime::with_being_id`], oletus
+    /// `DEFAULT_BEING_ID`) nimissä rate-limit-laskennassa.
     ///
     /// Jos taidon riskiluokka sallii auto-runin, putki suorittaa toiminnon
     /// loppuun ja todiste tallennetaan. Jos käytäntö vaatii ihmisen
@@ -440,11 +544,51 @@ impl ActionRuntime {
     /// palautetaan ([`SubmitOutcome::pending_approval`]); suorituksen voi
     /// jatkaa [`ActionRuntime::approve`]-kutsulla.
     ///
+    /// Kun usea olento jakaa saman ajoympäristön ja kullekin halutaan **oma**
+    /// rate-limit-kiintiö, käytä [`ActionRuntime::submit_task_as`]:ia ja anna
+    /// olento eksplisiittisesti.
+    ///
     /// # Errors
     /// - [`ActionError::UnknownSkill`] jos taitoa ei ole rekisteröity.
+    /// - [`ActionError::PolicyDenied`] jos tehtävä vaatisi hyväksynnän mutta
+    ///   olento on jo käyttänyt vaarallisten työkalujen rate-limit-kiintiönsä.
     /// - Putken jono-, suoritus- tai todistevirheet.
     pub async fn submit_task(
         &mut self,
+        skill_id: SkillId,
+        payload: Value,
+        now: Timestamp,
+    ) -> Result<SubmitOutcome> {
+        let being = self.being_id.clone();
+        self.submit_task_as(&being, skill_id, payload, now).await
+    }
+
+    /// Kuten [`ActionRuntime::submit_task`], mutta lähettää tehtävän
+    /// **nimenomaisen olennon** (`being`) nimissä rate-limit-laskennassa.
+    ///
+    /// Tämä on se kohta jossa vaarallisten (hyväksyntää vaativien)
+    /// työkalukutsujen **per-olento-rate-limit** kytkeytyy hyväksyntäpolkuun: jos
+    /// putki ratkaisee että tehtävä jää odottamaan ihmisen hyväksyntää, julkisivu
+    /// kysyy ensin rajoittimelta ([`DangerousToolRateLimiter::check_and_record`])
+    /// onko `being`-olennolla vielä tilaa liukuvassa ikkunassa. Jos kiintiö on
+    /// täynnä, hyväksyntää **ei** myönnetä eikä tehtävää jätetä odottamaan —
+    /// kutsu hylätään fail-closed ([`ActionError::PolicyDenied`]). Näin yksi
+    /// olento ei voi tulvittaa hyväksyntöjen jonoa, vaikka globaali
+    /// kapasiteettikatto ei vielä täyttyisi.
+    ///
+    /// **Auto-run-tehtäviä** (luku / paikallinen kirjoitus, jotka eivät vaadi
+    /// hyväksyntää) **ei** rate-limititä: ne suorittuvat normaalisti loppuun,
+    /// koska ne eivät kasvata hyväksyntöjen jonoa. Rate-limit kohdistuu
+    /// täsmälleen ja vain hyväksyntää vaativiin toimintoihin.
+    ///
+    /// # Errors
+    /// - [`ActionError::UnknownSkill`] jos taitoa ei ole rekisteröity.
+    /// - [`ActionError::PolicyDenied`] jos tehtävä vaatisi hyväksynnän mutta
+    ///   `being` on jo käyttänyt vaarallisten työkalujen rate-limit-kiintiönsä.
+    /// - Putken jono-, suoritus- tai todistevirheet.
+    pub async fn submit_task_as(
+        &mut self,
+        being: &str,
         skill_id: SkillId,
         payload: Value,
         now: Timestamp,
@@ -465,6 +609,11 @@ impl ActionRuntime {
         }
 
         let pending_approval = if outcome.awaiting_approval {
+            // Per-olento-rate-limit: tarkistetaan ENNEN hyväksynnän myöntämistä.
+            // Jos olento on jo täyttänyt kiintiönsä liukuvassa ikkunassa, hylkää
+            // fail-closed — hyväksyntää EI myönnetä eikä tehtävää jätetä jonoon
+            // odottamaan. Auto-run-tehtävät eivät koskaan päädy tähän haaraan.
+            self.rate_limiter.check_and_record(being, now)?;
             let approval = self.pipeline.grant_approval(
                 outcome.action_id,
                 &payload,
@@ -937,6 +1086,131 @@ mod tests {
             runtime.status(submitted.task_id).await,
             Some(TaskStatus::Done)
         );
+    }
+
+    #[tokio::test]
+    async fn per_being_rate_limit_denies_next_approval_required_submit() {
+        // Tiukka rajoitin: korkeintaan 2 hyväksyntää vaativaa toimintoa per olento
+        // 60 s ikkunassa. Kolmas saman olennon hyväksyntää vaativa lähetys
+        // hylätään fail-closed.
+        let mut runtime = ActionRuntime::with_default_skills()
+            .expect("default skills")
+            .with_rate_limiter(DangerousToolRateLimiter::new(60, 2));
+        let now = at(1_700_000_000);
+        let payload = json!({ "bug_report": "Button does nothing" });
+
+        // Kaksi ensimmäistä hyväksyntää vaativaa lähetystä mahtuvat kiintiöön.
+        let first = runtime
+            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload.clone(), now)
+            .await
+            .expect("first approval-required submit fits quota");
+        assert!(first.awaiting_approval(), "first must await approval");
+        let second = runtime
+            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload.clone(), now)
+            .await
+            .expect("second approval-required submit fits quota");
+        assert!(second.awaiting_approval(), "second must await approval");
+
+        // Kolmas ylittää per-olento-kiintiön → PolicyDenied (hyväksyntää ei myönnetä).
+        let err = runtime
+            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload, now)
+            .await
+            .expect_err("third approval-required submit exceeds per-being quota");
+        assert!(matches!(err, ActionError::PolicyDenied(_)));
+
+        // Hyväksyntää ei myönnetty kolmannelle → odottavia on yhä vain kaksi.
+        assert_eq!(
+            runtime.pending_approvals().len(),
+            2,
+            "denied submit must not enqueue a pending approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_is_per_being_separate_quota() {
+        // Rajoitin sallii vain yhden hyväksyntää vaativan toimen per olento per
+        // ikkuna. being-a kuluttaa kiintiönsä; being-b on koskematon (oma kiintiö).
+        let mut runtime = ActionRuntime::with_default_skills()
+            .expect("default skills")
+            .with_rate_limiter(DangerousToolRateLimiter::new(60, 1));
+        let now = at(1_700_000_000);
+        let payload = json!({ "bug_report": "Button does nothing" });
+
+        runtime
+            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload.clone(), now)
+            .await
+            .expect("being-a first fits its quota");
+        // being-a on nyt täynnä.
+        let denied = runtime
+            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload.clone(), now)
+            .await
+            .expect_err("being-a second exceeds quota");
+        assert!(matches!(denied, ActionError::PolicyDenied(_)));
+
+        // ERI olento → oma kiintiö, ei vaikutusta being-a:n täyttymisestä.
+        let other = runtime
+            .submit_task_as("being-b", GithubIssueDraftMock::skill_id(), payload, now)
+            .await
+            .expect("being-b unaffected by being-a quota");
+        assert!(other.awaiting_approval(), "being-b must still get approval");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_window_slides_capacity_returns() {
+        // Yksi hyväksyntää vaativa toimi per 60 s ikkuna. Ikkunan jälkeen kiintiö
+        // palautuu ja sama olento saa taas lähettää.
+        let mut runtime = ActionRuntime::with_default_skills()
+            .expect("default skills")
+            .with_rate_limiter(DangerousToolRateLimiter::new(60, 1));
+        let now = at(1_700_000_000);
+        let payload = json!({ "bug_report": "Button does nothing" });
+
+        runtime
+            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload.clone(), now)
+            .await
+            .expect("first fits quota");
+        // Heti perään sama ikkuna → estetty.
+        let denied = runtime
+            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload.clone(), now)
+            .await
+            .expect_err("second in same window is denied");
+        assert!(matches!(denied, ActionError::PolicyDenied(_)));
+
+        // Ikkunan liu'uttua (now + 61 s) vanha kirjaus häätyy → tilaa taas.
+        let later = at(1_700_000_061);
+        let after = runtime
+            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload, later)
+            .await
+            .expect("capacity returns after window slides");
+        assert!(after.awaiting_approval(), "submit must succeed after window");
+    }
+
+    #[tokio::test]
+    async fn auto_run_tasks_are_not_rate_limited() {
+        // Rajoitin joka estäisi kaikki vaaralliset kutsut (kiintiö 0). Read-only
+        // (auto-run) -tehtävät EIVÄT mene rate-limitin läpi → suorittuvat aina.
+        let mut runtime = ActionRuntime::with_default_skills()
+            .expect("default skills")
+            .with_rate_limiter(DangerousToolRateLimiter::new(60, 0));
+        let now = at(1_700_000_000);
+        let payload = json!({
+            "emails": [
+                { "from": "user@example.com", "subject": "Invoice question", "body": "When is it due?" }
+            ]
+        });
+
+        // Useita peräkkäisiä read-only-lähetyksiä — kiintiö 0 ei estä yhtäkään,
+        // koska ne eivät vaadi hyväksyntää eivätkä kosketa rate-limiteria.
+        for _ in 0..3 {
+            let outcome = runtime
+                .submit_task_as("being-a", EmailTriageMock::skill_id(), payload.clone(), now)
+                .await
+                .expect("read-only auto-run is never rate-limited");
+            assert_eq!(outcome.status, TaskStatus::Done);
+            assert!(!outcome.awaiting_approval());
+        }
+        // Yksikään ei jäänyt odottamaan hyväksyntää.
+        assert!(runtime.pending_approvals().is_empty());
     }
 
     #[tokio::test]

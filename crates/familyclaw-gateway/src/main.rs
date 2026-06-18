@@ -915,7 +915,14 @@ async fn start_runtime() -> Result<(
     }
     let reply_target = reply_target.to_string();
 
-    let agent_cfg = AgentConfig::new(&agent_name, ModelConfig::new(model));
+    // VAKAA olennotunniste: johdetaan deterministisesti agentin nimestä, EI
+    // arvota satunnaisesti. `AgentConfig::new` arpoo id:n joka prosessin
+    // käynnistyksessä — silloin agentin `being_id` muuttuisi joka restartissa,
+    // ja kaatumiskestävälle pinnalle ennen kaatumista tallennettu jatkettava
+    // vuoro EI enää täsmäisi heränneen agentin omistajuustarkistukseen (oma
+    // suspendoitu vuoro näyttäisi "toiselle olennolle kuuluvalta" eikä sitä
+    // voisi koskaan jatkaa). Nimestä johdettu id pysyy vakaana yli restartin.
+    let agent_cfg = AgentConfig::new_with_stable_id(&agent_name, ModelConfig::new(model));
     let soul = load_agent_soul(&agent_name);
     let resolver = build_resolver();
 
@@ -1570,6 +1577,33 @@ mod tests {
             .to_string()
     }
 
+    /// Apuri: lähettää odottavan hyväksynnän **injektoidulla `now`-hetkellä**,
+    /// jotta vanhentumisraja saadaan testissä determinismillä haltuun.
+    ///
+    /// Hyväksynnän `expires_at` lasketaan `now + TTL`:nä lähetyshetkellä, joten
+    /// kaukana menneisyydessä oleva `now` tuottaa hyväksynnän joka on jo
+    /// vanhentunut suhteessa todelliseen nykyhetkeen — juuri tällä `approve`
+    /// päätyy `410 Gone` -haaraan ilman kelloa väärentäviä globaaleja tiloja.
+    async fn submit_pending_at(
+        actions: &Arc<Mutex<ActionRuntime>>,
+        now: familyclaw_core::time::Timestamp,
+    ) -> String {
+        use familyclaw_actions::GithubIssueDraftMock;
+        let mut rt = actions.lock().await;
+        let submitted = rt
+            .submit_task(
+                GithubIssueDraftMock::skill_id(),
+                serde_json::json!({ "bug_report": "Button does nothing" }),
+                now,
+            )
+            .await
+            .expect("submit");
+        submitted
+            .pending_approval
+            .expect("write-external requires approval")
+            .to_string()
+    }
+
     #[tokio::test]
     async fn pending_route_503_without_action_runtime() {
         // Ilman kytkettyä toimintoajoympäristöä → 503 (ei paniikkia).
@@ -1644,6 +1678,23 @@ mod tests {
         let (status, _) =
             approve_pending(State(state), HeaderMap::new(), Path(unknown)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn approve_route_expired_id_is_410() {
+        // Vanhentunut hyväksyntä → 410 Gone (eri syy kuin tuntematon = 404).
+        // Lähetetään odottava hyväksyntä kaukana menneisyydessä olevalla
+        // `now`-hetkellä (epoch), jolloin `expires_at = epoch + TTL` on jo
+        // todellisen nykyhetken takana. `approve_pending` lukee oikean
+        // `familyclaw_core::time::now()`:n → `now > expires_at` → 410, ilman
+        // että hyväksyntää kulutetaan (fail-closed, ei sivuvaikutusta).
+        let (state, actions) = state_with_actions();
+        let past = familyclaw_core::time::from_unix_secs(0).expect("epoch is a valid timestamp");
+        let id = submit_pending_at(&actions, past).await;
+
+        let (status, _) =
+            approve_pending(State(state), HeaderMap::new(), Path(id)).await;
+        assert_eq!(status, StatusCode::GONE);
     }
 
     #[tokio::test]

@@ -103,6 +103,37 @@ impl AgentConfig {
         }
     }
 
+    /// Rakentaa agenttikonfiguraation **vakaalla** (nimestä johdetulla)
+    /// tunnisteella mallilla `model`.
+    ///
+    /// Toisin kuin [`new`](Self::new), tämä EI arvo satunnaista id:tä vaan johtaa
+    /// sen deterministisesti nimestä ([`AgentId::from_name`]). Tämä on
+    /// **tuotannon** oikea konstruktori silloin kun olennon identiteetin (ja
+    /// siitä johdetun `being_id`:n) on pysyttävä vakaana yli prosessin
+    /// uudelleenkäynnistyksen — esimerkiksi jotta kaatumiskestävälle pinnalle
+    /// tallennettu jatkettava vuoro täsmää heränneen agentin omistajuus­
+    /// tarkistukseen eikä jää ikuisesti jatkamatta.
+    pub fn new_with_stable_id(name: impl Into<String>, model: ModelConfig) -> Self {
+        let name = name.into();
+        let id = AgentId::from_name(&name);
+        Self {
+            id,
+            name,
+            model,
+            profile_dir: None,
+        }
+    }
+
+    /// Asettaa vakaan tunnisteen eksplisiittisesti (builder-tyyli).
+    ///
+    /// Käytetään kun tunniste johdetaan ulkoisesti (esim. profiilista) tai kun
+    /// se halutaan kiinnittää testeissä. Säilyttää muut kentät ennallaan.
+    #[must_use]
+    pub fn with_id(mut self, id: AgentId) -> Self {
+        self.id = id;
+        self
+    }
+
     /// Asettaa profiilihakemiston (builder-tyyli).
     #[must_use]
     pub fn with_profile_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -294,6 +325,27 @@ mod tests {
 
         let good_profile = sample_agent("agent_a").with_profile_dir("profiles/agent_a");
         assert!(good_profile.validate().is_ok());
+    }
+
+    #[test]
+    fn new_with_stable_id_is_deterministic_and_distinct() {
+        // VAKAUS: kahdesti rakennettu sama nimi → sama id (simuloi restartia).
+        let a = AgentConfig::new_with_stable_id("agent_a", ModelConfig::new("provider/model"));
+        let b = AgentConfig::new_with_stable_id("agent_a", ModelConfig::new("provider/model"));
+        assert_eq!(a.id, b.id, "vakaa id säilyy yli restartin (sama nimi)");
+        assert_eq!(a.id, AgentId::from_name("agent_a"));
+        // Eri nimi → eri id, jotta sisarukset eivät jaa identiteettiä.
+        let other = AgentConfig::new_with_stable_id("operator", ModelConfig::new("provider/model"));
+        assert_ne!(a.id, other.id);
+        assert!(a.validate().is_ok());
+    }
+
+    #[test]
+    fn with_id_overrides_id_and_preserves_other_fields() {
+        let fixed = AgentId::from_name("being_a");
+        let cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model")).with_id(fixed);
+        assert_eq!(cfg.id, fixed);
+        assert_eq!(cfg.name, "agent_a");
     }
 
     #[test]
