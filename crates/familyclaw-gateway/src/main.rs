@@ -14,20 +14,24 @@
 //! ([`MetricsRegistry::prometheus_export`], deterministinen nimijärjestys).
 //! Laivueen esinimetyt sarjat (luodut/valmistuneet tehtävät, sopimukset,
 //! agenttivuorot, LLM-kutsut, `agents_online`-gauge, …) ovat viennissä alusta
-//! asti arvolla `0`. **Nyt arvot ovat enimmäkseen nollia:** rekisteri on
-//! kytketty jaettuun tilaan, mutta ajonaikaiset tapahtumat eivät vielä
-//! inkrementoi sarjoja automaattisesti (tapahtumapohjainen täyttö
-//! [`EventRecorder`](familyclaw_observability::EventRecorder)-tyyppisellä
-//! sillalla busin päälle on erillinen kytkentä). Reitti on suojaamaton —
-//! mittarit ovat numeerisia aikasarjoja ilman salaisuuksia (ks.
-//! [`metrics_handler`]).
+//! asti arvolla `0`. **Tapahtumapohjainen täyttö on KYTKETTY:**
+//! [`serve`] tilaa siltakerroksen tapahtumaväylän
+//! ([`FamilyBridge`]) [`EventRecorder`]illa
+//! ja antaa SAMAN [`MetricsRegistry`]:n recorderille ja `GatewayState`:lle.
+//! Ajonaikaiset tapahtumat inkrementoivat siis ne sarjat jotka recorder
+//! kartoittaa: agentin rekisteröinti nostaa `agents_online`-gaugea heti
+//! käynnistyksessä, ja siltakerroksen tehtävä-/sopimus-/LLM-tapahtumat
+//! (`task.*`, `contract.*`, `llm.*`, `agent.turn`, `workflow.*`) kasvattavat
+//! vastaavia laskureita. Sarjat joille ei tuoteta tapahtumaa pysyvät nollassa.
+//! Reitti on suojaamaton — mittarit ovat numeerisia aikasarjoja ilman
+//! salaisuuksia (ks. [`metrics_handler`]).
 //!
 //! ```bash
 //! curl -s http://127.0.0.1:8787/metrics
 //! # → # TYPE agents_online gauge
-//! #   agents_online 0
+//! #   agents_online 1          # agentti rekisteröitiin käynnistyksessä
 //! #   # TYPE tasks_created counter
-//! #   tasks_created 0
+//! #   tasks_created 0          # nousee kun siltakerros luo tehtäviä
 //! #   ...
 //! ```
 //!
@@ -113,7 +117,7 @@ use familyclaw_channels::{
     RESPONSE_DEFERRED_CHANNEL_MESSAGE, RESPONSE_PONG,
 };
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
-use familyclaw_observability::MetricsRegistry;
+use familyclaw_observability::{EventRecorder, MetricsRegistry};
 use familyclaw_runtime::{build_family, FamilyRuntime};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -246,10 +250,13 @@ struct GatewayState {
     ///
     /// [`MetricsRegistry`] on `Clone` ja jakaa tilansa `Arc`:n kautta, joten
     /// tämä kahva näkee tarkalleen samat mittarit kuin se instanssi joka
-    /// kasvattaa niitä. Rakennetaan [`MetricsRegistry::with_fleet_defaults`]:lla
-    /// runtimen kokoamisen yhteydessä, joten laivueen sarjat (esim. luodut
-    /// tehtävät, online olevat agentit) ovat viennissä alusta asti arvolla `0`
-    /// — dashboardit eivät "katoa" ennen ensimmäistä tapahtumaa.
+    /// kasvattaa niitä. [`serve`] antaa TÄSMÄLLEEN saman rekisterin myös
+    /// [`EventRecorder`]ille (joka
+    /// tilaa siltakerroksen tapahtumaväylän), joten ajonaikaiset tapahtumat
+    /// inkrementoivat näitä sarjoja elävästi. Rakennetaan
+    /// [`MetricsRegistry::with_fleet_defaults`]:lla, joten laivueen sarjat
+    /// (esim. luodut tehtävät, online olevat agentit) ovat viennissä alusta asti
+    /// arvolla `0` — dashboardit eivät "katoa" ennen ensimmäistä tapahtumaa.
     ///
     /// Vienti on aina turvallinen: [`MetricsRegistry::prometheus_export`]
     /// palauttaa pelkän `String`:n eikä koskaan vuoda salaisuuksia (mittareilla
@@ -771,12 +778,19 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 /// **Mitkä mittarit ovat "eläviä":** rekisteri rakennetaan
 /// [`MetricsRegistry::with_fleet_defaults`]:lla, joten kaikki laivueen
 /// esinimetyt laskurit ja `agents_online`-gauge ovat viennissä alusta asti
-/// (arvolla `0`). Arvot ovat tällä hetkellä **enimmäkseen nollia**: rekisteri
-/// on kytketty jaettuun tilaan, mutta ajonaikaiset tapahtumat (busin liikenne)
-/// eivät vielä inkrementoi näitä sarjoja automaattisesti — `prometheus_export`
-/// palauttaa siis todelliset (joskin nyt nollaiset) laskurit/gaugit. Tapahtuma-
-/// pohjainen täyttö (esim. `familyclaw_observability::EventRecorder` busin
-/// päälle) on erillinen, isompi kytkentä.
+/// (arvolla `0`). Tapahtumapohjainen täyttö on **kytketty**: [`serve`] tilaa
+/// siltakerroksen tapahtumaväylän
+/// [`EventRecorder`]illa ja antaa
+/// SAMAN rekisterin sekä recorderille että tälle handlerille. Recorderin
+/// kartoittamat sarjat heijastavat siis ajonaikaista toimintaa:
+/// - `agents_online` (gauge) — agentin rekisteröinti käynnistyksessä → `1`,
+/// - `tasks_created` / `task_handoffs` — siltakerroksen tehtävätapahtumat,
+/// - `tasks_completed`, `contract_*`, `agent_turns`, `llm_*`,
+///   `durable_replays`, `workflow_steps_completed` — vastaavat
+///   `Custom`-etiketit (`task.completed`, `contract.proposed`, `llm.call`, …).
+///
+/// Sarjat joille ei (vielä) tuoteta vastaavaa tapahtumaa pysyvät rehellisesti
+/// nollassa — `prometheus_export` palauttaa todelliset luvut, ei arvauksia.
 ///
 /// Tilakoodit:
 /// - `200 OK` + Prometheus-teksti (myös enimmäkseen nollainen runko on validi),
@@ -933,8 +947,15 @@ impl Channel for SharedDiscordChannel {
 ///   ([`TELEGRAM_TOKEN_ENV`], [`TELEGRAM_CHANNEL_ID_ENV`],
 ///   [`REPLY_TARGET_ENV`]) puuttuu tai kanavan rakennus epäonnistuu.
 ///
+/// `bridge` on jaettu siltakerroksen tapahtumaväylä havainnoitavuutta varten:
+/// se annetaan [`build_family`]:lle, joka julkaisee sille agentin rekisteröinnin
+/// (→ `agents_online`-gauge). Kutsujan (serve) on jo tilattava se
+/// [`EventRecorder`]illa ennen tätä kutsua, jotta tapahtuma ei huku.
+///
 /// Palauttaa runtimen, Discord-kanavan (inject/interactions), inject-tokenin ja public keyn.
-async fn start_runtime() -> Result<(
+async fn start_runtime(
+    bridge: FamilyBridge,
+) -> Result<(
     FamilyRuntime,
     Option<Arc<DiscordChannel>>,
     Option<Arc<str>>,
@@ -1027,6 +1048,7 @@ async fn start_runtime() -> Result<(
         channel,
         reply_target,
         &resolver,
+        Some(bridge),
     )
     .await?;
 
@@ -1078,10 +1100,29 @@ async fn serve() -> Result<()> {
     let addr = resolve_addr()?;
     info!(%addr, "familyclaw-gateway käynnistyy");
 
+    // Prometheus-mittarit (GET /metrics): rakennetaan laivueen oletuksilla, ja
+    // jaetaan SAMA instanssi sekä havainnoitavuus-tallentimelle (joka kasvattaa
+    // sarjoja) että GatewayState:lle (joka tarjoilee ne) — `MetricsRegistry` on
+    // `Clone` + `Arc`-jaettu, joten molemmat näkevät samat luvut.
+    let metrics = MetricsRegistry::with_fleet_defaults();
+
+    // Havainnoitavuussilta: tilaa siltakerroksen tapahtumaväylä EventRecorderilla
+    // ENNEN runtimen kokoamista (EventBus toimittaa vain tilauksen jälkeen
+    // julkaistut tapahtumat). Sama `bridge` annetaan build_family:lle, joka
+    // julkaisee agentin rekisteröinnin → recorder kasvattaa jaettua rekisteriä
+    // (agents_online). Taustatehtävä valuttaa tapahtumat jatkuvasti (run = estävä
+    // silmukka kunnes silta sulkeutuu).
+    let bridge = FamilyBridge::new();
+    let recorder = EventRecorder::new(&bridge, metrics.clone());
+    tokio::spawn(recorder.run());
+
     // C5-sauma: yksi build_family-kutsu kokoaa bus + agentti + kanava +
     // reply-pumppu (FamilyRuntime). Bus-kahva luovutetaan GatewayState:lle;
     // HTTP-/sammutuskuori pysyy ennallaan (vain bus.stop() → runtime.shutdown()).
-    let (runtime, discord_ch, inject_token, discord_public_key) = start_runtime().await?;
+    // Sama `bridge` viedään runtimeen, joka julkaisee sille agentin
+    // rekisteröinnin (EventRecorder jo tilannut yllä).
+    let (runtime, discord_ch, inject_token, discord_public_key) =
+        start_runtime(bridge).await?;
     info!("FamilyRuntime käynnissä (bus + agentti + kanava)");
 
     // Operaattorin hyväksyntäpinta jakaa SAMAN Arc<Mutex<ActionRuntime>>-kahvan
@@ -1093,15 +1134,12 @@ async fn serve() -> Result<()> {
     // Arc<AuditCollector> jonka build_family kytki agentin tool-looppiin.
     let turn_audit = Some(runtime.turn_audit());
 
-    // Prometheus-mittarit (GET /metrics): rakennetaan laivueen oletuksilla,
-    // joten kaikki esinimetyt sarjat (luodut tehtävät, online olevat agentit,
-    // …) ovat viennissä alusta asti arvolla 0. Rekisteri jaetaan
-    // GatewayState:lle samalla Arc-jako-mallilla kuin muu jaettu tila — kun/jos
-    // tapahtumapohjainen täyttö kytketään (EventRecorder busin päälle), tämä
-    // SAMA rekisteri näkee inkrementit. Tällä hetkellä arvot ovat enimmäkseen
-    // nollia (ks. metrics_handler-dokumentaatio).
-    let metrics = Some(MetricsRegistry::with_fleet_defaults());
-
+    // Mittarirekisteri (GET /metrics): SAMA instanssi jonka EventRecorder yllä
+    // sai (metrics.clone()). Tapahtumapohjainen täyttö on nyt KYTKETTY — agentin
+    // rekisteröinti (build_family → bridge) nosti `agents_online`-gaugea, ja
+    // siltakerroksen `task.*`/`contract.*`/`llm.*`/… -tapahtumat kasvattavat
+    // vastaavia sarjoja recorderin kautta. Rekisteri jaetaan GatewayState:lle
+    // Arc-jako-mallilla → /metrics näkee tarkalleen recorderin kasvattamat luvut.
     let state = Arc::new(GatewayState {
         bus: Some(runtime.bus().clone()),
         discord_channel: discord_ch,
@@ -1109,7 +1147,7 @@ async fn serve() -> Result<()> {
         discord_public_key,
         actions,
         turn_audit,
-        metrics,
+        metrics: Some(metrics),
     });
     info!("operaattorin hyväksyntäpinta valmis — GET /approvals/pending, POST /approvals/{{id}}/approve");
     let app = build_router(state);
@@ -2127,6 +2165,76 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    /// **End-to-end-todiste:** elävä siltatapahtuma liikuttaa laskuria JAETUSSA
+    /// rekisterissä, ja `GET /metrics` heijastaa sen (>0).
+    ///
+    /// Tämä sulkee katselmoinnin lipittämän aukon ("ei pää-päähän-testiä että
+    /// elävä tehtävä liikuttaa laskuria"): sama kytkentä kuin [`serve`]:ssä —
+    /// [`EventRecorder`] tilaa [`FamilyBridge`]:n ENNEN tapahtumaa ja kasvattaa
+    /// `metrics.clone()`-rekisteriä, ja TÄSMÄLLEEN sama rekisteri annetaan
+    /// [`GatewayState`]:lle. Julkaistaan tapahtuma (`create_task` +
+    /// `Custom("task.completed")`), valutetaan recorder, ja todistetaan että
+    /// (a) jaetun rekisterin laskuri kasvoi ja (b) `GET /metrics` -runko näyttää
+    /// laskuririvin arvolla > 0.
+    #[tokio::test]
+    async fn live_bridge_event_moves_counter_on_shared_registry_and_metrics_reflects_it() {
+        // 1. SAMA jako-malli kuin serve():ssä: yksi rekisteri, kloonataan
+        //    recorderille; alkuperäinen menee GatewayState:lle.
+        let metrics = MetricsRegistry::with_fleet_defaults();
+        let bridge = FamilyBridge::new();
+        // Tilaa ENNEN tapahtumaa (EventBus toimittaa vain tilauksen jälkeiset).
+        let mut recorder = EventRecorder::new(&bridge, metrics.clone());
+
+        // 2. Elävä siltatapahtuma: tehtävän luonti (→ tasks_created) ja
+        //    valmistuminen (→ tasks_completed Custom-etiketillä).
+        bridge.create_task("live-task", None).await.expect("create_task");
+        bridge
+            .bus()
+            .publish(familyclaw_bridge::Event::new(
+                familyclaw_bridge::EventKind::Custom("task.completed".into()),
+                None,
+            ));
+
+        // 3. Valuta tapahtumat → jaettuun rekisteriin.
+        let drained = recorder.drain_once().await;
+        assert_eq!(drained, 2, "kaksi tapahtumaa käsiteltiin");
+
+        // 4a. Jaetun rekisterin laskuri kasvoi (sama instanssi).
+        assert_eq!(
+            metrics
+                .counter(familyclaw_observability::COUNTER_TASKS_CREATED)
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .counter(familyclaw_observability::COUNTER_TASKS_COMPLETED)
+                .get(),
+            1
+        );
+
+        // 4b. GET /metrics (sama rekisteri GatewayState:ssa) näyttää >0.
+        let state = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: None,
+            turn_audit: None,
+            metrics: Some(metrics),
+        });
+        let (status, _headers, body) = metrics_handler(State(state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("tasks_created 1"),
+            "elävä tehtävä näkyy /metrics:ssä arvolla 1, runko:\n{body}"
+        );
+        assert!(
+            body.contains("tasks_completed 1"),
+            "valmistuminen näkyy /metrics:ssä arvolla 1, runko:\n{body}"
+        );
     }
 
     /// Luo prosessikohtaisen uniikin väliaikaishakemiston journal-testeille.

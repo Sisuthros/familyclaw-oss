@@ -123,6 +123,7 @@ async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
         Box::new(channel),
         reply_target.clone(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -215,6 +216,7 @@ async fn dead_primary_fails_over_to_live_fallback() {
         Box::new(channel),
         reply_target.clone(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -317,6 +319,7 @@ async fn timeout_primary_fails_over_to_live_fallback() {
         Box::new(channel),
         reply_target.clone(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -466,6 +469,7 @@ async fn without_llm_no_reply_is_emitted() {
         Box::new(channel),
         "c".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -535,6 +539,7 @@ async fn run_one_persistent_turn(data_dir: &std::path::Path, body: &str, api_bas
         Box::new(channel),
         "restart-chat".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -680,6 +685,7 @@ async fn build_family_in_memory_path_writes_no_resumable_journal() {
         Box::new(channel),
         "c".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -725,6 +731,7 @@ async fn build_family_wires_durable_dispatch_outbox_on_persistent_path() {
         Box::new(channel),
         "dispatch-chat".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -760,6 +767,7 @@ async fn build_family_wires_durable_dispatch_outbox_on_persistent_path() {
         Box::new(channel2),
         "dispatch-chat".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family restart");
@@ -803,6 +811,7 @@ async fn build_family_in_memory_path_uses_in_memory_dispatch_outbox() {
         Box::new(channel),
         "c".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -972,6 +981,7 @@ async fn product_path_build_family_honors_persisted_dispatch_outbox_no_double_fi
         Box::new(channel),
         "outbox-chat".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family on seeded data_dir");
@@ -1073,6 +1083,7 @@ async fn inbound_reaches_agent_over_bus() {
         Box::new(channel),
         "c".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -1126,6 +1137,7 @@ async fn build_family_wires_durable_pending_store_on_persistent_path() {
         Box::new(channel),
         "pending-chat".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -1161,6 +1173,7 @@ async fn build_family_wires_durable_pending_store_on_persistent_path() {
         Box::new(channel2),
         "pending-chat".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family restart");
@@ -1207,6 +1220,7 @@ async fn build_family_in_memory_path_uses_in_memory_pending_store() {
         Box::new(channel),
         "c".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -1310,6 +1324,7 @@ async fn product_path_build_family_reloads_pending_approval_after_restart() {
         Box::new(channel),
         "pending-reload-chat".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family on seeded data_dir");

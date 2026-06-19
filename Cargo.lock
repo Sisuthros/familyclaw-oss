@@ -1708,6 +1708,7 @@ dependencies = [
  "axum 0.7.9",
  "familyclaw-actions",
  "familyclaw-agent",
+ "familyclaw-bridge",
  "familyclaw-bus",
  "familyclaw-channels",
  "familyclaw-core",

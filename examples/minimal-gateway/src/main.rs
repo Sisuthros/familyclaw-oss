@@ -79,6 +79,7 @@ async fn main() -> Result<()> {
         channel_a,
         "mock-a".to_string(), // reply_target
         &resolver,
+        None, // ei havainnoitavuussiltaa (esimerkki ei tarjoile /metrics)
     )
     .await?;
 

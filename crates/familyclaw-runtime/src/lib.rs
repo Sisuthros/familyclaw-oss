@@ -33,6 +33,7 @@ use std::env;
 use std::sync::Arc;
 
 use familyclaw_actions::{ActionRuntime, AuditCollector, JournalDispatchOutbox};
+use familyclaw_bridge::{AgentInfo, AgentRole, FamilyBridge, HostKind};
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, resolve_profile_dir, Agent, EmotionCalibration,
     ErasedMemoryStore, JournalResumableStore, LlmEndpointResolver, ResumableTurnStore, Soul,
@@ -65,6 +66,18 @@ use tokio::sync::Mutex;
 /// bounded-wrapper tai backpressure-mittari drain-puolelle.
 pub struct FamilyRuntime {
     bus: BusHandle,
+    /// **Jaettu siltakerroksen tapahtumaväylä** havainnoitavuutta varten.
+    ///
+    /// Sama [`FamilyBridge`] jonka kutsuja antoi [`build_family`]:lle (jos antoi).
+    /// Runtime julkaisee tälle sillalle ajonaikaisia virstanpylväitä (tällä
+    /// hetkellä: agentin rekisteröinti → [`EventKind::AgentRegistered`]), ja
+    /// gateway voi tilata sen `EventRecorder`illa
+    /// ([`FamilyRuntime::bridge`]) niin että jaettu `MetricsRegistry` näkee
+    /// elävät inkrementit. `None` kun kutsuja ei antanut siltaa (esim.
+    /// savutestit, jotka eivät tarvitse havainnoitavuutta).
+    ///
+    /// [`EventKind::AgentRegistered`]: familyclaw_bridge::EventKind::AgentRegistered
+    bridge: Option<FamilyBridge>,
     /// **Jaettu toimintoajoympäristö** (suspend/resume-silta, roadmap §6 D2).
     ///
     /// Sama [`Arc<Mutex<ActionRuntime>>`] joka kytkettiin agentin tool-looppiin
@@ -105,6 +118,20 @@ impl FamilyRuntime {
     #[must_use]
     pub fn bus(&self) -> &BusHandle {
         &self.bus
+    }
+
+    /// **Siltakerroksen tapahtumaväylä** havainnoitavuutta varten (jos kytketty).
+    ///
+    /// Palauttaa `Some(&bridge)` kun kutsuja antoi [`FamilyBridge`]:n
+    /// [`build_family`]:lle. Sama klooni jolle runtime julkaisee ajonaikaisia
+    /// virstanpylväitä (agentin rekisteröinti → [`EventKind::AgentRegistered`]):
+    /// gateway voi tilata sen `EventRecorder`illa, jolloin jaettu
+    /// `MetricsRegistry` saa elävät inkrementit. `None` kun siltaa ei annettu.
+    ///
+    /// [`EventKind::AgentRegistered`]: familyclaw_bridge::EventKind::AgentRegistered
+    #[must_use]
+    pub fn bridge(&self) -> Option<&FamilyBridge> {
+        self.bridge.as_ref()
     }
 
     /// **Jaettu toimintoajoympäristön kahva** operaattoripinnalle.
@@ -190,6 +217,22 @@ impl FamilyRuntime {
 /// tarkoituksella vääräksi ja todistaa että kaksi eri keskustelua reitittyvät
 /// omiin kohteisiinsa.
 ///
+/// # Havainnoitavuus: `bridge` (valinnainen)
+/// `bridge`-argumentti on **valinnainen** jaettu siltakerroksen tapahtumaväylä
+/// ([`FamilyBridge`]). Kun kutsuja antaa sen, runtime julkaisee sille
+/// ajonaikaisia virstanpylväitä — tällä hetkellä **agentin rekisteröinnin**
+/// ([`EventKind::AgentRegistered`]) kun agentti on spawnattu (askel 7d). Runtime
+/// säilyttää saman kloonin ([`FamilyRuntime::bridge`]) jotta gateway voi tilata
+/// sen `EventRecorder`illa ja täyttää jaetun `MetricsRegistry`:n elävillä
+/// luvuilla (esim. `agents_online`-gauge).
+///
+/// **Tilausjärjestys:** `EventBus` toimittaa vain *tilauksen jälkeen* julkaistut
+/// tapahtumat. Kutsujan on siksi luotava `EventRecorder` (tilattava `bridge`)
+/// **ennen** tämän funktion kutsua, jotta agentin rekisteröintitapahtuma ei
+/// huku. `None` → ei julkaisua (savutestit, jotka eivät tarvitse mittareita).
+///
+/// [`EventKind::AgentRegistered`]: familyclaw_bridge::EventKind::AgentRegistered
+///
 /// # Errors
 /// - [`FamilyClawError::Config`] jos mallikonfiguraatio on kelvoton (tämä
 ///   nostetaan vain jos primary on tyhjä — puuttuva endpoint johtaa
@@ -210,6 +253,7 @@ pub async fn build_family(
     channel: Box<dyn Channel>,
     reply_target: String,
     resolver: &dyn LlmEndpointResolver,
+    bridge: Option<FamilyBridge>,
 ) -> Result<FamilyRuntime> {
     // 0. Lue persistointikonfiguraatio SYNKRONISESTI ennen ensimmäistä
     //    `.await`-pistettä. Näin päätös (persistentti vs. in-memory) tehdään
@@ -353,6 +397,10 @@ pub async fn build_family(
     //    eikä (b) törmää muistin `turn_key`:ssä replayn duplikaattiin. Tämä
     //    tehdään vain persistentillä polulla — in-memory-journal on aina tyhjä.
     let dream_store = Arc::clone(&memory);
+    // Talleta agentin identiteetti ennen kuin `agent_cfg` siirtyy `Agent::new`:lle
+    // — havainnoitavuussilta (askel 7d) julkaisee rekisteröinnin näillä arvoilla.
+    let agent_id = agent_cfg.id;
+    let agent_name = agent_cfg.name.clone();
     let mut agent = Agent::new(agent_cfg, soul, memory, durable, bus.clone(), None, None);
     // Gateway-restart-korjaus (durable-replay): siirrä kursori replayn loppuun
     // ja palauta turn_counter seuraavaan vapaaseen vuoropaikkaan VAIN
@@ -457,6 +505,27 @@ pub async fn build_family(
     // 7. Spawnaa agentti actorina (rekisteröi busiin).
     let actor = agent.spawn().await?;
 
+    // 7d. Havainnoitavuussilta (valinnainen): jos kutsuja antoi siltakerroksen
+    //     tapahtumaväylän, julkaise agentin rekisteröinti REAALISENA
+    //     ajonaikaisena virstanpylväänä ([`EventKind::AgentRegistered`]). Gateway
+    //     on jo tilannut sillan `EventRecorder`illa (tilausjärjestys, ks.
+    //     funktion doc), joten tapahtuma päivittää jaetun `MetricsRegistry`:n
+    //     `agents_online`-gaugen elävästi. Rekisteröinnin epäonnistuminen ei saa
+    //     kaataa kokoonpanoa — havainnoitavuus on lisätieto, ei kriittinen polku;
+    //     virhe lokitetaan ja kokoaminen jatkuu.
+    if let Some(bridge) = &bridge {
+        let info = AgentInfo::new(agent_id, &agent_name, AgentRole::Executor, HostKind::Local);
+        if let Err(e) = bridge.register_agent(info).await {
+            tracing::warn!(
+                target: "familyclaw::observability",
+                agent = %agent_name,
+                error = %e,
+                "agent registration on observability bridge failed (non-fatal) — \
+                 agents_online gauge will not reflect this agent"
+            );
+        }
+    }
+
     // 8. Kanavan oma bus-seat — ERI kuin agentin being_id, muuten AgentActor
     //    skippaisi viestin "omana kaikuna" (agent.rs handle, sender-tarkistus).
     let channel_seat = BeingId::new();
@@ -531,6 +600,7 @@ pub async fn build_family(
     }
     Ok(FamilyRuntime {
         bus,
+        bridge,
         actions,
         turn_audit,
         agents: vec![actor],
@@ -772,6 +842,7 @@ mod tests {
             Box::new(channel),
             "mock:general".to_string(),
             &resolver,
+            None,
         )
         .await
         .expect("runtime builds");
@@ -813,6 +884,7 @@ mod tests {
             Box::new(channel),
             "mock:room".to_string(),
             &resolver,
+            None,
         )
         .await
         .expect("runtime builds with provider");
