@@ -2542,11 +2542,14 @@ mod tests {
         // 2. Skriptattu LLM: ensin hyväksyntää vaativa työkalukutsu (suspend),
         //    sitten (resumen aikana) lopullinen teksti. Toista runkoa EI lueta
         //    tässä RED-testissä, koska gateway ei aja resumea — se on tarkoitus.
+        // Payload sisältää SENTINEL-merkkijonon (tekosalaisuus, EI oikea avain eikä
+        //    perheen nimi) jonka redaktoidun tiivistelmän pitää KARSIA — todistaa (b):ssä
+        //    että /approvals/pending ei vuoda raakaa payloadia/salaisuuksia.
         let api = spawn_scripted_llm_e2e(vec![
             e2e_body_tool_call(
                 "call_approve",
                 "approval_skill",
-                &serde_json::json!({ "q": "ship" }),
+                &serde_json::json!({ "q": "ship", "secret": "sk-SENTINEL-DO-NOT-LEAK" }),
             ),
             e2e_body_text("hyväksytty toiminto valmis"),
         ])
@@ -2663,8 +2666,20 @@ mod tests {
             pending_body.contains(&approval_id.to_string()),
             "(b) pending sisältää approval_id:n, oli:\n{pending_body}"
         );
-        // Ei avaimen muotoista salaisuutta (sk-/Bearer), ei perheen nimiä, ei
-        // raakaa payloadia, ei yksityistä absoluuttista polkua.
+        // POSITIIVINEN redaktio-väite: tiivistelmä on TÄSMÄLLEEN
+        // `ActionRuntime::pending_summary`:n redaktoima muoto (vain taidon nimi),
+        // EI raaka payload. Tämä on sekä lähdekoodissa vuotamaton (ei perheen
+        // nimiä literaaleina) että merkityksellisempi kuin pelkkä negatiivinen
+        // tarkistus: se sitoo testin redaktoituun esitykseen.
+        assert!(
+            pending_body.contains("taito 'approval_skill' odottaa ihmisen hyväksyntää"),
+            "(b) pending sisältää redaktoidun tiivistelmän (vain taidon nimi), oli:\n{pending_body}"
+        );
+        // Negatiiviset vuototarkistukset: ei avain-muotoista salaisuutta
+        // (sk-/Bearer/test-key), ei SENTINEL-tekosalaisuutta, ei raakaa payloadia
+        // (arvo `ship`, avain `"q"`/`"secret"`), ei yksityistä absoluuttista polkua.
+        // SENTINEL todistaa AKTIIVISESTI että redaktio karsii payloadiin upotetut
+        // salaisuudet — ei kosmeettinen tarkistus.
         let lowered = pending_body.to_lowercase();
         assert!(
             !lowered.contains("sk-")
@@ -2672,14 +2687,14 @@ mod tests {
                 && !lowered.contains("test-key"),
             "(b) ei avain-muotoista salaisuutta: {pending_body}"
         );
-        for forbidden in ["agent_alpha", "agent_beta", "agent_gamma", "agent_delta", "agent_epsilon", "the operator"] {
-            assert!(
-                !lowered.contains(forbidden),
-                "(b) ei perheen nimeä ({forbidden}): {pending_body}"
-            );
-        }
         assert!(
-            !pending_body.contains("ship") && !pending_body.contains("\"q\""),
+            !pending_body.contains("SENTINEL"),
+            "(b) redaktion pitää karsia payloadiin upotettu SENTINEL-tekosalaisuus: {pending_body}"
+        );
+        assert!(
+            !pending_body.contains("ship")
+                && !pending_body.contains("\"q\"")
+                && !pending_body.contains("\"secret\""),
             "(b) ei raakaa payloadia: {pending_body}"
         );
         assert!(
