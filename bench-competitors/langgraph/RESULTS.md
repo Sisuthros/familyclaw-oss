@@ -82,7 +82,7 @@ clean path and re-fires on both adversarial crash points. The markdown baseline 
 
 ### Raw evidence behind the table (verified live, fresh re-run 2026-06-19 — not copied from the build summary)
 
-**LangGraph crash harness** (venv `C:\Users\operator\assistant-bot\_langgraph_bench_venv`,
+**LangGraph crash harness** (venv `<VENV_DIR>`,
 dir `E:\Familyclaw\bench-competitors\langgraph`):
 
 ```
@@ -196,7 +196,7 @@ effect→durable-record window, which is exactly where money-touching idempotenc
 ### LangGraph competitor (Python)
 
 ```bash
-VENV=C:/Users/operator/assistant-bot/_langgraph_bench_venv/Scripts/python.exe
+VENV=<VENV_DIR>/Scripts/python.exe
 cd E:/Familyclaw/bench-competitors/langgraph
 
 "$VENV" crash_harness.py cycle --crash-point clean        --workdir _runs/clean
@@ -213,8 +213,8 @@ Recreate the venv from scratch if needed:
 
 ```bash
 PY=C:/Users/operator/AppData/Local/Programs/Python/Python313/python.exe   # 3.13.5
-"$PY" -m venv C:/Users/operator/assistant-bot/_langgraph_bench_venv
-C:/Users/operator/assistant-bot/_langgraph_bench_venv/Scripts/python.exe -m pip install \
+"$PY" -m venv <VENV_DIR>
+<VENV_DIR>/Scripts/python.exe -m pip install \
   langgraph==1.2.6 langgraph-checkpoint-sqlite==3.1.0
 ```
 
@@ -234,7 +234,7 @@ cargo run  -p familyclaw-bench -- compare                               # Family
   `Cargo.toml` anywhere under `bench-competitors/`** — the competitor is a standalone
   Python harness, fully outside the Rust tree.
 - `cargo build --workspace` → **EXIT 0** (green, untouched).
-- Family-name scan (`agent_alpha/agent_beta/agent_delta/agent_gamma/agent_epsilon/assistant`, case-insensitive) over the
+- Private-identity scan (the Layer-B forbidden-name set, case-insensitive) over the
   competitor dir: **CLEAN** (no matches). No secrets, no API keys.
 - No Rust `LangGraphSubject` was wired into FamilyClaw's tree. **Follow-up:** if one is
   added later (shelling out to this harness), it MUST live behind a feature flag /
