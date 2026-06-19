@@ -1738,6 +1738,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "familyclaw-scheduler"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "familyclaw-actions",
+ "familyclaw-core",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "familyclaw-security"
 version = "0.1.0"
 dependencies = [

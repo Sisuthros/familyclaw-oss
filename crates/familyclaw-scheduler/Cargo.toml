@@ -1,0 +1,24 @@
+[package]
+name = "familyclaw-scheduler"
+description = "Minimaalinen intervalliperustainen ajastin idempotenteille proaktiivisille työkalutehtäthe operator (KERROS A, OSS)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+familyclaw-core = { workspace = true }
+familyclaw-actions = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "time"] }
