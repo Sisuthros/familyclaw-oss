@@ -37,7 +37,7 @@ use familyclaw_memory::{
     DecayPolicy, ImportanceFactors, Memory, MemoryStore, RetrievalContext, RetrievalResult,
 };
 use ractor::{Actor, ActorProcessingErr, ActorRef};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::llm::{LlmConfig, LlmMessage, ToolCall, ToolDefinition};
 use crate::llm_chain::LlmFailover;
@@ -2220,6 +2220,139 @@ impl Agent {
         }
     }
 
+    /// **Agentin puoli suspend/resume-sillasta**: käsittelee operaattorin
+    /// myöntämän hyväksynnän ohjaussignaalin
+    /// ([`BusMessage::ResumeApproval`])
+    /// jatkamalla keskeytetyn vuoron loppuun ja työntämällä lopullisen
+    /// vastauksen ULOS reply-sinkiin.
+    ///
+    /// Tämä on **eri polku kuin tavallinen vuoro**: se EI käynnistä uutta
+    /// LLM-vuoroa eikä kulje [`handle_turn_with_origin`](Self::handle_turn_with_origin):n
+    /// kautta, vaan ohjataan suoraan [`resume_approved`](Self::resume_approved):iin,
+    /// joka kuluttaa hyväksynnän ja jatkaa keskeytyneen tool-loopin siitä mihin
+    /// se jäi (idempotentisti). `now` (D1) injektoidaan kuten resume-polulla.
+    ///
+    /// ## Reply-kohteen johto (sama logiikka kuin normaalireitti)
+    /// Vastauksen kohde johdetaan **samalla** säännöllä kuin
+    /// [`handle_turn_with_origin`](Self::handle_turn_with_origin):n reply-haarassa:
+    /// ensisijaisesti keskeytetyn vuoron tallennetusta
+    /// [`conversation_origin`](crate::resumable::ResumableTurn::conversation_origin):sta
+    /// (`reply_target()`), ja jos sitä ei ole, agentin staattisesta
+    /// [`with_reply_target`](Self::with_reply_target)-kohteesta. Origin peekataan
+    /// jatkettavasta vuorosta **ennen** kuin `resume_approved` kuluttaa sen;
+    /// peek-virhe ei estä jatkoa (fallback `None` → staattinen kohde).
+    ///
+    /// ## Lopputuloksen mappays
+    /// - [`ThinkOutcome::Reply`] → rakennetaan [`OutboundMessage`] ja reititetään
+    ///   [`route_reply`](Self::route_reply):llä (EI bus-julkaisua → echo-loop-suoja).
+    /// - [`ThinkOutcome::Suspended`] → vuoro vaatii **lisähyväksynnän**;
+    ///   no-op + `info!` (operaattori myöntää seuraavan hyväksynnän erikseen).
+    /// - [`ThinkOutcome::NoReply`] → no-op.
+    ///
+    /// ## Fail-closed (yksi resume ei kaada actoria)
+    /// - Kelvoton `approval_id` (jäsennysvirhe): `warn!` + `Ok(())`, ei paniikkia.
+    /// - `resume_approved`-virhe (tuntematon/kulutettu/vanhentunut/omistajuus-
+    ///   epätäsmäys): `warn!` + `Ok(())` — sama virheraja kuin vuorokäsittelijällä.
+    /// - Reply-reitityksen epäonnistuminen (suljettu sink): `warn!`, ei kaadu.
+    ///
+    /// # Errors
+    /// Palauttaa aina `Ok(())` — kaikki virheet käsitellään fail-closed
+    /// (lokataan), jotta yksittäinen resume-signaali ei voi kaataa actoria.
+    pub async fn handle_resume_signal(&self, approval_id: &str, now: Timestamp) -> Result<()> {
+        // Jäsennä hyväksynnän tunniste fail-closed: kelvoton merkkijono → loki +
+        // no-op (ei paniikkia, ei sivuvaikutusta).
+        let Ok(id) = approval_id.parse::<ApprovalId>() else {
+            warn!(
+                agent = self.config.name,
+                approval_id, "resume signal: invalid approval id — ignoring"
+            );
+            return Ok(());
+        };
+
+        // Peek jatkettavan vuoron alkuperä reply-kohdetta varten ENNEN kuin
+        // `resume_approved` kuluttaa (poistaa) vuoron. Peek-virhe ei estä jatkoa:
+        // fallback `None` → agentin staattinen reply-kohde (sama kuin
+        // normaalireitin fallback). Ei `?`-propagointia: emme halua peek-virheen
+        // estävän hyväksynnän kulutusta.
+        let reply_origin = match self.resumable.get(id) {
+            Ok(turn) => turn.and_then(|t| t.conversation_origin),
+            Err(e) => {
+                debug!(
+                    agent = self.config.name,
+                    %id, error = %e,
+                    "resume signal: resumable peek failed — falling back to static reply target"
+                );
+                None
+            }
+        };
+
+        // Jatka vuoro loppuun. Virhe (tuntematon/kulutettu/vanhentunut/
+        // omistajuus-epätäsmäys) → loki + Ok (yksi resume ei kaada actoria,
+        // sama raja kuin vuorokäsittelijällä).
+        let outcome = match self.resume_approved(id, now).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                warn!(
+                    agent = self.config.name,
+                    %id, error = %e,
+                    "resume signal: resume_approved failed (non-fatal) — no reply"
+                );
+                return Ok(());
+            }
+        };
+
+        match outcome {
+            ThinkOutcome::Reply(text) => {
+                // Reply-kohde: sama sääntö kuin normaalireitti — origin ENSIN
+                // (keskeytetyn vuoron `conversation_origin`), FALLBACK agentin
+                // staattiseen reply-kohteeseen.
+                let target: Option<&str> = reply_origin
+                    .as_ref()
+                    .map(familyclaw_bus::MessageOrigin::reply_target)
+                    .or(self.reply_target.as_deref());
+                let Some(target) = target else {
+                    debug!(
+                        agent = self.config.name,
+                        %id,
+                        "resume signal: no reply target (no origin, no static target) — dropping reply"
+                    );
+                    return Ok(());
+                };
+                match OutboundMessage::new(target, text) {
+                    Ok(reply) => {
+                        if let Err(e) = self.route_reply(reply) {
+                            // Suljettu sink ei saa kaataa actoria — loki ja jatka.
+                            warn!(
+                                agent = self.config.name,
+                                %id, error = %e,
+                                "resume signal: reply routing failed (non-fatal)"
+                            );
+                        }
+                    }
+                    Err(e) => warn!(
+                        agent = self.config.name,
+                        %id, error = %e,
+                        "resume signal: reply build failed (non-fatal)"
+                    ),
+                }
+            }
+            ThinkOutcome::Suspended { approval_id, .. } => {
+                // Jatko vaati UUDEN hyväksynnän (ketjutettu). Tämä signaali ei sitä
+                // myönnä — no-op + info. Operaattori myöntää seuraavan erikseen.
+                info!(
+                    agent = self.config.name,
+                    next_approval = %approval_id,
+                    "resume signal: turn re-suspended awaiting further approval — no reply yet"
+                );
+            }
+            ThinkOutcome::NoReply => {
+                // Ei vastausta (esim. max-iter tai ei LLM:ää) — no-op.
+            }
+        }
+
+        Ok(())
+    }
+
     /// Käsittelee yhden vuoron **kaatumiskestävästi** (ilman per-viesti-
     /// alkuperää — käyttää staattista reply-kohdetta jos asetettu).
     ///
@@ -2993,6 +3126,22 @@ impl Actor for AgentActor {
         if sender == agent.being_id {
             return Ok(());
         }
+
+        // TEHTÄVÄ 1: RESUME-OHJAUSSIGNAALI ennen tavallista vuororeititystä.
+        // `ResumeApproval` EI ole keskustelu vaan ohjaussignaali: se ohjataan
+        // suoraan resume-polulle (`handle_resume_signal` → `resume_approved` +
+        // `route_reply`) EIKÄ käynnistä uutta LLM-vuoroa
+        // (`handle_turn_with_origin`). Self-echo-suoja yllä pätee tähänkin.
+        if let BusMessage::ResumeApproval { approval_id } = &envelope.payload {
+            if let Err(err) = agent.handle_resume_signal(approval_id, time::now()).await {
+                // `handle_resume_signal` käsittelee virheet jo fail-closed
+                // (palauttaa aina Ok); tämä haara on syvyyspuolustusta jos sopimus
+                // joskus muuttuu. Yhden signaalin virhe ei kaada olentoa.
+                warn!(agent = agent.name(), error = %err, "resume-signaalin käsittely epäonnistui");
+            }
+            return Ok(());
+        }
+
         // F2: per-viesti-alkuperä kirjekuoresta → reply-kohde johdetaan per
         // viesti (origin.reply_target()), fallback staattiseen kohteeseen.
         let origin = envelope.origin.clone();
@@ -3303,6 +3452,10 @@ mod tests {
             TaskEventKind::Started,
             "t1"
         )));
+        // ResumeApproval on ohjaussignaali ("verta"), ei muistettavaa sisältöä.
+        assert!(!should_remember(&BusMessage::ResumeApproval {
+            approval_id: "any".into(),
+        }));
     }
 
     #[test]
@@ -4870,6 +5023,88 @@ mod tests {
         assert!(
             store.get(approval_id).expect("get").is_none(),
             "resumable turn consumed after resume"
+        );
+        bus.stop();
+    }
+
+    /// **TEHTÄVÄ 1: `handle_resume_signal` ohjaa hyväksytyn vuoron jatkon
+    /// reply-sinkiin.** Tämä on agentin puolisko suspend/resume-sillasta:
+    /// operaattorin hyväksyntä saapuu busin `ResumeApproval`-signaalina, agentti
+    /// jatkaa keskeytetyn tool-loopin loppuun (`resume_approved`) ja työntää
+    /// lopullisen vastauksen ULOS reply-sinkiin (`route_reply`) — EI uutta
+    /// LLM-vuoroa, EI bus-julkaisua (echo-loop-suoja).
+    ///
+    /// Väitteet:
+    /// - sivuvaikutus (hyväksyntä-portattu taito) ajetaan TASAN KERRAN,
+    /// - lopullinen vastausteksti päätyy talteenotettuun reply-sinkiin oikealla
+    ///   kohteella (jatkettavan vuoron `conversation_origin`),
+    /// - jatkettava vuoro kulutetaan (resume on kertakäyttöinen).
+    #[tokio::test]
+    async fn resume_signal_routes_to_reply_sink() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        // Pyyntö 1: kutsu hyväksyntätyökalua (suspend).
+        // Pyyntö 2 (resumen aikana): nähtyään työkalun tuloksen, vastaa tekstillä.
+        let api = spawn_scripted_llm(vec![
+            body_tool_call("call_approve", "approval_skill", &serde_json::json!({ "q": "ship" })),
+            body_text("hyväksytty toiminto valmis"),
+        ])
+        .await;
+        let store: StdArc<dyn ResumableTurnStore> = StdArc::new(InMemoryResumableStore::new());
+        let count = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = counting_runtime_with_pending(
+            Box::new(familyclaw_actions::InMemoryPendingStore::new()),
+            StdArc::clone(&count),
+        );
+        let (sink, mut rx) = new_reply_channel();
+        // Per-viesti-alkuperä → reply-kohde johdetaan jatkettavan vuoron
+        // `conversation_origin`:sta (sama logiikka kuin normaalireitti).
+        let origin = familyclaw_bus::MessageOrigin::new("discord-main", "general-7", "operator");
+        let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+            .with_actions(StdArc::clone(&runtime))
+            .with_resumable_store(StdArc::clone(&store))
+            .with_reply_sink(sink);
+
+        // Vaihe 1: suspend (per-viesti-alkuperän kanssa, jotta vuoro tallentaa
+        // `conversation_origin`:n jatkoa varten).
+        let out = agent
+            .think_with_origin(&BusMessage::text("ship it"), Some(&origin))
+            .await
+            .expect("suspend ok");
+        let approval_id = match out {
+            ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+            other => panic!("odotettiin Suspended, sai: {other:?}"),
+        };
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "approval-gated action must NOT run before approve"
+        );
+
+        // Vaihe 2: RESUME-SIGNAALI (operaattorin hyväksyntä) → agentti jatkaa
+        // vuoron loppuun ja työntää vastauksen reply-sinkiin.
+        let now = time::now();
+        agent
+            .handle_resume_signal(&approval_id.to_string(), now)
+            .await
+            .expect("resume signal handled");
+
+        // Sivuvaikutus ajettiin TASAN KERRAN.
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "approval-gated side effect must run exactly once via resume signal"
+        );
+        // Lopullinen vastaus päätyi reply-sinkiin OIKEALLA kohteella.
+        let got = rx.recv().await.expect("reply delivered to sink");
+        assert_eq!(
+            got.target, "general-7",
+            "reply routed to conversation_origin reply target"
+        );
+        assert_eq!(got.body, "hyväksytty toiminto valmis");
+        // Jatkettava vuoro kulutettu.
+        assert!(
+            store.get(approval_id).expect("get").is_none(),
+            "resumable turn consumed after resume signal"
         );
         bus.stop();
     }
