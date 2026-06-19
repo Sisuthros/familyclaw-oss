@@ -775,22 +775,30 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 /// ([`MetricsRegistry`] perustuu `BTreeMap`:iin), joten tuloste on vakaa eikä
 /// vaihtele pyyntöjen välillä — sama panos tuottaa saman tulosteen.
 ///
-/// **Mitkä mittarit ovat "eläviä":** rekisteri rakennetaan
-/// [`MetricsRegistry::with_fleet_defaults`]:lla, joten kaikki laivueen
-/// esinimetyt laskurit ja `agents_online`-gauge ovat viennissä alusta asti
-/// (arvolla `0`). Tapahtumapohjainen täyttö on **kytketty**: [`serve`] tilaa
-/// siltakerroksen tapahtumaväylän
-/// [`EventRecorder`]illa ja antaa
-/// SAMAN rekisterin sekä recorderille että tälle handlerille. Recorderin
-/// kartoittamat sarjat heijastavat siis ajonaikaista toimintaa:
-/// - `agents_online` (gauge) — agentin rekisteröinti käynnistyksessä → `1`,
-/// - `tasks_created` / `task_handoffs` — siltakerroksen tehtävätapahtumat,
-/// - `tasks_completed`, `contract_*`, `agent_turns`, `llm_*`,
-///   `durable_replays`, `workflow_steps_completed` — vastaavat
-///   `Custom`-etiketit (`task.completed`, `contract.proposed`, `llm.call`, …).
+/// **Mitkä mittarit ovat "eläviä" — tarkka, rehellinen tila:** rekisteri
+/// rakennetaan [`MetricsRegistry::with_fleet_defaults`]:lla, joten kaikki
+/// laivueen esinimetyt laskurit ja `agents_online`-gauge ovat viennissä alusta
+/// asti (arvolla `0`). [`serve`] tilaa siltakerroksen tapahtumaväylän
+/// [`EventRecorder`]illa ja antaa SAMAN rekisterin sekä recorderille että tälle
+/// handlerille — joten **mekanismi** (tapahtuma → laskurin inkrementti →
+/// `/metrics`) on kytketty ja e2e-testattu.
 ///
-/// Sarjat joille ei (vielä) tuoteta vastaavaa tapahtumaa pysyvät rehellisesti
-/// nollassa — `prometheus_export` palauttaa todelliset luvut, ei arvauksia.
+/// **MUTTA tuotannon ajavassa gatewayssä vain YKSI sarja todella liikkuu tällä
+/// hetkellä:**
+/// - ✅ `agents_online` (gauge) — `build_family` julkaisee `AgentRegistered`:n
+///   käynnistyksessä tarjoiltuun väylään → `1`.
+/// - ⏳ `tasks_created`, `task_handoffs`, `tasks_completed`, `contract_*`,
+///   `agent_turns`, `llm_*`, `durable_replays`, `workflow_steps_completed` ovat
+///   **kytketty mutta ruokkimatta** (wired-but-unfed): recorder kartoittaa ne,
+///   mutta mikään live-gateway/agentti/orkestrointipolku ei vielä julkaise
+///   vastaavia tapahtumia (`TaskCreated` / `Custom("task.completed" |
+///   "contract.*" | "llm.*" | …)`) TÄHÄN tarjoiltuun väylään (`orchestrate`
+///   käyttää erillistä, kytkemätöntä väylää). Ne pysyvät siis `0`:na kunnes
+///   tool-loop/orkestrointi/contract/llm-kerrokset julkaisevat tarjoiltuun
+///   väylään — se on seuraava kytkentätyö, ei tämän reitin vika.
+///
+/// `prometheus_export` palauttaa aina TODELLISET luvut, ei arvauksia — nolla
+/// tarkoittaa rehellisesti "ei vielä tapahtumia", ei "rikki".
 ///
 /// Tilakoodit:
 /// - `200 OK` + Prometheus-teksti (myös enimmäkseen nollainen runko on validi),
