@@ -54,3 +54,14 @@ clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# E2E suspend→approve→resume -testi rakentaa AIDON agentin skriptatulla LLM:llä
+# in-crate (build_router + GatewayState ovat privaatteja → testi elää
+# main.rs:n tests-moduulissa). Agent::new vaatii durable- + muisti-kontekstin,
+# CountingApprovalSkill toteuttaa ActionExecutor/Skill-traitit (async_trait +
+# deterministinen uuid skill-id:lle).
+familyclaw-durable = { workspace = true }
+familyclaw-memory = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }

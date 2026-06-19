@@ -840,7 +840,9 @@ fn build_router(state: Arc<GatewayState>) -> Router {
         // ([`GatewayState::actions`] = `None`), handlerit vastaavat 503.
         // Bearer-suojaus on sama kuin /inject:llä (`check_inject_auth`).
         .route("/approvals/pending", get(list_pending_approvals))
-        .route("/approvals/{approval_id}/approve", post(approve_pending))
+        // axum 0.7 (matchit 0.7) käyttää `:param`-syntaksia polkukaappaukseen;
+        // `{approval_id}` tulkittaisiin LITERAALIksi segmentiksi → 404 HTTP:n yli.
+        .route("/approvals/:approval_id/approve", post(approve_pending))
         // Havainnoitava tool-loop-jälki (TURN-AUDIT, roadmap §6 D6). Rekisteröidään
         // aina; kun turn-auditia ei ole kytketty ([`GatewayState::turn_audit`] =
         // `None`), handler vastaa 503. Bearer-suojaus on sama kuin /inject:llä.
@@ -2407,5 +2409,340 @@ mod tests {
         } else {
             assert_eq!(label, "none (noop)");
         }
+    }
+
+    // ---- E2E: suspend → approve → resume → reply (Phase 1 §6, RED-todiste) ----
+
+    /// **Skriptattu fake-LLM** (raaka TCP, OpenAI-yhteensopiva endpoint): palauttaa
+    /// annetut JSON-rungot järjestyksessä, yksi per pyyntö. Sama kuvio kuin
+    /// `familyclaw-agent`:n tool-loop-testeissä — ei ulkoista mock-kirjastoa, ei
+    /// verkkoa ulospäin. Palauttaa base-URL:n (`http://127.0.0.1:PORT/v1`).
+    async fn spawn_scripted_llm_e2e(bodies: Vec<String>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scripted llm");
+        let addr = listener.local_addr().expect("scripted llm addr");
+        tokio::spawn(async move {
+            for body in bodies {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    /// OpenAI-vastausrunko: **yksi työkalukutsu** (litteä `{id,name,arguments}`).
+    fn e2e_body_tool_call(id: &str, name: &str, arguments: &serde_json::Value) -> String {
+        serde_json::json!({
+            "choices": [ {
+                "message": {
+                    "content": serde_json::Value::Null,
+                    "tool_calls": [ { "id": id, "name": name, "arguments": arguments } ]
+                }
+            } ]
+        })
+        .to_string()
+    }
+
+    /// OpenAI-vastausrunko: **pelkkä teksti** → tool-loop pysähtyy (lopullinen vastaus).
+    fn e2e_body_text(text: &str) -> String {
+        serde_json::json!({ "choices": [ { "message": { "content": text } } ] }).to_string()
+    }
+
+    /// Hyväksyntää vaativa **laskeva** testitaito: kasvattaa jaettua atomista
+    /// laskuria joka suorituksella → sivuvaikutuksen suorituskertojen suora
+    /// mittari. Nimi `approval_skill` (LLM-työkalukutsu viittaa nimeen).
+    #[derive(Debug, Clone)]
+    struct E2eCountingApprovalSkill {
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// Testitaidon kiinteä, deterministinen UUID (ei `uuid!`-makroa).
+    const E2E_APPROVAL_SKILL_UUID: u128 = 0x7e57_0000_0000_4000_8000_0000_0000_0001;
+
+    #[async_trait::async_trait]
+    impl familyclaw_actions::ActionExecutor for E2eCountingApprovalSkill {
+        async fn execute(
+            &self,
+            request: familyclaw_actions::ActionRequest,
+        ) -> familyclaw_actions::Result<familyclaw_actions::ActionResult> {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(familyclaw_actions::ActionResult::success(
+                "counting approval action executed",
+                serde_json::json!({ "executed": true }),
+                request.now,
+            ))
+        }
+    }
+
+    impl familyclaw_actions::Skill for E2eCountingApprovalSkill {
+        fn manifest(&self) -> familyclaw_actions::manifest::SkillManifest {
+            familyclaw_actions::manifest::SkillManifest {
+                id: familyclaw_actions::SkillId::from_uuid(uuid::Uuid::from_u128(
+                    E2E_APPROVAL_SKILL_UUID,
+                )),
+                name: "approval_skill".to_string(),
+                version: "1.0.0".to_string(),
+                description: "Laskeva ulkoisesti kirjoittava toiminto (vaatii hyväksynnän, E2E-testi)."
+                    .to_string(),
+                permissions: vec![familyclaw_actions::policy::SkillPermission::WriteExternal],
+                risk: familyclaw_actions::policy::ActionRisk::WriteExternal,
+                approval_policy: familyclaw_actions::policy::ApprovalPolicy::RequireApproval,
+                input_hint: None,
+                output_hint: None,
+                input_schema: familyclaw_actions::manifest::default_input_schema(),
+            }
+        }
+    }
+
+    /// **End-to-end RED-todiste (Phase 1 §6 manuaaliportin aukko):** todistaa että
+    /// operaattorin `POST /approvals/{id}/approve` **ajaa toiminnon sivuvaikutuksen
+    /// mutta EI aja agenttia lopulliseen vastaukseen** — vuoro ei jatku
+    /// (`turn_resumed`/`turn_answered` puuttuvat) eikä reply tavoita kanavaa.
+    ///
+    /// Harness kokoaa **aidon agentin** in-crate (skriptattu LLM + jaettu
+    /// `ActionRuntime` laskevalla hyväksyntätaidolla + jaettu `AuditCollector` +
+    /// captattu reply-sink). Sama `Arc<Mutex<ActionRuntime>>` ja sama
+    /// `Arc<AuditCollector>` annetaan sekä agentille (`with_actions` /
+    /// `with_turn_audit`) että `GatewayState`:lle — operaattori ja agentti jakavat
+    /// TÄSMÄLLEEN saman lukitun tilan, kuten tuotannon `build_family`-kytkennässä.
+    ///
+    /// Vuoro suspendataan kutsumalla `agent.think()` suoraan (deterministinen,
+    /// sama kuvio kuin `resume_approved_completes_turn_side_effect_runs_once`);
+    /// agentti spawnataan sen jälkeen actoriksi ja bus annetaan `GatewayState`:lle,
+    /// jotta myöhempi korjaus (`BusMessage::ResumeApproval` → actor-handler →
+    /// `resume_approved` → reply-sink) voi tehdä väitteestä (e) vihreän
+    /// koskematta tähän harnessiin.
+    ///
+    /// Väitteet (a)-(d) menevät LÄPI; (e) EPÄONNISTUU koska reply ei koskaan saavu
+    /// eikä `turn_resumed`/`turn_answered` synny — tämä on aukon todiste.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn e2e_suspend_approve_resume_reply() {
+        use familyclaw_agent::{new_reply_channel, Agent, ErasedMemoryStore, ThinkOutcome};
+        use familyclaw_bus::{BusMessage, ResonanceBus};
+        use familyclaw_durable::{DurableContext, InMemoryJournal, Journal};
+        use familyclaw_memory::LocalJsonStore;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // 1. Bus (sama instanssi GatewayState:lle — tuleva ResumeApproval-julkaisu).
+        let bus = ResonanceBus::start(None).await.expect("bus");
+
+        // 2. Skriptattu LLM: ensin hyväksyntää vaativa työkalukutsu (suspend),
+        //    sitten (resumen aikana) lopullinen teksti. Toista runkoa EI lueta
+        //    tässä RED-testissä, koska gateway ei aja resumea — se on tarkoitus.
+        let api = spawn_scripted_llm_e2e(vec![
+            e2e_body_tool_call(
+                "call_approve",
+                "approval_skill",
+                &serde_json::json!({ "q": "ship" }),
+            ),
+            e2e_body_text("hyväksytty toiminto valmis"),
+        ])
+        .await;
+
+        // 3. Jaettu ActionRuntime laskevalla hyväksyntätaidolla.
+        let side_effect_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut rt = ActionRuntime::new();
+        rt.register_skill(E2eCountingApprovalSkill {
+            count: std::sync::Arc::clone(&side_effect_count),
+        })
+        .expect("register approval_skill");
+        let actions: Arc<Mutex<ActionRuntime>> = Arc::new(Mutex::new(rt));
+
+        // 4. Jaettu turn-audit-keräin.
+        let turn_audit: Arc<AuditCollector> = Arc::new(AuditCollector::new());
+
+        // 5. Captattu reply-sink: tällä HAVAINNOIMME tavoittaako lopullinen vastaus
+        //    kanavan. Tuotannossa runtime omistaa recv-pään ja pumppaa Channel::send.
+        let (sink, mut reply_rx) = new_reply_channel();
+
+        // 6. Aito agentti skriptatulla LLM:llä + jaetut kahvat (sama kytkentä kuin
+        //    build_family). Reply-kohde on staattinen fallback.
+        let config = AgentConfig::new("e2e_agent", ModelConfig::new("scripted/model"));
+        let soul = Soul::from_essence("I am the E2E agent.".to_string());
+        let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
+        let durable = DurableContext::new(
+            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>,
+        )
+        .expect("durable ctx");
+        let llm_cfg = familyclaw_agent::llm::LlmConfig::new(&api, "test-key", "scripted-model")
+            .with_request_timeout_ms(2_000)
+            .with_connect_timeout_ms(2_000);
+        let agent = Agent::new(config, soul, memory, durable, bus.clone(), Some(llm_cfg), None)
+            .with_actions(Arc::clone(&actions))
+            .with_turn_audit(Arc::clone(&turn_audit))
+            .with_reply_sink(sink)
+            .with_reply_target("e2e-channel");
+
+        // 7. Aja vuoro → tool-loop suspendoituu hyväksyntää vaativaan työkaluun.
+        //    Tämä synnyttää AIDON turn_suspended-auditin + odottavan hyväksynnän
+        //    JAETTUUN ActionRuntimeen + jatkettavan vuoron resumable-pinnalle.
+        let out = agent
+            .think(&BusMessage::text("ship it"))
+            .await
+            .expect("think suspends");
+        let approval_id = match out {
+            ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+            other => panic!("odotettiin Suspended, sai: {other:?}"),
+        };
+        // Sivuvaikutus EI ole vielä ajettu (hyväksyntää ei myönnetty).
+        assert_eq!(
+            side_effect_count.load(SeqCst),
+            0,
+            "approval-gated side effect must NOT run before approve"
+        );
+
+        // 8. Spawnaa agentti actoriksi (pidetään elossa) — tuleva ResumeApproval-
+        //    bus-signaali tavoittaa juuri tämän postilaatikon. RED-testi ei sitä
+        //    vielä lähetä; pidämme actorin elossa harnessin uskollisuuden vuoksi.
+        let _actor = agent.spawn().await.expect("spawn agent actor");
+
+        // 9. GatewayState jakaa SAMAN actions- + turn_audit-kahvan ja saman busin.
+        let state = Arc::new(GatewayState {
+            bus: Some(bus.clone()),
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: Some(Arc::clone(&actions)),
+            turn_audit: Some(Arc::clone(&turn_audit)),
+            metrics: None,
+        });
+        let app = build_router(state);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // (a) Vuoro suspendattiin: ei vielä replyä, ja /turns/audit sisältää
+        //     turn_suspended-tapahtuman.
+        assert!(
+            reply_rx.try_recv().is_err(),
+            "(a) suspendin jälkeen ei saa olla replyä reply-sinkissä"
+        );
+        let audit_body: String = client
+            .get(format!("{base}/turns/audit"))
+            .send()
+            .await
+            .expect("GET /turns/audit (a)")
+            .text()
+            .await
+            .expect("audit body (a)");
+        assert!(
+            audit_body.contains("turn_suspended"),
+            "(a) audit-jälki sisältää turn_suspended:n, oli:\n{audit_body}"
+        );
+
+        // (b) /approvals/pending palauttaa approval_id:n + redaktoidun
+        //     tiivistelmän, EIKÄ vuoda salaisuuksia / perheen nimiä / yksityisiä
+        //     absoluuttisia polkuja (Layer-B-henki).
+        let pending_resp = client
+            .get(format!("{base}/approvals/pending"))
+            .send()
+            .await
+            .expect("GET /approvals/pending (b)");
+        assert_eq!(pending_resp.status().as_u16(), 200, "(b) pending = 200");
+        let pending_body = pending_resp.text().await.expect("pending body (b)");
+        assert!(
+            pending_body.contains(&approval_id.to_string()),
+            "(b) pending sisältää approval_id:n, oli:\n{pending_body}"
+        );
+        // Ei avaimen muotoista salaisuutta (sk-/Bearer), ei perheen nimiä, ei
+        // raakaa payloadia, ei yksityistä absoluuttista polkua.
+        let lowered = pending_body.to_lowercase();
+        assert!(
+            !lowered.contains("sk-")
+                && !lowered.contains("bearer ")
+                && !lowered.contains("test-key"),
+            "(b) ei avain-muotoista salaisuutta: {pending_body}"
+        );
+        for forbidden in ["agent_alpha", "agent_beta", "agent_gamma", "agent_delta", "agent_epsilon", "the operator"] {
+            assert!(
+                !lowered.contains(forbidden),
+                "(b) ei perheen nimeä ({forbidden}): {pending_body}"
+            );
+        }
+        assert!(
+            !pending_body.contains("ship") && !pending_body.contains("\"q\""),
+            "(b) ei raakaa payloadia: {pending_body}"
+        );
+        assert!(
+            !pending_body.contains("C:\\") && !pending_body.contains("/home/"),
+            "(b) ei yksityistä absoluuttista polkua: {pending_body}"
+        );
+
+        // (c) POST /approvals/{id}/approve → 200.
+        let approve_resp = client
+            .post(format!("{base}/approvals/{approval_id}/approve"))
+            .send()
+            .await
+            .expect("POST approve (c)");
+        assert_eq!(approve_resp.status().as_u16(), 200, "(c) approve = 200");
+
+        // (d) Sivuvaikutus ajettiin TASAN KERRAN (atominen laskuri == 1).
+        assert_eq!(
+            side_effect_count.load(SeqCst),
+            1,
+            "(d) approval-gated side effect must run exactly once"
+        );
+
+        // (e) RED: lopullinen reply tavoittaa kanavan/reply-sinkin JA /turns/audit
+        //     sisältää turn_resumed:n sitten turn_answered:n. Tämä EPÄONNISTUU
+        //     nykyisellä koodilla: approve_pending ajaa vain ActionRuntime::approve
+        //     eikä koskaan aja agenttia (resume_approved) → ei reply-sinkkiin, ei
+        //     resume/answered-auditia. Tämä on todistettu aukko (Phase 1 §6).
+        //
+        //     Annetaan reply-pumpulle pieni hetki — jos korjaus myöhemmin julkaisee
+        //     ResumeApprovalin, vastaus saapuu tämän ikkunan sisällä.
+        let reply = tokio::time::timeout(std::time::Duration::from_millis(500), reply_rx.recv())
+            .await
+            .ok()
+            .flatten();
+        let final_audit: String = client
+            .get(format!("{base}/turns/audit"))
+            .send()
+            .await
+            .expect("GET /turns/audit (e)")
+            .text()
+            .await
+            .expect("audit body (e)");
+
+        server.abort();
+        bus.stop();
+
+        // Nämä väitteet ovat se RED-rivi: ne FAILAAVAT kunnes resume-kytkentä on
+        // rakennettu. Älä löysennä niitä — niiden vihertäminen on seuraavan
+        // tehtävän hyväksymiskriteeri.
+        let reply_body = reply.map(|m| m.body);
+        assert_eq!(
+            reply_body.as_deref(),
+            Some("hyväksytty toiminto valmis"),
+            "(e) lopullisen vastauksen pitää tavoittaa reply-sink approven jälkeen \
+             (sai: {reply_body:?}) — operaattori-approve ei aja agenttia lopulliseen vastaukseen"
+        );
+        assert!(
+            final_audit.contains("turn_resumed"),
+            "(e) audit-jäljen pitää sisältää turn_resumed approven jälkeen, oli:\n{final_audit}"
+        );
+        assert!(
+            final_audit.contains("turn_answered"),
+            "(e) audit-jäljen pitää sisältää turn_answered approven jälkeen, oli:\n{final_audit}"
+        );
     }
 }
