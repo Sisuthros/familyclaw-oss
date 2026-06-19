@@ -245,8 +245,14 @@ impl ComparativeScorecard {
                 "On **S1 Crash Matrix**, FamilyClaw re-executes \
                  `side_effect_overcount: 0` side effects across every crash point \
                  and passes; the baseline re-runs `> 0` side effects on restart \
-                 and fails. Durable replay runs each side effect exactly once — \
-                 the truncating file-memory baseline cannot.\n",
+                 and fails. Durable replay plus the idempotency-keyed dispatch \
+                 outbox dispatch each side effect **at most once** under a crash — \
+                 a side effect never fires twice; a crash in the narrow \
+                 intent-only window fails closed (zero or one execution, requiring \
+                 recovery) rather than re-firing blindly. This is \
+                 duplicate-prevention under crash, not a guarantee of universal \
+                 exactly-once completion — the truncating file-memory baseline \
+                 offers neither.\n",
             );
         } else {
             out.push_str(
@@ -334,8 +340,11 @@ mod tests {
         let md = cmp.to_markdown();
         // S1-rivillä FamilyClaw=0.0000, baseline=12.0000.
         assert!(md.contains("| side_effect_overcount | 0.0000 | 12.0000 |"));
-        // Verdict toteaa edun.
-        assert!(md.contains("runs each side effect exactly once"));
+        // Verdict toteaa edun rehellisellä rajalla: at-most-once / fail-closed,
+        // EI universaalia "exactly-once completion" -lupausta.
+        assert!(md.contains("at most once"));
+        assert!(md.contains("not a guarantee of universal"));
+        assert!(!md.contains("each side effect exactly once"));
     }
 
     #[test]

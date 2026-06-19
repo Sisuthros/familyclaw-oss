@@ -37,3 +37,9 @@ serde_json = { workspace = true }
 familyclaw-channels = { workspace = true }
 familyclaw-agent = { workspace = true }
 familyclaw-core = { workspace = true }
+# Lähetys-outboxin (DispatchOutboxStore) PRODUCT-PATH-kaatumiskestävyystesti:
+# seed committed/intent-only -avain ja todista at-most-once build_family:n läpi.
+familyclaw-actions = { workspace = true }
+# Laskuri-skillin (sivuvaikutuksen mittari) rakentamiseen testissä.
+async-trait = { workspace = true }
+uuid = { workspace = true }

@@ -27,7 +27,7 @@ and private runtime profiles that never enter the repository.
 
 | Problem | Conventional frameworks | FamilyClaw |
 |---------|------------------------|------------|
-| **Memory discontinuity** — work and memory vanish on restart | Reload prompts; lose in-flight work | **Durable execution** — deterministic replay resumes exactly where stopped; side effects not re-run. **Eternal Thread** — persistent memory with Ebbinghaus decay + protected identity anchors (λ=0). |
+| **Memory discontinuity** — work and memory vanish on restart | Reload prompts; lose in-flight work | **Durable execution** — deterministic replay resumes exactly where stopped; side effects are dispatched **at most once** under a crash (idempotency-keyed: never fired twice; a crash in the intent-only window fails closed and requires recovery — not universal exactly-once *completion*). **Eternal Thread** — persistent memory with Ebbinghaus decay + protected identity anchors (λ=0). |
 | **Agents are isolated** — no shared situational awareness | Pass text messages | **Resonance Bus** — Ractor actor mesh where emotional state *leaks* to siblings (affective contagion). Roster never empty. |
 | **Memory rots** — duplicates pile up, "yesterday" goes stale | Manual cleanup | **Dreaming** — nightly consolidation merges duplicates, drops contradictions, absolutizes relative dates (hippocampal model). |
 | **Communication is lossy + token-expensive** | Everything serialized to text | **Latent telepathy** — siblings exchange hidden-state vectors directly, bridged across models, **always falling back to text** if incompatible. |

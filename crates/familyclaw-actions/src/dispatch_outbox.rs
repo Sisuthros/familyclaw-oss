@@ -174,6 +174,17 @@ struct KeyState {
 /// logiikkaansa. Kaikki metodit ovat `&self` (sisäinen mutaatio lukon takana),
 /// jotta trait on `dyn`-yhteensopiva.
 pub trait DispatchOutboxStore: std::fmt::Debug + Send + Sync {
+    /// Palauttaa toteutuksen **vakaan lajitunnisteen** (`"in-memory"` tai
+    /// `"journal"`).
+    ///
+    /// Tämä on tarkoituksellisesti pieni, salaisuudeton koukku jolla kutsuja
+    /// (ja testit) voi todeta KUMPI outbox on kytketty paljastamatta sisäistä
+    /// tilaa tai polkua. Kaatumiskestävyyttä vaativa kokoonpano voi näin
+    /// varmistaa että `dyn`-takana on `"journal"`-variantti eikä oletuksellinen
+    /// `"in-memory"`. Arvo on stabiili kontrakti — älä muuta olemassa olevia
+    /// merkkijonoja.
+    fn kind(&self) -> &'static str;
+
     /// Tarkistaa avaimen nykytilan **suorittamatta** mitään.
     ///
     /// # Errors
@@ -223,6 +234,10 @@ impl InMemoryDispatchOutbox {
 }
 
 impl DispatchOutboxStore for InMemoryDispatchOutbox {
+    fn kind(&self) -> &'static str {
+        "in-memory"
+    }
+
     fn lookup(&self, key: &str) -> Result<DispatchLookup> {
         let map = self.lock();
         Ok(match map.get(key) {
@@ -372,6 +387,10 @@ impl JournalDispatchOutbox {
 }
 
 impl DispatchOutboxStore for JournalDispatchOutbox {
+    fn kind(&self) -> &'static str {
+        "journal"
+    }
+
     fn lookup(&self, key: &str) -> Result<DispatchLookup> {
         let state = self.replay_key(key)?;
         Ok(match state.committed {

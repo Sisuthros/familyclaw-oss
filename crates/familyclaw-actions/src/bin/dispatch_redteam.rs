@@ -200,6 +200,11 @@ impl CrashAfterIntentOutbox {
 }
 
 impl DispatchOutboxStore for CrashAfterIntentOutbox {
+    fn kind(&self) -> &'static str {
+        // Kääre delegoi kaiken kaatumiskestävään outboxiin → sama lajitunniste.
+        self.inner.kind()
+    }
+
     fn lookup(&self, key: &str) -> familyclaw_actions::Result<DispatchLookup> {
         self.inner.lookup(key)
     }

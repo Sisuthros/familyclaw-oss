@@ -1651,6 +1651,8 @@ impl Agent {
             self.tool_loop.max_iterations,
             now,
             turn_id,
+            // Tuore vuoro: ei idempotenttia jatkoavainta (entinen käytös).
+            None,
         )
         .await
     }
@@ -1668,6 +1670,21 @@ impl Agent {
     /// kokonaisrajalla, ei nollaa sitä). `last_text` on viimeisin mallin teksti
     /// (resumessa tyypillisesti tyhjä). Käyttäytyminen on muuten identtinen
     /// alkuperäisen `run_tool_loop`:n kanssa — ks. sen vaihekuvaus.
+    ///
+    /// **Idempotentti lähetys (`idempotent_key_prefix`):**
+    /// - `None` → tuore vuoro: lähetä [`ActionRuntime::submit_task_as`]:lla
+    ///   (entinen käytös, ei muutosta — tämä polku on jo durable-suojattu
+    ///   [`drive_tool_loop_durable`]:n kautta tuotannossa).
+    /// - `Some(prefix)` → **hyväksynnän jälkeinen jatko** (resume): jokainen
+    ///   työkalun lähetys ajetaan **idempotentisti**
+    ///   ([`ActionRuntime::submit_task_idempotent`]) avaimella
+    ///   `{prefix}-dispatch-{k}`, jossa `k` on jatkon sisäinen, kaikkien
+    ///   kierrosten yli juokseva lähetysnumero. Avain on **deterministinen
+    ///   restartin yli**: sama `prefix` (johdettu hyväksynnän tunnisteesta) +
+    ///   sama lähetysindeksi → sama avain, joten outbox dedupoi
+    ///   kaatuminen-sitten-replay -tilanteessa eikä sivuvaikutus laukea
+    ///   kahdesti. Tämä sulkee viimeisen double-fire-ikkunan, joka jäi
+    ///   ei-durable-lähetyspolulle hyväksynnän myöntämisen JÄLKEEN.
     ///
     /// **Determinismi (D1):** `now` injektoidaan — kelloa **ei** lueta
     /// silmukkalogiikan sisällä, vaan kaikki tehtävänlähetykset käyttävät tätä
@@ -1696,7 +1713,13 @@ impl Agent {
         budget: u32,
         now: Timestamp,
         turn_id: ActionId,
+        idempotent_key_prefix: Option<&str>,
     ) -> Result<ToolLoopOutcome> {
+        // Hyväksynnän jälkeisen jatkon lähetysnumero: juokseva KAIKKIEN
+        // kierrosten yli (ei nollaudu per kierros), jotta jokainen
+        // idempotentti lähetysavain on uniikki ja deterministinen replayssa.
+        // Käytetään vain kun `idempotent_key_prefix` on `Some`.
+        let mut dispatch_index: u32 = 0;
         for _ in 0..budget {
             // 1. Rakenna työkalut runtimen MCP-kuvauksista (lukko vain
             //    kuvausten ajaksi — vapautetaan ennen LLM-kutsua).
@@ -1764,13 +1787,37 @@ impl Agent {
                     // Lähetä TÄMÄN olennon (`being_id`) nimissä, jotta hyväksyntää
                     // vaativien työkalujen per-olento-rate-limit kohdistuu oikein
                     // eikä romahda runtimen geneeriseen oletusolentoon.
-                    rt.submit_task_as(
-                        &self.being_id.to_string(),
-                        skill_id,
-                        call.arguments.clone(),
-                        now,
-                    )
-                    .await
+                    if let Some(prefix) = idempotent_key_prefix {
+                        // 🔑 Hyväksynnän jälkeinen jatko: lähetä idempotentisti
+                        // deterministisellä avaimella `{prefix}-dispatch-{k}`.
+                        // `k` (dispatch_index) on vakaa restartin yli (sama prefix
+                        // + sama indeksi → sama avain), joten outbox dedupoi
+                        // kaatuminen-sitten-replay -tilanteessa eikä sivuvaikutus
+                        // laukea kahdesti. Indeksi kasvatetaan ENNEN lähetystä,
+                        // jotta replay osuu samaan avaimeen samalla järjestyksellä.
+                        let key = format!("{prefix}-dispatch-{dispatch_index}");
+                        dispatch_index += 1;
+                        rt.submit_task_idempotent(
+                            &key,
+                            &self.being_id.to_string(),
+                            skill_id,
+                            call.arguments.clone(),
+                            now,
+                        )
+                        .await
+                    } else {
+                        // Tuore (ei-jatko) vuoro: entinen ei-idempotentti polku.
+                        // Tämä polku on jo durable-suojattu `drive_tool_loop_durable`:n
+                        // kautta tuotannossa; tässä `submit_task_as` säilyttää
+                        // alkuperäisen käytöksen byte-identtisenä.
+                        rt.submit_task_as(
+                            &self.being_id.to_string(),
+                            skill_id,
+                            call.arguments.clone(),
+                            now,
+                        )
+                        .await
+                    }
                 };
 
                 match outcome {
@@ -2070,6 +2117,16 @@ impl Agent {
         let Some(llm) = self.llm.as_ref() else {
             return Ok(ThinkOutcome::NoReply);
         };
+        // 🔑 IDEMPOTENTTI JATKO (sulkee viimeisen double-fire-ikkunan):
+        // hyväksynnän myöntämisen JÄLKEEN tehdyt työkalulähetykset reititetään
+        // `submit_task_idempotent`:n läpi deterministisellä avain-prefiksillä,
+        // joka johdetaan tämän jatkon hyväksynnän tunnisteesta. Sama
+        // `approval_id` + sama jatkon sisäinen lähetysindeksi tuottavat saman
+        // avaimen restartin yli, joten kaatuminen-sitten-replay ei laukaise
+        // sivuvaikutusta uudelleen. (Aiemmin tämä polku kutsui `submit_task_as`:ia
+        // suoraan, jolloin hyväksynnän jälkeiset lähetykset olivat alttiita
+        // kaksoislaukaisulle kaatumisikkunassa.)
+        let resume_dispatch_prefix = format!("resume-{approval_id}");
         // Jatketaan TÄYDELLÄ kierrosbudjetilla: resume on uusi "jakso" jossa malli
         // saa taas tilaa edetä. Turvaraja sitoo silti loputtoman kierron.
         // `turn_id` korreloi jatketun silmukan työkalukutsut tähän resume-vuoroon.
@@ -2082,6 +2139,7 @@ impl Agent {
                 self.tool_loop.max_iterations,
                 now,
                 turn_id,
+                Some(&resume_dispatch_prefix),
             )
             .await?;
 
@@ -4807,6 +4865,168 @@ mod tests {
             store.get(approval_id).expect("get").is_none(),
             "resumable turn consumed after resume"
         );
+        bus.stop();
+    }
+
+    /// (b-idempotent) **Hyväksynnän JÄLKEINEN jatko on idempotentti** — sulkee
+    /// viimeisen double-fire-ikkunan.
+    ///
+    /// Tausta: kun hyväksyntä on myönnetty, [`resume_approved`] jatkaa vuoron
+    /// [`drive_tool_loop`]:lla idempotentilla avain-prefiksillä
+    /// `resume-{approval_id}`. Aiemmin tämä polku lähetti hyväksynnän jälkeiset
+    /// työkalut [`ActionRuntime::submit_task_as`]:lla (ei-idempotentti), joten
+    /// kaatuminen sivuvaikutuksen ja sen journaloinnin VÄLISSÄ olisi voinut
+    /// laukaista sivuvaikutuksen kahdesti replayssa.
+    ///
+    /// Tämä testi simuloi juuri sen kaatuminen-sitten-replay -ikkunan: ajaa
+    /// `drive_tool_loop`:n **kahdesti SAMALLA** idempotentilla prefiksillä
+    /// JAETTUA runtimea vasten (toinen ajo = jatkon replay restartin jälkeen).
+    /// Jatko kutsuu auto-run-taitoa (`auto_counter`), jonka laskuri on suora
+    /// mittari sivuvaikutuksen suorituskerroista. Avain
+    /// `resume-{approval_id}-dispatch-0` on deterministinen → outbox dedupoi →
+    /// **laskuri pysyy 1:ssä** vaikka jatko ajetaan kahdesti.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn resume_continuation_dispatch_is_idempotent_across_replay() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        // Vakaa olennon tunniste molemmille ajoille (restart = sama olento herää).
+        let being_id = familyclaw_core::AgentId::new();
+        // Vakaa, deterministinen hyväksynnän tunniste → vakaa avain-prefiksi
+        // (`resume-{approval_id}`) molemmille ajoille, kuten tuotannossa sama
+        // `approval_id` johtaa saman avaimen restartin yli.
+        let approval_id = ApprovalId::new();
+        let prefix = format!("resume-{approval_id}");
+
+        // JAETTU runtime auto-run-laskevalla taidolla — sama dispatch-outbox
+        // kantaa idempotenssin molempien ajojen yli (sama prosessi = in-memory
+        // outbox riittää tämän replay-ikkunan kattamiseen).
+        let auto_count = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        let approval_count = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = crash_runtime(
+            Box::new(familyclaw_actions::InMemoryPendingStore::new()),
+            StdArc::clone(&auto_count),
+            StdArc::clone(&approval_count),
+        );
+
+        // Yhteinen LLM-skripti molemmille ajoille: kutsu auto_counter, sitten
+        // vastaa tekstillä. (Kumpikin ajo saa OMAN skriptatun mockinsa, koska
+        // skripti kuluu ajossa — replayssa LLM kutsutaan tuoreena, mutta
+        // SIVUVAIKUTUS dedupataan idempotentilla avaimella, ei LLM-kutsua.)
+        let scripted = || {
+            vec![
+                body_tool_call("call_a", "auto_counter", &serde_json::json!({ "n": 1 })),
+                body_text("jatko valmis"),
+            ]
+        };
+
+        let now = time::now();
+        let messages = vec![
+            LlmMessage::system("system"),
+            LlmMessage::user("jatka hyväksynnän jälkeen"),
+        ];
+
+        // ===== Ajo 1: alkuperäinen hyväksynnän jälkeinen jatko. =====
+        {
+            let api = spawn_scripted_llm(scripted()).await;
+            let agent = agent_with_scripted_llm_id(being_id, "agent_a", bus.clone(), &api)
+                .with_actions(StdArc::clone(&runtime));
+            let llm = agent.llm.as_ref().expect("llm present");
+            let actions = agent.actions.as_ref().expect("actions present");
+            let outcome = agent
+                .drive_tool_loop(
+                    llm,
+                    actions,
+                    messages.clone(),
+                    String::new(),
+                    agent.tool_loop.max_iterations,
+                    now,
+                    ActionId::new(),
+                    Some(&prefix),
+                )
+                .await
+                .expect("ajo 1 ok");
+            assert_eq!(
+                outcome,
+                ToolLoopOutcome::Answer("jatko valmis".to_string()),
+                "ajo 1 etenee lopulliseen vastaukseen"
+            );
+        }
+        assert_eq!(
+            auto_count.load(SeqCst),
+            1,
+            "jatkon auto-run-sivuvaikutus ajetaan kerran ensimmäisellä ajolla"
+        );
+
+        // ===== Ajo 2: SAMAN jatkon REPLAY restartin jälkeen (sama prefix). =====
+        // Sama deterministinen avain `resume-{approval_id}-dispatch-0` →
+        // outbox palauttaa committed-lopputuloksen ajamatta suoritinta uudelleen.
+        {
+            let api = spawn_scripted_llm(scripted()).await;
+            let agent = agent_with_scripted_llm_id(being_id, "agent_a", bus.clone(), &api)
+                .with_actions(StdArc::clone(&runtime));
+            let llm = agent.llm.as_ref().expect("llm present 2");
+            let actions = agent.actions.as_ref().expect("actions present 2");
+            let outcome = agent
+                .drive_tool_loop(
+                    llm,
+                    actions,
+                    messages.clone(),
+                    String::new(),
+                    agent.tool_loop.max_iterations,
+                    now,
+                    ActionId::new(),
+                    Some(&prefix),
+                )
+                .await
+                .expect("ajo 2 (replay) ok");
+            assert_eq!(
+                outcome,
+                ToolLoopOutcome::Answer("jatko valmis".to_string()),
+                "replay-ajo etenee samaan vastaukseen"
+            );
+        }
+
+        // YDINVÄITE: sivuvaikutus pysyy TASAN 1:ssä — jatkon replay EI
+        // laukaissut auto-run-taitoa uudelleen (idempotentti avain dedupasi).
+        assert_eq!(
+            auto_count.load(SeqCst),
+            1,
+            "hyväksynnän jälkeisen jatkon replay EI saa ajaa sivuvaikutusta uudelleen"
+        );
+
+        // Kontrastitodiste: ERI prefix (eri approval_id) EI dedupata → uusi
+        // avain `resume-{toinen}-dispatch-0` → sivuvaikutus laukeaa taas. Tämä
+        // varmistaa että dedup johtuu vakaasta avaimesta, ei pelkästä runtimen
+        // tilasta.
+        {
+            let other_prefix = format!("resume-{}", ApprovalId::new());
+            let api = spawn_scripted_llm(scripted()).await;
+            let agent = agent_with_scripted_llm_id(being_id, "agent_a", bus.clone(), &api)
+                .with_actions(StdArc::clone(&runtime));
+            let llm = agent.llm.as_ref().expect("llm present 3");
+            let actions = agent.actions.as_ref().expect("actions present 3");
+            let _ = agent
+                .drive_tool_loop(
+                    llm,
+                    actions,
+                    messages,
+                    String::new(),
+                    agent.tool_loop.max_iterations,
+                    now,
+                    ActionId::new(),
+                    Some(&other_prefix),
+                )
+                .await
+                .expect("eri-prefix ajo ok");
+        }
+        assert_eq!(
+            auto_count.load(SeqCst),
+            2,
+            "ERI idempotentti avain (eri approval_id) ei dedupata → sivuvaikutus laukeaa uudelleen"
+        );
+
         bus.stop();
     }
 

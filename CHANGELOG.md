@@ -41,6 +41,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`Arc<AuditCollector>`) altistavat saman lukitun toimintoajoympäristön ja
   vain-lisäävän turn-audit-keräimen jotka agentin tool-loop omistaa — gateway
   lukee odottavat hyväksynnät ja tool-loop-jäljen jakamatta agentin sisuksia.
+- **familyclaw-actions lähetyksen idempotenssi-outbox** (`DispatchOutboxStore` /
+  `JournalDispatchOutbox`) + `ActionRuntime::submit_task_idempotent` — sulkee
+  ikkunan sivuvaikutuksen suorituksen ja sen agenttikerroksen journaloinnin
+  välissä. Jokainen lähetys kytketään kutsujan johtamaan vakaaseen
+  idempotenssi-avaimeen ja kirjataan kaksivaiheisesti (intent ennen
+  sivuvaikutusta, committed sen jälkeen). `familyclaw-runtime build_family`
+  kytkee kaatumiskestävän `JournalDispatchOutbox`:n
+  (`<FAMILYCLAW_DATA_DIR>/dispatch_outbox.jsonl`) tuotantopolulla.
+  **Takuu (rehellinen raja):** sivuvaikutus **lähetetään korkeintaan kerran**
+  prosessin kaatumisen / SIGKILL:n yli — se ei koskaan laukea kahdesti.
+  Sitoutunut (committed) lähetys palautuu arvo-identtisenä ajamatta
+  sivuvaikutusta uudelleen; kaatuminen kapeassa intent-only-ikkunassa
+  **epäonnistuu suljettuna** (nolla tai yksi suoritusta, vaatii toipumisen) sen
+  sijaan että ajaisi sokeasti uudelleen. Tämä on **kaksoislaukaisun esto
+  (duplicate-prevention) kaatumisen yli, EI lupaus universaalista
+  "exactly-once completion" -valmistumisesta.**
 
 ### Verified
 - `bash scripts/audit-layer-b.sh` — PASS (ei sieluja/avaimia/nimivuotoja)
@@ -209,7 +225,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **familyclaw-core** — Foundation types, error hierarchy, timestamp utilities, agent identity
 - **familyclaw-bus** — Ractor actor mesh with affective contagion (sibling emotional state leaking)
-- **familyclaw-durable** — Deterministic replay engine; side effects not re-run on recovery
+- **familyclaw-durable** — Deterministic replay engine; on recovery a side effect is dispatched at most once (never re-run twice)
 - **familyclaw-memory** — Eternal Thread memory with Ebbinghaus decay, protected identity anchors, dual-write safety
 - **familyclaw-dream** — Nightly consolidation cycle: duplicate merge, contradiction drop, date absolutization (hippocampal model)
 - **familyclaw-emotion** — Valence-arousal affective nervous system with homeostasis regulation

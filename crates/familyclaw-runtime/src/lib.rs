@@ -32,7 +32,7 @@
 use std::env;
 use std::sync::Arc;
 
-use familyclaw_actions::{ActionRuntime, AuditCollector};
+use familyclaw_actions::{ActionRuntime, AuditCollector, DispatchOutboxStore, JournalDispatchOutbox};
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, resolve_profile_dir, Agent, EmotionCalibration,
     ErasedMemoryStore, JournalResumableStore, LlmEndpointResolver, ResumableTurnStore, Soul,
@@ -258,7 +258,23 @@ pub async fn build_family(
     //    In-memory-polulla agentti jää oletukseensa
     //    ([`InMemoryResumableStore`]) — ei levyä, ei kaatumiskestävyyttä, kuten
     //    muullakin in-memory-tilalla.
-    let (memory, durable, dream_journal, persistent, resumable) = if let Some(data_dir) = data_dir {
+    //
+    //    `dispatch_outbox` on lähetyksen idempotenssi-outbox — **at-most-once**-
+    //    rajan (kaksoislaukaisun esto, EI universaali exactly-once completion)
+    //    KAATUMISKESTÄVÄ pinta. Se rakennetaan **vain** persistentillä
+    //    polulla: silloin `submit_task`:n sivuvaikutus suoritetaan korkeintaan
+    //    kerran SIGKILL-kaatumisen yli (ei koskaan kahdesti), ja jo sitoutunut lähetys palautuu
+    //    arvo-identtisenä restartin jälkeen ([`JournalDispatchOutbox`],
+    //    `<data_dir>/dispatch_outbox.jsonl`). In-memory-polulla agentti jää
+    //    oletukseensa ([`InMemoryDispatchOutbox`]) — ei levyä, ei
+    //    kaatumiskestävyyttä, kuten muullakin in-memory-tilalla. Ilman tätä
+    //    persistentti daemon menettäisi juuri sen takuun jonka vuoksi outbox on
+    //    olemassa: kaatuminen ENNEN durable-askeleen journalointia (mutta
+    //    sivuvaikutuksen JÄLKEEN) johtaisi kaksoislaukaisuun restartissa.
+    let (memory, durable, dream_journal, persistent, resumable, dispatch_outbox) = if let Some(
+        data_dir,
+    ) = data_dir
+    {
         let dir = std::path::PathBuf::from(&data_dir);
         std::fs::create_dir_all(&dir).ok();
         let journal = FileJournal::open(dir.join("journal.jsonl"))
@@ -273,19 +289,25 @@ pub async fn build_family(
         let store = JournalResumableStore::open(dir.join("resumable.jsonl"))
             .map_err(|e| FamilyClawError::bus(e.to_string()))?;
         let resumable: Arc<dyn ResumableTurnStore> = Arc::new(store);
+        // Kaatumiskestävä lähetys-outbox `<data_dir>/dispatch_outbox.jsonl`
+        // (at-most-once-rajan kivijalka: kaksoislaukaisun esto — ks. yllä).
+        let outbox = JournalDispatchOutbox::open(dir.join("dispatch_outbox.jsonl"))
+            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+        let dispatch_outbox: Box<dyn DispatchOutboxStore> = Box::new(outbox);
         (
             Arc::new(mem) as ErasedMemoryStore,
             dur,
             Some(dream_j),
             true,
             Some(resumable),
+            Some(dispatch_outbox),
         )
     } else {
         let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
         let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(InMemoryJournal::new());
         let durable = DurableContext::new(Arc::clone(&dream_j))
             .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-        (memory, durable, Some(dream_j), false, None)
+        (memory, durable, Some(dream_j), false, None, None)
     };
 
     // 5. Ankkuroi identiteetti ennen agentin rakennusta — JA persistoi se.
@@ -364,9 +386,23 @@ pub async fn build_family(
     //     Sama kahva annetaan agentille `with_actions`:lla (tool-loop aktivoituu)
     //     JA talletetaan runtimeen ([`FamilyRuntime::actions`]) operaattoripintaa
     //     varten — molemmat osoittavat samaan lukittuun tilaan.
-    let action_runtime = ActionRuntime::with_default_skills().map_err(|e| {
+    //
+    //     **At-most-once persistentillä polulla** (kaksoislaukaisun esto, EI
+    //     universaali exactly-once completion): kun kaatumiskestävä
+    //     lähetys-outbox rakennettiin (persistentti polku, askel 4), kytke se
+    //     ajoympäristöön oletuksen ([`InMemoryDispatchOutbox`]) tilalle
+    //     ([`ActionRuntime::with_dispatch_outbox`]). Vasta tämä antaa
+    //     `submit_task`:lle at-most-once-takuun SIGKILL-kaatumisen yli
+    //     (sivuvaikutus korkeintaan kerran, ei koskaan kahdesti; intent-only-
+    //     kaatuminen epäonnistuu suljettuna) — ilman
+    //     tätä outbox eläisi muistissa ja kuolisi juuri siinä kaatumisessa jonka
+    //     selviämiseksi se on olemassa. In-memory-polulla outbox jää oletukseensa.
+    let mut action_runtime = ActionRuntime::with_default_skills().map_err(|e| {
         FamilyClawError::config(format!("action runtime build failed: {e}"))
     })?;
+    if let Some(dispatch_outbox) = dispatch_outbox {
+        action_runtime = action_runtime.with_dispatch_outbox(dispatch_outbox);
+    }
     let actions: Arc<Mutex<ActionRuntime>> = Arc::new(Mutex::new(action_runtime));
     agent = agent.with_actions(Arc::clone(&actions));
 

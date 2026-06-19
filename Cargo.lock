@@ -1702,6 +1702,7 @@ dependencies = [
 name = "familyclaw-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum 0.7.9",
  "familyclaw-actions",
  "familyclaw-agent",
@@ -1716,6 +1717,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -205,7 +205,9 @@ pub struct ActionRuntime {
     /// [`ActionRuntime::with_being_id`]:tä asettaaksesi tämän ajoympäristön
     /// oletusolennon.
     being_id: String,
-    /// **Lähetyksen idempotenssi-outbox** (exactly-once-rajan kivijalka).
+    /// **Lähetyksen idempotenssi-outbox** (at-most-once-rajan kivijalka:
+    /// kaksoislaukaisun esto kaatumisen yli, EI universaali exactly-once
+    /// completion).
     ///
     /// [`ActionRuntime::submit_task_idempotent`] kytkee jokaiseen lähetykseen
     /// kutsujan johtaman vakaan avaimen ja kirjaa lähetyksen kaksivaiheisesti
@@ -385,12 +387,14 @@ impl ActionRuntime {
     /// Vaihtaa ajoympäristön **lähetyksen idempotenssi-outboxin** annettuun
     /// toteutukseen ja palauttaa itsensä (builder-tyyli).
     ///
-    /// Tämä on exactly-once-takuun kytkentäkohta. Oletus
+    /// Tämä on at-most-once-takuun kytkentäkohta (kaksoislaukaisun esto, EI
+    /// universaali exactly-once completion). Oletus
     /// ([`ActionRuntime::new`]) on muistinvarainen
     /// ([`InMemoryDispatchOutbox`]) eikä selviä kaatumisesta; anna
     /// [`crate::dispatch_outbox::JournalDispatchOutbox`] saadaksesi takuun:
-    /// `submit_task`:n sivuvaikutus suoritetaan korkeintaan kerran SIGKILL-
-    /// kaatumisen yli, ja jo sitoutunut lähetys palautuu arvo-identtisenä.
+    /// `submit_task`:n sivuvaikutus suoritetaan **korkeintaan kerran** SIGKILL-
+    /// kaatumisen yli (ei koskaan kahdesti), ja jo sitoutunut lähetys palautuu
+    /// arvo-identtisenä.
     ///
     /// ```
     /// # use familyclaw_actions::ActionRuntime;
@@ -403,6 +407,19 @@ impl ActionRuntime {
     pub fn with_dispatch_outbox(mut self, outbox: Box<dyn DispatchOutboxStore>) -> Self {
         self.dispatch_outbox = outbox;
         self
+    }
+
+    /// Palauttaa kytketyn lähetys-outboxin **lajitunnisteen** (`"in-memory"` tai
+    /// `"journal"`).
+    ///
+    /// Tämä on salaisuudeton tarkistuskoukku kokoojalle ja testeille: sillä voi
+    /// todeta että persistentti kokoonpano sai kaatumiskestävän
+    /// (`"journal"`) outboxin oletuksellisen muistinvaraisen (`"in-memory"`)
+    /// sijaan, paljastamatta sisäistä tilaa tai tiedostopolkua. Arvo delegoituu
+    /// suoraan [`DispatchOutboxStore::kind`]:iin.
+    #[must_use]
+    pub fn dispatch_outbox_kind(&self) -> &'static str {
+        self.dispatch_outbox.kind()
     }
 
     /// Snapshottaa tehtävän nykytilan kaatumiskestävään jonoon, jos sellainen on
@@ -688,7 +705,9 @@ impl ActionRuntime {
     }
 
     /// Lähettää tehtävän **idempotentisti** kutsujan johtaman vakaan avaimen
-    /// (`key`) suojassa — exactly-once-takuun kivijalka.
+    /// (`key`) suojassa — at-most-once-takuun kivijalka (sivuvaikutus lähetetään
+    /// **korkeintaan kerran**, ei koskaan kahdesti; tämä on kaksoislaukaisun esto
+    /// kaatumisen yli, EI lupaus universaalista exactly-once *valmistumisesta*).
     ///
     /// Tämä on [`ActionRuntime::submit_task_as`]:n kaatumiskestävä kääre. Se
     /// sulkee ikkunan sivuvaikutuksen suorituksen ja sen journaloinnin välissä:
@@ -1036,6 +1055,37 @@ mod tests {
         let rendered = serde_json::to_string(&skills).expect("serialize summaries");
         assert!(!rendered.contains("sk-"));
         assert!(!rendered.contains("Bearer "));
+    }
+
+    /// Oletuskokoonpano ([`ActionRuntime::with_default_skills`]) saa
+    /// muistinvaraisen outboxin, ja [`ActionRuntime::with_dispatch_outbox`]
+    /// kytkee kaatumiskestävän journal-variantin tilalle.
+    ///
+    /// Tämä lukitsee kytkennän kontrollin: kokooja (`familyclaw-runtime`) luottaa
+    /// `dispatch_outbox_kind()`:iin todetakseen että persistentti polku sai
+    /// `"journal"`-outboxin oletuksellisen `"in-memory"`:n sijaan.
+    #[test]
+    fn dispatch_outbox_kind_reflects_wired_variant() {
+        // Oletus: muistinvarainen.
+        let in_memory = ActionRuntime::with_default_skills().expect("default skills");
+        assert_eq!(in_memory.dispatch_outbox_kind(), "in-memory");
+
+        // Kytketty journal-outbox → "journal".
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = std::env::temp_dir().join(format!(
+            "familyclaw-facade-outbox-{}-{nanos}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let journal = crate::dispatch_outbox::JournalDispatchOutbox::open(&path)
+            .expect("open journal outbox");
+        let durable = ActionRuntime::with_default_skills()
+            .expect("default skills")
+            .with_dispatch_outbox(Box::new(journal));
+        assert_eq!(durable.dispatch_outbox_kind(), "journal");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
