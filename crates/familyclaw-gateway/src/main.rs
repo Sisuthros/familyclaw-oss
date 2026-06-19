@@ -2,9 +2,34 @@
 //!
 //! **Gateway-binääri** — FamilyClaw-alustan (KERROS A, OSS) pitkäikäinen
 //! prosessi: se sitoo HTTP-portin, tarjoaa elinvoima- ja valmiustarkistukset
-//! (`/healthz`, `/readyz`), käynnistää [`FamilyRuntime`]:n (bus + agentti +
-//! kanava + reply-pumppu) yhdellä [`build_family`]-kutsulla ja pysyy pystyssä
-//! kunnes käyttäjä pyytää siistin sammutuksen (`Ctrl-C`).
+//! (`/healthz`, `/readyz`) sekä Prometheus-mittarit (`/metrics`), käynnistää
+//! [`FamilyRuntime`]:n (bus + agentti + kanava + reply-pumppu) yhdellä
+//! [`build_family`]-kutsulla ja pysyy pystyssä kunnes käyttäjä pyytää siistin
+//! sammutuksen (`Ctrl-C`).
+//!
+//! ## Havainnoitavuus: `GET /metrics` (Prometheus-eksposition tekstiformaatti)
+//! Gateway jakaa [`MetricsRegistry`]:n (rakennettu
+//! [`MetricsRegistry::with_fleet_defaults`]:lla) `GatewayState`-tilaansa ja
+//! tarjoilee sen `GET /metrics`:llä `text/plain`-vastauksena
+//! ([`MetricsRegistry::prometheus_export`], deterministinen nimijärjestys).
+//! Laivueen esinimetyt sarjat (luodut/valmistuneet tehtävät, sopimukset,
+//! agenttivuorot, LLM-kutsut, `agents_online`-gauge, …) ovat viennissä alusta
+//! asti arvolla `0`. **Nyt arvot ovat enimmäkseen nollia:** rekisteri on
+//! kytketty jaettuun tilaan, mutta ajonaikaiset tapahtumat eivät vielä
+//! inkrementoi sarjoja automaattisesti (tapahtumapohjainen täyttö
+//! [`EventRecorder`](familyclaw_observability::EventRecorder)-tyyppisellä
+//! sillalla busin päälle on erillinen kytkentä). Reitti on suojaamaton —
+//! mittarit ovat numeerisia aikasarjoja ilman salaisuuksia (ks.
+//! [`metrics_handler`]).
+//!
+//! ```bash
+//! curl -s http://127.0.0.1:8787/metrics
+//! # → # TYPE agents_online gauge
+//! #   agents_online 0
+//! #   # TYPE tasks_created counter
+//! #   tasks_created 0
+//! #   ...
+//! ```
 //!
 //! Tämä on C5-saumassa luvattu `build_family`-kokoojan **ohut kuori**:
 //! [`build_family`] (`FamilyRuntime`) korvaa aiemman suoran
@@ -73,7 +98,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
 use axum::Router;
 use clap::{Parser, Subcommand};
-use familyclaw_actions::{ActionRuntime, ApprovalId, AuditCollector};
+use familyclaw_actions::{ActionRuntime, ApprovalId, AuditCollector, JournalDispatchOutbox};
 use familyclaw_agent::{resolve_profile_dir, EnvEndpointResolver, LiveTurnExecutor, Soul};
 use familyclaw_bridge::{
     AgentInfo, AgentRole, FamilyBridge, HostKind, OrchestrationPlan, Orchestrator, TaskNode,
@@ -88,6 +113,7 @@ use familyclaw_channels::{
     RESPONSE_DEFERRED_CHANNEL_MESSAGE, RESPONSE_PONG,
 };
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
+use familyclaw_observability::MetricsRegistry;
 use familyclaw_runtime::{build_family, FamilyRuntime};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -216,6 +242,20 @@ struct GatewayState {
     /// kytketty (esim. testit). Kun `None`, audit-reitti vastaa
     /// `503 Service Unavailable`.
     turn_audit: Option<Arc<AuditCollector>>,
+    /// **Jaettu mittarirekisteri** Prometheus-viennille (`GET /metrics`).
+    ///
+    /// [`MetricsRegistry`] on `Clone` ja jakaa tilansa `Arc`:n kautta, joten
+    /// tämä kahva näkee tarkalleen samat mittarit kuin se instanssi joka
+    /// kasvattaa niitä. Rakennetaan [`MetricsRegistry::with_fleet_defaults`]:lla
+    /// runtimen kokoamisen yhteydessä, joten laivueen sarjat (esim. luodut
+    /// tehtävät, online olevat agentit) ovat viennissä alusta asti arvolla `0`
+    /// — dashboardit eivät "katoa" ennen ensimmäistä tapahtumaa.
+    ///
+    /// Vienti on aina turvallinen: [`MetricsRegistry::prometheus_export`]
+    /// palauttaa pelkän `String`:n eikä koskaan vuoda salaisuuksia (mittareilla
+    /// on vain numeeriset arvot, ei payloadia). `None` vain tiloissa joissa
+    /// rekisteriä ei ole kytketty (esim. osa testeistä).
+    metrics: Option<MetricsRegistry>,
 }
 
 /// Yhden odottavan hyväksynnän **operaattorille turvallinen, redaktoitu**
@@ -713,12 +753,65 @@ async fn list_turn_audit(
     (StatusCode::OK, Json(body))
 }
 
+/// Prometheus-vastauksen sisältötyyppi (eksposition tekstiformaatti).
+///
+/// Käytämme `version=0.0.4`-eksposition vakiotyyppiä (`text/plain`), jonka
+/// Prometheus-keräin ymmärtää suoraan. Charset on `utf-8` (mittarinimet ovat
+/// ASCII, mutta eksplisiittinen charset on eksposition suositus).
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// `GET /metrics` — vie jaetun [`MetricsRegistry`]:n **deterministisessä**
+/// Prometheus-eksposition tekstiformaatissa (`prometheus_export`).
+///
+/// Vastauksen sisältötyyppi on [`PROMETHEUS_CONTENT_TYPE`] (`text/plain`),
+/// jonka Prometheus-keräin osaa jäsentää. Runko järjestetään mittarinimen mukaan
+/// ([`MetricsRegistry`] perustuu `BTreeMap`:iin), joten tuloste on vakaa eikä
+/// vaihtele pyyntöjen välillä — sama panos tuottaa saman tulosteen.
+///
+/// **Mitkä mittarit ovat "eläviä":** rekisteri rakennetaan
+/// [`MetricsRegistry::with_fleet_defaults`]:lla, joten kaikki laivueen
+/// esinimetyt laskurit ja `agents_online`-gauge ovat viennissä alusta asti
+/// (arvolla `0`). Arvot ovat tällä hetkellä **enimmäkseen nollia**: rekisteri
+/// on kytketty jaettuun tilaan, mutta ajonaikaiset tapahtumat (busin liikenne)
+/// eivät vielä inkrementoi näitä sarjoja automaattisesti — `prometheus_export`
+/// palauttaa siis todelliset (joskin nyt nollaiset) laskurit/gaugit. Tapahtuma-
+/// pohjainen täyttö (esim. `familyclaw_observability::EventRecorder` busin
+/// päälle) on erillinen, isompi kytkentä.
+///
+/// Tilakoodit:
+/// - `200 OK` + Prometheus-teksti (myös enimmäkseen nollainen runko on validi),
+/// - `503 Service Unavailable` jos rekisteriä ei ole kytketty
+///   ([`GatewayState::metrics`] = `None`).
+///
+/// Reitti on **suojaamaton** (ei bearer-tokenia): mittarit ovat numeerisia
+/// aikasarjoja ilman salaisuuksia, ja keräimet (Prometheus) eivät tyypillisesti
+/// lähetä `Authorization`-otsikkoa. Verkkotason rajaus (loopback-sidonta /
+/// palomuuri) on oikea suojakerros tälle endpointille.
+async fn metrics_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> (StatusCode, [(axum::http::header::HeaderName, &'static str); 1], String) {
+    let content_type = (axum::http::header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE);
+    let Some(registry) = state.metrics.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [content_type],
+            "# metrics registry not configured\n".to_string(),
+        );
+    };
+    (StatusCode::OK, [content_type], registry.prometheus_export())
+}
+
 /// Rakentaa gatewayn HTTP-reitityksen jaetulla tilalla.
 fn build_router(state: Arc<GatewayState>) -> Router {
     use axum::routing::post;
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        // Prometheus-mittarit (jaettu MetricsRegistry, with_fleet_defaults).
+        // Rekisteröidään aina; kun rekisteriä ei ole kytketty
+        // ([`GatewayState::metrics`] = `None`), handler vastaa 503. Suojaamaton
+        // (numeerisia aikasarjoja ilman salaisuuksia) — ks. metrics_handler.
+        .route("/metrics", get(metrics_handler))
         .route("/inject", post(inject_discord))
         // Operaattorin hyväksyntäpinta (suspend/resume-silta, roadmap §6 D2).
         // Rekisteröidään aina; kun toimintoajoympäristöä ei ole kytketty
@@ -1000,6 +1093,15 @@ async fn serve() -> Result<()> {
     // Arc<AuditCollector> jonka build_family kytki agentin tool-looppiin.
     let turn_audit = Some(runtime.turn_audit());
 
+    // Prometheus-mittarit (GET /metrics): rakennetaan laivueen oletuksilla,
+    // joten kaikki esinimetyt sarjat (luodut tehtävät, online olevat agentit,
+    // …) ovat viennissä alusta asti arvolla 0. Rekisteri jaetaan
+    // GatewayState:lle samalla Arc-jako-mallilla kuin muu jaettu tila — kun/jos
+    // tapahtumapohjainen täyttö kytketään (EventRecorder busin päälle), tämä
+    // SAMA rekisteri näkee inkrementit. Tällä hetkellä arvot ovat enimmäkseen
+    // nollia (ks. metrics_handler-dokumentaatio).
+    let metrics = Some(MetricsRegistry::with_fleet_defaults());
+
     let state = Arc::new(GatewayState {
         bus: Some(runtime.bus().clone()),
         discord_channel: discord_ch,
@@ -1007,6 +1109,7 @@ async fn serve() -> Result<()> {
         discord_public_key,
         actions,
         turn_audit,
+        metrics,
     });
     info!("operaattorin hyväksyntäpinta valmis — GET /approvals/pending, POST /approvals/{{id}}/approve");
     let app = build_router(state);
@@ -1042,15 +1145,132 @@ fn health_url(addr: SocketAddr, path: &str) -> String {
     format!("http://{addr}{path}")
 }
 
+/// Kestävyystilan tiivistelmä jonka `status`/`doctor` näyttää operaattorille.
+///
+/// Kentät kertovat **mitä [`build_family`] kytkee** nykyisellä
+/// `FAMILYCLAW_DATA_DIR`-ympäristöllä, ilman salaisuuksia tai tiedostopolkuja:
+/// onko prosessi kaatumiskestävässä (persistentissä) vai muistinvaraisessa
+/// tilassa, sekä kytkettyjen [`ActionRuntime`]-pintojen lajitunnisteet.
+struct DurabilityReport {
+    /// `true` kun `FAMILYCLAW_DATA_DIR` on asetettu (persistentti, kaatumiskestävä).
+    persistent: bool,
+    /// Lähetys-outboxin lajitunniste ([`ActionRuntime::dispatch_outbox_kind`]),
+    /// `"journal"` tai `"in-memory"`.
+    dispatch_outbox_kind: &'static str,
+    /// Odottavien hyväksyntöjen pinnan lajitunniste
+    /// ([`ActionRuntime::pending_store_kind`]), `"journal"` tai `"in-memory"`.
+    pending_store_kind: &'static str,
+}
+
+impl DurabilityReport {
+    /// Muotoilee yksirivisen kestävyysyhteenvedon ilman tilaetuliitettä.
+    ///
+    /// Esim. `persistent (data_dir set); dispatch_outbox=journal;
+    /// pending_store=journal` tai `in-memory (no FAMILYCLAW_DATA_DIR) —
+    /// crash-survival OFF; dispatch_outbox=in-memory; pending_store=in-memory`.
+    /// Tiedostopolkua **ei** paljasteta (vain `set`-läsnäolo).
+    fn summary(&self) -> String {
+        let mode = if self.persistent {
+            "persistent (data_dir set)".to_string()
+        } else {
+            "in-memory (no FAMILYCLAW_DATA_DIR) — crash-survival OFF".to_string()
+        };
+        format!(
+            "{mode}; dispatch_outbox={}; pending_store={}",
+            self.dispatch_outbox_kind, self.pending_store_kind
+        )
+    }
+}
+
+/// Kokoaa [`DurabilityReport`]:n rakentamalla saman [`ActionRuntime`]:n kuin
+/// [`build_family`] valitsisi nykyisellä `FAMILYCLAW_DATA_DIR`-ympäristöllä.
+///
+/// Ohut kuori [`durability_report_for`]:lle: lukee `FAMILYCLAW_DATA_DIR`:n
+/// prosessin ympäristöstä (tyhjä = unset = muistinvarainen) ja delegoi.
+///
+/// # Errors
+/// [`FamilyClawError::config`] jos persistentin polun journal-pintojen avaus
+/// epäonnistuu (sama virhe jonka käynnistys antaisi).
+async fn build_durability_report() -> Result<DurabilityReport> {
+    let data_dir = std::env::var("FAMILYCLAW_DATA_DIR")
+        .ok()
+        .filter(|v| !v.is_empty());
+    durability_report_for(data_dir.as_deref()).await
+}
+
+/// Kokoaa [`DurabilityReport`]:n annetulle data-hakemistolle (env-vapaa ydin).
+///
+/// `data_dir`:
+/// - `Some(dir)` → persistentti polku: avaa samat journal-pinnat kuin
+///   [`build_family`] (durable pending + task + dispatch outbox) ja lukee niiden
+///   **todelliset** lajitunnisteet — ei kovakoodausta.
+/// - `None` → muistinvarainen polku: kaikki pinnat oletuksissaan, ei levy-I/O:ta.
+///
+/// Lukemalla lajitunnisteet kytketyistä pinnoista
+/// ([`ActionRuntime::dispatch_outbox_kind`] + [`ActionRuntime::pending_store_kind`])
+/// raportti vastaa täsmälleen sitä kestävyyspolkua jonka palvelin saisi.
+/// Persistentillä polulla journal-tiedostot avataan (idempotentti append-loki,
+/// sama kuin käynnistyksessä). Haaroitus on env-vapaa → deterministisesti
+/// testattavissa eksplisiittisellä hakemistolla.
+///
+/// # Errors
+/// [`FamilyClawError::config`] jos persistentin polun journal-pintojen avaus
+/// epäonnistuu (sama virhe jonka käynnistys antaisi).
+async fn durability_report_for(data_dir: Option<&str>) -> Result<DurabilityReport> {
+    // Sama haaroitus kuin build_familyssa: data-hakemisto ratkaisee persistentin
+    // (journal) vs. muistinvaraisen (in-memory) polun.
+    let runtime = if let Some(dir) = data_dir {
+        let dir = std::path::PathBuf::from(dir);
+        let pending_path = dir.join("pending_approvals.jsonl");
+        let task_path = dir.join("action_tasks.jsonl");
+        let outbox = JournalDispatchOutbox::open(dir.join("dispatch_outbox.jsonl"))
+            .map_err(|e| FamilyClawError::config(format!("dispatch outbox open failed: {e}")))?;
+        ActionRuntime::with_durable_stores(pending_path, task_path)
+            .await
+            .map_err(|e| {
+                FamilyClawError::config(format!("durable action stores open failed: {e}"))
+            })?
+            .with_dispatch_outbox(Box::new(outbox))
+    } else {
+        // Muistinvarainen polku: kaikki pinnat oletuksissaan, ei levyä.
+        ActionRuntime::with_default_skills()
+            .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?
+    };
+
+    Ok(DurabilityReport {
+        persistent: data_dir.is_some(),
+        dispatch_outbox_kind: runtime.dispatch_outbox_kind(),
+        pending_store_kind: runtime.pending_store_kind(),
+    })
+}
+
+/// Palauttaa hiekkalaatikon (sandbox) saatavuus-etiketin.
+///
+/// Delegoituu [`familyclaw_sandbox::sandbox_availability`]:lle, joka raportoi
+/// **todellisen käännetyn backendin**: `wasmtime (host-import denial + fuel
+/// cap)` kun `wasmtime`-passthrough-piirre on aktiivinen, muuten `none (noop)`.
+/// Lukemalla saatavuuden suoraan sandbox-cratesta (eikä gatewayn omasta
+/// irrallisesta lipusta) raportti ei voi valehdella: jos label sanoo
+/// `wasmtime`, oikea backend on oikeasti käännetty mukaan. Deterministinen ja
+/// salaisuudeton → sopii sekä `status`- että `doctor`-tulosteeseen.
+fn sandbox_label() -> &'static str {
+    familyclaw_sandbox::sandbox_availability()
+}
+
 /// Kysyy käynnissä olevan gatewayn tilan (`/healthz` + `/readyz`).
 ///
 /// Lukee kuunteluosoitteen [`resolve_addr`]:n kautta ja tekee kaksi HTTP
-/// GET -pyyntöä. Tulostaa kummankin endpointin tilan. Palaa `Ok(())` vain
-/// kun `/readyz` vastaa `200 OK`; muuten [`FamilyClawError::bus`], jolloin
-/// prosessi päättyy nollasta poikkeavalla exit-koodilla.
+/// GET -pyyntöä. Tulostaa kummankin endpointin tilan sekä **kestävyystilan**
+/// ([`build_durability_report`]) ja **hiekkalaatikon saatavuuden**
+/// ([`sandbox_label`]), jotta operaattori näkee mikä taustapinta on oikeasti
+/// kytkettynä. Palaa `Ok(())` vain kun `/readyz` vastaa `200 OK`; muuten
+/// [`FamilyClawError::bus`], jolloin prosessi päättyy nollasta poikkeavalla
+/// exit-koodilla.
 ///
 /// # Errors
 /// - [`FamilyClawError::config`] jos kuunteluosoite on jäsentymätön.
+/// - [`FamilyClawError::config`] jos persistentin polun journal-pintojen avaus
+///   epäonnistuu kestävyysraporttia koottaessa.
 /// - [`FamilyClawError::bus`] jos gatewayyn ei saada yhteyttä tai `/readyz`
 ///   ei ole `200`.
 async fn status() -> Result<()> {
@@ -1072,6 +1292,12 @@ async fn status() -> Result<()> {
         .map_err(|e| FamilyClawError::bus(format!("gateway not reachable at {addr}: {e}")))?;
     let ready_status = ready.status();
     println!("readyz  {addr} -> {ready_status}");
+
+    // Kestävä taustapinta + hiekkalaatikko: operaattori näkee mikä on
+    // oikeasti kytkettynä (ei vain HTTP-elossaolo).
+    let durability = build_durability_report().await?;
+    println!("durability: {}", durability.summary());
+    println!("sandbox: {}", sandbox_label());
 
     if health_ok && ready_status.as_u16() == 200 {
         println!("status: ready");
@@ -1163,6 +1389,20 @@ async fn doctor() -> Result<()> {
     } else {
         println!("[WARN]    env       FAMILYCLAW_DATA_DIR unset — in-memory memory only");
     }
+
+    // Kestävä taustapinta: raportoi todelliset lajitunnisteet jotka build_family
+    // kytkisi, ja varoita REHELLISESTI jos prosessi olisi muistinvaraisessa
+    // tilassa — at-most-once-takuu kaatumisen yli vaatii journal-taustapinnan.
+    // Varoitus ≠ virhe (ei kaada doctoria), mutta operaattorin pitää tietää.
+    let durability = build_durability_report().await?;
+    println!("[INFO]     durability {}", durability.summary());
+    if !durability.persistent {
+        println!(
+            "[WARN]    durability in-memory mode — at-most-once-under-crash guarantee needs the \
+             journal backend; in-memory does NOT survive a process crash (set FAMILYCLAW_DATA_DIR)"
+        );
+    }
+    println!("[INFO]     sandbox   {}", sandbox_label());
 
     if std::env::var_os("FAMILYCLAW_PROFILE_DIR").is_some_and(|v| !v.is_empty()) {
         println!("[OK]      env       FAMILYCLAW_PROFILE_DIR set");
@@ -1347,6 +1587,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            metrics: None,
         });
         let (status, _) = readyz(State(not_ready)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1360,6 +1601,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            metrics: None,
         });
         let (status, _) = readyz(State(ready)).await;
         assert_eq!(status, StatusCode::OK);
@@ -1376,6 +1618,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            metrics: None,
         }));
     }
 
@@ -1486,6 +1729,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            metrics: None,
         };
         assert!(check_inject_auth(&state, &HeaderMap::new()).is_ok());
         // Ylimääräinen otsikko ei haittaa kun suojausta ei ole.
@@ -1502,6 +1746,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            metrics: None,
         };
         assert!(check_inject_auth(&state, &headers_with_auth("Bearer s3cret-token")).is_ok());
     }
@@ -1516,6 +1761,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            metrics: None,
         };
         // Väärä token.
         assert_eq!(
@@ -1553,6 +1799,7 @@ mod tests {
             discord_public_key: None,
             actions: Some(Arc::clone(&actions)),
             turn_audit: None,
+            metrics: None,
         });
         (state, actions)
     }
@@ -1614,6 +1861,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            metrics: None,
         });
         let (status, _) = list_pending_approvals(State(state), HeaderMap::new()).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1653,6 +1901,7 @@ mod tests {
             discord_public_key: None,
             actions: mut_state.actions.clone(),
             turn_audit: None,
+            metrics: None,
         });
         let (status, _) = list_pending_approvals(State(state), HeaderMap::new()).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1706,6 +1955,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            metrics: None,
         });
         let (status, _) = approve_pending(
             State(state),
@@ -1736,5 +1986,300 @@ mod tests {
         // Hyväksyntä kulutettu → ei enää odottavissa, ja toinen approve = 404.
         let (status2, _) = approve_pending(State(state), HeaderMap::new(), Path(id)).await;
         assert_eq!(status2, StatusCode::NOT_FOUND, "kertakäyttö: ei voi hyväksyä uudelleen");
+    }
+
+    // ---- Prometheus-mittarit (GET /metrics) ----
+
+    /// Apuri: poimii `Content-Type`-otsikon arvon handlerin palauttamasta
+    /// otsikkotaulukosta merkkijonona (testin luettavuuden vuoksi).
+    fn content_type_of(headers: &[(axum::http::header::HeaderName, &'static str)]) -> &'static str {
+        headers
+            .iter()
+            .find(|(name, _)| name == axum::http::header::CONTENT_TYPE)
+            .map_or("", |(_, v)| v)
+    }
+
+    #[tokio::test]
+    async fn metrics_route_503_without_registry() {
+        // Ilman kytkettyä rekisteriä → 503 (ei paniikkia). Sisältötyyppi
+        // pysyy text/plain myös virhevastauksessa.
+        let state = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: None,
+            turn_audit: None,
+            metrics: None,
+        });
+        let (status, headers, body) = metrics_handler(State(state)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(content_type_of(&headers).starts_with("text/plain"));
+        assert!(body.contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn metrics_route_200_text_plain_prometheus_body() {
+        // Kytketään laivueen oletusrekisteri ja kasvatetaan yksi laskuri, jotta
+        // runko sisältää sekä TYPE-rivin että ei-nollaisen arvon. Vienti on
+        // deterministinen (nimijärjestys), joten testi ei voi olla epävakaa.
+        let registry = MetricsRegistry::with_fleet_defaults();
+        registry
+            .counter(familyclaw_observability::COUNTER_TASKS_CREATED)
+            .inc();
+        let state = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: None,
+            turn_audit: None,
+            metrics: Some(registry),
+        });
+
+        let (status, headers, body) = metrics_handler(State(state)).await;
+
+        // 200 + text/plain (Prometheus-eksposition sisältötyyppi).
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            content_type_of(&headers).starts_with("text/plain"),
+            "Prometheus-vienti on text/plain, oli: {}",
+            content_type_of(&headers)
+        );
+
+        // Runko jäsentyy Prometheus-ekspositioksi: vähintään yksi TYPE-rivi ja
+        // laivueen oletuksista tunnettu mittaririvi.
+        assert!(body.contains("# TYPE tasks_created counter"));
+        assert!(body.contains("tasks_created 1"));
+        assert!(body.contains("# TYPE agents_online gauge"));
+        assert!(body.contains("agents_online 0"));
+        // Determinismi: vienti on nimijärjestyksessä → agents_online ennen
+        // tasks_created (aakkosjärjestys), joten tulosteen järjestys on vakaa.
+        let agents_at = body.find("agents_online").expect("agents_online present");
+        let tasks_at = body.find("tasks_created").expect("tasks_created present");
+        assert!(
+            agents_at < tasks_at,
+            "vienti on deterministisesti nimijärjestyksessä"
+        );
+    }
+
+    /// **Aito HTTP-integraatiotesti:** sitoo [`build_router`]:lla kootun
+    /// reitityksen väliaikaiseen loopback-porttiin (sama malli kuin [`serve`]),
+    /// tarjoilee sen taustatehtävässä ja hakee `GET /metrics`:n oikealla
+    /// HTTP-asiakkaalla ([`reqwest`], jo riippuvuutena). Tämä testaa koko ketjun:
+    /// Router → reitti → handler → `Content-Type`-otsikko → Prometheus-runko
+    /// aidon socketin yli, ei vain handler-funktiota suoraan.
+    #[tokio::test]
+    async fn metrics_route_http_integration_returns_prometheus_text() {
+        let registry = MetricsRegistry::with_fleet_defaults();
+        let state = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: None,
+            turn_audit: None,
+            metrics: Some(registry),
+        });
+        let app = build_router(state);
+
+        // Sido portti 0 → käyttöjärjestelmä antaa vapaan portin (rinnakkais-
+        // turvallinen, ei kovakoodattua porttia).
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+
+        // Tarjoile reititin taustalla; abortoi testin lopuksi.
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .expect("GET /metrics");
+
+        // 200 OK.
+        assert_eq!(resp.status().as_u16(), 200);
+        // text/plain (Prometheus-eksposition sisältötyyppi).
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.starts_with("text/plain"),
+            "Content-Type pitää olla text/plain, oli: {content_type}"
+        );
+
+        // Runko jäsentyy Prometheus-ekspositioksi (TYPE-rivi + tunnettu mittari).
+        let body = resp.text().await.expect("body");
+        assert!(
+            body.contains("# TYPE"),
+            "runko sisältää Prometheus-TYPE-rivin"
+        );
+        assert!(
+            body.contains("agents_online"),
+            "laivueen oletusmittari näkyy viennissä"
+        );
+
+        server.abort();
+    }
+
+    /// Luo prosessikohtaisen uniikin väliaikaishakemiston journal-testeille.
+    ///
+    /// Ei riipu `tempfile`-kratesta (sitä ei ole dev-deppeissä): yhdistää
+    /// prosessi-ID:n + nanosekuntileiman, jotta rinnakkaiset testit eivät
+    /// törmää. Kutsuja vastaa siivouksesta.
+    fn unique_data_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "familyclaw-durability-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("luo testihakemisto");
+        dir
+    }
+
+    #[tokio::test]
+    async fn durability_report_in_memory_reflects_default_kinds() {
+        // Ilman data-hakemistoa: muistinvarainen tila, molemmat pinnat in-memory.
+        let report = durability_report_for(None)
+            .await
+            .expect("in-memory report builds");
+        assert!(!report.persistent, "ei data_diriä → ei persistentti");
+        assert_eq!(report.dispatch_outbox_kind, "in-memory");
+        assert_eq!(report.pending_store_kind, "in-memory");
+    }
+
+    #[tokio::test]
+    async fn durability_report_persistent_reflects_journal_kinds() {
+        // Data-hakemiston kanssa: persistentti tila, molemmat pinnat journal.
+        let dir = unique_data_dir("persistent");
+        let dir_str = dir.to_str().expect("polku on UTF-8");
+        let report = durability_report_for(Some(dir_str))
+            .await
+            .expect("persistent report builds");
+        assert!(report.persistent, "data_dir set → persistentti");
+        assert_eq!(report.dispatch_outbox_kind, "journal");
+        assert_eq!(report.pending_store_kind, "journal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durability_summary_in_memory_contains_crash_survival_off() {
+        // status/doctor näyttävät tämän rivin — in-memory tilassa sen pitää
+        // sisältää "crash-survival OFF" + molempien pintojen lajitunnisteet.
+        let report = DurabilityReport {
+            persistent: false,
+            dispatch_outbox_kind: "in-memory",
+            pending_store_kind: "in-memory",
+        };
+        let line = report.summary();
+        assert!(
+            line.contains("in-memory (no FAMILYCLAW_DATA_DIR)"),
+            "in-memory-tila näkyy: {line}"
+        );
+        assert!(
+            line.contains("crash-survival OFF"),
+            "kaatumiskestävyyden puuttuminen näkyy: {line}"
+        );
+        assert!(
+            line.contains("dispatch_outbox=in-memory")
+                && line.contains("pending_store=in-memory"),
+            "molemmat lajitunnisteet näkyvät: {line}"
+        );
+    }
+
+    #[test]
+    fn durability_summary_persistent_contains_journal_kinds() {
+        // status/doctor-rivi persistentissä tilassa: ei OFF-varoitusta, journal-pinnat.
+        let report = DurabilityReport {
+            persistent: true,
+            dispatch_outbox_kind: "journal",
+            pending_store_kind: "journal",
+        };
+        let line = report.summary();
+        assert!(line.contains("persistent (data_dir set)"), "tila: {line}");
+        assert!(
+            !line.contains("crash-survival OFF"),
+            "persistentissä tilassa ei OFF-varoitusta: {line}"
+        );
+        assert!(
+            line.contains("dispatch_outbox=journal")
+                && line.contains("pending_store=journal"),
+            "journal-lajitunnisteet näkyvät: {line}"
+        );
+    }
+
+    /// Apuri: rakentaa doctorin näyttämät kestävyysrivit raportista — sama
+    /// muotoilu kuin `doctor()`-funktiossa, jotta varoituslogiikka on testattava
+    /// ilman täyttä `doctor()`-ajoa (joka lukee prosessin globaalia ympäristöä).
+    fn doctor_durability_lines(report: &DurabilityReport) -> Vec<String> {
+        let mut lines = vec![format!("[INFO]     durability {}", report.summary())];
+        if !report.persistent {
+            lines.push(
+                "[WARN]    durability in-memory mode — at-most-once-under-crash guarantee needs the \
+                 journal backend; in-memory does NOT survive a process crash (set FAMILYCLAW_DATA_DIR)"
+                    .to_string(),
+            );
+        }
+        lines
+    }
+
+    #[test]
+    fn doctor_in_memory_emits_crash_survival_warning() {
+        // doctor muistinvaraisessa tilassa: REHELLINEN varoitus (ei kaada doctoria).
+        let report = DurabilityReport {
+            persistent: false,
+            dispatch_outbox_kind: "in-memory",
+            pending_store_kind: "in-memory",
+        };
+        let lines = doctor_durability_lines(&report);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("[WARN]") && joined.contains("at-most-once-under-crash"),
+            "doctor varoittaa kaatumiskestävyyden puuttumisesta: {joined}"
+        );
+        assert!(
+            joined.contains("does NOT survive a process crash"),
+            "varoitus on rehellinen kaatumisselviytymisestä: {joined}"
+        );
+    }
+
+    #[test]
+    fn doctor_persistent_emits_no_crash_survival_warning() {
+        // doctor persistentissä tilassa: vain INFO-rivi, ei kaatumisvaroitusta.
+        let report = DurabilityReport {
+            persistent: true,
+            dispatch_outbox_kind: "journal",
+            pending_store_kind: "journal",
+        };
+        let lines = doctor_durability_lines(&report);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("[INFO]") && joined.contains("dispatch_outbox=journal"),
+            "doctor näyttää journal-pinnat: {joined}"
+        );
+        assert!(
+            !joined.contains("[WARN]"),
+            "persistentissä tilassa ei kaatumisvaroitusta: {joined}"
+        );
+    }
+
+    #[test]
+    fn sandbox_label_matches_compiled_feature() {
+        // sandbox-etiketti seuraa käännösaikaista wasmtime-piirrettä.
+        let label = sandbox_label();
+        if cfg!(feature = "wasmtime") {
+            assert_eq!(label, "wasmtime (host-import denial + fuel cap)");
+        } else {
+            assert_eq!(label, "none (noop)");
+        }
     }
 }

@@ -43,6 +43,7 @@ familyclaw-gemu = { path = "crates/familyclaw-gemu" }
 familyclaw-hearth = { path = "crates/familyclaw-hearth" }
 familyclaw-latent = { path = "crates/familyclaw-latent" }
 familyclaw-memory = { path = "crates/familyclaw-memory" }
+familyclaw-observability = { path = "crates/familyclaw-observability" }
 familyclaw-runtime = { path = "crates/familyclaw-runtime" }
 familyclaw-sandbox = { path = "crates/familyclaw-sandbox" }
 familyclaw-security = { path = "crates/familyclaw-security" }
