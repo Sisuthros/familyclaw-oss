@@ -345,8 +345,39 @@ impl ActionRuntime {
     ///    uudelleenkäynnistys löytää sen.
     ///
     /// Taidot rekisteröidään tämän jälkeen normaalisti
-    /// ([`ActionRuntime::register_skill`]); ne ovat puhdasta koodia eivätkä
-    /// tarvitse persistointia.
+    /// ([`ActionRuntime::register_skill`] /
+    /// [`ActionRuntime::register_default_skills`]); ne ovat puhdasta koodia
+    /// eivätkä tarvitse persistointia.
+    ///
+    /// # Lähetys-outbox EI ole tämän konstruktorin vastuulla
+    /// Tämä konstruktori kytkee kaatumiskestävän **pending**-pinnan ja
+    /// **task-jonon**, mutta jättää lähetyksen idempotenssi-outboxin oletukseen
+    /// ([`InMemoryDispatchOutbox`]). At-most-once-takuun
+    /// (kaksoislaukaisun esto kaatumisen yli) tarvitseva kokooja **täytyy
+    /// ketjuttaa** [`ActionRuntime::with_dispatch_outbox`] tämän jälkeen
+    /// kaatumiskestävällä [`crate::dispatch_outbox::JournalDispatchOutbox`]:lla:
+    ///
+    /// ```no_run
+    /// # use familyclaw_actions::ActionRuntime;
+    /// # use familyclaw_actions::dispatch_outbox::JournalDispatchOutbox;
+    /// # async fn wire(dir: &std::path::Path) -> familyclaw_actions::error::Result<()> {
+    /// let outbox = Box::new(JournalDispatchOutbox::open(dir.join("dispatch_outbox.jsonl"))?);
+    /// let mut rt = ActionRuntime::with_durable_stores(
+    ///     dir.join("pending_approvals.jsonl"),
+    ///     dir.join("action_tasks.jsonl"),
+    /// )
+    /// .await?
+    /// .with_dispatch_outbox(outbox); // muuten outbox jää muistiin (kuolee kaatumisessa)
+    /// rt.register_default_skills()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Ilman tätä ketjutusta odottava hyväksyntä SÄILYY restartin yli (durable
+    /// pending + task), mutta `approve`:n at-most-once-suoja eläisi vain
+    /// muistissa — siksi `familyclaw-runtime`:n `build_family` ketjuttaa
+    /// molemmat (durable pending + durable dispatch outbox) persistentillä
+    /// polulla.
     ///
     /// # Errors
     /// - [`ActionError::Proof`] jos pending- tai task-journalin avaus/luku
@@ -422,6 +453,20 @@ impl ActionRuntime {
         self.dispatch_outbox.kind()
     }
 
+    /// Palauttaa kytketyn **odottavien hyväksyntöjen pinnan** lajitunnisteen
+    /// (`"in-memory"` tai `"journal"`).
+    ///
+    /// Tämä on salaisuudeton tarkistuskoukku kokoojalle ja testeille — sama
+    /// tarkoitus kuin [`ActionRuntime::dispatch_outbox_kind`]:lla: sillä voi
+    /// todeta että persistentti kokoonpano sai kaatumiskestävän (`"journal"`)
+    /// pending-pinnan oletuksellisen muistinvaraisen (`"in-memory"`) sijaan,
+    /// paljastamatta sisäistä tilaa tai tiedostopolkua. Arvo delegoituu suoraan
+    /// [`PendingApprovalStore::kind`]:iin.
+    #[must_use]
+    pub fn pending_store_kind(&self) -> &'static str {
+        self.pending.kind()
+    }
+
     /// Snapshottaa tehtävän nykytilan kaatumiskestävään jonoon, jos sellainen on
     /// asetettu ([`ActionRuntime::with_durable_stores`]). No-op in-memory-tilassa.
     ///
@@ -463,12 +508,31 @@ impl ActionRuntime {
     /// jos jokin sisäänrakennettu taito on virheellinen (ei pitäisi tapahtua).
     pub fn with_default_skills() -> Result<Self> {
         let mut runtime = Self::new();
-        runtime.register_skill(EmailTriageMock::new())?;
-        runtime.register_skill(GithubIssueDraftMock::new())?;
-        runtime.register_skill(DiscordThreadSummaryMock::new())?;
-        runtime.register_skill(FilePatchMock::new())?;
-        runtime.register_skill(FsReadAllowlisted::new())?;
+        runtime.register_default_skills()?;
         Ok(runtime)
+    }
+
+    /// Rekisteröi viisi KERROS A -oletustaitoa **olemassa olevaan**
+    /// ajoympäristöön (`&mut self`).
+    ///
+    /// Tämä on [`ActionRuntime::with_default_skills`]:n jaettu ydin: kokooja joka
+    /// rakentaa ajoympäristön kaatumiskestävillä pinnoilla
+    /// ([`ActionRuntime::with_durable_stores`]) voi rekisteröidä samat
+    /// oletustaidot ilman että 5-taidon lista kahdentuu. Taidot ovat puhdasta
+    /// koodia eivätkä tarvitse persistointia; [`FsReadAllowlisted`]
+    /// rekisteröidään tyhjällä allowlistilla (fail-closed), kuten
+    /// [`ActionRuntime::with_default_skills`]:ssä.
+    ///
+    /// # Errors
+    /// Palauttaa manifestin validoinnin tai duplikaattirekisteröinnin virheen,
+    /// jos jokin sisäänrakennettu taito on virheellinen (ei pitäisi tapahtua).
+    pub fn register_default_skills(&mut self) -> Result<()> {
+        self.register_skill(EmailTriageMock::new())?;
+        self.register_skill(GithubIssueDraftMock::new())?;
+        self.register_skill(DiscordThreadSummaryMock::new())?;
+        self.register_skill(FilePatchMock::new())?;
+        self.register_skill(FsReadAllowlisted::new())?;
+        Ok(())
     }
 
     /// Rekisteröi taidon sekä putken rekisteriin (manifesti) että julkisivun

@@ -1085,3 +1085,257 @@ async fn inbound_reaches_agent_over_bus() {
 
     runtime.shutdown().await;
 }
+
+/// **Durable-pending-pinta tuotantopolulla (review-finding: "production wires
+/// durable outbox but leaves pending store in-memory").** Kun `build_family`
+/// ajetaan persistentillä polulla (`FAMILYCLAW_DATA_DIR` asetettu), agentin ja
+/// operaattoripinnan jakama toimintoajoympäristö saa KAATUMISKESTÄVÄN
+/// odottavien hyväksyntöjen pinnan (`JournalPendingStore`,
+/// `<data_dir>/pending_approvals.jsonl`) oletuksellisen muistinvaraisen tilalle.
+///
+/// Ennen korjausta `build_family` kytki kaatumiskestävän lähetys-outboxin mutta
+/// jätti pending-pinnan muistiin → restartin jälkeen vielä odottava hyväksyntä
+/// katosi muistikartasta ja `approve` palautti `ApprovalMissing` (404) jo ENNEN
+/// outboxin InProgress/Committed-vahtia. At-most-once piti silloin VAIN 404:n
+/// sivuvaikutuksesta (vahingossa), ei siksi että durable-kerros sen pakottaa.
+///
+/// Todiste on kaksinkertainen, kuten dispatch-outbox-testissä: (1) suora —
+/// jaetun ajoympäristön `pending_store_kind()` on `"journal"` (ei `"in-memory"`);
+/// (2) epäsuora — `JournalPendingStore::open` LUO journal-tiedoston, joten
+/// `<data_dir>/pending_approvals.jsonl` on synnyttävä ja säilyttävä restartin yli.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_family_wires_durable_pending_store_on_persistent_path() {
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    let data_dir = unique_temp_dir("pending-store");
+    let pending_path = data_dir.join("pending_approvals.jsonl");
+    std::fs::create_dir_all(&data_dir).expect("temp dir");
+
+    std::env::set_var("FAMILYCLAW_DATA_DIR", &data_dir);
+    std::env::set_var("FAMILYCLAW_DREAM_DISABLED", "1");
+
+    let channel = MockChannel::new("mock-pending-store").expect("channel");
+    channel.close_inbound();
+    let resolver = EnvEndpointResolver::new();
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul = familyclaw_agent::Soul::from_essence("generic being for pending store test");
+
+    let runtime = build_family(
+        Some("pending-store-bus".to_string()),
+        agent_cfg,
+        soul,
+        Box::new(channel),
+        "pending-chat".to_string(),
+        &resolver,
+    )
+    .await
+    .expect("build_family");
+
+    // Suora väite: jaettu ajoympäristö kantaa journal-pending-pintaa.
+    {
+        let actions = runtime.actions();
+        let guard = actions.lock().await;
+        assert_eq!(
+            guard.pending_store_kind(),
+            "journal",
+            "persistent build wires JournalPendingStore (crash-surviving pending approvals)"
+        );
+    }
+    // Epäsuora väite: tiedosto syntyi avatessa.
+    assert!(
+        pending_path.is_file(),
+        "build_family wires JournalPendingStore on persistent path → pending_approvals.jsonl must exist at {}",
+        pending_path.display()
+    );
+
+    runtime.shutdown().await;
+
+    // Restart (sama data-dir): tiedosto säilyy — pinta on jaettu ja pysyvä.
+    let channel2 = MockChannel::new("mock-pending-store-2").expect("channel");
+    channel2.close_inbound();
+    let agent_cfg2 = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul2 = familyclaw_agent::Soul::from_essence("generic being for pending store test");
+    let runtime2 = build_family(
+        Some("pending-store-bus-2".to_string()),
+        agent_cfg2,
+        soul2,
+        Box::new(channel2),
+        "pending-chat".to_string(),
+        &resolver,
+    )
+    .await
+    .expect("build_family restart");
+    {
+        let actions = runtime2.actions();
+        let guard = actions.lock().await;
+        assert_eq!(
+            guard.pending_store_kind(),
+            "journal",
+            "restart keeps journal pending store"
+        );
+    }
+    assert!(
+        pending_path.is_file(),
+        "durable pending journal survives restart (shared, persistent — not per-process)"
+    );
+    runtime2.shutdown().await;
+
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// **Pending-pinnan vastaparitodiste (in-memory-polku):** ilman
+/// `FAMILYCLAW_DATA_DIR`:iä ajoympäristö jää muistinvaraiseen pending-pintaan
+/// (`"in-memory"`) — taaksepäin-yhteensopiva, ei sivuvaikutuksia
+/// tiedostojärjestelmään (oikein: ei persistointia pyydetty).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_family_in_memory_path_uses_in_memory_pending_store() {
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+
+    let channel = MockChannel::new("mock-inmem-pending").expect("channel");
+    channel.close_inbound();
+    let resolver = EnvEndpointResolver::new();
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul = familyclaw_agent::Soul::from_essence("generic being");
+
+    let runtime = build_family(
+        None,
+        agent_cfg,
+        soul,
+        Box::new(channel),
+        "c".to_string(),
+        &resolver,
+    )
+    .await
+    .expect("build_family");
+
+    {
+        let actions = runtime.actions();
+        let guard = actions.lock().await;
+        assert_eq!(
+            guard.pending_store_kind(),
+            "in-memory",
+            "in-memory build keeps InMemoryPendingStore (no persistence requested)"
+        );
+    }
+    runtime.shutdown().await;
+}
+
+/// **PRODUCT-PATH pending-reload -integraatiotesti (review-finding ydin).**
+///
+/// Todistaa että odottava hyväksyntä, joka kirjoitettiin kaatumiskestävään
+/// pending-pintaan ENNEN "restartia", LADATAAN takaisin tuoreen `build_family`:n
+/// toimesta samasta `FAMILYCLAW_DATA_DIR`:stä — joten `approve` EI enää palauta
+/// `ApprovalMissing` (404) vielä odottavalle hyväksynnälle restartin jälkeen.
+/// Tämä on se ero jonka korjaus tekee: at-most-once-rajaa ei enää pidetä
+/// vahingossa 404:n kautta, vaan vielä-odottava hyväksyntä etenee oikeasti
+/// outboxin InProgress/Committed-vahdille.
+///
+/// 1. **Seed (kaatuminen ennen restartia):** kirjoitetaan kaatumiskestävään
+///    pending-pintaan (`<data_dir>/pending_approvals.jsonl`) yksi odottava
+///    hyväksyntä — suoraan [`JournalPendingStore`]:lla, ilman `build_family`:tä.
+///    Tämä jäljittelee edellisen prosessin levyjälkeä SIGKILL:n jälkeen.
+/// 2. **Restart oikealla tuotantopolulla:** ajetaan [`build_family`] SAMALLA
+///    `FAMILYCLAW_DATA_DIR`:llä → se kytkee `JournalPendingStore`:n joka
+///    rekonstruoi seedatun hyväksynnän levyltä.
+/// 3. **Hyväksyntä on yhä odottamassa:** jaetun ajoympäristön
+///    `try_pending_approvals()` listaa seedatun `approval_id`:n — sama
+///    tunniste jonka `approve` löytäisi (ei `ApprovalMissing`).
+// Lineaarinen seed→restart→todiste-sekvenssi luetaan ylhäältä alas.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn product_path_build_family_reloads_pending_approval_after_restart() {
+    use familyclaw_actions::approval::Approval;
+    use familyclaw_actions::pending_store::{
+        JournalPendingStore, PendingApprovalStore, PendingRecord,
+    };
+    use familyclaw_actions::{ActionId, ActionTaskId, ApprovalId};
+
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+
+    let data_dir = unique_temp_dir("product-path-pending");
+    std::fs::create_dir_all(&data_dir).expect("temp dir");
+    let pending_path = data_dir.join("pending_approvals.jsonl");
+
+    // Aikaleimat: myönnetty menneisyydessä, vanhenee kaukana tulevaisuudessa,
+    // jottei eviktointi pudota seedattua hyväksyntää restartissa.
+    let granted_at = familyclaw_core::time::from_unix_secs(1_700_000_000).expect("granted ts");
+    let expires_at = familyclaw_core::time::from_unix_secs(4_000_000_000).expect("expiry ts");
+
+    // --- 1) SEED: vielä odottava hyväksyntä levylle ennen restartia. ---
+    let task_id = ActionTaskId::new();
+    let approval_id = {
+        let approval = Approval {
+            id: ApprovalId::new(),
+            action_id: ActionId::new(),
+            payload_hash: "0".repeat(64),
+            granted_at,
+            expires_at,
+            consumed: false,
+        };
+        let id = approval.id;
+        let record = PendingRecord::new(
+            task_id,
+            approval,
+            "generic skill awaiting human approval",
+            granted_at,
+        );
+        let seed = JournalPendingStore::open(&pending_path).expect("seed open");
+        seed.insert(record).expect("seed insert");
+        id
+    }; // drop = "kaatuminen"; levyjälki jää.
+    assert!(
+        pending_path.is_file(),
+        "seedattu pending_approvals.jsonl on levyllä"
+    );
+
+    // --- 2) RESTART OIKEALLA TUOTANTOPOLULLA: build_family samalla data-dirillä. ---
+    std::env::set_var("FAMILYCLAW_DATA_DIR", &data_dir);
+    std::env::set_var("FAMILYCLAW_DREAM_DISABLED", "1");
+
+    let channel = MockChannel::new("mock-product-path-pending").expect("channel");
+    channel.close_inbound();
+    let resolver = EnvEndpointResolver::new();
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul = familyclaw_agent::Soul::from_essence("generic being for product-path pending test");
+
+    let runtime = build_family(
+        Some("product-path-pending-bus".to_string()),
+        agent_cfg,
+        soul,
+        Box::new(channel),
+        "pending-reload-chat".to_string(),
+        &resolver,
+    )
+    .await
+    .expect("build_family on seeded data_dir");
+
+    let actions = runtime.actions();
+    {
+        let guard = actions.lock().await;
+        // build_family kytki KAATUMISKESTÄVÄN pending-pinnan (ei muistinvaraista).
+        assert_eq!(
+            guard.pending_store_kind(),
+            "journal",
+            "tuotantopolku kytkee JournalPendingStoren (kaatumiskestävä pending)"
+        );
+        // YDINVÄITE: seedattu, vielä odottava hyväksyntä LADATTIIN levyltä →
+        // approve EI näkisi ApprovalMissing:iä. Listalla on tasan se tunniste.
+        let pending = guard.try_pending_approvals().expect("list pending");
+        assert!(
+            pending.iter().any(|p| p.approval_id == approval_id && p.task_id == task_id),
+            "vielä odottava hyväksyntä rekonstruoitui restartissa (ei ApprovalMissing): \
+             approval_id={approval_id} task_id={task_id}, listalla={pending:?}"
+        );
+    }
+
+    runtime.shutdown().await;
+
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+    let _ = std::fs::remove_dir_all(&data_dir);
+}

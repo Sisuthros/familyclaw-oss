@@ -386,3 +386,279 @@ fn old_double_fires_but_new_does_not() {
     let _ = std::fs::remove_dir_all(&dir_old);
     let _ = std::fs::remove_dir_all(&dir_new);
 }
+
+// ============================================================================
+// HYVÄKSYNTÄPOLKU (avaimet `approval-*`) — at-most-once aidon prosessirajan yli
+// ============================================================================
+//
+// Tämä sulkee katselmoinnin löydöksen: aiempi cross-process-todiste kattoi vain
+// `submit_task`-avaimet (`turn-*`), EI hyväksyntä-avaimia (`approval-{id}`).
+// `ActionRuntime::approve` on idempotentti SAMAN dispatch-outboxin kautta
+// (avain `approval-{id}`: lookup → record_intent → run_after_approval
+// (sivuvaikutus) → record_committed → pending.remove), ja tässä todistetaan se
+// AIDON SIGKILL:n (exit 137) yli — durable pending (Wire-vaihe) sallii tuoreen
+// prosessin ladata SAMAN odottavan hyväksynnän levyltä ja uudelleenhyväksyä sen.
+
+/// Ympäristömuuttuja joka aseistaa committed-ikkunan kaatumiskoukun harnessissa.
+const CRASH_AFTER_COMMITTED_ENV: &str = "FAMILYCLAW_REDTEAM_CRASH_AFTER_COMMITTED";
+
+/// Rakentaa hyväksyntäpolun `run`-vaiheen argumentit (`--pending` + `--task-queue`
+/// lisätty `phase_args`:n päälle, koska durable pending = Wire-vaihe).
+#[allow(clippy::too_many_arguments)]
+fn approval_phase_args<'a>(
+    phase: &'a str,
+    outbox: &'a str,
+    counter: &'a str,
+    outcome: &'a str,
+    pending: &'a str,
+    task_queue: &'a str,
+) -> Vec<&'a str> {
+    vec![
+        "run",
+        "--mode",
+        "new",
+        "--phase",
+        phase,
+        "--outbox",
+        outbox,
+        "--counter",
+        counter,
+        "--outcome-out",
+        outcome,
+        "--pending",
+        pending,
+        "--task-queue",
+        task_queue,
+        "--clock",
+        CLOCK,
+    ]
+}
+
+/// **HYVÄKSYNTÄPOLKU, INTENT-ONLY-IKKUNA todistaa at-most-once fail-closed aidon
+/// prosessirajan yli — avaimella `approval-{id}` (EI `turn-*`).**
+///
+/// Tämä on katselmoinnin löydöksen suora sulkeminen: aiempi cross-process-todiste
+/// kattoi vain `submit_task`-avaimet. Nyt sama SIGKILL-todiste pätee
+/// [`ActionRuntime::approve`]:n sivuvaikutus-ikkunaan.
+///
+/// Vaihe 1 (`approve_crash_intent`, koukku aseistettu): lähetä hyväksyntää vaativa
+/// tehtävä → hyväksy → `run_after_approval` ajaa sivuvaikutuksen (laskuri = 1),
+/// `record_intent` fsyncataan, prosessi abortoi `record_committed`:n alussa →
+/// poistuu 137. Levyllä: intent-marker LÄSNÄ, committed-marker POISSA, odottava
+/// hyväksyntä yhä durable-pinnalla.
+///
+/// Vaihe 2 (`approve_resume`, tuore prosessi): durable pending ladataan levyltä
+/// (Wire), SAMA `ApprovalId` poimitaan ja uudelleenhyväksytään → outbox-lookup
+/// näkee `InProgress` → `approve` palauttaa `PolicyDenied` fail-closed. Laskuri
+/// PYSYY 1:ssä (sivuvaikutus EI aja uudelleen) → at-most-once.
+///
+/// Testi epäonnistuisi jos `approve` EI olisi idempotentti (outbox ohitettu):
+/// re-approve ajaisi `run_after_approval`:n uudelleen → laskuri = 2. (Mutaatio-
+/// todiste tehty erikseen poistamalla outbox-haara `approve`:sta.)
+#[test]
+#[allow(clippy::too_many_lines)]
+fn approval_path_intent_crash_is_at_most_once() {
+    let bin = harness_bin();
+    let dir = tempdir("approval-intent");
+    let outbox = dir.join("outbox.jsonl");
+    let counter = dir.join("counter.txt");
+    let outcome = dir.join("outcome.json");
+    let pending = dir.join("pending.jsonl");
+    let task_queue = dir.join("tasks.jsonl");
+    let (ob, ct, oc, pd, tq) = (
+        outbox.to_string_lossy().into_owned(),
+        counter.to_string_lossy().into_owned(),
+        outcome.to_string_lossy().into_owned(),
+        pending.to_string_lossy().into_owned(),
+        task_queue.to_string_lossy().into_owned(),
+    );
+
+    // Vaihe 1 (approve_crash_intent): aseistettu intent-koukku → abort
+    // record_committed:n alussa hyväksynnän jälkeen.
+    let (code1, ok1, _o1, e1) = run_env(
+        &bin,
+        &approval_phase_args("approve_crash_intent", &ob, &ct, &oc, &pd, &tq),
+        &[(CRASH_AFTER_INTENT_ENV, "1")],
+    );
+    assert!(
+        !ok1,
+        "approve_crash_intent phase must NOT exit success. stderr={e1}"
+    );
+    assert_eq!(
+        code1,
+        Some(137),
+        "approve_crash_intent must exit 137 (SIGKILL-style) from the crash hook. stderr={e1}"
+    );
+
+    // Sivuvaikutus laukesi TASAN KERRAN ennen kaatumista (approve ajoi
+    // run_after_approval:n, joka bumppasi laskurin).
+    assert_eq!(
+        read_counter(&counter),
+        1,
+        "side effect fired exactly once before the approval intent-only crash"
+    );
+
+    // Levyllä: intent-marker LÄSNÄ avaimella approval-*, committed-marker POISSA.
+    let on_disk = read_outbox(&outbox);
+    assert!(
+        on_disk.contains("dispatch_intent"),
+        "intent marker must be present on disk after approval intent-only crash. disk={on_disk:?}"
+    );
+    assert!(
+        on_disk.contains("approval-"),
+        "outbox key must be approval-* (NOT turn-*) on the approval path. disk={on_disk:?}"
+    );
+    assert!(
+        !on_disk.contains("dispatch_committed"),
+        "committed marker must be ABSENT on disk (crash hit before record_committed). \
+         disk={on_disk:?}"
+    );
+    // Odottava hyväksyntä SÄILYI durable-pinnalla (Wire) → resume voi ladata sen.
+    let pending_on_disk = std::fs::read_to_string(&pending).unwrap_or_default();
+    assert!(
+        pending_on_disk.contains("pending_approval_put"),
+        "durable pending must still hold the approval after the intent-only crash \
+         (Wire phase). pending={pending_on_disk:?}"
+    );
+
+    // Vaihe 2 (approve_resume): tuore prosessi, lataa sama ApprovalId levyltä,
+    // uudelleenhyväksyy → InProgress → PolicyDenied fail-closed.
+    let (code2, ok2, o2, e2) = run_env(
+        &bin,
+        &approval_phase_args("approve_resume", &ob, &ct, &oc, &pd, &tq),
+        // EI aseistusta resumessa — koukkua ei käytetä.
+        &[],
+    );
+    assert!(
+        ok2,
+        "approve_resume phase must exit success (code={code2:?}). stderr={e2}"
+    );
+    let report = result_json(&o2);
+    eprintln!("[approval-intent resume] {report}");
+
+    // AT-MOST-ONCE TODISTE 1: uudelleenhyväksyntä on PolicyDenied fail-closed.
+    assert_eq!(
+        report["policy_denied"],
+        serde_json::Value::Bool(true),
+        "APPROVAL intent-only replay must be PolicyDenied (fail-closed), not a silent re-run"
+    );
+
+    // AT-MOST-ONCE TODISTE 2: laskuri PYSYY 1:ssä — sivuvaikutus EI lauennut toiste.
+    assert_eq!(
+        report["side_effect_count"], 1,
+        "APPROVAL intent-only replay must NOT re-fire the side effect (at-most-once)"
+    );
+    assert_eq!(
+        read_counter(&counter),
+        1,
+        "disk counter confirms the approval side effect fired AT MOST once (1, never 2)"
+    );
+
+    // Wire-vaiheen todiste: tuore prosessi todella latasi SAMAN hyväksynnän levyltä.
+    assert!(
+        report["reloaded_approval_id"].is_string(),
+        "fresh process must have reloaded the durable pending approval id"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **HYVÄKSYNTÄPOLKU, COMMITTED-IKKUNA todistaa arvo-identtisen replayn aidon
+/// prosessirajan yli — avaimella `approval-{id}`.**
+///
+/// Vaihe 1 (`approve_crash_committed`, koukku aseistettu): hyväksy → sivuvaikutus
+/// laukeaa (laskuri = 1), `record_committed` fsyncataan, prosessi abortoi VASTA
+/// committedin jälkeen mutta ENNEN `pending.remove`:a → poistuu 137. Levyllä:
+/// intent + committed LÄSNÄ.
+///
+/// Vaihe 2 (`approve_resume`): tuore prosessi lataa saman `ApprovalId`:n →
+/// outbox-lookup näkee `Committed` → palauttaa arvo-identtisen `SubmitOutcome`:n
+/// (sama `task_id`, status Done) ajamatta sivuvaikutusta uudelleen. Laskuri = 1.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn approval_path_committed_crash_is_value_identical() {
+    let bin = harness_bin();
+    let dir = tempdir("approval-committed");
+    let outbox = dir.join("outbox.jsonl");
+    let counter = dir.join("counter.txt");
+    let outcome = dir.join("outcome.json");
+    let pending = dir.join("pending.jsonl");
+    let task_queue = dir.join("tasks.jsonl");
+    let (ob, ct, oc, pd, tq) = (
+        outbox.to_string_lossy().into_owned(),
+        counter.to_string_lossy().into_owned(),
+        outcome.to_string_lossy().into_owned(),
+        pending.to_string_lossy().into_owned(),
+        task_queue.to_string_lossy().into_owned(),
+    );
+
+    // Vaihe 1 (approve_crash_committed): koukku abortoi VASTA committedin jälkeen.
+    let (code1, ok1, _o1, e1) = run_env(
+        &bin,
+        &approval_phase_args("approve_crash_committed", &ob, &ct, &oc, &pd, &tq),
+        &[(CRASH_AFTER_COMMITTED_ENV, "1")],
+    );
+    assert!(
+        !ok1,
+        "approve_crash_committed phase must NOT exit success. stderr={e1}"
+    );
+    assert_eq!(
+        code1,
+        Some(137),
+        "approve_crash_committed must exit 137 from the crash hook. stderr={e1}"
+    );
+    assert_eq!(
+        read_counter(&counter),
+        1,
+        "side effect fired exactly once before the committed-window crash"
+    );
+
+    // Levyllä: intent + committed LÄSNÄ, avain approval-*.
+    let on_disk = read_outbox(&outbox);
+    assert!(
+        on_disk.contains("dispatch_intent") && on_disk.contains("dispatch_committed"),
+        "both intent and committed markers must be on disk (committed window). disk={on_disk:?}"
+    );
+    assert!(
+        on_disk.contains("approval-"),
+        "outbox key must be approval-* on the approval path. disk={on_disk:?}"
+    );
+
+    // Vaihe 2 (approve_resume): sama ApprovalId → Committed → arvo-identtinen.
+    let (code2, ok2, o2, e2) = run_env(
+        &bin,
+        &approval_phase_args("approve_resume", &ob, &ct, &oc, &pd, &tq),
+        &[],
+    );
+    assert!(
+        ok2,
+        "approve_resume phase must exit success (code={code2:?}). stderr={e2}"
+    );
+    let report = result_json(&o2);
+    eprintln!("[approval-committed resume] {report}");
+
+    // KORJAUKSEN TODISTE 1 (arvo-identtisyys): re-approve palauttaa saman task_id:n.
+    assert_eq!(
+        report["value_identical"],
+        serde_json::Value::Bool(true),
+        "APPROVAL committed replay must return the value-identical SubmitOutcome (same task_id)"
+    );
+    assert_eq!(
+        report["policy_denied"],
+        serde_json::Value::Bool(false),
+        "APPROVAL committed replay must NOT be denied (it returns the committed outcome)"
+    );
+
+    // KORJAUKSEN TODISTE 2 (at-most-once): laskuri PYSYY 1:ssä.
+    assert_eq!(
+        report["side_effect_count"], 1,
+        "APPROVAL committed replay must NOT re-fire the side effect (exactly-once dispatch)"
+    );
+    assert_eq!(
+        read_counter(&counter),
+        1,
+        "disk counter confirms the approval side effect fired exactly once"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

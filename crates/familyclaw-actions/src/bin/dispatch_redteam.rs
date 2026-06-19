@@ -19,6 +19,7 @@
 //!   outboxin kanssa → todistaa korjauksen (laskuri = 1, lopputulos identtinen).
 //!
 //! ## Vaiheet (`--phase`)
+//! ### `submit_task`-polku (avaimet `turn-*`)
 //! - `crash` — aja lähetys (sivuvaikutus tapahtuu), kirjaa lopputulos
 //!   `--outcome-out`-tiedostoon, ja **poistu 137 ENNEN kuin agentti ehtisi
 //!   journaloida dispatch-rivin**. Tämä on COMMITTED-ikkuna: outbox on jo
@@ -38,14 +39,41 @@
 //!   [`PolicyDenied`](familyclaw_actions::ActionError::PolicyDenied) fail-closed,
 //!   eikä sivuvaikutus aja uudelleen (laskuri pysyy 1:ssä).
 //!
+//! ### Hyväksyntäpolku (avaimet `approval-*`)
+//! Tämä todistaa SAMAN at-most-once-takuun [`ActionRuntime::approve`]:n
+//! sivuvaikutus-ikkunalle — outbox-avain on `approval-{id}`, EI `turn-*`. Polku
+//! tarvitsee kaatumiskestävän **pending**-pinnan (Wire-vaihe), jotta tuore
+//! prosessi voi ladata odottavan hyväksynnän levyltä ja **uudelleenhyväksyä
+//! saman `ApprovalId`:n**.
+//! - `approve_crash_intent` — lähetä hyväksyntää vaativa tehtävä, sitten
+//!   `approve()` aseistetulla intent-koukulla: `run_after_approval` ajaa
+//!   sivuvaikutuksen (laskuri = 1), `record_intent` on fsyncattu, mutta prosessi
+//!   abortoi `record_committed`:n alussa → **poistuu 137 INTENT-ONLY-ikkunassa**
+//!   (intent levyllä, committed + `pending.remove` tekemättä).
+//! - `approve_crash_committed` — kuten yllä mutta kaatumiskoukku abortoi
+//!   `record_committed`:n **jälkeen** (committed fsyncattu) mutta ENNEN
+//!   `pending.remove`:a → COMMITTED-ikkuna hyväksyntäpolulla.
+//! - `approve_resume` — tuore prosessi lataa odottavan hyväksynnän durable-
+//!   pinnalta (Wire), poimii **saman** `ApprovalId`:n ja uudelleenhyväksyy sen:
+//!   intent-only-kaatumisen jälkeen outbox näkee `InProgress` →
+//!   [`PolicyDenied`](familyclaw_actions::ActionError::PolicyDenied) fail-closed
+//!   (laskuri pysyy 1:ssä); committed-kaatumisen jälkeen outbox näkee `Committed`
+//!   → arvo-identtinen lopputulos (laskuri pysyy 1:ssä).
+//!
 //! ## Kaatumiskoukku — tuotannossa SAAVUTTAMATON (turvallisuusperustelu)
-//! Intent-only-kaatuminen toteutetaan [`CrashAfterIntentOutbox`]-kääreellä joka
-//! delegoi oikealle [`JournalDispatchOutbox`]:lle, mutta sen `record_committed`
-//! **abortoi prosessin ENNEN delegointia** kun se on aseistettu ympäristömuuttujalla
-//! [`CRASH_AFTER_INTENT_ENV`]. Koska `submit_task_idempotent` kutsuu
-//! `record_intent` → sivuvaikutus → `record_committed` tässä järjestyksessä,
-//! `record_committed`:n abortointi ENNEN delegointia jättää tilan tasan
-//! intent-only-ikkunaan.
+//! Intent-only- ja committed-kaatumiset toteutetaan [`CrashAfterIntentOutbox`]-
+//! kääreellä joka delegoi oikealle [`JournalDispatchOutbox`]:lle, mutta sen
+//! `record_committed` **abortoi prosessin** kun se on aseistettu jommallakummalla
+//! ympäristömuuttujalla:
+//! - [`CRASH_AFTER_INTENT_ENV`] → abort **ENNEN** delegointia (intent levyllä,
+//!   committed kirjoittamatta = INTENT-ONLY-ikkuna).
+//! - [`CRASH_AFTER_COMMITTED_ENV`] → abort **JÄLKEEN** delegoinnin (committed
+//!   fsyncattu, mutta `pending.remove` ajamatta = COMMITTED-ikkuna
+//!   hyväksyntäpolulla).
+//!
+//! Koska sekä `submit_task_idempotent` että `approve` kutsuvat `record_intent` →
+//! sivuvaikutus → `record_committed` tässä järjestyksessä, abort
+//! `record_committed`:n ympärillä jättää tilan tasan haluttuun ikkunaan.
 //!
 //! Koukku on **kaksinkertaisesti portitettu eikä voi laueta tuotannossa**:
 //! 1. **Käännösraja:** [`CrashAfterIntentOutbox`] on määritelty VAIN tässä
@@ -55,8 +83,9 @@
 //!    — tätä kääre-tyyppiä ei ole olemassa kirjasto-API:ssa, joten sitä on
 //!    rakenteellisesti mahdotonta instantioida tuotannossa.
 //! 2. **Ajonaikainen portti:** vaikka tyyppi jotenkin päätyisi käyttöön, abort
-//!    laukeaa vain kun [`CRASH_AFTER_INTENT_ENV`] = `"1"`. Mikään tuotantopolku
-//!    ei aseta tätä muuttujaa.
+//!    laukeaa vain kun [`CRASH_AFTER_INTENT_ENV`] **tai**
+//!    [`CRASH_AFTER_COMMITTED_ENV`] = `"1"`. Mikään tuotantopolku ei aseta
+//!    kumpaakaan muuttujaa.
 //!
 //! ## Determinismi
 //! Kello injektoidaan `--clock`:lla — järjestelmäkelloa ei lueta koskaan.
@@ -156,6 +185,86 @@ impl Skill for CountingExecutor {
     }
 }
 
+/// Hyväksyntää vaativa laskuri-taito (hyväksyntäpolun sivuvaikutus).
+///
+/// Identtinen [`CountingExecutor`]:n kanssa PAITSI että sen riskiluokka on
+/// [`ActionRisk::WriteExternal`] → `submit_task` jättää tehtävän odottamaan
+/// ihmisen hyväksyntää sen sijaan että ajaisi sen heti. Sivuvaikutus (laskurin
+/// kasvatus) tapahtuu siis vasta [`ActionRuntime::approve`]:n ajaessa
+/// [`run_after_approval`](familyclaw_actions)-haaran — täsmälleen se ikkuna jonka
+/// at-most-once-takuu kattaa `approval-{id}`-avaimella.
+///
+/// Laskuri elää **levyllä** samalla mekanismilla kuin [`CountingExecutor`]:lla,
+/// joten kaksoislaukaisu hyväksynnän yli näkyy laskurissa suoraan (1 → 2).
+#[derive(Debug)]
+struct ApprovalCountingExecutor {
+    /// Polku jossa sivuvaikutuslaskuri elää (jaettu muoto [`CountingExecutor`]:n kanssa).
+    counter_path: PathBuf,
+    /// Prosessin sisäinen laskuri (diagnostiikka; varsinainen todiste on levyllä).
+    in_process: AtomicU64,
+}
+
+impl ApprovalCountingExecutor {
+    /// Kiinteä tunniste (eri kuin [`CountingExecutor`]:lla), jotta hyväksyntäpolun
+    /// taito on yksikäsitteinen rekisterissä.
+    const SKILL_UUID: Uuid = uuid::uuid!("99999999-8888-4777-8666-555544443333");
+
+    fn skill_id() -> SkillId {
+        SkillId::from_uuid(Self::SKILL_UUID)
+    }
+
+    fn new(counter_path: PathBuf) -> Self {
+        Self {
+            counter_path,
+            in_process: AtomicU64::new(0),
+        }
+    }
+
+    /// Kasvattaa levyllä olevaa sivuvaikutuslaskuria atomisesti (luku → +1 → kirjoitus).
+    fn bump_disk_counter(&self) {
+        let current = std::fs::read_to_string(&self.counter_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let _ = std::fs::write(&self.counter_path, (current + 1).to_string());
+    }
+}
+
+#[async_trait]
+impl ActionExecutor for ApprovalCountingExecutor {
+    async fn execute(&self, request: ActionRequest) -> familyclaw_actions::Result<ActionResult> {
+        // SIVUVAIKUTUS: kasvata laskuria. Ajetaan hyväksyntäpolulla VASTA
+        // `approve()`:n `run_after_approval`-haarassa — tämä on se "ulkoinen
+        // vaikutus" jonka on tapahduttava korkeintaan kerran SIGKILL:n yli.
+        self.in_process.fetch_add(1, Ordering::SeqCst);
+        self.bump_disk_counter();
+        Ok(ActionResult::success(
+            "counter bumped (approval path)",
+            serde_json::json!({ "ok": true }),
+            request.now,
+        ))
+    }
+}
+
+impl Skill for ApprovalCountingExecutor {
+    fn manifest(&self) -> SkillManifest {
+        SkillManifest {
+            id: Self::skill_id(),
+            name: "counting_side_effect_approval".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Kasvattaa sivuvaikutuslaskuria (vaatii hyväksynnän)."
+                .to_string(),
+            permissions: vec![SkillPermission::WriteExternal],
+            // WriteExternal → vaatii ihmisen hyväksynnän (ei auto-run).
+            risk: ActionRisk::WriteExternal,
+            approval_policy: ApprovalPolicy::RequireApproval,
+            input_hint: None,
+            output_hint: None,
+            input_schema: default_input_schema(),
+        }
+    }
+}
+
 /// Ympäristömuuttuja joka **aseistaa** intent-only-kaatumiskoukun.
 ///
 /// Vain kun tämä on `"1"`, [`CrashAfterIntentOutbox::record_committed`] abortoi
@@ -163,19 +272,35 @@ impl Skill for CountingExecutor {
 /// dokumentaatio (käännösraja + ajonaikainen portti).
 const CRASH_AFTER_INTENT_ENV: &str = "FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT";
 
+/// Ympäristömuuttuja joka **aseistaa** committed-ikkunan kaatumiskoukun.
+///
+/// Vain kun tämä on `"1"`, [`CrashAfterIntentOutbox::record_committed`] abortoi
+/// prosessin **delegoinnin JÄLKEEN** (committed on jo fsyncattu levylle) mutta
+/// ennen kuin kutsuja ehtii `pending.remove`:n. Tämä jäljittelee
+/// hyväksyntäpolun COMMITTED-ikkunaa. Mikään tuotantopolku ei aseta tätä — ks.
+/// moduulin dokumentaatio (käännösraja + ajonaikainen portti).
+const CRASH_AFTER_COMMITTED_ENV: &str = "FAMILYCLAW_REDTEAM_CRASH_AFTER_COMMITTED";
+
 /// Exit-koodi jolla intent-only-kaatuminen poistuu (SIGKILL-tyyli, kuten 137).
 const CRASH_EXIT_CODE: i32 = 137;
 
-/// Kaatumiskoukku-kääre joka pakottaa **intent-only-ikkunan** prosessirajan yli.
+/// Kaatumiskoukku-kääre joka pakottaa joko **intent-only-** tai
+/// **committed-ikkunan** prosessirajan yli.
 ///
 /// Delegoi kaiken oikealle [`JournalDispatchOutbox`]:lle PAITSI että
 /// [`record_committed`](CrashAfterIntentOutbox::record_committed) **abortoi
-/// prosessin ENNEN delegointia** kun koukku on aseistettu
-/// ([`CRASH_AFTER_INTENT_ENV`] = `"1"`). Koska [`ActionRuntime::submit_task_idempotent`]
-/// kutsuu `record_intent` → sivuvaikutus → `record_committed` tässä järjestyksessä,
-/// abort `record_committed`:n alussa jättää tilan tasan siihen vaaralliseen
-/// ikkunaan jonka GPT-5.5 nosti esiin: **intent levyllä, sivuvaikutus lauennut,
-/// committed kirjoittamatta**.
+/// prosessin** kun koukku on aseistettu:
+/// - [`CRASH_AFTER_INTENT_ENV`] = `"1"` → abort **ENNEN** delegointia: committed
+///   EI koskaan kirjoitu (intent levyllä, sivuvaikutus lauennut, committed
+///   kirjoittamatta) — INTENT-ONLY-ikkuna jonka GPT-5.5 nosti esiin.
+/// - [`CRASH_AFTER_COMMITTED_ENV`] = `"1"` → abort **JÄLKEEN** delegoinnin:
+///   committed on jo fsyncattu levylle mutta kutsuja ei ehdi `pending.remove`:a
+///   → COMMITTED-ikkuna (hyvänlaatuinen replay-kohta, arvo-identtinen).
+///
+/// Koska sekä [`ActionRuntime::submit_task_idempotent`] että
+/// [`ActionRuntime::approve`] kutsuvat `record_intent` → sivuvaikutus →
+/// `record_committed` tässä järjestyksessä, abort `record_committed`:n ympärillä
+/// jättää tilan tasan haluttuun ikkunaan.
 ///
 /// ## Tuotannossa saavuttamaton
 /// Tämä tyyppi elää VAIN red-team-binäärissä (`src/bin/`), ei kirjasto-API:ssa.
@@ -187,15 +312,22 @@ const CRASH_EXIT_CODE: i32 = 137;
 struct CrashAfterIntentOutbox {
     /// Oikea kaatumiskestävä outbox johon kaikki ei-abortoivat kutsut delegoidaan.
     inner: JournalDispatchOutbox,
-    /// Aseistettu tila (luettu kerran ympäristöstä rakennusvaiheessa).
-    armed: bool,
+    /// Aseistettu tila intent-only-ikkunaan (abort ENNEN delegointia).
+    armed_before: bool,
+    /// Aseistettu tila committed-ikkunaan (abort JÄLKEEN delegoinnin).
+    armed_after: bool,
 }
 
 impl CrashAfterIntentOutbox {
-    /// Käärii oikean outboxin ja lukee aseistuksen ympäristöstä KERRAN.
+    /// Käärii oikean outboxin ja lukee aseistukset ympäristöstä KERRAN.
     fn new(inner: JournalDispatchOutbox) -> Self {
-        let armed = std::env::var(CRASH_AFTER_INTENT_ENV).as_deref() == Ok("1");
-        Self { inner, armed }
+        let armed_before = std::env::var(CRASH_AFTER_INTENT_ENV).as_deref() == Ok("1");
+        let armed_after = std::env::var(CRASH_AFTER_COMMITTED_ENV).as_deref() == Ok("1");
+        Self {
+            inner,
+            armed_before,
+            armed_after,
+        }
     }
 }
 
@@ -220,13 +352,13 @@ impl DispatchOutboxStore for CrashAfterIntentOutbox {
         key: &str,
         outcome: &DispatchedOutcome,
     ) -> familyclaw_actions::Result<()> {
-        if self.armed {
+        if self.armed_before {
             // INTENT-ONLY-IKKUNA: record_intent on jo levyllä JA sivuvaikutus on jo
             // lauennut (kutsuja ajoi sen ennen tätä). Abortoidaan ENNEN delegointia
             // → committed EI koskaan kirjoitu. Tämä on aidosti vaarallinen ikkuna.
             //
-            // `std::process::abort()` jäljittelee SIGKILL:iä (ei unwind-koodia,
-            // ei destruktoreita) — eikä kirjasto koskaan näe committed-riviä.
+            // `std::process::exit(137)` jäljittelee SIGKILL:iä — eikä kirjasto
+            // koskaan näe committed-riviä.
             let _ = std::io::stderr().flush();
             eprintln!(
                 "crash injected: AFTER record_intent + side effect, \
@@ -235,7 +367,22 @@ impl DispatchOutboxStore for CrashAfterIntentOutbox {
             // Käytä eksplisiittistä exit-koodia jotta testi voi vaatia 137:n.
             std::process::exit(CRASH_EXIT_CODE);
         }
-        self.inner.record_committed(key, outcome)
+        // Committed delegoidaan oikealle outboxille (fsync). Tämän jälkeen
+        // committed-marker on levyllä — at-most-once-takuu pitää siitä eteenpäin.
+        self.inner.record_committed(key, outcome)?;
+        if self.armed_after {
+            // COMMITTED-IKKUNA: committed on jo fsyncattu, mutta kutsuja (esim.
+            // `approve`) ei ole vielä ehtinyt `pending.remove`:a. Abortoidaan tähän
+            // → uudelleenhyväksyntä näkee Committed-rivin ja palauttaa
+            // arvo-identtisen lopputuloksen ajamatta sivuvaikutusta uudelleen.
+            let _ = std::io::stderr().flush();
+            eprintln!(
+                "crash injected: AFTER record_committed (committed on disk), \
+                 BEFORE pending.remove (committed window)"
+            );
+            std::process::exit(CRASH_EXIT_CODE);
+        }
+        Ok(())
     }
 }
 
@@ -267,6 +414,23 @@ enum Phase {
     /// palauttaa `InProgress`, joten odotettu lopputulos on `PolicyDenied`
     /// fail-closed (sivuvaikutus EI aja uudelleen).
     ResumeIntent,
+    /// HYVÄKSYNTÄPOLKU, INTENT-ONLY-ikkuna: lähetä hyväksyntää vaativa tehtävä,
+    /// kirjaa `ApprovalId` levylle, sitten `approve()` aseistetulla intent-koukulla
+    /// → `run_after_approval` ajaa sivuvaikutuksen (laskuri = 1), `record_intent`
+    /// fsyncattu, prosessi abortoi `record_committed`:n alussa → poistuu 137.
+    /// Vaatii `--mode new`, durable pending (`--pending`) + task queue
+    /// (`--task-queue`) ja `FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1`.
+    ApproveCrashIntent,
+    /// HYVÄKSYNTÄPOLKU, COMMITTED-ikkuna: kuten yllä mutta koukku abortoi
+    /// `record_committed`:n **jälkeen** (committed levyllä) ennen `pending.remove`:a
+    /// → poistuu 137. Vaatii `FAMILYCLAW_REDTEAM_CRASH_AFTER_COMMITTED=1`.
+    ApproveCrashCommitted,
+    /// HYVÄKSYNTÄPOLUN jälkeen: tuore prosessi lataa odottavan hyväksynnän
+    /// durable-pinnalta (Wire), poimii SAMAN `ApprovalId`:n ja uudelleenhyväksyy
+    /// sen. Intent-only-kaatumisen jälkeen → `PolicyDenied` fail-closed (laskuri
+    /// pysyy 1:ssä); committed-kaatumisen jälkeen → arvo-identtinen `SubmitOutcome`
+    /// (laskuri pysyy 1:ssä). Koukkua EI aseisteta tässä vaiheessa.
+    ApproveResume,
 }
 
 /// Komentorivirajapinta.
@@ -308,6 +472,14 @@ struct RunArgs {
     /// Injektoitu seinäkello (RFC 3339).
     #[arg(long)]
     clock: String,
+    /// Kaatumiskestävän **odottavien hyväksyntöjen** pinnan polku (Wire-vaihe).
+    /// Pakollinen hyväksyntäpolun vaiheille (`approve_*`).
+    #[arg(long)]
+    pending: Option<PathBuf>,
+    /// Kaatumiskestävän **tehtäväjonon** polku (durable queue). Pakollinen
+    /// hyväksyntäpolun vaiheille (`approve_*`).
+    #[arg(long)]
+    task_queue: Option<PathBuf>,
 }
 
 /// Lopputuloksen levymuoto arvo-identtisyyden vertailuun.
@@ -384,6 +556,47 @@ fn build_runtime(args: &RunArgs) -> HarnessResult<ActionRuntime> {
     Ok(runtime)
 }
 
+/// Pakottaa pakollisen polun argumentin (hyväksyntäpolun vaiheille).
+fn require_path<'a>(value: Option<&'a PathBuf>, flag: &str) -> HarnessResult<&'a PathBuf> {
+    value.ok_or_else(|| {
+        HarnessError::Io(std::io::Error::other(format!(
+            "hyväksyntäpolun vaihe vaatii argumentin {flag}"
+        )))
+    })
+}
+
+/// Rakentaa **kaatumiskestävän** ajoympäristön hyväksyntäpolulle: durable pending
+/// (Wire) + durable task queue + kaatumiskestävä dispatch-outbox.
+///
+/// Tämä on se kokoonpano jonka ansiosta tuore prosessi voi ladata odottavan
+/// hyväksynnän levyltä ([`ActionRuntime::with_durable_stores`]) ja
+/// uudelleenhyväksyä SAMAN `ApprovalId`:n at-most-once-suojan alla
+/// (`approval-{id}`-avain). Crash-vaiheissa outbox kääritään
+/// [`CrashAfterIntentOutbox`]:iin (intent- tai committed-ikkuna ympäristömuuttujan
+/// mukaan); resume-vaiheessa käytetään suoraa [`JournalDispatchOutbox`]:a.
+async fn build_approval_runtime(args: &RunArgs) -> HarnessResult<ActionRuntime> {
+    let pending = require_path(args.pending.as_ref(), "--pending")?;
+    let task_queue = require_path(args.task_queue.as_ref(), "--task-queue")?;
+
+    let outbox = JournalDispatchOutbox::open(&args.outbox)?;
+    let wrapped: Box<dyn DispatchOutboxStore> = if matches!(
+        args.phase,
+        Phase::ApproveCrashIntent | Phase::ApproveCrashCommitted
+    ) {
+        // Kääri kaatumiskoukku: abortoi record_committed:n ympärillä
+        // (ympäristömuuttuja valitsee ennen/jälkeen).
+        Box::new(CrashAfterIntentOutbox::new(outbox))
+    } else {
+        Box::new(outbox)
+    };
+
+    let mut runtime = ActionRuntime::with_durable_stores(pending, task_queue)
+        .await?
+        .with_dispatch_outbox(wrapped);
+    runtime.register_skill(ApprovalCountingExecutor::new(args.counter.clone()))?;
+    Ok(runtime)
+}
+
 /// Ajaa lähetyksen valitulla polulla (vanha vs uusi).
 async fn dispatch(
     runtime: &mut ActionRuntime,
@@ -418,9 +631,26 @@ async fn dispatch(
 
 async fn run_phase(args: RunArgs) -> HarnessResult<()> {
     let now = time::parse_rfc3339(&args.clock)?;
+
+    // Hyväksyntäpolun vaiheet käyttävät eri (kaatumiskestävää) kokoonpanoa ja
+    // erillistä taitoa → eroteta ne ENNEN submit-polun ajoympäristön rakennusta.
+    if matches!(
+        args.phase,
+        Phase::ApproveCrashIntent | Phase::ApproveCrashCommitted | Phase::ApproveResume
+    ) {
+        return run_approval_phase(args, now).await;
+    }
+
     let mut runtime = build_runtime(&args)?;
 
     match args.phase {
+        Phase::ApproveCrashIntent | Phase::ApproveCrashCommitted | Phase::ApproveResume => {
+            // Nämä haarautuivat jo `run_approval_phase`:een yllä; tänne ei pitäisi
+            // koskaan päästä. Epäonnistu äänekkäästi panikoimatta.
+            Err(HarnessError::Io(std::io::Error::other(
+                "approval phase reached submit-path match — internal routing error",
+            )))
+        }
         Phase::Crash => {
             // COMMITTED-ikkuna. Lähetys ajetaan kokonaan (intent + sivuvaikutus +
             // committed). Kirjaa lopputulos arvo-identtisyyden vertailuun ja poistu
@@ -483,6 +713,105 @@ async fn run_phase(args: RunArgs) -> HarnessResult<()> {
             println!("RESULT {result}");
             std::io::stdout().flush()?;
             Ok(())
+        }
+    }
+}
+
+/// Ajaa **hyväksyntäpolun** vaiheet aidon prosessirajan yli.
+///
+/// Kaikki kolme vaihetta jakavat saman kaatumiskestävän kokoonpanon
+/// ([`build_approval_runtime`]): durable pending (Wire) + durable task queue +
+/// kaatumiskestävä dispatch-outbox. Idempotenssi-avain on `approval-{id}` (EI
+/// `turn-*`).
+///
+/// - `approve_crash_intent` / `approve_crash_committed`: lähetä hyväksyntää
+///   vaativa tehtävä, kirjaa `ApprovalId` + lopputulos levylle, sitten `approve()`
+///   aseistetulla koukulla → prosessi abortoi `record_committed`:n ympärillä
+///   (intent- tai committed-ikkuna) ja poistuu 137.
+/// - `approve_resume`: lataa odottava hyväksyntä durable-pinnalta, poimi SAMA
+///   `ApprovalId` ja uudelleenhyväksy se. Tulosta yhden rivin RESULT-JSON.
+async fn run_approval_phase(args: RunArgs, now: Timestamp) -> HarnessResult<()> {
+    let mut runtime = build_approval_runtime(&args).await?;
+
+    match args.phase {
+        Phase::ApproveCrashIntent | Phase::ApproveCrashCommitted => {
+            // 1) Lähetä hyväksyntää vaativa tehtävä (WriteExternal → NeedsApproval).
+            //    Sivuvaikutus EI vielä laukea — se odottaa hyväksyntää.
+            let submitted = runtime
+                .submit_task_as(
+                    "agent_a",
+                    ApprovalCountingExecutor::skill_id(),
+                    serde_json::json!({ "n": 1 }),
+                    now,
+                )
+                .await?;
+            let approval_id = submitted.pending_approval.ok_or_else(|| {
+                HarnessError::Io(std::io::Error::other(
+                    "submit ei jättänyt tehtävää odottamaan hyväksyntää \
+                     (odotettiin NeedsApproval)",
+                ))
+            })?;
+            // Kirjaa lopputulos + ApprovalId levylle: resume-vaihe vertaa tähän
+            // (arvo-identtisyys) ja varmistaa että SAMA hyväksyntä ladattiin.
+            write_outcome(&args.outcome_out, &submitted)?;
+
+            // 2) Hyväksy → run_after_approval ajaa sivuvaikutuksen (laskuri = 1),
+            //    record_intent fsyncataan, sitten kaatumiskoukku abortoi
+            //    record_committed:n ympärillä. `approve` ei palaa normaalisti.
+            let _ = runtime.approve(approval_id, now).await?;
+            // Jos koukku EI ollut aseistettu, tänne päästään → ohjelmointivirhe.
+            Err(HarnessError::Io(std::io::Error::other(
+                "approve crash phase returned without aborting — is \
+                 FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT / _AFTER_COMMITTED=1 set?",
+            )))
+        }
+        Phase::ApproveResume => {
+            // Lataa odottava hyväksyntä durable-pinnalta (Wire-vaihe): tämä on se
+            // kohta jossa SAMA ApprovalId rekonstruoidaan levyltä uudessa prosessissa.
+            let pending = runtime.try_pending_approvals()?;
+            let approval_id = pending.first().map(|p| p.approval_id).ok_or_else(|| {
+                HarnessError::Io(std::io::Error::other(
+                    "tuore prosessi ei löytänyt odottavaa hyväksyntää durable-pinnalta \
+                     (Wire-vaihe rikki?)",
+                ))
+            })?;
+
+            // Uudelleenhyväksy SAMA ApprovalId → outbox-avain approval-{id}.
+            // Intent-only-kaatumisen jälkeen: InProgress → PolicyDenied.
+            // Committed-kaatumisen jälkeen: Committed → arvo-identtinen lopputulos.
+            let approve_result = runtime.approve(approval_id, now).await;
+            let policy_denied = matches!(approve_result, Err(ActionError::PolicyDenied(_)));
+            let denied_message = match &approve_result {
+                Err(ActionError::PolicyDenied(msg)) => Some(msg.clone()),
+                _ => None,
+            };
+
+            // Arvo-identtisyys committed-ikkunalle: vertaa kaatuneeseen lopputulokseen.
+            let before = read_outcome(&args.outcome_out);
+            let resumed = approve_result.as_ref().ok().map(OutcomeRecord::from_submit);
+            let value_identical = match (&before, &resumed) {
+                (Some(b), Some(r)) => b.task_id == r.task_id,
+                _ => false,
+            };
+
+            let result = serde_json::json!({
+                "side_effect_count": read_counter(&args.counter),
+                "policy_denied": policy_denied,
+                "denied_message": denied_message,
+                "value_identical": value_identical,
+                "reloaded_approval_id": approval_id.to_string(),
+                "resumed_task_id": resumed.as_ref().map(|r| r.task_id.clone()),
+                "resumed_status": resumed.as_ref().map(|r| r.status.clone()),
+            });
+            println!("RESULT {result}");
+            std::io::stdout().flush()?;
+            Ok(())
+        }
+        // Submit-polun vaiheet eivät koskaan päädy tänne (haaroitettu run_phase:ssa).
+        Phase::Crash | Phase::CrashIntent | Phase::Resume | Phase::ResumeIntent => {
+            Err(HarnessError::Io(std::io::Error::other(
+                "submit phase reached approval-path handler — internal routing error",
+            )))
         }
     }
 }

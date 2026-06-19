@@ -386,6 +386,18 @@ pub trait PendingApprovalStore: Send + Sync {
     /// Levytoteutuksilla [`ActionError::Proof`] jos lokin luku/kirjoitus
     /// epäonnistuu.
     fn evict_expired(&self, now: Timestamp) -> Result<usize>;
+
+    /// Palauttaa pinnan **lajitunnisteen** (`"in-memory"` tai `"journal"`).
+    ///
+    /// Tämä on salaisuudeton tarkistuskoukku kokoojalle ja testeille: sillä voi
+    /// todeta että persistentti kokoonpano sai kaatumiskestävän (`"journal"`)
+    /// odottavien hyväksyntöjen pinnan oletuksellisen muistinvaraisen
+    /// (`"in-memory"`) sijaan, paljastamatta sisäistä tilaa tai tiedostopolkua.
+    /// Sama tarkoitus kuin [`crate::dispatch_outbox::DispatchOutboxStore::kind`]:lla.
+    /// Oletus on `"in-memory"`; kaatumiskestävät toteutukset ohittavat tämän.
+    fn kind(&self) -> &'static str {
+        "in-memory"
+    }
 }
 
 /// Muistinvarainen tallennuspinta ([`HashMap`] traitin takana).
@@ -849,6 +861,11 @@ impl PendingApprovalStore for JournalPendingStore {
             self.maybe_auto_compact();
         }
         Ok(expired.len())
+    }
+
+    /// Kaatumiskestävä pinta: `"journal"`.
+    fn kind(&self) -> &'static str {
+        "journal"
     }
 }
 
