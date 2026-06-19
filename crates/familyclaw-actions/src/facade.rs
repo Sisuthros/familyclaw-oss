@@ -796,16 +796,69 @@ impl ActionRuntime {
         result
     }
 
+    /// Johtaa hyväksynnän **vakaan idempotenssi-avaimen** lähetys-outboxia varten.
+    ///
+    /// Avain on deterministinen ja **pysyvä yli restartin**: `ApprovalId` on
+    /// kaatumiskestävässä tallennuspinnassa, joten sama hyväksyntä tuottaa aina
+    /// saman avaimen. Tämä on se mekanismi jolla [`ActionRuntime::approve`]:n
+    /// sivuvaikutus lähetetään **korkeintaan kerran** prosessin kaatumisen yli.
+    #[must_use]
+    fn approval_dispatch_key(approval_id: ApprovalId) -> String {
+        format!("approval-{approval_id}")
+    }
+
     /// Kuluttaa (merkitsee käytetyksi) odottavan hyväksynnän ja ajaa pysähtyneen
-    /// tehtävän suorituksen loppuun.
+    /// tehtävän suorituksen loppuun — **idempotentisti** lähetys-outboxin
+    /// suojassa (at-most-once-takuun kivijalka hyväksyntäpolulla).
     ///
     /// Hyväksyntä kulutetaan tehtävän tallennettua payloadia vasten
     /// (payload-sidonta + kertakäyttö), joten muutettu payload ei voi käyttää
     /// hyväksyntää. Onnistuessa syntyvä todiste tallennetaan haettavaksi.
     ///
+    /// ## Miksi outbox myös tällä polulla (kaksoislaukaisun esto)
+    /// Sivuvaikutuksen suoritus ([`Pipeline::run_after_approval`]) ja sen
+    /// kuluttavan kirjauksen ([`PendingApprovalStore::remove`]) **väliin** jää
+    /// ikkuna: jos prosessi tapetaan (SIGKILL) juuri siinä, sivuvaikutus on jo
+    /// tapahtunut mutta hyväksyntä on yhä `pending` kaatumiskestävällä pinnalla →
+    /// restartin jälkeen operaattori voi **uudelleenhyväksyä saman hyväksynnän** ja
+    /// sivuvaikutus **laukeaisi kahdesti**. Outbox sulkee tämän:
+    /// sivuvaikutus kääritään vakaan avaimen (`approval-{id}`) idempotenssiin
+    /// täsmälleen kuten [`ActionRuntime::submit_task_idempotent`]:ssa, joten
+    /// uudelleenhyväksyntä osuu outboxiin eikä aja sivuvaikutusta uudelleen.
+    ///
+    /// ## Kaksivaiheinen sitoutuminen outboxiin
+    /// 1. **lookup(key)** — jos avain on jo:
+    ///    - **committed** → palauta tallennettu lopputulos heti, ÄLÄ aja
+    ///      sivuvaikutusta uudelleen.
+    ///    - **in-progress** (intent kirjattu, committed ei) → prosessi kaatui
+    ///      kesken aiemman sivuvaikutuksen → **fail-closed**
+    ///      ([`ActionError::PolicyDenied`]), ÄLÄ aja uudelleen.
+    ///    - **not-started** → jatka.
+    /// 2. **`record_intent`** (fsync) ENNEN sivuvaikutusta.
+    /// 3. aja sivuvaikutus ([`Pipeline::run_after_approval`]).
+    /// 4. **`record_committed`** (fsync) sivuvaikutuksen jälkeen — vasta tämä
+    ///    tekee lähetyksestä replay-palautuvan.
+    ///
+    /// `pending.remove` + tilannevedos seuraavat committedin jälkeen, mutta ovat
+    /// nyt idempotenssin suojaamia: uudelleenhyväksyntä ei aja sivuvaikutusta
+    /// uudelleen.
+    ///
+    /// ## Takuun raja (rehellisesti)
+    /// Tämä on kaksoislaukaisun esto / **at-most-once-lähetys** kaatumisen yli
+    /// (fail-closed intent-only-ikkunassa) — **EI** lupaus universaalista
+    /// exactly-once-*valmistumisesta*. Takuu kattaa SIGKILL:n vain
+    /// kaatumiskestävällä outboxilla ([`crate::dispatch_outbox::JournalDispatchOutbox`]);
+    /// muistinvaraisella oletus-outboxilla käyttäytyminen on ennallaan (vain saman
+    /// prosessin sisäinen replay, ei restartia).
+    ///
     /// # Errors
     /// - [`ActionError::ApprovalMissing`] jos hyväksyntää ei ole odottamassa.
     /// - [`ActionError::UnknownSkill`] jos tehtävän taitoa ei (enää) löydy.
+    /// - [`ActionError::PolicyDenied`] jos hyväksyntä on jäänyt kesken
+    ///   (intent-only) aiemmassa kaatumisessa.
+    /// - [`ActionError::ExecutionFailed`] jos tallennettu (committed) lähetys oli
+    ///   virhe (replay-palautus).
+    /// - [`ActionError::Proof`] jos outboxin luku/kirjoitus epäonnistuu.
     /// - Hyväksynnän kulutuksen tai putken virheet
     ///   ([`Pipeline::run_after_approval`]).
     pub async fn approve(
@@ -817,6 +870,31 @@ impl ActionRuntime {
             .pending
             .get(approval_id)?
             .ok_or_else(|| ActionError::ApprovalMissing(approval_id.to_string()))?;
+
+        // Vakaa idempotenssi-avain: pysyy samana yli restartin (ApprovalId on
+        // kaatumiskestävällä pinnalla). Sama outbox-protokolla kuin
+        // `submit_task_idempotent`:ssa.
+        let key = Self::approval_dispatch_key(approval_id);
+
+        // 1) Idempotenssi-tarkistus ENNEN sivuvaikutusta.
+        match self.dispatch_outbox.lookup(&key)? {
+            DispatchLookup::Committed(outcome) => {
+                // Jo sitoutunut → palauta arvo-identtinen lopputulos ajamatta
+                // sivuvaikutusta uudelleen. TÄMÄ on double-firen sulkeva haara
+                // uudelleenhyväksynnän yli.
+                return outcome.into_result();
+            }
+            DispatchLookup::InProgress => {
+                // Intent kirjattu mutta ei committed → kaatui kesken sivuvaikutuksen.
+                // Fail-closed: älä aja uudelleen (sivuvaikutus voi olla osittainen).
+                return Err(ActionError::PolicyDenied(format!(
+                    "hyväksynnän '{approval_id}' lähetys jäi kesken aiemmassa \
+                     kaatumisessa (intent ilman committed) — ei ajeta uudelleen \
+                     kaksoislaukaisun estämiseksi"
+                )));
+            }
+            DispatchLookup::NotStarted => {}
+        }
 
         let task = self
             .pipeline
@@ -830,13 +908,39 @@ impl ActionRuntime {
             .ok_or_else(|| ActionError::UnknownSkill(task.skill_id.to_string()))?
             .clone();
 
-        let outcome = self
+        // 2) Kirjaa AIE ENNEN sivuvaikutusta (fsync kaatumiskestävällä outboxilla).
+        self.dispatch_outbox.record_intent(&key)?;
+
+        // 3) Suorita sivuvaikutus (hyväksynnän kulutus + putken ajo) tasan kerran.
+        let run_result = self
             .pipeline
             .run_after_approval(executor.as_ref(), entry.task_id, &entry.approval, now)
-            .await?;
+            .await;
+
+        // 4) Kirjaa SITOUTUMINEN sivuvaikutuksen jälkeen — onnistui tai virhe.
+        //    Virhetapaus tallennetaan committed-virheenä, jotta uudelleenhyväksyntä
+        //    palauttaa saman virheen ajamatta sivuvaikutusta uudelleen.
+        let outcome = match run_result {
+            Ok(outcome) => {
+                let submit = SubmitOutcome {
+                    task_id: entry.task_id,
+                    status: outcome.status,
+                    pending_approval: None,
+                };
+                self.dispatch_outbox
+                    .record_committed(&key, &DispatchedOutcome::from_submit(&submit))?;
+                outcome
+            }
+            Err(e) => {
+                self.dispatch_outbox
+                    .record_committed(&key, &DispatchedOutcome::from_error(e.to_string()))?;
+                return Err(e);
+            }
+        };
 
         // Hyväksyntä on nyt kulutettu — poista se odottavista (pysyvästi, myös
-        // kaatumiskestävältä pinnalta).
+        // kaatumiskestävältä pinnalta). Idempotenssin suojaama: uudelleenhyväksyntä
+        // osuu yllä committed-haaraan eikä koskaan päädy tänne uudelleen.
         self.pending.remove(approval_id)?;
         // Kaatumiskestävyys: persistoi tehtävän lopullinen (Done/Failed) tila
         // durable-jonoon, jotta restart ei näe sitä enää NeedsApproval-rivinä.
@@ -1550,6 +1654,185 @@ mod tests {
         assert!(
             !whole.contains(&fake),
             "proof must never contain raw secret"
+        );
+    }
+
+    // --- approve()-idempotenssi (kaksoislaukaisun esto hyväksyntäpolulla) ---
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// Testitaito joka **vaatii hyväksynnän** (write-external) ja laskee
+    /// sivuvaikutuksen ajot. Käytetään todistamaan, että [`ActionRuntime::approve`]
+    /// ajaa sivuvaikutuksen **korkeintaan kerran** outbox-suojan alla.
+    #[derive(Debug, Clone)]
+    struct CountingApprovalSkill {
+        /// Sivuvaikutuksen ajojen lukumäärä (jaettu testin kanssa).
+        runs: Arc<AtomicU64>,
+    }
+
+    /// Laskevan testitaidon kiinteä tunniste.
+    const COUNTING_SKILL_UUID: uuid::Uuid = uuid::uuid!("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+
+    #[async_trait::async_trait]
+    impl ActionExecutor for CountingApprovalSkill {
+        async fn execute(
+            &self,
+            request: crate::executor::ActionRequest,
+        ) -> Result<crate::executor::ActionResult> {
+            // SIVUVAIKUTUS: kasvata laskuria. Tämän on tapahduttava tasan kerran.
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::executor::ActionResult::success(
+                "side effect fired",
+                json!({ "ok": true }),
+                request.now,
+            ))
+        }
+    }
+
+    impl Skill for CountingApprovalSkill {
+        fn manifest(&self) -> crate::manifest::SkillManifest {
+            crate::manifest::SkillManifest {
+                id: SkillId::from_uuid(COUNTING_SKILL_UUID),
+                name: "counting_approval_test".to_string(),
+                version: "1.0.0".to_string(),
+                description: "Laskee sivuvaikutuksen ajot (vaatii hyväksynnän, testikäyttö)."
+                    .to_string(),
+                // Write-external → vaatii hyväksynnän → kulkee run_after_approval-polkua.
+                permissions: vec![crate::policy::SkillPermission::WriteExternal],
+                risk: ActionRisk::WriteExternal,
+                approval_policy: crate::policy::ApprovalPolicy::RequireApproval,
+                input_hint: None,
+                output_hint: None,
+                input_schema: crate::manifest::default_input_schema(),
+            }
+        }
+    }
+
+    /// Jaettu (Arc-taustainen) muistinvarainen outbox testin esiseedausta varten.
+    ///
+    /// [`ActionRuntime::with_dispatch_outbox`] kuluttaa `Box<dyn ...>`:n, joten
+    /// tämä kääre antaa testille rinnakkaisen kahvan samaan outbox-tilaan: testi
+    /// voi kirjata committed/intent-rivin ENNEN `approve`-kutsua ja todeta, ettei
+    /// sivuvaikutus aja uudelleen.
+    #[derive(Debug, Clone)]
+    struct SharedOutbox(Arc<InMemoryDispatchOutbox>);
+
+    impl DispatchOutboxStore for SharedOutbox {
+        fn kind(&self) -> &'static str {
+            self.0.kind()
+        }
+        fn lookup(&self, key: &str) -> Result<DispatchLookup> {
+            self.0.lookup(key)
+        }
+        fn record_intent(&self, key: &str) -> Result<()> {
+            self.0.record_intent(key)
+        }
+        fn record_committed(&self, key: &str, outcome: &DispatchedOutcome) -> Result<()> {
+            self.0.record_committed(key, outcome)
+        }
+    }
+
+    /// Rakentaa ajoympäristön laskevalla hyväksyntätaidolla + jaetulla outboxilla,
+    /// ja lähettää yhden hyväksyntää vaativan tehtävän. Palauttaa runtimen, jaetun
+    /// outbox-kahvan, laskurin, lähetetyn tehtävän tunnisteen ja `approval_id`:n.
+    async fn build_approval_fixture(
+        now: Timestamp,
+    ) -> (
+        ActionRuntime,
+        Arc<InMemoryDispatchOutbox>,
+        Arc<AtomicU64>,
+        ActionTaskId,
+        ApprovalId,
+    ) {
+        let runs = Arc::new(AtomicU64::new(0));
+        let shared = Arc::new(InMemoryDispatchOutbox::new());
+        let mut runtime = ActionRuntime::new().with_dispatch_outbox(Box::new(SharedOutbox(
+            Arc::clone(&shared),
+        )));
+        runtime
+            .register_skill(CountingApprovalSkill {
+                runs: Arc::clone(&runs),
+            })
+            .expect("register counting approval skill");
+
+        let submitted = runtime
+            .submit_task(
+                SkillId::from_uuid(COUNTING_SKILL_UUID),
+                json!({ "any": "payload" }),
+                now,
+            )
+            .await
+            .expect("submit");
+        assert_eq!(submitted.status, TaskStatus::NeedsApproval);
+        let approval_id = submitted.pending_approval.expect("approval granted");
+        // Lähetys ei ole vielä ajanut sivuvaikutusta (odottaa hyväksyntää).
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "no side effect before approve");
+
+        (runtime, shared, runs, submitted.task_id, approval_id)
+    }
+
+    #[tokio::test]
+    async fn approve_with_committed_outbox_entry_returns_prior_without_rerun() {
+        // Skenaario: prosessi kaatui aiemmin `record_committed`:n JÄLKEEN mutta
+        // `pending.remove`:n EDELLÄ → hyväksyntä on yhä odottavissa, mutta outboxissa
+        // on committed-rivi avaimelle `approval-{id}`. Uudelleenhyväksyntä EI saa
+        // ajaa sivuvaikutusta uudelleen, vaan palauttaa tallennetun lopputuloksen.
+        let now = at(1_700_000_000);
+        let (mut runtime, shared, runs, task_id, approval_id) =
+            build_approval_fixture(now).await;
+
+        // Esiseedaa outbox committed-rivillä TÄSMÄLLEEN avaimelle approve käyttää.
+        let key = ActionRuntime::approval_dispatch_key(approval_id);
+        let prior = DispatchedOutcome {
+            task_id,
+            status: TaskStatus::Done,
+            pending_approval: None,
+            error: None,
+        };
+        shared.record_committed(&key, &prior).expect("seed committed");
+
+        // approve → committed-haara: palauttaa aiemman lopputuloksen ajamatta.
+        let approved = runtime.approve(approval_id, now).await.expect("approve");
+        assert_eq!(approved.task_id, task_id);
+        assert_eq!(approved.status, TaskStatus::Done);
+        assert!(approved.pending_approval.is_none());
+        // KRIITTINEN: laskuri pysyy 0:ssa — sivuvaikutus EI ajanut uudelleen.
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "committed outbox entry must short-circuit before run_after_approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_with_intent_only_outbox_entry_fails_closed_without_rerun() {
+        // Skenaario: prosessi kaatui intent-only-ikkunassa (intent levyllä,
+        // committed kirjoittamatta, sivuvaikutus mahdollisesti osittain ajanut).
+        // Uudelleenhyväksyntä on fail-closed (PolicyDenied) eikä aja uudelleen.
+        let now = at(1_700_000_000);
+        let (mut runtime, shared, runs, _task_id, approval_id) =
+            build_approval_fixture(now).await;
+
+        // Esiseedaa outbox VAIN intent-rivillä (ei committed) → InProgress.
+        let key = ActionRuntime::approval_dispatch_key(approval_id);
+        shared.record_intent(&key).expect("seed intent");
+
+        // approve → in-progress-haara: fail-closed PolicyDenied, ei sivuvaikutusta.
+        let before = runs.load(Ordering::SeqCst);
+        let err = runtime
+            .approve(approval_id, now)
+            .await
+            .expect_err("intent-only must fail closed");
+        assert!(
+            matches!(err, ActionError::PolicyDenied(_)),
+            "intent-only window must be PolicyDenied (fail-closed), got {err:?}"
+        );
+        // Laskuri pysyy ennallaan — sivuvaikutus EI ajanut uudelleen.
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            before,
+            "intent-only outbox entry must not re-run the side effect"
         );
     }
 }
