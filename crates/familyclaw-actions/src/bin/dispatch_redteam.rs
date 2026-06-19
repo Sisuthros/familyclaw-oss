@@ -39,6 +39,28 @@
 //!   [`PolicyDenied`](familyclaw_actions::ActionError::PolicyDenied) fail-closed,
 //!   eikä sivuvaikutus aja uudelleen (laskuri pysyy 1:ssä).
 //!
+//! ### Hyväksynnän jälkeisen jatkon polku (avaimet `resume-{id}-dispatch-{k}`)
+//! Tämä todistaa SAMAN at-most-once-takuun **jatkon lähetysavaimelle**, jonka
+//! agentin tool-loop tuottaa hyväksynnän myöntämisen JÄLKEEN. Kun keskeytetty
+//! vuoro hyväksytään ja malli pyytää jatkossa **toisen** työkalun, sen lähetys
+//! reititetään `submit_task_idempotent`:n läpi avaimella
+//! `resume-{approval_id}-dispatch-{k}` (johdettu suoraan jatkon hyväksynnän
+//! tunnisteesta + juoksevasta lähetysindeksistä). Tämä avain-muoto on tasan se,
+//! jonka tuotantopolku rakentaa (`drive_tool_loop` muodostaa `{prefix}-dispatch-{k}`
+//! prefiksistä `resume-{approval_id}`). Aiemmin tämä jatkon at-most-once oli
+//! todistettu vain saman prosessin sisäisellä yksikkötestillä — nämä vaiheet
+//! todistavat sen **aidon prosessirajan yli** (SIGKILL exit 137).
+//! - `resume_continuation_crash` — aja jatkon lähetys `resume-*-dispatch-*`-avaimella
+//!   aseistetulla intent-koukulla: `record_intent` fsyncataan JA sivuvaikutus
+//!   laukeaa (laskuri = 1), prosessi abortoi `record_committed`:n alussa →
+//!   **poistuu 137 INTENT-ONLY-ikkunassa**. Vaatii `--mode new` +
+//!   `FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1`.
+//! - `resume_continuation_resume` — tuore prosessi ajaa SAMAN jatkon lähetyksen
+//!   SAMALLA `resume-*-dispatch-*`-avaimella → outbox-lookup näkee `InProgress` →
+//!   `submit_task_idempotent` palauttaa
+//!   [`PolicyDenied`](familyclaw_actions::ActionError::PolicyDenied) fail-closed,
+//!   eikä sivuvaikutus aja uudelleen (laskuri pysyy 1:ssä).
+//!
 //! ### Hyväksyntäpolku (avaimet `approval-*`)
 //! Tämä todistaa SAMAN at-most-once-takuun [`ActionRuntime::approve`]:n
 //! sivuvaikutus-ikkunalle — outbox-avain on `approval-{id}`, EI `turn-*`. Polku
@@ -414,6 +436,19 @@ enum Phase {
     /// palauttaa `InProgress`, joten odotettu lopputulos on `PolicyDenied`
     /// fail-closed (sivuvaikutus EI aja uudelleen).
     ResumeIntent,
+    /// JATKON LÄHETYSPOLKU, INTENT-ONLY-ikkuna: aja hyväksynnän jälkeisen jatkon
+    /// lähetys avaimella `resume-{approval_id}-dispatch-{k}` (= tasan se avain,
+    /// jonka tuotannon `drive_tool_loop` muodostaa hyväksynnän myöntämisen
+    /// JÄLKEEN). Aseistettu intent-koukku → `record_intent` + sivuvaikutus
+    /// (laskuri = 1), abort `record_committed`:n alussa → poistuu 137. Vaatii
+    /// `--mode new` + `FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1`. Avain annetaan
+    /// `--key`:llä `resume-*-dispatch-*`-muodossa.
+    ResumeContinuationCrash,
+    /// JATKON LÄHETYSPOLUN jälkeen: tuore prosessi ajaa SAMAN jatkon lähetyksen
+    /// SAMALLA `resume-*-dispatch-*`-avaimella → outbox-lookup palauttaa
+    /// `InProgress`, joten odotettu lopputulos on `PolicyDenied` fail-closed
+    /// (sivuvaikutus EI aja uudelleen, laskuri pysyy 1:ssä).
+    ResumeContinuationResume,
     /// HYVÄKSYNTÄPOLKU, INTENT-ONLY-ikkuna: lähetä hyväksyntää vaativa tehtävä,
     /// kirjaa `ApprovalId` levylle, sitten `approve()` aseistetulla intent-koukulla
     /// → `run_after_approval` ajaa sivuvaikutuksen (laskuri = 1), `record_intent`
@@ -466,7 +501,10 @@ struct RunArgs {
     /// Tiedosto johon `crash`-vaihe kirjaa lopputuloksen (arvo-identtisyyden todiste).
     #[arg(long)]
     outcome_out: PathBuf,
-    /// Stabiili idempotenssi-avain (= agentin `turn-{turn}-dispatch-{k}`).
+    /// Stabiili idempotenssi-avain. `submit_task`-vaiheilla muoto on agentin
+    /// `turn-{turn}-dispatch-{k}`; jatkon lähetyspolun vaiheilla
+    /// (`resume_continuation_*`) muoto on `resume-{approval_id}-dispatch-{k}`,
+    /// tasan se jonka tuotannon `drive_tool_loop` muodostaa hyväksynnän jälkeen.
     #[arg(long, default_value = "turn-0-dispatch-0")]
     key: String,
     /// Injektoitu seinäkello (RFC 3339).
@@ -536,18 +574,19 @@ async fn run(cli: Cli) -> HarnessResult<()> {
 /// Rakentaa ajoympäristön: laskuri-taito rekisteröitynä + (uusi-moodissa)
 /// kaatumiskestävä outbox annetusta polusta.
 ///
-/// `crash_intent`-vaiheessa kaatumiskestävä outbox kääritään
-/// [`CrashAfterIntentOutbox`]:iin, joka abortoi prosessin `record_committed`:n
-/// alussa (intent-only-ikkuna). Kaikissa muissa vaiheissa käytetään suoraa
-/// [`JournalDispatchOutbox`]:a.
+/// `crash_intent`- ja `resume_continuation_crash`-vaiheissa kaatumiskestävä
+/// outbox kääritään [`CrashAfterIntentOutbox`]:iin, joka abortoi prosessin
+/// `record_committed`:n alussa (intent-only-ikkuna). Kaikissa muissa vaiheissa
+/// käytetään suoraa [`JournalDispatchOutbox`]:a.
 fn build_runtime(args: &RunArgs) -> HarnessResult<ActionRuntime> {
     let mut runtime = ActionRuntime::new();
     runtime.register_skill(CountingExecutor::new(args.counter.clone()))?;
     if args.mode == Mode::New {
         let outbox = JournalDispatchOutbox::open(&args.outbox)?;
-        if args.phase == Phase::CrashIntent {
-            // Kääri kaatumiskoukku: record_committed abortoi ennen delegointia
-            // (kun aseistettu ympäristömuuttujalla).
+        // Intent-only-kaatumisikkunan vaiheet (sekä `turn-*`- että
+        // `resume-*-dispatch-*`-avaimilla) tarvitsevat kaatumiskoukulla kääritun
+        // outboxin: `record_committed` abortoi ennen delegointia kun aseistettu.
+        if matches!(args.phase, Phase::CrashIntent | Phase::ResumeContinuationCrash) {
             runtime = runtime.with_dispatch_outbox(Box::new(CrashAfterIntentOutbox::new(outbox)));
         } else {
             runtime = runtime.with_dispatch_outbox(Box::new(outbox));
@@ -722,7 +761,66 @@ async fn run_phase(args: RunArgs) -> HarnessResult<()> {
             std::io::stdout().flush()?;
             Ok(())
         }
+        Phase::ResumeContinuationCrash => {
+            // JATKON LÄHETYS, INTENT-ONLY-ikkuna. Identtinen `CrashIntent`:n kanssa
+            // PAITSI että idempotenssi-avain on `resume-{approval_id}-dispatch-{k}`
+            // (annetaan `--key`:llä), eikä `turn-*`. Tämä on tasan se avain jonka
+            // tuotannon `drive_tool_loop` rakentaa hyväksynnän myöntämisen JÄLKEEN
+            // (prefiksistä `resume-{approval_id}` + juokseva lähetysindeksi).
+            // `dispatch` ei koskaan palaa: kaatumiskoukku abortoi prosessin
+            // `record_committed`:n alussa — `record_intent` on jo levyllä ja
+            // sivuvaikutus on jo lauennut. Jos koukku EI ole aseistettu, se on
+            // ohjelmointivirhe → epäonnistu äänekkäästi.
+            assert_resume_key_shape(&args.key)?;
+            let _ = dispatch(&mut runtime, &args, now).await?;
+            Err(HarnessError::Io(std::io::Error::other(
+                "resume_continuation_crash phase returned without aborting — \
+                 is FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1 set?",
+            )))
+        }
+        Phase::ResumeContinuationResume => {
+            // JATKON LÄHETYS, INTENT-ONLY-ikkunan jälkeen: tuore prosessi ajaa
+            // SAMAN jatkon lähetyksen SAMALLA `resume-*-dispatch-*`-avaimella.
+            // Outbox-lookup näkee intentin ilman committedia → InProgress →
+            // submit_task_idempotent palauttaa PolicyDenied fail-closed. Sivuvaikutus
+            // EI aja uudelleen → at-most-once jatkon lähetysavaimelle.
+            assert_resume_key_shape(&args.key)?;
+            let dispatch_result = dispatch(&mut runtime, &args, now).await;
+            let policy_denied = matches!(dispatch_result, Err(ActionError::PolicyDenied(_)));
+            let denied_message = match &dispatch_result {
+                Err(ActionError::PolicyDenied(msg)) => Some(msg.clone()),
+                _ => None,
+            };
+            let result = serde_json::json!({
+                "side_effect_count": read_counter(&args.counter),
+                "policy_denied": policy_denied,
+                "denied_message": denied_message,
+                "dispatch_key": args.key,
+                "other_outcome": dispatch_result.ok().map(|o| OutcomeRecord::from_submit(&o).task_id),
+            });
+            println!("RESULT {result}");
+            std::io::stdout().flush()?;
+            Ok(())
+        }
     }
+}
+
+/// Varmistaa että jatkon lähetysavain on muotoa `resume-{id}-dispatch-{k}`.
+///
+/// Tämä on sama avain-muoto jonka tuotannon `drive_tool_loop` muodostaa
+/// hyväksynnän myöntämisen JÄLKEEN (prefiksistä `resume-{approval_id}` +
+/// `-dispatch-{k}`). Vartija pitää red-team-vaiheet rehellisinä: jos avain ei
+/// noudata muotoa, todiste ei koskisi jatkon lähetysavainta — epäonnistu
+/// äänekkäästi panikoimatta.
+fn assert_resume_key_shape(key: &str) -> HarnessResult<()> {
+    if key.starts_with("resume-") && key.contains("-dispatch-") {
+        return Ok(());
+    }
+    Err(HarnessError::Io(std::io::Error::other(format!(
+        "resume_continuation phase requires a key of shape \
+         'resume-{{id}}-dispatch-{{k}}' (the exact shape drive_tool_loop builds \
+         after approval); got {key:?}"
+    ))))
 }
 
 /// Ajaa **hyväksyntäpolun** vaiheet aidon prosessirajan yli.
@@ -815,12 +913,16 @@ async fn run_approval_phase(args: RunArgs, now: Timestamp) -> HarnessResult<()> 
             std::io::stdout().flush()?;
             Ok(())
         }
-        // Submit-polun vaiheet eivät koskaan päädy tänne (haaroitettu run_phase:ssa).
-        Phase::Crash | Phase::CrashIntent | Phase::Resume | Phase::ResumeIntent => {
-            Err(HarnessError::Io(std::io::Error::other(
-                "submit phase reached approval-path handler — internal routing error",
-            )))
-        }
+        // Submit- ja jatkopolun vaiheet eivät koskaan päädy tänne (haaroitettu
+        // run_phase:ssa).
+        Phase::Crash
+        | Phase::CrashIntent
+        | Phase::Resume
+        | Phase::ResumeIntent
+        | Phase::ResumeContinuationCrash
+        | Phase::ResumeContinuationResume => Err(HarnessError::Io(std::io::Error::other(
+            "submit/continuation phase reached approval-path handler — internal routing error",
+        ))),
     }
 }
 

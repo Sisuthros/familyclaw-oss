@@ -351,6 +351,216 @@ fn intent_window_crash_is_at_most_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Rakentaa `run`-vaiheen argumentit eksplisiittisellä idempotenssi-avaimella.
+///
+/// `phase_args` käyttää binäärin oletusavainta (`turn-0-dispatch-0`); jatkon
+/// lähetyspolun (`resume_continuation_*`) vaiheet tarvitsevat
+/// `resume-{id}-dispatch-{k}`-muotoisen avaimen, joten ne annetaan tässä
+/// nimenomaisesti `--key`:llä.
+fn phase_args_keyed<'a>(
+    mode: &'a str,
+    phase: &'a str,
+    outbox: &'a str,
+    counter: &'a str,
+    outcome: &'a str,
+    key: &'a str,
+) -> Vec<&'a str> {
+    let mut args = phase_args(mode, phase, outbox, counter, outcome);
+    args.push("--key");
+    args.push(key);
+    args
+}
+
+/// Jatkon lähetysavain — tasan se muoto jonka tuotannon `drive_tool_loop`
+/// muodostaa hyväksynnän myöntämisen JÄLKEEN (`resume-{approval_id}-dispatch-{k}`).
+/// `approval_id` on tässä kiinteä UUID determinismin vuoksi.
+const RESUME_KEY: &str = "resume-00000000-0000-4000-8000-0000000000ab-dispatch-0";
+
+/// **JATKON LÄHETYSPOLKU, INTENT-ONLY-IKKUNA todistaa at-most-once fail-closed
+/// aidon prosessirajan yli — avaimella `resume-{id}-dispatch-{k}` (EI `turn-*`
+/// eikä `approval-*`).**
+///
+/// Tämä sulkee viimeisen kaveatin: aiemmat cross-process-todisteet kattoivat
+/// `submit_task`-avaimet (`turn-*`) ja hyväksyntäavaimet (`approval-{id}`), MUTTA
+/// EI hyväksynnän jälkeisen jatkon lähetysavainta. Skenaario: keskeytetty vuoro
+/// hyväksytään → malli pyytää jatkossa TOISEN työkalun → kaatuminen sen toisen
+/// työkalun lähetysikkunassa (intent levyllä + sivuvaikutus lauennut, committed
+/// kirjoittamatta) → tuore prosessi jatkaa → sivuvaikutus EI saa laueta toiste.
+///
+/// Tuotannossa tämän lähetyksen ajaa `drive_tool_loop`, joka muodostaa avaimen
+/// `{prefix}-dispatch-{k}` prefiksistä `resume-{approval_id}` (ks. `agent.rs`
+/// kohdat 2129 ja 1798). Tässä avain rakennetaan suoraan TÄHÄN samaan muotoon —
+/// se on juuri se, mikä outbox-dedupin todistamiseen ratkaisee.
+///
+/// Vaihe 1 (`resume_continuation_crash`, koukku aseistettu): `record_intent`
+/// fsyncataan resume-avaimella, sivuvaikutus laukeaa (laskuri = 1), sitten
+/// prosessi abortoi `record_committed`:n alussa → poistuu 137. Levyllä:
+/// intent-marker LÄSNÄ avaimella `resume-*`, committed-marker POISSA.
+///
+/// Vaihe 2 (`resume_continuation_resume`, sama avain): outbox-lookup näkee
+/// intentin ilman committedia → `InProgress` → `submit_task_idempotent` palauttaa
+/// `PolicyDenied`. Laskuri PYSYY 1:ssä → at-most-once.
+///
+/// **Mutaatiotodiste:** tämä todistaa nimenomaan resume-avaimen idempotenssin —
+/// jos jatkon lähetys käyttäisi `submit_task_as`:ia `submit_task_idempotent`:n
+/// sijaan (ts. ei outbox-avainta lainkaan), re-drive ajaisi sivuvaikutuksen
+/// uudelleen → laskuri = 2 ja `policy_denied = false`. Vrt. `--mode old`
+/// kontrastivaihe alla, joka ajaa juuri sen ei-idempotentin polun samalla
+/// resume-avaimella ja double-firaa.
+#[test]
+fn resume_continuation_intent_crash_is_at_most_once() {
+    let bin = harness_bin();
+    let dir = tempdir("resume-continuation-intent");
+    let outbox = dir.join("outbox.jsonl");
+    let counter = dir.join("counter.txt");
+    let outcome = dir.join("outcome.json");
+    let (ob, ct, oc) = (
+        outbox.to_string_lossy().into_owned(),
+        counter.to_string_lossy().into_owned(),
+        outcome.to_string_lossy().into_owned(),
+    );
+
+    // Vaihe 1 (resume_continuation_crash): aseistettu koukku → abort
+    // record_committed:n alussa, resume-avaimella.
+    let (code1, ok1, _o1, e1) = run_env(
+        &bin,
+        &phase_args_keyed("new", "resume_continuation_crash", &ob, &ct, &oc, RESUME_KEY),
+        &[(CRASH_AFTER_INTENT_ENV, "1")],
+    );
+    assert!(
+        !ok1,
+        "resume_continuation_crash phase must NOT exit success. stderr={e1}"
+    );
+    assert_eq!(
+        code1,
+        Some(137),
+        "resume_continuation_crash must exit 137 (SIGKILL-style) from the crash hook. stderr={e1}"
+    );
+
+    // Sivuvaikutus laukesi TASAN KERRAN ennen kaatumista.
+    assert_eq!(
+        read_counter(&counter),
+        1,
+        "side effect fired exactly once before the resume-continuation intent-only crash"
+    );
+
+    // Levyllä: intent-marker LÄSNÄ avaimella resume-*, committed-marker POISSA.
+    let on_disk = read_outbox(&outbox);
+    assert!(
+        on_disk.contains("dispatch_intent"),
+        "intent marker must be present on disk after resume-continuation intent-only crash. \
+         disk={on_disk:?}"
+    );
+    assert!(
+        on_disk.contains("resume-") && on_disk.contains("-dispatch-"),
+        "outbox key must be resume-*-dispatch-* (NOT turn-* nor approval-*) on the \
+         resume-continuation path. disk={on_disk:?}"
+    );
+    assert!(
+        !on_disk.contains("dispatch_committed"),
+        "committed marker must be ABSENT on disk (crash hit before record_committed). \
+         disk={on_disk:?}"
+    );
+
+    // Vaihe 2 (resume_continuation_resume): tuore prosessi, sama resume-avain →
+    // InProgress → PolicyDenied fail-closed, eikä sivuvaikutus aja uudelleen.
+    let (code2, ok2, o2, e2) = run_env(
+        &bin,
+        &phase_args_keyed("new", "resume_continuation_resume", &ob, &ct, &oc, RESUME_KEY),
+        // EI aseistusta resumessa — koukkua ei käytetä.
+        &[],
+    );
+    assert!(
+        ok2,
+        "resume_continuation_resume phase must exit success (code={code2:?}). stderr={e2}"
+    );
+    let report = result_json(&o2);
+    eprintln!("[resume-continuation resume] {report}");
+
+    // AT-MOST-ONCE TODISTE 1: replay on PolicyDenied fail-closed (ei hiljainen re-run).
+    assert_eq!(
+        report["policy_denied"],
+        serde_json::Value::Bool(true),
+        "RESUME-CONTINUATION intent-only replay must be PolicyDenied (fail-closed), \
+         not a silent re-run"
+    );
+
+    // AT-MOST-ONCE TODISTE 2: laskuri PYSYY 1:ssä — sivuvaikutus EI lauennut toiste.
+    assert_eq!(
+        report["side_effect_count"], 1,
+        "RESUME-CONTINUATION intent-only replay must NOT re-fire the side effect (at-most-once)"
+    );
+    assert_eq!(
+        read_counter(&counter),
+        1,
+        "disk counter confirms the resume-continuation side effect fired AT MOST once (1, never 2)"
+    );
+
+    // Avain-muodon todiste: tuore prosessi ajoi nimenomaan resume-*-dispatch-*-avaimen.
+    assert_eq!(
+        report["dispatch_key"], RESUME_KEY,
+        "the dedup key proven across the crash is the resume-continuation key shape"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **MUTAATIOTODISTE jatkon lähetyspolulle:** sama resume-avain, mutta
+/// ei-idempotentilla polulla (`--mode old`, `submit_task_as`) → kaatuminen +
+/// re-drive AJAA SIVUVAIKUTUKSEN UUDELLEEN (double-fire, laskuri = 2).
+///
+/// Tämä on suora todiste siitä, että ylempi testi
+/// (`resume_continuation_intent_crash_is_at_most_once`) EPÄONNISTUISI jos jatkon
+/// lähetys käyttäisi `submit_task_as`:ia `submit_task_idempotent`:n sijaan — eli
+/// että se aidosti todistaa resume-avaimen idempotenssin, ei vahingossa onnistu.
+/// (`--mode old` ohittaa outbox-avaimen kokonaan; `--key` jätetään huomiotta
+/// vanhalla polulla, mutta annetaan rehellisyyden vuoksi resume-muodossa.)
+#[test]
+fn resume_continuation_old_path_double_fires() {
+    let bin = harness_bin();
+    let dir = tempdir("resume-continuation-mutation");
+    let outbox = dir.join("outbox.jsonl");
+    let counter = dir.join("counter.txt");
+    let outcome = dir.join("outcome.json");
+    let (ob, ct, oc) = (
+        outbox.to_string_lossy().into_owned(),
+        counter.to_string_lossy().into_owned(),
+        outcome.to_string_lossy().into_owned(),
+    );
+
+    // `--mode old` käyttää `crash`/`resume`-vaiheita (submit_task_as, EI outboxia).
+    // Avain annetaan resume-muodossa korostamaan, että ID on sama — vanha polku
+    // vain EI dedupaa sitä.
+    let (ok1, _o1, e1) = run(
+        &bin,
+        &phase_args_keyed("old", "crash", &ob, &ct, &oc, RESUME_KEY),
+    );
+    assert!(!ok1, "crash phase must exit non-zero. stderr={e1}");
+    assert_eq!(read_counter(&counter), 1, "side effect ran once before crash");
+
+    let (ok2, o2, e2) = run(
+        &bin,
+        &phase_args_keyed("old", "resume", &ob, &ct, &oc, RESUME_KEY),
+    );
+    assert!(ok2, "resume phase must succeed. stderr={e2}");
+    let report = result_json(&o2);
+    eprintln!("[resume-continuation mutation] {report}");
+
+    // MUTAATION TODISTE: ilman idempotenssi-avainta sivuvaikutus laukeaa KAHDESTI.
+    assert_eq!(
+        report["side_effect_count"], 2,
+        "NON-IDEMPOTENT resume continuation double-fires across the crash (the mutation \
+         the idempotent test guards against)"
+    );
+    assert_eq!(
+        read_counter(&counter),
+        2,
+        "disk counter confirms the non-idempotent path double-fires"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Erottava väite: vanha ja uusi polku eroavat TÄSMÄLLEEN tässä — vanha
 /// double-firaa (2), uusi ei (1). Tämä on koko korjauksen ydin yhdellä rivillä.
 #[test]
