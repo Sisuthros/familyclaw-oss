@@ -1,21 +1,29 @@
 # FamilyClaw
 
-**Crash-proof memory + contract-verified multi-agent execution for AI agent families.**
+**A Rust agent runtime where in-flight work survives a crash — at-most-once external side effects, durable memory, contract-checked coordination.**
 
 Most AI agents die between runs. FamilyClaw gives them continuity:
 durable replay, persistent memory, actor-based coordination, sleep-time consolidation,
 and private runtime profiles that never enter the repository.
 
-> **What this demo proves today:** crash-proof durable replay, 19-dimension emotion contagion,
-> nightly dream consolidation, persistent memory with Ebbinghaus decay, Discord inbound gateway
+> **What this demo proves today:** crash-proof durable replay with **at-most-once
+> external side-effect dispatch under crash** (idempotency-keyed: never fired twice;
+> a crash in the intent-only window fails closed — proven across a real process
+> boundary, and benchmarked against LangGraph's strongest durability mode, not only a
+> shaped baseline), provenance-gated memory, 19-dimension emotion contagion, nightly
+> dream consolidation, persistent memory with Ebbinghaus decay, Discord inbound gateway
 > (Ed25519 verification), benchmarked continuity (8 scenarios, deterministic scorecard).
 >
-> **Shipped (alpha.5/.6):** live multi-agent orchestration (`familyclaw-gateway
-> orchestrate` — Orchestrator + LiveTurnExecutor), provenance-gated memory,
-> emotion-contagion receive-side, send-side latent translation.
-> **What's on the roadmap:** receive-side latent telepathy (hidden-state transfer
-> into agent cognition — a family-boundary decision), deeper WASM sandbox safety,
-> additional channel adapters.
+> **Built — but not yet proven end-to-end:** live multi-agent orchestration
+> (`familyclaw-gateway orchestrate` — Orchestrator + `LiveTurnExecutor` exist and are
+> wired, but the multi-agent integration test still runs against a mock executor, so
+> the live coordination path is **built, unproven**, not "shipped"). Send-side latent
+> translation is a fenced research track, not production behavior.
+> **What's on the roadmap:** a live multi-agent integration test (proving the
+> coordination path end-to-end), deeper WASM sandbox safety with integration tests
+> (fuel exhaustion, denied capability, per-invocation credential isolation — today the
+> sandbox compiles and has unit tests but lacks those end-to-end proofs), additional
+> channel adapters.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Rust 2021](https://img.shields.io/badge/Rust-2021%20edition-orange.svg)
