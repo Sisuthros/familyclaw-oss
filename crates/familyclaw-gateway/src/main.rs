@@ -107,7 +107,7 @@ use familyclaw_agent::{resolve_profile_dir, EnvEndpointResolver, LiveTurnExecuto
 use familyclaw_bridge::{
     AgentInfo, AgentRole, FamilyBridge, HostKind, OrchestrationPlan, Orchestrator, TaskNode,
 };
-use familyclaw_bus::BusHandle;
+use familyclaw_bus::{BeingId, BusHandle, BusMessage};
 use tokio::sync::Mutex;
 mod config;
 use config::FamilyConfig;
@@ -597,26 +597,52 @@ async fn list_pending_approvals(
     (StatusCode::OK, Json(body))
 }
 
-/// `POST /approvals/{approval_id}/approve` — myöntää hyväksynnän annetulle
-/// `approval_id`:lle ja **ajaa keskeytyneen toiminnon loppuun** (suspend/resume-
-/// silta, roadmap §6 D2).
+/// `POST /approvals/{approval_id}/approve` — **hyväksyy** annetun
+/// `approval_id`:n ja **välittää jatkon vuoron OMISTAVALLE agentille** bussin
+/// [`BusMessage::ResumeApproval`]-ohjaussignaalilla (suspend/resume-silta,
+/// roadmap §6 D2).
 ///
-/// Rungolla ei ole pakollista sisältöä (valinnainen). Hyväksyntä kulutetaan
-/// tehtävän tallennettua payloadia vasten (payload-sidonta + kertakäyttö
-/// [`ActionRuntime::approve`]:ssa), joten muutettu payload ei voi käyttää
-/// hyväksyntää — eikä runko siksi voi vuotaa salaisuuksia suoritukseen.
+/// ## Yksi kuluttaja kertakäyttöiselle hyväksynnälle (Option A)
+/// Hyväksyntä on **kertakäyttöinen**: sen kuluttaa (ajaa sivuvaikutuksen +
+/// poistaa odottavista) tasan yksi taho. Tässä mallissa kuluttaja on
+/// **agentti**, ei gateway. Gateway VALIDOI (auth + esitarkistus 400/404/410)
+/// ja sitten **julkaisee** `ResumeApproval`-signaalin; vuoron omistava agentti
+/// jatkaa [`handle_resume_signal`](familyclaw_agent::Agent::handle_resume_signal)
+/// → [`resume_approved`](familyclaw_agent::Agent::resume_approved)-polulle, ajaa
+/// payload-sidotun sivuvaikutuksen **TASAN KERRAN** ja reitittää lopullisen
+/// vastauksen alkuperäiselle kanavalle — **ilman uutta LLM-vuoroa**. Gateway EI
+/// kuluta hyväksyntää (kaksi kuluttajaa yhdelle kertakäyttöiselle hyväksynnälle
+/// olisi mahdoton: jälkimmäinen näkisi `ApprovalMissing`).
+///
+/// ## Asynkroninen semantiikka
+/// `200 OK` tarkoittaa **hyväksyntä otettu vastaan ja välitetty omistaja-
+/// agentille** — EI että sivuvaikutus on jo ajettu. Sivuvaikutus ajetaan ja
+/// vastaus toimitetaan **asynkronisesti** kanavalle (oikea UX). Vastausrunko ei
+/// siksi voi sisältää tehtävän lopputulosta; se sisältää vain tunnisteen + tilan
+/// `resuming`.
+///
+/// Rungolla ei ole pakollista sisältöä (valinnainen). Esitarkistus on
+/// **READ-ONLY** ([`ActionRuntime::pending_expiry_for`]) eikä kuluta
+/// hyväksyntää; payload-sidonta + kertakäyttö tapahtuu agentin
+/// [`ActionRuntime::approve`]-kutsussa, joten muutettu runko ei voi käyttää
+/// hyväksyntää eikä vuotaa salaisuuksia suoritukseen.
 ///
 /// Suojaus on sama kuin `POST /inject`:llä (bearer-token jos konfiguroitu).
 ///
 /// Tilakoodit (**fail-closed, ei paniikkia**):
-/// - `200 OK` + JSON-yhteenveto resumen lopputuloksesta (tehtävän tunniste +
-///   tila, esim. `done`/`needs_approval` jos jatko vaati uuden hyväksynnän),
+/// - `200 OK` + `{ approval_id, status: "resuming", note }` — hyväksyntä
+///   otettu vastaan ja välitetty agentille; sivuvaikutus + vastaus asynkronisesti
+///   kanavalle,
 /// - `400 Bad Request` jos `approval_id` ei jäsenny kelvolliseksi tunnisteeksi,
 /// - `401 Unauthorized` jos bearer-token vaaditaan eikä täsmää,
 /// - `404 Not Found` jos tunnistetta ei (enää) odota hyväksyntä (tuntematon tai
 ///   jo kulutettu),
 /// - `410 Gone` jos hyväksyntä on vanhentunut (TTL umpeutunut),
-/// - `503 Service Unavailable` jos toimintoajoympäristöä ei ole kytketty.
+/// - `503 Service Unavailable` jos (a) toimintoajoympäristöä ei ole kytketty, (b)
+///   bussia ei ole kytketty (Option A vaatii serve-tilan, jossa agentti
+///   kuuntelee bussia — ilman bussia jatkoa ei voi koskaan tapahtua), tai (c)
+///   signaalin julkaisu epäonnistui. Kaikissa kolmessa tapauksessa hyväksyntää
+///   EI kulutettu → pyynnön voi turvallisesti yrittää uudelleen.
 async fn approve_pending(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -647,11 +673,12 @@ async fn approve_pending(
     // sekä vanhentumistarkistuksen että keskeytyneen toiminnon suorituksen.
     let now = familyclaw_core::time::now();
 
-    // Esitarkistus SAMAN lukon alla kuin approve: erotellaan "tuntematon" (404)
-    // ja "vanhentunut" (410) ennen kuin yritämme kuluttaa hyväksynnän — muuten
-    // molemmat näkyisivät `ActionRuntime::approve`:n ApprovalMissing-virheenä,
-    // emmekä voisi erottaa 404:ää 410:stä fail-closed-tarkkuudella.
-    let mut rt = actions.lock().await;
+    // **Read-only esitarkistus** (Option A): erotellaan "tuntematon" (404) ja
+    // "vanhentunut" (410) ennen kuin välitämme jatkon agentille. Tämä EI kuluta
+    // hyväksyntää ([`ActionRuntime::pending_expiry_for`] on read-only) — kuluttaja
+    // on agentti. Ilman tätä erottelua 404 ja 410 näyttäisivät samalta agentin
+    // resume-polulla, emmekä voisi antaa operaattorille fail-closed-tarkkaa syytä.
+    let rt = actions.lock().await;
     match rt.pending_expiry_for(id) {
         None => {
             // Tunnistetta ei odota hyväksyntä (tuntematon tai jo kulutettu).
@@ -672,42 +699,83 @@ async fn approve_pending(
         Some(_) => {}
     }
 
-    // Myönnä hyväksyntä ja aja keskeytynyt toiminto loppuun. Tämä on resumen
-    // toiminto-puoli: payload-sidottu, kertakäyttöinen suoritus.
-    match rt.approve(id, now).await {
-        Ok(outcome) => {
-            drop(rt);
-            // Operaattorille palautetaan VAIN tehtävän tunniste + tila — ei
-            // todistepakettia, ei payloadia. `status` kertoo onnistuiko resume
-            // loppuun asti vai vaatiko jatko uuden hyväksynnän.
-            let status = format!("{:?}", outcome.status).to_lowercase();
-            info!(
-                task = %outcome.task_id,
-                status = %status,
-                "approvals: hyväksyntä myönnetty, keskeytynyt toiminto ajettu"
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "approval_id": approval_id,
-                    "task_id": outcome.task_id.to_string(),
-                    "status": status,
-                    "awaiting_further_approval": outcome.awaiting_approval(),
-                })),
-            )
-        }
-        Err(e) => {
-            drop(rt);
-            // Esitarkistus ohitti tuntemattoman/vanhentuneen; jäljelle jää lähinnä
-            // payload-mismatch tai putken virhe. Fail-closed 409, ei paniikkia,
-            // ei salaisuuksia virheviestiin.
-            warn!(approval = %id, error = %e, "approvals: approve epäonnistui putkessa");
-            (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "error": "approval could not be granted" })),
-            )
-        }
+    // Esitarkistus läpäisty: hyväksyntä on olemassa eikä vanhentunut. EMME
+    // kuluta sitä gatewayssä (Option A) — vapauta toiminto-lukko ja siirrä
+    // jatko vuoron omistavalle agentille bussin kautta. Vain agentti kuluttaa
+    // kertakäyttöisen hyväksynnän (ajaa sivuvaikutuksen + reitittää vastauksen),
+    // joten emme pidä lukkoa kun julkaisemme.
+    drop(rt);
+
+    // **Resume-silta (Phase 1 §6 manuaaliportti, Option A):** julkaise
+    // ohjaussignaali `ResumeApproval` bussiin, jotta vuoron OMISTAVA agentti
+    // jatkaa `handle_resume_signal` → `resume_approved` → `route_reply`-polulle
+    // (kuluttaa hyväksynnän, ajaa sivuvaikutuksen TASAN KERRAN, reitittää
+    // lopullisen vastauksen kanavaan) ILMAN uutta LLM-vuoroa.
+    //
+    // `publish` on **broadcast** (ei point-to-point) — ja se on tässä
+    // turvallista: vain omistava agentti kuluttaa resumen (omistajatarkistus
+    // `resume_approved`:ssa epäonnistuu suljettuna muille), joten muut olennot
+    // no-oppaavat. `from`-tunniste vaikuttaa vain itse-kaiun ohitukseen; gateway
+    // ei ole rekisteröity olento, joten tuore `BeingId::new()` riittää (ei voi
+    // osua kehenkään).
+    let Some(bus) = state.bus.as_ref() else {
+        // **Ei bussia → 503, EI hiljaista onnistumista.** Option A:ssa
+        // sivuvaikutus ajetaan VAIN agentin resume-polulla; ilman bussia
+        // (esim. CLI / ei-serve-konteksti) yhtään agenttia ei kuuntele, joten
+        // jatkoa ei voi koskaan tapahtua. Hyväksyntää EI kulutettu → rehellinen
+        // 503: operaattori-approve vaatii serve-tilan (bussilla ajava agentti).
+        warn!(
+            approval = %id,
+            "approvals: approve hylätty 503 — bussia ei kytketty (Option A vaatii serve-tilan, \
+             jossa omistava agentti kuuntelee bussia); hyväksyntää ei kulutettu, voi yrittää uudelleen"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "operator approve requires serve mode (a running agent on the bus); \
+                          approval was not actioned and can be retried"
+            })),
+        );
+    };
+
+    let signal = BusMessage::ResumeApproval {
+        approval_id: approval_id.clone(),
+    };
+    if let Err(e) = bus.publish(BeingId::new(), signal) {
+        // **Julkaisu epäonnistui → 503, hyväksyntää EI kulutettu.** Jos emme voi
+        // ilmoittaa agentille, jatkoa ei tapahdu. Älä palauta valheellista 200:aa
+        // — palauta rehellinen 503 (yhä odottava, voi yrittää uudelleen).
+        warn!(
+            approval = %id,
+            error = %e,
+            "approvals: approve hylätty 503 — ResumeApproval-signaalin julkaisu epäonnistui; \
+             hyväksyntää ei kulutettu, voi yrittää uudelleen"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "could not notify the owning agent (bus publish failed); \
+                          approval was not actioned and can be retried"
+            })),
+        );
     }
+
+    info!(
+        approval = %id,
+        "approvals: hyväksyntä otettu vastaan ja ResumeApproval julkaistu — omistava agentti \
+         ajaa sivuvaikutuksen + vastaa kanavalle asynkronisesti"
+    );
+    // **200 = hyväksyntä otettu vastaan ja välitetty agentille.** EI lopputulosta:
+    // sivuvaikutus + vastaus ajetaan asynkronisesti agentin resume-polulla, joten
+    // emme palauta task_id/status-pakettia (ei payloadia, ei salaisuuksia).
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "approval_id": approval_id,
+            "status": "resuming",
+            "note": "agent is completing the approved action; the reply will arrive on the originating channel"
+        })),
+    )
 }
 
 /// `GET /turns/audit` — palauttaa **havainnoitavan tool-loop-jäljen**
@@ -2025,25 +2093,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_route_grants_and_runs_to_completion() {
-        // Täysi polku: submit → odottava → approve → keskeytynyt toiminto ajetaan
-        // loppuun (status done), ei vaadi uutta hyväksyntää.
-        let (state, actions) = state_with_actions();
+    async fn approve_route_without_bus_is_503_and_does_not_consume() {
+        // **Option A:** ilman bussia gateway ei voi välittää jatkoa agentille
+        // (yhtään agenttia ei kuuntele) → rehellinen 503, EI hiljaista
+        // onnistumista. Esitarkistus on read-only → hyväksyntää EI kuluteta:
+        // se on yhä odottavissa pyynnön jälkeen (voi yrittää uudelleen).
+        let (state, actions) = state_with_actions(); // bus: None
         let id = submit_pending(&actions).await;
 
         let (status, Json(body)) =
             approve_pending(State(Arc::clone(&state)), HeaderMap::new(), Path(id.clone())).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.get("status").and_then(|v| v.as_str()), Some("done"));
         assert_eq!(
-            body.get("awaiting_further_approval")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ilman bussia operaattori-approve = 503 (Option A vaatii serve-tilan)"
+        );
+        assert!(
+            body.get("error").and_then(|v| v.as_str()).is_some_and(|s| s.contains("serve mode")),
+            "503-virheviesti mainitsee serve-tilan, oli: {body}"
         );
 
-        // Hyväksyntä kulutettu → ei enää odottavissa, ja toinen approve = 404.
-        let (status2, _) = approve_pending(State(state), HeaderMap::new(), Path(id)).await;
-        assert_eq!(status2, StatusCode::NOT_FOUND, "kertakäyttö: ei voi hyväksyä uudelleen");
+        // Hyväksyntää EI kulutettu: se näkyy yhä /approvals/pending-listalla.
+        let (list_status, Json(list_body)) =
+            list_pending_approvals(State(state), HeaderMap::new()).await;
+        assert_eq!(list_status, StatusCode::OK);
+        let arr = list_body.as_array().expect("array body");
+        assert_eq!(
+            arr.len(),
+            1,
+            "503-haaran jälkeen hyväksyntä on yhä odottavissa (ei kulutettu)"
+        );
+        assert_eq!(
+            arr[0].get("approval_id").and_then(|v| v.as_str()),
+            Some(id.as_str()),
+            "sama odottava hyväksyntä yhä listalla"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_route_with_bus_publishes_and_does_not_consume() {
+        // **Option A onnistunut polku:** bussin kanssa gateway VALIDOI +
+        // JULKAISEE `ResumeApproval`-signaalin → 200 `status: "resuming"`. Gateway
+        // EI kuluta hyväksyntää (sen kuluttaa agentti); ilman agenttia tässä
+        // testissä hyväksyntä jää odottavaksi → todiste että gateway ei tee
+        // sivuvaikutusta eikä kuluta lupaa.
+        use familyclaw_bus::ResonanceBus;
+
+        let rt = ActionRuntime::with_default_skills().expect("default skills");
+        let actions = Arc::new(Mutex::new(rt));
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let state = Arc::new(GatewayState {
+            bus: Some(bus.clone()),
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: Some(Arc::clone(&actions)),
+            turn_audit: None,
+            metrics: None,
+        });
+        let id = submit_pending(&actions).await;
+
+        let (status, Json(body)) =
+            approve_pending(State(Arc::clone(&state)), HeaderMap::new(), Path(id.clone())).await;
+        assert_eq!(status, StatusCode::OK, "bussin kanssa approve = 200");
+        assert_eq!(
+            body.get("status").and_then(|v| v.as_str()),
+            Some("resuming"),
+            "200-runko ilmoittaa asynkronisen jatkon (resuming), oli: {body}"
+        );
+        // EI lopputulosta gatewayssä (Option A): ei task_id/awaiting-kenttiä.
+        assert!(
+            body.get("task_id").is_none() && body.get("awaiting_further_approval").is_none(),
+            "Option A: gateway ei palauta lopputulosta (asynkroninen), oli: {body}"
+        );
+
+        // Gateway EI kuluttanut hyväksyntää — ilman agenttia se on yhä odottavissa.
+        let (list_status, Json(list_body)) =
+            list_pending_approvals(State(state), HeaderMap::new()).await;
+        assert_eq!(list_status, StatusCode::OK);
+        let arr = list_body.as_array().expect("array body");
+        assert_eq!(
+            arr.len(),
+            1,
+            "gateway ei kuluta hyväksyntää (sen kuluttaa agentti) → yhä odottavissa"
+        );
+
+        bus.stop();
     }
 
     // ---- Prometheus-mittarit (GET /metrics) ----
@@ -2702,54 +2837,75 @@ mod tests {
             "(b) ei yksityistä absoluuttista polkua: {pending_body}"
         );
 
-        // (c) POST /approvals/{id}/approve → 200.
+        // (c) POST /approvals/{id}/approve → 200. **Option A:** 200 tarkoittaa
+        //     "hyväksyntä otettu vastaan ja välitetty agentille" — EI että jatko on
+        //     jo valmis. Sivuvaikutus + vastaus ajetaan asynkronisesti agentin
+        //     resume-polulla (ResumeApproval-bus-signaali → handle_resume_signal).
         let approve_resp = client
             .post(format!("{base}/approvals/{approval_id}/approve"))
             .send()
             .await
             .expect("POST approve (c)");
         assert_eq!(approve_resp.status().as_u16(), 200, "(c) approve = 200");
-
-        // (d) Sivuvaikutus ajettiin TASAN KERRAN (atominen laskuri == 1).
+        let approve_body: serde_json::Value =
+            approve_resp.json().await.expect("approve body (c) json");
         assert_eq!(
-            side_effect_count.load(SeqCst),
-            1,
-            "(d) approval-gated side effect must run exactly once"
+            approve_body.get("status").and_then(|v| v.as_str()),
+            Some("resuming"),
+            "(c) 200-runko ilmoittaa asynkronisen jatkon (resuming), oli:\n{approve_body}"
         );
 
-        // (e) RED: lopullinen reply tavoittaa kanavan/reply-sinkin JA /turns/audit
-        //     sisältää turn_resumed:n sitten turn_answered:n. Tämä EPÄONNISTUU
-        //     nykyisellä koodilla: approve_pending ajaa vain ActionRuntime::approve
-        //     eikä koskaan aja agenttia (resume_approved) → ei reply-sinkkiin, ei
-        //     resume/answered-auditia. Tämä on todistettu aukko (Phase 1 §6).
-        //
-        //     Annetaan reply-pumpulle pieni hetki — jos korjaus myöhemmin julkaisee
-        //     ResumeApprovalin, vastaus saapuu tämän ikkunan sisällä.
-        let reply = tokio::time::timeout(std::time::Duration::from_millis(500), reply_rx.recv())
-            .await
-            .ok()
-            .flatten();
-        let final_audit: String = client
-            .get(format!("{base}/turns/audit"))
-            .send()
-            .await
-            .expect("GET /turns/audit (e)")
-            .text()
-            .await
-            .expect("audit body (e)");
+        // (d)+(e) **Asynkroninen, rajattu poll:** koska side-effect + vastaus
+        //     ajetaan nyt agentissa 200:n palautumisen JÄLKEEN (Option A), emme voi
+        //     väittää synkronisesti. Pollataan enintään ~3 s (60 × 50 ms) kunnes
+        //     KAIKKI toteutuvat: lopullinen reply saapuu reply-sinkkiin, side-effect-
+        //     laskuri == 1, ja /turns/audit sisältää turn_resumed:n + turn_answered:n.
+        //     Rajattu (ei loputon) → testi pysyy deterministisenä ja nopeana.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut reply_body: Option<String> = None;
+        let mut final_audit;
+        loop {
+            // Ime reply-sinkki ei-blokkaavasti (agentti työntää tänne kun resume
+            // valmistuu). Säilytä ensimmäinen saapunut vastaus.
+            if reply_body.is_none() {
+                if let Ok(msg) = reply_rx.try_recv() {
+                    reply_body = Some(msg.body);
+                }
+            }
+            final_audit = client
+                .get(format!("{base}/turns/audit"))
+                .send()
+                .await
+                .expect("GET /turns/audit (e)")
+                .text()
+                .await
+                .expect("audit body (e)");
 
-        server.abort();
-        bus.stop();
+            let done = reply_body.is_some()
+                && side_effect_count.load(SeqCst) == 1
+                && final_audit.contains("turn_resumed")
+                && final_audit.contains("turn_answered");
+            if done || std::time::Instant::now() >= deadline {
+                break; // valmis tai timeout → väitteet alla raportoivat havainnon
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
-        // Nämä väitteet ovat se RED-rivi: ne FAILAAVAT kunnes resume-kytkentä on
-        // rakennettu. Älä löysennä niitä — niiden vihertäminen on seuraavan
-        // tehtävän hyväksymiskriteeri.
-        let reply_body = reply.map(|m| m.body);
+        // Nämä väitteet ovat se ENTINEN RED-rivi: ne ovat nyt VIHREÄT, koska
+        // operaattori-approve julkaisee ResumeApprovalin ja agentti jatkaa vuoron
+        // loppuun (resume_approved → reply-sink). Älä löysennä niitä.
         assert_eq!(
             reply_body.as_deref(),
             Some("hyväksytty toiminto valmis"),
             "(e) lopullisen vastauksen pitää tavoittaa reply-sink approven jälkeen \
-             (sai: {reply_body:?}) — operaattori-approve ei aja agenttia lopulliseen vastaukseen"
+             (sai: {reply_body:?}); side_effect={}, audit:\n{final_audit}",
+            side_effect_count.load(SeqCst)
+        );
+        // (d) Sivuvaikutus ajettiin TASAN KERRAN (eventually-exactly-once).
+        assert_eq!(
+            side_effect_count.load(SeqCst),
+            1,
+            "(d) approval-gated side effect must run exactly once (async, polled)"
         );
         assert!(
             final_audit.contains("turn_resumed"),
@@ -2759,5 +2915,24 @@ mod tests {
             final_audit.contains("turn_answered"),
             "(e) audit-jäljen pitää sisältää turn_answered approven jälkeen, oli:\n{final_audit}"
         );
+
+        // **Ei kaksoislaukaisua:** odota muutama lisäsykli ja varmista että
+        // side-effect pysyy 1:ssä eikä toista vastausta saavu (hyväksyntä on
+        // kertakäyttöinen → agentti ei voi ajaa sitä kahdesti).
+        for _ in 0..5 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(
+                side_effect_count.load(SeqCst),
+                1,
+                "side-effect ei saa laueta toista kertaa (kertakäyttöinen hyväksyntä)"
+            );
+            assert!(
+                reply_rx.try_recv().is_err(),
+                "toista vastausta ei saa saapua (ei kaksoislaukaisua)"
+            );
+        }
+
+        server.abort();
+        bus.stop();
     }
 }
