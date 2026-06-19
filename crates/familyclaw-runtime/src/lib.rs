@@ -32,7 +32,7 @@
 use std::env;
 use std::sync::Arc;
 
-use familyclaw_actions::{ActionRuntime, AuditCollector, JournalDispatchOutbox};
+use familyclaw_actions::{ActionRuntime, AuditCollector};
 use familyclaw_bridge::{AgentInfo, AgentRole, FamilyBridge, HostKind};
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, resolve_profile_dir, Agent, EmotionCalibration,
@@ -316,18 +316,19 @@ pub async fn build_family(
     //    2. **tehtäväjono** (`<data_dir>/action_tasks.jsonl`) — jotta hyväksyttävä
     //       tehtävä (payload + tila) rekonstruoituu restartissa;
     //    3. **lähetyksen idempotenssi-outbox** (`<data_dir>/dispatch_outbox.jsonl`,
-    //       [`JournalDispatchOutbox`]) — **at-most-once**-rajan (kaksoislaukaisun
-    //       esto, EI universaali exactly-once completion) KAATUMISKESTÄVÄ pinta:
+    //       familyclaw_actions::JournalDispatchOutbox) — **at-most-once**-rajan
+    //       (kaksoislaukaisun esto, EI universaali exactly-once completion)
+    //       KAATUMISKESTÄVÄ pinta:
     //       `submit_task`:n / `approve`:n sivuvaikutus suoritetaan korkeintaan
     //       kerran SIGKILL-kaatumisen yli (ei koskaan kahdesti), ja jo sitoutunut
     //       lähetys palautuu arvo-identtisenä; intent-only-ikkunassa kaatuminen
     //       epäonnistuu suljettuna.
     //
-    //    Pinnat 1+2 kytketään [`ActionRuntime::with_durable_stores`]:lla, pinta 3
-    //    ketjutetaan [`ActionRuntime::with_dispatch_outbox`]:lla sen päälle (ks.
-    //    with_durable_stores-doc: se EI itse kytke durable-outboxia, vaan jättää
-    //    sen muistiin ellei sitä ketjuteta). In-memory-polulla kaikki kolme
-    //    jäävät oletuksiinsa (ei levyä), kuten muullakin in-memory-tilalla.
+    //    Kaikki kolme pintaa kytketään YHDELLÄ [`ActionRuntime::with_durable_stores`]
+    //    -kutsulla (se avaa nyt itse kaatumiskestävän dispatch-outboxin kolmannesta
+    //    polusta — ei enää erillistä with_dispatch_outbox-ketjutusta eikä outboxin
+    //    kaksoisavausta). In-memory-polulla kaikki kolme jäävät oletuksiinsa (ei
+    //    levyä), kuten muullakin in-memory-tilalla.
     //
     //    `resumable` on jatkettavien vuorojen pinta `<data_dir>/resumable.jsonl`,
     //    kytketään suoraan agenttiin (askel 7).
@@ -455,31 +456,32 @@ pub async fn build_family(
     //       vain 404:n sivuvaikutuksesta (vahingossa). Durable pending lataa
     //       hyväksynnän takaisin levyltä, jolloin kontrolli ETENEE outbox-vahdille
     //       ja **durable-kerros** pakottaa kaksoislaukaisun eston.
-    //     - **Durable lähetys-outbox** ([`ActionRuntime::with_dispatch_outbox`]
-    //       ketjutettuna `with_durable_stores`:n päälle — joka EI itse kytke
-    //       durable-outboxia): tämä antaa `submit_task`:lle / `approve`:lle
-    //       at-most-once-takuun (kaksoislaukaisun esto, EI universaali
-    //       exactly-once completion) SIGKILL-kaatumisen yli (sivuvaikutus
-    //       korkeintaan kerran; jo sitoutunut lähetys palautuu arvo-identtisenä;
-    //       intent-only-ikkunassa kaatuminen epäonnistuu suljettuna).
+    //     - **Durable lähetys-outbox** (avataan SAMASSA
+    //       [`ActionRuntime::with_durable_stores`] -kutsussa kolmannesta polusta —
+    //       ei enää erillistä with_dispatch_outbox-ketjutusta): tämä antaa
+    //       `submit_task`:lle / `approve`:lle at-most-once-takuun (kaksoislaukaisun
+    //       esto, EI universaali exactly-once completion) SIGKILL-kaatumisen yli
+    //       (sivuvaikutus korkeintaan kerran; jo sitoutunut lähetys palautuu
+    //       arvo-identtisenä; intent-only-ikkunassa kaatuminen epäonnistuu
+    //       suljettuna).
     //
     //     In-memory-polulla ([`ActionRuntime::with_default_skills`], ei data_diriä)
     //     kaikki kolme jäävät oletuksiinsa — ei levyä, ei kaatumiskestävyyttä,
     //     kuten muullakin in-memory-tilalla.
     let action_runtime = if let Some(dir) = action_data_dir {
-        // Persistentti polku: durable pending + task, sitten durable outbox
-        // ketjutettuna (with_durable_stores EI kytke durable-outboxia itse),
-        // sitten oletustaidot.
+        // Persistentti polku: durable pending + task + dispatch outbox YHDELLÄ
+        // konstruktorilla — `with_durable_stores` avaa nyt itse kaatumiskestävän
+        // journal-outboxin kolmannesta polusta, joten erillistä
+        // `with_dispatch_outbox`-ketjutusta ei enää tarvita (eikä outbox-tiedostoa
+        // avata kahdesti). Sen jälkeen oletustaidot.
         let pending_path = dir.join("pending_approvals.jsonl");
         let task_path = dir.join("action_tasks.jsonl");
-        let outbox = JournalDispatchOutbox::open(dir.join("dispatch_outbox.jsonl"))
-            .map_err(|e| FamilyClawError::config(format!("dispatch outbox open failed: {e}")))?;
-        let mut rt = ActionRuntime::with_durable_stores(pending_path, task_path)
+        let dispatch_path = dir.join("dispatch_outbox.jsonl");
+        let mut rt = ActionRuntime::with_durable_stores(pending_path, task_path, dispatch_path)
             .await
             .map_err(|e| {
                 FamilyClawError::config(format!("durable action stores open failed: {e}"))
-            })?
-            .with_dispatch_outbox(Box::new(outbox));
+            })?;
         rt.register_default_skills().map_err(|e| {
             FamilyClawError::config(format!("action runtime build failed: {e}"))
         })?;

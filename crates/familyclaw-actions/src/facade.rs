@@ -39,6 +39,7 @@ use familyclaw_core::time::Timestamp;
 
 use crate::dispatch_outbox::{
     DispatchLookup, DispatchOutboxStore, DispatchedOutcome, InMemoryDispatchOutbox,
+    JournalDispatchOutbox,
 };
 use crate::error::{ActionError, Result};
 use crate::executor::ActionExecutor;
@@ -324,24 +325,30 @@ impl ActionRuntime {
     }
 
     /// Luo ajoympäristön **täysin kaatumiskestävällä** suspend/resume-tilalla:
-    /// kaatumiskestävä odottavien hyväksyntöjen pinta **ja** kaatumiskestävä
-    /// tehtäväjono, molemmat rekonstruoituina annetuista durable-tiedostoista.
+    /// kaatumiskestävä odottavien hyväksyntöjen pinta, kaatumiskestävä
+    /// tehtäväjono **ja** kaatumiskestävä lähetys-outbox — kaikki kolme
+    /// rekonstruoituina annetuista durable-tiedostoista.
     ///
     /// Tämä on suspend/resume-sillan (roadmap §6) actions-puolen
     /// kaatumiskestävyys: pelkkä [`ActionRuntime::with_pending_store`] säilyttää
     /// odottavan **hyväksynnän**, mutta `approve` tarvitsee myös tehtävän
-    /// (payload + tila) putken jonossa ja itse hyväksynnän ledgerissä. Kaikki
-    /// kolme menetetään prosessin kaatuessa, ellei niitä persistoida. Tämä
-    /// konstruktori:
+    /// (payload + tila) putken jonossa ja itse hyväksynnän ledgerissä. Lisäksi
+    /// `submit_task`:n / `approve`:n at-most-once-takuu (kaksoislaukaisun esto
+    /// kaatumisen yli) vaatii kaatumiskestävän **lähetys-outboxin**. Kaikki nämä
+    /// menetetään prosessin kaatuessa, ellei niitä persistoida. Tämä
+    /// konstruktori kytkee **kaikki kolme kaatumiskestävää pintaa kerralla**:
     ///
     /// 1. rakentaa kaatumiskestävän **pending-pinnan** annetusta polusta
     ///    ([`crate::pending_store::JournalPendingStore`]),
     /// 2. rekonstruoi **tehtäväjonon** durable-jonosta
     ///    ([`DurableTaskQueue::reload`] → [`TaskQueue::from_map`]),
-    /// 3. **palauttaa ledgeriin** jokaisen odottavan hyväksynnän durable-
+    /// 3. avaa kaatumiskestävän **lähetys-outboxin** annetusta polusta
+    ///    ([`JournalDispatchOutbox::open`]) — jo sitoutuneet lähetykset
+    ///    rekonstruoituvat heti, joten at-most-once pitää restartin yli,
+    /// 4. **palauttaa ledgeriin** jokaisen odottavan hyväksynnän durable-
     ///    pinnalta ([`crate::pending_store::PendingRecord::approval`]), jotta
     ///    `approve` voi kuluttaa sen samalla payload-sidonnalla,
-    /// 4. mirroroi jatkossa jokaisen tehtävän tilannekuvan durable-jonoon, jotta
+    /// 5. mirroroi jatkossa jokaisen tehtävän tilannekuvan durable-jonoon, jotta
     ///    uudelleenkäynnistys löytää sen.
     ///
     /// Taidot rekisteröidään tämän jälkeen normaalisti
@@ -349,46 +356,54 @@ impl ActionRuntime {
     /// [`ActionRuntime::register_default_skills`]); ne ovat puhdasta koodia
     /// eivätkä tarvitse persistointia.
     ///
-    /// # Lähetys-outbox EI ole tämän konstruktorin vastuulla
-    /// Tämä konstruktori kytkee kaatumiskestävän **pending**-pinnan ja
-    /// **task-jonon**, mutta jättää lähetyksen idempotenssi-outboxin oletukseen
-    /// ([`InMemoryDispatchOutbox`]). At-most-once-takuun
-    /// (kaksoislaukaisun esto kaatumisen yli) tarvitseva kokooja **täytyy
-    /// ketjuttaa** [`ActionRuntime::with_dispatch_outbox`] tämän jälkeen
-    /// kaatumiskestävällä [`crate::dispatch_outbox::JournalDispatchOutbox`]:lla:
+    /// # Lähetys-outbox on nyt kaatumiskestävä OLETUKSENA (ei enää ansaa)
+    /// Aiemmin tämä konstruktori jätti lähetys-outboxin muistinvaraiseen
+    /// oletukseen ([`InMemoryDispatchOutbox`]), joten kutsuja joka EI
+    /// ketjuttanut erikseen [`ActionRuntime::with_dispatch_outbox`]:ia sai
+    /// hiljaisesti kaatumiskestävyyden POIS päältä lähetyksen osalta — juuri se
+    /// at-most-once-ominaisuus jonka durable-tila on tarkoitettu antamaan. Nyt
+    /// konstruktori avaa [`JournalDispatchOutbox`]:n suoraan
+    /// `dispatch_outbox_path`-polusta, joten **kaikki kolme pintaa ovat
+    /// kaatumiskestäviä ilman erillistä ketjutusta**. Kutsujan tulee antaa
+    /// erilliset polut (esim. `<data_dir>/{pending_approvals,action_tasks,\
+    /// dispatch_outbox}.jsonl`), jotta lokit eivät sekoitu.
+    ///
+    /// [`ActionRuntime::with_dispatch_outbox`] säilyy edelleen erikoistapauksia
+    /// varten (esim. kaatumiskoukulla kääritty outbox red-team-testeissä): sillä
+    /// voi yhä **korvata** tässä avatun oletus-journal-outboxin. Jos sitä ei
+    /// ketjuteta, oletus on jo kaatumiskestävä.
     ///
     /// ```no_run
     /// # use familyclaw_actions::ActionRuntime;
-    /// # use familyclaw_actions::dispatch_outbox::JournalDispatchOutbox;
     /// # async fn wire(dir: &std::path::Path) -> familyclaw_actions::error::Result<()> {
-    /// let outbox = Box::new(JournalDispatchOutbox::open(dir.join("dispatch_outbox.jsonl"))?);
     /// let mut rt = ActionRuntime::with_durable_stores(
     ///     dir.join("pending_approvals.jsonl"),
     ///     dir.join("action_tasks.jsonl"),
+    ///     dir.join("dispatch_outbox.jsonl"),
     /// )
-    /// .await?
-    /// .with_dispatch_outbox(outbox); // muuten outbox jää muistiin (kuolee kaatumisessa)
+    /// .await?; // lähetys-outbox on jo journal-kestävä — ei tarvitse with_dispatch_outbox-ketjutusta
     /// rt.register_default_skills()?;
     /// # Ok(())
     /// # }
     /// ```
     ///
-    /// Ilman tätä ketjutusta odottava hyväksyntä SÄILYY restartin yli (durable
-    /// pending + task), mutta `approve`:n at-most-once-suoja eläisi vain
-    /// muistissa — siksi `familyclaw-runtime`:n `build_family` ketjuttaa
-    /// molemmat (durable pending + durable dispatch outbox) persistentillä
-    /// polulla.
-    ///
     /// # Errors
-    /// - [`ActionError::Proof`] jos pending- tai task-journalin avaus/luku
-    ///   epäonnistuu.
+    /// - [`ActionError::Proof`] jos pending-, task- tai dispatch-outbox-journalin
+    ///   avaus/luku epäonnistuu.
     pub async fn with_durable_stores(
         pending_path: impl AsRef<std::path::Path>,
         task_queue_path: impl Into<std::path::PathBuf>,
+        dispatch_outbox_path: impl AsRef<std::path::Path>,
     ) -> Result<Self> {
         let pending: Box<dyn PendingApprovalStore> =
             Box::new(crate::pending_store::JournalPendingStore::open(pending_path)?);
         let durable_queue = DurableTaskQueue::new(task_queue_path);
+
+        // Kaatumiskestävä lähetys-outbox avataan SUORAAN tässä, jotta durable-tila
+        // on durable KAIKILLE kolmelle pinnalle (pending + task + dispatch) eikä
+        // kutsujan tarvitse muistaa ketjuttaa with_dispatch_outboxia (ent. ansa).
+        let dispatch_outbox: Box<dyn DispatchOutboxStore> =
+            Box::new(JournalDispatchOutbox::open(dispatch_outbox_path)?);
 
         // Rekonstruoi tehtäväjono levyltä → putki palautetulla jonolla.
         let task_map = durable_queue.reload().await?;
@@ -411,7 +426,7 @@ impl ActionRuntime {
                 DEFAULT_DANGEROUS_TOOL_LIMIT,
             ),
             being_id: DEFAULT_BEING_ID.to_string(),
-            dispatch_outbox: Box::new(InMemoryDispatchOutbox::new()),
+            dispatch_outbox,
         })
     }
 
@@ -426,6 +441,13 @@ impl ActionRuntime {
     /// `submit_task`:n sivuvaikutus suoritetaan **korkeintaan kerran** SIGKILL-
     /// kaatumisen yli (ei koskaan kahdesti), ja jo sitoutunut lähetys palautuu
     /// arvo-identtisenä.
+    ///
+    /// Huom: [`ActionRuntime::with_durable_stores`] avaa jo kaatumiskestävän
+    /// journal-outboxin oletuksena, joten sen päälle tätä tarvitaan vain kun
+    /// halutaan **korvata** oletus erikoistapauksessa (esim. kaatumiskoukulla
+    /// kääritty outbox red-team-testeissä). Muistinvaraisessa tilassa
+    /// ([`ActionRuntime::new`] / [`ActionRuntime::with_default_skills`]) tämä on
+    /// ainoa tapa kytkeä kaatumiskestävä outbox.
     ///
     /// ```
     /// # use familyclaw_actions::ActionRuntime;
@@ -1254,6 +1276,50 @@ mod tests {
             .with_dispatch_outbox(Box::new(journal));
         assert_eq!(durable.dispatch_outbox_kind(), "journal");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regressiovahti aiemmalle ansalle: [`ActionRuntime::with_durable_stores`]
+    /// kytkee KAIKKI KOLME kaatumiskestävää pintaa (pending + task + dispatch
+    /// outbox) **ilman** erillistä [`ActionRuntime::with_dispatch_outbox`]
+    /// -ketjutusta.
+    ///
+    /// Aiemmin durable-konstruktori kovakoodasi muistinvaraisen
+    /// [`InMemoryDispatchOutbox`]:n, joten kutsuja joka unohti ketjuttaa sai
+    /// hiljaisesti at-most-once-suojan POIS päältä lähetyksen osalta. Tämä testi
+    /// todistaa että pelkkä `with_durable_stores` riittää nyt: sekä
+    /// `dispatch_outbox_kind()` että `pending_store_kind()` ovat `"journal"`.
+    #[tokio::test]
+    async fn durable_stores_yield_journal_dispatch_without_chaining() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "familyclaw-facade-durable-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        // EI with_dispatch_outbox-ketjutusta — pelkkä konstruktori.
+        let runtime = ActionRuntime::with_durable_stores(
+            dir.join("pending_approvals.jsonl"),
+            dir.join("action_tasks.jsonl"),
+            dir.join("dispatch_outbox.jsonl"),
+        )
+        .await
+        .expect("durable stores open");
+
+        assert_eq!(
+            runtime.dispatch_outbox_kind(),
+            "journal",
+            "durable-konstruktori kytkee journal-outboxin ilman ketjutusta (ent. ansa)"
+        );
+        assert_eq!(
+            runtime.pending_store_kind(),
+            "journal",
+            "durable-konstruktori kytkee journal-pending-pinnan"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

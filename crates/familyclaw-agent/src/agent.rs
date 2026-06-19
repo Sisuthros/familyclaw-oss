@@ -4640,22 +4640,28 @@ mod tests {
         fn task_queue_path(&self) -> std::path::PathBuf {
             self.0.join("tasks.jsonl")
         }
+        fn outbox_path(&self) -> std::path::PathBuf {
+            self.0.join("dispatch_outbox.jsonl")
+        }
         fn resumable_path(&self) -> std::path::PathBuf {
             self.0.join("resumable.jsonl")
         }
     }
 
     /// Rakentaa **täysin kaatumiskestävän** jaetun runtimen laskevalla
-    /// hyväksyntätaidolla: durable pending + durable task queue (rekonstruoituna
-    /// annetuista tiedostoista) + per-testi laskuri.
+    /// hyväksyntätaidolla: durable pending + durable task queue + durable
+    /// dispatch-outbox (kaikki rekonstruoituna annetuista tiedostoista) +
+    /// per-testi laskuri.
     async fn durable_counting_runtime(
         pending_path: std::path::PathBuf,
         task_queue_path: std::path::PathBuf,
+        outbox_path: std::path::PathBuf,
         count: StdArc<std::sync::atomic::AtomicUsize>,
     ) -> StdArc<TokioMutex<ActionRuntime>> {
-        let mut rt = ActionRuntime::with_durable_stores(pending_path, task_queue_path)
-            .await
-            .expect("durable stores open");
+        let mut rt =
+            ActionRuntime::with_durable_stores(pending_path, task_queue_path, outbox_path)
+                .await
+                .expect("durable stores open");
         rt.register_skill(CountingApprovalSkill::new(count))
             .expect("register counting approval_skill");
         StdArc::new(TokioMutex::new(rt))
@@ -5132,6 +5138,7 @@ mod tests {
             let runtime = durable_counting_runtime(
                 dir.pending_path(),
                 dir.task_queue_path(),
+                dir.outbox_path(),
                 StdArc::clone(&count),
             )
             .await;
@@ -5173,6 +5180,7 @@ mod tests {
         let runtime2 = durable_counting_runtime(
             dir.pending_path(),
             dir.task_queue_path(),
+            dir.outbox_path(),
             StdArc::clone(&count),
         )
         .await;
@@ -5939,6 +5947,7 @@ mod tests {
                 Arc::new(LocalJsonStore::open(&rmem_path).await.expect("open rmem"));
             let pending_path = resume_dir.pending_path();
             let task_path = resume_dir.task_queue_path();
+            let outbox_path = resume_dir.outbox_path();
             let resumable_path = resume_dir.resumable_path();
 
             // Erilliset laskurit tälle vaiheelle (oma elinkaari).
@@ -5957,10 +5966,13 @@ mod tests {
                 ])
                 .await;
                 // Täysin durable runtime (pending + task queue) + durable resumable.
-                let mut rt =
-                    ActionRuntime::with_durable_stores(pending_path.clone(), task_path.clone())
-                        .await
-                        .expect("durable stores");
+                let mut rt = ActionRuntime::with_durable_stores(
+                    pending_path.clone(),
+                    task_path.clone(),
+                    outbox_path.clone(),
+                )
+                .await
+                .expect("durable stores");
                 rt.register_skill(CountingAutoSkill::new(StdArc::clone(&auto2)))
                     .expect("auto");
                 rt.register_skill(CountingApprovalSkill::new(StdArc::clone(&approval2)))
@@ -6002,7 +6014,7 @@ mod tests {
             let bus = ResonanceBus::start(None).await.expect("bus r2");
             // Resumen jatkokierros vastaa tekstillä (yksi pyyntö riittää).
             let api = spawn_scripted_llm(vec![body_text("valmis restartin jälkeen")]).await;
-            let mut rt = ActionRuntime::with_durable_stores(pending_path, task_path)
+            let mut rt = ActionRuntime::with_durable_stores(pending_path, task_path, outbox_path)
                 .await
                 .expect("durable stores 2");
             rt.register_skill(CountingAutoSkill::new(StdArc::clone(&auto2)))

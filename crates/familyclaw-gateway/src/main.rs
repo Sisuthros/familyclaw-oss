@@ -102,7 +102,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
 use axum::Router;
 use clap::{Parser, Subcommand};
-use familyclaw_actions::{ActionRuntime, ApprovalId, AuditCollector, JournalDispatchOutbox};
+use familyclaw_actions::{ActionRuntime, ApprovalId, AuditCollector};
 use familyclaw_agent::{resolve_profile_dir, EnvEndpointResolver, LiveTurnExecutor, Soul};
 use familyclaw_bridge::{
     AgentInfo, AgentRole, FamilyBridge, HostKind, OrchestrationPlan, Orchestrator, TaskNode,
@@ -1269,14 +1269,15 @@ async fn durability_report_for(data_dir: Option<&str>) -> Result<DurabilityRepor
         let dir = std::path::PathBuf::from(dir);
         let pending_path = dir.join("pending_approvals.jsonl");
         let task_path = dir.join("action_tasks.jsonl");
-        let outbox = JournalDispatchOutbox::open(dir.join("dispatch_outbox.jsonl"))
-            .map_err(|e| FamilyClawError::config(format!("dispatch outbox open failed: {e}")))?;
-        ActionRuntime::with_durable_stores(pending_path, task_path)
+        let dispatch_path = dir.join("dispatch_outbox.jsonl");
+        // `with_durable_stores` avaa nyt itse kaatumiskestävän dispatch-outboxin
+        // kolmannesta polusta — sama yhden kutsun kokoonpano kuin build_familyssa,
+        // ei erillistä with_dispatch_outbox-ketjutusta eikä outboxin kaksoisavausta.
+        ActionRuntime::with_durable_stores(pending_path, task_path, dispatch_path)
             .await
             .map_err(|e| {
                 FamilyClawError::config(format!("durable action stores open failed: {e}"))
             })?
-            .with_dispatch_outbox(Box::new(outbox))
     } else {
         // Muistinvarainen polku: kaikki pinnat oletuksissaan, ei levyä.
         ActionRuntime::with_default_skills()

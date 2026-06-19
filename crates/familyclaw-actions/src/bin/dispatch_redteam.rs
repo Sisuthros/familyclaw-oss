@@ -578,21 +578,29 @@ async fn build_approval_runtime(args: &RunArgs) -> HarnessResult<ActionRuntime> 
     let pending = require_path(args.pending.as_ref(), "--pending")?;
     let task_queue = require_path(args.task_queue.as_ref(), "--task-queue")?;
 
-    let outbox = JournalDispatchOutbox::open(&args.outbox)?;
-    let wrapped: Box<dyn DispatchOutboxStore> = if matches!(
+    // `with_durable_stores` avaa nyt itse kaatumiskestävän journal-outboxin
+    // annetusta polusta (`args.outbox`), joten resume-vaihe saa kaatumiskestävän
+    // outboxin SUORAAN ilman erillistä avausta tai ketjutusta.
+    let mut runtime =
+        ActionRuntime::with_durable_stores(pending, task_queue, &args.outbox).await?;
+
+    // Crash-vaiheet tarvitsevat kaatumiskoukulla KÄÄRITYN outboxin (abortoi
+    // record_committed:n ympärillä). Konstruktorin oletus-outbox ei voi tehdä
+    // tätä, joten korvaa se nimenomaisesti `with_dispatch_outbox`:lla — tämä on
+    // juuri se erikoistapaus jota varten override-koukku on olemassa. Outbox
+    // avataan toisen kerran SAMASTA polusta, mutta journal on idempotentti
+    // append-only-loki (ei truncate), joten kaksoisavaus on harmiton; tämä on
+    // testibinääri eikä tuotantopolku (build_family/gateway eivät kaksoisavaa).
+    if matches!(
         args.phase,
         Phase::ApproveCrashIntent | Phase::ApproveCrashCommitted
     ) {
-        // Kääri kaatumiskoukku: abortoi record_committed:n ympärillä
-        // (ympäristömuuttuja valitsee ennen/jälkeen).
-        Box::new(CrashAfterIntentOutbox::new(outbox))
-    } else {
-        Box::new(outbox)
-    };
+        let outbox = JournalDispatchOutbox::open(&args.outbox)?;
+        let wrapped: Box<dyn DispatchOutboxStore> =
+            Box::new(CrashAfterIntentOutbox::new(outbox));
+        runtime = runtime.with_dispatch_outbox(wrapped);
+    }
 
-    let mut runtime = ActionRuntime::with_durable_stores(pending, task_queue)
-        .await?
-        .with_dispatch_outbox(wrapped);
     runtime.register_skill(ApprovalCountingExecutor::new(args.counter.clone()))?;
     Ok(runtime)
 }
