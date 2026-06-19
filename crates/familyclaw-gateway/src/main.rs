@@ -1702,29 +1702,38 @@ mod tests {
     }
 
     #[test]
-    fn plan_load_falls_back_to_smoke_without_env() {
-        // Ilman PLAN_ENV:iä → sisäänrakennettu yhden solmun savutesti.
-        // (Testi ei aseta env-muuttujaa, joten luetaan oletus.)
+    fn plan_load_env_fallback_and_json_parsing() {
+        // YHDISTETTY testi: [`PLAN_ENV`] on PROSESSIN-LAAJUINEN ympäristömuuttuja,
+        // joten kaksi erillistä testifunktiota (toinen `remove_var`, toinen
+        // `set_var`) kilpailisivat rinnakkain ajettuna ja vuorottelisivat
+        // toistensa tilan päälle. Tehdään molemmat tarkistukset PERÄKKÄIN saman
+        // funktion sisällä — silloin env-muuttujaa ei jaeta säikeiden yli eikä
+        // tulos riipu ajojärjestyksestä.
+
+        // (a) Ilman PLAN_ENV:iä → sisäänrakennettu yhden solmun savutesti.
         std::env::remove_var(PLAN_ENV);
         let plan = load_orchestration_plan();
         assert_eq!(plan.id, "smoke");
         assert_eq!(plan.nodes.len(), 1);
         assert_eq!(plan.nodes[0].id.as_str(), "n1");
-    }
 
-    #[test]
-    fn plan_load_parses_json_nodes() {
+        // (b) PLAN_ENV asetettuna → JSON jäsentyy solmuiksi.
         let json = r#"{"id":"p","nodes":[
             {"id":"a","title":"A","description":"da"},
             {"id":"b","title":"B","description":"db"}
         ]}"#;
         std::env::set_var(PLAN_ENV, json);
         let plan = load_orchestration_plan();
-        std::env::remove_var(PLAN_ENV);
         assert_eq!(plan.id, "p");
         assert_eq!(plan.nodes.len(), 2);
         assert_eq!(plan.nodes[1].id.as_str(), "b");
         assert_eq!(plan.nodes[1].title, "B");
+
+        // (c) Siivous: palauta prosessin tila ennalleen, jotta mahdolliset muut
+        //     samaa muuttujaa lukevat testit eivät näe roskaa.
+        std::env::remove_var(PLAN_ENV);
+        let plan = load_orchestration_plan();
+        assert_eq!(plan.id, "smoke");
     }
 
     #[test]
