@@ -2935,4 +2935,192 @@ mod tests {
         server.abort();
         bus.stop();
     }
+
+    /// SF1 (GPT-5.5 review): **kaksi YHTÄAIKAISTA** `POST /approvals/{id}/approve`
+    /// -pyyntöä samalle hyväksynnälle saa laukaista sivuvaikutuksen **korkeintaan
+    /// kerran**. Aiempi `e2e_suspend_approve_resume_reply` todisti sekventiaalisen
+    /// ei-kaksoislaukaisun; tämä todistaa että kilpa kahden samanaikaisen HTTP-
+    /// pyynnön välillä ei riko kertakäyttöistä hyväksyntää.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn concurrent_double_approve_fires_side_effect_at_most_once() {
+        use familyclaw_agent::{new_reply_channel, Agent, ErasedMemoryStore, ThinkOutcome};
+        use familyclaw_bus::{BusMessage, ResonanceBus};
+        use familyclaw_durable::{DurableContext, InMemoryJournal, Journal};
+        use familyclaw_memory::LocalJsonStore;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let api = spawn_scripted_llm_e2e(vec![
+            e2e_body_tool_call(
+                "call_approve",
+                "approval_skill",
+                &serde_json::json!({ "q": "ship" }),
+            ),
+            e2e_body_text("hyväksytty toiminto valmis"),
+        ])
+        .await;
+
+        let side_effect_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut rt = ActionRuntime::new();
+        rt.register_skill(E2eCountingApprovalSkill {
+            count: std::sync::Arc::clone(&side_effect_count),
+        })
+        .expect("register approval_skill");
+        let actions: Arc<Mutex<ActionRuntime>> = Arc::new(Mutex::new(rt));
+        let turn_audit: Arc<AuditCollector> = Arc::new(AuditCollector::new());
+        let (sink, mut reply_rx) = new_reply_channel();
+
+        let config = AgentConfig::new("e2e_agent", ModelConfig::new("scripted/model"));
+        let soul = Soul::from_essence("I am the E2E agent.".to_string());
+        let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
+        let durable = DurableContext::new(
+            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>,
+        )
+        .expect("durable ctx");
+        let llm_cfg = familyclaw_agent::llm::LlmConfig::new(&api, "test-key", "scripted-model")
+            .with_request_timeout_ms(2_000)
+            .with_connect_timeout_ms(2_000);
+        let agent = Agent::new(config, soul, memory, durable, bus.clone(), Some(llm_cfg), None)
+            .with_actions(Arc::clone(&actions))
+            .with_turn_audit(Arc::clone(&turn_audit))
+            .with_reply_sink(sink)
+            .with_reply_target("e2e-channel");
+
+        let out = agent
+            .think(&BusMessage::text("ship it"))
+            .await
+            .expect("think suspends");
+        let approval_id = match out {
+            ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+            other => panic!("odotettiin Suspended, sai: {other:?}"),
+        };
+        assert_eq!(side_effect_count.load(SeqCst), 0, "ei sivuvaikutusta ennen approvea");
+
+        let _actor = agent.spawn().await.expect("spawn agent actor");
+        let state = Arc::new(GatewayState {
+            bus: Some(bus.clone()),
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: Some(Arc::clone(&actions)),
+            turn_audit: Some(Arc::clone(&turn_audit)),
+            metrics: None,
+        });
+        let app = build_router(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/approvals/{approval_id}/approve");
+
+        // Kaksi YHTÄAIKAISTA approve-pyyntöä samalle id:lle.
+        let (r1, r2) = tokio::join!(
+            client.post(&url).send(),
+            client.post(&url).send(),
+        );
+        let s1 = r1.expect("POST approve #1").status().as_u16();
+        let s2 = r2.expect("POST approve #2").status().as_u16();
+        // Tasan yksi pyyntö saa kuluttaa kertakäyttöisen hyväksynnän (200); toinen
+        // näkee sen jo kulutettuna (404 Not Found) tai myös 200 jos serialisointi
+        // sallii — mutta sivuvaikutus alla on JOKA TAPAUKSESSA korkeintaan 1.
+        let oks = u8::from(s1 == 200) + u8::from(s2 == 200);
+        assert!(oks >= 1, "ainakin yksi approve onnistuu (sai {s1}/{s2})");
+
+        // Odota että resume valmistuu, sitten varmista side-effect == 1 EIKÄ enää nouse.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if side_effect_count.load(SeqCst) >= 1 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        for _ in 0..6 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                side_effect_count.load(SeqCst) <= 1,
+                "samanaikainen kaksois-approve EI saa laukaista sivuvaikutusta kahdesti (oli {})",
+                side_effect_count.load(SeqCst)
+            );
+        }
+        assert_eq!(
+            side_effect_count.load(SeqCst),
+            1,
+            "sivuvaikutus ajetaan tasan kerran myös samanaikaisen kaksois-approven alla"
+        );
+        // Vain yksi lopullinen vastaus (ei kaksoislaukaisua reply-polulla).
+        let mut replies = 0u8;
+        while reply_rx.try_recv().is_ok() {
+            replies += 1;
+        }
+        assert!(replies <= 1, "korkeintaan yksi vastaus (sai {replies})");
+
+        server.abort();
+        bus.stop();
+    }
+
+    /// SF2 (GPT-5.5 review): negatiivinen reitti-regressio joka VARTIOI axum 0.7
+    /// -korjausta (`{approval_id}` → `:approval_id`). Jos joku palauttaisi reitin
+    /// brace-syntaksiin, kirjaimellinen polkusegmentti tulkittaisiin literaaliksi
+    /// eikä kaappaisi mielivaltaista id:tä → tämä testi punaistuisi.
+    ///
+    /// Todistus: POST mielivaltaiseen `:approval_id`-arvoon EI palauta 404
+    /// "route not found" (reitti matchaa ja handler ajaa → 400/404/503 sen oman
+    /// validoinnin mukaan), kun taas tuntematon polku palauttaa 404. Käytämme
+    /// 503-erottelua: ilman actions-runtimea handler vastaa 503, joten matchannut
+    /// reitti tuottaa 503 ja matchaamaton 404.
+    #[tokio::test]
+    async fn approve_route_captures_arbitrary_id_not_literal_braces() {
+        // GatewayState ILMAN actions-runtimea → approve_pending vastaa 503 KUN
+        // reitti matchaa. (Bearer-tarkistus ohitetaan kun inject_token = None.)
+        let state = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: None,
+            turn_audit: None,
+            metrics: None,
+        });
+        let app = build_router(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // (1) Mielivaltainen id matchaa `:approval_id`-kaappauksen → handler ajaa →
+        //     503 (ei actions-runtimea). Jos reitti olisi literaali `{approval_id}`,
+        //     tämä EI matchaisi → 404. 503 todistaa että kaappaus toimii.
+        let captured = client
+            .post(format!("{base}/approvals/any-arbitrary-id-123/approve"))
+            .send()
+            .await
+            .expect("POST arbitrary id");
+        assert_eq!(
+            captured.status().as_u16(),
+            503,
+            "mielivaltainen id matchaa reitin (handler ajaa, 503 ilman runtimea); \
+             404 tarkoittaisi paluuta literaaliin {{approval_id}}-bugiin"
+        );
+
+        // (2) Kontrolli: täysin tuntematon polku palauttaa 404 (router toimii
+        //     oikein, ei matchaa kaikkea).
+        let unknown = client
+            .post(format!("{base}/nonexistent/path"))
+            .send()
+            .await
+            .expect("POST unknown path");
+        assert_eq!(
+            unknown.status().as_u16(),
+            404,
+            "tuntematon polku palauttaa 404 (router ei matchaa sokeasti kaikkea)"
+        );
+
+        server.abort();
+    }
 }
