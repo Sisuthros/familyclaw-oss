@@ -40,3 +40,24 @@ Security-sensitive areas include:
 - We follow coordinated vulnerability disclosure.
 - Fixes will be released on `main` branch with a security advisory.
 - No CVE assignment planned until 1.0 release.
+
+## Known Advisories (`cargo audit`)
+
+We track `cargo audit` honestly rather than hiding open advisories. As of
+the current `Cargo.lock`, the following are known and **transitive only**
+(not in FamilyClaw's own code):
+
+- **`rustls-webpki` 0.102.8** (RUSTSEC-2026-0049/0098/0099/0104) — pulled in
+  **only under the `discord` feature** via `serenity 0.12.5 → tokio-tungstenite
+  0.21 → rustls 0.22`. These advisories concern certificate-revocation-list
+  and name-constraint handling in TLS server-certificate verification. They
+  cannot be resolved without an upstream `serenity` release that bumps its
+  `tungstenite`/`rustls` chain; we will upgrade as soon as one is available.
+  Builds **without** the `discord` feature are unaffected.
+- **`rsa` 0.9.x** (RUSTSEC-2023-0071, "Marvin Attack") — timing side-channel;
+  no fixed upstream version exists yet. Transitive; not used for FamilyClaw's
+  own key operations.
+- **`atomic-polyfill`** (RUSTSEC-2023-0089) — *unmaintained* warning only, not
+  a vulnerability.
+
+Run `cargo audit` yourself to verify this list against the current lockfile.
