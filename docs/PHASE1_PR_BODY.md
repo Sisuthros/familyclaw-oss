@@ -1,9 +1,9 @@
 # Phase 1 — Tool-loop, approval/resume, at-most-once dispatch, Discord hardening
 
 **Branch:** `feat/familyclaw-v1-tool-loop`
-**Head:** `203bef9e914d0f1ca3058695302f5b5fa8dce95b`
+**Head:** `e23e99979340a7fb68b5e0abc0bc0c3d8d01d037`
 **Base:** `main` @ `fd73adcdf0215c4e47d9476c4ffb2fad86721030`
-**Ahead / behind:** 42 / 0
+**Ahead / behind:** 45 / 0
 
 This PR closes the Phase 1 release-readiness gaps from the last external audit
 (Discord bot/DM config model, approval-route regressions, public-contact hygiene)
@@ -15,7 +15,7 @@ readiness sprint — it is hardening, tests, CI hygiene, and doc truth-correctio
 - **Phase 0 — CI / spike / docs truth:** `.gitattributes` LF normalisation, embedder
   spike, and earlier doc-truth audits. (CI workflow `.github/workflows/ci.yml`.)
 - **familyclaw-actions:** typed action manifest, durable outbox + pending store,
-  red-team dispatch harness, exactly-once *dispatch* proof tests.
+  red-team dispatch harness, at-most-once / replay-safe dispatch proof tests.
 - **tool-loop:** LLM tool-schema + `complete_with_tools` failover; agent tool loop.
 - **approval / resume:** operator approval → `ResumeApproval` signal; async,
   agent-owned resume.

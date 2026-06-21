@@ -3380,10 +3380,12 @@ mod tests {
             "tasan yksi turn_answered (yksi lopullinen vastaus), audit:\n{final_audit}"
         );
 
-        // 9. Imuroi reply-sinkki muutaman lisäsyklin ajan ja varmista ettei
-        //    sivuvaikutus enää nouse eikä toista vastausta saavu (ei kaksoislaukaisua).
-        for _ in 0..6 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // 9. Imuroi reply-sinkki muutaman lisäsyklin ajan: odota että TASAN yksi
+        //    lopullinen reply saapuu (auditissa on jo yksi turn_answered), ja
+        //    varmista ettei sivuvaikutus enää nouse eikä toista vastausta saavu.
+        //    `turn_answered == 1` (yllä) takaa että vastaus tuotettiin; tässä
+        //    odotetaan että se myös tavoittaa reply-sinkin tasan kerran.
+        for _ in 0..40 {
             while reply_rx.try_recv().is_ok() {
                 reply_count += 1;
             }
@@ -3392,10 +3394,19 @@ mod tests {
                 1,
                 "sivuvaikutus ei saa laueta toista kertaa (kertakäyttöinen hyväksyntä)"
             );
+            if reply_count >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(
-            reply_count <= 1,
-            "korkeintaan yksi lopullinen reply tavoittaa reply-sinkin (sai {reply_count})"
+        // Tyhjennä mahdolliset jälkijunan replyt ja vaadi TASAN yksi: ei nollaa
+        // (vastaus on tuotettu) eikä kahta (ei kaksoislaukaisua).
+        while reply_rx.try_recv().is_ok() {
+            reply_count += 1;
+        }
+        assert_eq!(
+            reply_count, 1,
+            "tasan yksi lopullinen reply tavoittaa reply-sinkin (sai {reply_count})"
         );
 
         server.abort();
