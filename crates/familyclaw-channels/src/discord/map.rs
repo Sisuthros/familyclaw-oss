@@ -181,6 +181,38 @@ mod tests {
     }
 
     #[test]
+    fn dm_reply_target_is_dm_channel_not_group_channel() {
+        // Eksplisiittinen vartija sääntö 9:lle: DM:ssä vastaus reititetään DM-
+        // kanavalle (channel_id), EI ryhmäkanavalle (target_channel_id), vaikka ne
+        // ovat eri arvot. DM-kanava = 500, ryhmä-target = 100 → vastaus → 500.
+        let dm_channel: u64 = 500;
+        let group_target: u64 = 100;
+        let env = map_message(
+            OWNER_ID,
+            false,
+            dm_channel,
+            group_target,
+            "yksityisesti",
+            SELF_ID,
+            false,
+            true,
+            OWNER_ID,
+        )
+        .expect("owner DM heard");
+        assert_eq!(
+            env.channel_id,
+            dm_channel.to_string(),
+            "DM-vastaus menee DM-kanavalle (channel_id), ei ryhmään"
+        );
+        assert_eq!(env.conversation, dm_channel.to_string());
+        assert_ne!(
+            env.channel_id,
+            group_target.to_string(),
+            "DM-vastaus EI saa mennä ryhmäkanavalle (target_channel_id)"
+        );
+    }
+
+    #[test]
     fn dm_from_non_owner_is_dropped() {
         // DM muulta ihmiseltä (ei owner) → pudotetaan (kahdenkeskinen vain omistajalle).
         assert!(map_message(42, false, 500, 100, "moi", SELF_ID, false, true, OWNER_ID).is_none());

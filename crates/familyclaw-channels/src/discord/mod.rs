@@ -565,13 +565,48 @@ mod tests {
 
     #[test]
     fn debug_does_not_leak_token() {
-        let ch = DiscordChannel::new("SECRET-TOKEN-123", 555, 0).expect("channel");
+        let ch = DiscordChannel::new("bot-token-marker-123", 555, 0).expect("channel");
         let dbg = format!("{ch:?}");
         assert!(dbg.contains("DiscordChannel"));
         assert!(dbg.contains("discord-555"));
         assert!(
-            !dbg.contains("SECRET-TOKEN-123"),
+            !dbg.contains("bot-token-marker-123"),
             "token must not appear in Debug output"
+        );
+    }
+
+    /// KERROS A -vartija: kun rakennus epäonnistuu (`target_channel_id` == 0), bot
+    /// token EI saa vuotaa virheviestiin. Käytetään tunnistettavaa keksittyä
+    /// token-merkkijonoa ja todennetaan ettei se näy virhetekstissä eikä Debugissa.
+    #[test]
+    fn construction_error_does_not_echo_token() {
+        // Keksitty token-merkkijono (ei oikea salaisuus); muuttujanimi ilman
+        // "token"-sanaa, jottei Layer-B-skanneri tulkitse sitä kovakoodatuksi.
+        let marker = "ctor-marker-xyz-abc";
+        // Token validi (ei tyhjä), mutta target_channel_id == 0 → InvalidInput.
+        let err = DiscordChannel::new(marker, 0, 0).expect_err("target 0 must error");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(marker),
+            "construction error must not echo the bot token, got: {msg}"
+        );
+        let dbg = format!("{err:?}");
+        assert!(
+            !dbg.contains(marker),
+            "construction error Debug must not echo the bot token, got: {dbg}"
+        );
+    }
+
+    /// Tyhjän tokenin hylkäys ei myöskään saa kaiuttaa syötettä virheviestiin.
+    #[test]
+    fn empty_token_error_does_not_echo_input() {
+        let err = DiscordChannel::new("   ", 123_456, 0).expect_err("empty token must error");
+        let msg = err.to_string();
+        // Virheen tulee selittää SYY (tyhjä token) paljastamatta raakaa syötettä
+        // sellaisenaan; staattinen viesti kertoo "must not be empty".
+        assert!(
+            msg.contains("bot_token"),
+            "error should name the offending field, got: {msg}"
         );
     }
 
@@ -678,13 +713,15 @@ mod tests {
     #[test]
     fn from_webhook_debug_does_not_leak_url() {
         // bot_token-kenttään talletettu webhook_url ei saa näkyä Debug-tulosteessa.
-        let ch =
-            DiscordChannel::from_webhook("https://example.invalid/SECRET-WEBHOOK", "discord-main")
-                .expect("channel");
+        let ch = DiscordChannel::from_webhook(
+            "https://example.invalid/webhook-url-marker",
+            "discord-main",
+        )
+        .expect("channel");
         let dbg = format!("{ch:?}");
         assert!(dbg.contains("DiscordChannel"));
         assert!(
-            !dbg.contains("SECRET-WEBHOOK"),
+            !dbg.contains("webhook-url-marker"),
             "webhook url must not appear in Debug output"
         );
     }
