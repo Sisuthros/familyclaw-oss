@@ -68,6 +68,32 @@ readiness sprint — it is hardening, tests, CI hygiene, and doc truth-correctio
 > machine); `deny.toml` is present and CI runs it. GitHub CI is the authoritative
 > gate — see the checks on this PR.
 
+## GitHub CI status (honest)
+
+First CI run on this PR: **5 of 8 checks pass** (Build & Test Windows, Build & Test
+Linux, Clippy + Doc MSVC, Layer B leak audit, cargo audit). Three checks failed —
+all **pre-existing on `main`, not regressions from this sprint** (verified: the
+sprint diff `765394e..HEAD` does not touch the relevant crates/lockfile entries):
+
+1. **`cargo deny`** — `webpki-roots` ships under `CDLA-Permissive-2.0` (the Mozilla
+   CA-bundle data license), which was missing from `deny.toml`'s allow-list. **Fixed
+   in this PR** by adding `CDLA-Permissive-2.0` to the allow-list (the lockfile entry
+   is byte-identical to `main`, so this was already failing on `main`).
+2. **`MSRV (1.85)`** — transitive `icu_*@2.2.0` requires rustc **1.86** (identical
+   versions on `main`). The CI MSRV pin (1.85) is now behind the dependency tree.
+   Raising the pin to 1.86 is a project-level decision (it changes the advertised
+   MSRV) and is **out of scope for this hardening sprint** — flagged for the
+   maintainer, not silently changed.
+3. **`Test (all features)`** — 6 tests in `familyclaw-bench` panic because the
+   `continuity_daemon` binary is not built before the test job runs
+   (`familyclaw_subject.rs:27` asserts the binary exists). This is a pre-existing CI
+   job-ordering gap (the all-features job does not `cargo build --bin
+   continuity_daemon` first); **not touched by this sprint**, flagged for a CI fix.
+
+**Do not merge until these are resolved.** Item 1 is fixed here; items 2 and 3 are
+pre-existing and need a maintainer decision (MSRV bump; add the daemon build step to
+the all-features CI job).
+
 ## Claims this PR makes (allowed)
 
 - **At-most-once external side-effect *dispatch* under crash**, when the journal
