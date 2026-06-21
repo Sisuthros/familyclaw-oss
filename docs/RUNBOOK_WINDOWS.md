@@ -96,8 +96,8 @@ Lisäksi gateway vaatii Telegram-kanavalle:
 LLM-vastaukset (valinnainen mutta suositeltu tuotannossa):
 
 ```powershell
-$env:FAMILYCLAW_PROVIDERS = "anthropic=https://api.anthropic.com/v1=ANTHROPIC_API_KEY"
-$env:ANTHROPIC_API_KEY = "<avaimesi>"
+$env:FAMILYCLAW_PROVIDERS = "openai=https://api.openai.com/v1=OPENAI_API_KEY"
+$env:OPENAI_API_KEY = "<avaimesi>"
 ```
 
 Esimerkki istunnon alustuksesta:

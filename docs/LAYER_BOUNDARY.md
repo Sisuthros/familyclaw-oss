@@ -34,7 +34,7 @@ familyclaw-durable    # Crash-proof replay (Journal trait + FileJournal/InMemory
 familyclaw-dream      # Sleep-time memory consolidation (DreamCycle)
 familyclaw-emotion    # 19-dim VAD emotion state + contagion
 familyclaw-latent     # Experimental hidden-state messaging
-familyclaw-channels   # Discord/Telegram/WhatsApp/Signal adapters
+familyclaw-channels   # Discord + Telegram adapters (WhatsApp/Signal feature stubs reserved, no source yet)
 familyclaw-sandbox    # Wasmtime WASM sandbox with fuel metering
 familyclaw-security   # SHA-256 tamper detection
 familyclaw-core       # Shared types, errors, time, Result

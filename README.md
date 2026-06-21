@@ -193,7 +193,7 @@ Proves: bus startup, 2 agents register, message exchange, memory storage, emotio
 ### Crash Replay Demo
 ```bash
 # Two-process mode (true process boundary)
-cargo run -p familyclaw-agent --bin crash_replay -- --reset
+cargo run -p familyclaw-agent --bin crash_replay -- reset
 cargo run -p familyclaw-agent --bin crash_replay -- write
 cargo run -p familyclaw-agent --bin crash_replay -- verify
 
@@ -207,7 +207,7 @@ Proves: FileJournal + LocalJsonStore persist to disk, process restart reloads bo
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/... \
 cargo run -p familyclaw-agent --features familyclaw-channels/discord
 ```
-Inbound gateway: live — Ed25519 signature verification, slash command parsing (`gateway/src/main.rs:269-379`).
+Inbound gateway: live — Ed25519 signature verification, slash command parsing (`crates/familyclaw-gateway/src/main.rs`, `handle_discord_interaction`).
 
 ---
 

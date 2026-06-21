@@ -35,7 +35,7 @@ Security-sensitive areas include:
 
 - **External side-effect dispatch** — Outbound side effects (tool dispatch, post-approval continuations) are **dispatched at most once under a crash**: each dispatch is bound to a caller-derived idempotency key and journaled in two phases (intent before the side effect, committed after). A committed dispatch replays as a value without re-running the effect; a crash in the narrow intent-only window **fails closed** (zero or one execution, requires recovery) rather than blindly re-firing. This is crash-survival duplicate-prevention — **at-most-once dispatch, not a guarantee of universal exactly-once *completion*.**
 
-- **Channel adapters** — Discord, Telegram, WhatsApp, Signal adapters handle external tokens. Ensure webhook URLs and bot tokens are loaded from environment, never committed.
+- **Channel adapters** — Discord and Telegram adapters handle external tokens (WhatsApp and Signal are reserved feature stubs with no adapter source yet). Ensure webhook URLs and bot tokens are loaded from environment, never committed.
 
 ## Responsible Disclosure
 

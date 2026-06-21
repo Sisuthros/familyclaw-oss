@@ -10,7 +10,7 @@
 //!   `cargo run -p familyclaw-agent --bin crash_replay -- write`
 //!   `cargo run -p familyclaw-agent --bin crash_replay -- verify`
 //!   `cargo run -p familyclaw-agent --bin crash_replay -- full`
-//!   `cargo run -p familyclaw-agent --bin crash_replay -- --reset`
+//!   `cargo run -p familyclaw-agent --bin crash_replay -- reset`
 
 use std::path::PathBuf;
 use std::sync::Arc;

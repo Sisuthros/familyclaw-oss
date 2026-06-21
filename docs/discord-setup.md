@@ -39,8 +39,8 @@ Botti tarvitsee toimiakseen kaksi ympäristömuuttujaa.
 
 Luo projektin juureen tiedosto nimeltä `.env` ja lisää sinne seuraavat rivit:
 ```env
-FAMILYCLAW_DISCORD_TOKEN="Kopioi_botin_token_Bot_sivulta_tähän"
-FAMILYCLAW_DISCORD_CHANNEL_ID="Kopioi_kanava_ID_tähän"
+DISCORD_BOT_TOKEN="Kopioi_botin_token_Bot_sivulta_tähän"
+DISCORD_CHANNEL_ID="Kopioi_kanava_ID_tähän"
 ```
 
 ## 6. Vianetsintä
@@ -48,6 +48,6 @@ FAMILYCLAW_DISCORD_CHANNEL_ID="Kopioi_kanava_ID_tähän"
 | Ongelma / Oire | Syy ja ratkaisu |
 |----------------|-----------------|
 | Tyhjät viestisisällöt | `MESSAGE_CONTENT`-intent puuttuu. Kytke se päälle Discord Developer Portalissa. |
-| HTTP 401 Unauthorized | Väärä tai vanhentunut token. Tarkista `FAMILYCLAW_DISCORD_TOKEN`. |
+| HTTP 401 Unauthorized | Väärä tai vanhentunut token. Tarkista `DISCORD_BOT_TOKEN`. |
 | "Missing Access" tai HTTP 403 | Botti ei ole kyseisellä kanavalla tai siltä puuttuu luku-/kirjoitusoikeudet. |
-| Ei tapahtumia (hiljaista) | Väärä kanava-ID muuttujassa `FAMILYCLAW_DISCORD_CHANNEL_ID`, tai palvelimen `GUILD_MESSAGES`-intent on estetty. |
+| Ei tapahtumia (hiljaista) | Väärä kanava-ID muuttujassa `DISCORD_CHANNEL_ID`, tai botti on yhdistynyt mutta ei vastaanota guild-viestejä (botti tarvitsee `GUILDS`-intentin — ilman sitä guild jää pysyvästi *unavailable* eikä yksikään `MESSAGE_CREATE` saavu; tämä on sisäänrakennettu, ei käyttäjän säädettävä). |
