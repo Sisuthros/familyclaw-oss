@@ -34,7 +34,6 @@ Jotta botti voi lukea viestien sisältöjä, sinun on kytkettävä päälle `MES
 4. Napsauta hiiren oikealla painikkeella sitä tekstikanavaa, jota haluat botin käyttävän, ja valitse **Copy Channel ID** (Kopioi kanavan tunnus).
 
 ## 5. Konfigurointi
-Botti tarvitsee toimiakseen kaksi ympäristömuuttujaa. 
 **TÄRKEÄÄ:** Älä koskaan commitoi botin tokenia versionhallintaan! Lisää tiedosto `.env` `.gitignore`-tiedostoon.
 
 Luo projektin juureen tiedosto nimeltä `.env` ja lisää sinne seuraavat rivit:
@@ -42,6 +41,22 @@ Luo projektin juureen tiedosto nimeltä `.env` ja lisää sinne seuraavat rivit:
 DISCORD_BOT_TOKEN="Kopioi_botin_token_Bot_sivulta_tähän"
 DISCORD_CHANNEL_ID="Kopioi_kanava_ID_tähän"
 ```
+
+### Kaksisuuntainen bot-moodi vs. webhook-postaus
+- **`DISCORD_BOT_TOKEN` asetettu** → gateway käynnistää serenity-gateway-yhteyden:
+  botti **kuuntelee JA postaa** (kaksisuuntainen). Tämä on suositeltu moodi.
+- **Vain `DISCORD_WEBHOOK_URL` asetettu** (ei bot-tokenia) → botti on **send-only**
+  (postaa webhookilla, ei kuuntele viestejä).
+
+### Valinnainen: kahdenkeskinen DM huoltajan kanssa
+```env
+FAMILYCLAW_OWNER_ID="Discord-user-id-numerosi"
+```
+Jos asetettu, vain tämä käyttäjä voi keskustella botin kanssa **yksityisviestillä**
+(DM); vastaus reititetään takaisin DM-kanavalle. Ilman tätä DM:t pudotetaan (vain
+ryhmäkanava `DISCORD_CHANNEL_ID` on aktiivinen). Ryhmäkanavalla ihmiset menevät
+läpi suoraan; toiset botit kuullaan vain kun ne @-mainitsevat botin (estää
+botti-botti-silmukan).
 
 ## 6. Vianetsintä
 
