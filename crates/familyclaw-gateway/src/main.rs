@@ -593,7 +593,10 @@ async fn list_pending_approvals(
         .collect();
     drop(rt);
 
-    info!(count = views.len(), "approvals: listattiin odottavat hyväksynnät (redaktoituina)");
+    info!(
+        count = views.len(),
+        "approvals: listattiin odottavat hyväksynnät (redaktoituina)"
+    );
     let body = serde_json::to_value(&views).unwrap_or_else(|_| serde_json::json!([]));
     (StatusCode::OK, Json(body))
 }
@@ -824,7 +827,10 @@ async fn list_turn_audit(
     // Tapahtumat ovat jo redaktoituja (agentti redaktoi `detail`:n
     // kirjaushetkellä). Serialisoidaan sellaisenaan — ei lisäkäsittelyä.
     let events = audit.list();
-    info!(count = events.len(), "turns: listattiin redaktoitu tool-loop-audit-jälki");
+    info!(
+        count = events.len(),
+        "turns: listattiin redaktoitu tool-loop-audit-jälki"
+    );
     let body = serde_json::to_value(&events).unwrap_or_else(|_| serde_json::json!([]));
     (StatusCode::OK, Json(body))
 }
@@ -880,7 +886,11 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 /// palomuuri) on oikea suojakerros tälle endpointille.
 async fn metrics_handler(
     State(state): State<Arc<GatewayState>>,
-) -> (StatusCode, [(axum::http::header::HeaderName, &'static str); 1], String) {
+) -> (
+    StatusCode,
+    [(axum::http::header::HeaderName, &'static str); 1],
+    String,
+) {
     let content_type = (axum::http::header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE);
     let Some(registry) = state.metrics.as_ref() else {
         return (
@@ -1031,6 +1041,23 @@ impl Channel for SharedDiscordChannel {
 /// (→ `agents_online`-gauge). Kutsujan (serve) on jo tilattava se
 /// [`EventRecorder`]illa ennen tätä kutsua, jotta tapahtuma ei huku.
 ///
+/// Resolvoi `/inject`-suojaustokenin konfiguraatiosta. Tyhjä token = avoin
+/// loopback-only-oletus (varoitus); asetettu token = pakollinen bearer-täsmäys.
+/// Arvoa ei koskaan lokiteta.
+fn resolve_inject_token(cfg: &FamilyConfig) -> Option<Arc<str>> {
+    let raw = cfg.gateway_token().trim();
+    if raw.is_empty() {
+        warn!(
+            "{GATEWAY_TOKEN_ENV} ei asetettu — POST /inject on suojaamaton \
+             (luota loopback-sidontaan). Aseta token tuotannossa."
+        );
+        None
+    } else {
+        info!("POST /inject suojattu bearer-tokenilla ({GATEWAY_TOKEN_ENV})");
+        Some(Arc::from(raw))
+    }
+}
+
 /// Palauttaa runtimen, Discord-kanavan (inject/interactions), inject-tokenin ja public keyn.
 async fn start_runtime(
     bridge: FamilyBridge,
@@ -1045,77 +1072,64 @@ async fn start_runtime(
     let model = cfg.model().to_string();
     let channel_kind = cfg.channel_kind().to_string();
 
-    // /inject-suojaus: tyhjä token = avoin loopback-only-oletus (varoitus),
-    // asetettu token = pakollinen bearer-täsmäys. Arvoa ei koskaan lokiteta.
-    let inject_token: Option<Arc<str>> = {
-        let raw = cfg.gateway_token().trim();
-        if raw.is_empty() {
-            warn!(
-                "{GATEWAY_TOKEN_ENV} ei asetettu — POST /inject on suojaamaton \
-                 (luota loopback-sidontaan). Aseta token tuotannossa."
-            );
-            None
-        } else {
-            info!("POST /inject suojattu bearer-tokenilla ({GATEWAY_TOKEN_ENV})");
-            Some(Arc::from(raw))
-        }
-    };
+    let inject_token: Option<Arc<str>> = resolve_inject_token(&cfg);
 
-    let (channel, discord_ch): (Box<dyn Channel>, Option<Arc<DiscordChannel>>) =
-        if channel_kind == "discord" {
-            let bot_token = cfg.discord_bot_token();
-            let ch_id = cfg.discord_channel_id();
-            // KAKSISUUNTAINEN bot-moodi, jos DISCORD_BOT_TOKEN on asetettu: serenity-
-            // gateway kuuntelee (MESSAGE_CONTENT) JA postaa. Muuten fallback
-            // yksisuuntaiseen webhook-postaukseen (DISCORD_WEBHOOK_URL).
-            // Rakenna DiscordChannel TÄSMÄLLEEN KERRAN ja jaa sama instanssi:
-            // bus-pumppu saa `SharedDiscordChannel`-adapterin, inject-polut `Arc`-
-            // kahvan — molemmat samaan `inbound_tx`/`inbound_rx`-pariin (ei dual-
-            // instance-mustaaukkoa; ks. SharedDiscordChannel-dokumentaatio).
-            let dc = if bot_token.is_empty() {
-                let webhook_url = cfg.discord_webhook_url();
-                if webhook_url.is_empty() {
-                    return Err(FamilyClawError::invalid_input(format!(
+    let (channel, discord_ch): (Box<dyn Channel>, Option<Arc<DiscordChannel>>) = if channel_kind
+        == "discord"
+    {
+        let bot_token = cfg.discord_bot_token();
+        let ch_id = cfg.discord_channel_id();
+        // KAKSISUUNTAINEN bot-moodi, jos DISCORD_BOT_TOKEN on asetettu: serenity-
+        // gateway kuuntelee (MESSAGE_CONTENT) JA postaa. Muuten fallback
+        // yksisuuntaiseen webhook-postaukseen (DISCORD_WEBHOOK_URL).
+        // Rakenna DiscordChannel TÄSMÄLLEEN KERRAN ja jaa sama instanssi: bus-pumppu
+        // saa `SharedDiscordChannel`-adapterin, inject-polut `Arc`-kahvan — molemmat
+        // samaan `inbound_tx`/`inbound_rx`-pariin (ks. SharedDiscordChannel-dokumentaatio).
+        let dc = if bot_token.is_empty() {
+            let webhook_url = cfg.discord_webhook_url();
+            if webhook_url.is_empty() {
+                return Err(FamilyClawError::invalid_input(format!(
                         "discord channel requires DISCORD_BOT_TOKEN (kaksisuuntainen) tai {DISCORD_WEBHOOK_URL_ENV} (postaus)"
                     )));
-                }
-                info!("Discord: yksisuuntainen webhook-postaus");
-                DiscordChannel::from_webhook(webhook_url.to_string(), ch_id.to_string())
-                    .map_err(FamilyClawError::from)?
-            } else {
-                let cid: u64 = ch_id.trim().parse().map_err(|_| {
-                    FamilyClawError::invalid_input(format!(
-                        "DISCORD_CHANNEL_ID must be a numeric id for bot mode, got: {ch_id:?}"
-                    ))
-                })?;
-                let dc = DiscordChannel::new(bot_token.to_string(), cid)
-                    .map_err(FamilyClawError::from)?;
-                // Käynnistä gateway-yhteys: palaa vasta kun `ready` tai virhe.
-                dc.start().await.map_err(FamilyClawError::from)?;
-                info!("Discord: kaksisuuntainen bot-moodi (kanava {cid})");
-                dc
-            };
-            let dc_arc = Arc::new(dc);
-            let ch: Box<dyn Channel> = Box::new(SharedDiscordChannel(Arc::clone(&dc_arc)));
-            (ch, Some(dc_arc))
+            }
+            info!("Discord: yksisuuntainen webhook-postaus");
+            DiscordChannel::from_webhook(webhook_url.to_string(), ch_id.to_string())
+                .map_err(FamilyClawError::from)?
         } else {
-            let token = cfg.telegram_token();
-            if token.is_empty() {
-                return Err(FamilyClawError::invalid_input(format!(
-                    "{TELEGRAM_TOKEN_ENV} must be set"
-                )));
-            }
-            let ch_id = cfg.telegram_channel_id();
-            if ch_id.is_empty() {
-                return Err(FamilyClawError::invalid_input(format!(
-                    "{TELEGRAM_CHANNEL_ID_ENV} must be set"
-                )));
-            }
-            let tc = TelegramChannel::new(token.to_string(), ch_id.to_string())
+            let cid: u64 = ch_id.trim().parse().map_err(|_| {
+                FamilyClawError::invalid_input(format!(
+                    "DISCORD_CHANNEL_ID must be a numeric id for bot mode, got: {ch_id:?}"
+                ))
+            })?;
+            // owner_id konfigista (TOML + env FAMILYCLAW_OWNER_ID config-rajalla); 0 = DM:t pois.
+            let dc = DiscordChannel::new(bot_token.to_string(), cid, cfg.discord_owner_id())
                 .map_err(FamilyClawError::from)?;
-            let ch: Box<dyn Channel> = Box::new(tc);
-            (ch, None)
+            // Käynnistä gateway-yhteys: palaa vasta kun `ready` tai virhe.
+            dc.start().await.map_err(FamilyClawError::from)?;
+            info!("Discord: kaksisuuntainen bot-moodi (kanava {cid})");
+            dc
         };
+        let dc_arc = Arc::new(dc);
+        let ch: Box<dyn Channel> = Box::new(SharedDiscordChannel(Arc::clone(&dc_arc)));
+        (ch, Some(dc_arc))
+    } else {
+        let token = cfg.telegram_token();
+        if token.is_empty() {
+            return Err(FamilyClawError::invalid_input(format!(
+                "{TELEGRAM_TOKEN_ENV} must be set"
+            )));
+        }
+        let ch_id = cfg.telegram_channel_id();
+        if ch_id.is_empty() {
+            return Err(FamilyClawError::invalid_input(format!(
+                "{TELEGRAM_CHANNEL_ID_ENV} must be set"
+            )));
+        }
+        let tc = TelegramChannel::new(token.to_string(), ch_id.to_string())
+            .map_err(FamilyClawError::from)?;
+        let ch: Box<dyn Channel> = Box::new(tc);
+        (ch, None)
+    };
 
     let reply_target = cfg.reply_target();
     if reply_target.is_empty() {
@@ -1217,8 +1231,7 @@ async fn serve() -> Result<()> {
     // HTTP-/sammutuskuori pysyy ennallaan (vain bus.stop() → runtime.shutdown()).
     // Sama `bridge` viedään runtimeen, joka julkaisee sille agentin
     // rekisteröinnin (EventRecorder jo tilannut yllä).
-    let (runtime, discord_ch, inject_token, discord_public_key) =
-        start_runtime(bridge).await?;
+    let (runtime, discord_ch, inject_token, discord_public_key) = start_runtime(bridge).await?;
     info!("FamilyRuntime käynnissä (bus + agentti + kanava)");
 
     // Operaattorin hyväksyntäpinta jakaa SAMAN Arc<Mutex<ActionRuntime>>-kahvan
@@ -1508,16 +1521,13 @@ async fn doctor() -> Result<()> {
     if channel_kind == "discord" {
         // Discord vaatii JOKO bot-tokenin (kaksisuuntainen) TAI webhookin (postaus).
         let has_bot = std::env::var_os(DISCORD_BOT_TOKEN_ENV).is_some_and(|v| !v.is_empty());
-        let has_webhook =
-            std::env::var_os(DISCORD_WEBHOOK_URL_ENV).is_some_and(|v| !v.is_empty());
+        let has_webhook = std::env::var_os(DISCORD_WEBHOOK_URL_ENV).is_some_and(|v| !v.is_empty());
         if has_bot {
             println!("[OK]      env       {DISCORD_BOT_TOKEN_ENV} set (kaksisuuntainen bot)");
         } else if has_webhook {
             println!("[OK]      env       {DISCORD_WEBHOOK_URL_ENV} set (webhook-postaus)");
         } else {
-            println!(
-                "[MISSING] env       {DISCORD_BOT_TOKEN_ENV} tai {DISCORD_WEBHOOK_URL_ENV}"
-            );
+            println!("[MISSING] env       {DISCORD_BOT_TOKEN_ENV} tai {DISCORD_WEBHOOK_URL_ENV}");
             ok = false;
         }
     }
@@ -2036,7 +2046,10 @@ mod tests {
         let item = &arr[0];
         // Vain kolme salaisuudetonta kenttää.
         assert!(item.get("approval_id").and_then(|v| v.as_str()).is_some());
-        assert!(item.get("redacted_summary").and_then(|v| v.as_str()).is_some());
+        assert!(item
+            .get("redacted_summary")
+            .and_then(|v| v.as_str())
+            .is_some());
         assert!(item.get("created_at").and_then(|v| v.as_str()).is_some());
         // EI raakaa payloadia ("bug_report"/"Button does nothing") eikä payload-kenttää.
         let rendered = serde_json::to_string(&body).expect("serialize");
@@ -2081,8 +2094,7 @@ mod tests {
         let (state, _actions) = state_with_actions();
         // Kelvollinen UUID mutta ei odottavaa hyväksyntää → 404 (fail-closed).
         let unknown = ApprovalId::new().to_string();
-        let (status, _) =
-            approve_pending(State(state), HeaderMap::new(), Path(unknown)).await;
+        let (status, _) = approve_pending(State(state), HeaderMap::new(), Path(unknown)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -2098,8 +2110,7 @@ mod tests {
         let past = familyclaw_core::time::from_unix_secs(0).expect("epoch is a valid timestamp");
         let id = submit_pending_at(&actions, past).await;
 
-        let (status, _) =
-            approve_pending(State(state), HeaderMap::new(), Path(id)).await;
+        let (status, _) = approve_pending(State(state), HeaderMap::new(), Path(id)).await;
         assert_eq!(status, StatusCode::GONE);
     }
 
@@ -2132,15 +2143,21 @@ mod tests {
         let (state, actions) = state_with_actions(); // bus: None
         let id = submit_pending(&actions).await;
 
-        let (status, Json(body)) =
-            approve_pending(State(Arc::clone(&state)), HeaderMap::new(), Path(id.clone())).await;
+        let (status, Json(body)) = approve_pending(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Path(id.clone()),
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::SERVICE_UNAVAILABLE,
             "ilman bussia operaattori-approve = 503 (Option A vaatii serve-tilan)"
         );
         assert!(
-            body.get("error").and_then(|v| v.as_str()).is_some_and(|s| s.contains("serve mode")),
+            body.get("error")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("serve mode")),
             "503-virheviesti mainitsee serve-tilan, oli: {body}"
         );
 
@@ -2184,8 +2201,12 @@ mod tests {
         });
         let id = submit_pending(&actions).await;
 
-        let (status, Json(body)) =
-            approve_pending(State(Arc::clone(&state)), HeaderMap::new(), Path(id.clone())).await;
+        let (status, Json(body)) = approve_pending(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Path(id.clone()),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "bussin kanssa approve = 200");
         assert_eq!(
             body.get("status").and_then(|v| v.as_str()),
@@ -2375,13 +2396,14 @@ mod tests {
 
         // 2. Elävä siltatapahtuma: tehtävän luonti (→ tasks_created) ja
         //    valmistuminen (→ tasks_completed Custom-etiketillä).
-        bridge.create_task("live-task", None).await.expect("create_task");
         bridge
-            .bus()
-            .publish(familyclaw_bridge::Event::new(
-                familyclaw_bridge::EventKind::Custom("task.completed".into()),
-                None,
-            ));
+            .create_task("live-task", None)
+            .await
+            .expect("create_task");
+        bridge.bus().publish(familyclaw_bridge::Event::new(
+            familyclaw_bridge::EventKind::Custom("task.completed".into()),
+            None,
+        ));
 
         // 3. Valuta tapahtumat → jaettuun rekisteriin.
         let drained = recorder.drain_once().await;
@@ -2484,8 +2506,7 @@ mod tests {
             "kaatumiskestävyyden puuttuminen näkyy: {line}"
         );
         assert!(
-            line.contains("dispatch_outbox=in-memory")
-                && line.contains("pending_store=in-memory"),
+            line.contains("dispatch_outbox=in-memory") && line.contains("pending_store=in-memory"),
             "molemmat lajitunnisteet näkyvät: {line}"
         );
     }
@@ -2505,8 +2526,7 @@ mod tests {
             "persistentissä tilassa ei OFF-varoitusta: {line}"
         );
         assert!(
-            line.contains("dispatch_outbox=journal")
-                && line.contains("pending_store=journal"),
+            line.contains("dispatch_outbox=journal") && line.contains("pending_store=journal"),
             "journal-lajitunnisteet näkyvät: {line}"
         );
     }
@@ -2660,8 +2680,9 @@ mod tests {
                 )),
                 name: "approval_skill".to_string(),
                 version: "1.0.0".to_string(),
-                description: "Laskeva ulkoisesti kirjoittava toiminto (vaatii hyväksynnän, E2E-testi)."
-                    .to_string(),
+                description:
+                    "Laskeva ulkoisesti kirjoittava toiminto (vaatii hyväksynnän, E2E-testi)."
+                        .to_string(),
                 permissions: vec![familyclaw_actions::policy::SkillPermission::WriteExternal],
                 risk: familyclaw_actions::policy::ActionRisk::WriteExternal,
                 approval_policy: familyclaw_actions::policy::ApprovalPolicy::RequireApproval,
@@ -2742,18 +2763,25 @@ mod tests {
         let config = AgentConfig::new("e2e_agent", ModelConfig::new("scripted/model"));
         let soul = Soul::from_essence("I am the E2E agent.".to_string());
         let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
-        let durable = DurableContext::new(
-            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>,
-        )
-        .expect("durable ctx");
+        let durable =
+            DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
+                .expect("durable ctx");
         let llm_cfg = familyclaw_agent::llm::LlmConfig::new(&api, "test-key", "scripted-model")
             .with_request_timeout_ms(2_000)
             .with_connect_timeout_ms(2_000);
-        let agent = Agent::new(config, soul, memory, durable, bus.clone(), Some(llm_cfg), None)
-            .with_actions(Arc::clone(&actions))
-            .with_turn_audit(Arc::clone(&turn_audit))
-            .with_reply_sink(sink)
-            .with_reply_target("e2e-channel");
+        let agent = Agent::new(
+            config,
+            soul,
+            memory,
+            durable,
+            bus.clone(),
+            Some(llm_cfg),
+            None,
+        )
+        .with_actions(Arc::clone(&actions))
+        .with_turn_audit(Arc::clone(&turn_audit))
+        .with_reply_sink(sink)
+        .with_reply_target("e2e-channel");
 
         // 7. Aja vuoro → tool-loop suspendoituu hyväksyntää vaativaan työkaluun.
         //    Tämä synnyttää AIDON turn_suspended-auditin + odottavan hyväksynnän
@@ -3005,18 +3033,25 @@ mod tests {
         let config = AgentConfig::new("e2e_agent", ModelConfig::new("scripted/model"));
         let soul = Soul::from_essence("I am the E2E agent.".to_string());
         let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
-        let durable = DurableContext::new(
-            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>,
-        )
-        .expect("durable ctx");
+        let durable =
+            DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
+                .expect("durable ctx");
         let llm_cfg = familyclaw_agent::llm::LlmConfig::new(&api, "test-key", "scripted-model")
             .with_request_timeout_ms(2_000)
             .with_connect_timeout_ms(2_000);
-        let agent = Agent::new(config, soul, memory, durable, bus.clone(), Some(llm_cfg), None)
-            .with_actions(Arc::clone(&actions))
-            .with_turn_audit(Arc::clone(&turn_audit))
-            .with_reply_sink(sink)
-            .with_reply_target("e2e-channel");
+        let agent = Agent::new(
+            config,
+            soul,
+            memory,
+            durable,
+            bus.clone(),
+            Some(llm_cfg),
+            None,
+        )
+        .with_actions(Arc::clone(&actions))
+        .with_turn_audit(Arc::clone(&turn_audit))
+        .with_reply_sink(sink)
+        .with_reply_target("e2e-channel");
 
         let out = agent
             .think(&BusMessage::text("ship it"))
@@ -3026,7 +3061,11 @@ mod tests {
             ThinkOutcome::Suspended { approval_id, .. } => approval_id,
             other => panic!("odotettiin Suspended, sai: {other:?}"),
         };
-        assert_eq!(side_effect_count.load(SeqCst), 0, "ei sivuvaikutusta ennen approvea");
+        assert_eq!(
+            side_effect_count.load(SeqCst),
+            0,
+            "ei sivuvaikutusta ennen approvea"
+        );
 
         let _actor = agent.spawn().await.expect("spawn agent actor");
         let state = Arc::new(GatewayState {
@@ -3048,10 +3087,7 @@ mod tests {
         let url = format!("http://{addr}/approvals/{approval_id}/approve");
 
         // Kaksi YHTÄAIKAISTA approve-pyyntöä samalle id:lle.
-        let (r1, r2) = tokio::join!(
-            client.post(&url).send(),
-            client.post(&url).send(),
-        );
+        let (r1, r2) = tokio::join!(client.post(&url).send(), client.post(&url).send(),);
         let s1 = r1.expect("POST approve #1").status().as_u16();
         let s2 = r2.expect("POST approve #2").status().as_u16();
         // Tasan yksi pyyntö saa kuluttaa kertakäyttöisen hyväksynnän (200); toinen
@@ -3141,6 +3177,305 @@ mod tests {
 
         // (2) Kontrolli: täysin tuntematon polku palauttaa 404 (router toimii
         //     oikein, ei matchaa kaikkea).
+        let unknown = client
+            .post(format!("{base}/nonexistent/path"))
+            .send()
+            .await
+            .expect("POST unknown path");
+        assert_eq!(
+            unknown.status().as_u16(),
+            404,
+            "tuntematon polku palauttaa 404 (router ei matchaa sokeasti kaikkea)"
+        );
+
+        server.abort();
+    }
+
+    /// **P0 approval-regressio (kilpa):** kaksi YHTÄAIKAISTA HTTP-tason
+    /// `POST /approvals/{id}/approve` -pyyntöä samalle hyväksynnälle saavat laukaista
+    /// ulkoisen sivuvaikutuksen **TASAN KERRAN**. Käyttää SAMAA aitoa E2E-harnessia
+    /// kuin [`e2e_suspend_approve_resume_reply`] (aito axum-reititin + soketti +
+    /// jaettu `ActionRuntime` laskevalla hyväksyntätaidolla + captattu reply-sink +
+    /// jaettu `AuditCollector`).
+    ///
+    /// **Dokumentoitu semantiikka (Option A, sama kuin tuotanto):** hyväksyntä on
+    /// kertakäyttöinen; ensimmäinen pyyntö kuluttaa sen ja palauttaa `200 resuming`
+    /// (sivuvaikutus + vastaus ajetaan asynkronisesti agentin resume-polulla). Toinen
+    /// rinnakkainen pyyntö joko (a) näkee hyväksynnän jo kulutettuna ja palauttaa
+    /// turvallisen ei-onnistumisen (404), TAI (b) palauttaa myös 200 jos se ehtii
+    /// ennen kulutusta — mutta kummassakin tapauksessa ulkoinen sivuvaikutus
+    /// dispatchataan KORKEINTAAN KERRAN (kertakäyttöinen hyväksyntä serialisoituu
+    /// jaetun `Mutex<ActionRuntime>`-lukon takana). Testi vahvistaa: tasan yksi 200
+    /// EI ole pakollinen (rinnakkaisuus voi tuottaa 1 tai 2 × 200), mutta sivuvaikutus
+    /// == 1, tasan yksi `turn_resumed`/`turn_answered`, korkeintaan yksi lopullinen reply,
+    /// eikä actor kaadu/paniikkaa.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn approval_double_post_race_runs_side_effect_once() {
+        use familyclaw_agent::{new_reply_channel, Agent, ErasedMemoryStore, ThinkOutcome};
+        use familyclaw_bus::{BusMessage, ResonanceBus};
+        use familyclaw_durable::{DurableContext, InMemoryJournal, Journal};
+        use familyclaw_memory::LocalJsonStore;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // 1. Bus + skriptattu LLM (suspend-työkalukutsu → lopullinen teksti) — sama
+        //    kuvio kuin e2e_suspend_approve_resume_reply.
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let api = spawn_scripted_llm_e2e(vec![
+            e2e_body_tool_call(
+                "call_approve",
+                "approval_skill",
+                &serde_json::json!({ "q": "ship" }),
+            ),
+            e2e_body_text("hyväksytty toiminto valmis"),
+        ])
+        .await;
+
+        // 2. Jaettu ActionRuntime laskevalla hyväksyntätaidolla (sivuvaikutusmittari).
+        let side_effect_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut rt = ActionRuntime::new();
+        rt.register_skill(E2eCountingApprovalSkill {
+            count: std::sync::Arc::clone(&side_effect_count),
+        })
+        .expect("register approval_skill");
+        let actions: Arc<Mutex<ActionRuntime>> = Arc::new(Mutex::new(rt));
+        let turn_audit: Arc<AuditCollector> = Arc::new(AuditCollector::new());
+        let (sink, mut reply_rx) = new_reply_channel();
+
+        // 3. Aito agentti jaetuilla kahvoilla (sama kytkentä kuin build_family).
+        let config = AgentConfig::new("e2e_agent", ModelConfig::new("scripted/model"));
+        let soul = Soul::from_essence("I am the E2E agent.".to_string());
+        let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
+        let durable =
+            DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
+                .expect("durable ctx");
+        let llm_cfg = familyclaw_agent::llm::LlmConfig::new(&api, "test-key", "scripted-model")
+            .with_request_timeout_ms(2_000)
+            .with_connect_timeout_ms(2_000);
+        let agent = Agent::new(
+            config,
+            soul,
+            memory,
+            durable,
+            bus.clone(),
+            Some(llm_cfg),
+            None,
+        )
+        .with_actions(Arc::clone(&actions))
+        .with_turn_audit(Arc::clone(&turn_audit))
+        .with_reply_sink(sink)
+        .with_reply_target("e2e-channel");
+
+        // 4. Aja vuoro → suspendoituu yhteen odottavaan hyväksyntään.
+        let out = agent
+            .think(&BusMessage::text("ship it"))
+            .await
+            .expect("think suspends");
+        let approval_id = match out {
+            ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+            other => panic!("odotettiin Suspended, sai: {other:?}"),
+        };
+        assert_eq!(
+            side_effect_count.load(SeqCst),
+            0,
+            "sivuvaikutus EI saa ajaa ennen approvea"
+        );
+
+        // 5. Spawnaa agentti actoriksi (ResumeApproval-signaali tavoittaa sen
+        //    postilaatikon) + GatewayState jakaa SAMAN actions/turn_audit/bus-kahvan.
+        let _actor = agent.spawn().await.expect("spawn agent actor");
+        let state = Arc::new(GatewayState {
+            bus: Some(bus.clone()),
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: Some(Arc::clone(&actions)),
+            turn_audit: Some(Arc::clone(&turn_audit)),
+            metrics: None,
+        });
+        let app = build_router(state);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/approvals/{approval_id}/approve");
+
+        // 6. KAKSI YHTÄAIKAISTA approve-pyyntöä samalle id:lle (aito soketti).
+        let (r1, r2) = tokio::join!(client.post(&url).send(), client.post(&url).send());
+        let s1 = r1.expect("POST approve #1").status().as_u16();
+        let s2 = r2.expect("POST approve #2").status().as_u16();
+        // Semantiikka (dokumentoitu yllä): ainakin yksi 200 (resuming); toinen joko
+        // 200 (ehti ennen kulutusta) tai 404 (jo kulutettu). Kumpikaan EI 5xx.
+        let oks = u8::from(s1 == 200) + u8::from(s2 == 200);
+        assert!(
+            oks >= 1,
+            "ainakin yksi rinnakkainen approve onnistuu (sai {s1}/{s2})"
+        );
+        assert!(
+            s1 < 500 && s2 < 500,
+            "kumpikaan rinnakkainen approve ei saa tuottaa 5xx-kaatumista (sai {s1}/{s2})"
+        );
+        for s in [s1, s2] {
+            assert!(
+                s == 200 || s == 404,
+                "rinnakkainen approve on joko 200 (resuming) tai 404 (jo kulutettu), oli {s}"
+            );
+        }
+
+        // 7. Odota että asynkroninen resume valmistuu, sitten todista invariantit.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut reply_count = 0u8;
+        loop {
+            while reply_rx.try_recv().is_ok() {
+                reply_count += 1;
+            }
+            let audit = client
+                .get(format!("http://{addr}/turns/audit"))
+                .send()
+                .await
+                .expect("GET /turns/audit")
+                .text()
+                .await
+                .expect("audit body");
+            let done = side_effect_count.load(SeqCst) >= 1
+                && audit.contains("turn_resumed")
+                && audit.contains("turn_answered");
+            if done || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // 8. **Kovat väitteet.** Sivuvaikutus ajettiin TASAN KERRAN — kilpa kahden
+        //    HTTP-pyynnön välillä ei riko kertakäyttöistä hyväksyntää.
+        assert_eq!(
+            side_effect_count.load(SeqCst),
+            1,
+            "ulkoinen sivuvaikutus dispatchataan TASAN KERRAN myös rinnakkaisen \
+             kaksois-approven alla (sai {})",
+            side_effect_count.load(SeqCst)
+        );
+        // Auditin pitää näyttää TASAN yksi tehokas jatkettu vuoro (yksi turn_resumed
+        // + yksi turn_answered) — ei kahta jatkoa.
+        let final_audit = client
+            .get(format!("http://{addr}/turns/audit"))
+            .send()
+            .await
+            .expect("GET /turns/audit (final)")
+            .text()
+            .await
+            .expect("audit body (final)");
+        assert_eq!(
+            final_audit.matches("turn_resumed").count(),
+            1,
+            "tasan yksi turn_resumed (hyväksyntä ei jatka vuoroa kahdesti), audit:\n{final_audit}"
+        );
+        assert_eq!(
+            final_audit.matches("turn_answered").count(),
+            1,
+            "tasan yksi turn_answered (yksi lopullinen vastaus), audit:\n{final_audit}"
+        );
+
+        // 9. Imuroi reply-sinkki muutaman lisäsyklin ajan ja varmista ettei
+        //    sivuvaikutus enää nouse eikä toista vastausta saavu (ei kaksoislaukaisua).
+        for _ in 0..6 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            while reply_rx.try_recv().is_ok() {
+                reply_count += 1;
+            }
+            assert_eq!(
+                side_effect_count.load(SeqCst),
+                1,
+                "sivuvaikutus ei saa laueta toista kertaa (kertakäyttöinen hyväksyntä)"
+            );
+        }
+        assert!(
+            reply_count <= 1,
+            "korkeintaan yksi lopullinen reply tavoittaa reply-sinkin (sai {reply_count})"
+        );
+
+        server.abort();
+        bus.stop();
+    }
+
+    /// **P0 approval-regressio (reitti-syntaksi axum 0.7):** vartioi että hyväksyntä-
+    /// reitti on rekisteröity `:approval_id`-kaappauksena EIKÄ kirjaimellisena
+    /// brace-segmenttinä. axum 0.7 / matchit 0.7 tulkitsee brace-muotoisen segmentin
+    /// literaaliksi polkusegmentiksi, joten brace-reitti EI matchaa todellisia id:itä.
+    ///
+    /// **Empiirisesti todettu semantiikka (tämä repo, axum 0.7.9 / matchit 0.7.3):**
+    /// - Oikea reitti `:approval_id`: mielivaltainen id (ml. oikea UUID) MATCHAA →
+    ///   handler ajaa → 503 (ilman actions-runtimea). Myös kirjaimellinen brace-
+    ///   segmentti matchaa, koska se on vain yksi kaapattu arvo → 503.
+    /// - BUGATTU brace-reitti (literaali): KAIKKI pyynnöt — sekä oikea UUID ETTÄ
+    ///   kirjaimellinen brace-polku — palauttavat 404 (literaali ei matchaa oikeaa
+    ///   id:tä; empiirisesti todennettu probella ennen tämän testin kirjoittamista).
+    ///
+    /// Ratkaiseva erotin regression havaitsemiseksi on siis **OIKEA UUID matchaa
+    /// (503, ei 404)**. Jos joku palauttaa reitin brace-muotoon, oikea UUID alkaa
+    /// palauttaa 404 → tämä testi punaistuu (todennettu temp-revertillä). Brace-polun
+    /// käytös dokumentoidaan ja varmistetaan ettei se tuota onnistunutta hyväksyntää.
+    #[tokio::test]
+    async fn approval_literal_braces_route_does_not_match_on_axum_07() {
+        // GatewayState ILMAN actions-runtimea → matchannut reitti vastaa 503,
+        // matchaamaton reitti vastaa 404. (Bearer ohitetaan kun inject_token = None.)
+        let state = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: None,
+            turn_audit: None,
+            metrics: None,
+        });
+        let app = build_router(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // (1) RATKAISEVA: oikea UUID tavoittaa hyväksyntä-handlerin → 503 (ei runtimea).
+        //     Jos reitti olisi literaali brace-muoto, tämä palauttaisi 404 ja testi
+        //     punaistuisi. TÄMÄ rivi pakottaa `:approval_id`-syntaksin.
+        let real_uuid = "11111111-1111-4111-8111-111111111111";
+        let real = client
+            .post(format!("{base}/approvals/{real_uuid}/approve"))
+            .send()
+            .await
+            .expect("POST real uuid");
+        assert_eq!(
+            real.status().as_u16(),
+            503,
+            "oikea UUID tavoittaa approval-handlerin (503 ilman runtimea); 404 \
+             tarkoittaisi paluuta literaaliin brace-reittiin (axum 0.7 -bugi)"
+        );
+
+        // (2) Kirjaimellinen brace-polku `/approvals/{{approval_id}}/approve` EI saa
+        //     tuottaa ONNISTUNUTTA hyväksyntää. Oikean `:approval_id`-reitin alla se
+        //     matchaa kaapattuna arvona ja päätyy 503:een (ei runtimea) — EI 2xx.
+        //     Tämä todistaa ettei kirjaimellinen brace ole erikoiskäsitelty
+        //     onnistumispolku.
+        let braces = client
+            .post(format!("{base}/approvals/{{approval_id}}/approve"))
+            .send()
+            .await
+            .expect("POST literal braces");
+        let braces_status = braces.status().as_u16();
+        assert!(
+            !(200..300).contains(&braces_status),
+            "kirjaimellinen brace-polku ei saa tuottaa onnistunutta hyväksyntää (oli {braces_status})"
+        );
+
+        // (3) Kontrolli: täysin tuntematon polku palauttaa 404 (router ei matchaa
+        //     sokeasti kaikkea) — varmistaa että 503 yllä on aito reitti-match eikä
+        //     catch-all.
         let unknown = client
             .post(format!("{base}/nonexistent/path"))
             .send()

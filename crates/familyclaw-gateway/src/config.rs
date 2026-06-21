@@ -43,6 +43,11 @@ pub struct DiscordCfg {
     /// Discord bot token. Jos asetettu, gateway käyttää kaksisuuntaista
     /// serenity-bot-yhteyttä (kuuntelee + postaa) webhook-postauksen sijaan.
     pub bot_token: String,
+    /// Huoltajan/operaattorin Discord-user-id. Vain tämä id saa `DMata` agenttia
+    /// (kahdenkeskinen keskustelu). 0 = ei asetettu → DM:t pudotetaan kaikilta
+    /// (turvallinen oletus, ei koskaan "kaikki DM:t sallittu"). TOML-kentästä tai
+    /// env-ylikirjoituksesta `FAMILYCLAW_OWNER_ID`.
+    pub owner_id: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -104,6 +109,8 @@ impl Default for DiscordCfg {
             channel_id: "discord-main".into(),
             public_key: String::new(),
             bot_token: String::new(),
+            // 0 = ei huoltajaa asetettu → DM:t pois (turvallinen oletus).
+            owner_id: 0,
         }
     }
 }
@@ -227,6 +234,21 @@ impl FamilyConfig {
         if let Ok(v) = std::env::var("DISCORD_BOT_TOKEN") {
             self.channel.discord.bot_token = v;
         }
+        // Huoltajan Discord-user-id DM-portille. Virheellinen arvo EI ohita
+        // turvallista oletusta: varoitetaan ja säilytetään TOML-/default-arvo
+        // (ei koskaan "kaikki DM:t sallittu"). Tyhjä string parsitaan myös
+        // virheelliseksi → varoitus, mutta tyhjä env-arvo on harvinainen.
+        if let Ok(v) = std::env::var("FAMILYCLAW_OWNER_ID") {
+            if let Ok(n) = v.trim().parse::<u64>() {
+                self.channel.discord.owner_id = n;
+            } else {
+                tracing::warn!(
+                    value = %v,
+                    "FAMILYCLAW_OWNER_ID is not a valid u64 — ignoring env override, \
+                     keeping configured owner_id (DMs stay disabled if owner_id is 0)"
+                );
+            }
+        }
         if let Ok(v) = std::env::var("TELEGRAM_BOT_TOKEN") {
             self.channel.telegram.token = v;
         }
@@ -266,6 +288,10 @@ impl FamilyConfig {
     }
     pub fn discord_bot_token(&self) -> &str {
         &self.channel.discord.bot_token
+    }
+    /// Huoltajan Discord-user-id DM-portille. 0 = ei asetettu → DM:t pois.
+    pub fn discord_owner_id(&self) -> u64 {
+        self.channel.discord.owner_id
     }
     pub fn telegram_token(&self) -> &str {
         &self.channel.telegram.token
@@ -338,6 +364,69 @@ mod tests {
         // Siivous.
         std::env::remove_var(CANON);
         std::env::remove_var(ALIAS);
+    }
+
+    /// Huoltajan `owner_id` latautuu TOML:sta DiscordCfg-kenttänä.
+    #[test]
+    fn owner_id_loads_from_toml() {
+        let toml = r"
+[channel.discord]
+owner_id = 123456789
+";
+        let cfg: FamilyConfig = toml::from_str(toml).expect("parse toml");
+        assert_eq!(cfg.discord_owner_id(), 123_456_789);
+    }
+
+    /// Puuttuva `owner_id` → oletus 0 → DM:t pois (turvallinen oletus).
+    #[test]
+    fn missing_owner_id_defaults_to_zero_disabling_dms() {
+        let cfg = FamilyConfig::default();
+        assert_eq!(
+            cfg.discord_owner_id(),
+            0,
+            "puuttuva owner_id → 0 → DM:t pudotetaan, ei koskaan 'kaikki sallittu'"
+        );
+    }
+
+    /// `FAMILYCLAW_OWNER_ID` ylikirjoittaa TOML-arvon; virheellinen arvo
+    /// EI ohita turvallista oletusta (säilyttää TOML-/default-arvon + varoittaa).
+    ///
+    /// Env-muuttujat ovat prosessin laajuisia → kaikki tapaukset peräkkäin
+    /// yhdessä testissä ja siivous lopuksi.
+    #[test]
+    fn owner_id_env_overrides_toml_and_invalid_fails_safe() {
+        const ENV: &str = "FAMILYCLAW_OWNER_ID";
+        std::env::remove_var(ENV);
+
+        // Validi env → ylikirjoittaa TOML-arvon.
+        let mut cfg: FamilyConfig =
+            toml::from_str("[channel.discord]\nowner_id = 111\n").expect("parse toml");
+        std::env::set_var(ENV, "222");
+        cfg.apply_env();
+        assert_eq!(cfg.discord_owner_id(), 222, "env voittaa TOML:n");
+
+        // Virheellinen env → EI ohita: TOML-arvo säilyy (fail-safe + varoitus).
+        let mut cfg: FamilyConfig =
+            toml::from_str("[channel.discord]\nowner_id = 333\n").expect("parse toml");
+        std::env::set_var(ENV, "not-a-number");
+        cfg.apply_env();
+        assert_eq!(
+            cfg.discord_owner_id(),
+            333,
+            "virheellinen env ei ohita turvallista oletusta → TOML-arvo säilyy"
+        );
+
+        // Virheellinen env ilman TOML-arvoa → pysyy default 0 (DM:t pois).
+        let mut cfg = FamilyConfig::default();
+        std::env::set_var(ENV, "xyz");
+        cfg.apply_env();
+        assert_eq!(
+            cfg.discord_owner_id(),
+            0,
+            "virheellinen env + ei TOML → 0 → DM:t pois (fail-safe)"
+        );
+
+        std::env::remove_var(ENV);
     }
 
     /// FIX 4: oletusmallin on oltava provider-prefixed `provider/model`

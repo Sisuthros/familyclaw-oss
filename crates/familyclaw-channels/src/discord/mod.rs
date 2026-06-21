@@ -84,8 +84,9 @@ pub struct DiscordChannel {
     /// graceful shutdowniin.
     shard_manager: Mutex<Option<Arc<ShardManager>>>,
     /// Huoltajan/operaattorin Discord-user-id. Vain tämä id saa `DMata` agenttia
-    /// (kahdenkeskinen keskustelu). Luetaan env `FAMILYCLAW_OWNER_ID`:stä; 0 =
-    /// ei asetettu → DM:t pudotetaan kaikilta (turvallinen oletus).
+    /// (kahdenkeskinen keskustelu). Annetaan konstruktorissa (johdetaan
+    /// runtime-konfigista, EI lueta env:stä tässä kerroksessa); 0 = ei asetettu
+    /// → DM:t pudotetaan kaikilta (turvallinen oletus).
     owner_id: u64,
 }
 
@@ -93,13 +94,20 @@ impl DiscordChannel {
     /// Luo uuden Discord-kanavan.
     ///
     /// # Arguments
-    /// * `bot_token` — Discord bot token (ladataan env:stä, ei kovakoodata).
+    /// * `bot_token` — Discord bot token (ladataan runtime-konfigista, ei kovakoodata).
     /// * `target_channel_id` — kohdekanavan id Discordissa (ei saa olla 0).
+    /// * `owner_id` — huoltajan Discord-user-id DM-portille (johdetaan
+    ///   runtime-konfigista). 0 = ei asetettu → DM:t pudotetaan (turvallinen
+    ///   oletus). Tätä EI lueta env:stä tässä — konfig-kerros resolvoi sen.
     ///
     /// # Errors
     /// [`ChannelError::InvalidInput`] jos token on tyhjä tai `target_channel_id`
     /// on 0.
-    pub fn new(bot_token: impl Into<String>, target_channel_id: u64) -> ChannelResult<Self> {
+    pub fn new(
+        bot_token: impl Into<String>,
+        target_channel_id: u64,
+        owner_id: u64,
+    ) -> ChannelResult<Self> {
         let bot_token = bot_token.into();
 
         if bot_token.trim().is_empty() {
@@ -119,11 +127,8 @@ impl DiscordChannel {
         // toteutus pudotti vastaanottimen konstruktorissa (viestejä ei saatu).
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
 
-        // Huoltajan id env:stä (kahdenkeskinen DM). 0 = ei asetettu → DM:t pois.
-        let owner_id = std::env::var("FAMILYCLAW_OWNER_ID")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(0);
+        // Huoltajan id annetaan konfig-kerroksesta (kahdenkeskinen DM). 0 = ei
+        // asetettu → DM:t pois. Tätä EI lueta env:stä tässä — konfig resolvoi.
 
         Ok(Self {
             channel_id,
@@ -381,7 +386,12 @@ impl EventHandler for DiscordHandler {
     // Diagnostiikka: lokita JOKAINEN guild-availability-eventti. Jos guild jää
     // pysyvästi `unavailable` eikä guild_create laukea, gateway ei saa guild-
     // viestejä — tämä handler tekee sen näkyväksi (gateway-debug).
-    async fn guild_create(&self, _ctx: Context, guild: serenity::model::guild::Guild, is_new: Option<bool>) {
+    async fn guild_create(
+        &self,
+        _ctx: Context,
+        guild: serenity::model::guild::Guild,
+        is_new: Option<bool>,
+    ) {
         info!(
             guild_id = guild.id.get(),
             channels = guild.channels.len(),
@@ -462,7 +472,7 @@ impl Channel for DiscordChannel {
                 return Err(ChannelError::invalid_input(format!(
                     "channel '{channel_id}' is inbound-only (no numeric Discord channel id); \
                      outbound send is not supported on a webhook-only instance — \
-                     construct DiscordChannel::new(bot_token, target_channel_id) for sending"
+                     construct DiscordChannel::new(bot_token, target_channel_id, owner_id) for sending"
                 )));
             }
             let target = ChannelId::new(target_id);
@@ -524,22 +534,38 @@ mod tests {
 
     #[test]
     fn new_discord_channel_validates_tokens() {
-        assert!(DiscordChannel::new("", 123_456).is_err());
-        assert!(DiscordChannel::new("  ", 123_456).is_err());
-        assert!(DiscordChannel::new("valid_token", 0).is_err());
-        assert!(DiscordChannel::new("valid_token", 123_456).is_ok());
+        assert!(DiscordChannel::new("", 123_456, 0).is_err());
+        assert!(DiscordChannel::new("  ", 123_456, 0).is_err());
+        assert!(DiscordChannel::new("valid_token", 0, 0).is_err());
+        assert!(DiscordChannel::new("valid_token", 123_456, 0).is_ok());
+    }
+
+    /// Regressiovartija: `DiscordChannel::new` EI saa lukea `FAMILYCLAW_OWNER_ID`:tä
+    /// env:stä — `owner_id` annetaan konstruktorissa (konfig-kerros resolvoi env:n).
+    /// Asetetaan env tarkoituksella ERI arvoon kuin argumentti ja todennetaan että
+    /// instanssi käyttää ARGUMENTTIA, ei env-arvoa. (Allekirjoitus pakottaa tämän jo
+    /// käännösaikaisesti, mutta tämä todentaa myös ajonaikaisen käytöksen.)
+    #[test]
+    fn new_uses_owner_id_argument_not_env() {
+        std::env::set_var("FAMILYCLAW_OWNER_ID", "999999");
+        let ch = DiscordChannel::new("token", 123_456, 42).expect("channel");
+        assert_eq!(
+            ch.owner_id, 42,
+            "owner_id must come from the constructor argument, not env"
+        );
+        std::env::remove_var("FAMILYCLAW_OWNER_ID");
     }
 
     #[test]
     fn channel_id_and_kind() {
-        let ch = DiscordChannel::new("test_token", 987_654).expect("channel");
+        let ch = DiscordChannel::new("test_token", 987_654, 0).expect("channel");
         assert_eq!(ch.channel_id(), "discord-987654");
         assert_eq!(ch.kind(), ChannelKind::Discord);
     }
 
     #[test]
     fn debug_does_not_leak_token() {
-        let ch = DiscordChannel::new("SECRET-TOKEN-123", 555).expect("channel");
+        let ch = DiscordChannel::new("SECRET-TOKEN-123", 555, 0).expect("channel");
         let dbg = format!("{ch:?}");
         assert!(dbg.contains("DiscordChannel"));
         assert!(dbg.contains("discord-555"));
@@ -551,7 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn receive_twice_returns_error() {
-        let ch = DiscordChannel::new("token", 123).expect("channel");
+        let ch = DiscordChannel::new("token", 123, 0).expect("channel");
         assert!(ch.receive().is_ok(), "first receive() yields the stream");
         assert!(
             ch.receive().is_err(),
@@ -561,7 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_tx_reaches_receive_stream() {
-        let ch = DiscordChannel::new("token", 777).expect("channel");
+        let ch = DiscordChannel::new("token", 777, 0).expect("channel");
         let mut stream = ch.receive().expect("stream");
 
         // Simuloi gatewayn vastaanottama viesti raita B:n map_message-funktion
@@ -577,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_without_start_is_ok() {
-        let ch = DiscordChannel::new("token", 1).expect("channel");
+        let ch = DiscordChannel::new("token", 1, 0).expect("channel");
         assert!(
             ch.stop().await.is_ok(),
             "stop() before start() is idempotent"

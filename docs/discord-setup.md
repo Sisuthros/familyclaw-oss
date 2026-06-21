@@ -49,14 +49,27 @@ DISCORD_CHANNEL_ID="Kopioi_kanava_ID_tähän"
   (postaa webhookilla, ei kuuntele viestejä).
 
 ### Valinnainen: kahdenkeskinen DM huoltajan kanssa
+Huoltajan id voidaan asettaa kahdella tavalla. **Env-arvo ylikirjoittaa
+TOML-arvon.**
+
+Env-muuttujana:
 ```env
 FAMILYCLAW_OWNER_ID="Discord-user-id-numerosi"
 ```
+
+Tai `familyclaw.toml`-tiedostossa:
+```toml
+[channel.discord]
+owner_id = 123456789012345678
+```
+
 Jos asetettu, vain tämä käyttäjä voi keskustella botin kanssa **yksityisviestillä**
-(DM); vastaus reititetään takaisin DM-kanavalle. Ilman tätä DM:t pudotetaan (vain
-ryhmäkanava `DISCORD_CHANNEL_ID` on aktiivinen). Ryhmäkanavalla ihmiset menevät
-läpi suoraan; toiset botit kuullaan vain kun ne @-mainitsevat botin (estää
-botti-botti-silmukan).
+(DM); vastaus reititetään takaisin DM-kanavalle. Ilman tätä (puuttuva, `0` tai
+virheellinen arvo) DM:t pudotetaan — koskaan ei "kaikki DM:t sallittu" — ja vain
+ryhmäkanava `DISCORD_CHANNEL_ID` on aktiivinen. Virheellinen `FAMILYCLAW_OWNER_ID`
+(ei numero) jätetään huomiotta varoituksella, ja TOML-/oletusarvo säilyy.
+Ryhmäkanavalla ihmiset menevät läpi suoraan; toiset botit kuullaan vain kun ne
+@-mainitsevat botin (estää botti-botti-silmukan).
 
 ## 6. Vianetsintä
 

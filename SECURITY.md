@@ -15,7 +15,7 @@ FamilyClaw is currently **pre-1.0**. Security fixes apply to the `main` branch u
 
 Report privately through:
 - GitHub Security Advisories (preferred): https://github.com/Sisuthros/familyclaw/security/advisories/new
-- Email: viltsu.operator@gmail.com
+- Or contact a maintainer privately via GitHub (see the repository profile)
 
 We aim to acknowledge valid reports promptly.
 

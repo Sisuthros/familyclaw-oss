@@ -115,7 +115,9 @@ mod tests {
         body: &str,
         mentions: bool,
     ) -> Option<crate::message::InboundEnvelope> {
-        map_message(author, bot, chan, target, body, SELF_ID, mentions, false, OWNER_ID)
+        map_message(
+            author, bot, chan, target, body, SELF_ID, mentions, false, OWNER_ID,
+        )
     }
 
     #[test]
@@ -160,8 +162,18 @@ mod tests {
     fn dm_from_owner_is_heard_and_replies_to_dm_channel() {
         // DM huoltajalta (owner): läpäisee, vastaus DM-kanavalle (channel_id 500).
         // target_channel_id 100 (ryhmä) jätetään huomiotta DM:ssä.
-        let env = map_message(OWNER_ID, false, 500, 100, "hei agentti", SELF_ID, false, true, OWNER_ID)
-            .expect("owner DM heard");
+        let env = map_message(
+            OWNER_ID,
+            false,
+            500,
+            100,
+            "hei agentti",
+            SELF_ID,
+            false,
+            true,
+            OWNER_ID,
+        )
+        .expect("owner DM heard");
         assert_eq!(env.sender, OWNER_ID.to_string());
         // Vastaus reititetään DM-kanavalle (500), EI ryhmään (100).
         assert_eq!(env.channel_id, "500");
@@ -177,7 +189,9 @@ mod tests {
     #[test]
     fn dm_from_bot_is_dropped_even_if_owner_id_matches() {
         // DM botilta pudotetaan aina (vaikka id sattuisi owneriin).
-        assert!(map_message(OWNER_ID, true, 500, 100, "moi", SELF_ID, false, true, OWNER_ID).is_none());
+        assert!(
+            map_message(OWNER_ID, true, 500, 100, "moi", SELF_ID, false, true, OWNER_ID).is_none()
+        );
     }
 
     #[test]

@@ -36,7 +36,7 @@ This Code of Conduct applies within all community spaces, and also applies when 
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement at viltsu.operator@gmail.com. All complaints will be reviewed and investigated promptly and fairly.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported privately to the project maintainers through GitHub. For security-sensitive reports, please use the repository's private vulnerability reporting (GitHub Security Advisories). For conduct issues, contact the maintainers privately via GitHub (for example, by opening a private security advisory or contacting a maintainer listed on the repository profile). All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the reporter of any incident.
 
