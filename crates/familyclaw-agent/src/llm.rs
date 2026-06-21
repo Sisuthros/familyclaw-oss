@@ -762,8 +762,14 @@ mod tests {
             tool_choice: None,
         };
         let json = serde_json::to_value(&req).expect("serialize");
-        assert!(json.get("tools").is_none(), "tools must be omitted when empty");
-        assert!(json.get("tool_choice").is_none(), "tool_choice must be omitted when None");
+        assert!(
+            json.get("tools").is_none(),
+            "tools must be omitted when empty"
+        );
+        assert!(
+            json.get("tool_choice").is_none(),
+            "tool_choice must be omitted when None"
+        );
         assert_eq!(json["model"], "m");
         assert_eq!(json["max_tokens"], 100);
     }
@@ -827,7 +833,10 @@ mod tests {
             description: "d".into(),
             input_schema: serde_json::json!({"type": "object"}),
         };
-        assert!(matches!(bad_chars.validate(), Err(LlmError::InvalidTool(_))));
+        assert!(matches!(
+            bad_chars.validate(),
+            Err(LlmError::InvalidTool(_))
+        ));
 
         let empty = ToolDefinition {
             name: String::new(),

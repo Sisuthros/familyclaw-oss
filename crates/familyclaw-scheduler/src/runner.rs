@@ -191,11 +191,10 @@ mod tests {
             ActionRuntime::new(),
             StdDuration::from_millis(10),
         );
-        let signal = runner
-            .run(move || {
-                calls_clone.fetch_add(1, Ordering::SeqCst);
-                now_at_secs(0)
-            });
+        let signal = runner.run(move || {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+            now_at_secs(0)
+        });
 
         // Anna muutaman tikin tapahtua paused-ajassa.
         tokio::time::advance(StdDuration::from_millis(35)).await;
@@ -213,7 +212,10 @@ mod tests {
         tokio::time::advance(StdDuration::from_millis(100)).await;
         tokio::task::yield_now().await;
         let final_count = calls.load(Ordering::SeqCst);
-        assert_eq!(after, final_count, "peruutuksen jälkeen ei saa tikittää lisää");
+        assert_eq!(
+            after, final_count,
+            "peruutuksen jälkeen ei saa tikittää lisää"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -226,11 +228,10 @@ mod tests {
             ActionRuntime::new(),
             StdDuration::from_millis(10),
         );
-        let signal = runner
-            .run(move || {
-                calls_clone.fetch_add(1, Ordering::SeqCst);
-                now_at_secs(0)
-            });
+        let signal = runner.run(move || {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+            now_at_secs(0)
+        });
 
         tokio::time::advance(StdDuration::from_millis(25)).await;
         tokio::task::yield_now().await;
@@ -244,7 +245,11 @@ mod tests {
 
         tokio::time::advance(StdDuration::from_millis(100)).await;
         tokio::task::yield_now().await;
-        assert_eq!(after, calls.load(Ordering::SeqCst), "pudotuksen jälkeen ei lisää tikkejä");
+        assert_eq!(
+            after,
+            calls.load(Ordering::SeqCst),
+            "pudotuksen jälkeen ei lisää tikkejä"
+        );
     }
 
     #[test]

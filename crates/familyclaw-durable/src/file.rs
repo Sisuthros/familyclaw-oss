@@ -379,10 +379,10 @@ impl FileJournal {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let mut name = self
-            .path
-            .file_name()
-            .map_or_else(|| "journal".to_string(), |n| n.to_string_lossy().into_owned());
+        let mut name = self.path.file_name().map_or_else(
+            || "journal".to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
         // `write!` String:iin ei voi epäonnistua → tulos sivuutetaan tarkoituksella.
         let _ = write!(name, ".compact-{}-{nanos}.tmp", std::process::id());
         match self.path.parent() {
@@ -907,7 +907,11 @@ mod tests {
 
         // Tiivistä — atominen rename. Heti onnistumisen jälkeen tiedosto on
         // joko TÄYSIN vanha tai TÄYSIN uusi, ei sekoitus.
-        let kept = vec![JournalEntry::completed(StepId::ZERO, "compacted", json!(42))];
+        let kept = vec![JournalEntry::completed(
+            StepId::ZERO,
+            "compacted",
+            json!(42),
+        )];
         j.rewrite(&kept).expect("rewrite");
         let after = std::fs::read_to_string(j.path()).expect("read after");
 
@@ -1002,7 +1006,11 @@ mod tests {
                     assert_eq!(e.step_id, StepId::new(i as u64));
                 }
                 // Säilytä vain yksi (uudelleennumeroitu) elävä rivi.
-                Ok(vec![JournalEntry::completed(StepId::ZERO, "compacted", json!(99))])
+                Ok(vec![JournalEntry::completed(
+                    StepId::ZERO,
+                    "compacted",
+                    json!(99),
+                )])
             })
             .expect("compact_with");
         assert_eq!(dropped, 2, "3 read − 1 kept = 2 dropped");
@@ -1084,7 +1092,10 @@ mod tests {
         // eikä elävää tiedostoa muuteta (swapia ei tehdä).
         let err = j
             .compact_with(|_entries| {
-                Err(DurableError::step_failed("build", "intentional build failure"))
+                Err(DurableError::step_failed(
+                    "build",
+                    "intentional build failure",
+                ))
             })
             .expect_err("build error must propagate");
         match err {

@@ -147,7 +147,11 @@ impl Scheduler {
 
     /// Pakottaa yhden tehtävän erääntymispäätöksen tarkasteluun (introspektio).
     #[must_use]
-    pub fn decision_for(&self, id: ScheduledTaskId, now: Timestamp) -> Option<crate::decision::DueDecision> {
+    pub fn decision_for(
+        &self,
+        id: ScheduledTaskId,
+        now: Timestamp,
+    ) -> Option<crate::decision::DueDecision> {
         self.tasks
             .iter()
             .find(|t| t.id == id)

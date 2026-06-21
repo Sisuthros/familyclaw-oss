@@ -579,10 +579,7 @@ impl JournalPendingStore {
     ///
     /// # Errors
     /// [`ActionError::Proof`] jos journalia ei voi avata tai lukea.
-    pub fn open_with_capacity(
-        path: impl AsRef<Path>,
-        capacity: PendingCapacity,
-    ) -> Result<Self> {
+    pub fn open_with_capacity(path: impl AsRef<Path>, capacity: PendingCapacity) -> Result<Self> {
         let journal = FileJournal::open(path)
             .map_err(|e| ActionError::Proof(format!("open pending journal failed: {e}")))?;
         // Päättele seuraava sekvenssipaikka olemassa olevan lokin pituudesta.
@@ -659,9 +656,7 @@ impl JournalPendingStore {
     /// [`FileJournal::compact_with`]-suljin voivat rakentaa tilan **samalla
     /// logiikalla** — jälkimmäinen saa rivit valmiiksi luettuina lukon alta, eikä
     /// saa lukea journalia uudelleen (deadlock).
-    fn reconstruct_state(
-        entries: Vec<JournalEntry>,
-    ) -> Result<HashMap<ApprovalId, PendingRecord>> {
+    fn reconstruct_state(entries: Vec<JournalEntry>) -> Result<HashMap<ApprovalId, PendingRecord>> {
         let mut state: HashMap<ApprovalId, PendingRecord> = HashMap::new();
         for entry in entries {
             let EntryKind::Marker { name, payload } = entry.kind else {
@@ -825,9 +820,8 @@ impl PendingApprovalStore for JournalPendingStore {
         let existing = self.replay_state()?.remove(&approval_id);
         if existing.is_some() {
             // Kirjaa tombstone vain jos kirjaus oli olemassa — turha rivi vältetään.
-            let payload = serde_json::to_value(approval_id).map_err(|e| {
-                ActionError::Proof(format!("encode pending delete id failed: {e}"))
-            })?;
+            let payload = serde_json::to_value(approval_id)
+                .map_err(|e| ActionError::Proof(format!("encode pending delete id failed: {e}")))?;
             self.append_marker(PENDING_DELETE, payload)?;
             // Tombstone on kuollut rivi → harkitse auto-tiivistystä.
             self.maybe_auto_compact();
@@ -851,9 +845,8 @@ impl PendingApprovalStore for JournalPendingStore {
             .map(PendingRecord::approval_id)
             .collect();
         for id in &expired {
-            let payload = serde_json::to_value(id).map_err(|e| {
-                ActionError::Proof(format!("encode pending delete id failed: {e}"))
-            })?;
+            let payload = serde_json::to_value(id)
+                .map_err(|e| ActionError::Proof(format!("encode pending delete id failed: {e}")))?;
             self.append_marker(PENDING_DELETE, payload)?;
         }
         if !expired.is_empty() {
@@ -884,8 +877,8 @@ mod tests {
 
     /// Apuri: payload-sidottu hyväksyntä annetulla TTL:llä.
     fn approval_at(now: Timestamp, ttl: Duration) -> Approval {
-        let payload = serde_json::to_vec(&serde_json::json!({ "to": "general" }))
-            .expect("serialize payload");
+        let payload =
+            serde_json::to_vec(&serde_json::json!({ "to": "general" })).expect("serialize payload");
         Approval {
             id: ApprovalId::new(),
             action_id: ActionId::new(),
@@ -1134,9 +1127,8 @@ mod tests {
     fn durable_capacity_cap_rejects_beyond_limit() {
         let tmp = TempPath::new("cap");
         let now = at(1_700_000_000);
-        let store =
-            JournalPendingStore::open_with_capacity(tmp.path(), PendingCapacity::new(1))
-                .expect("open");
+        let store = JournalPendingStore::open_with_capacity(tmp.path(), PendingCapacity::new(1))
+            .expect("open");
 
         store
             .insert(record_at(now, Duration::minutes(60)))
@@ -1205,7 +1197,11 @@ mod tests {
         // Tiivistä: 10 kuollutta riviä (5 poistettua put + 5 tombstone) pudotetaan.
         let dropped = store.compact().expect("compact");
         assert_eq!(dropped, 10, "15 rows → 5 live rows = 10 dropped");
-        assert_eq!(physical_rows(tmp.path()), 5, "only live rows remain on disk");
+        assert_eq!(
+            physical_rows(tmp.path()),
+            5,
+            "only live rows remain on disk"
+        );
         assert_eq!(store.len().expect("len"), 5, "live count unchanged");
 
         // Kaikki elävät kirjaukset yhä haettavissa, poistetut eivät.
@@ -1242,9 +1238,16 @@ mod tests {
 
         // Restart pelkästä tiivistetystä tiedostosta → identtinen tila.
         let resumed = JournalPendingStore::open(tmp.path()).expect("open 2");
-        assert_eq!(resumed.len().expect("len"), 3, "3 live survive compaction+reload");
+        assert_eq!(
+            resumed.len().expect("len"),
+            3,
+            "3 live survive compaction+reload"
+        );
         for id in live_ids.iter().take(3) {
-            assert!(resumed.get(*id).expect("get").is_none(), "removed stay removed");
+            assert!(
+                resumed.get(*id).expect("get").is_none(),
+                "removed stay removed"
+            );
         }
         for id in live_ids.iter().skip(3) {
             assert!(resumed.get(*id).expect("get").is_some(), "live stay live");
@@ -1334,7 +1337,10 @@ mod tests {
         assert_eq!(physical_rows(tmp.path()), 1, "only the live entry remains");
         // Vanhentuneen tiivistetiiviste/tunniste ei näy enää levyllä.
         let on_disk = std::fs::read_to_string(tmp.path()).expect("read");
-        assert!(!on_disk.contains(&short_id.to_string()), "expired id gone from disk");
+        assert!(
+            !on_disk.contains(&short_id.to_string()),
+            "expired id gone from disk"
+        );
     }
 
     #[test]
@@ -1411,7 +1417,10 @@ mod tests {
 
         // Tiivistä (atominen, yhden lukon alla).
         let dropped = store.compact().expect("compact");
-        assert_eq!(dropped, 6, "9 rows (6 put + 3 tombstone) → 3 live = 6 dropped");
+        assert_eq!(
+            dropped, 6,
+            "9 rows (6 put + 3 tombstone) → 3 live = 6 dropped"
+        );
         assert_eq!(physical_rows(tmp.path()), 3, "only live rows after compact");
 
         // Tiivistyksen JÄLKEEN lisätty kirjaus laskeutuu elävien PERÄÄN (ei katoa).
@@ -1419,19 +1428,28 @@ mod tests {
         let post_id = post.approval_id();
         store.insert(post).expect("insert after compact");
         assert_eq!(store.len().expect("len"), 4, "3 live + 1 post-compact");
-        assert!(store.get(post_id).expect("get").is_some(), "post-compact insert present");
+        assert!(
+            store.get(post_id).expect("get").is_some(),
+            "post-compact insert present"
+        );
 
         // Uudelleenlataus tuottaa TÄSMÄLLEEN oikean tilan: tiivistetyt elävät +
         // tiivistyksen jälkeen lisätty; poistetut pysyvät poissa.
         let resumed = JournalPendingStore::open(tmp.path()).expect("reopen");
         assert_eq!(resumed.len().expect("len"), 4);
         for id in ids.iter().take(3) {
-            assert!(resumed.get(*id).expect("get").is_none(), "removed stay removed");
+            assert!(
+                resumed.get(*id).expect("get").is_none(),
+                "removed stay removed"
+            );
         }
         for id in ids.iter().skip(3) {
             assert!(resumed.get(*id).expect("get").is_some(), "live stay live");
         }
-        assert!(resumed.get(post_id).expect("get").is_some(), "post-compact survives reload");
+        assert!(
+            resumed.get(post_id).expect("get").is_some(),
+            "post-compact survives reload"
+        );
     }
 
     // ---- Rate limiter ----
@@ -1455,9 +1473,13 @@ mod tests {
     fn rate_limiter_is_per_being() {
         let limiter = DangerousToolRateLimiter::new(60, 1);
         let now = at(1_700_000_000);
-        limiter.check_and_record("being-a", now).expect("being-a first");
+        limiter
+            .check_and_record("being-a", now)
+            .expect("being-a first");
         // Eri olento → oma kiintiö.
-        limiter.check_and_record("being-b", now).expect("being-b first");
+        limiter
+            .check_and_record("being-b", now)
+            .expect("being-b first");
         // being-a jo täynnä.
         assert!(limiter.check_and_record("being-a", now).is_err());
     }

@@ -480,8 +480,7 @@ approval_policy = "auto_if_read_only"
         });
         let m = valid_manifest().with_input_schema(schema.clone());
         m.validate().expect("custom schema validates");
-        let back = SkillManifest::from_json(&m.to_json().expect("serialize"))
-            .expect("deserialize");
+        let back = SkillManifest::from_json(&m.to_json().expect("serialize")).expect("deserialize");
         assert_eq!(back.input_schema, schema);
         assert_eq!(m, back);
     }
@@ -495,8 +494,7 @@ approval_policy = "auto_if_read_only"
 
     #[test]
     fn with_input_schema_keeps_input_hint() {
-        let m = valid_manifest()
-            .with_input_schema(serde_json::json!({ "type": "object" }));
+        let m = valid_manifest().with_input_schema(serde_json::json!({ "type": "object" }));
         // input_hint säilyy ihmisnäyttöä varten skeeman rinnalla.
         assert_eq!(m.input_hint.as_deref(), Some("text"));
     }

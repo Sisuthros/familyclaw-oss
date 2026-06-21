@@ -395,8 +395,9 @@ impl ActionRuntime {
         task_queue_path: impl Into<std::path::PathBuf>,
         dispatch_outbox_path: impl AsRef<std::path::Path>,
     ) -> Result<Self> {
-        let pending: Box<dyn PendingApprovalStore> =
-            Box::new(crate::pending_store::JournalPendingStore::open(pending_path)?);
+        let pending: Box<dyn PendingApprovalStore> = Box::new(
+            crate::pending_store::JournalPendingStore::open(pending_path)?,
+        );
         let durable_queue = DurableTaskQueue::new(task_queue_path);
 
         // Kaatumiskestävä lähetys-outbox avataan SUORAAN tässä, jotta durable-tila
@@ -649,11 +650,7 @@ impl ActionRuntime {
                 (m.id, descriptor)
             })
             .collect();
-        out.sort_by(|a, b| {
-            a.1.name
-                .cmp(&b.1.name)
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        out.sort_by(|a, b| a.1.name.cmp(&b.1.name).then_with(|| a.0.cmp(&b.0)));
         out.into_iter().map(|(_, d)| d).collect()
     }
 
@@ -1330,11 +1327,7 @@ mod tests {
 
         // Sama vakautettu nimijärjestys kuin list_skills.
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        let skill_names: Vec<String> = runtime
-            .list_skills()
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
+        let skill_names: Vec<String> = runtime.list_skills().into_iter().map(|s| s.name).collect();
         assert_eq!(tool_names, skill_names);
 
         // Jokaisen kuvauksen syöteskeema on manifestin skeema (juuri objekti) ja
@@ -1412,10 +1405,7 @@ mod tests {
     #[test]
     fn strictest_permission_picks_most_privileged() {
         // Tyhjä lista → vähiten oikeuttava oletus.
-        assert_eq!(
-            super::strictest_permission(&[]),
-            SkillPermission::ReadFiles
-        );
+        assert_eq!(super::strictest_permission(&[]), SkillPermission::ReadFiles);
         // Sekalainen joukko → tiukin (spend_money).
         assert_eq!(
             super::strictest_permission(&[
@@ -1518,12 +1508,22 @@ mod tests {
 
         // Kaksi ensimmäistä hyväksyntää vaativaa lähetystä mahtuvat kiintiöön.
         let first = runtime
-            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload.clone(), now)
+            .submit_task_as(
+                "being-a",
+                GithubIssueDraftMock::skill_id(),
+                payload.clone(),
+                now,
+            )
             .await
             .expect("first approval-required submit fits quota");
         assert!(first.awaiting_approval(), "first must await approval");
         let second = runtime
-            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload.clone(), now)
+            .submit_task_as(
+                "being-a",
+                GithubIssueDraftMock::skill_id(),
+                payload.clone(),
+                now,
+            )
             .await
             .expect("second approval-required submit fits quota");
         assert!(second.awaiting_approval(), "second must await approval");
@@ -1554,12 +1554,22 @@ mod tests {
         let payload = json!({ "bug_report": "Button does nothing" });
 
         runtime
-            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload.clone(), now)
+            .submit_task_as(
+                "being-a",
+                GithubIssueDraftMock::skill_id(),
+                payload.clone(),
+                now,
+            )
             .await
             .expect("being-a first fits its quota");
         // being-a on nyt täynnä.
         let denied = runtime
-            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload.clone(), now)
+            .submit_task_as(
+                "being-a",
+                GithubIssueDraftMock::skill_id(),
+                payload.clone(),
+                now,
+            )
             .await
             .expect_err("being-a second exceeds quota");
         assert!(matches!(denied, ActionError::PolicyDenied(_)));
@@ -1583,12 +1593,22 @@ mod tests {
         let payload = json!({ "bug_report": "Button does nothing" });
 
         runtime
-            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload.clone(), now)
+            .submit_task_as(
+                "being-a",
+                GithubIssueDraftMock::skill_id(),
+                payload.clone(),
+                now,
+            )
             .await
             .expect("first fits quota");
         // Heti perään sama ikkuna → estetty.
         let denied = runtime
-            .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload.clone(), now)
+            .submit_task_as(
+                "being-a",
+                GithubIssueDraftMock::skill_id(),
+                payload.clone(),
+                now,
+            )
             .await
             .expect_err("second in same window is denied");
         assert!(matches!(denied, ActionError::PolicyDenied(_)));
@@ -1599,7 +1619,10 @@ mod tests {
             .submit_task_as("being-a", GithubIssueDraftMock::skill_id(), payload, later)
             .await
             .expect("capacity returns after window slides");
-        assert!(after.awaiting_approval(), "submit must succeed after window");
+        assert!(
+            after.awaiting_approval(),
+            "submit must succeed after window"
+        );
     }
 
     #[tokio::test]
@@ -1877,9 +1900,8 @@ mod tests {
     ) {
         let runs = Arc::new(AtomicU64::new(0));
         let shared = Arc::new(InMemoryDispatchOutbox::new());
-        let mut runtime = ActionRuntime::new().with_dispatch_outbox(Box::new(SharedOutbox(
-            Arc::clone(&shared),
-        )));
+        let mut runtime =
+            ActionRuntime::new().with_dispatch_outbox(Box::new(SharedOutbox(Arc::clone(&shared))));
         runtime
             .register_skill(CountingApprovalSkill {
                 runs: Arc::clone(&runs),
@@ -1897,7 +1919,11 @@ mod tests {
         assert_eq!(submitted.status, TaskStatus::NeedsApproval);
         let approval_id = submitted.pending_approval.expect("approval granted");
         // Lähetys ei ole vielä ajanut sivuvaikutusta (odottaa hyväksyntää).
-        assert_eq!(runs.load(Ordering::SeqCst), 0, "no side effect before approve");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "no side effect before approve"
+        );
 
         (runtime, shared, runs, submitted.task_id, approval_id)
     }
@@ -1909,8 +1935,7 @@ mod tests {
         // on committed-rivi avaimelle `approval-{id}`. Uudelleenhyväksyntä EI saa
         // ajaa sivuvaikutusta uudelleen, vaan palauttaa tallennetun lopputuloksen.
         let now = at(1_700_000_000);
-        let (mut runtime, shared, runs, task_id, approval_id) =
-            build_approval_fixture(now).await;
+        let (mut runtime, shared, runs, task_id, approval_id) = build_approval_fixture(now).await;
 
         // Esiseedaa outbox committed-rivillä TÄSMÄLLEEN avaimelle approve käyttää.
         let key = ActionRuntime::approval_dispatch_key(approval_id);
@@ -1920,7 +1945,9 @@ mod tests {
             pending_approval: None,
             error: None,
         };
-        shared.record_committed(&key, &prior).expect("seed committed");
+        shared
+            .record_committed(&key, &prior)
+            .expect("seed committed");
 
         // approve → committed-haara: palauttaa aiemman lopputuloksen ajamatta.
         let approved = runtime.approve(approval_id, now).await.expect("approve");
@@ -1941,8 +1968,7 @@ mod tests {
         // committed kirjoittamatta, sivuvaikutus mahdollisesti osittain ajanut).
         // Uudelleenhyväksyntä on fail-closed (PolicyDenied) eikä aja uudelleen.
         let now = at(1_700_000_000);
-        let (mut runtime, shared, runs, _task_id, approval_id) =
-            build_approval_fixture(now).await;
+        let (mut runtime, shared, runs, _task_id, approval_id) = build_approval_fixture(now).await;
 
         // Esiseedaa outbox VAIN intent-rivillä (ei committed) → InProgress.
         let key = ActionRuntime::approval_dispatch_key(approval_id);

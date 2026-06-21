@@ -335,10 +335,9 @@ impl Skill for FsReadAllowlisted {
             id: Self::skill_id(),
             name: "fs_read_allowlisted".to_string(),
             version: "1.0.0".to_string(),
-            description:
-                "Lukee paikallisen tiedoston vain allowlistatun juuren alta \
+            description: "Lukee paikallisen tiedoston vain allowlistatun juuren alta \
                  (kanonisoitu polku, ei verkkoa); todiste = tiiviste + koko + yhteenveto."
-                    .to_string(),
+                .to_string(),
             permissions: vec![SkillPermission::ReadFiles],
             risk: ActionRisk::ReadOnly,
             approval_policy: ApprovalPolicy::AutoIfReadOnly,
@@ -374,10 +373,7 @@ mod tests {
     /// macOS `/var`→`/private/var`-symlinkit eivät sotke `starts_with`-vertailua).
     fn temp_dir(tag: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "familyclaw_fs_read_{tag}_{}",
-            uuid::Uuid::new_v4()
-        ));
+        dir.push(format!("familyclaw_fs_read_{tag}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         std::fs::canonicalize(&dir).expect("canonicalize temp dir")
     }
@@ -614,7 +610,10 @@ mod tests {
         );
 
         // Yhteenveto on VAIN ensimmäinen rivi — tiedoston runko (rivit 2+) ei vuoda.
-        assert_eq!(res.raw_output_redacted["summary"], json!("harmless first line"));
+        assert_eq!(
+            res.raw_output_redacted["summary"],
+            json!("harmless first line")
+        );
 
         // Koko tiedoston sisältö EI saa esiintyä tulosteessa (vain yhteenveto,
         // joka on tiedoston ensimmäinen rivi typistettynä — ei koko sisältö).
@@ -656,7 +655,10 @@ mod tests {
             untrusted_result.untrusted,
             "non-project file must stay tainted"
         );
-        assert_eq!(untrusted_result.raw_output_redacted["trusted"], json!(false));
+        assert_eq!(
+            untrusted_result.raw_output_redacted["trusted"],
+            json!(false)
+        );
 
         // Luotetun juuren alta luettu → taint poistuu.
         let trusted_payload = serde_json::to_value(FsReadInput {

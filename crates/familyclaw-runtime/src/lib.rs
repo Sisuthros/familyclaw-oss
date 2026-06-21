@@ -33,12 +33,12 @@ use std::env;
 use std::sync::Arc;
 
 use familyclaw_actions::{ActionRuntime, AuditCollector};
-use familyclaw_bridge::{AgentInfo, AgentRole, FamilyBridge, HostKind};
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, resolve_profile_dir, Agent, EmotionCalibration,
     ErasedMemoryStore, JournalResumableStore, LlmEndpointResolver, ResumableTurnStore, Soul,
     TableCalibration,
 };
+use familyclaw_bridge::{AgentInfo, AgentRole, FamilyBridge, HostKind};
 use familyclaw_bus::{BeingId, BusHandle, ResonanceBus, ResonanceMessage};
 use familyclaw_channels::Channel;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
@@ -482,15 +482,13 @@ pub async fn build_family(
             .map_err(|e| {
                 FamilyClawError::config(format!("durable action stores open failed: {e}"))
             })?;
-        rt.register_default_skills().map_err(|e| {
-            FamilyClawError::config(format!("action runtime build failed: {e}"))
-        })?;
+        rt.register_default_skills()
+            .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?;
         rt
     } else {
         // In-memory-polku: kaikki kolme pintaa oletuksissaan.
-        ActionRuntime::with_default_skills().map_err(|e| {
-            FamilyClawError::config(format!("action runtime build failed: {e}"))
-        })?
+        ActionRuntime::with_default_skills()
+            .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?
     };
     let actions: Arc<Mutex<ActionRuntime>> = Arc::new(Mutex::new(action_runtime));
     agent = agent.with_actions(Arc::clone(&actions));

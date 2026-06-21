@@ -38,9 +38,7 @@ use std::collections::HashMap;
 
 use familyclaw_core::{FamilyClawError, ModelConfig, Result};
 
-use crate::llm::{
-    CompletionResult, LlmClient, LlmConfig, LlmError, LlmMessage, ToolDefinition,
-};
+use crate::llm::{CompletionResult, LlmClient, LlmConfig, LlmError, LlmMessage, ToolDefinition};
 
 /// Kuvaa mallinimen (`"provider/model"`) ajettavaksi [`LlmConfig`]:ksi.
 ///

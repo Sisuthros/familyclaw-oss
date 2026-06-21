@@ -45,7 +45,7 @@
 #![cfg(feature = "wasmtime")]
 
 use familyclaw_sandbox::{
-    CapabilitySet, Capability, CodeSandbox, FuelLimit, SandboxError, SandboxRequest,
+    Capability, CapabilitySet, CodeSandbox, FuelLimit, SandboxError, SandboxRequest,
     WasmtimeSandbox,
 };
 
@@ -90,12 +90,14 @@ fn fuel_exhaustion_terminates_infinite_loop() {
 #[test]
 fn fuel_exhaustion_honours_a_tiny_budget() {
     let sandbox = WasmtimeSandbox::new().expect("engine init");
-    let request =
-        SandboxRequest::new(wasm(INFINITE_LOOP)).with_fuel_limit(FuelLimit::limited(1));
+    let request = SandboxRequest::new(wasm(INFINITE_LOOP)).with_fuel_limit(FuelLimit::limited(1));
     let err = sandbox
         .execute(&request)
         .expect_err("budget of 1 cannot run an infinite loop");
-    assert!(err.is_fuel_exhausted(), "expected FuelExhausted, got: {err}");
+    assert!(
+        err.is_fuel_exhausted(),
+        "expected FuelExhausted, got: {err}"
+    );
 }
 
 /// 2. Denied capability / host-import rejection: a module importing a host

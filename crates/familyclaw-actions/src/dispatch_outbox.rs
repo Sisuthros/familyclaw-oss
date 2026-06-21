@@ -465,10 +465,16 @@ mod tests {
     #[test]
     fn in_memory_lookup_lifecycle() {
         let outbox = InMemoryDispatchOutbox::new();
-        assert_eq!(outbox.lookup("k").expect("lookup"), DispatchLookup::NotStarted);
+        assert_eq!(
+            outbox.lookup("k").expect("lookup"),
+            DispatchLookup::NotStarted
+        );
 
         outbox.record_intent("k").expect("intent");
-        assert_eq!(outbox.lookup("k").expect("lookup"), DispatchLookup::InProgress);
+        assert_eq!(
+            outbox.lookup("k").expect("lookup"),
+            DispatchLookup::InProgress
+        );
 
         let outcome = sample_outcome();
         outbox.record_committed("k", &outcome).expect("commit");
@@ -556,8 +562,13 @@ mod tests {
     fn separate_keys_are_independent() {
         let outbox = InMemoryDispatchOutbox::new();
         outbox.record_intent("a").expect("a intent");
-        outbox.record_committed("a", &sample_outcome()).expect("a commit");
+        outbox
+            .record_committed("a", &sample_outcome())
+            .expect("a commit");
         // Eri avain on koskematon.
-        assert_eq!(outbox.lookup("b").expect("lookup"), DispatchLookup::NotStarted);
+        assert_eq!(
+            outbox.lookup("b").expect("lookup"),
+            DispatchLookup::NotStarted
+        );
     }
 }

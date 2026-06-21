@@ -74,7 +74,10 @@ fn tempdir(tag: &str) -> PathBuf {
 
 /// Ajaa harness-prosessin ja palauttaa (`exit_ok`, stdout, stderr).
 fn run(bin: &Path, args: &[&str]) -> (bool, String, String) {
-    let out = Command::new(bin).args(args).output().expect("spawn harness");
+    let out = Command::new(bin)
+        .args(args)
+        .output()
+        .expect("spawn harness");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -88,7 +91,11 @@ fn run(bin: &Path, args: &[&str]) -> (bool, String, String) {
 /// Tarvitaan intent-only-kaatumiseen, joka aseistetaan
 /// `FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1`:llä. `exit_code` palautetaan
 /// erikseen jotta voidaan vaatia tasan 137 (SIGKILL-tyyli).
-fn run_env(bin: &Path, args: &[&str], envs: &[(&str, &str)]) -> (Option<i32>, bool, String, String) {
+fn run_env(
+    bin: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (Option<i32>, bool, String, String) {
     let mut cmd = Command::new(bin);
     cmd.args(args);
     for (k, v) in envs {
@@ -167,7 +174,11 @@ fn old_path_double_fires_side_effect_across_crash() {
     // Vaihe 1 (crash): aja lähetys (sivuvaikutus +1), poistu 137 ennen journalointia.
     let (ok1, _o1, e1) = run(&bin, &phase_args("old", "crash", &ob, &ct, &oc));
     assert!(!ok1, "crash phase must exit non-zero. stderr={e1}");
-    assert_eq!(read_counter(&counter), 1, "side effect ran once before crash");
+    assert_eq!(
+        read_counter(&counter),
+        1,
+        "side effect ran once before crash"
+    );
 
     // Vaihe 2 (resume): re-drive SAMA lähetys — vanhalla polulla ei idempotenssia.
     let (ok2, o2, e2) = run(&bin, &phase_args("old", "resume", &ob, &ct, &oc));
@@ -180,7 +191,11 @@ fn old_path_double_fires_side_effect_across_crash() {
         report["side_effect_count"], 2,
         "OLD path: side effect double-fires across the crash window (THIS is the bug)"
     );
-    assert_eq!(read_counter(&counter), 2, "disk counter confirms double-fire");
+    assert_eq!(
+        read_counter(&counter),
+        2,
+        "disk counter confirms double-fire"
+    );
     // Eikä lopputulos ole identtinen (uusi satunnais-task_id re-drivessä).
     assert_eq!(
         report["value_identical"],
@@ -211,7 +226,11 @@ fn new_path_side_effect_exactly_once_and_value_identical() {
     // poistu 137 ennen kuin agentti ehtisi journaloida dispatch-rivin.
     let (ok1, _o1, e1) = run(&bin, &phase_args("new", "crash", &ob, &ct, &oc));
     assert!(!ok1, "crash phase must exit non-zero. stderr={e1}");
-    assert_eq!(read_counter(&counter), 1, "side effect ran once before crash");
+    assert_eq!(
+        read_counter(&counter),
+        1,
+        "side effect ran once before crash"
+    );
 
     // Vaihe 2 (resume): re-drive SAMA lähetys samalla idempotenssi-avaimella.
     // Outbox palauttaa committed-lopputuloksen ajamatta sivuvaikutusta uudelleen.
@@ -287,7 +306,10 @@ fn intent_window_crash_is_at_most_once() {
         &phase_args("new", "crash_intent", &ob, &ct, &oc),
         &[(CRASH_AFTER_INTENT_ENV, "1")],
     );
-    assert!(!ok1, "crash_intent phase must NOT exit success. stderr={e1}");
+    assert!(
+        !ok1,
+        "crash_intent phase must NOT exit success. stderr={e1}"
+    );
     assert_eq!(
         code1,
         Some(137),
@@ -424,7 +446,14 @@ fn resume_continuation_intent_crash_is_at_most_once() {
     // record_committed:n alussa, resume-avaimella.
     let (code1, ok1, _o1, e1) = run_env(
         &bin,
-        &phase_args_keyed("new", "resume_continuation_crash", &ob, &ct, &oc, RESUME_KEY),
+        &phase_args_keyed(
+            "new",
+            "resume_continuation_crash",
+            &ob,
+            &ct,
+            &oc,
+            RESUME_KEY,
+        ),
         &[(CRASH_AFTER_INTENT_ENV, "1")],
     );
     assert!(
@@ -466,7 +495,14 @@ fn resume_continuation_intent_crash_is_at_most_once() {
     // InProgress → PolicyDenied fail-closed, eikä sivuvaikutus aja uudelleen.
     let (code2, ok2, o2, e2) = run_env(
         &bin,
-        &phase_args_keyed("new", "resume_continuation_resume", &ob, &ct, &oc, RESUME_KEY),
+        &phase_args_keyed(
+            "new",
+            "resume_continuation_resume",
+            &ob,
+            &ct,
+            &oc,
+            RESUME_KEY,
+        ),
         // EI aseistusta resumessa — koukkua ei käytetä.
         &[],
     );
@@ -536,7 +572,11 @@ fn resume_continuation_old_path_double_fires() {
         &phase_args_keyed("old", "crash", &ob, &ct, &oc, RESUME_KEY),
     );
     assert!(!ok1, "crash phase must exit non-zero. stderr={e1}");
-    assert_eq!(read_counter(&counter), 1, "side effect ran once before crash");
+    assert_eq!(
+        read_counter(&counter),
+        1,
+        "side effect ran once before crash"
+    );
 
     let (ok2, o2, e2) = run(
         &bin,

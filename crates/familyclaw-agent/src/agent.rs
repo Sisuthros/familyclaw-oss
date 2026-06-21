@@ -27,7 +27,6 @@ use familyclaw_bus::{BeingId, BeingInfo, BusHandle, BusMessage, ResonanceMessage
 use familyclaw_channels::OutboundMessage;
 use familyclaw_core::time::Timestamp;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
-use tokio::sync::Mutex;
 use familyclaw_durable::{DurableContext, Journal};
 use familyclaw_emotion::{
     default_governing_profile, ActionDecision, Dimension, EmotionActionGoverning,
@@ -37,6 +36,7 @@ use familyclaw_memory::{
     DecayPolicy, ImportanceFactors, Memory, MemoryStore, RetrievalContext, RetrievalResult,
 };
 use ractor::{Actor, ActorProcessingErr, ActorRef};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::llm::{LlmConfig, LlmMessage, ToolCall, ToolDefinition};
@@ -942,8 +942,7 @@ impl Agent {
             // Yhden kerran -polku (taaksepäin-yhteensopiva): yksi LLM-kutsu,
             // ei työkaluja. Sama käytös kuin ennen tool-loopia → teksti Reply:nä.
             None => {
-                let messages =
-                    vec![LlmMessage::system(system_prompt), LlmMessage::user(query)];
+                let messages = vec![LlmMessage::system(system_prompt), LlmMessage::user(query)];
                 let text = llm
                     .complete(&messages)
                     .await
@@ -1046,7 +1045,9 @@ impl Agent {
                             turn_id,
                             AuditKind::TurnSuspended,
                             now,
-                            format!("suspended awaiting approval {approval_id}: {redacted_summary}"),
+                            format!(
+                                "suspended awaiting approval {approval_id}: {redacted_summary}"
+                            ),
                         );
                         Ok(ThinkOutcome::Suspended {
                             approval_id,
@@ -1187,30 +1188,34 @@ impl Agent {
             // `iteration` on silmukan järjestysnumero → deterministinen askelnimi.
             let llm_step = format!("turn-{turn}-llm-{iteration}");
             let replaying_llm = durable.is_replaying();
-            let (content, tool_calls_opt): (Option<String>, Option<Vec<ToolCall>>) = if replaying_llm
-            {
-                durable
-                    .step(&llm_step, || {
-                        Err("unreachable: replay returns journaled LLM result".to_string())
-                    })
-                    .map_err(|e| FamilyClawError::bus(format!("durable llm replay failed: {e}")))?
-            } else {
-                let tools = {
-                    let rt = actions.lock().await;
-                    build_tool_definitions(&rt.tool_definitions())
+            let (content, tool_calls_opt): (Option<String>, Option<Vec<ToolCall>>) =
+                if replaying_llm {
+                    durable
+                        .step(&llm_step, || {
+                            Err("unreachable: replay returns journaled LLM result".to_string())
+                        })
+                        .map_err(|e| {
+                            FamilyClawError::bus(format!("durable llm replay failed: {e}"))
+                        })?
+                } else {
+                    let tools = {
+                        let rt = actions.lock().await;
+                        build_tool_definitions(&rt.tool_definitions())
+                    };
+                    let result = llm
+                        .complete_with_tools(&messages, &tools)
+                        .await
+                        .map_err(|e| FamilyClawError::llm(e.to_string()))?;
+                    let projection = (result.content.clone(), result.tool_calls.clone());
+                    durable
+                        .step(&llm_step, {
+                            let projection = projection.clone();
+                            move || Ok(projection)
+                        })
+                        .map_err(|e| {
+                            FamilyClawError::bus(format!("durable llm step failed: {e}"))
+                        })?
                 };
-                let result = llm
-                    .complete_with_tools(&messages, &tools)
-                    .await
-                    .map_err(|e| FamilyClawError::llm(e.to_string()))?;
-                let projection = (result.content.clone(), result.tool_calls.clone());
-                durable
-                    .step(&llm_step, {
-                        let projection = projection.clone();
-                        move || Ok(projection)
-                    })
-                    .map_err(|e| FamilyClawError::bus(format!("durable llm step failed: {e}")))?
-            };
 
             let text = content.clone().unwrap_or_default();
             if !text.is_empty() {
@@ -1268,7 +1273,9 @@ impl Agent {
                                 task_id: ActionTaskId::nil(),
                                 status: familyclaw_actions::task::TaskStatus::Failed,
                                 pending_approval: None,
-                                error: Some("unreachable: replay returns journaled value".to_string()),
+                                error: Some(
+                                    "unreachable: replay returns journaled value".to_string(),
+                                ),
                             })
                         })
                         .map_err(|e| {
@@ -1458,10 +1465,7 @@ impl Agent {
         };
         record_turn_audit_into(audit, turn_id, AuditKind::TurnStarted, now, "turn started");
 
-        let messages = vec![
-            LlmMessage::system(system_prompt),
-            LlmMessage::user(query),
-        ];
+        let messages = vec![LlmMessage::system(system_prompt), LlmMessage::user(query)];
         // LLM-kahva on `LlmFailover` (ei `Clone`); luetaan se `self`:stä
         // erikseen samaan aikaan kuin `&mut self.durable` — disjoint field
         // borrow toimii koska `llm` ja `durable` ovat eri kenttiä.
@@ -1743,7 +1747,10 @@ impl Agent {
             //    OpenAI-yhteensopivista providereista tuottaa) suodatetaan pois,
             //    jotta palautamme aiemman ei-tyhjän tekstin emmekä mykisty.
             let Some(tool_calls) = result.tool_calls.filter(|c| !c.is_empty()) else {
-                let answer = result.content.filter(|c| !c.is_empty()).unwrap_or(last_text);
+                let answer = result
+                    .content
+                    .filter(|c| !c.is_empty())
+                    .unwrap_or(last_text);
                 return Ok(ToolLoopOutcome::Answer(answer));
             };
 
@@ -2524,9 +2531,7 @@ impl Agent {
             // metodin sisällä. Korvaa entisen "yksi `-think`-askel koko
             // think:lle" -mallin, joka menetti vuoron sisäisen edistymisen
             // kahden lähetyksen välisessä kaatumisessa (red-team-löydös).
-            let (thought, susp) = self
-                .think_actions_durable(message, origin, turn)
-                .await?;
+            let (thought, susp) = self.think_actions_durable(message, origin, turn).await?;
             suspend = susp;
             thought.filter(|s| !s.is_empty())
         } else if self.durable.is_replaying() {
@@ -2995,8 +3000,8 @@ fn tool_result_text_for(
     status: familyclaw_actions::task::TaskStatus,
 ) -> String {
     if let Some(proof) = runtime.proof(task_id) {
-        let body = serde_json::to_string(&proof.redacted_output)
-            .unwrap_or_else(|_| "{}".to_string());
+        let body =
+            serde_json::to_string(&proof.redacted_output).unwrap_or_else(|_| "{}".to_string());
         format!("status={status:?}; {}; output={body}", proof.output_summary)
     } else {
         format!("status={status:?}; no proof produced")
@@ -4203,7 +4208,8 @@ mod tests {
     /// Rakentaa jaetun runtimen, johon on rekisteröity `loop_echo`-testitaito.
     fn echo_runtime() -> StdArc<TokioMutex<ActionRuntime>> {
         let mut rt = ActionRuntime::new();
-        rt.register_skill(LoopEchoSkill).expect("register loop_echo");
+        rt.register_skill(LoopEchoSkill)
+            .expect("register loop_echo");
         StdArc::new(TokioMutex::new(rt))
     }
 
@@ -4240,8 +4246,9 @@ mod tests {
                 id: familyclaw_actions::SkillId::from_uuid(APPROVAL_UUID),
                 name: "approval_skill".to_string(),
                 version: "1.0.0".to_string(),
-                description: "Ulkoisesti kirjoittava toiminto (vaatii ihmisen hyväksynnän, testikäyttö)."
-                    .to_string(),
+                description:
+                    "Ulkoisesti kirjoittava toiminto (vaatii ihmisen hyväksynnän, testikäyttö)."
+                        .to_string(),
                 permissions: vec![familyclaw_actions::policy::SkillPermission::WriteExternal],
                 risk: familyclaw_actions::policy::ActionRisk::WriteExternal,
                 approval_policy: familyclaw_actions::policy::ApprovalPolicy::RequireApproval,
@@ -4280,8 +4287,7 @@ mod tests {
     }
 
     /// Laskevan hyväksyntätaidon kiinteä tunniste.
-    const COUNTING_APPROVAL_UUID: uuid::Uuid =
-        uuid::uuid!("99999999-3333-4444-8555-666666666666");
+    const COUNTING_APPROVAL_UUID: uuid::Uuid = uuid::uuid!("99999999-3333-4444-8555-666666666666");
 
     #[async_trait::async_trait]
     impl familyclaw_actions::ActionExecutor for CountingApprovalSkill {
@@ -4304,8 +4310,9 @@ mod tests {
                 id: familyclaw_actions::SkillId::from_uuid(COUNTING_APPROVAL_UUID),
                 name: "approval_skill".to_string(),
                 version: "1.0.0".to_string(),
-                description: "Laskeva ulkoisesti kirjoittava toiminto (vaatii hyväksynnän, testikäyttö)."
-                    .to_string(),
+                description:
+                    "Laskeva ulkoisesti kirjoittava toiminto (vaatii hyväksynnän, testikäyttö)."
+                        .to_string(),
                 permissions: vec![familyclaw_actions::policy::SkillPermission::WriteExternal],
                 risk: familyclaw_actions::policy::ActionRisk::WriteExternal,
                 approval_policy: familyclaw_actions::policy::ApprovalPolicy::RequireApproval,
@@ -4339,7 +4346,8 @@ mod tests {
     async fn tool_loop_stops_on_no_tool_calls() {
         let bus = ResonanceBus::start(None).await.expect("bus");
         let api = spawn_scripted_llm(vec![body_text("ei työkaluja tarvita")]).await;
-        let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api).with_actions(echo_runtime());
+        let agent =
+            agent_with_scripted_llm("agent_a", bus.clone(), &api).with_actions(echo_runtime());
         assert!(agent.has_actions());
 
         let out = agent
@@ -4370,7 +4378,10 @@ mod tests {
             .expect("loop ok");
         // Toinen kierros pysähtyi lopulliseen tekstiin (työkalun tulos
         // syötettiin takaisin malliin ennen tätä).
-        assert_eq!(out, ThinkOutcome::Reply("työkalu vastasi, valmis".to_string()));
+        assert_eq!(
+            out,
+            ThinkOutcome::Reply("työkalu vastasi, valmis".to_string())
+        );
         bus.stop();
     }
 
@@ -4426,7 +4437,9 @@ mod tests {
         let api = spawn_scripted_llm(bodies).await;
         let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
             .with_actions(echo_runtime())
-            .with_tool_loop(ToolLoopConfig { max_iterations: max });
+            .with_tool_loop(ToolLoopConfig {
+                max_iterations: max,
+            });
 
         // Silmukka pysähtyy rajaan ilman paniikkia/hangia. Koska malli ei
         // koskaan tuottanut tekstiä, käyttäjälle EI synny vastausta: `think`
@@ -4465,8 +4478,8 @@ mod tests {
             &serde_json::json!({ "q": "do-it" }),
         )])
         .await;
-        let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
-            .with_actions(approval_runtime());
+        let agent =
+            agent_with_scripted_llm("agent_a", bus.clone(), &api).with_actions(approval_runtime());
 
         let out = agent
             .think(&BusMessage::text("aja hyväksyntä-työkalu"))
@@ -4576,7 +4589,10 @@ mod tests {
             .think(&BusMessage::text("aja työkalu"))
             .await
             .expect("loop ok");
-        assert_eq!(out, ThinkOutcome::Reply("työkalu vastasi, valmis".to_string()));
+        assert_eq!(
+            out,
+            ThinkOutcome::Reply("työkalu vastasi, valmis".to_string())
+        );
 
         // Audit-jälki: alku → dispatch → answered, juuri tässä järjestyksessä.
         let kinds = audit_kinds(&audit);
@@ -4765,9 +4781,7 @@ mod tests {
 
     // ---- 1C suspend/resume bridge (roadmap §6) -----------------------------
 
-    use crate::resumable::{
-        InMemoryResumableStore, JournalResumableStore, ResumableTurnStore,
-    };
+    use crate::resumable::{InMemoryResumableStore, JournalResumableStore, ResumableTurnStore};
     use familyclaw_actions::{DangerousToolRateLimiter, JournalPendingStore, PendingApprovalStore};
 
     /// RAII-temp-hakemisto durable-pintojen kirjoituksia varten (ei ulkoisia
@@ -4811,10 +4825,9 @@ mod tests {
         outbox_path: std::path::PathBuf,
         count: StdArc<std::sync::atomic::AtomicUsize>,
     ) -> StdArc<TokioMutex<ActionRuntime>> {
-        let mut rt =
-            ActionRuntime::with_durable_stores(pending_path, task_queue_path, outbox_path)
-                .await
-                .expect("durable stores open");
+        let mut rt = ActionRuntime::with_durable_stores(pending_path, task_queue_path, outbox_path)
+            .await
+            .expect("durable stores open");
         rt.register_skill(CountingApprovalSkill::new(count))
             .expect("register counting approval_skill");
         StdArc::new(TokioMutex::new(rt))
@@ -4931,9 +4944,7 @@ mod tests {
 
         // Käyttäjäviesti, joka itse kantaa salaisuuden vapaatekstinä.
         let out = agent
-            .think(&BusMessage::text(format!(
-                "use my key {secret} to deploy"
-            )))
+            .think(&BusMessage::text(format!("use my key {secret} to deploy")))
             .await
             .expect("suspend ok");
         let approval_id = match out {
@@ -4971,7 +4982,11 @@ mod tests {
         // Pyyntö 1: kutsu hyväksyntätyökalua (suspend).
         // Pyyntö 2 (resumen aikana): nähtyään työkalun tuloksen, vastaa tekstillä.
         let api = spawn_scripted_llm(vec![
-            body_tool_call("call_approve", "approval_skill", &serde_json::json!({ "q": "ship" })),
+            body_tool_call(
+                "call_approve",
+                "approval_skill",
+                &serde_json::json!({ "q": "ship" }),
+            ),
             body_text("hyväksytty toiminto valmis"),
         ])
         .await;
@@ -5045,7 +5060,11 @@ mod tests {
         // Pyyntö 1: kutsu hyväksyntätyökalua (suspend).
         // Pyyntö 2 (resumen aikana): nähtyään työkalun tuloksen, vastaa tekstillä.
         let api = spawn_scripted_llm(vec![
-            body_tool_call("call_approve", "approval_skill", &serde_json::json!({ "q": "ship" })),
+            body_tool_call(
+                "call_approve",
+                "approval_skill",
+                &serde_json::json!({ "q": "ship" }),
+            ),
             body_text("hyväksytty toiminto valmis"),
         ])
         .await;
@@ -5278,7 +5297,11 @@ mod tests {
     async fn turn_audit_records_resume_and_answer() {
         let bus = ResonanceBus::start(None).await.expect("bus");
         let api = spawn_scripted_llm(vec![
-            body_tool_call("call_approve", "approval_skill", &serde_json::json!({ "q": "ship" })),
+            body_tool_call(
+                "call_approve",
+                "approval_skill",
+                &serde_json::json!({ "q": "ship" }),
+            ),
             body_text("hyväksytty toiminto valmis"),
         ])
         .await;
@@ -5295,7 +5318,10 @@ mod tests {
             .with_turn_audit(StdArc::clone(&audit));
 
         // Vaihe 1: suspend → audit kirjaa start + dispatch + suspended.
-        let out = agent.think(&BusMessage::text("ship it")).await.expect("suspend ok");
+        let out = agent
+            .think(&BusMessage::text("ship it"))
+            .await
+            .expect("suspend ok");
         let approval_id = match out {
             ThinkOutcome::Suspended { approval_id, .. } => approval_id,
             other => panic!("odotettiin Suspended, sai: {other:?}"),
@@ -5307,7 +5333,10 @@ mod tests {
             .resume_approved(approval_id, now)
             .await
             .expect("resume_approved ok");
-        assert_eq!(resumed, ThinkOutcome::Reply("hyväksytty toiminto valmis".to_string()));
+        assert_eq!(
+            resumed,
+            ThinkOutcome::Reply("hyväksytty toiminto valmis".to_string())
+        );
 
         // Koko audit-jälki kahdesta vuorosta (suspend-vuoro + resume-vuoro).
         //
@@ -5377,8 +5406,9 @@ mod tests {
                 StdArc::clone(&count),
             )
             .await;
-            let resumable: StdArc<dyn ResumableTurnStore> =
-                StdArc::new(JournalResumableStore::open(dir.resumable_path()).expect("resumable 1"));
+            let resumable: StdArc<dyn ResumableTurnStore> = StdArc::new(
+                JournalResumableStore::open(dir.resumable_path()).expect("resumable 1"),
+            );
             let agent = agent_with_scripted_llm_id(being_id, "agent_a", bus.clone(), &api)
                 .with_actions(runtime)
                 .with_resumable_store(resumable);
@@ -5408,7 +5438,11 @@ mod tests {
         // Tarkista että odottava hyväksyntä säilyi durable-pinnalla restartin yli.
         {
             let probe = JournalPendingStore::open(dir.pending_path()).expect("pending probe");
-            assert_eq!(probe.len().expect("len"), 1, "pending approval survived restart");
+            assert_eq!(
+                probe.len().expect("len"),
+                1,
+                "pending approval survived restart"
+            );
         }
         // Avaa SAMAT durable-tiedostot uudelleen — runtime rekonstruoituu
         // (pending + task queue + ledger) lokeista.
@@ -5530,7 +5564,11 @@ mod tests {
         // --- Olento A: keskeyttää oman vuoronsa (suspend) ---
         let count_a = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
         let api_a = spawn_scripted_llm(vec![
-            body_tool_call("call_approve", "approval_skill", &serde_json::json!({ "q": "ship" })),
+            body_tool_call(
+                "call_approve",
+                "approval_skill",
+                &serde_json::json!({ "q": "ship" }),
+            ),
             body_text("alkuperäisen olennon vastaus"),
         ])
         .await;
@@ -5662,8 +5700,8 @@ mod tests {
         // Yksi JAETTU runtime: rajoitin = korkeintaan 1 hyväksyntää vaativa
         // toiminto per olento (iso ikkuna, jottei aika häädä kirjauksia kesken).
         let runtime: StdArc<TokioMutex<ActionRuntime>> = {
-            let mut rt = ActionRuntime::new()
-                .with_rate_limiter(DangerousToolRateLimiter::new(3_600, 1));
+            let mut rt =
+                ActionRuntime::new().with_rate_limiter(DangerousToolRateLimiter::new(3_600, 1));
             rt.register_skill(ApprovalSkill)
                 .expect("register approval_skill");
             StdArc::new(TokioMutex::new(rt))
@@ -5768,8 +5806,8 @@ mod tests {
         let bus = ResonanceBus::start(None).await.expect("bus");
 
         let runtime: StdArc<TokioMutex<ActionRuntime>> = {
-            let mut rt = ActionRuntime::new()
-                .with_rate_limiter(DangerousToolRateLimiter::new(3_600, 1));
+            let mut rt =
+                ActionRuntime::new().with_rate_limiter(DangerousToolRateLimiter::new(3_600, 1));
             rt.register_skill(ApprovalSkill)
                 .expect("register approval_skill");
             StdArc::new(TokioMutex::new(rt))
@@ -5995,7 +6033,11 @@ mod tests {
             let bus = ResonanceBus::start(None).await.expect("bus 1");
             let api = spawn_scripted_llm(vec![
                 body_tool_call("call_a", "auto_counter", &serde_json::json!({ "n": 1 })),
-                body_tool_call("call_b", "approval_skill", &serde_json::json!({ "q": "do-it" })),
+                body_tool_call(
+                    "call_b",
+                    "approval_skill",
+                    &serde_json::json!({ "q": "do-it" }),
+                ),
             ])
             .await;
             let runtime = crash_runtime(
@@ -6146,7 +6188,10 @@ mod tests {
                 StdArc::clone(&memory),
             )
             .with_actions(StdArc::clone(&runtime));
-            assert!(agent.durable.is_replaying(), "katkaistu journal → replay-tila");
+            assert!(
+                agent.durable.is_replaying(),
+                "katkaistu journal → replay-tila"
+            );
 
             let outcome = agent
                 .handle_turn(BeingId::new(), &BusMessage::text("aja kaksi työkalua"))
@@ -6197,7 +6242,11 @@ mod tests {
                 let bus = ResonanceBus::start(None).await.expect("bus r1");
                 let api = spawn_scripted_llm(vec![
                     body_tool_call("call_a", "auto_counter", &serde_json::json!({ "n": 1 })),
-                    body_tool_call("call_b", "approval_skill", &serde_json::json!({ "q": "go" })),
+                    body_tool_call(
+                        "call_b",
+                        "approval_skill",
+                        &serde_json::json!({ "q": "go" }),
+                    ),
                 ])
                 .await;
                 // Täysin durable runtime (pending + task queue) + durable resumable.
@@ -6232,8 +6281,16 @@ mod tests {
                     .await
                     .expect("turn ok");
                 assert!(outcome.summary.contains("suspended(approval="));
-                assert_eq!(auto2.load(SeqCst), 1, "auto-sivuvaikutus kerran ennen kaatumista");
-                assert_eq!(approval2.load(SeqCst), 0, "hyväksyntä-taito ei aja ennen lupaa");
+                assert_eq!(
+                    auto2.load(SeqCst),
+                    1,
+                    "auto-sivuvaikutus kerran ennen kaatumista"
+                );
+                assert_eq!(
+                    approval2.load(SeqCst),
+                    0,
+                    "hyväksyntä-taito ei aja ennen lupaa"
+                );
 
                 // ApprovalId durable-lokin `turn-0-suspend`-askeleesta (säilyy
                 // restartin yli, koska FileJournal fsyncaa jokaisen askeleen).
@@ -6286,7 +6343,11 @@ mod tests {
                 "resume vie keskeytetyn vuoron loppuun restartin jälkeen"
             );
             // Hyväksytty toiminto ajettiin TASAN kerran (resume = approve).
-            assert_eq!(approval2.load(SeqCst), 1, "hyväksytty toiminto ajetaan kerran resumessa");
+            assert_eq!(
+                approval2.load(SeqCst),
+                1,
+                "hyväksytty toiminto ajetaan kerran resumessa"
+            );
             // SUSPEND-EDELTÄVÄ sivuvaikutus (auto-counter) EI ajanut uudelleen:
             // yhä tasan 1 koko suspend→restart→resume-elinkaaren yli.
             assert_eq!(
@@ -6319,10 +6380,7 @@ mod tests {
 
     /// Apuri: poimii nimetyn `turn-0-dispatch-{k}`-askeleen journaloidun
     /// [`DispatchRecord`]:n (deterministinen arvo replay-vertailuun).
-    fn extract_dispatch_record(
-        journal_jsonl: &str,
-        step_name: &str,
-    ) -> Option<serde_json::Value> {
+    fn extract_dispatch_record(journal_jsonl: &str, step_name: &str) -> Option<serde_json::Value> {
         for line in journal_jsonl.lines() {
             let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;

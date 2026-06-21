@@ -787,9 +787,7 @@ mod tests {
             .registry()
             .contains(&DiscordThreadSummaryMock::skill_id()));
         assert!(pipeline.registry().contains(&FilePatchMock::skill_id()));
-        assert!(pipeline
-            .registry()
-            .contains(&FsReadAllowlisted::skill_id()));
+        assert!(pipeline.registry().contains(&FsReadAllowlisted::skill_id()));
     }
 
     /// Tuntematon taito hylätään ([`crate::ActionError::UnknownSkill`]).

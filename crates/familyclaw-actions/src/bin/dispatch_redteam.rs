@@ -195,8 +195,7 @@ impl Skill for CountingExecutor {
             id: Self::skill_id(),
             name: "counting_side_effect".to_string(),
             version: "1.0.0".to_string(),
-            description: "Kasvattaa sivuvaikutuslaskuria (auto-run, suoritetaan heti)."
-                .to_string(),
+            description: "Kasvattaa sivuvaikutuslaskuria (auto-run, suoritetaan heti).".to_string(),
             permissions: vec![SkillPermission::NetworkRead],
             risk: ActionRisk::ReadOnly,
             approval_policy: ApprovalPolicy::AutoIfReadOnly,
@@ -274,8 +273,7 @@ impl Skill for ApprovalCountingExecutor {
             id: Self::skill_id(),
             name: "counting_side_effect_approval".to_string(),
             version: "1.0.0".to_string(),
-            description: "Kasvattaa sivuvaikutuslaskuria (vaatii hyväksynnän)."
-                .to_string(),
+            description: "Kasvattaa sivuvaikutuslaskuria (vaatii hyväksynnän).".to_string(),
             permissions: vec![SkillPermission::WriteExternal],
             // WriteExternal → vaatii ihmisen hyväksynnän (ei auto-run).
             risk: ActionRisk::WriteExternal,
@@ -470,7 +468,10 @@ enum Phase {
 
 /// Komentorivirajapinta.
 #[derive(Parser)]
-#[command(name = "dispatch_redteam", about = "FamilyClaw exactly-once dispatch black box")]
+#[command(
+    name = "dispatch_redteam",
+    about = "FamilyClaw exactly-once dispatch black box"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -586,7 +587,10 @@ fn build_runtime(args: &RunArgs) -> HarnessResult<ActionRuntime> {
         // Intent-only-kaatumisikkunan vaiheet (sekä `turn-*`- että
         // `resume-*-dispatch-*`-avaimilla) tarvitsevat kaatumiskoukulla kääritun
         // outboxin: `record_committed` abortoi ennen delegointia kun aseistettu.
-        if matches!(args.phase, Phase::CrashIntent | Phase::ResumeContinuationCrash) {
+        if matches!(
+            args.phase,
+            Phase::CrashIntent | Phase::ResumeContinuationCrash
+        ) {
             runtime = runtime.with_dispatch_outbox(Box::new(CrashAfterIntentOutbox::new(outbox)));
         } else {
             runtime = runtime.with_dispatch_outbox(Box::new(outbox));
@@ -620,8 +624,7 @@ async fn build_approval_runtime(args: &RunArgs) -> HarnessResult<ActionRuntime> 
     // `with_durable_stores` avaa nyt itse kaatumiskestävän journal-outboxin
     // annetusta polusta (`args.outbox`), joten resume-vaihe saa kaatumiskestävän
     // outboxin SUORAAN ilman erillistä avausta tai ketjutusta.
-    let mut runtime =
-        ActionRuntime::with_durable_stores(pending, task_queue, &args.outbox).await?;
+    let mut runtime = ActionRuntime::with_durable_stores(pending, task_queue, &args.outbox).await?;
 
     // Crash-vaiheet tarvitsevat kaatumiskoukulla KÄÄRITYN outboxin (abortoi
     // record_committed:n ympärillä). Konstruktorin oletus-outbox ei voi tehdä
@@ -635,8 +638,7 @@ async fn build_approval_runtime(args: &RunArgs) -> HarnessResult<ActionRuntime> 
         Phase::ApproveCrashIntent | Phase::ApproveCrashCommitted
     ) {
         let outbox = JournalDispatchOutbox::open(&args.outbox)?;
-        let wrapped: Box<dyn DispatchOutboxStore> =
-            Box::new(CrashAfterIntentOutbox::new(outbox));
+        let wrapped: Box<dyn DispatchOutboxStore> = Box::new(CrashAfterIntentOutbox::new(outbox));
         runtime = runtime.with_dispatch_outbox(wrapped);
     }
 

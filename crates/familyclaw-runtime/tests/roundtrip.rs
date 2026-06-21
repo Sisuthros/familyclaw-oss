@@ -774,7 +774,11 @@ async fn build_family_wires_durable_dispatch_outbox_on_persistent_path() {
     {
         let actions = runtime2.actions();
         let guard = actions.lock().await;
-        assert_eq!(guard.dispatch_outbox_kind(), "journal", "restart keeps journal outbox");
+        assert_eq!(
+            guard.dispatch_outbox_kind(),
+            "journal",
+            "restart keeps journal outbox"
+        );
     }
     assert!(
         outbox_path.is_file(),
@@ -955,14 +959,18 @@ async fn product_path_build_family_honors_persisted_dispatch_outbox_no_double_fi
     {
         let seed = JournalDispatchOutbox::open(&outbox_path).expect("seed open");
         // committed-avain: intent + committed (sivuvaikutus ehti tapahtua + sitoutua).
-        seed.record_intent(committed_key).expect("seed intent (committed)");
+        seed.record_intent(committed_key)
+            .expect("seed intent (committed)");
         seed.record_committed(committed_key, &committed_outcome)
             .expect("seed committed");
         // intent-only-avain: VAIN intent (kaatui kesken sivuvaikutuksen).
         seed.record_intent(intent_only_key)
             .expect("seed intent-only");
     } // drop = "kaatuminen"; levyjälki jää.
-    assert!(outbox_path.is_file(), "seedattu dispatch_outbox.jsonl on levyllä");
+    assert!(
+        outbox_path.is_file(),
+        "seedattu dispatch_outbox.jsonl on levyllä"
+    );
 
     // --- 2) RESTART OIKEALLA TUOTANTOPOLULLA: build_family samalla data-dirillä. ---
     std::env::set_var("FAMILYCLAW_DATA_DIR", &data_dir);
@@ -1342,7 +1350,9 @@ async fn product_path_build_family_reloads_pending_approval_after_restart() {
         // approve EI näkisi ApprovalMissing:iä. Listalla on tasan se tunniste.
         let pending = guard.try_pending_approvals().expect("list pending");
         assert!(
-            pending.iter().any(|p| p.approval_id == approval_id && p.task_id == task_id),
+            pending
+                .iter()
+                .any(|p| p.approval_id == approval_id && p.task_id == task_id),
             "vielä odottava hyväksyntä rekonstruoitui restartissa (ei ApprovalMissing): \
              approval_id={approval_id} task_id={task_id}, listalla={pending:?}"
         );

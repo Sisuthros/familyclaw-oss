@@ -484,10 +484,9 @@ impl JournalResumableStore {
 
     /// Rekonstruoi nykytilan toistamalla lokin (myöhempi rivi voittaa).
     fn replay_state(&self) -> Result<HashMap<ApprovalId, ResumableTurn>> {
-        let entries = self
-            .journal
-            .replay_all()
-            .map_err(|e| ResumableError::Journal(format!("replay resumable journal failed: {e}")))?;
+        let entries = self.journal.replay_all().map_err(|e| {
+            ResumableError::Journal(format!("replay resumable journal failed: {e}"))
+        })?;
         Self::reconstruct_state(entries)
     }
 
@@ -499,9 +498,7 @@ impl JournalResumableStore {
     /// replay että [`compact`](Self::compact):n [`FileJournal::compact_with`]-suljin
     /// rakentavat tilan **samalla logiikalla** — jälkimmäinen saa rivit valmiiksi
     /// luettuina lukon alta, eikä saa lukea journalia uudelleen (deadlock).
-    fn reconstruct_state(
-        entries: Vec<JournalEntry>,
-    ) -> Result<HashMap<ApprovalId, ResumableTurn>> {
+    fn reconstruct_state(entries: Vec<JournalEntry>) -> Result<HashMap<ApprovalId, ResumableTurn>> {
         let mut state: HashMap<ApprovalId, ResumableTurn> = HashMap::new();
         for entry in entries {
             let EntryKind::Marker { name, payload } = entry.kind else {
@@ -589,7 +586,9 @@ impl JournalResumableStore {
                 live_count.set(kept.len());
                 Ok(kept)
             })
-            .map_err(|e| ResumableError::Journal(format!("compact resumable journal failed: {e}")))?;
+            .map_err(|e| {
+                ResumableError::Journal(format!("compact resumable journal failed: {e}"))
+            })?;
 
         // Sekvenssikursori osoittamaan tiivistetyn lokin perään (= elävien määrä,
         // koska rivit uudelleennumeroitiin tiiviisti 0..N).
@@ -763,7 +762,10 @@ mod tests {
         assert_eq!(got.approval_id, id);
         assert_eq!(got.tool_name, "github_issue_draft");
         // Payload-sidonta: tiiviste vastaa samaa argument-arvoa.
-        assert_eq!(got.arguments_hash, sha256_hex(&serde_json::to_vec(&args).unwrap()));
+        assert_eq!(
+            got.arguments_hash,
+            sha256_hex(&serde_json::to_vec(&args).unwrap())
+        );
 
         let removed = store.remove(id).expect("remove").expect("present");
         assert_eq!(removed.approval_id, id);
@@ -780,7 +782,10 @@ mod tests {
         let turn = turn_at(now, Duration::minutes(60), &args);
         // Sarjallistettu muoto ei sisällä raakaa salaisuutta.
         let json = serde_json::to_string(&turn).expect("serialize");
-        assert!(!json.contains(&secret), "raw secret must never be in the turn");
+        assert!(
+            !json.contains(&secret),
+            "raw secret must never be in the turn"
+        );
         // Mutta tiiviste on läsnä.
         assert!(json.contains(&sha256_hex(&serde_json::to_vec(&args).unwrap())));
     }
@@ -945,7 +950,10 @@ mod tests {
         let resumed = JournalResumableStore::open(tmp.path()).expect("open 2");
         assert_eq!(resumed.len().expect("len"), 3);
         for id in ids.iter().take(3) {
-            assert!(resumed.get(*id).expect("get").is_none(), "removed stay removed");
+            assert!(
+                resumed.get(*id).expect("get").is_none(),
+                "removed stay removed"
+            );
         }
         for id in ids.iter().skip(3) {
             assert!(resumed.get(*id).expect("get").is_some(), "live stay live");
@@ -1016,7 +1024,10 @@ mod tests {
         assert!(store.get(long_id).expect("get").is_some());
         assert_eq!(physical_rows(tmp.path()), 1, "only the live turn remains");
         let on_disk = std::fs::read_to_string(tmp.path()).expect("read");
-        assert!(!on_disk.contains(&short_id.to_string()), "expired id gone from disk");
+        assert!(
+            !on_disk.contains(&short_id.to_string()),
+            "expired id gone from disk"
+        );
     }
 
     #[test]
@@ -1040,7 +1051,10 @@ mod tests {
         }
 
         let rows = physical_rows(tmp.path());
-        assert!(rows < 50, "auto-compaction should keep log small, got {rows}");
+        assert!(
+            rows < 50,
+            "auto-compaction should keep log small, got {rows}"
+        );
         assert!(store.get(keeper_id).expect("get").is_some());
         assert_eq!(store.len().expect("len"), 1);
     }
@@ -1077,7 +1091,10 @@ mod tests {
         assert_eq!(store.len().expect("len"), 3, "3 live before compact");
 
         let dropped = store.compact().expect("compact");
-        assert_eq!(dropped, 6, "9 rows (6 put + 3 tombstone) → 3 live = 6 dropped");
+        assert_eq!(
+            dropped, 6,
+            "9 rows (6 put + 3 tombstone) → 3 live = 6 dropped"
+        );
         assert_eq!(physical_rows(tmp.path()), 3, "only live rows after compact");
 
         // Tiivistyksen JÄLKEEN tallennettu vuoro laskeutuu elävien PERÄÄN.
@@ -1092,11 +1109,17 @@ mod tests {
         let resumed = JournalResumableStore::open(tmp.path()).expect("reopen");
         assert_eq!(resumed.len().expect("len"), 4);
         for id in ids.iter().take(3) {
-            assert!(resumed.get(*id).expect("get").is_none(), "removed stay removed");
+            assert!(
+                resumed.get(*id).expect("get").is_none(),
+                "removed stay removed"
+            );
         }
         for id in ids.iter().skip(3) {
             assert!(resumed.get(*id).expect("get").is_some(), "live stay live");
         }
-        assert!(resumed.get(post_id).expect("get").is_some(), "post-compact survives reload");
+        assert!(
+            resumed.get(post_id).expect("get").is_some(),
+            "post-compact survives reload"
+        );
     }
 }

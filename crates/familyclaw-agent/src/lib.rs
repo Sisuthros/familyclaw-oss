@@ -74,16 +74,16 @@ pub mod soul;
 pub use agent::{
     new_reply_channel, Agent, AgentActor, ErasedMemoryStore, ReplySink, ThinkOutcome, TurnOutcome,
 };
-pub use resumable::{
-    InMemoryResumableStore, JournalResumableStore, ResumableError, ResumableTurn,
-    ResumableTurnStore,
-};
 pub use channel_bridge::{
     envelope_origin, envelope_to_bus_message, publish_envelope, pump_channel_to_bus,
 };
 pub use live_executor::LiveTurnExecutor;
 pub use llm_chain::{
     build_llm_chain, primary_llm_config, EnvEndpointResolver, LlmEndpointResolver, LlmFailover,
+};
+pub use resumable::{
+    InMemoryResumableStore, JournalResumableStore, ResumableError, ResumableTurn,
+    ResumableTurnStore,
 };
 pub use session::{MessageOrigin, SESSION_TAG_PREFIX};
 pub use soul::{load_soul, resolve_profile_dir, Soul, PROFILE_DIR_ENV};

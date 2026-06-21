@@ -149,7 +149,12 @@ mod tests {
     #[test]
     fn new_task_carries_fields() {
         let skill = SkillId::new();
-        let task = ScheduledTask::new(skill, serde_json::json!({"k": 1}), Duration::seconds(60), "x");
+        let task = ScheduledTask::new(
+            skill,
+            serde_json::json!({"k": 1}),
+            Duration::seconds(60),
+            "x",
+        );
         assert_eq!(task.skill_id, skill);
         assert_eq!(task.interval, Duration::seconds(60));
         assert_eq!(task.being_id, "x");

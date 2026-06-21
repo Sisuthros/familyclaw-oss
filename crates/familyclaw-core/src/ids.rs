@@ -240,7 +240,10 @@ mod tests {
 
     #[test]
     fn from_name_distinguishes_different_names() {
-        assert_ne!(AgentId::from_name("agent_a"), AgentId::from_name("operator"));
+        assert_ne!(
+            AgentId::from_name("agent_a"),
+            AgentId::from_name("operator")
+        );
     }
 
     #[test]

@@ -319,7 +319,10 @@ mod tests {
         assert_eq!(metrics.counter(COUNTER_TASKS_CREATED).get(), 0);
 
         // Poisto laskee gaugen takaisin nollaan.
-        assert!(bridge.deregister_agent(id).await.is_some(), "agentti poistui");
+        assert!(
+            bridge.deregister_agent(id).await.is_some(),
+            "agentti poistui"
+        );
         let n2 = recorder.drain_once().await;
         assert_eq!(n2, 1);
         assert_eq!(metrics.gauge(GAUGE_AGENTS_ONLINE).get(), 0);

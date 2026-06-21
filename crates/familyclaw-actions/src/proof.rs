@@ -320,7 +320,11 @@ pub fn redact_value_deep(value: &Value) -> (Value, RedactionReport) {
 /// Kuten [`redact_inner`], mutta merkkijonolehdille ajetaan lisäksi
 /// [`redact_text`]-osajono­pass, jotta vapaamuotoiseen tekstiin upotetut
 /// salaisuudet (esim. `"deploy using sk-live..."`) eivät jää redaktoimatta.
-fn redact_inner_deep(value: &Value, parent_key: Option<&str>, report: &mut RedactionReport) -> Value {
+fn redact_inner_deep(
+    value: &Value,
+    parent_key: Option<&str>,
+    report: &mut RedactionReport,
+) -> Value {
     match value {
         Value::String(s) => {
             // 1. Avainnimipohjainen redaktointi: kentän nimi paljastaa salaisuuden.

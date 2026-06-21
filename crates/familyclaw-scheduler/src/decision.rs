@@ -111,11 +111,7 @@ pub fn decide(task: &ScheduledTask, last_fired: Option<Timestamp>, now: Timestam
 /// laukaisuajan (tai `None` jos ei koskaan laukennut). Palauttaa vain
 /// erääntyneiden tehtävien päätökset, syötteen järjestyksessä (deterministinen).
 #[must_use]
-pub fn due_tasks<F>(
-    tasks: &[ScheduledTask],
-    mut last_fired: F,
-    now: Timestamp,
-) -> Vec<DueDecision>
+pub fn due_tasks<F>(tasks: &[ScheduledTask], mut last_fired: F, now: Timestamp) -> Vec<DueDecision>
 where
     F: FnMut(ScheduledTaskId) -> Option<Timestamp>,
 {
