@@ -72,8 +72,8 @@ Environment (Layer B - never in repo):
   FAMILYCLAW_PROVIDERS     Provider table: prefix=url=KEY_ENV;...
 
 Example (user install + enable service):
-  bash install.sh --user --service-name familyclaw-agent_alpha
-  systemctl --user enable --now familyclaw-agent_alpha
+  bash install.sh --user --service-name familyclaw-agent
+  systemctl --user enable --now familyclaw-agent
 EOF
             exit 0
             ;;

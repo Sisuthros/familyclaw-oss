@@ -29,7 +29,7 @@ cat _runs/before_write/side_effect_counter.txt   # raw side-effect count
 If recreating the venv from scratch:
 
 ```bash
-PY=C:/Users/operator/AppData/Local/Programs/Python/Python313/python.exe   # 3.13.5, pip 25.2
+PY=python   # or the full path to a Python 3.13 interpreter (3.13.5, pip 25.2)
 "$PY" -m venv $VENV_DIR
 $VENV_DIR/Scripts/python.exe -m pip install \
   langgraph==1.2.6 langgraph-checkpoint-sqlite==3.1.0

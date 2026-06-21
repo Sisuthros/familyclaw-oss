@@ -212,7 +212,7 @@ cat _runs/mid_replay/side_effect_counter.txt     # -> 6  (overcount 2)
 Recreate the venv from scratch if needed:
 
 ```bash
-PY=C:/Users/operator/AppData/Local/Programs/Python/Python313/python.exe   # 3.13.5
+PY=python   # or the full path to a Python 3.13 interpreter (3.13.5)
 "$PY" -m venv <VENV_DIR>
 <VENV_DIR>/Scripts/python.exe -m pip install \
   langgraph==1.2.6 langgraph-checkpoint-sqlite==3.1.0
