@@ -40,6 +40,9 @@ pub struct DiscordCfg {
     pub channel_id: String,
     /// Ed25519 public key (hex) Discord Interactions -verifyyn.
     pub public_key: String,
+    /// Discord bot token. Jos asetettu, gateway käyttää kaksisuuntaista
+    /// serenity-bot-yhteyttä (kuuntelee + postaa) webhook-postauksen sijaan.
+    pub bot_token: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -100,6 +103,7 @@ impl Default for DiscordCfg {
             webhook_url: String::new(),
             channel_id: "discord-main".into(),
             public_key: String::new(),
+            bot_token: String::new(),
         }
     }
 }
@@ -220,6 +224,9 @@ impl FamilyConfig {
         if let Ok(v) = std::env::var("DISCORD_PUBLIC_KEY") {
             self.channel.discord.public_key = v;
         }
+        if let Ok(v) = std::env::var("DISCORD_BOT_TOKEN") {
+            self.channel.discord.bot_token = v;
+        }
         if let Ok(v) = std::env::var("TELEGRAM_BOT_TOKEN") {
             self.channel.telegram.token = v;
         }
@@ -256,6 +263,9 @@ impl FamilyConfig {
     }
     pub fn discord_public_key(&self) -> &str {
         &self.channel.discord.public_key
+    }
+    pub fn discord_bot_token(&self) -> &str {
+        &self.channel.discord.bot_token
     }
     pub fn telegram_token(&self) -> &str {
         &self.channel.telegram.token

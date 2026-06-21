@@ -134,6 +134,7 @@ const PROVIDERS_ENV: &str = "FAMILYCLAW_PROVIDERS";
 
 /// Env-nimet virheviesteissä (ei lueta suoraan — `FamilyConfig` hoitaa)
 const DISCORD_WEBHOOK_URL_ENV: &str = "DISCORD_WEBHOOK_URL";
+const DISCORD_BOT_TOKEN_ENV: &str = "DISCORD_BOT_TOKEN";
 const DISCORD_PUBLIC_KEY_ENV: &str = "DISCORD_PUBLIC_KEY";
 const DISCORD_CHANNEL_ID_ENV: &str = "DISCORD_CHANNEL_ID";
 const TELEGRAM_CHANNEL_ID_ENV: &str = "FAMILYCLAW_TELEGRAM_CHANNEL_ID";
@@ -1062,21 +1063,38 @@ async fn start_runtime(
 
     let (channel, discord_ch): (Box<dyn Channel>, Option<Arc<DiscordChannel>>) =
         if channel_kind == "discord" {
-            let webhook_url = cfg.discord_webhook_url();
-            if webhook_url.is_empty() {
-                return Err(FamilyClawError::invalid_input(format!(
-                    "{DISCORD_WEBHOOK_URL_ENV} must be set for discord channel"
-                )));
-            }
+            let bot_token = cfg.discord_bot_token();
             let ch_id = cfg.discord_channel_id();
-            // Rakenna DiscordChannel TÄSMÄLLEEN KERRAN ja jaa sama instanssi.
-            // Bus-pumppu saa `SharedDiscordChannel`-adapterin (Box<dyn Channel>),
-            // inject-polut saavat `Arc`-kahvan — molemmat osoittavat samaan
-            // `inbound_tx`/`inbound_rx`-pariin. Aiempi koodi rakensi KAKSI
-            // erillistä instanssia, jolloin injektoidut viestit katosivat (dual-
-            // instance-mustaaukko); ks. SharedDiscordChannel-dokumentaatio.
-            let dc = DiscordChannel::from_webhook(webhook_url.to_string(), ch_id.to_string())
-                .map_err(FamilyClawError::from)?;
+            // KAKSISUUNTAINEN bot-moodi, jos DISCORD_BOT_TOKEN on asetettu: serenity-
+            // gateway kuuntelee (MESSAGE_CONTENT) JA postaa. Muuten fallback
+            // yksisuuntaiseen webhook-postaukseen (DISCORD_WEBHOOK_URL).
+            // Rakenna DiscordChannel TÄSMÄLLEEN KERRAN ja jaa sama instanssi:
+            // bus-pumppu saa `SharedDiscordChannel`-adapterin, inject-polut `Arc`-
+            // kahvan — molemmat samaan `inbound_tx`/`inbound_rx`-pariin (ei dual-
+            // instance-mustaaukkoa; ks. SharedDiscordChannel-dokumentaatio).
+            let dc = if bot_token.is_empty() {
+                let webhook_url = cfg.discord_webhook_url();
+                if webhook_url.is_empty() {
+                    return Err(FamilyClawError::invalid_input(format!(
+                        "discord channel requires DISCORD_BOT_TOKEN (kaksisuuntainen) tai {DISCORD_WEBHOOK_URL_ENV} (postaus)"
+                    )));
+                }
+                info!("Discord: yksisuuntainen webhook-postaus");
+                DiscordChannel::from_webhook(webhook_url.to_string(), ch_id.to_string())
+                    .map_err(FamilyClawError::from)?
+            } else {
+                let cid: u64 = ch_id.trim().parse().map_err(|_| {
+                    FamilyClawError::invalid_input(format!(
+                        "DISCORD_CHANNEL_ID must be a numeric id for bot mode, got: {ch_id:?}"
+                    ))
+                })?;
+                let dc = DiscordChannel::new(bot_token.to_string(), cid)
+                    .map_err(FamilyClawError::from)?;
+                // Käynnistä gateway-yhteys: palaa vasta kun `ready` tai virhe.
+                dc.start().await.map_err(FamilyClawError::from)?;
+                info!("Discord: kaksisuuntainen bot-moodi (kanava {cid})");
+                dc
+            };
             let dc_arc = Arc::new(dc);
             let ch: Box<dyn Channel> = Box::new(SharedDiscordChannel(Arc::clone(&dc_arc)));
             (ch, Some(dc_arc))
@@ -1469,11 +1487,7 @@ async fn doctor() -> Result<()> {
     //    (TELEGRAM_TOKEN on salaisuus → ehdottomasti vain set/MISSING.)
     let channel_kind = cfg.channel_kind().to_string();
     let channel_keys: &[&str] = if channel_kind == "discord" {
-        &[
-            DISCORD_WEBHOOK_URL_ENV,
-            DISCORD_CHANNEL_ID_ENV,
-            REPLY_TARGET_ENV,
-        ]
+        &[DISCORD_CHANNEL_ID_ENV, REPLY_TARGET_ENV]
     } else {
         &[
             TELEGRAM_TOKEN_ENV,
@@ -1487,6 +1501,23 @@ async fn doctor() -> Result<()> {
             println!("[OK]      env       {key} set");
         } else {
             println!("[MISSING] env       {key}");
+            ok = false;
+        }
+    }
+
+    if channel_kind == "discord" {
+        // Discord vaatii JOKO bot-tokenin (kaksisuuntainen) TAI webhookin (postaus).
+        let has_bot = std::env::var_os(DISCORD_BOT_TOKEN_ENV).is_some_and(|v| !v.is_empty());
+        let has_webhook =
+            std::env::var_os(DISCORD_WEBHOOK_URL_ENV).is_some_and(|v| !v.is_empty());
+        if has_bot {
+            println!("[OK]      env       {DISCORD_BOT_TOKEN_ENV} set (kaksisuuntainen bot)");
+        } else if has_webhook {
+            println!("[OK]      env       {DISCORD_WEBHOOK_URL_ENV} set (webhook-postaus)");
+        } else {
+            println!(
+                "[MISSING] env       {DISCORD_BOT_TOKEN_ENV} tai {DISCORD_WEBHOOK_URL_ENV}"
+            );
             ok = false;
         }
     }

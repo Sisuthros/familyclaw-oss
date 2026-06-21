@@ -83,6 +83,10 @@ pub struct DiscordChannel {
     /// [`DiscordChannel::start`]:ssa, käytetään [`DiscordChannel::stop`]:ssa
     /// graceful shutdowniin.
     shard_manager: Mutex<Option<Arc<ShardManager>>>,
+    /// Huoltajan/operaattorin Discord-user-id. Vain tämä id saa `DMata` agenttia
+    /// (kahdenkeskinen keskustelu). Luetaan env `FAMILYCLAW_OWNER_ID`:stä; 0 =
+    /// ei asetettu → DM:t pudotetaan kaikilta (turvallinen oletus).
+    owner_id: u64,
 }
 
 impl DiscordChannel {
@@ -115,6 +119,12 @@ impl DiscordChannel {
         // toteutus pudotti vastaanottimen konstruktorissa (viestejä ei saatu).
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
 
+        // Huoltajan id env:stä (kahdenkeskinen DM). 0 = ei asetettu → DM:t pois.
+        let owner_id = std::env::var("FAMILYCLAW_OWNER_ID")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+
         Ok(Self {
             channel_id,
             bot_token,
@@ -123,6 +133,7 @@ impl DiscordChannel {
             inbound_rx: Mutex::new(Some(inbound_rx)),
             inbound_tx,
             shard_manager: Mutex::new(None),
+            owner_id,
         })
     }
 
@@ -138,17 +149,15 @@ impl DiscordChannel {
     /// [`ChannelError::Backend`] jos serenity-clientin rakennus epäonnistuu,
     /// gateway-tehtävä kaatuu ennen valmiutta tai `ready` ei saavu ajoissa.
     pub async fn start(&self) -> ChannelResult<()> {
-        // MESSAGE_CONTENT on privileged-intent: ilman sitä msg.content on tyhjä
-        // (ks. moduulidokumentaatio). Aktivoitava myös Developer Portalissa.
-        let intents = GatewayIntents::GUILD_MESSAGES
-            | GatewayIntents::DIRECT_MESSAGES
-            | GatewayIntents::MESSAGE_CONTENT;
+        let intents = gateway_intents();
 
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let handler = DiscordHandler {
             target_channel_id: self.target_channel_id,
             inbound_tx: self.inbound_tx.clone(),
             ready_tx: Mutex::new(Some(ready_tx)),
+            self_id: std::sync::atomic::AtomicU64::new(0),
+            owner_id: self.owner_id,
         };
 
         let mut client = Client::builder(&self.bot_token, intents)
@@ -267,6 +276,8 @@ impl DiscordChannel {
             inbound_rx: Mutex::new(Some(inbound_rx)),
             inbound_tx,
             shard_manager: Mutex::new(None),
+            // Webhook-only-instanssi ei käsittele DM:iä → owner-portti pois käytöstä.
+            owner_id: 0,
         })
     }
 
@@ -342,11 +353,19 @@ struct DiscordHandler {
     inbound_tx: mpsc::UnboundedSender<InboundEnvelope>,
     /// Kertasignaali [`DiscordChannel::start`]:lle kun gateway on `ready`.
     ready_tx: Mutex<Option<oneshot::Sender<()>>>,
+    /// Botin oma user-id (asetetaan `ready`:ssä). Käytetään self-echo-suojaan
+    /// `message`:ssa. 0 = ei vielä tiedossa (ennen ready-eventtiä).
+    self_id: std::sync::atomic::AtomicU64,
+    /// Huoltajan user-id DM-portille (vain hän saa `DMata`). 0 = DM:t pois.
+    owner_id: u64,
 }
 
 #[async_trait]
 impl EventHandler for DiscordHandler {
     async fn ready(&self, _ctx: Context, ready: Ready) {
+        // Talleta botin oma id self-echo-suojaa varten (map_message self_id).
+        self.self_id
+            .store(ready.user.id.get(), std::sync::atomic::Ordering::Relaxed);
         info!(
             bot = %ready.user.name,
             guilds = ready.guilds.len(),
@@ -359,7 +378,34 @@ impl EventHandler for DiscordHandler {
         }
     }
 
+    // Diagnostiikka: lokita JOKAINEN guild-availability-eventti. Jos guild jää
+    // pysyvästi `unavailable` eikä guild_create laukea, gateway ei saa guild-
+    // viestejä — tämä handler tekee sen näkyväksi (gateway-debug).
+    async fn guild_create(&self, _ctx: Context, guild: serenity::model::guild::Guild, is_new: Option<bool>) {
+        info!(
+            guild_id = guild.id.get(),
+            channels = guild.channels.len(),
+            is_new = ?is_new,
+            "GUILD_CREATE received — guild now available, message events should flow"
+        );
+    }
+
     async fn message(&self, _ctx: Context, msg: Message) {
+        let self_id = self.self_id.load(std::sync::atomic::Ordering::Relaxed);
+        // Mainintaportti perheen botti-viesteille: kuullaan toinen botti vain
+        // jos se @-mainitsee meidät (estää megaloopin). msg.mentions sisältää
+        // suorat user-maininnat; mention_everyone ei laukaise (liian leveä).
+        let mentions_me = msg.mentions.iter().any(|u| u.id.get() == self_id);
+        // DM tunnistetaan guild_id:n puuttumisesta (yksityisviesti ei ole guildissa).
+        let is_dm = msg.guild_id.is_none();
+        info!(
+            author = msg.author.id.get(),
+            bot = msg.author.bot,
+            channel = msg.channel_id.get(),
+            mentions_me,
+            is_dm,
+            "MESSAGE_CREATE received"
+        );
         // Suodatus ja muunnos delegoidaan puhtaalle funktiolle (raita B), jotta
         // logiikka on testattavissa ilman serenity-kontekstia.
         let Some(envelope) = map_message(
@@ -368,6 +414,10 @@ impl EventHandler for DiscordHandler {
             msg.channel_id.get(),
             self.target_channel_id,
             &msg.content,
+            self_id,
+            mentions_me,
+            is_dm,
+            self.owner_id,
         ) else {
             return;
         };
@@ -435,9 +485,42 @@ impl Channel for DiscordChannel {
     }
 }
 
+/// Gateway-intent-maski jolla botti tunnistautuu Discordiin.
+///
+/// `GUILDS` on PAKOLLINEN: ilman sitä Discord ei lähetä `GUILD_CREATE`-eventtiä,
+/// jolloin guild jää pysyvästi `unavailable: true` eikä botti vastaanota yhdenkään
+/// guild-kanavan `MESSAGE_CREATE`-viestiä — se on rakenteellisesti kuuro perheen
+/// kanavalla vaikka gateway on muuten `ready`. (Regressiovartija: ks. testit.)
+///
+/// `MESSAGE_CONTENT` on privileged-intent: ilman sitä `msg.content` on tyhjä
+/// (ks. moduulidokumentaatio). Aktivoitava myös Developer Portalissa.
+fn gateway_intents() -> GatewayIntents {
+    GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::DIRECT_MESSAGES
+        | GatewayIntents::MESSAGE_CONTENT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regressiovartija: `GUILDS`-intentin puuttuminen teki botista kuuron
+    /// guild-kanavilla (guild unavailable, ei `MESSAGE_CREATE`). Älä poista.
+    #[test]
+    fn gateway_intents_include_guilds_and_message_content() {
+        let i = gateway_intents();
+        assert!(
+            i.contains(GatewayIntents::GUILDS),
+            "GUILDS pakollinen: ilman sitä guild jää unavailable, botti ei kuule guild-viestejä"
+        );
+        assert!(i.contains(GatewayIntents::GUILD_MESSAGES));
+        assert!(i.contains(GatewayIntents::DIRECT_MESSAGES));
+        assert!(
+            i.contains(GatewayIntents::MESSAGE_CONTENT),
+            "MESSAGE_CONTENT pakollinen: ilman sitä msg.content on tyhjä"
+        );
+    }
 
     #[test]
     fn new_discord_channel_validates_tokens() {
@@ -483,7 +566,8 @@ mod tests {
 
         // Simuloi gatewayn vastaanottama viesti raita B:n map_message-funktion
         // kautta ja työnnä se inbound_tx:ään (sama polku kuin EventHandler::message).
-        let env = map_message(42, false, 777, 777, "hei").expect("valid");
+        // Ihmisviesti ryhmäkanavalla (ei botti, ei DM), self_id=9 ≠ author.
+        let env = map_message(42, false, 777, 777, "hei", 9, false, false, 5).expect("valid");
         ch.inbound_tx.send(env).expect("send to inbound");
 
         let got = stream.recv().await.expect("one message");

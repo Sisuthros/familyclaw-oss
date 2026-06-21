@@ -32,6 +32,7 @@ ed25519-dalek = { version = "2.2", optional = true }
 # rustls_backend välttää järjestelmän OpenSSL-riippuvuuden.
 serenity = { version = "0.12", default-features = false, features = [
     "builder",
+    "cache",
     "client",
     "gateway",
     "http",
