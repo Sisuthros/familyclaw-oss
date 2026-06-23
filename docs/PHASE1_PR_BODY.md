@@ -1,9 +1,9 @@
 # Phase 1 — Tool-loop, approval/resume, at-most-once dispatch, Discord hardening
 
 **Branch:** `feat/familyclaw-v1-tool-loop`
-**Head:** `e23e99979340a7fb68b5e0abc0bc0c3d8d01d037`
+**Head:** `ce7d750c1363b3feaf000eed0aa3cc58175a4258`
 **Base:** `main` @ `fd73adcdf0215c4e47d9476c4ffb2fad86721030`
-**Ahead / behind:** 45 / 0
+**Ahead / behind:** 49 / 0
 
 This PR closes the Phase 1 release-readiness gaps from the last external audit
 (Discord bot/DM config model, approval-route regressions, public-contact hygiene)
@@ -22,19 +22,23 @@ readiness sprint — it is hardening, tests, CI hygiene, and doc truth-correctio
 - **at-most-once dispatch:** idempotency-key intent→effect→committed, fail-closed
   intent-only under crash; cross-process proof (SIGKILL) for dispatch and approval.
 - **Discord bot/DM hardening:** `owner_id` moved into the config model (TOML + env at
-  the boundary), mapping rules + token/stream safety fully tested.
+  the boundary), mapping rules + token/stream safety fully tested; outbound replies
+  route to the inbound message's channel snowflake (DM stays a DM).
 - **docs / security:** CoC + SECURITY contact hygiene, doc truth-drift sweep.
 
-## Release-readiness sprint (this PR's final 3 commits)
+## Most recent commits
 
-- `style: cargo fmt --all` — normalise pre-existing rustfmt drift (formatting only).
-- `fix(discord,gateway): P0 release-readiness` — `owner_id` config model
-  (`DiscordCfg.owner_id`, TOML + `FAMILYCLAW_OWNER_ID` env override resolved at the
-  config boundary, invalid value ignored with a warning, never "all DMs allowed";
-  `DiscordChannel::new` takes `owner_id` as an argument — no direct env read).
-  Two HTTP-level approval regression tests. CoC/SECURITY contact hygiene.
-- `test(discord): P1 hardening` — explicit DM-reply-target and token-no-echo tests;
-  QUICKSTART truth-drift fix.
+- `ce7d750` — `fix(discord): reititä lähtevä viesti message.target-snowflakeen`
+  (outbound `send()` uses `OutboundMessage.target` first so DM replies route to the
+  DM channel instead of the guild channel; falls back to `target_channel_id` for
+  webhook / bus-pump instances).
+- `b9a6df3` — `chore(gitignore): ignore PHASE2_RECON_PLAN_*.json` (local artifact).
+- `8ce97c2` — `docs(bench): record s7_provenance_gate + s8_weekly_review results`
+  (both PASS).
+- `50387b1` — `fix(docs,test): address external review` — PR-body truth-drift +
+  strengthen reply assertion (`approval_double_post_race_runs_side_effect_once`
+  asserts `side_effect_count == 1` with one final reply; "exactly-once dispatch proof
+  tests" wording replaced with "at-most-once / replay-safe dispatch proof tests").
 
 ## Tests added
 
@@ -116,7 +120,7 @@ the all-features CI job).
   there is no durable replay.
 - Discord adapter has no live-credential smoke test in CI by design; integration test
   self-skips without `DISCORD_TEST_TOKEN`.
-- Branch is large (42 commits). If a single review is unwieldy, a split is available
+- Branch is large (49 commits). If a single review is unwieldy, a split is available
   (see "PR split plan" below); kept as one reviewable PR for now.
 - `cargo-deny` not verified locally — relying on CI.
 
