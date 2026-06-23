@@ -168,7 +168,7 @@ fn extract_message_option(data: &serde_json::Value) -> Option<String> {
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("odd hex length".into());
     }
     (0..s.len())
