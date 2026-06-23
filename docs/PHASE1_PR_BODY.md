@@ -1,9 +1,8 @@
 # Phase 1 — Tool-loop, approval/resume, at-most-once dispatch, Discord hardening
 
-**Branch:** `feat/familyclaw-v1-tool-loop`
-**Head:** `096d5da` (docs-only body refresh on top of `ce7d750`)
-**Base:** `main` @ `fd73adcdf0215c4e47d9476c4ffb2fad86721030`
-**Ahead / behind:** 50 / 0
+**Branch:** `feat/familyclaw-v1-tool-loop`  
+**Base:** `main` @ `fd73adcdf0215c4e47d9476c4ffb2fad86721030`  
+**Head / ahead count:** see the live PR metadata. This file intentionally avoids pinning a fast-moving HEAD SHA so every docs-only commit does not immediately create a new truth-drift loop.
 
 This PR closes the Phase 1 release-readiness gaps from the last external audit
 (Discord bot/DM config model, approval-route regressions, public-contact hygiene)
@@ -26,7 +25,7 @@ readiness sprint — it is hardening, tests, CI hygiene, and doc truth-correctio
   route to the inbound message's channel snowflake (DM stays a DM).
 - **docs / security:** CoC + SECURITY contact hygiene, doc truth-drift sweep.
 
-## Most recent commits
+## Recent release-readiness commits
 
 - `ce7d750` — `fix(discord): reititä lähtevä viesti message.target-snowflakeen`
   (outbound `send()` uses `OutboundMessage.target` first so DM replies route to the
@@ -40,11 +39,12 @@ readiness sprint — it is hardening, tests, CI hygiene, and doc truth-correctio
   asserts `side_effect_count == 1` with one final reply; "exactly-once dispatch proof
   tests" wording replaced with "at-most-once / replay-safe dispatch proof tests").
 
-## Tests added
+## Tests added / hardened
 
 - `approval_double_post_race_runs_side_effect_once` — two concurrent
   `POST /approvals/:approval_id/approve` on a real router/socket; asserts
-  `side_effect_count == 1`, one final reply, one resume/answer sequence, no panic.
+  `side_effect_count == 1`, exactly one final reply, one resume/answer sequence,
+  no panic.
 - `approval_literal_braces_route_does_not_match_on_axum_07` — guards the axum 0.7
   `:approval_id` route; fails if anyone reverts it to `{approval_id}`.
 - `owner_id_loads_from_toml`, `owner_id_env_overrides_toml_and_invalid_fails_safe`,
@@ -53,6 +53,8 @@ readiness sprint — it is hardening, tests, CI hygiene, and doc truth-correctio
 - `dm_reply_target_is_dm_channel_not_group_channel`,
   `construction_error_does_not_echo_token`, `empty_token_error_does_not_echo_input`
   — Discord DM-reply target + token-no-echo guards.
+- `send_on_inbound_only_webhook_returns_clear_error` — webhook/inbound-only Discord
+  instances fail loudly instead of pretending an outbound send succeeded.
 
 ## Validation run (Windows / MSVC, local)
 
@@ -65,38 +67,40 @@ readiness sprint — it is hardening, tests, CI hygiene, and doc truth-correctio
 | `cargo test -p familyclaw-channels --features discord` | 89 + 1 + 3 passed, 0 failed |
 | `cargo clippy --workspace --all-targets --features discord -- -D warnings` | PASS (0) |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --features discord --no-deps` | PASS |
-| `cargo audit` (respecting `.cargo/audit.toml`) | clean (exit 0, 650 deps scanned) |
+| `cargo audit` (respecting `.cargo/audit.toml`) | clean in the local validation previously recorded |
 | Feature builds: default · discord · telegram · whatsapp · signal · wasmtime | all PASS |
-
-> ⚠️ `cargo deny check` was **not run locally** (`cargo-deny` not installed on this
-> machine); `deny.toml` is present and CI runs it. GitHub CI is the authoritative
-> gate — see the checks on this PR.
 
 ## GitHub CI status (honest)
 
-First CI run on this PR: **5 of 8 checks pass** (Build & Test Windows, Build & Test
-Linux, Clippy + Doc MSVC, Layer B leak audit, cargo audit). Three checks failed —
-all **pre-existing on `main`, not regressions from this sprint** (verified: the
-sprint diff `765394e..HEAD` does not touch the relevant crates/lockfile entries):
+Latest checked CI run at the time of this doc refresh: **run #42 completed with failure**.
 
-1. **`cargo deny`** — `webpki-roots` ships under `CDLA-Permissive-2.0` (the Mozilla
-   CA-bundle data license), which was missing from `deny.toml`'s allow-list. **Fixed
-   in this PR** by adding `CDLA-Permissive-2.0` to the allow-list (the lockfile entry
-   is byte-identical to `main`, so this was already failing on `main`).
-2. **`MSRV (1.85)`** — transitive `icu_*@2.2.0` requires rustc **1.86** (identical
-   versions on `main`). The CI MSRV pin (1.85) is now behind the dependency tree.
-   Raising the pin to 1.86 is a project-level decision (it changes the advertised
-   MSRV) and is **out of scope for this hardening sprint** — flagged for the
-   maintainer, not silently changed.
-3. **`Test (all features)`** — 6 tests in `familyclaw-bench` panic because the
-   `continuity_daemon` binary is not built before the test job runs
-   (`familyclaw_subject.rs:27` asserts the binary exists). This is a pre-existing CI
-   job-ordering gap (the all-features job does not `cargo build --bin
-   continuity_daemon` first); **not touched by this sprint**, flagged for a CI fix.
+Passing jobs in that run:
 
-**Do not merge until these are resolved.** Item 1 is fixed here; items 2 and 3 are
-pre-existing and need a maintainer decision (MSRV bump; add the daemon build step to
-the all-features CI job).
+- `Layer B leak audit`
+- `cargo deny`
+- `Build and Test (Windows)`
+- `Clippy + Doc (Windows / MSVC)`
+- `Check, Build, and Test`
+
+Failing jobs in that run:
+
+1. **`cargo audit`** — failing at step `Run cargo audit`.
+2. **`MSRV (1.85)`** — failing at step `cargo check --workspace`.
+3. **`Test (all features)`** — failing at step `cargo test (kaikki elävät featuret)`.
+
+Known triage context:
+
+- The earlier `cargo deny` CDLA issue is fixed in this PR and the latest observed
+  `cargo deny` job passes.
+- **MSRV (1.85)** is still a project-level decision: either make Rust 1.85 true by
+  pinning/downgrading dependencies, or bump the advertised MSRV to 1.86 everywhere.
+- **Test (all features)** still needs an explicit `continuity_daemon` build/path fix
+  if the `familyclaw-bench` tests depend on that binary.
+- **cargo audit** is now red in CI even though local validation was previously clean;
+  the exact advisory/error from the job log must be captured before ready-for-review.
+
+**Do not merge until CI is green or the remaining failures are explicitly marked
+non-required with maintainer-owned follow-up issues.**
 
 ## Claims this PR makes (allowed)
 
@@ -120,9 +124,9 @@ the all-features CI job).
   there is no durable replay.
 - Discord adapter has no live-credential smoke test in CI by design; integration test
   self-skips without `DISCORD_TEST_TOKEN`.
-- Branch is large (50 commits). If a single review is unwieldy, a split is available
-  (see "PR split plan" below); kept as one reviewable PR for now.
-- `cargo-deny` not verified locally — relying on CI.
+- Branch is large. If a single review is unwieldy, a split is available (see
+  "PR split plan" below); kept as one reviewable PR for now.
+- `cargo audit` is currently red in GitHub CI and must be triaged from the actual job log.
 
 ## PR split plan (if a single review is too large)
 
