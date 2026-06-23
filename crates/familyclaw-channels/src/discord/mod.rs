@@ -460,14 +460,17 @@ impl Channel for DiscordChannel {
 
     fn send(&self, message: OutboundMessage) -> SendFuture<'_> {
         let http = Arc::clone(&self.http);
-        let target_id = self.target_channel_id;
+        // DM-korjaus (2026-06-23): OutboundMessage.target kantaa vastauskanavan
+        // snowflakea (DM-kanava tai guild-kanava). Käytetään sitä ensisijaisena,
+        // jotta DM-vastaukset reitittyvät oikein eivätkä päädy guild-kanavalle.
+        // Fallback: self.target_channel_id (vanha käytös, esim. webhook-instanssi
+        // tai bus-pumppu ilman selkeää targetia).
+        let target_from_msg = message.target.trim().parse::<u64>().ok();
+        let target_id = target_from_msg
+            .filter(|&id| id != 0)
+            .unwrap_or(self.target_channel_id);
         let channel_id = self.channel_id.clone();
         Box::pin(async move {
-            // target_channel_id == 0 tarkoittaa webhook/inbound-only-instanssia
-            // (`from_webhook` ei-numeerisella channel_id:llä): lähtevälle viestille
-            // ei ole aitoa Discord-snowflakea. Palauta SELKEÄ virhe sen sijaan että
-            // yrittäisi lähettää kanavalle 0 (joka epäonnistuisi hämärästi).
-            // Lähtevä liikenne kulkee tällöin bus-pumpun / oikean send-kanavan kautta.
             if target_id == 0 {
                 return Err(ChannelError::invalid_input(format!(
                     "channel '{channel_id}' is inbound-only (no numeric Discord channel id); \
