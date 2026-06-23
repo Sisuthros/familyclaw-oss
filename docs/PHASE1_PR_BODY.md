@@ -1,9 +1,9 @@
 # Phase 1 — Tool-loop, approval/resume, at-most-once dispatch, Discord hardening
 
 **Branch:** `feat/familyclaw-v1-tool-loop`
-**Head:** `ce7d750c1363b3feaf000eed0aa3cc58175a4258`
+**Head:** `096d5da` (docs-only body refresh on top of `ce7d750`)
 **Base:** `main` @ `fd73adcdf0215c4e47d9476c4ffb2fad86721030`
-**Ahead / behind:** 49 / 0
+**Ahead / behind:** 50 / 0
 
 This PR closes the Phase 1 release-readiness gaps from the last external audit
 (Discord bot/DM config model, approval-route regressions, public-contact hygiene)
@@ -120,7 +120,7 @@ the all-features CI job).
   there is no durable replay.
 - Discord adapter has no live-credential smoke test in CI by design; integration test
   self-skips without `DISCORD_TEST_TOKEN`.
-- Branch is large (49 commits). If a single review is unwieldy, a split is available
+- Branch is large (50 commits). If a single review is unwieldy, a split is available
   (see "PR split plan" below); kept as one reviewable PR for now.
 - `cargo-deny` not verified locally — relying on CI.
 
