@@ -61,7 +61,7 @@ jobs:
           DISCORD_TEST_CHANNEL_ID: ${{ secrets.DISCORD_TEST_CHANNEL_ID }}
 
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.88)
     needs: layer-b-audit
     runs-on: ubuntu-latest
     steps:
@@ -69,7 +69,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.85
+        uses: dtolnay/rust-toolchain@1.88
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
@@ -91,6 +91,14 @@ jobs:
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
 
+      # familyclaw-bench-integraatiotestit ajavat continuity_daemon-binäärin
+      # lapsiprosessina ja paikantavat sen valmiiksi käännettynä target/debug/-
+      # kansiosta. `cargo test --workspace` EI rakenna toisen craten [[bin]]-
+      # kohdetta testiajoa varten, joten daemon on käännettävä eksplisiittisesti
+      # ennen testejä — muuten familyclaw_subject.rs panikoi "binary not found".
+      - name: Build continuity_daemon binary (familyclaw-bench prosessiraja)
+        run: cargo build -p familyclaw-agent --bin continuity_daemon
+
       # familyclaw-gateway is binary-only; --workspace (not --lib) includes its tests.
       # NB: emme käytä --all-features koska se aktivoisi familyclaw-hearthin
       # `surreal`-featuren, joka kääntää kytkemättömän, API-vanhentuneen
@@ -98,6 +106,13 @@ jobs:
       # (mikään ei rakenna SurrealHearthStorea); sen korjaus koskee perheen
       # muistisubstraattia ja vaatii erillisen päätöksen. Listataan sen sijaan
       # kaikki ELÄVÄT ei-default-featuret eksplisiittisesti.
+      # Sandbox aktivoidaan gatewayn OMAN `wasmtime`-passthrough-piirteen kautta
+      # (familyclaw-gateway/wasmtime → familyclaw-sandbox/wasmtime), EI suoraan
+      # familyclaw-sandbox/wasmtime: muuten gatewayn käännösaikainen
+      # `cfg!(feature = "wasmtime")` jäisi pois päältä vaikka sandbox-backend on
+      # käännetty, ja `sandbox_label_matches_compiled_feature` epäonnistuisi
+      # (etiketti "wasmtime …" vs odotettu "none (noop)"). Gatewayn piirre pitää
+      # cfg:n ja todellisen backendin synkassa.
       - name: cargo test (kaikki elävät featuret)
         run: |
           cargo test --workspace \
@@ -105,7 +120,7 @@ jobs:
             --features familyclaw-channels/telegram \
             --features familyclaw-channels/whatsapp \
             --features familyclaw-channels/signal \
-            --features familyclaw-sandbox/wasmtime
+            --features familyclaw-gateway/wasmtime
 
   windows:
     name: Build and Test (Windows)
