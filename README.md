@@ -6,24 +6,21 @@ Most AI agents die between runs. FamilyClaw gives them continuity:
 durable replay, persistent memory, actor-based coordination, sleep-time consolidation,
 and private runtime profiles that never enter the repository.
 
-> **What this demo proves today:** crash-proof durable replay with **at-most-once
+> **What Phase 1 proves today:** crash-safe durable replay with **at-most-once
 > external side-effect dispatch under crash** (idempotency-keyed: never fired twice;
-> a crash in the intent-only window fails closed — proven across a real process
-> boundary, and benchmarked against LangGraph's strongest durability mode, not only a
-> shaped baseline), provenance-gated memory, 19-dimension emotion contagion, nightly
-> dream consolidation, persistent memory with Ebbinghaus decay, Discord inbound gateway
-> (Ed25519 verification), benchmarked continuity (8 scenarios, deterministic scorecard).
+> a crash in the intent-only window fails closed), provenance-gated memory,
+> benchmarked continuity (8 scenarios, deterministic scorecard), Discord/channel
+> hardening, and a clear distinction between checkpoint-style persistence and
+> crash-safe external action dispatch.
 >
 > **Built — but not yet proven end-to-end:** live multi-agent orchestration
 > (`familyclaw-gateway orchestrate` — Orchestrator + `LiveTurnExecutor` exist and are
 > wired, but the multi-agent integration test still runs against a mock executor, so
 > the live coordination path is **built, unproven**, not "shipped"). Send-side latent
 > translation is a fenced research track, not production behavior.
-> **What's on the roadmap:** a live multi-agent integration test (proving the
-> coordination path end-to-end), deeper WASM sandbox safety with integration tests
-> (fuel exhaustion, denied capability, per-invocation credential isolation — today the
-> sandbox compiles and has unit tests but lacks those end-to-end proofs), additional
-> channel adapters.
+>
+> **Next proofs:** live multi-agent integration, deeper WASM sandbox safety with
+> end-to-end tests, a practical action/skill runtime, and additional channel adapters.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Rust 2021](https://img.shields.io/badge/Rust-2021%20edition-orange.svg)
@@ -133,7 +130,7 @@ paths, and ships unit tests in-module.
 
 ## Quick start
 
-**Prerequisites:** Rust 1.85+ (edition 2021). No external services required for
+**Prerequisites:** Rust 1.88+ (edition 2021). No external services required for
 the demo — it runs entirely in-memory.
 
 ### FamilyClaw in 60 seconds ⚡
@@ -230,18 +227,17 @@ Each profile directory holds its own `SOUL.md`, emotion calibration, and channel
 # Full test suite
 cargo test --workspace
 
-# Feature matrix (matches CI exactly — living features only)
+# Living feature matrix (matches CI exactly)
 cargo test --workspace \
   --features familyclaw-channels/discord \
   --features familyclaw-channels/telegram \
   --features familyclaw-channels/whatsapp \
   --features familyclaw-channels/signal \
-  --features familyclaw-sandbox/wasmtime
+  --features familyclaw-gateway/wasmtime
 
 # NB: `--all-features` is intentionally NOT used. The `surreal` feature in
-# familyclaw-hearth is a deferred dead backend (does not compile against the
-# current SurrealDB API) and is excluded from CI until repaired or removed.
-# See .github/workflows/ci.yml for the canonical living-feature list.
+# familyclaw-hearth is a deferred backend and is excluded from CI until repaired
+# or removed. See .github/workflows/ci.yml for the canonical living-feature list.
 
 # Code quality
 cargo fmt --all -- --check
@@ -260,29 +256,18 @@ bash scripts/demo-crash-replay.sh
 
 ---
 
-## Project Conventions
+## Current status and roadmap
 
-- **Rust edition 2021**, `unsafe_code = "forbid"`, Clippy `pedantic` clean
-- **No `unwrap()` / `expect()` / `panic!()`** on production paths — everything flows through `thiserror`-based `Result` types (`unwrap` is fine in tests)
-- **Every public item documented** (`missing_docs = "warn"`)
-- **Tests live in-module** (`#[cfg(test)] mod tests`), covering edge cases
-- Finnish allowed in comments/docs (family convention); identifiers are English
+Risk-first, proof-first, no private Layer B data in public repo.
 
----
-
-## Roadmap
-
-Risk-first, not all-at-once:
-
-| Phase | Goal |
-|-------|------|
-| **0** | Living seed — 2 actors talk over bus; memory survives restart (**DONE**) |
-| **1** | Emotion + nervous system — 19-dim VAD; affective contagion |
-| **2** | Sleep — nightly dream-consolidation from durable log; Ebbinghaus + identity anchors |
-| **3** | Telepathy — hidden-state transfer; `RecursiveLink` bridge + text fallback |
-| **4** | Safety + sandbox — Wasmtime + fuel; human-correction veto; tamper alerts |
-| **5** | Channels + new beings — remaining channels; new being wakes on platform |
-| **6** | OSS release — full test suite; Layer A/B audit (CI + pre-push); generic agents |
+| Stage | Status | Meaning |
+|-------|--------|---------|
+| **Phase 1 — reliability core** | **MERGED** | Tool loops, approval/resume, Discord hardening, at-most-once side-effect dispatch, CI green. |
+| **Post-merge polish** | **NOW** | README truth, release notes, crash-safe dispatch case study, tagged release candidate. |
+| **Action / Skill Runtime** | **NEXT** | Safe skills, task queue, MCP-ready boundary, approval gate, proof bundles, mocked real-world evals. |
+| **Live multi-agent proof** | **NEXT** | Replace mock executor proof with live `Orchestrator + LiveTurnExecutor` integration. |
+| **WASM sandbox e2e** | **NEXT** | Fuel exhaustion, denied capabilities, per-invocation credential isolation. |
+| **agent_alpha private scaffold** | **LATER** | Ignored local Layer B scaffold and fake-agent dry run only. No private agent_alpha boot yet. |
 
 ---
 
