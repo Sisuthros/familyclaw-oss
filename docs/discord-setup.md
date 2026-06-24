@@ -34,20 +34,48 @@ Jotta botti voi lukea viestien sisältöjä, sinun on kytkettävä päälle `MES
 4. Napsauta hiiren oikealla painikkeella sitä tekstikanavaa, jota haluat botin käyttävän, ja valitse **Copy Channel ID** (Kopioi kanavan tunnus).
 
 ## 5. Konfigurointi
-Botti tarvitsee toimiakseen kaksi ympäristömuuttujaa. 
 **TÄRKEÄÄ:** Älä koskaan commitoi botin tokenia versionhallintaan! Lisää tiedosto `.env` `.gitignore`-tiedostoon.
 
 Luo projektin juureen tiedosto nimeltä `.env` ja lisää sinne seuraavat rivit:
 ```env
-FAMILYCLAW_DISCORD_TOKEN="Kopioi_botin_token_Bot_sivulta_tähän"
-FAMILYCLAW_DISCORD_CHANNEL_ID="Kopioi_kanava_ID_tähän"
+DISCORD_BOT_TOKEN="Kopioi_botin_token_Bot_sivulta_tähän"
+DISCORD_CHANNEL_ID="Kopioi_kanava_ID_tähän"
 ```
+
+### Kaksisuuntainen bot-moodi vs. webhook-postaus
+- **`DISCORD_BOT_TOKEN` asetettu** → gateway käynnistää serenity-gateway-yhteyden:
+  botti **kuuntelee JA postaa** (kaksisuuntainen). Tämä on suositeltu moodi.
+- **Vain `DISCORD_WEBHOOK_URL` asetettu** (ei bot-tokenia) → botti on **send-only**
+  (postaa webhookilla, ei kuuntele viestejä).
+
+### Valinnainen: kahdenkeskinen DM huoltajan kanssa
+Huoltajan id voidaan asettaa kahdella tavalla. **Env-arvo ylikirjoittaa
+TOML-arvon.**
+
+Env-muuttujana:
+```env
+FAMILYCLAW_OWNER_ID="Discord-user-id-numerosi"
+```
+
+Tai `familyclaw.toml`-tiedostossa:
+```toml
+[channel.discord]
+owner_id = 123456789012345678
+```
+
+Jos asetettu, vain tämä käyttäjä voi keskustella botin kanssa **yksityisviestillä**
+(DM); vastaus reititetään takaisin DM-kanavalle. Ilman tätä (puuttuva, `0` tai
+virheellinen arvo) DM:t pudotetaan — koskaan ei "kaikki DM:t sallittu" — ja vain
+ryhmäkanava `DISCORD_CHANNEL_ID` on aktiivinen. Virheellinen `FAMILYCLAW_OWNER_ID`
+(ei numero) jätetään huomiotta varoituksella, ja TOML-/oletusarvo säilyy.
+Ryhmäkanavalla ihmiset menevät läpi suoraan; toiset botit kuullaan vain kun ne
+@-mainitsevat botin (estää botti-botti-silmukan).
 
 ## 6. Vianetsintä
 
 | Ongelma / Oire | Syy ja ratkaisu |
 |----------------|-----------------|
 | Tyhjät viestisisällöt | `MESSAGE_CONTENT`-intent puuttuu. Kytke se päälle Discord Developer Portalissa. |
-| HTTP 401 Unauthorized | Väärä tai vanhentunut token. Tarkista `FAMILYCLAW_DISCORD_TOKEN`. |
+| HTTP 401 Unauthorized | Väärä tai vanhentunut token. Tarkista `DISCORD_BOT_TOKEN`. |
 | "Missing Access" tai HTTP 403 | Botti ei ole kyseisellä kanavalla tai siltä puuttuu luku-/kirjoitusoikeudet. |
-| Ei tapahtumia (hiljaista) | Väärä kanava-ID muuttujassa `FAMILYCLAW_DISCORD_CHANNEL_ID`, tai palvelimen `GUILD_MESSAGES`-intent on estetty. |
+| Ei tapahtumia (hiljaista) | Väärä kanava-ID muuttujassa `DISCORD_CHANNEL_ID`, tai botti on yhdistynyt mutta ei vastaanota guild-viestejä (botti tarvitsee `GUILDS`-intentin — ilman sitä guild jää pysyvästi *unavailable* eikä yksikään `MESSAGE_CREATE` saavu; tämä on sisäänrakennettu, ei käyttäjän säädettävä). |

@@ -12,6 +12,15 @@ rust-version.workspace = true
 name = "familyclaw-gateway"
 path = "src/main.rs"
 
+[features]
+# Kytkee oikean wasmtime-pohjaisen hiekkalaatikon (host-import-esto + fuel-katto)
+# passthrough-piirteenä `familyclaw-sandbox/wasmtime`:een. Oletuksena POIS:
+# wasmtime on iso riippuvuus (Cranelift + JIT). doctor/status raportoivat
+# saatavuuden TODELLISEN käännetyn backendin mukaan
+# ([`familyclaw_sandbox::sandbox_availability`]) — ei irrallista lippua, joten
+# raportti ei voi valehdella saatavuudesta.
+wasmtime = ["familyclaw-sandbox/wasmtime"]
+
 [lints]
 workspace = true
 
@@ -26,6 +35,17 @@ familyclaw-agent = { workspace = true }
 # Ei sykliä: bridge riippuu vain coresta. (familyclaw-agent re-exportaa vain
 # LiveTurnExecutorin, ei orkesteri-tyyppejä, joten bridge tarvitaan suoraan.)
 familyclaw-bridge = { workspace = true }
+# Operaattorin hyväksyntäpinta (GET /approvals/pending, POST /approvals/{id}/approve):
+# jakaa runtimen Arc<Mutex<ActionRuntime>>-kahvan listatakseen odottavat
+# hyväksynnät redaktoituina ja myöntääkseen hyväksynnän (suspend/resume-silta).
+familyclaw-actions = { workspace = true }
+# GET /metrics: jaettu MetricsRegistry (with_fleet_defaults) joka viedään
+# deterministisessä Prometheus-tekstiformaatissa (prometheus_export).
+familyclaw-observability = { workspace = true }
+# doctor/status: hiekkalaatikon saatavuus (wasmtime vs noop). Kevyt ilman
+# wasmtime-featurea (vain NoopSandbox); gatewayn `wasmtime`-passthrough kytkee
+# oikean backendin tarvittaessa.
+familyclaw-sandbox = { workspace = true }
 familyclaw-channels = { workspace = true, features = ["telegram", "discord"] }
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -34,3 +54,14 @@ clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# E2E suspend→approve→resume -testi rakentaa AIDON agentin skriptatulla LLM:llä
+# in-crate (build_router + GatewayState ovat privaatteja → testi elää
+# main.rs:n tests-moduulissa). Agent::new vaatii durable- + muisti-kontekstin,
+# CountingApprovalSkill toteuttaa ActionExecutor/Skill-traitit (async_trait +
+# deterministinen uuid skill-id:lle).
+familyclaw-durable = { workspace = true }
+familyclaw-memory = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }

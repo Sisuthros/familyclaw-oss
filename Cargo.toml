@@ -8,7 +8,7 @@ edition = "2021"
 license = "MIT"
 authors = ["The FamilyClaw contributors"]
 repository = "https://github.com/Sisuthros/familyclaw"
-rust-version = "1.85"
+rust-version = "1.88"
 
 
 [workspace.lints.rust]
@@ -29,6 +29,7 @@ async-trait = "0.1"
 axum = "0.7"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+familyclaw-actions = { path = "crates/familyclaw-actions" }
 familyclaw-agent = { path = "crates/familyclaw-agent" }
 familyclaw-bench = { path = "crates/familyclaw-bench" }
 familyclaw-bridge = { path = "crates/familyclaw-bridge" }
@@ -42,6 +43,7 @@ familyclaw-gemu = { path = "crates/familyclaw-gemu" }
 familyclaw-hearth = { path = "crates/familyclaw-hearth" }
 familyclaw-latent = { path = "crates/familyclaw-latent" }
 familyclaw-memory = { path = "crates/familyclaw-memory" }
+familyclaw-observability = { path = "crates/familyclaw-observability" }
 familyclaw-runtime = { path = "crates/familyclaw-runtime" }
 familyclaw-sandbox = { path = "crates/familyclaw-sandbox" }
 familyclaw-security = { path = "crates/familyclaw-security" }
@@ -54,6 +56,6 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime"] }
 wat = "1"

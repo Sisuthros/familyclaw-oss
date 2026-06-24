@@ -27,7 +27,8 @@ async fn test_discord_round_trip() {
 
     let channel_id: u64 = channel_id_str.parse().expect("Virheellinen Channel ID");
 
-    let channel = DiscordChannel::new(token, channel_id).expect("Kanavan luonti epäonnistui");
+    // owner_id 0 = DM-portti pois (integraatiotesti todentaa vain guild-round-tripin).
+    let channel = DiscordChannel::new(token, channel_id, 0).expect("Kanavan luonti epäonnistui");
 
     // Käynnistä gateway (palaa vasta ready/virhe).
     channel

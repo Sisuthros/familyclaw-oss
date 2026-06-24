@@ -16,6 +16,14 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Kiinteä nimiavaruus deterministisille (`UUIDv5`) tunnisteille.
+///
+/// Käytetään [`AgentId::from_name`]-tyyppisissä johdannaisissa, jotta vakaa
+/// nimi tuottaa aina saman tunnisteen yli prosessin uudelleenkäynnistyksen.
+/// Arvo on satunnaisesti valittu **kerran** eikä saa muuttua — sen
+/// vaihtaminen rikkoisi kaikkien aiemmin johdettujen tunnisteiden vakauden.
+pub const ID_NAMESPACE: Uuid = uuid::uuid!("6f1c0e2a-9b3d-4f5a-8c7e-1d2b3a4c5d6e");
+
 /// Generoi newtype-tunnistetyypin annetulla nimellä ja dokumentaatiolla.
 ///
 /// Makro pitää toteutukset identtisinä kaikille tunnisteille ja vähentää
@@ -40,6 +48,23 @@ macro_rules! define_id {
             #[must_use]
             pub const fn from_uuid(uuid: Uuid) -> Self {
                 Self(uuid)
+            }
+
+            /// Johtaa **deterministisen** tunnisteen vakaasta nimestä (`UUIDv5`).
+            ///
+            /// Sama `name` tuottaa AINA saman tunnisteen — yli prosessin
+            /// uudelleenkäynnistyksen, yli koneiden, ilman levyltä luettua tilaa.
+            /// Tämä on edellytys sille, että olennon identiteetti (ja siitä
+            /// johdettu `being_id`) pysyy **vakaana yli restartin**: ilman vakaata
+            /// tunnistetta kaatumiskestävälle pinnalle tallennettu jatkettava vuoro
+            /// ei enää täsmäisi heränneen agentin omistajuustarkistukseen.
+            ///
+            /// Nimiavaruus on [`ID_NAMESPACE`] (kiinteä, projektikohtainen),
+            /// joten eri tunnistetyypit johtavat saman nimen samaan UUID:hen —
+            /// tyyppijärjestelmä pitää ne silti erillään käännösaikana.
+            #[must_use]
+            pub fn from_name(name: &str) -> Self {
+                Self(Uuid::new_v5(&ID_NAMESPACE, name.as_bytes()))
             }
 
             /// Palauttaa sisällä olevan [`Uuid`]-arvon.
@@ -201,5 +226,31 @@ mod tests {
         let lo = AgentId::from_uuid(Uuid::from_u128(1));
         let hi = AgentId::from_uuid(Uuid::from_u128(2));
         assert!(lo < hi);
+    }
+
+    #[test]
+    fn from_name_is_deterministic_across_calls() {
+        // Sama nimi → sama tunniste. Tämä on vakauden ydin: kahdesti johdettu
+        // (kuin kahdessa eri prosessissa) tunniste täsmää, ei satunnaisuutta.
+        let a = AgentId::from_name("agent_a");
+        let b = AgentId::from_name("agent_a");
+        assert_eq!(a, b);
+        assert!(!a.is_nil());
+    }
+
+    #[test]
+    fn from_name_distinguishes_different_names() {
+        assert_ne!(
+            AgentId::from_name("agent_a"),
+            AgentId::from_name("operator")
+        );
+    }
+
+    #[test]
+    fn from_name_matches_known_v5_vector() {
+        // Kiinteä vektori suojaa nimiavaruuden tahattomalta muutokselta:
+        // jos `ID_NAMESPACE` muuttuu, tämä testi hälyttää (vakaus rikkoutuisi).
+        let expected = Uuid::new_v5(&ID_NAMESPACE, b"agent_a");
+        assert_eq!(AgentId::from_name("agent_a").into_uuid(), expected);
     }
 }

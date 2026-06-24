@@ -33,7 +33,7 @@
 //! *auktoritatiiviset* mittarit lasketaan tämän skenaarion omistamasta
 //! kylvetystä tallennuksesta, koska `false_merge_rate` ja
 //! `protected_core_intact` vaativat muistokohtaisen ennen/jälkeen-vertailun
-//! jota [`DreamSummary`] ei yksin tarjoa.
+//! jota [`DreamSummary`](crate::subject::DreamSummary) ei yksin tarjoa.
 
 use std::collections::BTreeSet;
 

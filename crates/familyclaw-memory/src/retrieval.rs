@@ -263,9 +263,9 @@ const PROVENANCE_TRUST_FLOOR: f32 = 0.1;
 /// Suora kokemus ja johdetut muistot (`trust = 1.0`) säilyttävät
 /// pisteensä ennallaan. Matalan luottamuksen ulkoinen lähde laskee
 /// sijoitustaan kertoimella `0.1 + 0.9 · trust` (kts.
-/// [`PROVENANCE_TRUST_FLOOR`]): epäluotettava ulkoinen väite painuu
+/// `PROVENANCE_TRUST_FLOOR`): epäluotettava ulkoinen väite painuu
 /// hakutulosten pohjalle (Sleeper Memory Poisoning -suoja jälkikäteen,
-/// myös niille muistoille jotka eivät kulkeneet [`ProvenanceGate`]in läpi).
+/// myös niille muistoille jotka eivät kulkeneet [`ProvenanceGate`](crate::ProvenanceGate)in läpi).
 ///
 /// Palauttaa `None` samoissa tapauksissa kuin [`score`] (haudattu,
 /// poissuljettu arkistoitu, tägi-suodatus).

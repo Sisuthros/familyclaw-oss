@@ -123,6 +123,7 @@ async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
         Box::new(channel),
         reply_target.clone(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -215,6 +216,7 @@ async fn dead_primary_fails_over_to_live_fallback() {
         Box::new(channel),
         reply_target.clone(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -317,6 +319,7 @@ async fn timeout_primary_fails_over_to_live_fallback() {
         Box::new(channel),
         reply_target.clone(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -466,6 +469,7 @@ async fn without_llm_no_reply_is_emitted() {
         Box::new(channel),
         "c".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -476,7 +480,7 @@ async fn without_llm_no_reply_is_emitted() {
     assert_eq!(
         outbox_probe.sent_count(),
         0,
-        "ilman LLM:ää think() palauttaa None → ei ulosmenevää vastausta"
+        "ilman LLM:ää think() palauttaa ThinkOutcome::NoReply → ei ulosmenevää vastausta"
     );
 
     runtime.shutdown().await;
@@ -535,6 +539,7 @@ async fn run_one_persistent_turn(data_dir: &std::path::Path, body: &str, api_bas
         Box::new(channel),
         "restart-chat".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -572,7 +577,10 @@ async fn gateway_restart_processes_new_message_fresh_not_replayed_mute() {
 
     // --- Ajo 1: ensimmäinen viesti persistenttiin runtimeen. ---
     let sent_1 = run_one_persistent_turn(&data_dir, "ensimmäinen viesti", &api_base).await;
-    assert_eq!(sent_1, 1, "ajo 1: ensimmäinen viesti tuottaa yhden vastauksen");
+    assert_eq!(
+        sent_1, 1,
+        "ajo 1: ensimmäinen viesti tuottaa yhden vastauksen"
+    );
 
     // Muistissa tasan yksi rivi ajon 1 jälkeen (levyltä luettuna).
     let mem_after_1 = LocalJsonStore::open(data_dir.join("memory.json"))
@@ -609,6 +617,456 @@ async fn gateway_restart_processes_new_message_fresh_not_replayed_mute() {
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
+/// **Defect #1 -todiste (suspend/resume-kaatumiskestävyys tuotantopolulla):**
+/// kun `build_family` ajetaan persistentillä polulla (`FAMILYCLAW_DATA_DIR`
+/// asetettu), agentin jatkettavien vuorojen pinta kytketään
+/// KAATUMISKESTÄVÄKSI `JournalResumableStore`:ksi `<data_dir>/resumable.jsonl`:iin
+/// — ei oletukseksi jäävää muistinvaraista pintaa. Ennen korjausta ainoa
+/// tuotantopolku (`build_family`, jonka gateway kutsuu) jätti agentin oletukseen
+/// (`InMemoryResumableStore`), joten jokainen odottava resumable-vuoro katosi
+/// restartissa.
+///
+/// Todiste on tarkoituksella tiukka mutta epäsuora: emme pääse agentin sisäiseen
+/// pintaan (agentti siirtyy actoriin), mutta `JournalResumableStore::open` LUO
+/// journal-tiedoston avatessaan. Persistentillä polulla tiedoston on synnyttävä;
+/// in-memory-polulla (sama testi ilman data-diriä) sitä ei saa syntyä. Saman
+/// data-dirin uudelleenavaus (restart) säilyttää tiedoston — pinta on jaettu ja
+/// pysyvä, ei per-prosessi.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_family_wires_durable_resumable_store_on_persistent_path() {
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    let api_base = spawn_mock_llm().await;
+    let data_dir = unique_temp_dir("resumable");
+    let resumable_path = data_dir.join("resumable.jsonl");
+
+    // --- Persistentti polku: resumable.jsonl on synnyttävä. ---
+    let sent = run_one_persistent_turn(&data_dir, "viesti yksi", &api_base).await;
+    assert_eq!(sent, 1, "persistentti vuoro tuottaa vastauksen");
+    assert!(
+        resumable_path.is_file(),
+        "build_family wires JournalResumableStore on persistent path → resumable.jsonl must exist at {}",
+        resumable_path.display()
+    );
+
+    // --- Restart (sama data-dir): tiedosto säilyy, ei katoa prosessin yli. ---
+    let sent_2 = run_one_persistent_turn(&data_dir, "viesti kaksi", &api_base).await;
+    assert_eq!(sent_2, 1, "restartin jälkeinen vuoro tuottaa vastauksen");
+    assert!(
+        resumable_path.is_file(),
+        "durable resumable journal survives restart (shared, persistent — not per-process)"
+    );
+
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// **Defect #1 -vastaparitodiste (in-memory-polku):** ilman
+/// `FAMILYCLAW_DATA_DIR`:iä agentti jää muistinvaraiseen oletukseen eikä mitään
+/// resumable-journalia kirjoiteta levylle — taaksepäin-yhteensopiva, ei
+/// sivuvaikutuksia tiedostojärjestelmään.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_family_in_memory_path_writes_no_resumable_journal() {
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    // Varmista ettei aiempi testi jättänyt env-muuttujaa voimaan.
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+
+    let channel = MockChannel::new("mock-inmem-resumable").expect("channel");
+    channel.close_inbound();
+    let resolver = EnvEndpointResolver::new();
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul = familyclaw_agent::Soul::from_essence("generic being");
+
+    let runtime = build_family(
+        None,
+        agent_cfg,
+        soul,
+        Box::new(channel),
+        "c".to_string(),
+        &resolver,
+        None,
+    )
+    .await
+    .expect("build_family");
+
+    // Bus käynnissä, yksi olento — kokoonpano rakentui in-memory-pinnoilla.
+    assert_eq!(runtime.bus().count().await.expect("count"), 1);
+    runtime.shutdown().await;
+}
+
+/// **Exactly-once-todiste (lähetys-outbox tuotantopolulla):** kun `build_family`
+/// ajetaan persistentillä polulla (`FAMILYCLAW_DATA_DIR` asetettu), agentin
+/// jakama toimintoajoympäristö saa KAATUMISKESTÄVÄN lähetys-outboxin
+/// (`JournalDispatchOutbox`, `<data_dir>/dispatch_outbox.jsonl`) oletuksellisen
+/// muistinvaraisen tilalle. Ennen korjausta ainoa tuotantopolku (`build_family`,
+/// jonka gateway kutsuu) jätti outboxin oletukseen (`InMemoryDispatchOutbox`),
+/// joten `submit_task`:n exactly-once-takuu kuoli juuri siinä SIGKILL-
+/// kaatumisessa jonka selviämiseksi outbox on olemassa.
+///
+/// Todiste on kaksinkertainen: (1) suora — jaetun ajoympäristön
+/// `dispatch_outbox_kind()` on `"journal"` (ei `"in-memory"`); (2) epäsuora —
+/// `JournalDispatchOutbox::open` LUO journal-tiedoston, joten
+/// `<data_dir>/dispatch_outbox.jsonl` on synnyttävä ja säilyttävä restartin yli.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_family_wires_durable_dispatch_outbox_on_persistent_path() {
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    let data_dir = unique_temp_dir("dispatch-outbox");
+    let outbox_path = data_dir.join("dispatch_outbox.jsonl");
+    std::fs::create_dir_all(&data_dir).expect("temp dir");
+
+    std::env::set_var("FAMILYCLAW_DATA_DIR", &data_dir);
+    std::env::set_var("FAMILYCLAW_DREAM_DISABLED", "1");
+
+    let channel = MockChannel::new("mock-dispatch-outbox").expect("channel");
+    channel.close_inbound();
+    let resolver = EnvEndpointResolver::new();
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul = familyclaw_agent::Soul::from_essence("generic being for dispatch outbox test");
+
+    let runtime = build_family(
+        Some("dispatch-outbox-bus".to_string()),
+        agent_cfg,
+        soul,
+        Box::new(channel),
+        "dispatch-chat".to_string(),
+        &resolver,
+        None,
+    )
+    .await
+    .expect("build_family");
+
+    // Suora väite: jaettu ajoympäristö kantaa journal-outboxia.
+    {
+        let actions = runtime.actions();
+        let guard = actions.lock().await;
+        assert_eq!(
+            guard.dispatch_outbox_kind(),
+            "journal",
+            "persistent build wires JournalDispatchOutbox (crash-surviving exactly-once)"
+        );
+    }
+    // Epäsuora väite: tiedosto syntyi avatessa.
+    assert!(
+        outbox_path.is_file(),
+        "build_family wires JournalDispatchOutbox on persistent path → dispatch_outbox.jsonl must exist at {}",
+        outbox_path.display()
+    );
+
+    runtime.shutdown().await;
+
+    // Restart (sama data-dir): tiedosto säilyy — pinta on jaettu ja pysyvä.
+    let channel2 = MockChannel::new("mock-dispatch-outbox-2").expect("channel");
+    channel2.close_inbound();
+    let agent_cfg2 = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul2 = familyclaw_agent::Soul::from_essence("generic being for dispatch outbox test");
+    let runtime2 = build_family(
+        Some("dispatch-outbox-bus-2".to_string()),
+        agent_cfg2,
+        soul2,
+        Box::new(channel2),
+        "dispatch-chat".to_string(),
+        &resolver,
+        None,
+    )
+    .await
+    .expect("build_family restart");
+    {
+        let actions = runtime2.actions();
+        let guard = actions.lock().await;
+        assert_eq!(
+            guard.dispatch_outbox_kind(),
+            "journal",
+            "restart keeps journal outbox"
+        );
+    }
+    assert!(
+        outbox_path.is_file(),
+        "durable dispatch outbox journal survives restart (shared, persistent — not per-process)"
+    );
+    runtime2.shutdown().await;
+
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// **Exactly-once-vastaparitodiste (in-memory-polku):** ilman
+/// `FAMILYCLAW_DATA_DIR`:iä ajoympäristö jää muistinvaraiseen lähetys-outboxiin
+/// (`"in-memory"`) eikä mitään dispatch-journalia kirjoiteta levylle —
+/// taaksepäin-yhteensopiva, ei sivuvaikutuksia tiedostojärjestelmään (oikein: ei
+/// persistointia pyydetty).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_family_in_memory_path_uses_in_memory_dispatch_outbox() {
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+
+    let channel = MockChannel::new("mock-inmem-dispatch").expect("channel");
+    channel.close_inbound();
+    let resolver = EnvEndpointResolver::new();
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul = familyclaw_agent::Soul::from_essence("generic being");
+
+    let runtime = build_family(
+        None,
+        agent_cfg,
+        soul,
+        Box::new(channel),
+        "c".to_string(),
+        &resolver,
+        None,
+    )
+    .await
+    .expect("build_family");
+
+    {
+        let actions = runtime.actions();
+        let guard = actions.lock().await;
+        assert_eq!(
+            guard.dispatch_outbox_kind(),
+            "in-memory",
+            "in-memory build keeps InMemoryDispatchOutbox (no persistence requested)"
+        );
+    }
+    runtime.shutdown().await;
+}
+
+/// **Laskuri-skill (sivuvaikutuksen mittari) PRODUCT-PATH-outbox-testille.**
+///
+/// Jokainen `execute` kasvattaa **prosessin sisäistä** laskuria. Testi vaatii
+/// että laskuri pysyy **nollassa** kun lähetys palautuu outboxin replayna
+/// (committed) tai hylätään fail-closed (intent-only) — kumpikin todistaa ettei
+/// sivuvaikutusta ajeta uudelleen [`build_family`]:n läpi.
+///
+/// Taito on tarkoituksella **auto-run** ([`ActionRisk::ReadOnly`] +
+/// [`ApprovalPolicy::AutoIfReadOnly`]), jotta `submit_task_idempotent` AJAISI
+/// suorittajan heti — paitsi kun outbox neutraloi sen. Näin "ulkoinen
+/// sivuvaikutus" olisi mitattavissa jos kaksoislaukaisu pääsisi läpi.
+#[derive(Debug)]
+struct CountingSideEffect {
+    /// Prosessin sisäinen sivuvaikutuslaskuri (jaettu kloonien kesken).
+    calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl CountingSideEffect {
+    /// Kiinteä tunniste, jotta seed-avain ja uudelleenajo viittaavat samaan taitoon.
+    const SKILL_UUID: uuid::Uuid = uuid::uuid!("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+
+    fn skill_id() -> familyclaw_actions::SkillId {
+        familyclaw_actions::SkillId::from_uuid(Self::SKILL_UUID)
+    }
+}
+
+#[async_trait::async_trait]
+impl familyclaw_actions::ActionExecutor for CountingSideEffect {
+    async fn execute(
+        &self,
+        request: familyclaw_actions::ActionRequest,
+    ) -> familyclaw_actions::Result<familyclaw_actions::ActionResult> {
+        // SIVUVAIKUTUS: kasvata laskuria. Tämän on tapahduttava korkeintaan kerran.
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(familyclaw_actions::ActionResult::success(
+            "counter bumped",
+            serde_json::json!({ "ok": true }),
+            request.now,
+        ))
+    }
+}
+
+impl familyclaw_actions::Skill for CountingSideEffect {
+    fn manifest(&self) -> familyclaw_actions::manifest::SkillManifest {
+        familyclaw_actions::manifest::SkillManifest {
+            id: Self::skill_id(),
+            name: "counting_side_effect_runtime".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Kasvattaa sivuvaikutuslaskuria (auto-run, testikäyttö).".to_string(),
+            permissions: vec![familyclaw_actions::policy::SkillPermission::NetworkRead],
+            risk: familyclaw_actions::policy::ActionRisk::ReadOnly,
+            approval_policy: familyclaw_actions::policy::ApprovalPolicy::AutoIfReadOnly,
+            input_hint: None,
+            output_hint: None,
+            input_schema: familyclaw_actions::manifest::default_input_schema(),
+        }
+    }
+}
+
+/// **PRODUCT-PATH crash-survival -integraatiotesti (P0-4 / GPT-5.5:n vaatima).**
+///
+/// Tämä on se testi jonka GPT-5.5 vaati: at-most-once-takuu todistettuna **sillä
+/// polulla jonka oikea käyttäjä ajaa** ([`build_family`] + `FAMILYCLAW_DATA_DIR`),
+/// EI vain suoralla [`ActionRuntime`]-harnessilla. Se mallintaa kaatumisen
+/// **dispatch-lähetyksen ja agenttikerroksen journal-appendin VÄLISSÄ**: outbox
+/// on jo kirjoitettu levylle, mutta prosessi kuoli ennen kuin agentti ehti
+/// journaloida vuoron. Restartin jälkeen agentin tuore-haara ajaisi SAMAN
+/// lähetyksen samalla idempotenssi-avaimella uudelleen — ja **ilman**
+/// kaatumiskestävää outboxia se laukaisisi sivuvaikutuksen toiseen kertaan.
+///
+/// ## Mitä tämä todistaa [`build_family`]:n LÄPI
+/// 1. **Seed (kaatuminen ennen restartia):** kirjoitetaan kaatumiskestävään
+///    outboxiin (`<data_dir>/dispatch_outbox.jsonl`) kaksi avainta — toinen
+///    **committed** (sivuvaikutus ehti tapahtua + sitoutua) ja toinen
+///    **intent-only** (sivuvaikutus ehti tapahtua, committed EI) — ilman
+///    [`build_family`]:tä, suoraan [`JournalDispatchOutbox`]:lla. Tämä jäljittelee
+///    edellisen prosessin levyjälkeä SIGKILL:n jälkeen.
+/// 2. **Restart oikealla tuotantopolulla:** ajetaan [`build_family`] SAMALLA
+///    `FAMILYCLAW_DATA_DIR`:llä → se kytkee `JournalDispatchOutbox`:n joka
+///    rekonstruoi seedatut avaimet levyltä.
+/// 3. **Sivuvaikutus EI aja uudelleen:**
+///    - committed-avain → `submit_task_idempotent` palauttaa **arvo-identtisen**
+///      tallennetun lopputuloksen (sama `task_id`) ajamatta suorittajaa
+///      (laskuri pysyy 0:ssa).
+///    - intent-only-avain → `submit_task_idempotent` **epäonnistuu suljettuna**
+///      ([`ActionError::PolicyDenied`]) ajamatta suorittajaa (laskuri pysyy 0:ssa).
+///
+/// Laskuri pysyy **tasan nollassa** koko ajan: at-most-once säilyy juuri sillä
+/// polulla jolla oikea käyttäjä rakentaa perheen — ei vain yksikkö-harnessilla.
+// Lineaarinen seed→restart→todiste-sekvenssi luetaan ylhäältä alas; paloittelu
+// apufunktioihin hajottaisi product-path-kertomuksen ilman selvyyshyötyä.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn product_path_build_family_honors_persisted_dispatch_outbox_no_double_fire() {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    use familyclaw_actions::dispatch_outbox::{
+        DispatchOutboxStore, DispatchedOutcome, JournalDispatchOutbox,
+    };
+    use familyclaw_actions::task::TaskStatus;
+    use familyclaw_actions::{ActionError, ActionTaskId, SkillId};
+
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+
+    let data_dir = unique_temp_dir("product-path-outbox");
+    std::fs::create_dir_all(&data_dir).expect("temp dir");
+    let outbox_path = data_dir.join("dispatch_outbox.jsonl");
+
+    // Vakaat idempotenssi-avaimet (= agentin `turn-{turn}-dispatch-{k}`).
+    let committed_key = "turn-7-dispatch-0";
+    let intent_only_key = "turn-9-dispatch-0";
+
+    // --- 1) SEED: kaatumisjälki ennen restartia (suoraan outboxiin). ---
+    // Tunnettu lopputulos jonka arvo-identtisyyden voimme tarkistaa replayssa.
+    let committed_task_id = ActionTaskId::new();
+    let committed_outcome = DispatchedOutcome {
+        task_id: committed_task_id,
+        status: TaskStatus::Done,
+        pending_approval: None,
+        error: None,
+    };
+    {
+        let seed = JournalDispatchOutbox::open(&outbox_path).expect("seed open");
+        // committed-avain: intent + committed (sivuvaikutus ehti tapahtua + sitoutua).
+        seed.record_intent(committed_key)
+            .expect("seed intent (committed)");
+        seed.record_committed(committed_key, &committed_outcome)
+            .expect("seed committed");
+        // intent-only-avain: VAIN intent (kaatui kesken sivuvaikutuksen).
+        seed.record_intent(intent_only_key)
+            .expect("seed intent-only");
+    } // drop = "kaatuminen"; levyjälki jää.
+    assert!(
+        outbox_path.is_file(),
+        "seedattu dispatch_outbox.jsonl on levyllä"
+    );
+
+    // --- 2) RESTART OIKEALLA TUOTANTOPOLULLA: build_family samalla data-dirillä. ---
+    std::env::set_var("FAMILYCLAW_DATA_DIR", &data_dir);
+    std::env::set_var("FAMILYCLAW_DREAM_DISABLED", "1");
+
+    let channel = MockChannel::new("mock-product-path-outbox").expect("channel");
+    channel.close_inbound();
+    let resolver = EnvEndpointResolver::new();
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul = familyclaw_agent::Soul::from_essence("generic being for product-path outbox test");
+
+    let runtime = build_family(
+        Some("product-path-outbox-bus".to_string()),
+        agent_cfg,
+        soul,
+        Box::new(channel),
+        "outbox-chat".to_string(),
+        &resolver,
+        None,
+    )
+    .await
+    .expect("build_family on seeded data_dir");
+
+    // build_family kytki KAATUMISKESTÄVÄN outboxin (ei muistinvaraista) →
+    // seedatut avaimet rekonstruoituivat levyltä.
+    let actions = runtime.actions();
+    {
+        let guard = actions.lock().await;
+        assert_eq!(
+            guard.dispatch_outbox_kind(),
+            "journal",
+            "tuotantopolku kytkee JournalDispatchOutboxin (kaatumiskestävä at-most-once)"
+        );
+    }
+
+    // Rekisteröi laskuri-skill jaettuun ajoympäristöön (sama Arc<Mutex> jonka
+    // tool-loop omistaa). Sivuvaikutuslaskuri jaetaan kloonin kautta.
+    let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let skill_id: SkillId = CountingSideEffect::skill_id();
+    {
+        let mut guard = actions.lock().await;
+        guard
+            .register_skill(CountingSideEffect {
+                calls: Arc::clone(&calls),
+            })
+            .expect("register counting skill into shared runtime");
+    }
+
+    let now = familyclaw_core::time::from_unix_secs(1_700_000_500).expect("ts");
+    let payload = serde_json::json!({ "n": 1 });
+
+    // --- 3a) committed-avain: replay palauttaa arvo-identtisen lopputuloksen,
+    //         EI aja sivuvaikutusta (agentin tuore-haaran uudelleenajo). ---
+    let replayed = {
+        let mut guard = actions.lock().await;
+        guard
+            .submit_task_idempotent(committed_key, "agent_a", skill_id, payload.clone(), now)
+            .await
+            .expect("committed key replays prior outcome (no re-execute)")
+    };
+    assert_eq!(
+        replayed.task_id, committed_task_id,
+        "committed-avain palautti ARVO-IDENTTISEN lopputuloksen (sama task_id) — ei tuoretta ajoa"
+    );
+    assert_eq!(replayed.status, TaskStatus::Done);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "committed-replay EI ajanut sivuvaikutusta uudelleen (laskuri 0)"
+    );
+
+    // --- 3b) intent-only-avain: fail-closed (PolicyDenied), EI aja sivuvaikutusta. ---
+    let denied = {
+        let mut guard = actions.lock().await;
+        guard
+            .submit_task_idempotent(intent_only_key, "agent_a", skill_id, payload, now)
+            .await
+            .expect_err("intent-only key must fail closed (not re-execute)")
+    };
+    assert!(
+        matches!(denied, ActionError::PolicyDenied(_)),
+        "intent-only-kaatuminen → fail-closed PolicyDenied, ei sokeaa uudelleenajoa (sai: {denied:?})"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "intent-only fail-closed EI ajanut sivuvaikutusta (laskuri yhä 0 — at-most-once säilyi build_family:n läpi)"
+    );
+
+    runtime.shutdown().await;
+
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
 /// Varmistaa erikseen että inbound todella **kulkee busin läpi agentille**
 /// (muisti saa merkinnän), riippumatta reply-pathista — toinen pää roundtripin
 /// todisteketjusta.
@@ -633,6 +1091,7 @@ async fn inbound_reaches_agent_over_bus() {
         Box::new(channel),
         "c".to_string(),
         &resolver,
+        None,
     )
     .await
     .expect("build_family");
@@ -644,4 +1103,264 @@ async fn inbound_reaches_agent_over_bus() {
     assert_eq!(beings[0].name, "agent_a");
 
     runtime.shutdown().await;
+}
+
+/// **Durable-pending-pinta tuotantopolulla (review-finding: "production wires
+/// durable outbox but leaves pending store in-memory").** Kun `build_family`
+/// ajetaan persistentillä polulla (`FAMILYCLAW_DATA_DIR` asetettu), agentin ja
+/// operaattoripinnan jakama toimintoajoympäristö saa KAATUMISKESTÄVÄN
+/// odottavien hyväksyntöjen pinnan (`JournalPendingStore`,
+/// `<data_dir>/pending_approvals.jsonl`) oletuksellisen muistinvaraisen tilalle.
+///
+/// Ennen korjausta `build_family` kytki kaatumiskestävän lähetys-outboxin mutta
+/// jätti pending-pinnan muistiin → restartin jälkeen vielä odottava hyväksyntä
+/// katosi muistikartasta ja `approve` palautti `ApprovalMissing` (404) jo ENNEN
+/// outboxin InProgress/Committed-vahtia. At-most-once piti silloin VAIN 404:n
+/// sivuvaikutuksesta (vahingossa), ei siksi että durable-kerros sen pakottaa.
+///
+/// Todiste on kaksinkertainen, kuten dispatch-outbox-testissä: (1) suora —
+/// jaetun ajoympäristön `pending_store_kind()` on `"journal"` (ei `"in-memory"`);
+/// (2) epäsuora — `JournalPendingStore::open` LUO journal-tiedoston, joten
+/// `<data_dir>/pending_approvals.jsonl` on synnyttävä ja säilyttävä restartin yli.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_family_wires_durable_pending_store_on_persistent_path() {
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    let data_dir = unique_temp_dir("pending-store");
+    let pending_path = data_dir.join("pending_approvals.jsonl");
+    std::fs::create_dir_all(&data_dir).expect("temp dir");
+
+    std::env::set_var("FAMILYCLAW_DATA_DIR", &data_dir);
+    std::env::set_var("FAMILYCLAW_DREAM_DISABLED", "1");
+
+    let channel = MockChannel::new("mock-pending-store").expect("channel");
+    channel.close_inbound();
+    let resolver = EnvEndpointResolver::new();
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul = familyclaw_agent::Soul::from_essence("generic being for pending store test");
+
+    let runtime = build_family(
+        Some("pending-store-bus".to_string()),
+        agent_cfg,
+        soul,
+        Box::new(channel),
+        "pending-chat".to_string(),
+        &resolver,
+        None,
+    )
+    .await
+    .expect("build_family");
+
+    // Suora väite: jaettu ajoympäristö kantaa journal-pending-pintaa.
+    {
+        let actions = runtime.actions();
+        let guard = actions.lock().await;
+        assert_eq!(
+            guard.pending_store_kind(),
+            "journal",
+            "persistent build wires JournalPendingStore (crash-surviving pending approvals)"
+        );
+    }
+    // Epäsuora väite: tiedosto syntyi avatessa.
+    assert!(
+        pending_path.is_file(),
+        "build_family wires JournalPendingStore on persistent path → pending_approvals.jsonl must exist at {}",
+        pending_path.display()
+    );
+
+    runtime.shutdown().await;
+
+    // Restart (sama data-dir): tiedosto säilyy — pinta on jaettu ja pysyvä.
+    let channel2 = MockChannel::new("mock-pending-store-2").expect("channel");
+    channel2.close_inbound();
+    let agent_cfg2 = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul2 = familyclaw_agent::Soul::from_essence("generic being for pending store test");
+    let runtime2 = build_family(
+        Some("pending-store-bus-2".to_string()),
+        agent_cfg2,
+        soul2,
+        Box::new(channel2),
+        "pending-chat".to_string(),
+        &resolver,
+        None,
+    )
+    .await
+    .expect("build_family restart");
+    {
+        let actions = runtime2.actions();
+        let guard = actions.lock().await;
+        assert_eq!(
+            guard.pending_store_kind(),
+            "journal",
+            "restart keeps journal pending store"
+        );
+    }
+    assert!(
+        pending_path.is_file(),
+        "durable pending journal survives restart (shared, persistent — not per-process)"
+    );
+    runtime2.shutdown().await;
+
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// **Pending-pinnan vastaparitodiste (in-memory-polku):** ilman
+/// `FAMILYCLAW_DATA_DIR`:iä ajoympäristö jää muistinvaraiseen pending-pintaan
+/// (`"in-memory"`) — taaksepäin-yhteensopiva, ei sivuvaikutuksia
+/// tiedostojärjestelmään (oikein: ei persistointia pyydetty).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_family_in_memory_path_uses_in_memory_pending_store() {
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+
+    let channel = MockChannel::new("mock-inmem-pending").expect("channel");
+    channel.close_inbound();
+    let resolver = EnvEndpointResolver::new();
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul = familyclaw_agent::Soul::from_essence("generic being");
+
+    let runtime = build_family(
+        None,
+        agent_cfg,
+        soul,
+        Box::new(channel),
+        "c".to_string(),
+        &resolver,
+        None,
+    )
+    .await
+    .expect("build_family");
+
+    {
+        let actions = runtime.actions();
+        let guard = actions.lock().await;
+        assert_eq!(
+            guard.pending_store_kind(),
+            "in-memory",
+            "in-memory build keeps InMemoryPendingStore (no persistence requested)"
+        );
+    }
+    runtime.shutdown().await;
+}
+
+/// **PRODUCT-PATH pending-reload -integraatiotesti (review-finding ydin).**
+///
+/// Todistaa että odottava hyväksyntä, joka kirjoitettiin kaatumiskestävään
+/// pending-pintaan ENNEN "restartia", LADATAAN takaisin tuoreen `build_family`:n
+/// toimesta samasta `FAMILYCLAW_DATA_DIR`:stä — joten `approve` EI enää palauta
+/// `ApprovalMissing` (404) vielä odottavalle hyväksynnälle restartin jälkeen.
+/// Tämä on se ero jonka korjaus tekee: at-most-once-rajaa ei enää pidetä
+/// vahingossa 404:n kautta, vaan vielä-odottava hyväksyntä etenee oikeasti
+/// outboxin InProgress/Committed-vahdille.
+///
+/// 1. **Seed (kaatuminen ennen restartia):** kirjoitetaan kaatumiskestävään
+///    pending-pintaan (`<data_dir>/pending_approvals.jsonl`) yksi odottava
+///    hyväksyntä — suoraan [`JournalPendingStore`]:lla, ilman `build_family`:tä.
+///    Tämä jäljittelee edellisen prosessin levyjälkeä SIGKILL:n jälkeen.
+/// 2. **Restart oikealla tuotantopolulla:** ajetaan [`build_family`] SAMALLA
+///    `FAMILYCLAW_DATA_DIR`:llä → se kytkee `JournalPendingStore`:n joka
+///    rekonstruoi seedatun hyväksynnän levyltä.
+/// 3. **Hyväksyntä on yhä odottamassa:** jaetun ajoympäristön
+///    `try_pending_approvals()` listaa seedatun `approval_id`:n — sama
+///    tunniste jonka `approve` löytäisi (ei `ApprovalMissing`).
+// Lineaarinen seed→restart→todiste-sekvenssi luetaan ylhäältä alas.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn product_path_build_family_reloads_pending_approval_after_restart() {
+    use familyclaw_actions::approval::Approval;
+    use familyclaw_actions::pending_store::{
+        JournalPendingStore, PendingApprovalStore, PendingRecord,
+    };
+    use familyclaw_actions::{ActionId, ActionTaskId, ApprovalId};
+
+    let _guard = DATA_DIR_ENV_LOCK.lock().await;
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+
+    let data_dir = unique_temp_dir("product-path-pending");
+    std::fs::create_dir_all(&data_dir).expect("temp dir");
+    let pending_path = data_dir.join("pending_approvals.jsonl");
+
+    // Aikaleimat: myönnetty menneisyydessä, vanhenee kaukana tulevaisuudessa,
+    // jottei eviktointi pudota seedattua hyväksyntää restartissa.
+    let granted_at = familyclaw_core::time::from_unix_secs(1_700_000_000).expect("granted ts");
+    let expires_at = familyclaw_core::time::from_unix_secs(4_000_000_000).expect("expiry ts");
+
+    // --- 1) SEED: vielä odottava hyväksyntä levylle ennen restartia. ---
+    let task_id = ActionTaskId::new();
+    let approval_id = {
+        let approval = Approval {
+            id: ApprovalId::new(),
+            action_id: ActionId::new(),
+            payload_hash: "0".repeat(64),
+            granted_at,
+            expires_at,
+            consumed: false,
+        };
+        let id = approval.id;
+        let record = PendingRecord::new(
+            task_id,
+            approval,
+            "generic skill awaiting human approval",
+            granted_at,
+        );
+        let seed = JournalPendingStore::open(&pending_path).expect("seed open");
+        seed.insert(record).expect("seed insert");
+        id
+    }; // drop = "kaatuminen"; levyjälki jää.
+    assert!(
+        pending_path.is_file(),
+        "seedattu pending_approvals.jsonl on levyllä"
+    );
+
+    // --- 2) RESTART OIKEALLA TUOTANTOPOLULLA: build_family samalla data-dirillä. ---
+    std::env::set_var("FAMILYCLAW_DATA_DIR", &data_dir);
+    std::env::set_var("FAMILYCLAW_DREAM_DISABLED", "1");
+
+    let channel = MockChannel::new("mock-product-path-pending").expect("channel");
+    channel.close_inbound();
+    let resolver = EnvEndpointResolver::new();
+    let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
+    let soul = familyclaw_agent::Soul::from_essence("generic being for product-path pending test");
+
+    let runtime = build_family(
+        Some("product-path-pending-bus".to_string()),
+        agent_cfg,
+        soul,
+        Box::new(channel),
+        "pending-reload-chat".to_string(),
+        &resolver,
+        None,
+    )
+    .await
+    .expect("build_family on seeded data_dir");
+
+    let actions = runtime.actions();
+    {
+        let guard = actions.lock().await;
+        // build_family kytki KAATUMISKESTÄVÄN pending-pinnan (ei muistinvaraista).
+        assert_eq!(
+            guard.pending_store_kind(),
+            "journal",
+            "tuotantopolku kytkee JournalPendingStoren (kaatumiskestävä pending)"
+        );
+        // YDINVÄITE: seedattu, vielä odottava hyväksyntä LADATTIIN levyltä →
+        // approve EI näkisi ApprovalMissing:iä. Listalla on tasan se tunniste.
+        let pending = guard.try_pending_approvals().expect("list pending");
+        assert!(
+            pending
+                .iter()
+                .any(|p| p.approval_id == approval_id && p.task_id == task_id),
+            "vielä odottava hyväksyntä rekonstruoitui restartissa (ei ApprovalMissing): \
+             approval_id={approval_id} task_id={task_id}, listalla={pending:?}"
+        );
+    }
+
+    runtime.shutdown().await;
+
+    std::env::remove_var("FAMILYCLAW_DATA_DIR");
+    std::env::remove_var("FAMILYCLAW_DREAM_DISABLED");
+    let _ = std::fs::remove_dir_all(&data_dir);
 }

@@ -29,7 +29,7 @@
 //! Yksi agentti, yksi muisti — **ei** per-sessio Agent-instansseja (ylirakennus).
 //! Isolaatio tehdään muisti-scopella session-avaimella:
 //! 1. **Kirjoitus:** [`Agent::handle_turn`](crate::Agent::handle_turn) liittää
-//!    muistoon tagin `session:<key>` (origin-Some-haara), [`session_tag`].
+//!    muistoon tagin `session:<key>` (origin-Some-haara), [`session_tag`](MessageOrigin::session_tag).
 //! 2. **Luku:** [`Agent::think`](crate::Agent::think) suodattaa recallin samalla
 //!    `session:<key>`-tagilla → A:n muistot eivät vuoda B:n kontekstiin.
 //! 3. **Reply-kohde:** vastaus johdetaan originin keskustelusta, ei staattisesta
@@ -38,7 +38,7 @@
 //!
 //! Vaihe 2 (recall-suodatus) odottaa muistikerroksen tag-filtteriä; siihen asti
 //! `session:<key>`-tag kirjoitetaan jo nyt (vaihe 1 + 3 ovat valmiita), ja luku
-//! suodattaa kun rajapinta on saatavilla. Ks. [`session_tag`].
+//! suodattaa kun rajapinta on saatavilla. Ks. [`session_tag`](MessageOrigin::session_tag).
 //!
 //! ## OSS-raja (KERROS A)
 //! Geneeristä alustakoodia: ei kovakoodattuja kanavanimiä, keskusteluja,

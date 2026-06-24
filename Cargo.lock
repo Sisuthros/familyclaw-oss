@@ -1129,6 +1129,20 @@ dependencies = [
 
 [[package]]
 name = "dashmap"
+version = "5.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
+dependencies = [
+ "cfg-if",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+ "serde",
+]
+
+[[package]]
+name = "dashmap"
 version = "6.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
@@ -1438,12 +1452,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "familyclaw-actions"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "clap",
+ "familyclaw-bridge",
+ "familyclaw-core",
+ "familyclaw-durable",
+ "familyclaw-security",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "uuid",
+]
+
+[[package]]
 name = "familyclaw-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "chrono",
  "clap",
+ "familyclaw-actions",
  "familyclaw-bridge",
  "familyclaw-bus",
  "familyclaw-channels",
@@ -1589,14 +1625,20 @@ dependencies = [
 name = "familyclaw-gateway"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum 0.7.9",
  "clap",
+ "familyclaw-actions",
  "familyclaw-agent",
  "familyclaw-bridge",
  "familyclaw-bus",
  "familyclaw-channels",
  "familyclaw-core",
+ "familyclaw-durable",
+ "familyclaw-memory",
+ "familyclaw-observability",
  "familyclaw-runtime",
+ "familyclaw-sandbox",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -1604,6 +1646,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1679,8 +1722,11 @@ dependencies = [
 name = "familyclaw-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum 0.7.9",
+ "familyclaw-actions",
  "familyclaw-agent",
+ "familyclaw-bridge",
  "familyclaw-bus",
  "familyclaw-channels",
  "familyclaw-core",
@@ -1692,6 +1738,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1706,6 +1753,19 @@ dependencies = [
  "tracing",
  "wasmtime",
  "wat",
+]
+
+[[package]]
+name = "familyclaw-scheduler"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "familyclaw-actions",
+ "familyclaw-core",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3789,9 +3849,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -3851,7 +3911,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d65972a0286ef14c43c6daafbac6cf15e96496446147683b2905292c35cc178"
 dependencies = [
  "bon",
- "dashmap",
+ "dashmap 6.2.1",
  "futures",
  "once_cell",
  "strum",
@@ -4693,11 +4753,14 @@ dependencies = [
  "base64",
  "bitflags",
  "bytes",
+ "dashmap 5.5.3",
  "flate2",
  "futures",
  "mime_guess",
+ "parking_lot",
  "percent-encoding",
  "reqwest 0.12.28",
+ "rustc-hash",
  "secrecy",
  "serde",
  "serde_cow",
@@ -4720,6 +4783,12 @@ dependencies = [
  "cpufeatures 0.2.17",
  "digest",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"
@@ -5023,7 +5092,7 @@ dependencies = [
  "bytes",
  "chrono",
  "ciborium",
- "dashmap",
+ "dashmap 6.2.1",
  "deunicode",
  "diskann",
  "diskann-utils",
@@ -5921,6 +5990,7 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

@@ -132,3 +132,5 @@ ops/
 scripts/*.bak-*
 plans/
 research/
+_stray-backup/
+PHASE2_RECON_PLAN_*.json

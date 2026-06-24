@@ -308,7 +308,10 @@ mod tests {
         let mut t = CoherenceTracker::with_state(MesiState::Modified);
         let out = t.remote_write();
         assert_eq!(out.state, MesiState::Invalid);
-        assert!(out.needs_writeback, "likainen M kirjoitetaan takaisin ennen I");
+        assert!(
+            out.needs_writeback,
+            "likainen M kirjoitetaan takaisin ennen I"
+        );
     }
 
     #[test]
@@ -370,6 +373,9 @@ mod tests {
         assert_eq!(b.local_write(), MesiState::Modified);
         let a_out = a.remote_write();
         assert_eq!(a.state(), MesiState::Invalid);
-        assert!(!a_out.needs_writeback, "A oli Shared (puhdas), ei write-backia");
+        assert!(
+            !a_out.needs_writeback,
+            "A oli Shared (puhdas), ei write-backia"
+        );
     }
 }

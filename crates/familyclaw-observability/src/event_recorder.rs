@@ -9,6 +9,28 @@
 //! `_ => {}`-haarassa — näin uudet tapahtumatyypit eivät koskaan riko
 //! tallenninta (eteenpäin-yhteensopivuus).
 //!
+//! ## Tapahtuma → mittari -kartta (mitkä sarjat ovat eläviä)
+//! Tallennin kasvattaa **vain** alla luetellut sarjat. Muut laivueen
+//! oletussarjat pysyvät nollassa kunnes niille tuotetaan vastaava tapahtuma.
+//!
+//! | [`EventKind`] | Mittari |
+//! |---|---|
+//! | `TaskCreated` | `tasks_created` (laskuri +1) |
+//! | `TaskHandedOff` | `task_handoffs` (laskuri +1) |
+//! | `AgentRegistered` | `agents_online` (gauge +1) |
+//! | `AgentDeregistered` | `agents_online` (gauge -1) |
+//! | `Custom("task.completed" \| "orchestration.task_completed")` | `tasks_completed` (+1) |
+//! | `Custom("contract.proposed")` | `contract_proposed` (+1) |
+//! | `Custom("contract.fulfilled")` | `contract_fulfilled` (+1) |
+//! | `Custom("contract.breached")` | `contract_breached` (+1) |
+//! | `Custom("agent.turn" \| "orchestration.agent_turn")` | `agent_turns` (+1) |
+//! | `Custom("llm.call")` | `llm_calls` (+1) |
+//! | `Custom("llm.fallback")` | `llm_fallbacks` (+1) |
+//! | `Custom("durable.replay")` | `durable_replays` (+1) |
+//! | `Custom("workflow.step_completed" \| "orchestration.workflow_step_completed")` | `workflow_steps_completed` (+1) |
+//!
+//! `TaskStatusChanged` ja `AgentHeartbeat` eivät kartoitu omaan mittariin.
+//!
 //! ## Custom-tapahtumat
 //! Orkestrointi- ja sopimuskerros lähettää koordinaation
 //! [`EventKind::Custom`]-tapahtumina vakaalla etuliitteellä
@@ -33,6 +55,8 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! [`EventBus`]: familyclaw_bridge::EventBus
 
 use familyclaw_bridge::{EventKind, EventSubscriber, FamilyBridge};
 
@@ -40,7 +64,7 @@ use crate::metrics::{
     MetricsRegistry, COUNTER_AGENT_TURNS, COUNTER_CONTRACT_BREACHED, COUNTER_CONTRACT_FULFILLED,
     COUNTER_CONTRACT_PROPOSED, COUNTER_DURABLE_REPLAYS, COUNTER_LLM_CALLS, COUNTER_LLM_FALLBACKS,
     COUNTER_TASKS_COMPLETED, COUNTER_TASKS_CREATED, COUNTER_TASK_HANDOFFS,
-    COUNTER_WORKFLOW_STEPS_COMPLETED,
+    COUNTER_WORKFLOW_STEPS_COMPLETED, GAUGE_AGENTS_ONLINE,
 };
 
 /// Tilaa tapahtumaväylän ja päivittää mittareita tapahtumien perusteella.
@@ -128,14 +152,21 @@ impl EventRecorder {
         match kind {
             EventKind::TaskCreated => self.metrics.counter(COUNTER_TASKS_CREATED).inc(),
             EventKind::TaskHandedOff => self.metrics.counter(COUNTER_TASK_HANDOFFS).inc(),
+            // Agentin rekisteröinti/poisto liikuttaa `agents_online`-gaugea:
+            // rekisteröinti +1, poisto -1. Tämä on hetkellinen arvo (gauge), ei
+            // kumulatiivinen laskuri — se voi nousta ja laskea agenttien tullessa
+            // ja poistuessa. Runtime julkaisee rekisteröinnin agentin spawnatessa
+            // (havainnoitavuussilta), joten gauge heijastaa elävää agenttimäärää.
+            EventKind::AgentRegistered => self.metrics.gauge(GAUGE_AGENTS_ONLINE).add(1),
+            EventKind::AgentDeregistered => self.metrics.gauge(GAUGE_AGENTS_ONLINE).sub(1),
             EventKind::Custom(label) => self.record_custom(label),
             // Eteenpäin-yhteensopivuus: turvallisesti ohitettavat lajit.
             //
             // - `TaskStatusChanged`: emme tarkastele hyötykuormaa tässä, joten
             //   emme tiedä kohdetilaa; tehtävän valmistuminen kirjataan
             //   erilliseltä Custom-etiketiltä (workflow/orkestrointi).
-            // - Ydinlajit joita emme erikseen mittaa (`AgentRegistered`/
-            //   `AgentDeregistered`/`AgentHeartbeat`).
+            // - `AgentHeartbeat`: ei oma mittarinsa (liveness lasketaan
+            //   rekisteröinnin perusteella).
             // - Mahdolliset tulevat variantit (`_`).
             _ => {}
         }
@@ -266,7 +297,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn core_agent_events_are_ignored_without_panic() {
+    async fn agent_registration_moves_online_gauge_and_heartbeat_is_ignored() {
         use familyclaw_bridge::{AgentInfo, AgentRole, HostKind};
         use familyclaw_core::ids::AgentId;
 
@@ -280,9 +311,21 @@ mod tests {
         bridge.heartbeat_now(id).await.expect("heartbeat");
 
         let n = recorder.drain_once().await;
-        // Molemmat tapahtumat käsiteltiin, mutta laskurit eivät muuttuneet.
+        // Molemmat tapahtumat käsiteltiin (register + heartbeat).
         assert_eq!(n, 2);
+        // Rekisteröinti nosti agents_online-gaugea +1; heartbeatilla ei ole omaa
+        // mittaria. Tehtävälaskuri ei muuttunut (eri tapahtumaperhe).
+        assert_eq!(metrics.gauge(GAUGE_AGENTS_ONLINE).get(), 1);
         assert_eq!(metrics.counter(COUNTER_TASKS_CREATED).get(), 0);
+
+        // Poisto laskee gaugen takaisin nollaan.
+        assert!(
+            bridge.deregister_agent(id).await.is_some(),
+            "agentti poistui"
+        );
+        let n2 = recorder.drain_once().await;
+        assert_eq!(n2, 1);
+        assert_eq!(metrics.gauge(GAUGE_AGENTS_ONLINE).get(), 0);
     }
 
     #[tokio::test]

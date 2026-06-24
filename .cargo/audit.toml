@@ -1,0 +1,25 @@
+# cargo-audit-politiikka FamilyClawlle (Layer A / OSS).
+# Peilaa deny.toml:n [advisories].ignore-listaa, jotta `cargo audit` ja
+# `cargo deny check advisories` antavat saman tuloksen. Kukin poikkeus on
+# perusteltu deny.toml:ssa (ei korjaavaa upstream-versiota TAI ei FamilyClawn
+# laukaisemaa koodipolkua). Bumpattavat advisoryt EIVÄT kuulu tänne.
+# https://docs.rs/cargo-audit/latest/cargo_audit/config/
+
+[advisories]
+ignore = [
+    # rsa Marvin Attack — RSA-PKCS1v15-purun ajoituskanava. Ei korjaavaa
+    # upstream-versiota. FamilyClaw ei tee RSA-PKCS1v15-purkua (JWT = ed25519/ES256).
+    "RUSTSEC-2023-0071",
+    # rustls-webpki — CRL/name-constraint-viat PALVELIN-serteille. Tulevat vain
+    # `discord`-featuren ketjusta serenity 0.12.5 → tokio-tungstenite 0.21 →
+    # rustls 0.22; ei korjaavaa serenity-versiota. FamilyClaw on Discord-CLIENT,
+    # ei validoi näillä poluilla. Poistuu kun serenity päivittää rustlsin.
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    # atomic-polyfill — unmaintained (ei haavoittuvuus). Transitiivinen.
+    "RUSTSEC-2023-0089",
+    # number_prefix — unmaintained (ei haavoittuvuus). Transitiivinen (indicatif).
+    "RUSTSEC-2025-0119",
+]

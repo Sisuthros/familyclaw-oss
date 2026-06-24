@@ -32,10 +32,13 @@
 use std::env;
 use std::sync::Arc;
 
+use familyclaw_actions::{ActionRuntime, AuditCollector};
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, resolve_profile_dir, Agent, EmotionCalibration,
-    ErasedMemoryStore, LlmEndpointResolver, Soul, TableCalibration,
+    ErasedMemoryStore, JournalResumableStore, LlmEndpointResolver, ResumableTurnStore, Soul,
+    TableCalibration,
 };
+use familyclaw_bridge::{AgentInfo, AgentRole, FamilyBridge, HostKind};
 use familyclaw_bus::{BeingId, BusHandle, ResonanceBus, ResonanceMessage};
 use familyclaw_channels::Channel;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
@@ -43,6 +46,7 @@ use familyclaw_dream::DreamCycle;
 use familyclaw_durable::{DurableContext, FileJournal, InMemoryJournal, Journal};
 use familyclaw_memory::LocalJsonStore;
 use ractor::ActorRef;
+use tokio::sync::Mutex;
 
 /// Ajonaikainen kokoonpano: bus + spawnatut agentit + reply-pumppu + kanavat.
 ///
@@ -62,6 +66,41 @@ use ractor::ActorRef;
 /// bounded-wrapper tai backpressure-mittari drain-puolelle.
 pub struct FamilyRuntime {
     bus: BusHandle,
+    /// **Jaettu siltakerroksen tapahtumaväylä** havainnoitavuutta varten.
+    ///
+    /// Sama [`FamilyBridge`] jonka kutsuja antoi [`build_family`]:lle (jos antoi).
+    /// Runtime julkaisee tälle sillalle ajonaikaisia virstanpylväitä (tällä
+    /// hetkellä: agentin rekisteröinti → [`EventKind::AgentRegistered`]), ja
+    /// gateway voi tilata sen `EventRecorder`illa
+    /// ([`FamilyRuntime::bridge`]) niin että jaettu `MetricsRegistry` näkee
+    /// elävät inkrementit. `None` kun kutsuja ei antanut siltaa (esim.
+    /// savutestit, jotka eivät tarvitse havainnoitavuutta).
+    ///
+    /// [`EventKind::AgentRegistered`]: familyclaw_bridge::EventKind::AgentRegistered
+    bridge: Option<FamilyBridge>,
+    /// **Jaettu toimintoajoympäristö** (suspend/resume-silta, roadmap §6 D2).
+    ///
+    /// Sama [`Arc<Mutex<ActionRuntime>>`] joka kytkettiin agentin tool-looppiin
+    /// ([`Agent::with_actions`]). Runtime pitää tästä OMAN kahvansa, jotta
+    /// operaattoripinta (gateway `GET /approvals/pending` + `POST
+    /// /approvals/{id}/approve`) voi lukea odottavat hyväksynnät ja myöntää
+    /// hyväksynnän jakamatta agentin sisuksia. Mutex on `tokio::sync::Mutex`,
+    /// koska [`ActionRuntime::approve`] on `async` + `&mut self`.
+    ///
+    /// Lukko otetaan **vain** yksittäisen operaation ajaksi (lista/approve);
+    /// agentin tool-loop ottaa saman lukon omille kutsuilleen — kilpailu
+    /// ratkeaa lukon kautta, ei jaetun tilan kopioinnilla.
+    actions: Arc<Mutex<ActionRuntime>>,
+    /// **Jaettu turn-audit-keräin** (TURN-AUDIT, roadmap §6 D6).
+    ///
+    /// Sama [`Arc<AuditCollector>`] joka kytkettiin agentin tool-looppiin
+    /// ([`Agent::with_turn_audit`](familyclaw_agent::Agent::with_turn_audit)).
+    /// Runtime pitää tästä OMAN kahvansa, jotta operaattoripinta (esim. gatewayn
+    /// reitti) voi lukea havainnoitavan tool-loop-jäljen (vuoron alku,
+    /// työkalukutsut redaktoituina, suspend/resume, `stop_reason`) jakamatta
+    /// agentin sisuksia. Keräin on säikeenturvallinen ja vain-lisäävä
+    /// (tamper-evident); `detail`-kentät on redaktoitu jo kirjaushetkellä.
+    turn_audit: Arc<AuditCollector>,
     /// Spawnatut agentti-actorit. Pidetään elossa (drop = actor pysähtyy →
     /// reply-sink dropataan → drain-task valuu loppuun luonnostaan).
     agents: Vec<ActorRef<ResonanceMessage>>,
@@ -79,6 +118,53 @@ impl FamilyRuntime {
     #[must_use]
     pub fn bus(&self) -> &BusHandle {
         &self.bus
+    }
+
+    /// **Siltakerroksen tapahtumaväylä** havainnoitavuutta varten (jos kytketty).
+    ///
+    /// Palauttaa `Some(&bridge)` kun kutsuja antoi [`FamilyBridge`]:n
+    /// [`build_family`]:lle. Sama klooni jolle runtime julkaisee ajonaikaisia
+    /// virstanpylväitä (agentin rekisteröinti → [`EventKind::AgentRegistered`]):
+    /// gateway voi tilata sen `EventRecorder`illa, jolloin jaettu
+    /// `MetricsRegistry` saa elävät inkrementit. `None` kun siltaa ei annettu.
+    ///
+    /// [`EventKind::AgentRegistered`]: familyclaw_bridge::EventKind::AgentRegistered
+    #[must_use]
+    pub fn bridge(&self) -> Option<&FamilyBridge> {
+        self.bridge.as_ref()
+    }
+
+    /// **Jaettu toimintoajoympäristön kahva** operaattoripinnalle.
+    ///
+    /// Palauttaa kloonin samasta [`Arc<Mutex<ActionRuntime>>`]:stä jonka agentin
+    /// tool-loop omistaa ([`Agent::with_actions`]). Gateway tallettaa tämän
+    /// `GatewayState`-tilaansa ja käyttää sitä:
+    /// - `GET /approvals/pending` → [`ActionRuntime::try_pending_approvals`] +
+    ///   [`ActionRuntime::pending_summary_for`] (redaktoidut tiivistelmät),
+    /// - `POST /approvals/{id}/approve` → [`ActionRuntime::approve`] (myöntää
+    ///   hyväksynnän ja ajaa keskeytyneen toiminnon loppuun).
+    ///
+    /// Kahva on aina läsnä: [`build_family`] luo toimintoajoympäristön
+    /// (oletustaidoilla) jokaiselle perheelle ja kytkee saman kahvan sekä
+    /// agentille että runtimelle. Lukko otetaan vain operaation ajaksi.
+    #[must_use]
+    pub fn actions(&self) -> Arc<Mutex<ActionRuntime>> {
+        Arc::clone(&self.actions)
+    }
+
+    /// **Jaettu turn-audit-keräimen kahva** operaattoripinnalle (TURN-AUDIT,
+    /// roadmap §6 D6).
+    ///
+    /// Palauttaa kloonin samasta [`Arc<AuditCollector>`]:sta jonka agentin
+    /// tool-loop omistaa ([`Agent::with_turn_audit`](familyclaw_agent::Agent::with_turn_audit)).
+    /// Gateway voi tallettaa tämän tilaansa ja näyttää operaattorille
+    /// havainnoitavan tool-loop-jäljen ([`AuditCollector::list`] /
+    /// [`AuditCollector::events_for`]) — vuoron alku, työkalukutsut
+    /// **redaktoituina**, suspend/resume ja `stop_reason`. Tuloste ei koskaan
+    /// sisällä raakoja salaisuuksia.
+    #[must_use]
+    pub fn turn_audit(&self) -> Arc<AuditCollector> {
+        Arc::clone(&self.turn_audit)
     }
 
     /// Sammuttaa kokoonpanon siististi: **ei pudota in-flight-vastauksia.**
@@ -105,7 +191,7 @@ impl FamilyRuntime {
 
 /// C5-kokooja: rakentaa elävän [`FamilyRuntime`]:n yhdellä kutsulla.
 ///
-/// Kytkee `Channel::receive()` → [`pump_channel_to_bus`] → bus → `Agent`
+/// Kytkee `Channel::receive()` → [`familyclaw_agent::pump_channel_to_bus`] → bus → `Agent`
 /// (spawn) → `route_reply` → reply-jono → `Channel::send`. MVP: yksi agentti,
 /// yksi kanava, staattinen reply-kohde.
 ///
@@ -131,6 +217,22 @@ impl FamilyRuntime {
 /// tarkoituksella vääräksi ja todistaa että kaksi eri keskustelua reitittyvät
 /// omiin kohteisiinsa.
 ///
+/// # Havainnoitavuus: `bridge` (valinnainen)
+/// `bridge`-argumentti on **valinnainen** jaettu siltakerroksen tapahtumaväylä
+/// ([`FamilyBridge`]). Kun kutsuja antaa sen, runtime julkaisee sille
+/// ajonaikaisia virstanpylväitä — tällä hetkellä **agentin rekisteröinnin**
+/// ([`EventKind::AgentRegistered`]) kun agentti on spawnattu (askel 7d). Runtime
+/// säilyttää saman kloonin ([`FamilyRuntime::bridge`]) jotta gateway voi tilata
+/// sen `EventRecorder`illa ja täyttää jaetun `MetricsRegistry`:n elävillä
+/// luvuilla (esim. `agents_online`-gauge).
+///
+/// **Tilausjärjestys:** `EventBus` toimittaa vain *tilauksen jälkeen* julkaistut
+/// tapahtumat. Kutsujan on siksi luotava `EventRecorder` (tilattava `bridge`)
+/// **ennen** tämän funktion kutsua, jotta agentin rekisteröintitapahtuma ei
+/// huku. `None` → ei julkaisua (savutestit, jotka eivät tarvitse mittareita).
+///
+/// [`EventKind::AgentRegistered`]: familyclaw_bridge::EventKind::AgentRegistered
+///
 /// # Errors
 /// - [`FamilyClawError::Config`] jos mallikonfiguraatio on kelvoton (tämä
 ///   nostetaan vain jos primary on tyhjä — puuttuva endpoint johtaa
@@ -151,6 +253,7 @@ pub async fn build_family(
     channel: Box<dyn Channel>,
     reply_target: String,
     resolver: &dyn LlmEndpointResolver,
+    bridge: Option<FamilyBridge>,
 ) -> Result<FamilyRuntime> {
     // 0. Lue persistointikonfiguraatio SYNKRONISESTI ennen ensimmäistä
     //    `.await`-pistettä. Näin päätös (persistentti vs. in-memory) tehdään
@@ -191,7 +294,45 @@ pub async fn build_family(
     //    journalin päälle (FAMILYCLAW_DATA_DIR). Vain silloin on replay-historiaa
     //    josta on jatkettava elävänä (askel 6, `resume_live`). In-memory-polulla
     //    journal on aina tyhjä → ei replayta → ei resume-tarvetta.
-    let (memory, durable, dream_journal, persistent) =
+    //
+    //    `resumable` on jatkettavien vuorojen (suspend/resume-silta, roadmap §6)
+    //    KAATUMISKESTÄVÄ tallennuspinta. Se rakennetaan **vain** persistentillä
+    //    polulla: silloin hyväksyntää odottava, keskeytynyt tool-loop-vuoro
+    //    säilyy levyllä prosessin uudelleenkäynnistyksen yli (ks. askel 7).
+    //    In-memory-polulla agentti jää oletukseensa
+    //    ([`InMemoryResumableStore`]) — ei levyä, ei kaatumiskestävyyttä, kuten
+    //    muullakin in-memory-tilalla.
+    //
+    //    `action_data_dir` (`Some(dir)` vain persistentillä polulla) kantaa
+    //    hakemiston, josta toimintoajoympäristön KOLME kaatumiskestävää pintaa
+    //    rakennetaan askeleessa 7b:
+    //
+    //    1. **odottavien hyväksyntöjen pinta** (`<data_dir>/pending_approvals.jsonl`,
+    //       `JournalPendingStore`) — ilman tätä restartin jälkeen `approve`
+    //       törmäisi tyhjään muistikarttaan ja palauttaisi `ApprovalMissing`
+    //       (404) jo ENNEN outboxin InProgress/Committed-vahtia, jolloin
+    //       at-most-once pitäisi VAIN 404:n sivuvaikutuksesta (vahingossa) eikä
+    //       siksi että durable-kerros sen pakottaa;
+    //    2. **tehtäväjono** (`<data_dir>/action_tasks.jsonl`) — jotta hyväksyttävä
+    //       tehtävä (payload + tila) rekonstruoituu restartissa;
+    //    3. **lähetyksen idempotenssi-outbox** (`<data_dir>/dispatch_outbox.jsonl`,
+    //       familyclaw_actions::JournalDispatchOutbox) — **at-most-once**-rajan
+    //       (kaksoislaukaisun esto, EI universaali exactly-once completion)
+    //       KAATUMISKESTÄVÄ pinta:
+    //       `submit_task`:n / `approve`:n sivuvaikutus suoritetaan korkeintaan
+    //       kerran SIGKILL-kaatumisen yli (ei koskaan kahdesti), ja jo sitoutunut
+    //       lähetys palautuu arvo-identtisenä; intent-only-ikkunassa kaatuminen
+    //       epäonnistuu suljettuna.
+    //
+    //    Kaikki kolme pintaa kytketään YHDELLÄ [`ActionRuntime::with_durable_stores`]
+    //    -kutsulla (se avaa nyt itse kaatumiskestävän dispatch-outboxin kolmannesta
+    //    polusta — ei enää erillistä with_dispatch_outbox-ketjutusta eikä outboxin
+    //    kaksoisavausta). In-memory-polulla kaikki kolme jäävät oletuksiinsa (ei
+    //    levyä), kuten muullakin in-memory-tilalla.
+    //
+    //    `resumable` on jatkettavien vuorojen pinta `<data_dir>/resumable.jsonl`,
+    //    kytketään suoraan agenttiin (askel 7).
+    let (memory, durable, dream_journal, persistent, resumable, action_data_dir) =
         if let Some(data_dir) = data_dir {
             let dir = std::path::PathBuf::from(&data_dir);
             std::fs::create_dir_all(&dir).ok();
@@ -203,13 +344,24 @@ pub async fn build_family(
                 .map_err(|e| FamilyClawError::bus(e.to_string()))?;
             let dur = DurableContext::new(Arc::clone(&dream_j))
                 .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-            (Arc::new(mem) as ErasedMemoryStore, dur, Some(dream_j), true)
+            // Kaatumiskestävä jatkettavien vuorojen pinta `<data_dir>/resumable.jsonl`.
+            let store = JournalResumableStore::open(dir.join("resumable.jsonl"))
+                .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+            let resumable: Arc<dyn ResumableTurnStore> = Arc::new(store);
+            (
+                Arc::new(mem) as ErasedMemoryStore,
+                dur,
+                Some(dream_j),
+                true,
+                Some(resumable),
+                Some(dir),
+            )
         } else {
             let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
             let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(InMemoryJournal::new());
             let durable = DurableContext::new(Arc::clone(&dream_j))
                 .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-            (memory, durable, Some(dream_j), false)
+            (memory, durable, Some(dream_j), false, None, None)
         };
 
     // 5. Ankkuroi identiteetti ennen agentin rakennusta — JA persistoi se.
@@ -246,12 +398,26 @@ pub async fn build_family(
     //    eikä (b) törmää muistin `turn_key`:ssä replayn duplikaattiin. Tämä
     //    tehdään vain persistentillä polulla — in-memory-journal on aina tyhjä.
     let dream_store = Arc::clone(&memory);
+    // Talleta agentin identiteetti ennen kuin `agent_cfg` siirtyy `Agent::new`:lle
+    // — havainnoitavuussilta (askel 7d) julkaisee rekisteröinnin näillä arvoilla.
+    let agent_id = agent_cfg.id;
+    let agent_name = agent_cfg.name.clone();
     let mut agent = Agent::new(agent_cfg, soul, memory, durable, bus.clone(), None, None);
     // Gateway-restart-korjaus (durable-replay): siirrä kursori replayn loppuun
     // ja palauta turn_counter seuraavaan vapaaseen vuoropaikkaan VAIN
     // persistentillä polulla (FAMILYCLAW_DATA_DIR). In-memory-journal on tyhjä.
     if persistent {
         agent = agent.resume_live();
+    }
+    // Kaatumiskestävä jatkettavien vuorojen pinta (suspend/resume-silta): kun se
+    // rakennettiin (persistentti polku), kytke se agenttiin oletuksen
+    // ([`InMemoryResumableStore`]) tilalle. Näin hyväksyntää odottava,
+    // keskeytynyt tool-loop-vuoro säilyy levyllä prosessin kaatumisen yli ja
+    // [`Agent::resume_approved`] voi viedä sen loppuun restartin jälkeen. Ilman
+    // tätä tuotannon daemon menettäisi jokaisen odottavan resumable-vuoron
+    // restartissa (oletus on muistinvarainen).
+    if let Some(resumable) = resumable {
+        agent = agent.with_resumable_store(resumable);
     }
     agent = agent.with_reply_sink(sink).with_reply_target(reply_target);
     // Tunnemoottorin kalibrointi (KERROS B): jos profiilin calibration.json
@@ -263,8 +429,102 @@ pub async fn build_family(
         agent = agent.with_failover(failover);
     }
 
+    // 7b. Toimintoajoympäristö (ActionRuntime) — tool-loop + operaattorin
+    //     hyväksyntäpinta jakavat SAMAN Arc<Mutex<ActionRuntime>>-kahvan.
+    //
+    //     Tämä on suspend/resume-sillan (roadmap §6 D2) kytkentäpiste: ilman
+    //     toimintoajoympäristöä agentin `think` ei voi koskaan keskeytyä
+    //     hyväksyntää odottamaan (ei työkaluja → ei `Suspended`), joten ei myös
+    //     mitään mitä operaattorin pinta voisi näyttää tai hyväksyä. Kaikki taidot
+    //     ovat KERROS A -geneerisiä mockeja, eivät oikeita providereita. Jos
+    //     taitojen rekisteröinti epäonnistuisi (ei pitäisi — sisäänrakennetut
+    //     manifestit on validoitu), kaadutaan kontrolloidusti virheeseen ennen
+    //     spawnia.
+    //
+    //     Sama kahva annetaan agentille `with_actions`:lla (tool-loop aktivoituu)
+    //     JA talletetaan runtimeen ([`FamilyRuntime::actions`]) operaattoripintaa
+    //     varten — molemmat osoittavat samaan lukittuun tilaan.
+    //
+    //     **Kaatumiskestävyys persistentillä polulla** — KOLME durable-pintaa:
+    //
+    //     - **Durable pending + task** ([`ActionRuntime::with_durable_stores`]):
+    //       odottava hyväksyntä (`pending_approvals.jsonl`) JA hyväksyttävä
+    //       tehtävä (`action_tasks.jsonl`, payload + tila) SÄILYVÄT restartin yli.
+    //       Ilman durable-pendingiä `approve` törmäisi restartin jälkeen tyhjään
+    //       muistikarttaan ja palauttaisi `ApprovalMissing` (404) jo ENNEN
+    //       outboxin InProgress/Committed-vahtia — jolloin at-most-once pitäisi
+    //       vain 404:n sivuvaikutuksesta (vahingossa). Durable pending lataa
+    //       hyväksynnän takaisin levyltä, jolloin kontrolli ETENEE outbox-vahdille
+    //       ja **durable-kerros** pakottaa kaksoislaukaisun eston.
+    //     - **Durable lähetys-outbox** (avataan SAMASSA
+    //       [`ActionRuntime::with_durable_stores`] -kutsussa kolmannesta polusta —
+    //       ei enää erillistä with_dispatch_outbox-ketjutusta): tämä antaa
+    //       `submit_task`:lle / `approve`:lle at-most-once-takuun (kaksoislaukaisun
+    //       esto, EI universaali exactly-once completion) SIGKILL-kaatumisen yli
+    //       (sivuvaikutus korkeintaan kerran; jo sitoutunut lähetys palautuu
+    //       arvo-identtisenä; intent-only-ikkunassa kaatuminen epäonnistuu
+    //       suljettuna).
+    //
+    //     In-memory-polulla ([`ActionRuntime::with_default_skills`], ei data_diriä)
+    //     kaikki kolme jäävät oletuksiinsa — ei levyä, ei kaatumiskestävyyttä,
+    //     kuten muullakin in-memory-tilalla.
+    let action_runtime = if let Some(dir) = action_data_dir {
+        // Persistentti polku: durable pending + task + dispatch outbox YHDELLÄ
+        // konstruktorilla — `with_durable_stores` avaa nyt itse kaatumiskestävän
+        // journal-outboxin kolmannesta polusta, joten erillistä
+        // `with_dispatch_outbox`-ketjutusta ei enää tarvita (eikä outbox-tiedostoa
+        // avata kahdesti). Sen jälkeen oletustaidot.
+        let pending_path = dir.join("pending_approvals.jsonl");
+        let task_path = dir.join("action_tasks.jsonl");
+        let dispatch_path = dir.join("dispatch_outbox.jsonl");
+        let mut rt = ActionRuntime::with_durable_stores(pending_path, task_path, dispatch_path)
+            .await
+            .map_err(|e| {
+                FamilyClawError::config(format!("durable action stores open failed: {e}"))
+            })?;
+        rt.register_default_skills()
+            .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?;
+        rt
+    } else {
+        // In-memory-polku: kaikki kolme pintaa oletuksissaan.
+        ActionRuntime::with_default_skills()
+            .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?
+    };
+    let actions: Arc<Mutex<ActionRuntime>> = Arc::new(Mutex::new(action_runtime));
+    agent = agent.with_actions(Arc::clone(&actions));
+
+    // 7c. Turn-audit-keräin (TURN-AUDIT, roadmap §6 D6): tool-loopin elinkaari
+    //     muuttuu havainnoitavaksi. Agentti kirjoittaa jäljen (vuoron alku,
+    //     työkalukutsut redaktoituina, suspend/resume, stop_reason), ja runtime
+    //     pitää SAMASTA Arc<AuditCollector>:sta oman kahvansa operaattoripintaa
+    //     varten ([`FamilyRuntime::turn_audit`]). Molemmat osoittavat samaan
+    //     säikeenturvalliseen, vain-lisäävään pintaan.
+    let turn_audit: Arc<AuditCollector> = Arc::new(AuditCollector::new());
+    agent = agent.with_turn_audit(Arc::clone(&turn_audit));
+
     // 7. Spawnaa agentti actorina (rekisteröi busiin).
     let actor = agent.spawn().await?;
+
+    // 7d. Havainnoitavuussilta (valinnainen): jos kutsuja antoi siltakerroksen
+    //     tapahtumaväylän, julkaise agentin rekisteröinti REAALISENA
+    //     ajonaikaisena virstanpylväänä ([`EventKind::AgentRegistered`]). Gateway
+    //     on jo tilannut sillan `EventRecorder`illa (tilausjärjestys, ks.
+    //     funktion doc), joten tapahtuma päivittää jaetun `MetricsRegistry`:n
+    //     `agents_online`-gaugen elävästi. Rekisteröinnin epäonnistuminen ei saa
+    //     kaataa kokoonpanoa — havainnoitavuus on lisätieto, ei kriittinen polku;
+    //     virhe lokitetaan ja kokoaminen jatkuu.
+    if let Some(bridge) = &bridge {
+        let info = AgentInfo::new(agent_id, &agent_name, AgentRole::Executor, HostKind::Local);
+        if let Err(e) = bridge.register_agent(info).await {
+            tracing::warn!(
+                target: "familyclaw::observability",
+                agent = %agent_name,
+                error = %e,
+                "agent registration on observability bridge failed (non-fatal) — \
+                 agents_online gauge will not reflect this agent"
+            );
+        }
+    }
 
     // 8. Kanavan oma bus-seat — ERI kuin agentin being_id, muuten AgentActor
     //    skippaisi viestin "omana kaikuna" (agent.rs handle, sender-tarkistus).
@@ -340,6 +600,9 @@ pub async fn build_family(
     }
     Ok(FamilyRuntime {
         bus,
+        bridge,
+        actions,
+        turn_audit,
         agents: vec![actor],
         drain,
         tasks,
@@ -579,6 +842,7 @@ mod tests {
             Box::new(channel),
             "mock:general".to_string(),
             &resolver,
+            None,
         )
         .await
         .expect("runtime builds");
@@ -620,6 +884,7 @@ mod tests {
             Box::new(channel),
             "mock:room".to_string(),
             &resolver,
+            None,
         )
         .await
         .expect("runtime builds with provider");

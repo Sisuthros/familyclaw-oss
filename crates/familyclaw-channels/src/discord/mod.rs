@@ -83,19 +83,31 @@ pub struct DiscordChannel {
     /// [`DiscordChannel::start`]:ssa, käytetään [`DiscordChannel::stop`]:ssa
     /// graceful shutdowniin.
     shard_manager: Mutex<Option<Arc<ShardManager>>>,
+    /// Huoltajan/operaattorin Discord-user-id. Vain tämä id saa `DMata` agenttia
+    /// (kahdenkeskinen keskustelu). Annetaan konstruktorissa (johdetaan
+    /// runtime-konfigista, EI lueta env:stä tässä kerroksessa); 0 = ei asetettu
+    /// → DM:t pudotetaan kaikilta (turvallinen oletus).
+    owner_id: u64,
 }
 
 impl DiscordChannel {
     /// Luo uuden Discord-kanavan.
     ///
     /// # Arguments
-    /// * `bot_token` — Discord bot token (ladataan env:stä, ei kovakoodata).
+    /// * `bot_token` — Discord bot token (ladataan runtime-konfigista, ei kovakoodata).
     /// * `target_channel_id` — kohdekanavan id Discordissa (ei saa olla 0).
+    /// * `owner_id` — huoltajan Discord-user-id DM-portille (johdetaan
+    ///   runtime-konfigista). 0 = ei asetettu → DM:t pudotetaan (turvallinen
+    ///   oletus). Tätä EI lueta env:stä tässä — konfig-kerros resolvoi sen.
     ///
     /// # Errors
     /// [`ChannelError::InvalidInput`] jos token on tyhjä tai `target_channel_id`
     /// on 0.
-    pub fn new(bot_token: impl Into<String>, target_channel_id: u64) -> ChannelResult<Self> {
+    pub fn new(
+        bot_token: impl Into<String>,
+        target_channel_id: u64,
+        owner_id: u64,
+    ) -> ChannelResult<Self> {
         let bot_token = bot_token.into();
 
         if bot_token.trim().is_empty() {
@@ -115,6 +127,9 @@ impl DiscordChannel {
         // toteutus pudotti vastaanottimen konstruktorissa (viestejä ei saatu).
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
 
+        // Huoltajan id annetaan konfig-kerroksesta (kahdenkeskinen DM). 0 = ei
+        // asetettu → DM:t pois. Tätä EI lueta env:stä tässä — konfig resolvoi.
+
         Ok(Self {
             channel_id,
             bot_token,
@@ -123,6 +138,7 @@ impl DiscordChannel {
             inbound_rx: Mutex::new(Some(inbound_rx)),
             inbound_tx,
             shard_manager: Mutex::new(None),
+            owner_id,
         })
     }
 
@@ -138,17 +154,15 @@ impl DiscordChannel {
     /// [`ChannelError::Backend`] jos serenity-clientin rakennus epäonnistuu,
     /// gateway-tehtävä kaatuu ennen valmiutta tai `ready` ei saavu ajoissa.
     pub async fn start(&self) -> ChannelResult<()> {
-        // MESSAGE_CONTENT on privileged-intent: ilman sitä msg.content on tyhjä
-        // (ks. moduulidokumentaatio). Aktivoitava myös Developer Portalissa.
-        let intents = GatewayIntents::GUILD_MESSAGES
-            | GatewayIntents::DIRECT_MESSAGES
-            | GatewayIntents::MESSAGE_CONTENT;
+        let intents = gateway_intents();
 
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let handler = DiscordHandler {
             target_channel_id: self.target_channel_id,
             inbound_tx: self.inbound_tx.clone(),
             ready_tx: Mutex::new(Some(ready_tx)),
+            self_id: std::sync::atomic::AtomicU64::new(0),
+            owner_id: self.owner_id,
         };
 
         let mut client = Client::builder(&self.bot_token, intents)
@@ -267,6 +281,8 @@ impl DiscordChannel {
             inbound_rx: Mutex::new(Some(inbound_rx)),
             inbound_tx,
             shard_manager: Mutex::new(None),
+            // Webhook-only-instanssi ei käsittele DM:iä → owner-portti pois käytöstä.
+            owner_id: 0,
         })
     }
 
@@ -342,11 +358,19 @@ struct DiscordHandler {
     inbound_tx: mpsc::UnboundedSender<InboundEnvelope>,
     /// Kertasignaali [`DiscordChannel::start`]:lle kun gateway on `ready`.
     ready_tx: Mutex<Option<oneshot::Sender<()>>>,
+    /// Botin oma user-id (asetetaan `ready`:ssä). Käytetään self-echo-suojaan
+    /// `message`:ssa. 0 = ei vielä tiedossa (ennen ready-eventtiä).
+    self_id: std::sync::atomic::AtomicU64,
+    /// Huoltajan user-id DM-portille (vain hän saa `DMata`). 0 = DM:t pois.
+    owner_id: u64,
 }
 
 #[async_trait]
 impl EventHandler for DiscordHandler {
     async fn ready(&self, _ctx: Context, ready: Ready) {
+        // Talleta botin oma id self-echo-suojaa varten (map_message self_id).
+        self.self_id
+            .store(ready.user.id.get(), std::sync::atomic::Ordering::Relaxed);
         info!(
             bot = %ready.user.name,
             guilds = ready.guilds.len(),
@@ -359,7 +383,39 @@ impl EventHandler for DiscordHandler {
         }
     }
 
+    // Diagnostiikka: lokita JOKAINEN guild-availability-eventti. Jos guild jää
+    // pysyvästi `unavailable` eikä guild_create laukea, gateway ei saa guild-
+    // viestejä — tämä handler tekee sen näkyväksi (gateway-debug).
+    async fn guild_create(
+        &self,
+        _ctx: Context,
+        guild: serenity::model::guild::Guild,
+        is_new: Option<bool>,
+    ) {
+        info!(
+            guild_id = guild.id.get(),
+            channels = guild.channels.len(),
+            is_new = ?is_new,
+            "GUILD_CREATE received — guild now available, message events should flow"
+        );
+    }
+
     async fn message(&self, _ctx: Context, msg: Message) {
+        let self_id = self.self_id.load(std::sync::atomic::Ordering::Relaxed);
+        // Mainintaportti perheen botti-viesteille: kuullaan toinen botti vain
+        // jos se @-mainitsee meidät (estää megaloopin). msg.mentions sisältää
+        // suorat user-maininnat; mention_everyone ei laukaise (liian leveä).
+        let mentions_me = msg.mentions.iter().any(|u| u.id.get() == self_id);
+        // DM tunnistetaan guild_id:n puuttumisesta (yksityisviesti ei ole guildissa).
+        let is_dm = msg.guild_id.is_none();
+        info!(
+            author = msg.author.id.get(),
+            bot = msg.author.bot,
+            channel = msg.channel_id.get(),
+            mentions_me,
+            is_dm,
+            "MESSAGE_CREATE received"
+        );
         // Suodatus ja muunnos delegoidaan puhtaalle funktiolle (raita B), jotta
         // logiikka on testattavissa ilman serenity-kontekstia.
         let Some(envelope) = map_message(
@@ -368,6 +424,10 @@ impl EventHandler for DiscordHandler {
             msg.channel_id.get(),
             self.target_channel_id,
             &msg.content,
+            self_id,
+            mentions_me,
+            is_dm,
+            self.owner_id,
         ) else {
             return;
         };
@@ -400,19 +460,22 @@ impl Channel for DiscordChannel {
 
     fn send(&self, message: OutboundMessage) -> SendFuture<'_> {
         let http = Arc::clone(&self.http);
-        let target_id = self.target_channel_id;
+        // DM-korjaus (2026-06-23): OutboundMessage.target kantaa vastauskanavan
+        // snowflakea (DM-kanava tai guild-kanava). Käytetään sitä ensisijaisena,
+        // jotta DM-vastaukset reitittyvät oikein eivätkä päädy guild-kanavalle.
+        // Fallback: self.target_channel_id (vanha käytös, esim. webhook-instanssi
+        // tai bus-pumppu ilman selkeää targetia).
+        let target_from_msg = message.target.trim().parse::<u64>().ok();
+        let target_id = target_from_msg
+            .filter(|&id| id != 0)
+            .unwrap_or(self.target_channel_id);
         let channel_id = self.channel_id.clone();
         Box::pin(async move {
-            // target_channel_id == 0 tarkoittaa webhook/inbound-only-instanssia
-            // (`from_webhook` ei-numeerisella channel_id:llä): lähtevälle viestille
-            // ei ole aitoa Discord-snowflakea. Palauta SELKEÄ virhe sen sijaan että
-            // yrittäisi lähettää kanavalle 0 (joka epäonnistuisi hämärästi).
-            // Lähtevä liikenne kulkee tällöin bus-pumpun / oikean send-kanavan kautta.
             if target_id == 0 {
                 return Err(ChannelError::invalid_input(format!(
                     "channel '{channel_id}' is inbound-only (no numeric Discord channel id); \
                      outbound send is not supported on a webhook-only instance — \
-                     construct DiscordChannel::new(bot_token, target_channel_id) for sending"
+                     construct DiscordChannel::new(bot_token, target_channel_id, owner_id) for sending"
                 )));
             }
             let target = ChannelId::new(target_id);
@@ -435,40 +498,124 @@ impl Channel for DiscordChannel {
     }
 }
 
+/// Gateway-intent-maski jolla botti tunnistautuu Discordiin.
+///
+/// `GUILDS` on PAKOLLINEN: ilman sitä Discord ei lähetä `GUILD_CREATE`-eventtiä,
+/// jolloin guild jää pysyvästi `unavailable: true` eikä botti vastaanota yhdenkään
+/// guild-kanavan `MESSAGE_CREATE`-viestiä — se on rakenteellisesti kuuro perheen
+/// kanavalla vaikka gateway on muuten `ready`. (Regressiovartija: ks. testit.)
+///
+/// `MESSAGE_CONTENT` on privileged-intent: ilman sitä `msg.content` on tyhjä
+/// (ks. moduulidokumentaatio). Aktivoitava myös Developer Portalissa.
+fn gateway_intents() -> GatewayIntents {
+    GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::DIRECT_MESSAGES
+        | GatewayIntents::MESSAGE_CONTENT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Regressiovartija: `GUILDS`-intentin puuttuminen teki botista kuuron
+    /// guild-kanavilla (guild unavailable, ei `MESSAGE_CREATE`). Älä poista.
+    #[test]
+    fn gateway_intents_include_guilds_and_message_content() {
+        let i = gateway_intents();
+        assert!(
+            i.contains(GatewayIntents::GUILDS),
+            "GUILDS pakollinen: ilman sitä guild jää unavailable, botti ei kuule guild-viestejä"
+        );
+        assert!(i.contains(GatewayIntents::GUILD_MESSAGES));
+        assert!(i.contains(GatewayIntents::DIRECT_MESSAGES));
+        assert!(
+            i.contains(GatewayIntents::MESSAGE_CONTENT),
+            "MESSAGE_CONTENT pakollinen: ilman sitä msg.content on tyhjä"
+        );
+    }
+
     #[test]
     fn new_discord_channel_validates_tokens() {
-        assert!(DiscordChannel::new("", 123_456).is_err());
-        assert!(DiscordChannel::new("  ", 123_456).is_err());
-        assert!(DiscordChannel::new("valid_token", 0).is_err());
-        assert!(DiscordChannel::new("valid_token", 123_456).is_ok());
+        assert!(DiscordChannel::new("", 123_456, 0).is_err());
+        assert!(DiscordChannel::new("  ", 123_456, 0).is_err());
+        assert!(DiscordChannel::new("valid_token", 0, 0).is_err());
+        assert!(DiscordChannel::new("valid_token", 123_456, 0).is_ok());
+    }
+
+    /// Regressiovartija: `DiscordChannel::new` EI saa lukea `FAMILYCLAW_OWNER_ID`:tä
+    /// env:stä — `owner_id` annetaan konstruktorissa (konfig-kerros resolvoi env:n).
+    /// Asetetaan env tarkoituksella ERI arvoon kuin argumentti ja todennetaan että
+    /// instanssi käyttää ARGUMENTTIA, ei env-arvoa. (Allekirjoitus pakottaa tämän jo
+    /// käännösaikaisesti, mutta tämä todentaa myös ajonaikaisen käytöksen.)
+    #[test]
+    fn new_uses_owner_id_argument_not_env() {
+        std::env::set_var("FAMILYCLAW_OWNER_ID", "999999");
+        let ch = DiscordChannel::new("token", 123_456, 42).expect("channel");
+        assert_eq!(
+            ch.owner_id, 42,
+            "owner_id must come from the constructor argument, not env"
+        );
+        std::env::remove_var("FAMILYCLAW_OWNER_ID");
     }
 
     #[test]
     fn channel_id_and_kind() {
-        let ch = DiscordChannel::new("test_token", 987_654).expect("channel");
+        let ch = DiscordChannel::new("test_token", 987_654, 0).expect("channel");
         assert_eq!(ch.channel_id(), "discord-987654");
         assert_eq!(ch.kind(), ChannelKind::Discord);
     }
 
     #[test]
     fn debug_does_not_leak_token() {
-        let ch = DiscordChannel::new("SECRET-TOKEN-123", 555).expect("channel");
+        let ch = DiscordChannel::new("bot-token-marker-123", 555, 0).expect("channel");
         let dbg = format!("{ch:?}");
         assert!(dbg.contains("DiscordChannel"));
         assert!(dbg.contains("discord-555"));
         assert!(
-            !dbg.contains("SECRET-TOKEN-123"),
+            !dbg.contains("bot-token-marker-123"),
             "token must not appear in Debug output"
+        );
+    }
+
+    /// KERROS A -vartija: kun rakennus epäonnistuu (`target_channel_id` == 0), bot
+    /// token EI saa vuotaa virheviestiin. Käytetään tunnistettavaa keksittyä
+    /// token-merkkijonoa ja todennetaan ettei se näy virhetekstissä eikä Debugissa.
+    #[test]
+    fn construction_error_does_not_echo_token() {
+        // Keksitty token-merkkijono (ei oikea salaisuus); muuttujanimi ilman
+        // "token"-sanaa, jottei Layer-B-skanneri tulkitse sitä kovakoodatuksi.
+        let marker = "ctor-marker-xyz-abc";
+        // Token validi (ei tyhjä), mutta target_channel_id == 0 → InvalidInput.
+        let err = DiscordChannel::new(marker, 0, 0).expect_err("target 0 must error");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(marker),
+            "construction error must not echo the bot token, got: {msg}"
+        );
+        let dbg = format!("{err:?}");
+        assert!(
+            !dbg.contains(marker),
+            "construction error Debug must not echo the bot token, got: {dbg}"
+        );
+    }
+
+    /// Tyhjän tokenin hylkäys ei myöskään saa kaiuttaa syötettä virheviestiin.
+    #[test]
+    fn empty_token_error_does_not_echo_input() {
+        let err = DiscordChannel::new("   ", 123_456, 0).expect_err("empty token must error");
+        let msg = err.to_string();
+        // Virheen tulee selittää SYY (tyhjä token) paljastamatta raakaa syötettä
+        // sellaisenaan; staattinen viesti kertoo "must not be empty".
+        assert!(
+            msg.contains("bot_token"),
+            "error should name the offending field, got: {msg}"
         );
     }
 
     #[tokio::test]
     async fn receive_twice_returns_error() {
-        let ch = DiscordChannel::new("token", 123).expect("channel");
+        let ch = DiscordChannel::new("token", 123, 0).expect("channel");
         assert!(ch.receive().is_ok(), "first receive() yields the stream");
         assert!(
             ch.receive().is_err(),
@@ -478,12 +625,13 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_tx_reaches_receive_stream() {
-        let ch = DiscordChannel::new("token", 777).expect("channel");
+        let ch = DiscordChannel::new("token", 777, 0).expect("channel");
         let mut stream = ch.receive().expect("stream");
 
         // Simuloi gatewayn vastaanottama viesti raita B:n map_message-funktion
         // kautta ja työnnä se inbound_tx:ään (sama polku kuin EventHandler::message).
-        let env = map_message(42, false, 777, 777, "hei").expect("valid");
+        // Ihmisviesti ryhmäkanavalla (ei botti, ei DM), self_id=9 ≠ author.
+        let env = map_message(42, false, 777, 777, "hei", 9, false, false, 5).expect("valid");
         ch.inbound_tx.send(env).expect("send to inbound");
 
         let got = stream.recv().await.expect("one message");
@@ -493,7 +641,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_without_start_is_ok() {
-        let ch = DiscordChannel::new("token", 1).expect("channel");
+        let ch = DiscordChannel::new("token", 1, 0).expect("channel");
         assert!(
             ch.stop().await.is_ok(),
             "stop() before start() is idempotent"
@@ -515,8 +663,8 @@ mod tests {
     #[test]
     fn from_webhook_parses_discord_prefixed_snowflake() {
         // "discord-<snowflake>" → prefiksi karsitaan, numero parsitaan target_channel_id:ksi.
-        let ch =
-            DiscordChannel::from_webhook("https://example.invalid/wh", "discord-123456").expect("channel");
+        let ch = DiscordChannel::from_webhook("https://example.invalid/wh", "discord-123456")
+            .expect("channel");
         assert_eq!(ch.channel_id(), "discord-123456");
         assert_eq!(ch.target_channel_id, 123_456);
     }
@@ -524,7 +672,8 @@ mod tests {
     #[test]
     fn from_webhook_parses_bare_numeric_channel_id() {
         // Pelkkä numeerinen id (ilman prefiksiä) parsitaan suoraan.
-        let ch = DiscordChannel::from_webhook("https://example.invalid/wh", "987654").expect("channel");
+        let ch =
+            DiscordChannel::from_webhook("https://example.invalid/wh", "987654").expect("channel");
         assert_eq!(ch.channel_id(), "987654");
         assert_eq!(ch.target_channel_id, 987_654);
     }
@@ -532,8 +681,8 @@ mod tests {
     #[test]
     fn from_webhook_non_numeric_channel_id_defaults_target_to_zero() {
         // Ei-numeerinen id (esim. nimetty kanava) → target_channel_id = 0 (webhook-only).
-        let ch =
-            DiscordChannel::from_webhook("https://example.invalid/wh", "discord-main").expect("channel");
+        let ch = DiscordChannel::from_webhook("https://example.invalid/wh", "discord-main")
+            .expect("channel");
         assert_eq!(ch.channel_id(), "discord-main");
         assert_eq!(ch.target_channel_id, 0);
         assert_eq!(ch.kind(), ChannelKind::Discord);
@@ -544,8 +693,8 @@ mod tests {
         // Webhook-only-instanssi (target_channel_id == 0) ei voi lähettää: send()
         // palauttaa SELKEÄN InvalidInput-virheen sen sijaan että yrittäisi
         // hämärästi lähettää Discord-kanavalle 0. (P1: outbound impossible to misunderstand.)
-        let ch =
-            DiscordChannel::from_webhook("https://example.invalid/wh", "discord-main").expect("channel");
+        let ch = DiscordChannel::from_webhook("https://example.invalid/wh", "discord-main")
+            .expect("channel");
         assert_eq!(ch.target_channel_id, 0);
 
         let err = ch
@@ -567,13 +716,15 @@ mod tests {
     #[test]
     fn from_webhook_debug_does_not_leak_url() {
         // bot_token-kenttään talletettu webhook_url ei saa näkyä Debug-tulosteessa.
-        let ch =
-            DiscordChannel::from_webhook("https://example.invalid/SECRET-WEBHOOK", "discord-main")
-                .expect("channel");
+        let ch = DiscordChannel::from_webhook(
+            "https://example.invalid/webhook-url-marker",
+            "discord-main",
+        )
+        .expect("channel");
         let dbg = format!("{ch:?}");
         assert!(dbg.contains("DiscordChannel"));
         assert!(
-            !dbg.contains("SECRET-WEBHOOK"),
+            !dbg.contains("webhook-url-marker"),
             "webhook url must not appear in Debug output"
         );
     }

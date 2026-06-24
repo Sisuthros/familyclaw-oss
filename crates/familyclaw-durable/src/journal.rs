@@ -78,7 +78,7 @@ pub trait Journal: Send + Sync {
     }
 }
 
-/// Implement Journal for Box<dyn Journal> so trait objects can be used
+/// Implement Journal for `Box<dyn Journal>` so trait objects can be used
 /// directly as the journal type in `DurableContext`.
 impl<J: Journal + ?Sized> Journal for Box<J> {
     fn append(&self, entry: JournalEntry) -> Result<()> {
@@ -106,7 +106,7 @@ impl<J: Journal + ?Sized> Journal for Box<J> {
     }
 }
 
-/// Implement Journal for Arc<dyn Journal> so trait objects can be used
+/// Implement Journal for `Arc<dyn Journal>` so trait objects can be used
 /// with shared ownership.
 impl<J: Journal + ?Sized> Journal for std::sync::Arc<J> {
     fn append(&self, entry: JournalEntry) -> Result<()> {

@@ -15,11 +15,32 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Barrier;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::OnceLock;
 use std::thread;
 
 use familyclaw_durable::{FileJournal, Journal, JournalEntry, StepId};
 use familyclaw_memory::{ImportanceFactors, LocalJsonStore, Memory, MemoryStore};
 use serde_json::json;
+
+/// Prosessin-laajuinen sarjallistuslukko TÄMÄN binäärin testeille.
+///
+/// `HYÖKKÄYS 1` ajaa kaksi säiettä jotka appendaavat samaan tiedostoon
+/// maksimaalisen lomitusriskin alla. Itse väitteet (ei korruptiota, ei
+/// kadonneita kirjoituksia) ovat oikeellisuusinvariantteja, joita EI saa
+/// löysentää. Vika ei ole väitteissä vaan siinä, että kun KOKO työtila ajetaan
+/// rinnakkain, käyttöjärjestelmän ajastin + levyn fsync-jono ruuhkautuvat niin
+/// pahasti, että testin omat kaksi säiettä lomittuvat `write_all`-syscallien
+/// välissä Windowsilla (~1/3 ajoista). Sarjallistamalla tämän binäärin testit
+/// keskenään poistetaan ulkoinen ruuhka — testi pysyy yhtä tiukkana mutta tulee
+/// deterministiseksi. Ei lisää crate-riippuvuutta (vrt. `#[serial]`).
+fn serial_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Yksilöivä temp-polku ilman ulkoisia crateja.
 fn temp_path(tag: &str) -> PathBuf {
@@ -59,6 +80,10 @@ impl Drop for Cleanup {
 #[test]
 fn filejournal_two_handles_concurrent_append_integrity() {
     const N: u64 = 400;
+
+    // Sarjallista tämän binäärin testit keskenään: poistaa ulkoisen
+    // ajastin-/fsync-ruuhkan joka muuten lomittaa testin omat kaksi säiettä.
+    let _guard = serial_guard();
 
     let path = temp_path("journal");
     let _cleanup = Cleanup(path.clone());
@@ -184,6 +209,7 @@ fn filejournal_two_handles_concurrent_append_integrity() {
 // ─────────────────────────────────────────────────────────────────────────────
 #[test]
 fn localjsonstore_two_handles_same_path_lost_update() {
+    let _guard = serial_guard();
     let path = temp_path("store");
     let _cleanup = Cleanup(path.clone());
 
@@ -269,6 +295,7 @@ fn localjsonstore_two_handles_same_path_lost_update() {
 // ─────────────────────────────────────────────────────────────────────────────
 #[test]
 fn localjsonstore_deterministic_lost_update() {
+    let _guard = serial_guard();
     let path = temp_path("store-det");
     let _cleanup = Cleanup(path.clone());
 

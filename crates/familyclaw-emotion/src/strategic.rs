@@ -194,7 +194,10 @@ mod tests {
         for &stakes in &[0.0_f32, 0.5, 1.0] {
             for &social in &[0.0_f32, 0.5, 1.0] {
                 let v = appraisal.recommend_intensity(&s, &Situation::new(stakes, social));
-                assert!((0.0..=1.0).contains(&v), "intensiteetti {v} ulkona rajoista");
+                assert!(
+                    (0.0..=1.0).contains(&v),
+                    "intensiteetti {v} ulkona rajoista"
+                );
             }
         }
     }
@@ -216,7 +219,10 @@ mod tests {
         let a = appraisal.recommend_intensity(&s, &Situation::new(0.0, 0.0));
         let b = appraisal.recommend_intensity(&s, &Situation::new(0.5, 0.0));
         let c = appraisal.recommend_intensity(&s, &Situation::new(1.0, 0.0));
-        assert!(a <= b && b <= c, "intensiteetin pitäisi kasvaa monotonisesti");
+        assert!(
+            a <= b && b <= c,
+            "intensiteetin pitäisi kasvaa monotonisesti"
+        );
     }
 
     #[test]
@@ -226,7 +232,10 @@ mod tests {
         let s = joyful_state();
         let private = appraisal.recommend_intensity(&s, &Situation::new(0.0, 0.0));
         let public = appraisal.recommend_intensity(&s, &Situation::new(0.0, 1.0));
-        assert!(public < private, "sosiaalisuus hillitsee matalilla panoksilla");
+        assert!(
+            public < private,
+            "sosiaalisuus hillitsee matalilla panoksilla"
+        );
     }
 
     #[test]
@@ -259,6 +268,9 @@ mod tests {
         let s = joyful_state();
         let v = a.recommend_intensity(&s, &Situation::new(1.0, 1.0));
         assert!((0.0..=1.0).contains(&v));
-        assert_eq!(StrategicAppraisal::default(), StrategicAppraisal::balanced());
+        assert_eq!(
+            StrategicAppraisal::default(),
+            StrategicAppraisal::balanced()
+        );
     }
 }

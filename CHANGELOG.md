@@ -5,6 +5,66 @@ All notable changes to FamilyClaw will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha.8] - 2026-06-16
+
+### Added
+- **familyclaw-actions** (UUSI crate, KERROS A / OSS) — toiminta-/skill-ajoaika joka
+  toteuttaa putken `observe → plan → approve → execute → verify → persist proof →
+  remember → report`. Sisältää geneerisen skill-rekisterin, kyvykkyyspolitiikan,
+  hyväksyntäportin, redaktoivat todistepaketit (proof bundles) ja audit-lokin.
+  Vain mock-skillejä — ei oikeita Gmail/GitHub-verkkokutsuja, ei providereita,
+  sieluja eikä avaimia. 161 yksikkötestiä, mukaan lukien redaktio-todiste
+  (synteettinen avain-mallinen syöte korvautuu `[REDACTED]`-merkinnällä).
+- Juuren `Cargo.toml`: `familyclaw-actions` lisätty `[workspace.dependencies]`-listaan
+  (aakkosjärjestyksessä).
+- **familyclaw-gateway operaattorin hyväksyntäpinta** (suspend/resume-silta,
+  roadmap §6 D1/D2) — kaksi bearer-suojattua HTTP-reittiä (sama
+  `FAMILYCLAW_GATEWAY_TOKEN` kuin `/inject`, vakioaikainen täsmäys):
+  - `GET /approvals/pending` — listaa odottavat hyväksynnät **redaktoituina**
+    (`approval_id`, `redacted_summary`, `created_at`); ei koskaan raakaa
+    payloadia, työkaluargumentteja eikä salaisuuksia.
+  - `POST /approvals/{approval_id}/approve` — myöntää hyväksynnän ja ajaa
+    keskeytyneen toiminnon loppuun (payload-sidottu, kertakäyttöinen).
+
+  Reitit rekisteröidään aina; kun toimintoajoympäristöä ei ole kytketty,
+  handlerit vastaavat `503`. Bearer-tokenin puuttuessa `401`.
+- **familyclaw-gateway turn-audit-reitti** (TURN-AUDIT, roadmap §6 D6) —
+  `GET /turns/audit` palauttaa operaattorille havainnoitavan tool-loop-jäljen
+  JSON-listana (`familyclaw_actions::ExecAuditEvent`): vuoron korrelaatiotunniste
+  (`action_id`), tapahtumatyyppi (`turn_started` / `tool_dispatched` /
+  `turn_suspended` / `turn_resumed` / `turn_answered` / `turn_max_iterations`),
+  aikaleima (`at`) ja **redaktoitu** selite (`detail`, redaktoitu jo
+  kirjaushetkellä). Sama bearer-suojaus kuin `/inject`; `503` jos turn-auditia
+  ei ole kytketty.
+- **familyclaw-runtime jaetut operaattorikahvat** — `FamilyRuntime::actions()`
+  (`Arc<Mutex<ActionRuntime>>`) ja `FamilyRuntime::turn_audit()`
+  (`Arc<AuditCollector>`) altistavat saman lukitun toimintoajoympäristön ja
+  vain-lisäävän turn-audit-keräimen jotka agentin tool-loop omistaa — gateway
+  lukee odottavat hyväksynnät ja tool-loop-jäljen jakamatta agentin sisuksia.
+- **familyclaw-actions lähetyksen idempotenssi-outbox** (`DispatchOutboxStore` /
+  `JournalDispatchOutbox`) + `ActionRuntime::submit_task_idempotent` — sulkee
+  ikkunan sivuvaikutuksen suorituksen ja sen agenttikerroksen journaloinnin
+  välissä. Jokainen lähetys kytketään kutsujan johtamaan vakaaseen
+  idempotenssi-avaimeen ja kirjataan kaksivaiheisesti (intent ennen
+  sivuvaikutusta, committed sen jälkeen). `familyclaw-runtime build_family`
+  kytkee kaatumiskestävän `JournalDispatchOutbox`:n
+  (`<FAMILYCLAW_DATA_DIR>/dispatch_outbox.jsonl`) tuotantopolulla.
+  **Takuu (rehellinen raja):** sivuvaikutus **lähetetään korkeintaan kerran**
+  prosessin kaatumisen / SIGKILL:n yli — se ei koskaan laukea kahdesti.
+  Sitoutunut (committed) lähetys palautuu arvo-identtisenä ajamatta
+  sivuvaikutusta uudelleen; kaatuminen kapeassa intent-only-ikkunassa
+  **epäonnistuu suljettuna** (nolla tai yksi suoritusta, vaatii toipumisen) sen
+  sijaan että ajaisi sokeasti uudelleen. Tämä on **kaksoislaukaisun esto
+  (duplicate-prevention) kaatumisen yli, EI lupaus universaalista
+  "exactly-once completion" -valmistumisesta.**
+
+### Verified
+- `bash scripts/audit-layer-b.sh` — PASS (ei sieluja/avaimia/nimivuotoja)
+- `cargo build --workspace` ja `--features discord` — PASS
+- `cargo clippy --workspace --all-targets --features discord -- -D warnings` (pedantic) — clean
+- `cargo test --workspace --features discord` — kaikki PASS (familyclaw-actions: 161)
+- `cargo doc -p familyclaw-actions --no-deps` (RUSTDOCFLAGS=-D warnings) — clean
+
 ## [0.1.0-alpha.7] - 2026-06-14
 
 ### Fixed
@@ -165,7 +225,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **familyclaw-core** — Foundation types, error hierarchy, timestamp utilities, agent identity
 - **familyclaw-bus** — Ractor actor mesh with affective contagion (sibling emotional state leaking)
-- **familyclaw-durable** — Deterministic replay engine; side effects not re-run on recovery
+- **familyclaw-durable** — Deterministic replay engine; on recovery a side effect is dispatched at most once (never re-run twice)
 - **familyclaw-memory** — Eternal Thread memory with Ebbinghaus decay, protected identity anchors, dual-write safety
 - **familyclaw-dream** — Nightly consolidation cycle: duplicate merge, contradiction drop, date absolutization (hippocampal model)
 - **familyclaw-emotion** — Valence-arousal affective nervous system with homeostasis regulation

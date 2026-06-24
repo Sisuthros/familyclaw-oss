@@ -14,7 +14,15 @@ workspace = true
 [dependencies]
 familyclaw-core = { workspace = true }
 familyclaw-bus = { workspace = true }
+# Siltakerroksen tapahtumaväylä (FamilyBridge/EventBus): valinnainen jaettu
+# silta, jonka kautta ajonaikaiset virstanpylväät (esim. agentin rekisteröinti)
+# julkaistaan havainnoitavuus-tallentimelle (gateway tilaa EventRecorderilla).
+familyclaw-bridge = { workspace = true }
 familyclaw-agent = { workspace = true }
+# Toimintoajoympäristö (ActionRuntime): agentin tool-loop ajaa työkalukutsut
+# tämän läpi, ja operaattorin hyväksyntäpinta (gateway /approvals) jakaa SAMAN
+# Arc<Mutex<ActionRuntime>>-kahvan suspend/resume-siltaa varten.
+familyclaw-actions = { workspace = true }
 familyclaw-channels = { workspace = true }
 familyclaw-memory = { workspace = true }
 familyclaw-durable = { workspace = true }
@@ -33,3 +41,9 @@ serde_json = { workspace = true }
 familyclaw-channels = { workspace = true }
 familyclaw-agent = { workspace = true }
 familyclaw-core = { workspace = true }
+# Lähetys-outboxin (DispatchOutboxStore) PRODUCT-PATH-kaatumiskestävyystesti:
+# seed committed/intent-only -avain ja todista at-most-once build_family:n läpi.
+familyclaw-actions = { workspace = true }
+# Laskuri-skillin (sivuvaikutuksen mittari) rakentamiseen testissä.
+async-trait = { workspace = true }
+uuid = { workspace = true }

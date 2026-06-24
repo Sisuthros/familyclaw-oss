@@ -21,7 +21,7 @@
 //!
 //! ## Feature-flagit
 //! - **`wasmtime`** (ei oletuksena): kytkee
-//!   [`WasmtimeSandbox`](crate::WasmtimeSandbox)-toteutuksen. wasmtime on iso
+//!   `WasmtimeSandbox`-toteutuksen. wasmtime on iso
 //!   riippuvuus (Cranelift + JIT), joten se on optional ettei se hidasta koko
 //!   workspacen buildia. Ilman tätä featurea vain [`NoopSandbox`] on saatavilla.
 //!
@@ -79,7 +79,7 @@
 //!    lopun. Kytketään **valinnaisena** koukkuna muuttamatta olemassa
 //!    olevien tyyppien julkista rajapintaa.
 //!
-//! Lisäksi [`replay`] toteuttaa LOOP-mekanismin (2605.14237): suoritus
+//! Lisäksi [`replay`](mod@replay) toteuttaa LOOP-mekanismin (2605.14237): suoritus
 //! tallennetaan [`ExecutionTrace`]:ksi ja toistetaan deterministisesti
 //! pelkästä lokista, mikä mahdollistaa containment-tapahtumien bitintarkan
 //! jälkitarkastelun ilman alkuperäistä backendia.
@@ -112,10 +112,36 @@ pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Kertoo onko oikea wasmtime-pohjainen sandbox käännetty mukaan.
+///
+/// `true` kun `wasmtime`-feature on aktiivinen (host-import-esto + fuel-katto
+/// pakotettu, [`default_sandbox`] palauttaa `WasmtimeSandbox`:n); `false` kun
+/// vain [`NoopSandbox`] on saatavilla. Tämä on käännösaikaisesti vakio, joten
+/// kutsuja (esim. gateway-`doctor`/`status`) voi raportoida hiekkalaatikon
+/// saatavuuden ilman riippuvuutta `cfg!`-makroon omassa cratessa.
+#[must_use]
+pub const fn wasmtime_available() -> bool {
+    cfg!(feature = "wasmtime")
+}
+
+/// Palauttaa ihmisluettavan hiekkalaatikon saatavuus-etiketin.
+///
+/// `wasmtime (host-import denial + fuel cap)` kun [`wasmtime_available`] on
+/// `true`, muuten `none (noop)`. Tarkoitettu operaattorin tilatulosteeseen
+/// (gateway `doctor`/`status`); deterministinen ja salaisuudeton.
+#[must_use]
+pub const fn sandbox_availability() -> &'static str {
+    if wasmtime_available() {
+        "wasmtime (host-import denial + fuel cap)"
+    } else {
+        "none (noop)"
+    }
+}
+
 /// Palauttaa oletussandboxin laatikoituna trait-objektina.
 ///
 /// `wasmtime`-featuren kanssa tämä on
-/// [`WasmtimeSandbox`](crate::WasmtimeSandbox); ilman sitä
+/// `WasmtimeSandbox`; ilman sitä
 /// [`NoopSandbox`]. Tämä antaa kutsujalle backend-riippumattoman tavan saada
 /// "paras saatavilla oleva" sandbox.
 ///
@@ -140,6 +166,21 @@ mod tests {
     #[test]
     fn version_is_nonempty() {
         assert!(!version().is_empty());
+    }
+
+    #[test]
+    fn sandbox_availability_matches_compiled_feature() {
+        // Saatavuus-etiketti + lippu seuraavat käännösaikaista wasmtime-piirrettä.
+        if cfg!(feature = "wasmtime") {
+            assert!(wasmtime_available());
+            assert_eq!(
+                sandbox_availability(),
+                "wasmtime (host-import denial + fuel cap)"
+            );
+        } else {
+            assert!(!wasmtime_available());
+            assert_eq!(sandbox_availability(), "none (noop)");
+        }
     }
 
     #[test]

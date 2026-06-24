@@ -98,7 +98,14 @@ for optional Telegram/Discord wiring (Layer B).
 
 ### Connect to Discord
 
-Run with a Discord webhook (currently send-only; inbound gateway is future work):
+Two modes (see [`discord-setup.md`](discord-setup.md)):
+
+- **Bot mode (`DISCORD_BOT_TOKEN`)** — bidirectional: the bot listens *and* posts.
+  Recommended. Inbound gateway is live (Ed25519 signature verification + slash
+  command parsing; see `handle_discord_interaction` in `crates/familyclaw-gateway/src/main.rs`).
+- **Webhook mode (`DISCORD_WEBHOOK_URL` only)** — send-only (posts via webhook, does
+  not listen).
+
 ```bash
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/... cargo run -p familyclaw-agent --features familyclaw-channels/discord
 ```

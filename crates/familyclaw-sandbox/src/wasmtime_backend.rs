@@ -54,8 +54,10 @@ impl WasmtimeSandbox {
         // __fastfail-aborttausta Windowsilla.
         config.native_unwind_info(true);
         // Ei guest-backtraceja: sandbox ei paljasta epäluotetun koodin
-        // pinokuvaa ja keventää kustannusta.
-        config.wasm_backtrace(false);
+        // pinokuvaa ja keventää kustannusta. `wasm_backtrace(false)` on
+        // deprekoitu uudemmassa wasmtimessa — `None` poistaa backtrace-
+        // kontekstin kokonaan, mikä vastaa täsmälleen vanhaa käytöstä.
+        config.wasm_backtrace_max_frames(None);
         let engine =
             Engine::new(&config).map_err(|e| SandboxError::setup(format!("engine init: {e}")))?;
         Ok(Self { engine })

@@ -131,7 +131,10 @@ mod tests {
         let req = AcpRequest::new("prompt_text").with_permission_mode("bypass_permissions");
         let value: serde_json::Value = serde_json::to_value(&req).expect("serialize request");
         let obj = value.as_object().expect("request is an object");
-        assert_eq!(obj["permission_mode"], serde_json::json!("bypass_permissions"));
+        assert_eq!(
+            obj["permission_mode"],
+            serde_json::json!("bypass_permissions")
+        );
     }
 
     #[test]

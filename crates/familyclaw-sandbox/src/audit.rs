@@ -8,7 +8,7 @@
 //! karkaamisia ei voi havaita jälkikäteen.
 //!
 //! ## Suunnitteluperiaate: ei riko olemassa olevaa rajapintaa
-//! [`CapabilitySet`](crate::CapabilitySet):in julkiset metodit pysyvät
+//! [`CapabilitySet`]:in julkiset metodit pysyvät
 //! ennallaan (ne ovat puhtaita, sivuvaikutuksettomia kyselyitä). Tarkastus
 //! kytketään **valinnaisena** [`AuditedCapabilities`]-näkymän kautta: se
 //! kietoo viittauksen [`CapabilitySet`]:iin ja viittauksen [`AuditLog`]:iin,

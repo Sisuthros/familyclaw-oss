@@ -43,9 +43,7 @@ use async_trait::async_trait;
 
 use familyclaw_core::Timestamp;
 use familyclaw_dream::{tag_conflict, weekly_review, WeeklyReport};
-use familyclaw_memory::{
-    ImportanceFactors, LocalJsonStore, Memory, MemoryStatus, MemoryStore,
-};
+use familyclaw_memory::{ImportanceFactors, LocalJsonStore, Memory, MemoryStatus, MemoryStore};
 
 use crate::error::{BenchError, Result};
 use crate::scenario::{Scenario, ScenarioResult};
@@ -107,7 +105,11 @@ impl WeeklyReviewScenario {
         add(store, mem("a low-priority passing thought", 0.2, clock)).await?;
 
         // — Arkistoitu (yhä haettava, top-listalle) ——————————————————————————
-        let archived = add(store, mem("an older but still relevant decision", 0.7, clock)).await?;
+        let archived = add(
+            store,
+            mem("an older but still relevant decision", 0.7, clock),
+        )
+        .await?;
         store
             .set_status(archived, MemoryStatus::Archived)
             .await
@@ -178,7 +180,9 @@ impl Scenario for WeeklyReviewScenario {
         let seeded = Self::seed(&store, clock).await?;
 
         // Aja AITO viikkokatsaus injektoidulla hetkellä, sitten arvioi.
-        let report = weekly_review(&store, clock).await.map_err(BenchError::from)?;
+        let report = weekly_review(&store, clock)
+            .await
+            .map_err(BenchError::from)?;
         let outcome = Outcome::evaluate(&seeded, &report)?;
 
         let result = ScenarioResult::new(Self::ID, outcome.passed)
@@ -256,9 +260,16 @@ impl Outcome {
 
         // Top-järjestys: sisällöt vastaavat odotettua laskevaa järjestystä JA
         // tärkeydet ovat ei-kasvavia (varmuuden vuoksi).
-        let actual_top: Vec<&str> = report.top_memories.iter().map(|d| d.content.as_str()).collect();
-        let expected_top: Vec<&str> =
-            seeded.expected_top_order.iter().map(String::as_str).collect();
+        let actual_top: Vec<&str> = report
+            .top_memories
+            .iter()
+            .map(|d| d.content.as_str())
+            .collect();
+        let expected_top: Vec<&str> = seeded
+            .expected_top_order
+            .iter()
+            .map(String::as_str)
+            .collect();
         let order_matches = actual_top == expected_top;
         let importance_non_increasing = report
             .top_memories
@@ -401,7 +412,9 @@ mod tests {
         // Suora todiste: korkein tärkeys (0.95) on haudattu, joten se EI saa
         // olla top-listan kärjessä — kärjessä on 0.9 aktiivinen.
         let store = LocalJsonStore::in_memory();
-        WeeklyReviewScenario::seed(&store, clock()).await.expect("seed");
+        WeeklyReviewScenario::seed(&store, clock())
+            .await
+            .expect("seed");
         let report = weekly_review(&store, clock()).await.expect("review");
         assert_eq!(report.top_memories[0].content, "the launch shipped on time");
         assert!(report

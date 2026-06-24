@@ -689,7 +689,11 @@ mod tests {
         let journal = ctx.finish();
 
         let ctx2 = DurableContext::new(journal).expect("ctx2");
-        assert_eq!(ctx2.replayed_turn_count(), 1, "vain turn-0 lasketaan vuoroksi");
+        assert_eq!(
+            ctx2.replayed_turn_count(),
+            1,
+            "vain turn-0 lasketaan vuoroksi"
+        );
     }
 
     #[test]

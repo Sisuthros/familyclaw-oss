@@ -54,6 +54,18 @@
 |-----------|------------|----------|
 | result | PASS | PASS |
 
+## s7_provenance_gate
+
+| Dimension | FamilyClaw | Baseline |
+|-----------|------------|----------|
+| result | PASS | PASS |
+
+## s8_weekly_review
+
+| Dimension | FamilyClaw | Baseline |
+|-----------|------------|----------|
+| result | PASS | PASS |
+
 ## Verdict
 
-On **S1 Crash Matrix**, FamilyClaw re-executes `side_effect_overcount: 0` side effects across every crash point and passes; the baseline re-runs `> 0` side effects on restart and fails. Durable replay runs each side effect exactly once — the truncating file-memory baseline cannot.
+On **S1 Crash Matrix**, FamilyClaw re-executes `side_effect_overcount: 0` side effects across every crash point and passes; the baseline re-runs `> 0` side effects on restart and fails. Durable replay plus the idempotency-keyed dispatch outbox dispatch each side effect **at most once** under a crash — a side effect never fires twice; a crash in the narrow intent-only window fails closed (zero or one execution, requiring recovery) rather than re-firing blindly. This is duplicate-prevention under crash, not a guarantee of universal exactly-once completion — the truncating file-memory baseline offers neither.

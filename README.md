@@ -1,21 +1,29 @@
 # FamilyClaw
 
-**Crash-proof memory + contract-verified multi-agent execution for AI agent families.**
+**A Rust agent runtime where in-flight work survives a crash — at-most-once external side effects, durable memory, contract-checked coordination.**
 
 Most AI agents die between runs. FamilyClaw gives them continuity:
 durable replay, persistent memory, actor-based coordination, sleep-time consolidation,
 and private runtime profiles that never enter the repository.
 
-> **What this demo proves today:** crash-proof durable replay, 19-dimension emotion contagion,
-> nightly dream consolidation, persistent memory with Ebbinghaus decay, Discord inbound gateway
+> **What this demo proves today:** crash-proof durable replay with **at-most-once
+> external side-effect dispatch under crash** (idempotency-keyed: never fired twice;
+> a crash in the intent-only window fails closed — proven across a real process
+> boundary, and benchmarked against LangGraph's strongest durability mode, not only a
+> shaped baseline), provenance-gated memory, 19-dimension emotion contagion, nightly
+> dream consolidation, persistent memory with Ebbinghaus decay, Discord inbound gateway
 > (Ed25519 verification), benchmarked continuity (8 scenarios, deterministic scorecard).
 >
-> **Shipped (alpha.5/.6):** live multi-agent orchestration (`familyclaw-gateway
-> orchestrate` — Orchestrator + LiveTurnExecutor), provenance-gated memory,
-> emotion-contagion receive-side, send-side latent translation.
-> **What's on the roadmap:** receive-side latent telepathy (hidden-state transfer
-> into agent cognition — a family-boundary decision), deeper WASM sandbox safety,
-> additional channel adapters.
+> **Built — but not yet proven end-to-end:** live multi-agent orchestration
+> (`familyclaw-gateway orchestrate` — Orchestrator + `LiveTurnExecutor` exist and are
+> wired, but the multi-agent integration test still runs against a mock executor, so
+> the live coordination path is **built, unproven**, not "shipped"). Send-side latent
+> translation is a fenced research track, not production behavior.
+> **What's on the roadmap:** a live multi-agent integration test (proving the
+> coordination path end-to-end), deeper WASM sandbox safety with integration tests
+> (fuel exhaustion, denied capability, per-invocation credential isolation — today the
+> sandbox compiles and has unit tests but lacks those end-to-end proofs), additional
+> channel adapters.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Rust 2021](https://img.shields.io/badge/Rust-2021%20edition-orange.svg)
@@ -27,7 +35,7 @@ and private runtime profiles that never enter the repository.
 
 | Problem | Conventional frameworks | FamilyClaw |
 |---------|------------------------|------------|
-| **Memory discontinuity** — work and memory vanish on restart | Reload prompts; lose in-flight work | **Durable execution** — deterministic replay resumes exactly where stopped; side effects not re-run. **Eternal Thread** — persistent memory with Ebbinghaus decay + protected identity anchors (λ=0). |
+| **Memory discontinuity** — work and memory vanish on restart | Reload prompts; lose in-flight work | **Durable execution** — deterministic replay resumes exactly where stopped; side effects are dispatched **at most once** under a crash (idempotency-keyed: never fired twice; a crash in the intent-only window fails closed and requires recovery — not universal exactly-once *completion*). **Eternal Thread** — persistent memory with Ebbinghaus decay + protected identity anchors (λ=0). |
 | **Agents are isolated** — no shared situational awareness | Pass text messages | **Resonance Bus** — Ractor actor mesh where emotional state *leaks* to siblings (affective contagion). Roster never empty. |
 | **Memory rots** — duplicates pile up, "yesterday" goes stale | Manual cleanup | **Dreaming** — nightly consolidation merges duplicates, drops contradictions, absolutizes relative dates (hippocampal model). |
 | **Communication is lossy + token-expensive** | Everything serialized to text | **Latent telepathy** — siblings exchange hidden-state vectors directly, bridged across models, **always falling back to text** if incompatible. |
@@ -119,6 +127,7 @@ paths, and ships unit tests in-module.
 | [`familyclaw-hearth`](crates/familyclaw-hearth) | **The Hearth** — shared family memory, narratives, emotional state and anchors. |
 | [`familyclaw-observability`](crates/familyclaw-observability) | **Observability** — metrics, event recording and per-role RBAC for the multi-agent fleet. |
 | [`familyclaw-runtime`](crates/familyclaw-runtime) | **Runtime assembly** — wires bus + agents + channels + reply pump (`build_family`). |
+| [`familyclaw-actions`](crates/familyclaw-actions) | **Action/Skill Runtime** — observe → plan → approve → execute → verify → persist proof → remember → report. Generic skill registry, capability policy, approval gate, redacting proof bundles and audit log. Mock skills only, no providers or keys. |
 
 ---
 
@@ -184,7 +193,7 @@ Proves: bus startup, 2 agents register, message exchange, memory storage, emotio
 ### Crash Replay Demo
 ```bash
 # Two-process mode (true process boundary)
-cargo run -p familyclaw-agent --bin crash_replay -- --reset
+cargo run -p familyclaw-agent --bin crash_replay -- reset
 cargo run -p familyclaw-agent --bin crash_replay -- write
 cargo run -p familyclaw-agent --bin crash_replay -- verify
 
@@ -198,7 +207,7 @@ Proves: FileJournal + LocalJsonStore persist to disk, process restart reloads bo
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/... \
 cargo run -p familyclaw-agent --features familyclaw-channels/discord
 ```
-Inbound gateway: live — Ed25519 signature verification, slash command parsing (`gateway/src/main.rs:269-379`).
+Inbound gateway: live — Ed25519 signature verification, slash command parsing (`crates/familyclaw-gateway/src/main.rs`, `handle_discord_interaction`).
 
 ---
 

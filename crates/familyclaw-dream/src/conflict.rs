@@ -9,7 +9,7 @@
 //! natiiviksi: ristiriita on signaali tutkia, ei käsky tuhota.
 //!
 //! ## Miksi tägi eikä uusi elinkaaritila
-//! `Conflicted` EI ole [`MemoryStatus`]-variantti: elinkaari
+//! `Conflicted` EI ole [`familyclaw_memory::MemoryStatus`]-variantti: elinkaari
 //! (`Active → Archived → Tombstoned`) elää [`familyclaw_memory`]-cratessa
 //! (tämän paketin ulkopuolella) ja kuvaa *säilyvyyttä*, ei *luotettavuutta*.
 //! Ristiriita on ortogonaalinen totuus — muisto voi olla yhtä aikaa `Active` ja
@@ -151,7 +151,9 @@ where
         return Ok(false);
     };
     let before = memory.tags.len();
-    memory.tags.retain(|t| !t.eq_ignore_ascii_case(CONFLICT_TAG));
+    memory
+        .tags
+        .retain(|t| !t.eq_ignore_ascii_case(CONFLICT_TAG));
     if memory.tags.len() == before {
         return Ok(false); // ei tägiä — ei kirjoitusta
     }
@@ -319,7 +321,9 @@ mod tests {
         let id_a = store.add(mem("x")).await.expect("a");
         let id_b = store.add(mem("y")).await.expect("b");
         tag_conflict(&store, id_a, id_b, at()).await.expect("tag");
-        assert!(is_conflicted(&store.get(id_a).await.expect("g").expect("p")));
+        assert!(is_conflicted(
+            &store.get(id_a).await.expect("g").expect("p")
+        ));
 
         let cleared = clear_conflict(&store, id_a).await.expect("clear");
         assert!(cleared);
@@ -327,7 +331,9 @@ mod tests {
             &store.get(id_a).await.expect("g").expect("p")
         ));
         // Toinen osapuoli yhä tägätty (clear koskee yhtä muistoa kerrallaan).
-        assert!(is_conflicted(&store.get(id_b).await.expect("g").expect("p")));
+        assert!(is_conflicted(
+            &store.get(id_b).await.expect("g").expect("p")
+        ));
     }
 
     #[tokio::test]

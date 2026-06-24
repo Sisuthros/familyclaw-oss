@@ -3,18 +3,18 @@
 //! [`GatedMemoryStore`] kietoo minkä tahansa [`MemoryStore`]-toteutuksen ja
 //! pakottaa [`ProvenanceGate`]-myrkytyssuojan **kirjoitushetkellä**: ennen kuin
 //! muisto pääsee sisempään tallennukseen, sen alkuperä punnitaan portilla.
-//! Matalan luottamuksen ulkoinen lähde ([`Provenance::External`] jonka `trust`
+//! Matalan luottamuksen ulkoinen lähde ([`Provenance::External`](crate::Provenance::External) jonka `trust`
 //! alittaa portin kynnyksen) hylätään, jolloin se ei pääse saastuttamaan
 //! myöhempää haetua (*Sleeper Memory Poisoning* -suoja, kts.
 //! [`crate::provenance`]).
 //!
-//! Suora kokemus ([`Provenance::DirectExperience`]) ja johdetut muistot
-//! ([`Provenance::Derived`]) pääsevät aina läpi — vain ulkoiset väitteet
+//! Suora kokemus ([`Provenance::DirectExperience`](crate::Provenance::DirectExperience)) ja johdetut muistot
+//! ([`Provenance::Derived`](crate::Provenance::Derived)) pääsevät aina läpi — vain ulkoiset väitteet
 //! punnitaan.
 //!
 //! ## Suunnittelu
 //! - **Additiivinen:** ei muuta [`MemoryStore`]-traitia eikä
-//!   [`LocalJsonStore`]-toteutusta. Vahti on uusi, valinnainen kerros.
+//!   [`LocalJsonStore`](crate::LocalJsonStore)-toteutusta. Vahti on uusi, valinnainen kerros.
 //! - **Läpinäkyvä:** kaikki muut metodit ([`get`](MemoryStore::get),
 //!   [`retrieve`](MemoryStore::retrieve), [`run_decay`](MemoryStore::run_decay)
 //!   jne.) delegoidaan sellaisenaan sisempään tallennukseen.
@@ -213,7 +213,10 @@ mod tests {
     async fn admits_direct_experience_write() {
         let store = GatedMemoryStore::new(LocalJsonStore::in_memory(), ProvenanceGate::new(0.6));
         let m = mem_with("my own observation", Provenance::DirectExperience);
-        let id = store.add(m).await.expect("direct experience must be admitted");
+        let id = store
+            .add(m)
+            .await
+            .expect("direct experience must be admitted");
         // Kirjoitus päätyi sisempään tallennukseen.
         assert_eq!(store.len().await.expect("len"), 1);
         assert!(store.get(id).await.expect("get").is_some());
@@ -238,7 +241,10 @@ mod tests {
     #[tokio::test]
     async fn admits_high_trust_external_write() {
         let store = GatedMemoryStore::new(LocalJsonStore::in_memory(), ProvenanceGate::new(0.6));
-        let m = mem_with("well-sourced external fact", Provenance::external("web", 0.9));
+        let m = mem_with(
+            "well-sourced external fact",
+            Provenance::external("web", 0.9),
+        );
         store
             .add(m)
             .await

@@ -1,0 +1,41 @@
+[package]
+name = "familyclaw-actions"
+description = "Skill-, hyväksyntä-, suoritus- ja todistepino agenttien toiminnoille (KERROS A, OSS)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "familyclaw-actions-cli"
+path = "src/bin/familyclaw-actions-cli.rs"
+
+# Red-team-musta laatikko exactly-once-lähetyksen todistamiseen (ajetaan
+# lapsiprosessina familyclaw-actions-testeistä, jotta SIGKILL ylittää prosessirajan).
+[[bin]]
+name = "dispatch_redteam"
+path = "src/bin/dispatch_redteam.rs"
+
+[dependencies]
+familyclaw-core = { workspace = true }
+familyclaw-bridge = { workspace = true }
+familyclaw-security = { workspace = true }
+familyclaw-durable = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { version = "0.8" }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread", "macros"] }
+async-trait = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

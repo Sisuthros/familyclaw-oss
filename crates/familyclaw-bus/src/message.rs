@@ -161,6 +161,19 @@ pub enum BusMessage {
         detail: Option<String>,
     },
 
+    /// Operaattorin myöntämä hyväksyntä: pyytää vastaanottavaa agenttia jatkamaan
+    /// keskeytetyn vuoron (suspend/resume-silta). Kantaa vain hyväksynnän tunnisteen
+    /// (merkkijonona) — ei payloadia, ei salaisuuksia.
+    ///
+    /// Tämä on **ohjaussignaali, ei sisältö**: se EI mene mallin
+    /// keskusteluputkeen eikä käynnistä uutta LLM-vuoroa, vaan ohjataan suoraan
+    /// agentin resume-polulle. Vastaanottaja jäsentää tunnisteen ja jatkaa
+    /// hyväksynnän odotuksessa olleen tool-loopin loppuun.
+    ResumeApproval {
+        /// Myönnetyn hyväksynnän tunniste (UUID-merkkijonona). Ei salaisuus.
+        approval_id: String,
+    },
+
     /// Sovellus-/adapterikohtainen viesti vapaalla JSON-hyötykuormalla.
     /// Mahdollistaa laajennukset ilman ydintyypin muuttamista.
     Custom {
@@ -214,6 +227,7 @@ impl BusMessage {
             BusMessage::Latent { .. } => "latent",
             BusMessage::EmotionPulse { .. } => "emotion_pulse",
             BusMessage::TaskEvent { .. } => "task_event",
+            BusMessage::ResumeApproval { .. } => "resume_approval",
             BusMessage::Custom { .. } => "custom",
         }
     }
@@ -399,6 +413,25 @@ mod tests {
 
         let task = BusMessage::task_event(TaskEventKind::Started, "task-1");
         assert_eq!(task.kind_label(), "task_event");
+
+        let resume = BusMessage::ResumeApproval {
+            approval_id: "abc".into(),
+        };
+        assert_eq!(resume.kind_label(), "resume_approval");
+        assert!(!resume.is_emotion_pulse());
+    }
+
+    #[test]
+    fn resume_approval_serde_roundtrip_carries_only_id() {
+        let msg = BusMessage::ResumeApproval {
+            approval_id: "11111111-2222-4333-8444-555555555555".into(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        // Vain tunniste + laji — ei payloadia, ei salaisuuksia.
+        assert!(json.contains("resume_approval"));
+        assert!(json.contains("11111111-2222-4333-8444-555555555555"));
+        let back: BusMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(msg, back);
     }
 
     #[test]

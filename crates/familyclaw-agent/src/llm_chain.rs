@@ -38,7 +38,7 @@ use std::collections::HashMap;
 
 use familyclaw_core::{FamilyClawError, ModelConfig, Result};
 
-use crate::llm::{LlmClient, LlmConfig, LlmError, LlmMessage};
+use crate::llm::{CompletionResult, LlmClient, LlmConfig, LlmError, LlmMessage, ToolDefinition};
 
 /// Kuvaa mallinimen (`"provider/model"`) ajettavaksi [`LlmConfig`]:ksi.
 ///
@@ -216,6 +216,34 @@ impl LlmFailover {
                     last_err = Some(e);
                 }
                 // Ei-retryable (esim. parse) → palauta heti, älä jauha ketjua.
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or(LlmError::NoContent))
+    }
+
+    /// Kuten [`complete`](Self::complete), mutta mainostaa `tools`-työkalut ja
+    /// palauttaa [`CompletionResult`]:n (teksti + mahdolliset tool-callit).
+    /// Kulkee saman järjestetyn failover-ketjun läpi samalla F1 retryable-
+    /// semantiikalla: retryable-virhe → seuraava fallback; ei-retryable → heti.
+    ///
+    /// # Errors
+    /// Viimeisin [`LlmError`] jos kaikki ketjun klientit epäonnistuvat (tai
+    /// ensimmäinen ei-retryable virhe), tai [`LlmError::NoContent`] jos ketju on
+    /// tyhjä.
+    pub async fn complete_with_tools(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[ToolDefinition],
+    ) -> std::result::Result<CompletionResult, LlmError> {
+        let mut last_err: Option<LlmError> = None;
+        for client in &self.chain {
+            match client.complete_with_tools(messages, tools).await {
+                Ok(result) => return Ok(result),
+                Err(e) if e.is_retryable() => {
+                    tracing::debug!(error = %e, "retryable LLM error (tools) — trying next fallback");
+                    last_err = Some(e);
+                }
                 Err(e) => return Err(e),
             }
         }

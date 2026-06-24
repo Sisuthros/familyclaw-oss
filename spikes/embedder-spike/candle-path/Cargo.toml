@@ -1,0 +1,10 @@
+[package]
+name = "spike-candle"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+candle-core = "0.10"
+
+[workspace]

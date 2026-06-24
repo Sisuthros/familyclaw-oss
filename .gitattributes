@@ -1,0 +1,19 @@
+# Normalisoi rivinpäätteet — estää CRLF↔LF-mössön joka paisuttaa diffit
+# (Windows-checkout teki CRLF-rivejä; repo pidetään LF-normalisoituna).
+* text=auto eol=lf
+
+# Lähdekoodi ja konfiguraatiot: aina LF
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+
+# Binäärit: ei rivinpääte-normalisointia
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.gz    binary
+*.exe   binary

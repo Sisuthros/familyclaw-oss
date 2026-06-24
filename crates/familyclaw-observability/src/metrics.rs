@@ -131,7 +131,7 @@ const SUM_SCALE: f64 = 1000.0;
 const U64_MAX_AS_F64: f64 = 18_446_744_073_709_551_615.0;
 
 impl Histogram {
-    /// Luo histogrammin oletusämpäreillä ([`DEFAULT_BUCKETS`]).
+    /// Luo histogrammin oletusämpäreillä (`DEFAULT_BUCKETS`).
     #[must_use]
     pub fn new() -> Self {
         Self::with_buckets(&DEFAULT_BUCKETS)

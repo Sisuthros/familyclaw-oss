@@ -190,7 +190,7 @@ struct RecallOutput {
     hits: Vec<RecallHitOutput>,
 }
 
-/// `sleep`-komennon JSON-tuloste — peilaa [`DreamReport`]:n harnessille.
+/// `sleep`-komennon JSON-tuloste — peilaa [`DreamReport`](familyclaw_dream::DreamReport):n harnessille.
 #[derive(Debug, Serialize, Deserialize)]
 struct SleepOutput {
     /// Skannattujen muistojen määrä.

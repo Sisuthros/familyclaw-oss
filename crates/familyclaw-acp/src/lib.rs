@@ -11,7 +11,7 @@
 //!
 //! ## Integraatio `familyclaw-agent`:in
 //!
-//! [`AcpLlmClient`] implementoi HTTP [`LlmClient`](familyclaw_agent::llm::LlmClient):n
+//! `AcpLlmClient` implementoi HTTP `familyclaw_agent::llm::LlmClient`:n
 //! kaltaisen rajapinnan, jolloin `FamilyClaw` voi käyttää CLI-agentteja
 //! pudotuskorvaavina LLM-asiakkaina.
 //!
