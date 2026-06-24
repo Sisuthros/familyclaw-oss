@@ -267,7 +267,7 @@ Risk-first, proof-first, no private Layer B data in public repo.
 | **Action / Skill Runtime** | **NEXT** | Safe skills, task queue, MCP-ready boundary, approval gate, proof bundles, mocked real-world evals. |
 | **Live multi-agent proof** | **NEXT** | Replace mock executor proof with live `Orchestrator + LiveTurnExecutor` integration. |
 | **WASM sandbox e2e** | **NEXT** | Fuel exhaustion, denied capabilities, per-invocation credential isolation. |
-| **agent_alpha private scaffold** | **LATER** | Ignored local Layer B scaffold and fake-agent dry run only. No private agent_alpha boot yet. |
+| **Additional channel adapters** | **LATER** | Add adapters only after action/runtime and safety gates remain green. |
 
 ---
 
