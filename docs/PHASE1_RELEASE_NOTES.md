@@ -63,7 +63,7 @@ FamilyClaw Phase 1 does **not** claim:
 - production-ready Discord operations without live smoke testing
 - fully shipped live multi-agent orchestration
 - safe execution of arbitrary untrusted code without deeper sandbox e2e proofs
-- any private agent_alpha/agent_beta/Layer B boot
+- any private Layer B runtime/profile is part of this public repo
 
 ## Why it matters
 
@@ -82,6 +82,6 @@ That is the difference between a demo agent and infrastructure that can eventual
 3. Action / Skill Runtime.
 4. Live multi-agent integration proof.
 5. WASM sandbox end-to-end safety proofs.
-6. agent_alpha private scaffold with fake-agent dry run only.
+6. Additional channel adapters after the safety gates remain green.
 
-No real private Layer B boot happens until explicitly approved and after the public runtime remains clean.
+Separate private projects stay outside this repository and outside this release plan.
