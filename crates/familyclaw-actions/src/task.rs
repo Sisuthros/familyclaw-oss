@@ -50,6 +50,12 @@ pub enum TaskStatus {
     NeedsApproval,
     /// Estetty: ulkoinen este (esim. riippuvuus) pysäyttää tehtävän.
     Blocked,
+    /// Keskeytetty vastapaineen vuoksi: resurssibudjetti (esim. samanaikaisuus-
+    /// tai nopeusraja) ei ollut saatavilla, joten tehtävä pysäytettiin ja
+    /// persistoitiin levylle. Jatkuu tilaan [`TaskStatus::Ready`] kun budjetti
+    /// vapautuu. Ero [`TaskStatus::Blocked`]:iin: `Blocked` = ulkoinen este,
+    /// `Suspended` = sisäinen resurssirajoite (vastapaine).
+    Suspended,
     /// Valmistunut onnistuneesti (päätetila).
     Done,
     /// Epäonnistui (päätetila).
@@ -73,9 +79,10 @@ impl TaskStatus {
     /// Sallitut reunat:
     /// - `Planned → Ready`
     /// - `Ready → Running`
-    /// - `Running → {Done | Failed | NeedsApproval | Blocked}`
+    /// - `Running → {Done | Failed | NeedsApproval | Blocked | Suspended}`
     /// - `NeedsApproval → Running`
     /// - `Blocked → Ready` (este poistui)
+    /// - `Suspended → Ready` (resurssibudjetti vapautui — vastapaine purkautui)
     /// - mikä tahansa **ei-päätetila** → `Cancelled`
     ///
     /// Päätetilat eivät salli mitään siirtymää. Siirtymä samaan tilaan ei ole
@@ -83,7 +90,7 @@ impl TaskStatus {
     #[must_use]
     pub const fn can_transition_to(self, next: Self) -> bool {
         use TaskStatus::{
-            Blocked, Cancelled, Done, Failed, NeedsApproval, Planned, Ready, Running,
+            Blocked, Cancelled, Done, Failed, NeedsApproval, Planned, Ready, Running, Suspended,
         };
 
         // Päätetilasta ei voi siirtyä mihinkään.
@@ -98,9 +105,9 @@ impl TaskStatus {
 
         matches!(
             (self, next),
-            (Planned | Blocked, Ready)
+            (Planned | Blocked | Suspended, Ready)
                 | (Ready | NeedsApproval, Running)
-                | (Running, Done | Failed | NeedsApproval | Blocked)
+                | (Running, Done | Failed | NeedsApproval | Blocked | Suspended)
         )
     }
 }
@@ -129,6 +136,15 @@ pub struct ActionTask {
     pub deadline: Option<Timestamp>,
     /// Suorituksesta syntyneen todistepaketin tunniste (`None` ennen suoritusta).
     pub proof_bundle_id: Option<ProofBundleId>,
+    /// Vastapaine-keskeytyksen syy ihmisluettavana (`None` kun ei keskeytetty).
+    ///
+    /// Asetetaan kun tehtävä siirtyy tilaan [`TaskStatus::Suspended`] ja
+    /// nollataan kun se jatkuu tilaan [`TaskStatus::Ready`]. Tämä kenttä
+    /// persistoituu [`DurableTaskQueue`]-snapshotissa, jotta uudelleenkäynnistys
+    /// tietää miksi tehtävä on keskeytetty. **Ei saa koskaan sisältää
+    /// salaisuuksia** — vain geneerinen resurssisyy (esim. budjetin nimi).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspension_reason: Option<String>,
     /// Luontihetki (injektoitu).
     pub created_at: Timestamp,
     /// Viimeisin päivityshetki (injektoitu).
@@ -151,6 +167,7 @@ impl ActionTask {
             scheduled_at: None,
             deadline: None,
             proof_bundle_id: None,
+            suspension_reason: None,
             created_at: now,
             updated_at: now,
         }
@@ -384,6 +401,72 @@ impl TaskQueue {
             task_id: id,
             from,
             to: next,
+            at: now,
+        })
+    }
+
+    /// Keskeyttää tehtävän vastapaineen vuoksi: siirtää sen tilaan
+    /// [`TaskStatus::Suspended`] ja tallentaa geneerisen `reason`-syyn.
+    ///
+    /// Siirtymä tarkistetaan [`TaskStatus::can_transition_to`]-koneella (vain
+    /// `Running → Suspended` on laillinen). `reason` ei saa sisältää
+    /// salaisuuksia — vain resurssisyy (esim. budjetin nimi).
+    ///
+    /// # Errors
+    /// - [`ActionError::NotFound`] jos tehtävää ei ole jonossa.
+    /// - [`ActionError::IllegalTransition`] jos nykytilasta ei voi keskeyttää.
+    pub async fn suspend(
+        &self,
+        id: ActionTaskId,
+        reason: impl Into<String>,
+        now: Timestamp,
+    ) -> Result<TaskEvent> {
+        let mut guard = self.inner.lock().await;
+        let task = guard
+            .get_mut(&id)
+            .ok_or_else(|| ActionError::NotFound(format!("tehtävää {id} ei löydy")))?;
+        let from = task.status;
+        if !from.can_transition_to(TaskStatus::Suspended) {
+            return Err(ActionError::IllegalTransition(format!(
+                "{from:?} -> Suspended ei ole sallittu (tehtävä {id})"
+            )));
+        }
+        task.status = TaskStatus::Suspended;
+        task.suspension_reason = Some(reason.into());
+        task.updated_at = now;
+        Ok(TaskEvent::StatusChanged {
+            task_id: id,
+            from,
+            to: TaskStatus::Suspended,
+            at: now,
+        })
+    }
+
+    /// Jatkaa keskeytettyä tehtävää: siirtää sen tilasta
+    /// [`TaskStatus::Suspended`] takaisin tilaan [`TaskStatus::Ready`] ja
+    /// nollaa keskeytyssyyn. Käytetään kun resurssibudjetti vapautuu.
+    ///
+    /// # Errors
+    /// - [`ActionError::NotFound`] jos tehtävää ei ole jonossa.
+    /// - [`ActionError::IllegalTransition`] jos tehtävä ei ole keskeytettynä.
+    pub async fn resume(&self, id: ActionTaskId, now: Timestamp) -> Result<TaskEvent> {
+        let mut guard = self.inner.lock().await;
+        let task = guard
+            .get_mut(&id)
+            .ok_or_else(|| ActionError::NotFound(format!("tehtävää {id} ei löydy")))?;
+        let from = task.status;
+        if from != TaskStatus::Suspended {
+            return Err(ActionError::IllegalTransition(format!(
+                "{from:?} -> Ready (resume) vaatii Suspended-tilan (tehtävä {id})"
+            )));
+        }
+        task.status = TaskStatus::Ready;
+        task.suspension_reason = None;
+        task.updated_at = now;
+        Ok(TaskEvent::StatusChanged {
+            task_id: id,
+            from,
+            to: TaskStatus::Ready,
             at: now,
         })
     }
@@ -896,5 +979,157 @@ mod tests {
             at: at(1),
         };
         assert_eq!(ev.task_id(), id);
+    }
+
+    // ---- Track 2: Suspended-tila + vastapaine (suspend/resume) ----
+
+    #[test]
+    fn suspend_transitions_are_legal_only_from_running() {
+        // Running -> Suspended on laillinen vastapaine-keskeytys.
+        assert!(TaskStatus::Running.can_transition_to(TaskStatus::Suspended));
+        // Suspended -> Ready on laillinen jatkaminen.
+        assert!(TaskStatus::Suspended.can_transition_to(TaskStatus::Ready));
+        // Suspended -> Cancelled (ei-päätetila voidaan aina peruuttaa).
+        assert!(TaskStatus::Suspended.can_transition_to(TaskStatus::Cancelled));
+        // Suspended EI saa hypätä suoraan Runningiin (täytyy kulkea Readyn kautta).
+        assert!(!TaskStatus::Suspended.can_transition_to(TaskStatus::Running));
+        // Ei voi keskeyttää ei-Running-tilasta.
+        assert!(!TaskStatus::Ready.can_transition_to(TaskStatus::Suspended));
+        assert!(!TaskStatus::Planned.can_transition_to(TaskStatus::Suspended));
+    }
+
+    #[tokio::test]
+    async fn running_suspends_on_backpressure_then_resumes() {
+        let queue = TaskQueue::new();
+        let now = at(1_700_000_000);
+        let task = task_at(now).with_id(ActionTaskId::new());
+        let id = task.id;
+        queue.submit(task).await.expect("submit");
+        queue
+            .transition(id, TaskStatus::Ready, at(1_700_000_001))
+            .await
+            .expect("ready");
+        queue
+            .transition(id, TaskStatus::Running, at(1_700_000_002))
+            .await
+            .expect("running");
+
+        // Vastapaine: keskeytä budjettisyyllä.
+        queue
+            .suspend(
+                id,
+                "per_skill_concurrency budget exhausted",
+                at(1_700_000_003),
+            )
+            .await
+            .expect("suspend");
+        let suspended = queue.get(id).await.expect("present");
+        assert_eq!(suspended.status, TaskStatus::Suspended);
+        assert_eq!(
+            suspended.suspension_reason.as_deref(),
+            Some("per_skill_concurrency budget exhausted")
+        );
+
+        // Budjetti vapautui: jatka.
+        queue.resume(id, at(1_700_000_004)).await.expect("resume");
+        let resumed = queue.get(id).await.expect("present");
+        assert_eq!(resumed.status, TaskStatus::Ready);
+        assert_eq!(
+            resumed.suspension_reason, None,
+            "reason nollataan resumessa"
+        );
+    }
+
+    #[tokio::test]
+    async fn suspend_from_non_running_is_rejected() {
+        let queue = TaskQueue::new();
+        let now = at(1_700_000_000);
+        let task = task_at(now).with_id(ActionTaskId::new());
+        let id = task.id;
+        queue.submit(task).await.expect("submit");
+        // Planned-tilasta ei voi keskeyttää.
+        let err = queue.suspend(id, "nope", at(1_700_000_001)).await;
+        assert!(matches!(err, Err(ActionError::IllegalTransition(_))));
+    }
+
+    #[tokio::test]
+    async fn resume_requires_suspended_state() {
+        let queue = TaskQueue::new();
+        let now = at(1_700_000_000);
+        let task = task_at(now).with_id(ActionTaskId::new());
+        let id = task.id;
+        queue.submit(task).await.expect("submit");
+        // Ei voi jatkaa tehtävää joka ei ole keskeytetty.
+        let err = queue.resume(id, at(1_700_000_001)).await;
+        assert!(matches!(err, Err(ActionError::IllegalTransition(_))));
+    }
+
+    #[tokio::test]
+    async fn durable_reload_preserves_suspension_reason() {
+        let path = std::env::temp_dir().join(format!(
+            "familyclaw-actions-suspend-{}.jsonl",
+            ActionTaskId::new()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let durable = DurableTaskQueue::new(&path);
+        let now = at(1_700_000_000);
+        let mut task = task_at(now).with_id(ActionTaskId::new());
+        let id = task.id;
+
+        task.status = TaskStatus::Suspended;
+        task.suspension_reason = Some("api_rate_limit budget exhausted".to_string());
+        task.updated_at = at(1_700_000_010);
+        durable.append(&task).await.expect("append suspended");
+
+        // Uudelleenkäynnistys: keskeytyssyy säilyy snapshotissa.
+        let reloaded = DurableTaskQueue::new(&path).reload().await.expect("reload");
+        let restored = reloaded.get(&id).expect("restored");
+        assert_eq!(restored.status, TaskStatus::Suspended);
+        assert_eq!(
+            restored.suspension_reason.as_deref(),
+            Some("api_rate_limit budget exhausted")
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn suspension_reason_carries_no_secret() {
+        // Operaattorin vastuulla on antaa salaisuudeton syy; tämä testi
+        // dokumentoi invariantin ja varmistaa ettei suspend/resume itse vuoda
+        // payloadia syyhyn.
+        let queue = TaskQueue::new();
+        let now = at(1_700_000_000);
+        let task = ActionTask::new(
+            SkillId::new(),
+            serde_json::json!({ "token": "sk-supersecret-value" }),
+            now,
+        )
+        .with_id(ActionTaskId::new());
+        let id = task.id;
+        queue.submit(task).await.expect("submit");
+        queue
+            .transition(id, TaskStatus::Ready, at(1_700_000_001))
+            .await
+            .expect("ready");
+        queue
+            .transition(id, TaskStatus::Running, at(1_700_000_002))
+            .await
+            .expect("running");
+        queue
+            .suspend(id, "queue_length budget exhausted", at(1_700_000_003))
+            .await
+            .expect("suspend");
+        let reason = queue
+            .get(id)
+            .await
+            .expect("present")
+            .suspension_reason
+            .expect("reason set");
+        assert!(
+            !reason.contains("sk-supersecret-value"),
+            "keskeytyssyy ei saa sisältää payloadin salaisuutta"
+        );
     }
 }
