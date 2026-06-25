@@ -566,7 +566,10 @@ pub async fn build_family(
     //      -laskurit alkavat elää. Replay-vartiointi tehdään agentissa
     //      (`!is_replaying()`), joten sillalle tulee vain tuoreita tapahtumia.
     if let Some(bridge) = &bridge {
-        let (metrics_tx, mut metrics_rx) = tokio::sync::mpsc::unbounded_channel::<MetricEvent>();
+        // Rajattu kanava (bounded): agentti pudottaa ylivuodon `try_send`:llä
+        // jos tämä silta jää jälkeen → ei muistivuotoa kuumalla polulla.
+        let (metrics_tx, mut metrics_rx) =
+            tokio::sync::mpsc::channel::<MetricEvent>(familyclaw_agent::METRIC_SINK_CAPACITY);
         agent = agent.with_metrics_sink(metrics_tx);
         let event_bus = bridge.bus().clone();
         let bridge_agent_id = agent_id;

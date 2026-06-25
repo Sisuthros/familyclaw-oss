@@ -73,7 +73,7 @@ pub mod soul;
 
 pub use agent::{
     new_reply_channel, Agent, AgentActor, ErasedMemoryStore, MetricEvent, MetricEventSink,
-    ReplySink, ThinkOutcome, TurnOutcome,
+    ReplySink, ThinkOutcome, TurnOutcome, METRIC_SINK_CAPACITY,
 };
 pub use channel_bridge::{
     envelope_origin, envelope_to_bus_message, publish_envelope, pump_channel_to_bus,

@@ -76,11 +76,22 @@ pub enum MetricEvent {
     ToolDispatched,
 }
 
-/// Havainnoitavuus-sinkki: minne agentti työntää [`MetricEvent`]:t. Kuten
-/// [`ReplySink`], tämä on ei-lukkiutuva [`tokio::sync::mpsc::UnboundedSender`],
-/// joten sitä voi kutsua synkronisesta polusta. `None` = ei mittarointia
-/// (oletus, taaksepäin-yhteensopiva).
-pub type MetricEventSink = tokio::sync::mpsc::UnboundedSender<MetricEvent>;
+/// Havainnoitavuus-sinkki: minne agentti työntää [`MetricEvent`]:t.
+///
+/// **Rajattu (bounded)** [`tokio::sync::mpsc::Sender`] tarkoituksella: jos
+/// vastaanottaja (runtime-silta) jää jälkeen, ylivuoto **pudotetaan**
+/// (`try_send` palauttaa virheen, jonka emittointi sivuuttaa) —
+/// havainnoitavuus EI saa kasvattaa jonoa rajatta kuumalla polulla eikä lukita
+/// agentin vuoroa. Mittarit ovat lisätietoa; muutama
+/// pudotettu tapahtuma korkean kuorman piikissä on hyväksyttävää, muistivuoto
+/// ei. (Tämä on `try_send`-drop-malli, turvallisempi kuin unbounded jono kun
+/// emittereitä on monta, esim. rinnakkainen multi-agent-ajo.)
+pub type MetricEventSink = tokio::sync::mpsc::Sender<MetricEvent>;
+
+/// Havainnoitavuus-sinkin kapasiteetti (rajatun kanavan koko). Tarpeeksi suuri
+/// normaaliin tikki-/vuorovolyymiin, tarpeeksi pieni ettei muisti kasva
+/// hallitsemattomasti jos kuluttaja pysähtyy.
+pub const METRIC_SINK_CAPACITY: usize = 1024;
 
 /// Rakentaa reply-kanavaparin: [`ReplySink`] agentille + vastaanottopää
 /// gatewaylle (C1 Malli A — gateway omistaa recv-pään ja kutsuu `Channel::send`).
@@ -850,12 +861,13 @@ impl Agent {
     /// Työntää [`MetricEvent`]:n havainnoitavuus-sinkkiin jos asennettu.
     ///
     /// **Kutsu VAIN tuoreessa vuorossa** (`!self.durable.is_replaying()`) —
-    /// replay ei saa kaksoislaskea mittareita. No-op kun sinkkiä ei ole tai
-    /// vastaanottaja on sulkeutunut (send-virhe sivuutetaan: havainnoitavuus on
-    /// lisätieto, ei kriittinen polku).
+    /// replay ei saa kaksoislaskea mittareita. Käyttää [`Sender::try_send`]:iä:
+    /// jos kanava on täynnä (kuluttaja jäljessä) tai sulkeutunut, tapahtuma
+    /// **pudotetaan** — havainnoitavuus ei saa lukita vuoroa eikä kasvattaa
+    /// jonoa rajatta. No-op kun sinkkiä ei ole.
     fn emit_metric(&self, event: MetricEvent) {
         if let Some(sink) = self.metrics_sink.as_ref() {
-            let _ = sink.send(event);
+            let _ = sink.try_send(event);
         }
     }
 
@@ -1311,7 +1323,8 @@ impl Agent {
         let emit_tool = |replaying: bool| {
             if !replaying {
                 if let Some(sink) = metrics_sink {
-                    let _ = sink.send(MetricEvent::ToolDispatched);
+                    // try_send: pudota ylivuoto, älä lukita/kasvata jonoa rajatta.
+                    let _ = sink.try_send(MetricEvent::ToolDispatched);
                 }
             }
         };
@@ -4606,7 +4619,7 @@ mod tests {
             body_text("valmis"),
         ])
         .await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MetricEvent>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<MetricEvent>(METRIC_SINK_CAPACITY);
         let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
             .with_actions(echo_runtime())
             .with_metrics_sink(tx);
@@ -4627,7 +4640,7 @@ mod tests {
     async fn text_only_turn_emits_no_tool_metric() {
         let bus = ResonanceBus::start(None).await.expect("bus");
         let api = spawn_scripted_llm(vec![body_text("pelkkä teksti")]).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MetricEvent>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<MetricEvent>(METRIC_SINK_CAPACITY);
         let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
             .with_actions(echo_runtime())
             .with_metrics_sink(tx);
@@ -4646,7 +4659,7 @@ mod tests {
     async fn completed_turn_emits_turn_metric() {
         let bus = ResonanceBus::start(None).await.expect("bus");
         let api = spawn_scripted_llm(vec![body_text("vastaus")]).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MetricEvent>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<MetricEvent>(METRIC_SINK_CAPACITY);
         let mut agent = agent_with_scripted_llm("agent_a", bus.clone(), &api).with_metrics_sink(tx);
 
         let _ = agent
