@@ -79,6 +79,15 @@ pub struct ScheduledTask {
     /// Olennon (being) geneerinen tunniste jonka nimissä lähetys tehdään
     /// (rate-limit-laskentaa varten toimintopinossa).
     pub being_id: String,
+    /// **Perhe-agency-kontrolli (Phase 4): onko tehtävä aktiivinen.**
+    ///
+    /// `true` (oletus) = tehtävä laukeaa normaalisti. `false` = ajastin
+    /// **ohittaa** sen ([`crate::decision::decide`] palauttaa `due=false`), kunnes
+    /// se taas otetaan käyttöön. Tämä on **kill-switch / opt-in**: ihminen voi
+    /// pysäyttää proaktiivisen ajastetun tehtävän ajamatta alas koko ajastinta.
+    /// Tila on osa tehtävämäärittelyä, joten operaattoripinta voi kytkeä sen
+    /// päälle/pois ja persistoida valinnan.
+    pub enabled: bool,
 }
 
 impl ScheduledTask {
@@ -100,6 +109,7 @@ impl ScheduledTask {
             payload,
             interval,
             being_id: being_id.into(),
+            enabled: true,
         }
     }
 
@@ -121,7 +131,18 @@ impl ScheduledTask {
             payload,
             interval,
             being_id: being_id.into(),
+            enabled: true,
         }
+    }
+
+    /// Asettaa [`ScheduledTask::enabled`]-tilan (perhe-agency-kontrolli).
+    ///
+    /// `with_enabled(false)` = kill-switch: ajastin ohittaa tehtävän kunnes se
+    /// taas otetaan käyttöön. Palauttaa `self` ketjutusta varten.
+    #[must_use]
+    pub const fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
     }
 }
 

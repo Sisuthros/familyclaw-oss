@@ -92,7 +92,9 @@ pub fn is_due(interval: Duration, last_fired: Option<Timestamp>, now: Timestamp)
 /// avaimen ([`firing_key`]).
 #[must_use]
 pub fn decide(task: &ScheduledTask, last_fired: Option<Timestamp>, now: Timestamp) -> DueDecision {
-    let due = is_due(task.interval, last_fired, now);
+    // Perhe-agency (Phase 4): pois käytöstä otettu tehtävä EI laukea koskaan —
+    // ihmisen kill-switch ohittaa erääntymisen kokonaan.
+    let due = task.enabled && is_due(task.interval, last_fired, now);
     let key = if due {
         Some(firing_key(task.id, task.interval, now))
     } else {
@@ -173,6 +175,24 @@ mod tests {
         let decision = decide(&task, None, at(0));
         assert!(decision.due);
         assert!(decision.key.is_some());
+    }
+
+    #[test]
+    fn disabled_task_is_never_due() {
+        // Perhe-agency (Phase 4): kill-switch ohittaa erääntymisen. Sama tehtävä
+        // joka muuten laukeaisi heti (ei koskaan laukennut) EI laukea kun
+        // enabled=false.
+        let task = task_with(Duration::seconds(60)).with_enabled(false);
+        let decision = decide(&task, None, at(0));
+        assert!(!decision.due, "disabloitu tehtävä ei laukea");
+        assert!(decision.key.is_none(), "ei avainta kun ei laukea");
+
+        // Uudelleen käyttöön → laukeaa taas.
+        let reenabled = task.with_enabled(true);
+        assert!(
+            decide(&reenabled, None, at(0)).due,
+            "käyttöön otto palauttaa"
+        );
     }
 
     #[test]

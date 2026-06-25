@@ -210,6 +210,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_task_does_not_fire_until_reenabled() {
+        // Perhe-agency (Phase 4) end-to-end: disabloitu tehtävä ei lähetä
+        // mitään tickissä; käyttöön otto palauttaa laukaisun.
+        let mut rt = runtime_with_fs_read();
+        let mut sched = Scheduler::new();
+        let task = ScheduledTask::with_id(
+            ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(12)),
+            FsReadAllowlisted::skill_id(),
+            json!({"path": "/nonexistent"}),
+            Duration::seconds(60),
+            "being",
+        )
+        .with_enabled(false);
+        sched.register(task.clone());
+
+        // Disabloitu → tick ei lähetä, vaikka muuten olisi erääntynyt.
+        let s1 = sched.tick(&mut rt, at(0)).await.expect("tick disabled");
+        assert_eq!(s1.fired_count(), 0, "disabloitu ei laukea");
+
+        // Ota käyttöön (register korvaa määrittelyn) → laukeaa.
+        sched.register(task.with_enabled(true));
+        let s2 = sched.tick(&mut rt, at(0)).await.expect("tick enabled");
+        assert_eq!(s2.fired_count(), 1, "käyttöön otto palauttaa laukaisun");
+    }
+
+    #[tokio::test]
     async fn restart_with_lost_last_fired_dedups_via_outbox_key() {
         // Sama avain samassa ikkunassa: vaikka ajastin "unohtaa" last_fired
         // (uusi Scheduler = restart), idempotenssiavain on sama → outbox
