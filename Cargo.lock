@@ -1615,6 +1615,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "familyclaw-embeddings"
+version = "0.1.0"
+
+[[package]]
 name = "familyclaw-emotion"
 version = "0.1.0"
 dependencies = [

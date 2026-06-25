@@ -38,6 +38,7 @@ familyclaw-channels = { path = "crates/familyclaw-channels" }
 familyclaw-core = { path = "crates/familyclaw-core" }
 familyclaw-dream = { path = "crates/familyclaw-dream" }
 familyclaw-durable = { path = "crates/familyclaw-durable" }
+familyclaw-embeddings = { path = "crates/familyclaw-embeddings" }
 familyclaw-emotion = { path = "crates/familyclaw-emotion" }
 familyclaw-gemu = { path = "crates/familyclaw-gemu" }
 familyclaw-hearth = { path = "crates/familyclaw-hearth" }

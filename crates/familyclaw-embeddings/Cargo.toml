@@ -1,0 +1,19 @@
+[package]
+name = "familyclaw-embeddings"
+description = "Embedding-tarjoajat (EmbeddingProvider) — deterministinen zero-dep oletus, pure-Rust mallit feature-gateina (KERROS A, OSS)"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Zero-dep ydin: deterministinen oletustarjoaja ei vaadi mitään ulkoista.
+# Tulevat pure-Rust-mallit (Phase-0-spiken valitsema) lisätään feature-gatein,
+# jottei oletusrakennus vedä raskasta riippuvuutta (köyhyys-rajoite + MSVC/deny).
+
+[dev-dependencies]
