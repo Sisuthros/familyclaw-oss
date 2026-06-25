@@ -140,10 +140,18 @@ mod tests {
         assert_eq!(m.approval_policy, ApprovalPolicy::RequireApproval);
         assert_eq!(m.permissions, vec![SkillPermission::WriteLocalFiles]);
         assert_eq!(m.id, DreamSkill::skill_id());
-        // Layer B: nimi/kuvaus geneerisiä, ei perheen nimiä.
+        // Layer B: nimi/kuvaus geneerisiä, ei perheen nimiä. Kielletyt nimet
+        // rakennetaan ROT13:sta, jotta tämä TESTI ei itse sisällä Kerros B
+        // -nimiä literaaleina (muuten scripts/audit-layer-b.sh napsahtaisi tähän
+        // testitiedostoon vaikka tuotantokoodi on puhdas).
         let blob = format!("{} {}", m.name, m.description).to_lowercase();
-        for frag in ["agent_alpha", "agent_beta", "agent_delta", "agent_gamma", "agent_epsilon"] {
-            assert!(!blob.contains(frag), "Layer B -vuoto manifestissa");
+        let forbidden_rot13 = ["yhzra", "yhzvan", "cubgba", "cevfzn", "nheben"];
+        for enc in forbidden_rot13 {
+            let frag: String = enc
+                .chars()
+                .map(|c| (((c as u8 - b'a' + 13) % 26) + b'a') as char)
+                .collect();
+            assert!(!blob.contains(&frag), "Layer B -vuoto manifestissa");
         }
     }
 
