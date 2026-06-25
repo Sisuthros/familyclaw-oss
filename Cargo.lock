@@ -1672,6 +1672,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "familyclaw-growth"
+version = "0.1.0"
+dependencies = [
+ "familyclaw-core",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "familyclaw-hearth"
 version = "0.1.0"
 dependencies = [

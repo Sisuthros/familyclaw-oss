@@ -41,6 +41,7 @@ familyclaw-durable = { path = "crates/familyclaw-durable" }
 familyclaw-embeddings = { path = "crates/familyclaw-embeddings" }
 familyclaw-emotion = { path = "crates/familyclaw-emotion" }
 familyclaw-gemu = { path = "crates/familyclaw-gemu" }
+familyclaw-growth = { path = "crates/familyclaw-growth" }
 familyclaw-hearth = { path = "crates/familyclaw-hearth" }
 familyclaw-latent = { path = "crates/familyclaw-latent" }
 familyclaw-memory = { path = "crates/familyclaw-memory" }
