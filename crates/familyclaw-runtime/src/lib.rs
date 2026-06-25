@@ -126,6 +126,11 @@ pub struct FamilyRuntime {
     /// päälle/pois ([`Scheduler::set_task_enabled`]) saman lukon kautta jota
     /// tikkisilmukka käyttää. `None` kun ajastin on pois käytöstä.
     scheduler_handle: Option<SchedulerHandle>,
+    /// Perhe-agency-configin polku (`<data_dir>/agency.json`), kun ajastin on
+    /// käynnissä persistentillä polulla (Phase 4). Operaattoripinta (gateway)
+    /// kirjoittaa kill-switch-muutokset tähän, jotta ne säilyvät yli restartin.
+    /// `None` muistinvaraisessa tilassa tai kun ajastin on pois käytöstä.
+    agency_config_path: Option<std::path::PathBuf>,
 }
 
 impl FamilyRuntime {
@@ -191,6 +196,15 @@ impl FamilyRuntime {
     #[must_use]
     pub fn scheduler_handle(&self) -> Option<SchedulerHandle> {
         self.scheduler_handle.clone()
+    }
+
+    /// **Perhe-agency-configin polku** (`<data_dir>/agency.json`) operaattori-
+    /// pinnalle (Phase 4). Gateway kirjoittaa kill-switch-muutokset tähän, jotta
+    /// ne säilyvät yli restartin. `Some` kun ajastin on käynnissä persistentillä
+    /// polulla; `None` muistinvaraisessa tilassa tai kun ajastin on pois käytöstä.
+    #[must_use]
+    pub fn agency_config_path(&self) -> Option<std::path::PathBuf> {
+        self.agency_config_path.clone()
     }
 
     /// Sammuttaa kokoonpanon siististi: **ei pudota in-flight-vastauksia.**
@@ -509,7 +523,7 @@ pub async fn build_family(
     //     In-memory-polulla ([`ActionRuntime::with_default_skills`], ei data_diriä)
     //     kaikki kolme jäävät oletuksiinsa — ei levyä, ei kaatumiskestävyyttä,
     //     kuten muullakin in-memory-tilalla.
-    let action_runtime = if let Some(dir) = action_data_dir {
+    let action_runtime = if let Some(dir) = action_data_dir.as_ref() {
         // Persistentti polku: durable pending + task + dispatch outbox YHDELLÄ
         // konstruktorilla — `with_durable_stores` avaa nyt itse kaatumiskestävän
         // journal-outboxin kolmannesta polusta, joten erillistä
@@ -662,6 +676,24 @@ pub async fn build_family(
                     "dream",
                 );
                 scheduler.register(dream_task);
+                // Perhe-agency-persistenssi (Phase 4): lataa <data_dir>/agency.json
+                // ja sovella se → operaattorin kill-switch säilyy yli restartin.
+                // Vain persistentillä polulla (action_data_dir = Some); muistin-
+                // varaisessa tilassa ei ole mihin persistoida.
+                if let Some(dir) = action_data_dir.as_ref() {
+                    let agency_path = dir.join("agency.json");
+                    match familyclaw_scheduler::AgencyConfig::load(&agency_path) {
+                        Ok(cfg) => {
+                            scheduler.apply_agency_config(&cfg);
+                            if !cfg.disabled.is_empty() {
+                                tracing::info!(target: "familyclaw::scheduler", disabled = cfg.disabled.len(), "applied persisted agency config");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "familyclaw::scheduler", error = %e, "failed to load agency config — using defaults");
+                        }
+                    }
+                }
                 // Tikkiväli: min(intervalli, 60s) jotta erääntyminen huomataan
                 // ajoissa mutta tikki ei pyöri turhaan tiuhaan.
                 let tick_secs = interval_secs.clamp(1, 60);
@@ -684,6 +716,12 @@ pub async fn build_family(
     //     sen loppuun (in-flight-vastaukset) abortoinnin sijaan. Ajastimen
     //     peruutussignaali talletetaan erikseen ja peruutetaan sammutuksessa.
     let tasks = vec![pump];
+    // Agency-configin polku: vain kun ajastin pyörii (scheduler_handle = Some) JA
+    // persistentti polku on olemassa → operaattorin kill-switch voidaan persistoida.
+    let agency_config_path = scheduler_handle
+        .as_ref()
+        .and(action_data_dir.as_ref())
+        .map(|dir| dir.join("agency.json"));
     Ok(FamilyRuntime {
         bus,
         bridge,
@@ -694,6 +732,7 @@ pub async fn build_family(
         tasks,
         scheduler_signal,
         scheduler_handle,
+        agency_config_path,
     })
 }
 

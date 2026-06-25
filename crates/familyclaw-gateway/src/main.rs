@@ -119,7 +119,7 @@ use familyclaw_channels::{
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
 use familyclaw_observability::{EventRecorder, MetricsRegistry};
 use familyclaw_runtime::{build_family, FamilyRuntime};
-use familyclaw_scheduler::{ScheduledTaskId, SchedulerHandle};
+use familyclaw_scheduler::{AgencyConfig, ScheduledTaskId, SchedulerHandle};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
@@ -258,6 +258,11 @@ struct GatewayState {
     /// ajastin on pois käytöstä (`FAMILYCLAW_DREAM_DISABLED`) tai runtimea ei
     /// ole kytketty. Kun `None`, kill-switch-reitti vastaa `503`.
     scheduler: Option<SchedulerHandle>,
+    /// Perhe-agency-configin polku (`<data_dir>/agency.json`) johon kill-switch-
+    /// muutos persistoidaan (Phase 4). `Some` kun ajastin pyörii persistentillä
+    /// polulla; `None` muistinvaraisessa tilassa → muutos jää vain muistiin
+    /// (häviää restartissa, mikä on oikein in-memory-tilalle).
+    agency_config_path: Option<std::path::PathBuf>,
     /// **Jaettu mittarirekisteri** Prometheus-viennille (`GET /metrics`).
     ///
     /// [`MetricsRegistry`] on `Clone` ja jakaa tilansa `Arc`:n kautta, joten
@@ -842,6 +847,25 @@ async fn set_task_enabled_route(
 
     let mut sched = scheduler.lock().await;
     if sched.set_task_enabled(id, enabled) {
+        drop(sched); // vapauta lukko ennen tiedosto-I/O:ta
+                     // Persistoi muutos config-tiedostoon, jotta kill-switch
+                     // säilyy yli restartin (Phase 4). Best-effort: persistenssin
+                     // epäonnistuminen ei kumoa live-muutosta (joka jo tehtiin),
+                     // mutta se lokitetaan — muistinvaraisessa tilassa polkua ei
+                     // ole, jolloin muutos jää vain muistiin (oikein in-memorylle).
+        if let Some(path) = state.agency_config_path.as_ref() {
+            match AgencyConfig::load(path) {
+                Ok(mut cfg) => {
+                    cfg.set(id, enabled);
+                    if let Err(e) = cfg.save(path) {
+                        tracing::warn!(target: "familyclaw::scheduler", error = %e, "failed to persist agency config — live change kept, restart may revert it");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target: "familyclaw::scheduler", error = %e, "failed to load agency config for persist — live change kept");
+                }
+            }
+        }
         (
             StatusCode::OK,
             Json(serde_json::json!({ "task_id": task_id, "enabled": enabled })),
@@ -1323,6 +1347,8 @@ async fn serve() -> Result<()> {
     // altistaa → kill-switch-reitti kytkee tehtäviä päälle/pois. None jos
     // ajastin ei ole käynnissä.
     let scheduler = runtime.scheduler_handle();
+    // Agency-configin polku: kill-switch-muutos persistoidaan tähän (Phase 4).
+    let agency_config_path = runtime.agency_config_path();
 
     // Mittarirekisteri (GET /metrics): SAMA instanssi jonka EventRecorder yllä
     // sai (metrics.clone()). Tapahtumapohjainen täyttö on nyt KYTKETTY — agentin
@@ -1338,6 +1364,7 @@ async fn serve() -> Result<()> {
         actions,
         turn_audit,
         scheduler,
+        agency_config_path,
         metrics: Some(metrics),
     });
     info!("operaattorin hyväksyntäpinta valmis — GET /approvals/pending, POST /approvals/{{id}}/approve");
@@ -1848,6 +1875,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         });
         let (status, _) = readyz(State(not_ready)).await;
@@ -1863,6 +1891,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         });
         let (status, _) = readyz(State(ready)).await;
@@ -1881,6 +1910,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         }));
     }
@@ -2002,6 +2032,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         };
         assert!(check_inject_auth(&state, &HeaderMap::new()).is_ok());
@@ -2020,6 +2051,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         };
         assert!(check_inject_auth(&state, &headers_with_auth("Bearer s3cret-token")).is_ok());
@@ -2036,6 +2068,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         };
         // Väärä token.
@@ -2075,6 +2108,7 @@ mod tests {
             actions: Some(Arc::clone(&actions)),
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         });
         (state, actions)
@@ -2138,6 +2172,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         });
         let (status, _) = list_pending_approvals(State(state), HeaderMap::new()).await;
@@ -2182,6 +2217,7 @@ mod tests {
             actions: mut_state.actions.clone(),
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         });
         let (status, _) = list_pending_approvals(State(state), HeaderMap::new()).await;
@@ -2235,6 +2271,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         });
         let (status, _) = approve_pending(
@@ -2257,6 +2294,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         })
     }
@@ -2286,6 +2324,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: Some(sched),
+            agency_config_path: None,
             metrics: None,
         });
         // Epäkelpo UUID → 400.
@@ -2331,6 +2370,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: Some(Arc::clone(&sched)),
+            agency_config_path: None,
             metrics: None,
         });
 
@@ -2360,6 +2400,68 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn killswitch_persists_to_agency_config() {
+        use familyclaw_actions::SkillId;
+        use familyclaw_scheduler::{AgencyConfig, ScheduledTask, ScheduledTaskId, Scheduler};
+        let mut s = Scheduler::new();
+        let task_uuid = uuid::Uuid::from_u128(77);
+        let id = ScheduledTaskId::from_uuid(task_uuid);
+        s.register(ScheduledTask::with_id(
+            id,
+            SkillId::new(),
+            serde_json::json!({}),
+            chrono::Duration::seconds(60),
+            "being",
+        ));
+        let sched = Arc::new(tokio::sync::Mutex::new(s));
+
+        // Eristetty config-polku tälle testille.
+        let dir = std::env::temp_dir().join("familyclaw-gw-agency-persist-test");
+        let path = dir.join("agency.json");
+        let _ = std::fs::remove_file(&path);
+
+        let state = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: None,
+            turn_audit: None,
+            scheduler: Some(Arc::clone(&sched)),
+            agency_config_path: Some(path.clone()),
+            metrics: None,
+        });
+
+        // Disabloi reitin kautta → pitää persistoitua tiedostoon.
+        let (status, _) = set_task_enabled_route(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Path(task_uuid.to_string()),
+            Json(serde_json::json!({ "enabled": false })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Tiedostoon kirjoittui disabled-merkintä.
+        let cfg = AgencyConfig::load(&path).expect("load persisted");
+        assert!(cfg.is_disabled(id), "kill-switch persistoitui configiin");
+
+        // Käyttöön otto reitin kautta → poistuu configista.
+        let (status, _) = set_task_enabled_route(
+            State(state),
+            HeaderMap::new(),
+            Path(task_uuid.to_string()),
+            Json(serde_json::json!({ "enabled": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let cfg = AgencyConfig::load(&path).expect("load");
+        assert!(!cfg.is_disabled(id), "käyttöön otto poisti configista");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
@@ -2426,6 +2528,7 @@ mod tests {
             actions: Some(Arc::clone(&actions)),
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         });
         let id = submit_pending(&actions).await;
@@ -2485,6 +2588,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         });
         let (status, headers, body) = metrics_handler(State(state)).await;
@@ -2510,6 +2614,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: Some(registry),
         });
 
@@ -2556,6 +2661,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: Some(registry),
         });
         let app = build_router(state);
@@ -2664,6 +2770,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: Some(metrics),
         });
         let (status, _headers, body) = metrics_handler(State(state)).await;
@@ -3059,6 +3166,7 @@ mod tests {
             actions: Some(Arc::clone(&actions)),
             turn_audit: Some(Arc::clone(&turn_audit)),
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         });
         let app = build_router(state);
@@ -3321,6 +3429,7 @@ mod tests {
             actions: Some(Arc::clone(&actions)),
             turn_audit: Some(Arc::clone(&turn_audit)),
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         });
         let app = build_router(state);
@@ -3396,6 +3505,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         });
         let app = build_router(state);
@@ -3539,6 +3649,7 @@ mod tests {
             actions: Some(Arc::clone(&actions)),
             turn_audit: Some(Arc::clone(&turn_audit)),
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         });
         let app = build_router(state);
@@ -3690,6 +3801,7 @@ mod tests {
             actions: None,
             turn_audit: None,
             scheduler: None,
+            agency_config_path: None,
             metrics: None,
         });
         let app = build_router(state);
