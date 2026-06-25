@@ -1150,6 +1150,62 @@ mod tests {
         );
     }
 
+    /// Phase 5 (D3): Orkestraattori koordinoi **≥2 live-agenttia** reitittäen
+    /// solmut KYVYKKYYDEN mukaan oikealle työntekijälle. Tämä on aito
+    /// multi-agent-koordinointi joka toimii nykyrakenteella: kahdella eri-
+    /// kykyisellä työntekijällä eri solmut menevät eri agenteille
+    /// ([`Orchestrator::select_worker`] suodattaa `required_capabilities`:n
+    /// mukaan). `TurnExecutor`-sauma (tässä mock) on sama jonka läpi
+    /// `LiveTurnExecutor` ajaa tuotannossa.
+    ///
+    /// Huom (rehellinen rajaus): solmut ajetaan **sekventiaalisesti** loppuun
+    /// (kukin Done ennen seuraavaa), joten pelkkä kuorma-tasapainotus ei vielä
+    /// hajauta riippumattomia solmuja rinnakkain — rinnakkaissuoritus on osa
+    /// Phase 5:n isompaa työtä (per-node journal ownership). Kyvykkyys­reititys
+    /// sen sijaan koordinoi ≥2 agenttia jo nyt.
+    #[tokio::test]
+    async fn run_routes_nodes_to_capable_workers() {
+        let bridge = FamilyBridge::new();
+        let now = ts(1000);
+        // Työntekijä A osaa "sql", työntekijä B osaa "vision".
+        let a = AgentId::from_uuid(uuid::Uuid::from_u128(1));
+        let b = AgentId::from_uuid(uuid::Uuid::from_u128(2));
+        let info_a = AgentInfo::new(a, "w-sql", AgentRole::Executor, HostKind::Local)
+            .with_capabilities(["sql"]);
+        let info_b = AgentInfo::new(b, "w-vision", AgentRole::Executor, HostKind::Local)
+            .with_capabilities(["vision"]);
+        bridge.register_agent(info_a).await.expect("reg a");
+        bridge.register_agent(info_b).await.expect("reg b");
+        bridge.heartbeat(a, now).await.expect("hb a");
+        bridge.heartbeat(b, now).await.expect("hb b");
+
+        // Kaksi solmua: toinen vaatii "sql" → A, toinen "vision" → B.
+        let plan = OrchestrationPlan::new(
+            "capability-routed",
+            vec![
+                TaskNode::new("q", "query", "")
+                    .with_role(AgentRole::Executor)
+                    .with_capabilities(["sql"]),
+                TaskNode::new("img", "analyze", "")
+                    .with_role(AgentRole::Executor)
+                    .with_capabilities(["vision"]),
+            ],
+        );
+        let orch = Orchestrator::new(bridge.clone());
+        let report = orch.run(&plan, now).await.expect("run");
+        assert_eq!(report.completed.len(), 2);
+
+        // Kumpikin työntekijä sai TÄSMÄLLEEN kykyään vastaavan solmun → ≥2
+        // agenttia koordinoitiin kyvykkyysreitityksellä.
+        let a_tasks = bridge.board().list_for_assignee(a).await.len();
+        let b_tasks = bridge.board().list_for_assignee(b).await.len();
+        assert_eq!(a_tasks, 1, "sql-työntekijä sai sql-solmun, sai {a_tasks}");
+        assert_eq!(
+            b_tasks, 1,
+            "vision-työntekijä sai vision-solmun, sai {b_tasks}"
+        );
+    }
+
     #[tokio::test]
     async fn run_errors_when_no_eligible_worker() {
         let bridge = FamilyBridge::new();
