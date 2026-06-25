@@ -1640,6 +1640,7 @@ dependencies = [
  "familyclaw-channels",
  "familyclaw-core",
  "familyclaw-durable",
+ "familyclaw-embeddings",
  "familyclaw-memory",
  "familyclaw-observability",
  "familyclaw-runtime",

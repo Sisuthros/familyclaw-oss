@@ -1405,6 +1405,24 @@ fn sandbox_label() -> &'static str {
     familyclaw_sandbox::sandbox_availability()
 }
 
+/// Palauttaa aktiivisen muistin upotustarjoajan etiketin (Phase 3, D4).
+///
+/// Runtime kääräisee muistin `EmbeddingMemoryStore`:lla
+/// [`DeterministicEmbedder`](familyclaw_embeddings::DeterministicEmbedder)-
+/// oletustarjoajalla (riippuvuudeton, köyhyys-yhteensopiva). Raportoi tarjoajan
+/// vakaan id:n + ulottuvuuden, jotta operaattori näkee mikä upotus on todella
+/// käytössä. Deterministinen ja salaisuudeton → sopii `status`/`doctor`-
+/// tulosteeseen. Kun feature-gated mallintarjoaja lisätään, tämä päivitetään
+/// raportoimaan todellinen käännetty tarjoaja (kuten [`sandbox_label`]).
+fn embedder_label() -> String {
+    use familyclaw_embeddings::DeterministicEmbedder;
+    format!(
+        "{} (dim={})",
+        DeterministicEmbedder::ID,
+        DeterministicEmbedder::DEFAULT_DIMENSIONS
+    )
+}
+
 /// Kysyy käynnissä olevan gatewayn tilan (`/healthz` + `/readyz`).
 ///
 /// Lukee kuunteluosoitteen [`resolve_addr`]:n kautta ja tekee kaksi HTTP
@@ -1446,6 +1464,7 @@ async fn status() -> Result<()> {
     let durability = build_durability_report().await?;
     println!("durability: {}", durability.summary());
     println!("sandbox: {}", sandbox_label());
+    println!("embedder: {}", embedder_label());
 
     if health_ok && ready_status.as_u16() == 200 {
         println!("status: ready");
@@ -1561,6 +1580,7 @@ async fn doctor() -> Result<()> {
         );
     }
     println!("[INFO]     sandbox   {}", sandbox_label());
+    println!("[INFO]     embedder  {}", embedder_label());
 
     if std::env::var_os("FAMILYCLAW_PROFILE_DIR").is_some_and(|v| !v.is_empty()) {
         println!("[OK]      env       FAMILYCLAW_PROFILE_DIR set");
@@ -2595,6 +2615,17 @@ mod tests {
         } else {
             assert_eq!(label, "none (noop)");
         }
+    }
+
+    #[test]
+    fn embedder_label_reports_active_provider() {
+        // Phase 3: status/doctor näyttää aktiivisen upotustarjoajan id + dim.
+        let label = embedder_label();
+        assert!(
+            label.contains("deterministic-hash-v1"),
+            "tarjoajan id: {label}"
+        );
+        assert!(label.contains("dim=256"), "ulottuvuus: {label}");
     }
 
     // ---- E2E: suspend → approve → resume → reply (Phase 1 §6, RED-todiste) ----
