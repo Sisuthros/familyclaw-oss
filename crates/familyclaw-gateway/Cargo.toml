@@ -30,6 +30,7 @@ serde = { workspace = true }
 familyclaw-core = { workspace = true }
 familyclaw-bus = { workspace = true }
 familyclaw-runtime = { workspace = true }
+familyclaw-scheduler = { workspace = true }
 familyclaw-agent = { workspace = true }
 # orchestrate-alikomennolle: Orchestrator + FamilyBridge + OrchestrationPlan.
 # Ei sykliä: bridge riippuu vain coresta. (familyclaw-agent re-exportaa vain
@@ -56,6 +57,8 @@ tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 # Phase 3: status/doctor raportoi aktiivisen upotustarjoajan (embedder_label).
 familyclaw-embeddings = { workspace = true }
+# Phase 4: kill-switch-reitti jäsentää ScheduledTaskId:n UUID-stringistä.
+uuid = { workspace = true }
 
 [dev-dependencies]
 # E2E suspend→approve→resume -testi rakentaa AIDON agentin skriptatulla LLM:llä
@@ -66,4 +69,5 @@ familyclaw-embeddings = { workspace = true }
 familyclaw-durable = { workspace = true }
 familyclaw-memory = { workspace = true }
 async-trait = { workspace = true }
-uuid = { workspace = true }
+# Phase 4 kill-switch -reittitesti rakentaa ScheduledTaskin (interval = chrono::Duration).
+chrono = { workspace = true }

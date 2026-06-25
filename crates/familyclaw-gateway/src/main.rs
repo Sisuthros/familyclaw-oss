@@ -119,6 +119,7 @@ use familyclaw_channels::{
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
 use familyclaw_observability::{EventRecorder, MetricsRegistry};
 use familyclaw_runtime::{build_family, FamilyRuntime};
+use familyclaw_scheduler::{ScheduledTaskId, SchedulerHandle};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
@@ -247,6 +248,16 @@ struct GatewayState {
     /// kytketty (esim. testit). Kun `None`, audit-reitti vastaa
     /// `503 Service Unavailable`.
     turn_audit: Option<Arc<AuditCollector>>,
+    /// **Jaettu ajastinkahva** perhe-agency-operaattoripinnalle
+    /// (`POST /tasks/{id}/enabled`, Phase 4 kill-switch).
+    ///
+    /// Sama [`SchedulerHandle`] jonka [`FamilyRuntime`] altistaa
+    /// ([`FamilyRuntime::scheduler_handle`]) — operaattori voi kytkeä ajastettuja
+    /// tehtäviä päälle/pois saman lukon kautta jota tikkisilmukka käyttää.
+    /// `Some` palvelevassa gatewayssa kun ajastin on käynnissä; `None` kun
+    /// ajastin on pois käytöstä (`FAMILYCLAW_DREAM_DISABLED`) tai runtimea ei
+    /// ole kytketty. Kun `None`, kill-switch-reitti vastaa `503`.
+    scheduler: Option<SchedulerHandle>,
     /// **Jaettu mittarirekisteri** Prometheus-viennille (`GET /metrics`).
     ///
     /// [`MetricsRegistry`] on `Clone` ja jakaa tilansa `Arc`:n kautta, joten
@@ -782,6 +793,67 @@ async fn approve_pending(
     )
 }
 
+/// `POST /tasks/{task_id}/enabled` — **perhe-agency kill-switch** (Phase 4):
+/// kytkee ajastetun tehtävän päälle tai pois.
+///
+/// Runko: JSON `{"enabled": true|false}`. `enabled=false` = ajastin ohittaa
+/// tehtävän seuraavissa tikeissä (kill-switch); `true` = ottaa taas käyttöön.
+/// Mutaatio menee saman lukon kautta jota tikkisilmukka käyttää, joten kilpailu
+/// ratkeaa lukolla.
+///
+/// Vastaa:
+/// - `200 OK` + uusi tila kun tehtävä löytyi ja kytkettiin,
+/// - `400 Bad Request` jos tunniste on epäkelpo UUID tai runko puuttuu `enabled`,
+/// - `401` jos bearer-auth vaaditaan eikä täsmää,
+/// - `404 Not Found` jos tunnistetta ei ole rekisteröity ajastimeen,
+/// - `503 Service Unavailable` jos ajastin ei ole kytketty (esim. dream pois
+///   käytöstä tai runtimea ei ole).
+async fn set_task_enabled_route(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if check_inject_auth(&state, &headers).is_err() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        );
+    }
+    let Some(scheduler) = state.scheduler.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "scheduler not configured" })),
+        );
+    };
+    let Some(enabled) = payload.get("enabled").and_then(serde_json::Value::as_bool) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "body must be {\"enabled\": bool}" })),
+        );
+    };
+    let Ok(uuid) = uuid::Uuid::parse_str(task_id.trim()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid task id" })),
+        );
+    };
+    let id = ScheduledTaskId::from_uuid(uuid);
+
+    let mut sched = scheduler.lock().await;
+    if sched.set_task_enabled(id, enabled) {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "task_id": task_id, "enabled": enabled })),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such scheduled task" })),
+        )
+    }
+}
+
 /// `GET /turns/audit` — palauttaa **havainnoitavan tool-loop-jäljen**
 /// operaattorille (TURN-AUDIT, roadmap §6 D6).
 ///
@@ -922,6 +994,11 @@ fn build_router(state: Arc<GatewayState>) -> Router {
         // axum 0.7 (matchit 0.7) käyttää `:param`-syntaksia polkukaappaukseen;
         // `{approval_id}` tulkittaisiin LITERAALIksi segmentiksi → 404 HTTP:n yli.
         .route("/approvals/:approval_id/approve", post(approve_pending))
+        // Perhe-agency kill-switch (Phase 4): kytkee ajastetun tehtävän
+        // päälle/pois. Rekisteröidään aina; kun ajastinta ei ole kytketty
+        // ([`GatewayState::scheduler`] = `None`), handler vastaa 503. Bearer-
+        // suojaus on sama kuin /inject:llä.
+        .route("/tasks/:task_id/enabled", post(set_task_enabled_route))
         // Havainnoitava tool-loop-jälki (TURN-AUDIT, roadmap §6 D6). Rekisteröidään
         // aina; kun turn-auditia ei ole kytketty ([`GatewayState::turn_audit`] =
         // `None`), handler vastaa 503. Bearer-suojaus on sama kuin /inject:llä.
@@ -1242,6 +1319,10 @@ async fn serve() -> Result<()> {
     // Havainnoitava tool-loop-jälki (TURN-AUDIT, roadmap §6 D6): sama
     // Arc<AuditCollector> jonka build_family kytki agentin tool-looppiin.
     let turn_audit = Some(runtime.turn_audit());
+    // Ajastinkahva (perhe-agency, Phase 4): sama SchedulerHandle jonka runtime
+    // altistaa → kill-switch-reitti kytkee tehtäviä päälle/pois. None jos
+    // ajastin ei ole käynnissä.
+    let scheduler = runtime.scheduler_handle();
 
     // Mittarirekisteri (GET /metrics): SAMA instanssi jonka EventRecorder yllä
     // sai (metrics.clone()). Tapahtumapohjainen täyttö on nyt KYTKETTY — agentin
@@ -1256,6 +1337,7 @@ async fn serve() -> Result<()> {
         discord_public_key,
         actions,
         turn_audit,
+        scheduler,
         metrics: Some(metrics),
     });
     info!("operaattorin hyväksyntäpinta valmis — GET /approvals/pending, POST /approvals/{{id}}/approve");
@@ -1765,6 +1847,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         });
         let (status, _) = readyz(State(not_ready)).await;
@@ -1779,6 +1862,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         });
         let (status, _) = readyz(State(ready)).await;
@@ -1796,6 +1880,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         }));
     }
@@ -1916,6 +2001,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         };
         assert!(check_inject_auth(&state, &HeaderMap::new()).is_ok());
@@ -1933,6 +2019,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         };
         assert!(check_inject_auth(&state, &headers_with_auth("Bearer s3cret-token")).is_ok());
@@ -1948,6 +2035,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         };
         // Väärä token.
@@ -1986,6 +2074,7 @@ mod tests {
             discord_public_key: None,
             actions: Some(Arc::clone(&actions)),
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         });
         (state, actions)
@@ -2048,6 +2137,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         });
         let (status, _) = list_pending_approvals(State(state), HeaderMap::new()).await;
@@ -2091,6 +2181,7 @@ mod tests {
             discord_public_key: None,
             actions: mut_state.actions.clone(),
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         });
         let (status, _) = list_pending_approvals(State(state), HeaderMap::new()).await;
@@ -2143,6 +2234,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         });
         let (status, _) = approve_pending(
@@ -2152,6 +2244,122 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── Phase 4: kill-switch -reitti (POST /tasks/{id}/enabled) ──────────────
+
+    fn state_without_scheduler() -> Arc<GatewayState> {
+        Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: None,
+            turn_audit: None,
+            scheduler: None,
+            metrics: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn killswitch_503_without_scheduler() {
+        let state = state_without_scheduler();
+        let (status, _) = set_task_enabled_route(
+            State(state),
+            HeaderMap::new(),
+            Path(uuid::Uuid::from_u128(1).to_string()),
+            Json(serde_json::json!({ "enabled": false })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn killswitch_400_on_bad_id_and_missing_body() {
+        use familyclaw_scheduler::Scheduler;
+        let sched = Arc::new(tokio::sync::Mutex::new(Scheduler::new()));
+        let state = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: None,
+            turn_audit: None,
+            scheduler: Some(sched),
+            metrics: None,
+        });
+        // Epäkelpo UUID → 400.
+        let (status, _) = set_task_enabled_route(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Path("not-a-uuid".to_string()),
+            Json(serde_json::json!({ "enabled": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Puuttuva `enabled` → 400.
+        let (status, _) = set_task_enabled_route(
+            State(state),
+            HeaderMap::new(),
+            Path(uuid::Uuid::from_u128(1).to_string()),
+            Json(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn killswitch_toggles_known_task_and_404s_unknown() {
+        use familyclaw_actions::SkillId;
+        use familyclaw_scheduler::{ScheduledTask, ScheduledTaskId, Scheduler};
+        let mut s = Scheduler::new();
+        let task_uuid = uuid::Uuid::from_u128(42);
+        s.register(ScheduledTask::with_id(
+            ScheduledTaskId::from_uuid(task_uuid),
+            SkillId::new(),
+            serde_json::json!({}),
+            chrono::Duration::seconds(60),
+            "being",
+        ));
+        let sched = Arc::new(tokio::sync::Mutex::new(s));
+        let state = Arc::new(GatewayState {
+            bus: None,
+            discord_channel: None,
+            inject_token: None,
+            discord_public_key: None,
+            actions: None,
+            turn_audit: None,
+            scheduler: Some(Arc::clone(&sched)),
+            metrics: None,
+        });
+
+        // Tunnettu tehtävä → 200, tila päivittyy.
+        let (status, _) = set_task_enabled_route(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Path(task_uuid.to_string()),
+            Json(serde_json::json!({ "enabled": false })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            sched
+                .lock()
+                .await
+                .task_enabled(ScheduledTaskId::from_uuid(task_uuid)),
+            Some(false)
+        );
+
+        // Tuntematon tehtävä → 404.
+        let (status, _) = set_task_enabled_route(
+            State(state),
+            HeaderMap::new(),
+            Path(uuid::Uuid::from_u128(999).to_string()),
+            Json(serde_json::json!({ "enabled": false })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2217,6 +2425,7 @@ mod tests {
             discord_public_key: None,
             actions: Some(Arc::clone(&actions)),
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         });
         let id = submit_pending(&actions).await;
@@ -2275,6 +2484,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         });
         let (status, headers, body) = metrics_handler(State(state)).await;
@@ -2299,6 +2509,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: Some(registry),
         });
 
@@ -2344,6 +2555,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: Some(registry),
         });
         let app = build_router(state);
@@ -2451,6 +2663,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: Some(metrics),
         });
         let (status, _headers, body) = metrics_handler(State(state)).await;
@@ -2845,6 +3058,7 @@ mod tests {
             discord_public_key: None,
             actions: Some(Arc::clone(&actions)),
             turn_audit: Some(Arc::clone(&turn_audit)),
+            scheduler: None,
             metrics: None,
         });
         let app = build_router(state);
@@ -3106,6 +3320,7 @@ mod tests {
             discord_public_key: None,
             actions: Some(Arc::clone(&actions)),
             turn_audit: Some(Arc::clone(&turn_audit)),
+            scheduler: None,
             metrics: None,
         });
         let app = build_router(state);
@@ -3180,6 +3395,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         });
         let app = build_router(state);
@@ -3322,6 +3538,7 @@ mod tests {
             discord_public_key: None,
             actions: Some(Arc::clone(&actions)),
             turn_audit: Some(Arc::clone(&turn_audit)),
+            scheduler: None,
             metrics: None,
         });
         let app = build_router(state);
@@ -3472,6 +3689,7 @@ mod tests {
             discord_public_key: None,
             actions: None,
             turn_audit: None,
+            scheduler: None,
             metrics: None,
         });
         let app = build_router(state);
