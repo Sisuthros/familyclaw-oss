@@ -101,6 +101,17 @@ impl Scheduler {
         self.tasks.iter().map(|t| t.id).collect()
     }
 
+    /// Soveltaa persistoidun perhe-agency-configin rekisteröityihin tehtäviin
+    /// (Phase 4): configin disabled-listalla olevat otetaan pois käytöstä, loput
+    /// jätetään käyttöön. Kutsu **bootissa** rekisteröinnin jälkeen, jotta
+    /// operaattorin kill-switch säilyy yli restartin. Tuntemattomat id:t
+    /// configissa sivuutetaan vaarattomasti.
+    pub fn apply_agency_config(&mut self, config: &crate::persistence::AgencyConfig) {
+        for task in &mut self.tasks {
+            task.enabled = !config.is_disabled(task.id);
+        }
+    }
+
     /// Rekisteröityjen tehtävien lukumäärä.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -266,6 +277,34 @@ mod tests {
         let unknown = ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(999));
         assert!(!sched.set_task_enabled(unknown, false));
         assert_eq!(sched.task_enabled(unknown), None);
+    }
+
+    #[tokio::test]
+    async fn apply_agency_config_restores_disabled_state() {
+        use crate::persistence::AgencyConfig;
+        let mut sched = Scheduler::new();
+        let a = ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(30));
+        let b = ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(31));
+        for id in [a, b] {
+            sched.register(ScheduledTask::with_id(
+                id,
+                FsReadAllowlisted::skill_id(),
+                json!({}),
+                Duration::seconds(60),
+                "being",
+            ));
+        }
+        // Config disabloi vain a:n (simuloi restartia jossa a oli pysäytetty).
+        let mut cfg = AgencyConfig::default();
+        cfg.set(a, false);
+        sched.apply_agency_config(&cfg);
+
+        assert_eq!(
+            sched.task_enabled(a),
+            Some(false),
+            "a palautui disabloituna"
+        );
+        assert_eq!(sched.task_enabled(b), Some(true), "b jäi käyttöön");
     }
 
     #[tokio::test]
