@@ -50,3 +50,36 @@ runs: it caught a `rustdoc::private_intra_doc_links` error in `web_fetch.rs`
 (a module-level doc linking a private `validate_url`) that per-crate doc builds
 let through. Fixed in the same change as this file. This is exactly why the
 whole-workspace CI equivalent matters — it surfaces what narrower runs miss.
+
+## Hosted CI blocker (documented, verified 2026-06-25)
+
+Hosted GitHub Actions is **not** green — but **not** because of a code or
+workflow problem. The workflow is valid and Actions are enabled on the repo;
+the jobs are refused at *start* by an **account-level billing block**.
+
+**Exact error** (captured from `gh run view <id>`, run on a real PR):
+
+> The job was not started because recent account payments have failed or your
+> spending limit needs to be increased. Please check the 'Billing & plans'
+> section in your settings
+
+Because every job `needs: layer-b-audit` and that job cannot start, the whole
+pipeline shows `failure` within a few seconds (no build actually runs).
+
+**Verification that this is billing, not code/workflow:**
+
+- `gh api repos/Sisuthros/familyclaw/actions/permissions`
+  → `{"enabled":true,"allowed_actions":"all", …}` (Actions are enabled).
+- `gh run view <id>` annotation is the billing message above, on the
+  `layer-b-audit` job, run duration ~2s (it never gets to checkout work).
+- Repo is **private**, so it consumes paid Actions minutes.
+
+**Hosted CI is intentionally not relied upon for this private repo.** Running it
+would consume paid Actions minutes the project deliberately does not spend, so
+the local, reproducible proof in this file is the **authoritative** gate (run the
+commands in [How to reproduce](#how-to-reproduce) — they mirror `ci.yml` exactly).
+
+Should the repo owner later choose to enable hosted runs — by clearing the
+Actions billing block, or by publishing the repo (public repos get free Actions
+minutes) — the hosted run would then supersede this file (see the header). That
+is an owner decision and is **not** required for the local proof to be valid.
