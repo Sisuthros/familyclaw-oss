@@ -30,12 +30,27 @@ Key facts:
   local provider (candle-backed) is feature-gated and refuses/warns when `semantic_weight > 0`
   without a real provider configured.
 
-## NOT verified locally (honest gaps → CI / Phase 3 will close)
+## Gaps closed by follow-up verification (2026-06-25)
 
-- `cargo deny check licenses` was **NOT run** here — `cargo-deny` is not installed on this machine
-  (`no such command: deny`). The license gate is enforced by the CI `cargo-deny` job; Phase 3 must
-  run it against the candle dependency tree before the feature is enabled by default.
-- A full `cargo build` (compiling candle) was not run — resolution + dep-shape is sufficient to
-  pick the default; Phase 3 does the real build behind the feature flag.
-- This spike crate is throwaway and is **not** a workspace member; delete `spikes/embedder-spike/`
-  once Phase 3 lands, or keep `DECISION.md` as the record and drop the `*-path/` crates.
+The two honest gaps below were left open on 2026-06-16 because `cargo-deny` wasn't
+installed and the full build wasn't run. Both are now **verified** (cargo-deny 0.19.9
+present; MSVC stable host `x86_64-pc-windows-msvc`):
+
+- ✅ **`cargo build` on MSVC stable** — a throwaway `candle-core` probe **compiled cleanly**
+  (`Finished dev` in ~36s, exit 0). No native link step, no `link.exe` onnx errors. candle is
+  confirmed pure-Rust-buildable on this toolchain.
+- ✅ **`cargo deny check licenses`** against the repo `deny.toml` — candle's **transitive license
+  tree passes** (`licenses ok`; the only failure was the probe crate itself being unlicensed,
+  which disappears once given a `license` field). No rejected/copyleft licenses in the tree.
+- ⚠️ **`cargo deny check advisories`** surfaces **RUSTSEC-2024-0436** (`paste` is *unmaintained*,
+  **not a vulnerability**), transitive via `gemm`. This is the same class already ignored in
+  `deny.toml` (`atomic-polyfill`, `number_prefix`). **Action for Phase 3:** add
+  `RUSTSEC-2024-0436` to the `deny.toml` `ignore` list when the candle feature lands.
+
+**Conclusion stands and is now fully evidence-backed: candle (pure-Rust) is the Phase-3 backend;**
+`ort`/onnx stays rejected (rc-only, native FFI, network binary download).
+
+## Spike crate lifecycle
+
+This spike crate is throwaway and is **not** a workspace member; keep `DECISION.md` as the record
+and drop the `*-path/` crates once the Phase-3 candle feature lands.
