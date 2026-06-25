@@ -5,7 +5,7 @@
 //! kirjoituksia, ja **rakenteellisesti SSRF-turvallinen**:
 //!
 //! ## Kuormaa kantava turvallisuus: `validate_url` + ei-redirect
-//! Ennen yhtäkään verkkopyyntöä [`validate_url`] hylkää:
+//! Ennen yhtäkään verkkopyyntöä `validate_url` hylkää:
 //! 1. ei-`http`/`https`-skeemat (estää `file://`, `ftp://`, `gopher://`, `data:`),
 //! 2. puuttuvan hostin,
 //! 3. `localhost` (ja `*.localhost`),
