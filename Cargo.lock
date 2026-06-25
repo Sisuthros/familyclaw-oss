@@ -1703,6 +1703,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "familyclaw-core",
+ "familyclaw-embeddings",
  "familyclaw-emotion",
  "serde",
  "serde_json",

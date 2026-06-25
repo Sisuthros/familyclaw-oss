@@ -86,6 +86,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod decay;
+pub mod embedding_store;
 pub mod gated_store;
 pub mod importance;
 pub mod memory;
@@ -95,6 +96,7 @@ pub mod retrieval;
 pub mod store;
 
 pub use decay::DecayPolicy;
+pub use embedding_store::EmbeddingMemoryStore;
 pub use gated_store::GatedMemoryStore;
 pub use importance::{
     ImportanceFactors, WEIGHT_EMOTION, WEIGHT_IDENTITY, WEIGHT_NOVELTY, WEIGHT_REINFORCEMENT,
