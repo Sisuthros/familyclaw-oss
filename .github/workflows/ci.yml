@@ -17,6 +17,9 @@ jobs:
       - name: Run Layer B leak audit
         run: bash scripts/audit-layer-b.sh
 
+      - name: Run Layer B audit regression tests
+        run: bash scripts/test-audit-layer-b.sh
+
   check:
     name: Check, Build, and Test
     needs: layer-b-audit

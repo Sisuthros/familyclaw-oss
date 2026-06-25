@@ -79,24 +79,43 @@ check_dir "keys" "keys"
 
 # 8. No real agent names in publishable content
 echo "8️⃣  Checking for real Layer B names in publishable content..."
-# Scan EVERY git-tracked publishable file (text formats) instead of a hardcoded
-# allowlist. This way any newly-added tracked file is caught by default — a narrow
-# allowlist silently missed FAMILYCLAW_MAP.md + docs/plans/ + docs/research/ +
-# docs/source-blueprints/, which leaked real family names into the OSS tree.
+# Scan EVERY git-tracked TEXT file instead of an extension allowlist. An
+# extension allowlist ('*.md' '*.rs' …) silently missed tracked text files in
+# other formats — .txt/.html/.csv/.xml/.sql/.ini/.cfg as well as extensionless
+# text files (LICENSE, .gitattributes) — any of which could carry a leaked
+# private name into the OSS tree. (Earlier this allowlist had already missed
+# FAMILYCLAW_MAP.md + docs/plans/ + docs/research/ + docs/source-blueprints/.)
 # Internal-only files must be untracked (.gitignore) — not whitelisted here.
-# An explicit deny-list excludes legitimately-public files that mention agent names
-# only as escaped/example tokens (e.g. *.example).
-# Extension-based formats PLUS extensionless tracked text files that a future
-# OSS release must also be clean of (.gitignore/.dockerignore/Dockerfile can carry
-# private-name comments). Extension-only scanning silently missed these.
-SCAN_FILES=$(git ls-files -- \
-    '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' '*.json' '*.py' '*.sh' '*.ps1' \
-    '.gitignore' '**/.gitignore' '.dockerignore' '**/.dockerignore' \
-    'Dockerfile' '**/Dockerfile' 'Containerfile' '**/Containerfile' 2>/dev/null \
+#
+# Text-vs-binary is decided by CONTENT, not extension: `grep -Iq .` matches a
+# file iff it is text with at least one byte of content (GNU grep -I treats files
+# containing NUL bytes as binary → no match). We never GUESS by extension, so a
+# new binary format added tomorrow is skipped safely and a new text format is
+# scanned by default. Empty files match nothing and carry no content, so skipping
+# them is safe.
+#
+# An explicit deny-list excludes legitimately-public files that mention agent
+# names only as escaped/example tokens (e.g. *.example).
+# `|| true`: the trailing `grep -vE` exits 1 when EVERY tracked path is filtered
+# out (e.g. a repo whose only tracked files are .example + this script). Under
+# `set -e` an empty result would otherwise abort the whole audit — guard it so an
+# empty scan set is treated as "nothing to scan", not as a script error.
+ALL_TRACKED=$(git ls-files 2>/dev/null \
     | grep -vE '(^|/)(target)/' \
     | grep -vE '\.example($|\.)' \
-    | grep -vE '\.example\.(md|rs|toml|yml|yaml|json|py|sh|ps1)$' \
-    | grep -vE '(^|/)scripts/audit-layer-b\.sh$')
+    | grep -vE '(^|/)scripts/audit-layer-b\.sh$' || true)
+# Keep only TEXT files (content-based, no extension guessing). Iterate safely
+# even with spaces/odd chars via a while-read loop on NUL-free, newline-listed
+# paths from git ls-files (git paths use forward slashes, no newlines).
+SCAN_FILES=""
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    [ -f "$f" ] || continue
+    if grep -Iq . "$f" 2>/dev/null; then
+        SCAN_FILES="${SCAN_FILES}${f}"$'\n'
+    fi
+done <<< "$ALL_TRACKED"
+SCAN_FILES=$(printf '%s' "$SCAN_FILES")
 NAME_FOUND=0
 for name in $FORBIDDEN_NAMES; do
     # Remove quotes for grep
