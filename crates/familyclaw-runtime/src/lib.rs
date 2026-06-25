@@ -35,10 +35,10 @@ use std::sync::Arc;
 use familyclaw_actions::{ActionRuntime, AuditCollector};
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, resolve_profile_dir, Agent, EmotionCalibration,
-    ErasedMemoryStore, JournalResumableStore, LlmEndpointResolver, ResumableTurnStore, Soul,
-    TableCalibration,
+    ErasedMemoryStore, JournalResumableStore, LlmEndpointResolver, MetricEvent, ResumableTurnStore,
+    Soul, TableCalibration,
 };
-use familyclaw_bridge::{AgentInfo, AgentRole, FamilyBridge, HostKind};
+use familyclaw_bridge::{AgentInfo, AgentRole, Event, EventKind, FamilyBridge, HostKind};
 use familyclaw_bus::{BeingId, BusHandle, ResonanceBus, ResonanceMessage};
 use familyclaw_channels::Channel;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
@@ -501,6 +501,33 @@ pub async fn build_family(
     //     säikeenturvalliseen, vain-lisäävään pintaan.
     let turn_audit: Arc<AuditCollector> = Arc::new(AuditCollector::new());
     agent = agent.with_turn_audit(Arc::clone(&turn_audit));
+
+    // 7c½. Havainnoitavuus-mittarisilta (Phase 2): jos siltakerros on annettu,
+    //      anna agentille kevyt [`MetricEvent`]-sinkki ja sillattaa sen
+    //      tapahtumat siltaväylän `Custom`-etiketeiksi, jotka `EventRecorder`
+    //      jo kartoittaa mittareiksi (`agent.turn` → `agent_turns`, `tool.call`
+    //      → `tool_calls`). Näin agentti pysyy IRTI `MetricsRegistry`:stä
+    //      (sama irrotus kuin reply_sink) ja kuolleet `agent_turns`/`tool_calls`
+    //      -laskurit alkavat elää. Replay-vartiointi tehdään agentissa
+    //      (`!is_replaying()`), joten sillalle tulee vain tuoreita tapahtumia.
+    if let Some(bridge) = &bridge {
+        let (metrics_tx, mut metrics_rx) = tokio::sync::mpsc::unbounded_channel::<MetricEvent>();
+        agent = agent.with_metrics_sink(metrics_tx);
+        let event_bus = bridge.bus().clone();
+        let bridge_agent_id = agent_id;
+        tokio::spawn(async move {
+            while let Some(ev) = metrics_rx.recv().await {
+                let label = match ev {
+                    MetricEvent::TurnCompleted => "agent.turn",
+                    MetricEvent::ToolDispatched => "tool.call",
+                };
+                event_bus.publish(Event::new(
+                    EventKind::Custom(label.to_string()),
+                    Some(bridge_agent_id),
+                ));
+            }
+        });
+    }
 
     // 7. Spawnaa agentti actorina (rekisteröi busiin).
     let actor = agent.spawn().await?;

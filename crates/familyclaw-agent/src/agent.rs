@@ -61,6 +61,27 @@ pub type ErasedMemoryStore = Arc<dyn MemoryStore + Send + Sync>;
 /// [`Agent::route_reply`]:stä.
 pub type ReplySink = tokio::sync::mpsc::UnboundedSender<OutboundMessage>;
 
+/// Kevyt havainnoitavuus-tapahtuma jonka agentti emittoi vuoron edetessä.
+///
+/// Tarkoituksella **pieni, geneerinen enum** — EI `MetricsRegistry`-kahvaa
+/// agentille (Kerros A -irrotus säilyy: agentti ei tunne mittaripinoa, kuten
+/// se ei tunne kanavia [`ReplySink`]:n takana). Runtime sillattaa nämä
+/// tapahtumat havainnoitavuus-väylälle ([`crate::MetricEventSink`]). Variantit
+/// ovat geneerisiä eivätkä koskaan kanna käyttäjä- tai Kerros B -dataa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricEvent {
+    /// Yksi tuore (ei-replay) vuoro käsiteltiin loppuun.
+    TurnCompleted,
+    /// Yksi työkalukutsu lähetettiin tool-loopissa (tuore, ei-replay).
+    ToolDispatched,
+}
+
+/// Havainnoitavuus-sinkki: minne agentti työntää [`MetricEvent`]:t. Kuten
+/// [`ReplySink`], tämä on ei-lukkiutuva [`tokio::sync::mpsc::UnboundedSender`],
+/// joten sitä voi kutsua synkronisesta polusta. `None` = ei mittarointia
+/// (oletus, taaksepäin-yhteensopiva).
+pub type MetricEventSink = tokio::sync::mpsc::UnboundedSender<MetricEvent>;
+
 /// Rakentaa reply-kanavaparin: [`ReplySink`] agentille + vastaanottopää
 /// gatewaylle (C1 Malli A — gateway omistaa recv-pään ja kutsuu `Channel::send`).
 #[must_use]
@@ -333,6 +354,10 @@ pub struct Agent {
     /// Reply-kanava (C1 Malli A): minne LLM-vastaus työnnetään ulos. `None` =
     /// pudota vastaukset (nykyinen, taaksepäin-yhteensopiva käytös).
     reply_sink: Option<ReplySink>,
+    /// Havainnoitavuus-sinkki (Phase 2): minne agentti työntää [`MetricEvent`]:t
+    /// (vuoro valmis, työkalukutsu). `None` = ei mittarointia (oletus,
+    /// taaksepäin-yhteensopiva). Runtime sillattaa tämän mittaripinoon.
+    metrics_sink: Option<MetricEventSink>,
     /// Reply-kohde: kanavakohtainen vastausosoite (keskustelu/kanava-id), johon
     /// [`Agent::route_reply`] lähettää. `None` = ei tunnettua kohdetta
     /// (vastaukset pudotetaan vaikka sink olisi asennettu).
@@ -470,6 +495,7 @@ impl Agent {
             llm,
             sandbox,
             reply_sink: None,
+            metrics_sink: None,
             reply_target: None,
             session: None,
             governor: None,
@@ -488,6 +514,16 @@ impl Agent {
     #[must_use]
     pub fn with_reply_sink(mut self, sink: ReplySink) -> Self {
         self.reply_sink = Some(sink);
+        self
+    }
+
+    /// Asenna havainnoitavuus-sinkki (Phase 2). `None` (oletus) = ei
+    /// mittarointia. Runtime sillattaa nämä [`MetricEvent`]:t jaettuun
+    /// `MetricsRegistry`:hin. Palauttaa `self` ketjutusta varten
+    /// ([`Agent::new`]-signatuuri pysyy muuttumattomana).
+    #[must_use]
+    pub fn with_metrics_sink(mut self, sink: MetricEventSink) -> Self {
+        self.metrics_sink = Some(sink);
         self
     }
 
@@ -792,6 +828,15 @@ impl Agent {
         at: Timestamp,
         detail: impl Into<String>,
     ) {
+        // Phase 2: jokainen TUORE (ei-replay) työkalukutsu nostaa tool-mittaria.
+        // Sidottu tähän yhteen audit-kirjauspisteeseen, joka jo kutsutaan
+        // JOKAISESSA dispatch-kohdassa (molemmat tool-loopit) → kattaa kaikki
+        // ilman emit-kutsun toistoa per kohta. Replay-vartiointi tässä: replay
+        // ei saa kaksoislaskea (audit-kirjaus sen sijaan tehdään myös replayssa,
+        // joten emit on erikseen vartioitu).
+        if matches!(kind, AuditKind::ToolDispatched) && !self.durable.is_replaying() {
+            self.emit_metric(MetricEvent::ToolDispatched);
+        }
         let Some(audit) = self.turn_audit.as_ref() else {
             return;
         };
@@ -800,6 +845,18 @@ impl Agent {
         // vain puhdistetun merkkijonon).
         let (safe_detail, _) = familyclaw_actions::redact_free_text(&detail.into());
         audit.record(ExecAuditEvent::new(kind, turn_id, at, safe_detail));
+    }
+
+    /// Työntää [`MetricEvent`]:n havainnoitavuus-sinkkiin jos asennettu.
+    ///
+    /// **Kutsu VAIN tuoreessa vuorossa** (`!self.durable.is_replaying()`) —
+    /// replay ei saa kaksoislaskea mittareita. No-op kun sinkkiä ei ole tai
+    /// vastaanottaja on sulkeutunut (send-virhe sivuutetaan: havainnoitavuus on
+    /// lisätieto, ei kriittinen polku).
+    fn emit_metric(&self, event: MetricEvent) {
+        if let Some(sink) = self.metrics_sink.as_ref() {
+            let _ = sink.send(event);
+        }
     }
 
     /// Onko agentille asennettu toimintoajoympäristö (tool-loop aktiivinen)?
@@ -1241,12 +1298,23 @@ impl Agent {
         agent_name: &str,
         being_id: &str,
         turn_audit: Option<&Arc<AuditCollector>>,
+        metrics_sink: Option<&MetricEventSink>,
         mut messages: Vec<LlmMessage>,
         mut last_text: String,
         budget: u32,
         now: Timestamp,
         turn_id: ActionId,
     ) -> Result<ToolLoopOutcome> {
+        // Phase 2: emittoi tool-call-mittarin jos sinkki on asennettu. Kutsutaan
+        // jokaisessa dispatch-kohdassa `!replaying`-vartioituna (replay ei saa
+        // kaksoislaskea). Geneerinen, ei kanna käyttäjä-/Kerros B -dataa.
+        let emit_tool = |replaying: bool| {
+            if !replaying {
+                if let Some(sink) = metrics_sink {
+                    let _ = sink.send(MetricEvent::ToolDispatched);
+                }
+            }
+        };
         // `-dispatch-{k}` ja `-llm-{k}` -juoksevat numerot: jatkavat replayn
         // jälkeen oikeasta kohdasta. Jaettu KAIKKIEN kierrosten yli (ei
         // nollaudu per kierros), jotta jokainen askel saa uniikin,
@@ -1308,6 +1376,7 @@ impl Agent {
 
             for call in tool_calls {
                 let Some(skill_id) = actions.lock().await.map_name_to_skill(&call.name) else {
+                    emit_tool(durable.is_replaying());
                     record_turn_audit_into(
                         turn_audit,
                         turn_id,
@@ -1408,6 +1477,7 @@ impl Agent {
                             error = %e,
                             "tool loop (durable): submit_task failed — feeding error result, continuing"
                         );
+                        emit_tool(replaying);
                         record_turn_audit_into(
                             turn_audit,
                             turn_id,
@@ -1432,6 +1502,7 @@ impl Agent {
                             format!("tool '{}' awaiting human approval", call.name)
                         })
                     };
+                    emit_tool(replaying);
                     record_turn_audit_into(
                         turn_audit,
                         turn_id,
@@ -1462,6 +1533,7 @@ impl Agent {
                     let rt = actions.lock().await;
                     tool_result_text_for(&rt, record.task_id, record.status)
                 };
+                emit_tool(replaying);
                 record_turn_audit_into(
                     turn_audit,
                     turn_id,
@@ -1526,6 +1598,8 @@ impl Agent {
         let agent_name = self.config.name.clone();
         let being_id = self.being_id;
         let turn_audit = self.turn_audit.clone();
+        // Klooni mittarisinkki ennen `&mut self.durable`-lainaa (disjoint-borrow).
+        let metrics_sink = self.metrics_sink.clone();
 
         let (system_prompt, query) = self.build_think_context(message).await;
         // Lyhytmuisti: tämän keskustelun aiemmat vuorot mukaan (korjaa "vastaa
@@ -1565,6 +1639,7 @@ impl Agent {
             &agent_name,
             &being_id.to_string(),
             turn_audit.as_ref(),
+            metrics_sink.as_ref(),
             messages,
             String::new(),
             max_iterations,
@@ -2679,6 +2754,8 @@ impl Agent {
                 let user_text = bus_message_text(message);
                 let conv_key = self.conversation_key(origin);
                 self.append_history(&conv_key, &user_text, reply);
+                // Phase 2: tuore vuoro tuotti vastauksen → mittariin (turn-laskuri).
+                self.emit_metric(MetricEvent::TurnCompleted);
             }
         }
 
@@ -4515,6 +4592,69 @@ mod tests {
             out,
             ThinkOutcome::Reply("työkalu vastasi, valmis".to_string())
         );
+        bus.stop();
+    }
+
+    // ── Phase 2: havainnoitavuus-mittarisinkki ──────────────────────────────
+
+    /// Tool-loopin työkalukutsu emittoi [`MetricEvent::ToolDispatched`] sinkkiin.
+    #[tokio::test]
+    async fn tool_dispatch_emits_metric_event() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let api = spawn_scripted_llm(vec![
+            body_tool_call("call_1", "loop_echo", &serde_json::json!({ "q": "ping" })),
+            body_text("valmis"),
+        ])
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MetricEvent>();
+        let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+            .with_actions(echo_runtime())
+            .with_metrics_sink(tx);
+
+        let _ = agent
+            .think(&BusMessage::text("aja työkalu"))
+            .await
+            .expect("loop ok");
+        // Yksi työkalukutsu lähetettiin → tasan yksi ToolDispatched.
+        let ev = rx.try_recv().expect("metric event emitted");
+        assert_eq!(ev, MetricEvent::ToolDispatched);
+        assert!(rx.try_recv().is_err(), "vain yksi dispatch tässä vuorossa");
+        bus.stop();
+    }
+
+    /// `think()` ilman työkaluja EI emittoi tool-mittaria (vain tekstivuoro).
+    #[tokio::test]
+    async fn text_only_turn_emits_no_tool_metric() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let api = spawn_scripted_llm(vec![body_text("pelkkä teksti")]).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MetricEvent>();
+        let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+            .with_actions(echo_runtime())
+            .with_metrics_sink(tx);
+
+        let _ = agent.think(&BusMessage::text("hei")).await.expect("ok");
+        assert!(
+            rx.try_recv().is_err(),
+            "ei työkalukutsua → ei tool-mittaria"
+        );
+        bus.stop();
+    }
+
+    /// Onnistunut vuoro [`Agent::handle_turn`]:n kautta emittoi
+    /// [`MetricEvent::TurnCompleted`] (tuore vuoro, ei replay).
+    #[tokio::test]
+    async fn completed_turn_emits_turn_metric() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let api = spawn_scripted_llm(vec![body_text("vastaus")]).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MetricEvent>();
+        let mut agent = agent_with_scripted_llm("agent_a", bus.clone(), &api).with_metrics_sink(tx);
+
+        let _ = agent
+            .handle_turn(BeingId::new(), &BusMessage::text("kysymys"))
+            .await
+            .expect("turn ok");
+        let ev = rx.try_recv().expect("turn metric emitted");
+        assert_eq!(ev, MetricEvent::TurnCompleted);
         bus.stop();
     }
 

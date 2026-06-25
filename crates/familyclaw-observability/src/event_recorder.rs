@@ -28,6 +28,7 @@
 //! | `Custom("llm.fallback")` | `llm_fallbacks` (+1) |
 //! | `Custom("durable.replay")` | `durable_replays` (+1) |
 //! | `Custom("workflow.step_completed" \| "orchestration.workflow_step_completed")` | `workflow_steps_completed` (+1) |
+//! | `Custom("tool.call" \| "orchestration.tool_call")` | `tool_calls` (+1) |
 //!
 //! `TaskStatusChanged` ja `AgentHeartbeat` eivät kartoitu omaan mittariin.
 //!
@@ -63,7 +64,7 @@ use familyclaw_bridge::{EventKind, EventSubscriber, FamilyBridge};
 use crate::metrics::{
     MetricsRegistry, COUNTER_AGENT_TURNS, COUNTER_CONTRACT_BREACHED, COUNTER_CONTRACT_FULFILLED,
     COUNTER_CONTRACT_PROPOSED, COUNTER_DURABLE_REPLAYS, COUNTER_LLM_CALLS, COUNTER_LLM_FALLBACKS,
-    COUNTER_TASKS_COMPLETED, COUNTER_TASKS_CREATED, COUNTER_TASK_HANDOFFS,
+    COUNTER_TASKS_COMPLETED, COUNTER_TASKS_CREATED, COUNTER_TASK_HANDOFFS, COUNTER_TOOL_CALLS,
     COUNTER_WORKFLOW_STEPS_COMPLETED, GAUGE_AGENTS_ONLINE,
 };
 
@@ -190,6 +191,9 @@ impl EventRecorder {
             "workflow.step_completed" | "orchestration.workflow_step_completed" => {
                 self.metrics.counter(COUNTER_WORKFLOW_STEPS_COMPLETED).inc();
             }
+            "tool.call" | "orchestration.tool_call" => {
+                self.metrics.counter(COUNTER_TOOL_CALLS).inc();
+            }
             // Tuntematon Custom-etiketti → ohita (eteenpäin-yhteensopivuus).
             _ => {}
         }
@@ -280,11 +284,12 @@ mod tests {
             "agent.turn",
             "workflow.step_completed",
             "task.completed",
+            "tool.call",
         ] {
             bus.publish(Event::new(EventKind::Custom(label.into()), None));
         }
         let n = recorder.drain_once().await;
-        assert_eq!(n, 9);
+        assert_eq!(n, 10);
         assert_eq!(metrics.counter(COUNTER_CONTRACT_PROPOSED).get(), 1);
         assert_eq!(metrics.counter(COUNTER_CONTRACT_FULFILLED).get(), 1);
         assert_eq!(metrics.counter(COUNTER_CONTRACT_BREACHED).get(), 1);
@@ -294,6 +299,7 @@ mod tests {
         assert_eq!(metrics.counter(COUNTER_AGENT_TURNS).get(), 1);
         assert_eq!(metrics.counter(COUNTER_WORKFLOW_STEPS_COMPLETED).get(), 1);
         assert_eq!(metrics.counter(COUNTER_TASKS_COMPLETED).get(), 1);
+        assert_eq!(metrics.counter(COUNTER_TOOL_CALLS).get(), 1);
     }
 
     #[tokio::test]

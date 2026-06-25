@@ -434,11 +434,14 @@ pub const COUNTER_DURABLE_REPLAYS: &str = "durable_replays";
 /// Esinimetty laskuri: valmistuneet workflow-askeleet.
 pub const COUNTER_WORKFLOW_STEPS_COMPLETED: &str = "workflow_steps_completed";
 
+/// Esinimetty laskuri: agentin tool-loopissa lähetetyt työkalukutsut.
+pub const COUNTER_TOOL_CALLS: &str = "tool_calls";
+
 /// Esinimetty gauge: online olevien agenttien määrä.
 pub const GAUGE_AGENTS_ONLINE: &str = "agents_online";
 
 /// Kaikki esinimetyt laskurit laivueen oletuksina.
-const FLEET_COUNTERS: [&str; 11] = [
+const FLEET_COUNTERS: [&str; 12] = [
     COUNTER_TASKS_CREATED,
     COUNTER_TASKS_COMPLETED,
     COUNTER_TASK_HANDOFFS,
@@ -450,6 +453,7 @@ const FLEET_COUNTERS: [&str; 11] = [
     COUNTER_LLM_FALLBACKS,
     COUNTER_DURABLE_REPLAYS,
     COUNTER_WORKFLOW_STEPS_COMPLETED,
+    COUNTER_TOOL_CALLS,
 ];
 
 /// Muotoilee `f64`:n vakaaksi (deterministiseksi) Prometheus-merkkijonoksi.
@@ -637,13 +641,16 @@ req_seconds_count 3
     #[test]
     fn fleet_defaults_prenames_all_series() {
         let reg = MetricsRegistry::with_fleet_defaults();
-        // 11 laskuria + 1 gauge.
-        assert_eq!(reg.len(), 12);
+        // 12 laskuria + 1 gauge.
+        assert_eq!(reg.len(), 13);
         let out = reg.prometheus_export();
         assert!(out.contains("# TYPE tasks_created counter"));
         assert!(out.contains("tasks_created 0"));
         assert!(out.contains("# TYPE agents_online gauge"));
         assert!(out.contains("agents_online 0"));
+        // Tool-call-laskuri esinimetty → näkyy 0:na ennen ensimmäistä kutsua.
+        assert!(out.contains("# TYPE tool_calls counter"));
+        assert!(out.contains("tool_calls 0"));
     }
 
     #[test]
