@@ -73,6 +73,34 @@ impl Scheduler {
         }
     }
 
+    /// Kytkee tehtävän päälle/pois (perhe-agency kill-switch, Phase 4).
+    ///
+    /// Asettaa [`ScheduledTask::enabled`]-lipun annetulle tehtävälle. `false` =
+    /// ajastin ohittaa sen seuraavissa tikeissä; `true` = ottaa taas käyttöön.
+    /// Palauttaa `true` jos tehtävä löytyi ja tila asetettiin, `false` jos
+    /// tunnistetta ei ole rekisteröity. EI nollaa `last_fired`-tilaa (käyttöön
+    /// otto jatkaa normaalia intervallia, ei laukaise heti ellei jo erääntynyt).
+    pub fn set_task_enabled(&mut self, id: ScheduledTaskId, enabled: bool) -> bool {
+        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+            task.enabled = enabled;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Tehtävän nykyinen enabled-tila (introspektio), tai `None` jos tuntematon.
+    #[must_use]
+    pub fn task_enabled(&self, id: ScheduledTaskId) -> Option<bool> {
+        self.tasks.iter().find(|t| t.id == id).map(|t| t.enabled)
+    }
+
+    /// Rekisteröityjen tehtävien tunnisteet (introspektio operaattoripinnalle).
+    #[must_use]
+    pub fn task_ids(&self) -> Vec<ScheduledTaskId> {
+        self.tasks.iter().map(|t| t.id).collect()
+    }
+
     /// Rekisteröityjen tehtävien lukumäärä.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -207,6 +235,37 @@ mod tests {
         // Tikki 3 seuraavassa ikkunassa: erääntynyt taas.
         let s3 = sched.tick(&mut rt, at(60)).await.expect("tick 3");
         assert_eq!(s3.fired_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_task_enabled_toggles_and_reports() {
+        let mut sched = Scheduler::new();
+        let id = ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(20));
+        let task = ScheduledTask::with_id(
+            id,
+            FsReadAllowlisted::skill_id(),
+            json!({}),
+            Duration::seconds(60),
+            "being",
+        );
+        sched.register(task);
+
+        // Oletus enabled.
+        assert_eq!(sched.task_enabled(id), Some(true));
+        assert_eq!(sched.task_ids(), vec![id]);
+
+        // Kill-switch off.
+        assert!(sched.set_task_enabled(id, false), "tunnettu id → true");
+        assert_eq!(sched.task_enabled(id), Some(false));
+
+        // Takaisin päälle.
+        assert!(sched.set_task_enabled(id, true));
+        assert_eq!(sched.task_enabled(id), Some(true));
+
+        // Tuntematon id → false, ei paniikkia.
+        let unknown = ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(999));
+        assert!(!sched.set_task_enabled(unknown, false));
+        assert_eq!(sched.task_enabled(unknown), None);
     }
 
     #[tokio::test]

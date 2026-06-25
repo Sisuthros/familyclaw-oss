@@ -49,5 +49,5 @@ pub mod task;
 
 pub use decision::{firing_key, DueDecision};
 pub use dispatch::{DispatchSummary, Scheduler};
-pub use runner::{run_until_cancelled, SchedulerRunner};
+pub use runner::{run_until_cancelled, SchedulerHandle, SchedulerRunner};
 pub use task::{ScheduledTask, ScheduledTaskId};

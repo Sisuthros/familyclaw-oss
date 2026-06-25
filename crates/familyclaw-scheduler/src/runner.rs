@@ -14,13 +14,22 @@
 //! silmukka näkee sen → pysähtyy. Näin sekä eksplisiittinen sammutussignaali
 //! että kahvan pudottaminen lopettavat ajastimen.
 
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use familyclaw_actions::ActionRuntime;
 use familyclaw_core::time::Timestamp;
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 
 use crate::dispatch::Scheduler;
+
+/// Jaettu kahva ajastimeen ajon aikana (perhe-agency operaattoripinnalle).
+///
+/// [`SchedulerRunner::run_shared`] palauttaa tämän, jotta tikkisilmukan rinnalla
+/// esim. gateway voi kytkeä tehtäviä päälle/pois
+/// ([`Scheduler::set_task_enabled`]). Lukko otetaan **lyhyesti** sekä tikissä
+/// (per erääntymisarvio) että operaattorimutaatiossa — ei pitkiä pitoja.
+pub type SchedulerHandle = Arc<Mutex<Scheduler>>;
 
 /// Peruutussignaali ajastinsilmukalle (kill switch).
 ///
@@ -156,6 +165,53 @@ impl SchedulerRunner {
         });
 
         signal
+    }
+
+    /// Kuten [`run`](Self::run), mutta palauttaa myös **jaetun kahvan** ajastimeen
+    /// ([`SchedulerHandle`]) operaattoripinnalle (perhe-agency, Phase 4).
+    ///
+    /// Ajastin laitetaan `Arc<Mutex<Scheduler>>`:n taakse; tikkisilmukka lukitsee
+    /// sen **lyhyesti** per tikki (`tick`-kutsun ajaksi), ja palautettu kahva
+    /// sallii esim. gatewayn kytkeä tehtäviä päälle/pois
+    /// ([`Scheduler::set_task_enabled`]) saman lukon kautta. Kilpailu ratkeaa
+    /// lukolla — ei jaetun tilan kopiointia.
+    ///
+    /// Vaatii Tokio-ajoympäristön ([`tokio::spawn`]).
+    pub fn run_shared<F>(self, now_fn: F) -> (CancellationSignal, SchedulerHandle)
+    where
+        F: Fn() -> Timestamp + Send + 'static,
+    {
+        let (signal, token) = cancellation_pair();
+        let handle: SchedulerHandle = Arc::new(Mutex::new(self.scheduler));
+        let loop_handle = Arc::clone(&handle);
+        let mut runtime = self.runtime;
+        let period = self.period;
+        let mut token_loop = token;
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = token_loop.cancelled() => {
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        if token_loop.is_cancelled() {
+                            break;
+                        }
+                        let now = now_fn();
+                        // Lukko vain tikin ajaksi → operaattorimutaatio mahtuu väliin.
+                        let mut sched = loop_handle.lock().await;
+                        if let Err(error) = sched.tick(&mut runtime, now).await {
+                            tracing::warn!(%error, "ajastimen tikki epäonnistui — jatketaan");
+                        }
+                    }
+                }
+            }
+        });
+
+        (signal, handle)
     }
 }
 

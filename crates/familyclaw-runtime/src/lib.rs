@@ -49,7 +49,7 @@ use familyclaw_durable::{DurableContext, FileJournal, InMemoryJournal, Journal};
 use familyclaw_embeddings::DeterministicEmbedder;
 use familyclaw_memory::{EmbeddingMemoryStore, LocalJsonStore};
 use familyclaw_scheduler::runner::CancellationSignal;
-use familyclaw_scheduler::{ScheduledTask, Scheduler, SchedulerRunner};
+use familyclaw_scheduler::{ScheduledTask, Scheduler, SchedulerHandle, SchedulerRunner};
 use ractor::ActorRef;
 use tokio::sync::Mutex;
 
@@ -121,6 +121,11 @@ pub struct FamilyRuntime {
     /// (`FAMILYCLAW_DREAM_DISABLED`). Sammutus peruuttaa sen → tikkisilmukka
     /// pysähtyy siististi.
     scheduler_signal: Option<CancellationSignal>,
+    /// Jaettu kahva ajastimeen (perhe-agency, Phase 4). `Some` kun ajastin on
+    /// käynnissä → operaattoripinta (gateway) voi kytkeä ajastettuja tehtäviä
+    /// päälle/pois ([`Scheduler::set_task_enabled`]) saman lukon kautta jota
+    /// tikkisilmukka käyttää. `None` kun ajastin on pois käytöstä.
+    scheduler_handle: Option<SchedulerHandle>,
 }
 
 impl FamilyRuntime {
@@ -175,6 +180,17 @@ impl FamilyRuntime {
     #[must_use]
     pub fn turn_audit(&self) -> Arc<AuditCollector> {
         Arc::clone(&self.turn_audit)
+    }
+
+    /// **Jaettu ajastinkahva** operaattoripinnalle (perhe-agency, Phase 4).
+    ///
+    /// Palauttaa `Some(handle)` kun ajastin on käynnissä → gateway voi kytkeä
+    /// ajastettuja tehtäviä päälle/pois ([`Scheduler::set_task_enabled`]) saman
+    /// lukon kautta jota tikkisilmukka käyttää (kilpailu ratkeaa lukolla).
+    /// `None` kun ajastin on pois käytöstä (`FAMILYCLAW_DREAM_DISABLED`).
+    #[must_use]
+    pub fn scheduler_handle(&self) -> Option<SchedulerHandle> {
+        self.scheduler_handle.clone()
     }
 
     /// Sammuttaa kokoonpanon siististi: **ei pudota in-flight-vastauksia.**
@@ -613,13 +629,16 @@ pub async fn build_family(
     //     `ActionRuntime`:n johon vain `DreamSkill` rekisteröidään — se ei jaa
     //     agentin tool-runtimea. Spawnataan vain jos journal on olemassa EIKÄ
     //     `FAMILYCLAW_DREAM_DISABLED` ole asetettu (taaksepäin-yhteensopiva).
-    let scheduler_signal: Option<CancellationSignal> = if let Some(dream_journal) = dream_journal {
+    let (scheduler_signal, scheduler_handle): (
+        Option<CancellationSignal>,
+        Option<SchedulerHandle>,
+    ) = if let Some(dream_journal) = dream_journal {
         let dream_disabled = env::var("FAMILYCLAW_DREAM_DISABLED")
             .ok()
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         if dream_disabled {
             tracing::info!(target: "familyclaw::dream", "scheduled dream task disabled (FAMILYCLAW_DREAM_DISABLED)");
-            None
+            (None, None)
         } else {
             let interval_secs: i64 = env::var("FAMILYCLAW_DREAM_INTERVAL_SECS")
                 .ok()
@@ -631,7 +650,7 @@ pub async fn build_family(
             let dream_skill = DreamSkill::new(Arc::clone(&dream_store), Arc::clone(&dream_journal));
             if let Err(e) = sched_runtime.register_skill(dream_skill) {
                 tracing::warn!(target: "familyclaw::dream", error = %e, "failed to register dream skill — scheduled dream disabled");
-                None
+                (None, None)
             } else {
                 let mut scheduler = Scheduler::new();
                 // Vakaa tehtävä-id (with_id) → idempotenssiavain pysyy
@@ -650,11 +669,14 @@ pub async fn build_family(
                 let period = std::time::Duration::from_secs(tick_secs as u64);
                 let runner = SchedulerRunner::new(scheduler, sched_runtime, period);
                 tracing::info!(target: "familyclaw::dream", interval_secs, "scheduled dream task active");
-                Some(runner.run(time::now))
+                // run_shared: jaettu kahva ajastimeen → operaattoripinta voi
+                // kytkeä tehtäviä päälle/pois (perhe-agency kill-switch).
+                let (signal, handle) = runner.run_shared(time::now);
+                (Some(signal), Some(handle))
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     // 12. Kokoa runtime — omistaa busin, agentin ja taustatehtävät. `drain`
@@ -671,6 +693,7 @@ pub async fn build_family(
         drain,
         tasks,
         scheduler_signal,
+        scheduler_handle,
     })
 }
 
