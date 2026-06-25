@@ -35,6 +35,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread", "macros"] }
 async-trait = { workspace = true }
+reqwest = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]

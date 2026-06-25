@@ -52,7 +52,7 @@ use crate::policy::{ActionRisk, SkillPermission};
 use crate::proof::ProofBundle;
 use crate::skills::{
     DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, FsReadAllowlisted,
-    GithubIssueDraftMock, Pipeline, Skill,
+    GithubIssueDraftMock, Pipeline, Skill, WebFetchSkill,
 };
 use crate::task::{ActionTask, DurableTaskQueue, TaskQueue, TaskStatus};
 
@@ -555,6 +555,8 @@ impl ActionRuntime {
         self.register_skill(DiscordThreadSummaryMock::new())?;
         self.register_skill(FilePatchMock::new())?;
         self.register_skill(FsReadAllowlisted::new())?;
+        // 2026-06-25: aito tutkimustaito (read-only web-fetch, SSRF-vartioitu).
+        self.register_skill(WebFetchSkill::new())?;
         Ok(())
     }
 
@@ -1230,7 +1232,7 @@ mod tests {
     fn default_skills_are_listed_without_secrets() {
         let runtime = ActionRuntime::with_default_skills().expect("default skills");
         let skills = runtime.list_skills();
-        assert_eq!(skills.len(), 5, "all five default skills registered");
+        assert_eq!(skills.len(), 6, "all six default skills registered");
 
         // Nimet aakkostettu → deterministinen järjestys.
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
@@ -1323,7 +1325,7 @@ mod tests {
     fn tool_definitions_mirror_skills_sorted_without_secrets() {
         let runtime = ActionRuntime::with_default_skills().expect("default skills");
         let tools = runtime.tool_definitions();
-        assert_eq!(tools.len(), 5, "one descriptor per registered skill");
+        assert_eq!(tools.len(), 6, "one descriptor per registered skill");
 
         // Sama vakautettu nimijärjestys kuin list_skills.
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
