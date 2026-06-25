@@ -1513,6 +1513,7 @@ dependencies = [
  "familyclaw-core",
  "familyclaw-dream",
  "familyclaw-durable",
+ "familyclaw-embeddings",
  "familyclaw-emotion",
  "familyclaw-hearth",
  "familyclaw-memory",

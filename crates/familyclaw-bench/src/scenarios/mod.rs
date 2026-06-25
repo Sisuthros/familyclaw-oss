@@ -21,6 +21,7 @@
 
 pub mod crash_matrix;
 pub mod dream_quality;
+pub mod embedding_recall;
 pub mod emotional_contagion;
 pub mod eternal_thread;
 pub mod provenance_gate;
@@ -30,6 +31,7 @@ pub mod weekly_review;
 
 pub use crash_matrix::CrashMatrix;
 pub use dream_quality::DreamQuality;
+pub use embedding_recall::EmbeddingRecall;
 pub use emotional_contagion::EmotionalContagion;
 pub use eternal_thread::EternalThread;
 pub use provenance_gate::ProvenanceGateScenario;
