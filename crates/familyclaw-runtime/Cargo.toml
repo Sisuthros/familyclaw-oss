@@ -24,6 +24,7 @@ familyclaw-agent = { workspace = true }
 # Arc<Mutex<ActionRuntime>>-kahvan suspend/resume-siltaa varten.
 familyclaw-actions = { workspace = true }
 familyclaw-channels = { workspace = true }
+familyclaw-embeddings = { workspace = true }
 familyclaw-memory = { workspace = true }
 familyclaw-durable = { workspace = true }
 familyclaw-dream = { workspace = true }

@@ -44,7 +44,8 @@ use familyclaw_channels::Channel;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
 use familyclaw_dream::DreamCycle;
 use familyclaw_durable::{DurableContext, FileJournal, InMemoryJournal, Journal};
-use familyclaw_memory::LocalJsonStore;
+use familyclaw_embeddings::DeterministicEmbedder;
+use familyclaw_memory::{EmbeddingMemoryStore, LocalJsonStore};
 use ractor::ActorRef;
 use tokio::sync::Mutex;
 
@@ -342,6 +343,12 @@ pub async fn build_family(
             let mem = LocalJsonStore::open(dir.join("memory.json"))
                 .await
                 .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+            // Phase 3: kääräise muisti auto-upotuksella. Oletustarjoaja on
+            // riippuvuudeton ja deterministinen (köyhyys-yhteensopiva);
+            // `semantic_weight` on oletuksena 0.0, joten upotukset tuotetaan
+            // mutta vektorihaku aktivoituu vasta kun kutsuja nostaa painon →
+            // täysin taaksepäin-yhteensopiva.
+            let mem = EmbeddingMemoryStore::new(mem, Arc::new(DeterministicEmbedder::new()));
             let dur = DurableContext::new(Arc::clone(&dream_j))
                 .map_err(|e| FamilyClawError::bus(e.to_string()))?;
             // Kaatumiskestävä jatkettavien vuorojen pinta `<data_dir>/resumable.jsonl`.
@@ -357,7 +364,12 @@ pub async fn build_family(
                 Some(dir),
             )
         } else {
-            let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
+            // Phase 3: sama auto-upotuskääre myös muistinvaraisessa polussa.
+            let mem = EmbeddingMemoryStore::new(
+                LocalJsonStore::in_memory(),
+                Arc::new(DeterministicEmbedder::new()),
+            );
+            let memory: ErasedMemoryStore = Arc::new(mem);
             let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(InMemoryJournal::new());
             let durable = DurableContext::new(Arc::clone(&dream_j))
                 .map_err(|e| FamilyClawError::bus(e.to_string()))?;
