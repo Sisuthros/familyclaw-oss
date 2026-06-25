@@ -88,6 +88,16 @@ pub struct ScheduledTask {
     /// Tila on osa tehtävämäärittelyä, joten operaattoripinta voi kytkeä sen
     /// päälle/pois ja persistoida valinnan.
     pub enabled: bool,
+    /// **Perhe-agency-kontrolli (Phase 4): vanhene-jos-ei-ihmistä.**
+    ///
+    /// Jos asetettu, tehtävä **lakkaa laukeamasta** kun edellisestä
+    /// ihmisaktiivisuudesta on kulunut yli tämän verran aikaa
+    /// ([`crate::decision::decide`] palauttaa `due=false`). Tämä estää
+    /// proaktiivista agenttia jatkamasta autonomisesti tyhjään huoneeseen:
+    /// kun ihminen ei ole läsnä, ajastetut tehtävät hiljenevät itsestään ja
+    /// heräävät taas kun ihminen palaa (aktiivisuus päivittyy → ei enää
+    /// vanhentunut). `None` (oletus) = ei vanhene koskaan idleen.
+    pub expire_after_idle: Option<Duration>,
 }
 
 impl ScheduledTask {
@@ -110,6 +120,7 @@ impl ScheduledTask {
             interval,
             being_id: being_id.into(),
             enabled: true,
+            expire_after_idle: None,
         }
     }
 
@@ -132,6 +143,7 @@ impl ScheduledTask {
             interval,
             being_id: being_id.into(),
             enabled: true,
+            expire_after_idle: None,
         }
     }
 
@@ -142,6 +154,16 @@ impl ScheduledTask {
     #[must_use]
     pub const fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
+        self
+    }
+
+    /// Asettaa [`ScheduledTask::expire_after_idle`]:n (perhe-agency:
+    /// vanhene-jos-ei-ihmistä). Tehtävä lakkaa laukeamasta kun edellisestä
+    /// ihmisaktiivisuudesta on kulunut yli `idle`; herää kun ihminen palaa.
+    /// Palauttaa `self` ketjutusta varten.
+    #[must_use]
+    pub const fn with_expire_after_idle(mut self, idle: Duration) -> Self {
+        self.expire_after_idle = Some(idle);
         self
     }
 }

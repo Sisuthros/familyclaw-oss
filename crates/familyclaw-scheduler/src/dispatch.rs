@@ -51,6 +51,10 @@ impl DispatchSummary {
 pub struct Scheduler {
     tasks: Vec<ScheduledTask>,
     last_fired: HashMap<ScheduledTaskId, Timestamp>,
+    /// Viimeisin kirjattu ihmisaktiivisuus (perhe-agency: vanhene-jos-ei-
+    /// ihmistä, Phase 4). `None` = ihmistä ei ole vielä nähty. Päivitetään
+    /// [`Scheduler::note_human_activity`]:lla kun ihminen on aktiivinen.
+    last_human_activity: Option<Timestamp>,
 }
 
 impl Scheduler {
@@ -112,6 +116,25 @@ impl Scheduler {
         }
     }
 
+    /// Kirjaa ihmisaktiivisuuden (perhe-agency: vanhene-jos-ei-ihmistä, Phase 4).
+    ///
+    /// Kutsu kun ihminen on aktiivinen (esim. saapuva ihmisviesti). Päivittää
+    /// `last_human_activity`-ajan vain eteenpäin (ei taakse), jotta vanha
+    /// aikaleima ei nollaa tuoreempaa. `expire_after_idle`-tehtävät pysyvät
+    /// hereillä niin kauan kuin ihminen on ollut aktiivinen tämän ajan sisällä.
+    pub fn note_human_activity(&mut self, at: Timestamp) {
+        match self.last_human_activity {
+            Some(prev) if prev >= at => {}
+            _ => self.last_human_activity = Some(at),
+        }
+    }
+
+    /// Viimeisin kirjattu ihmisaktiivisuus (introspektio), tai `None`.
+    #[must_use]
+    pub fn last_human_activity(&self) -> Option<Timestamp> {
+        self.last_human_activity
+    }
+
     /// Rekisteröityjen tehtävien lukumäärä.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -134,7 +157,12 @@ impl Scheduler {
     /// (puhdas tarkastelu testaukseen ja introspektioon).
     #[must_use]
     pub fn due_now(&self, now: Timestamp) -> Vec<crate::decision::DueDecision> {
-        due_tasks(&self.tasks, |id| self.last_fired(id), now)
+        due_tasks(
+            &self.tasks,
+            |id| self.last_fired(id),
+            self.last_human_activity,
+            now,
+        )
     }
 
     /// Suorittaa yhden tikin: lähettää kaikki erääntyneet tehtävät
@@ -194,7 +222,7 @@ impl Scheduler {
         self.tasks
             .iter()
             .find(|t| t.id == id)
-            .map(|task| decide(task, self.last_fired(id), now))
+            .map(|task| decide(task, self.last_fired(id), self.last_human_activity, now))
     }
 }
 
@@ -277,6 +305,37 @@ mod tests {
         let unknown = ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(999));
         assert!(!sched.set_task_enabled(unknown, false));
         assert_eq!(sched.task_enabled(unknown), None);
+    }
+
+    #[tokio::test]
+    async fn idle_task_sleeps_until_human_activity() {
+        // Perhe-agency (Phase 4) end-to-end: idle-katollinen tehtävä ei laukea
+        // tyhjään huoneeseen, mutta herää kun ihminen on aktiivinen.
+        let mut rt = runtime_with_fs_read();
+        let mut sched = Scheduler::new();
+        let task = ScheduledTask::with_id(
+            ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(40)),
+            FsReadAllowlisted::skill_id(),
+            json!({"path": "/nonexistent"}),
+            Duration::seconds(60),
+            "being",
+        )
+        .with_expire_after_idle(Duration::seconds(100));
+        sched.register(task);
+
+        // Ei ihmistä koskaan → idle-vanhentunut → ei laukea vaikka erääntynyt.
+        let s1 = sched.tick(&mut rt, at(0)).await.expect("tick idle");
+        assert_eq!(s1.fired_count(), 0, "ei laukea tyhjään huoneeseen");
+
+        // Ihminen aktiivinen → herää → laukeaa (sama ikkuna, sama erääntyminen).
+        sched.note_human_activity(at(10));
+        let s2 = sched.tick(&mut rt, at(10)).await.expect("tick after human");
+        assert_eq!(s2.fired_count(), 1, "herää kun ihminen on läsnä");
+
+        // Ihminen poissa kauan (200s idle > 100s katto) → hiljenee taas.
+        // (Seuraava ikkuna at(120) jotta erääntyminen olisi muuten ok.)
+        let s3 = sched.tick(&mut rt, at(220)).await.expect("tick idle again");
+        assert_eq!(s3.fired_count(), 0, "hiljenee taas kun ihminen poissa");
     }
 
     #[tokio::test]

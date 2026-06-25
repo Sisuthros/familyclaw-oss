@@ -91,10 +91,19 @@ pub fn is_due(interval: Duration, last_fired: Option<Timestamp>, now: Timestamp)
 /// erääntynyt, palautettu päätös sisältää sille johdetun deterministisen
 /// avaimen ([`firing_key`]).
 #[must_use]
-pub fn decide(task: &ScheduledTask, last_fired: Option<Timestamp>, now: Timestamp) -> DueDecision {
+pub fn decide(
+    task: &ScheduledTask,
+    last_fired: Option<Timestamp>,
+    last_human_activity: Option<Timestamp>,
+    now: Timestamp,
+) -> DueDecision {
     // Perhe-agency (Phase 4): pois käytöstä otettu tehtävä EI laukea koskaan —
-    // ihmisen kill-switch ohittaa erääntymisen kokonaan.
-    let due = task.enabled && is_due(task.interval, last_fired, now);
+    // ihmisen kill-switch ohittaa erääntymisen kokonaan. JA: vanhene-jos-ei-
+    // ihmistä — jos idle-katto on asetettu ja ihmisaktiivisuudesta on kulunut
+    // liikaa, tehtävä hiljenee (ei laukea), kunnes ihminen palaa.
+    let due = task.enabled
+        && !idle_expired(task.expire_after_idle, last_human_activity, now)
+        && is_due(task.interval, last_fired, now);
     let key = if due {
         Some(firing_key(task.id, task.interval, now))
     } else {
@@ -107,19 +116,51 @@ pub fn decide(task: &ScheduledTask, last_fired: Option<Timestamp>, now: Timestam
     }
 }
 
+/// Onko tehtävä **vanhentunut idleen** (perhe-agency: vanhene-jos-ei-ihmistä).
+///
+/// `expire_after_idle = None` → ei koskaan vanhene (palauttaa `false`). Muuten
+/// vanhentunut kun `now - last_human_activity > expire_after_idle`. Jos
+/// ihmisaktiivisuutta ei ole koskaan kirjattu (`None`), tehtävä on vanhentunut
+/// heti idle-katon ollessa asetettu — proaktiivinen tehtävä ei käynnisty tyhjään
+/// huoneeseen ennen kuin ihminen on edes kerran ollut läsnä.
+#[must_use]
+pub fn idle_expired(
+    expire_after_idle: Option<Duration>,
+    last_human_activity: Option<Timestamp>,
+    now: Timestamp,
+) -> bool {
+    let Some(idle) = expire_after_idle else {
+        return false; // ei idle-kattoa → ei koskaan vanhene
+    };
+    if idle <= Duration::zero() {
+        return false; // ei-positiivinen katto → ei vanhene (turvallinen degeneraatio)
+    }
+    match last_human_activity {
+        None => true, // ei koskaan ihmistä + idle-katto asetettu → vanhentunut
+        Some(last) => now > last + idle,
+    }
+}
+
 /// Laskee erääntyneet tehtävät listalle kerralla.
 ///
 /// `last_fired` on hakulausekefunktio joka palauttaa tehtävän viimeisen
-/// laukaisuajan (tai `None` jos ei koskaan laukennut). Palauttaa vain
-/// erääntyneiden tehtävien päätökset, syötteen järjestyksessä (deterministinen).
+/// laukaisuajan (tai `None` jos ei koskaan laukennut). `last_human_activity` on
+/// viimeisin kirjattu ihmisaktiivisuus (idle-vanhenemista varten; `None` =
+/// ihmistä ei ole vielä nähty). Palauttaa vain erääntyneiden tehtävien
+/// päätökset, syötteen järjestyksessä (deterministinen).
 #[must_use]
-pub fn due_tasks<F>(tasks: &[ScheduledTask], mut last_fired: F, now: Timestamp) -> Vec<DueDecision>
+pub fn due_tasks<F>(
+    tasks: &[ScheduledTask],
+    mut last_fired: F,
+    last_human_activity: Option<Timestamp>,
+    now: Timestamp,
+) -> Vec<DueDecision>
 where
     F: FnMut(ScheduledTaskId) -> Option<Timestamp>,
 {
     tasks
         .iter()
-        .map(|task| decide(task, last_fired(task.id), now))
+        .map(|task| decide(task, last_fired(task.id), last_human_activity, now))
         .filter(|decision| decision.due)
         .collect()
 }
@@ -172,7 +213,7 @@ mod tests {
     #[test]
     fn never_fired_is_due_immediately() {
         let task = task_with(Duration::seconds(60));
-        let decision = decide(&task, None, at(0));
+        let decision = decide(&task, None, None, at(0));
         assert!(decision.due);
         assert!(decision.key.is_some());
     }
@@ -183,14 +224,14 @@ mod tests {
         // joka muuten laukeaisi heti (ei koskaan laukennut) EI laukea kun
         // enabled=false.
         let task = task_with(Duration::seconds(60)).with_enabled(false);
-        let decision = decide(&task, None, at(0));
+        let decision = decide(&task, None, None, at(0));
         assert!(!decision.due, "disabloitu tehtävä ei laukea");
         assert!(decision.key.is_none(), "ei avainta kun ei laukea");
 
         // Uudelleen käyttöön → laukeaa taas.
         let reenabled = task.with_enabled(true);
         assert!(
-            decide(&reenabled, None, at(0)).due,
+            decide(&reenabled, None, None, at(0)).due,
             "käyttöön otto palauttaa"
         );
     }
@@ -198,7 +239,7 @@ mod tests {
     #[test]
     fn not_due_has_no_key() {
         let task = task_with(Duration::seconds(60));
-        let decision = decide(&task, Some(at(0)), at(30));
+        let decision = decide(&task, Some(at(0)), None, at(30));
         assert!(!decision.due);
         assert!(decision.key.is_none());
     }
@@ -265,9 +306,39 @@ mod tests {
                     None
                 }
             },
+            None,
             at(60),
         );
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].task_id, b.id);
+    }
+
+    // (Phase 4) vanhene-jos-ei-ihmistä: idle_expired + decide-integraatio.
+    #[test]
+    fn idle_expired_logic() {
+        let idle = Some(Duration::seconds(100));
+        // Ei idle-kattoa → ei koskaan vanhene.
+        assert!(!idle_expired(None, None, at(1_000_000)));
+        // Idle-katto + ei koskaan ihmistä → vanhentunut heti.
+        assert!(idle_expired(idle, None, at(0)));
+        // Ihminen aktiivinen äsken (50s sitten) → ei vanhentunut (50 < 100).
+        assert!(!idle_expired(idle, Some(at(0)), at(50)));
+        // Ihminen aktiivinen kauan sitten (150s) → vanhentunut (150 > 100).
+        assert!(idle_expired(idle, Some(at(0)), at(150)));
+        // Ei-positiivinen katto → ei vanhene (turvallinen degeneraatio).
+        assert!(!idle_expired(Some(Duration::zero()), None, at(1_000_000)));
+    }
+
+    #[test]
+    fn decide_respects_idle_expiry() {
+        // Tehtävä joka muuten laukeaisi heti, mutta idle-katto + ei ihmistä →
+        // ei laukea; ihmisaktiivisuuden myötä laukeaa taas.
+        let task = task_with(Duration::seconds(60)).with_expire_after_idle(Duration::seconds(100));
+        // Ei ihmistä → vanhentunut → ei laukea.
+        assert!(!decide(&task, None, None, at(0)).due);
+        // Ihminen aktiivinen nyt → laukeaa (ei vielä idleä).
+        assert!(decide(&task, None, Some(at(0)), at(0)).due);
+        // Ihminen 200s sitten → idle ylittyi → ei laukea.
+        assert!(!decide(&task, None, Some(at(0)), at(200)).due);
     }
 }
