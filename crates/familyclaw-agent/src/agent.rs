@@ -17,6 +17,7 @@
 //! eikä polkuja. Kaikki ladataan ajonaikaisesti konfiguraatiosta ja
 //! profiilihakemistosta. Esimerkit käyttävät geneerisiä nimiä.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use familyclaw_actions::{
@@ -104,6 +105,16 @@ const RESUMABLE_DEFAULT_TTL_MINUTES: i64 = 60;
 /// sisaarvaikutuksen jalkeen tunnetila on vajaa puolet maksimistaan
 /// (eksponentiaalinen vaimennus). Tama estaa feedback-loop-saturaation.
 const HOMEOSTASIS_RATE: f32 = 0.10;
+
+/// Montako PERÄKKÄISTÄ historiaviestiä (user+assistant) säilytetään per
+/// keskustelu LLM-kontekstia varten. 6 = ~3 vuoroparia: tarpeeksi jatkuvuuteen
+/// ("vastaa enemmän kuin kerran"), tarpeeksi vähän ettei kontekstia paisuteta.
+/// Vanhin pudotetaan kun katto ylittyy (liukuva ikkuna).
+const HISTORY_MAX_MESSAGES: usize = 6;
+
+/// Yhden historiaviestin merkkikatto. Pitkä viesti typistetään tähän ennen
+/// historiaan tallennusta — estää yhden jättiviestin syömästä koko ikkunaa.
+const HISTORY_MAX_CHARS_PER_MSG: usize = 1500;
 
 /// Tool-loopin (Phase 1 keystone) konfiguraatio.
 ///
@@ -297,6 +308,19 @@ pub struct Agent {
     bus: BusHandle,
     /// Kuinka monta vuoroa on käsitelty (durable-askelten nimien sekvensointiin).
     turn_counter: u64,
+    /// Per-keskustelu lyhytmuisti LLM-kontekstiin (liukuva ikkuna, enintään
+    /// [`HISTORY_MAX_MESSAGES`] viestiä per avain). Avain rakennetaan
+    /// [`Agent::conversation_key`]:llä viestin alkuperästä (`channel_id` +
+    /// `conversation`). Tämä korjaa "agentti vastaa vain kerran" -ongelman:
+    /// ilman tätä jokainen vuoro rakennettiin tyhjästä `[system, user]` ilman
+    /// aiempia vuoroja, joten agentti ei nähnyt keskustelun jatkumoa.
+    ///
+    /// **Replay-turvallisuus:** historiaan liitetään VAIN tuoreessa vuorossa
+    /// (`!self.durable.is_replaying()`), jottei deterministinen replay
+    /// kaksoiskirjaa viestejä. Historia on prosessin sisäinen (ei journaloitu):
+    /// kaatumisen jälkeen se rakentuu uudelleen tulevista vuoroista, mikä on
+    /// hyväksyttävää lyhytmuistille (pitkä muisti elää [`Agent::memory`]ssa).
+    history: HashMap<String, VecDeque<LlmMessage>>,
     /// LLM-failover-ketju ajatteluun (valinnainen, jotta testit toimivat ilman
     /// LLM:ää). [`Agent::new`] kääräisee yhden [`LlmConfig`]:n 1-pituiseksi
     /// ketjuksi ([`LlmFailover::single`]); koko fallback-ketju kytketään
@@ -442,6 +466,7 @@ impl Agent {
             durable,
             bus,
             turn_counter: 0,
+            history: HashMap::new(),
             llm,
             sandbox,
             reply_sink: None,
@@ -938,11 +963,16 @@ impl Agent {
         };
         let (system_prompt, query) = self.build_think_context(current_message).await;
 
+        // Lyhytmuisti: hae tämän keskustelun aiemmat vuorot, jotta malli näkee
+        // jatkumon (korjaa "vastaa vain kerran"). Tyhjä ensimmäisellä vuorolla.
+        let conv_key = self.conversation_key(origin);
+        let history = self.history_for(&conv_key);
+
         match self.actions.as_ref() {
             // Yhden kerran -polku (taaksepäin-yhteensopiva): yksi LLM-kutsu,
             // ei työkaluja. Sama käytös kuin ennen tool-loopia → teksti Reply:nä.
             None => {
-                let messages = vec![LlmMessage::system(system_prompt), LlmMessage::user(query)];
+                let messages = build_message_stack(system_prompt, &history, query);
                 let text = llm
                     .complete(&messages)
                     .await
@@ -961,8 +991,9 @@ impl Agent {
                 // stop_reason) merkitään. No-op kun auditia ei ole kytketty.
                 let turn_id = ActionId::new();
                 self.record_turn_audit(turn_id, AuditKind::TurnStarted, now, "turn started");
+                let messages = build_message_stack(system_prompt, &history, query);
                 match self
-                    .run_tool_loop(llm, actions, system_prompt, query, now, turn_id)
+                    .run_tool_loop(llm, actions, messages, now, turn_id)
                     .await?
                 {
                     ToolLoopOutcome::Answer(text) => {
@@ -1076,6 +1107,53 @@ impl Agent {
         }
     }
 
+    /// Rakentaa keskustelu-avaimen viestin alkuperästä lyhytmuistia varten.
+    ///
+    /// Avain = `"{channel_id}:{conversation}"` — sama muoto kuin F4 session-key,
+    /// mutta johdettu per-viesti annetusta [`familyclaw_bus::MessageOrigin`]:sta.
+    /// Jos originia ei ole (esim. sisäinen/testiviesti ilman kanavaa), käytetään
+    /// reply-kohdetta fallbackina, ja viime kädessä jaettua `"default"`-avainta.
+    /// Näin agentti, jolla ei vielä ole origin-tietoa, käyttää yhtä yhteistä
+    /// historiaa sen sijaan että menettäisi jatkuvuuden kokonaan.
+    fn conversation_key(&self, origin: Option<&familyclaw_bus::MessageOrigin>) -> String {
+        if let Some(o) = origin {
+            return format!("{}:{}", o.channel_id, o.conversation);
+        }
+        self.reply_target
+            .clone()
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// Palauttaa keskustelun lyhytmuistin viestit (vanhin→uusin) LLM-stackin
+    /// rakentamista varten. Tyhjä, jos keskustelusta ei vielä ole historiaa.
+    fn history_for(&self, conv_key: &str) -> Vec<LlmMessage> {
+        self.history
+            .get(conv_key)
+            .map(|dq| dq.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Liittää onnistuneen vuoron (käyttäjän viesti + agentin vastaus) keskustelun
+    /// lyhytmuistiin liukuvana ikkunana. Typistää kunkin viestin
+    /// [`HISTORY_MAX_CHARS_PER_MSG`]:hen ja pudottaa vanhimmat kun määrä ylittää
+    /// [`HISTORY_MAX_MESSAGES`]:n.
+    ///
+    /// **Kutsu VAIN tuoreessa vuorossa** (`!self.durable.is_replaying()`) —
+    /// muuten replay kaksoiskirjaisi. Tyhjiä viestejä ei tallenneta.
+    fn append_history(&mut self, conv_key: &str, user_text: &str, assistant_text: &str) {
+        let user_text = user_text.trim();
+        let assistant_text = assistant_text.trim();
+        if user_text.is_empty() || assistant_text.is_empty() {
+            return;
+        }
+        let dq = self.history.entry(conv_key.to_string()).or_default();
+        dq.push_back(LlmMessage::user(truncate_for_history(user_text)));
+        dq.push_back(LlmMessage::assistant(truncate_for_history(assistant_text)));
+        while dq.len() > HISTORY_MAX_MESSAGES {
+            dq.pop_front();
+        }
+    }
+
     /// Rakentaa [`think`](Agent::think):n jaetun kontekstin: RAG-recall +
     /// system prompt (sielun ydin + muistit) sekä viestin teksti (`query`).
     ///
@@ -1085,11 +1163,7 @@ impl Agent {
     /// recall vaatii session-tagin (vain tämän session muistot näkyvät).
     #[allow(clippy::format_push_string)]
     async fn build_think_context(&self, current_message: &BusMessage) -> (String, String) {
-        let query = match current_message {
-            BusMessage::Text { body } => body.clone(),
-            BusMessage::Latent { text_shadow, .. } => text_shadow.clone(),
-            other => format!("[{}]", other.kind_label()),
-        };
+        let query = bus_message_text(current_message);
 
         // ORIENT: hae relevantit muistot ENSIN (RAG — ennen LLM-kutsua).
         let mut recall_ctx = RetrievalContext::new(query.clone()).with_limit(5);
@@ -1454,6 +1528,11 @@ impl Agent {
         let turn_audit = self.turn_audit.clone();
 
         let (system_prompt, query) = self.build_think_context(message).await;
+        // Lyhytmuisti: tämän keskustelun aiemmat vuorot mukaan (korjaa "vastaa
+        // vain kerran" myös actions/tool-loop-polulla). Rakennetaan ennen
+        // `&mut self.durable`-lainaa, koska `history_for` lainaa `&self`:iä.
+        let conv_key = self.conversation_key(origin);
+        let history = self.history_for(&conv_key);
         let now = time::now();
         let turn_id = ActionId::new();
         // TURN-AUDIT-kirjaukset eivät kuulu replatuun vuoroon (jälki kirjattiin
@@ -1465,7 +1544,7 @@ impl Agent {
         };
         record_turn_audit_into(audit, turn_id, AuditKind::TurnStarted, now, "turn started");
 
-        let messages = vec![LlmMessage::system(system_prompt), LlmMessage::user(query)];
+        let messages = build_message_stack(system_prompt, &history, query);
         // LLM-kahva on `LlmFailover` (ei `Clone`); luetaan se `self`:stä
         // erikseen samaan aikaan kuin `&mut self.durable` — disjoint field
         // borrow toimii koska `llm` ja `durable` ovat eri kenttiä.
@@ -1637,12 +1716,10 @@ impl Agent {
         &self,
         llm: &LlmFailover,
         actions: &Arc<Mutex<ActionRuntime>>,
-        system_prompt: String,
-        query: String,
+        messages: Vec<LlmMessage>,
         now: Timestamp,
         turn_id: ActionId,
     ) -> Result<ToolLoopOutcome> {
-        let messages = vec![LlmMessage::system(system_prompt), LlmMessage::user(query)];
         // Aja silmukka tuoreesta viestipinosta täydellä kierrosbudjetilla.
         // `now` injektoidaan (D1): kelloa ei lueta silmukkalogiikan sisällä,
         // jotta tehtävien lähetys käyttää samaa, journaloitavaa aikaleimaa.
@@ -2591,6 +2668,20 @@ impl Agent {
             }
         };
 
+        // 5a½. Lyhytmuisti: liitä onnistunut vaihto (käyttäjä → agentti) tämän
+        //      keskustelun historiaan, jotta SEURAAVA vuoro näkee jatkumon.
+        //      Tämä on "vastaa enemmän kuin kerran" -korjaus. Vain tuoreessa
+        //      vuorossa (`!is_replaying()`) — replay ei saa kaksoiskirjata —
+        //      ja vain kun vuoro tuotti aidon tekstivastauksen (suspend/no-reply
+        //      ei kuulu keskusteluhistoriaan).
+        if !self.durable.is_replaying() {
+            if let Some(reply) = thought_response.as_ref() {
+                let user_text = bus_message_text(message);
+                let conv_key = self.conversation_key(origin);
+                self.append_history(&conv_key, &user_text, reply);
+            }
+        }
+
         // 5b. Reply-path (C1 Malli A, TEHTÄVÄ C2): jos `think()` tuotti tekstin
         //     JA reply-sink + reply-kohde on asennettu, työnnä vastaus ULOS
         //     kanavalle. Tämä on ERI polku kuin bus-julkaisu — gateway omistaa
@@ -2869,6 +2960,48 @@ fn vad_magnitude(vad: &familyclaw_emotion::Vad) -> f32 {
     // Etäisyys neutraalista dominanssista (0.5).
     let d = (vad.dominance - 0.5).abs() * 2.0;
     ((v + a + d) / 3.0).clamp(0.0, 1.0)
+}
+
+/// Poimii viestin tekstiedustuksen lyhytmuistia varten. Sama logiikka kuin
+/// [`Agent::build_think_context`]:n `query`-poiminta, jotta historiaan kirjattu
+/// käyttäjäteksti vastaa sitä mitä mallille lähetettiin.
+fn bus_message_text(message: &BusMessage) -> String {
+    match message {
+        BusMessage::Text { body } => body.clone(),
+        BusMessage::Latent { text_shadow, .. } => text_shadow.clone(),
+        other => format!("[{}]", other.kind_label()),
+    }
+}
+
+/// Rakentaa LLM-viestipinon: `[system, ...history (vanhin→uusin), current_user]`.
+///
+/// `history` on keskustelun aiemmat user/assistant-viestit liukuvasta ikkunasta
+/// (ks. [`Agent::history_for`]). Tämä on se korjaus joka antaa mallille
+/// keskustelun jatkumon — ilman sitä pino oli aina vain `[system, user]` ja
+/// agentti "vastasi vain kerran" (ei nähnyt edellistä vaihtoa).
+fn build_message_stack(
+    system_prompt: String,
+    history: &[LlmMessage],
+    query: String,
+) -> Vec<LlmMessage> {
+    let mut messages = Vec::with_capacity(history.len() + 2);
+    messages.push(LlmMessage::system(system_prompt));
+    messages.extend(history.iter().cloned());
+    messages.push(LlmMessage::user(query));
+    messages
+}
+
+/// Typistää tekstin [`HISTORY_MAX_CHARS_PER_MSG`]:hen UTF-8-rajaa kunnioittaen
+/// lyhytmuistiin tallennusta varten. Lyhyet tekstit palautuvat sellaisenaan.
+fn truncate_for_history(text: &str) -> String {
+    if text.len() <= HISTORY_MAX_CHARS_PER_MSG {
+        return text.to_string();
+    }
+    let mut end = HISTORY_MAX_CHARS_PER_MSG;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 /// Päättelee deterministisesti, kannattaako viesti muistaa.
@@ -6393,6 +6526,115 @@ mod tests {
             }
         }
         None
+    }
+
+    // ── Lyhytmuisti / multiturn ("vastaa enemmän kuin kerran") ──────────────
+
+    #[test]
+    fn build_message_stack_orders_system_history_then_user() {
+        let history = vec![
+            LlmMessage::user("aiempi kysymys"),
+            LlmMessage::assistant("aiempi vastaus"),
+        ];
+        let stack = build_message_stack("SYSTEM".to_string(), &history, "uusi".to_string());
+        // [system, user(aiempi), assistant(aiempi), user(uusi)]
+        assert_eq!(stack.len(), 4);
+        assert_eq!(stack[0].role, crate::llm::LlmRole::System);
+        assert_eq!(stack[1].role, crate::llm::LlmRole::User);
+        assert_eq!(stack[1].content, "aiempi kysymys");
+        assert_eq!(stack[2].role, crate::llm::LlmRole::Assistant);
+        assert_eq!(stack[3].role, crate::llm::LlmRole::User);
+        assert_eq!(stack[3].content, "uusi");
+    }
+
+    #[test]
+    fn build_message_stack_empty_history_is_just_system_user() {
+        let stack = build_message_stack("SYSTEM".to_string(), &[], "kysymys".to_string());
+        assert_eq!(stack.len(), 2);
+        assert_eq!(stack[0].role, crate::llm::LlmRole::System);
+        assert_eq!(stack[1].role, crate::llm::LlmRole::User);
+    }
+
+    #[test]
+    fn truncate_for_history_keeps_short_and_caps_long_at_utf8_boundary() {
+        assert_eq!(truncate_for_history("lyhyt"), "lyhyt");
+        // Pitkä monitavuinen merkkijono ei katkea keskeltä merkkiä.
+        let long = "ä".repeat(HISTORY_MAX_CHARS_PER_MSG); // 2 tavua/merkki
+        let out = truncate_for_history(&long);
+        assert!(out.ends_with('…'));
+        let body = out.trim_end_matches('…');
+        assert!(body.len() <= HISTORY_MAX_CHARS_PER_MSG);
+        // Jokainen tavu on kelvollinen UTF-8-raja (ei rikottua 'ä').
+        assert!(body.is_char_boundary(body.len()));
+    }
+
+    #[tokio::test]
+    async fn append_history_is_a_sliding_window() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let mut agent = test_agent("agent_a", bus.clone());
+        let key = "discord-main:general";
+        // Työnnä enemmän vaihtoja kuin ikkuna vetää.
+        for i in 0..(HISTORY_MAX_MESSAGES) {
+            agent.append_history(key, &format!("kysymys {i}"), &format!("vastaus {i}"));
+        }
+        let hist = agent.history_for(key);
+        // Ikkuna pitää enintään HISTORY_MAX_MESSAGES viestiä (user+assistant).
+        assert_eq!(hist.len(), HISTORY_MAX_MESSAGES);
+        // Vanhin pudonnut: viimeisin viesti on uusin assistant-vastaus.
+        assert_eq!(
+            hist.last().expect("last").role,
+            crate::llm::LlmRole::Assistant
+        );
+        let newest = &hist.last().expect("last").content;
+        assert!(newest.starts_with("vastaus"));
+        bus.stop();
+    }
+
+    #[tokio::test]
+    async fn append_history_skips_empty_messages() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let mut agent = test_agent("agent_a", bus.clone());
+        let key = "k";
+        agent.append_history(key, "", "vastaus");
+        agent.append_history(key, "kysymys", "   ");
+        assert!(agent.history_for(key).is_empty(), "tyhjiä ei tallenneta");
+        agent.append_history(key, "kysymys", "vastaus");
+        assert_eq!(agent.history_for(key).len(), 2);
+        bus.stop();
+    }
+
+    #[tokio::test]
+    async fn conversation_key_separates_channels_and_conversations() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let agent = test_agent("agent_a", bus.clone());
+        let a = familyclaw_bus::MessageOrigin::new("discord-main", "general", "u1");
+        let b = familyclaw_bus::MessageOrigin::new("discord-main", "random", "u1");
+        let c = familyclaw_bus::MessageOrigin::new("telegram", "general", "u1");
+        assert_ne!(
+            agent.conversation_key(Some(&a)),
+            agent.conversation_key(Some(&b))
+        );
+        assert_ne!(
+            agent.conversation_key(Some(&a)),
+            agent.conversation_key(Some(&c))
+        );
+        assert_eq!(agent.conversation_key(Some(&a)), "discord-main:general");
+        // Ilman originia: fallback "default" (ei reply-targetia testiagentilla).
+        assert_eq!(agent.conversation_key(None), "default");
+        bus.stop();
+    }
+
+    #[tokio::test]
+    async fn separate_conversations_keep_independent_history() {
+        let bus = ResonanceBus::start(None).await.expect("bus");
+        let mut agent = test_agent("agent_a", bus.clone());
+        agent.append_history("chan:a", "ka", "va");
+        agent.append_history("chan:b", "kb", "vb");
+        assert_eq!(agent.history_for("chan:a").len(), 2);
+        assert_eq!(agent.history_for("chan:b").len(), 2);
+        assert!(agent.history_for("chan:a")[0].content.contains("ka"));
+        assert!(agent.history_for("chan:b")[0].content.contains("kb"));
+        bus.stop();
     }
 
     /// Apuri: revi FileJournal-tiedosto niin, että `step_name`-askel + sitä
