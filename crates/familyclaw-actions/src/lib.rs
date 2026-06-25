@@ -75,6 +75,7 @@ pub mod pending_store;
 pub mod policy;
 pub mod proof;
 pub mod registry;
+pub mod resource_budget;
 pub mod skills;
 pub mod task;
 
@@ -101,6 +102,7 @@ pub use proof::{
     build_proof, redact_free_text, redact_value, redact_value_deep, sha256_hex, ProofBundle,
     RedactionReport, VerificationResult,
 };
+pub use resource_budget::{AcquireOutcome, BudgetLimits, ResourceBudget, ResourceLease};
 #[allow(deprecated)]
 pub use skills::MockSkill;
 pub use skills::{
