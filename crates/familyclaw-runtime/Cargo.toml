@@ -28,10 +28,17 @@ familyclaw-embeddings = { workspace = true }
 familyclaw-memory = { workspace = true }
 familyclaw-durable = { workspace = true }
 familyclaw-dream = { workspace = true }
+familyclaw-scheduler = { workspace = true }
 familyclaw-hearth = { workspace = true }
 ractor = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# DreamSkill (Phase 4): taito-trait (async-trait), payload/output (serde_json),
+# vakaa skill-id (uuid), ajastinintervalli (chrono::Duration).
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }

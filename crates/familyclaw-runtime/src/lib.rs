@@ -32,6 +32,9 @@
 use std::env;
 use std::sync::Arc;
 
+pub mod dream_skill;
+
+use dream_skill::DreamSkill;
 use familyclaw_actions::{ActionRuntime, AuditCollector};
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, resolve_profile_dir, Agent, EmotionCalibration,
@@ -42,10 +45,11 @@ use familyclaw_bridge::{AgentInfo, AgentRole, Event, EventKind, FamilyBridge, Ho
 use familyclaw_bus::{BeingId, BusHandle, ResonanceBus, ResonanceMessage};
 use familyclaw_channels::Channel;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
-use familyclaw_dream::DreamCycle;
 use familyclaw_durable::{DurableContext, FileJournal, InMemoryJournal, Journal};
 use familyclaw_embeddings::DeterministicEmbedder;
 use familyclaw_memory::{EmbeddingMemoryStore, LocalJsonStore};
+use familyclaw_scheduler::runner::CancellationSignal;
+use familyclaw_scheduler::{ScheduledTask, Scheduler, SchedulerRunner};
 use ractor::ActorRef;
 use tokio::sync::Mutex;
 
@@ -109,9 +113,14 @@ pub struct FamilyRuntime {
     /// tämä kantaa in-flight-vastauksia, joten se DRAINATAAN loppuun (ei
     /// abortoida) sammutuksessa, ettei puskuroitu vastaus katoa.
     drain: tokio::task::JoinHandle<()>,
-    /// Abortoitavat taustatehtävät: channel→bus -pumppu (+ dream). Nämä EIVÄT
-    /// kanna in-flight-vastauksia, joten ne voi keskeyttää suoraan.
+    /// Abortoitavat taustatehtävät: channel→bus -pumppu. Nämä EIVÄT kanna
+    /// in-flight-vastauksia, joten ne voi keskeyttää suoraan.
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Ajastimen (Phase 4) peruutussignaali, jos ajastin käynnistettiin (uni-
+    /// sykli ajastettuna tehtävänä). `None` kun ajastin on pois käytöstä
+    /// (`FAMILYCLAW_DREAM_DISABLED`). Sammutus peruuttaa sen → tikkisilmukka
+    /// pysähtyy siististi.
+    scheduler_signal: Option<CancellationSignal>,
 }
 
 impl FamilyRuntime {
@@ -181,11 +190,15 @@ impl FamilyRuntime {
         // 1. Lopeta reply-tuotanto: bus seis + agentit pois (pudottaa sinkin).
         self.bus.stop();
         drop(self.agents);
-        // 2. Abortoi vastauksia kantamattomat taustatehtävät.
+        // 2. Peruuta ajastin (Phase 4): tikkisilmukka pysähtyy siististi.
+        if let Some(signal) = self.scheduler_signal {
+            signal.cancel();
+        }
+        // 3. Abortoi vastauksia kantamattomat taustatehtävät.
         for t in self.tasks {
             t.abort();
         }
-        // 3. Anna drainin valua loppuun (rajattu, ettei sammutus jää roikkumaan).
+        // 4. Anna drainin valua loppuun (rajattu, ettei sammutus jää roikkumaan).
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.drain).await;
     }
 }
@@ -592,38 +605,53 @@ pub async fn build_family(
         }
     });
 
-    // 11. Dream-silmukka (valinnainen): spawnaa vain jos journal on olemassa
-    //     EIKÄ FAMILYCLAW_DREAM_DISABLED ole asetettu. Kahva talletetaan
-    //     `Option<JoinHandle>`:na ja työnnetään `tasks`-vektoriin, jotta
-    //     `shutdown()` OMISTAA ja keskeyttää sen (aiemmin bare `tokio::spawn`
-    //     pudotti kahvan → tausta­silmukka jäi orvoksi sammutuksessa).
-    let dream: Option<tokio::task::JoinHandle<()>> = if let Some(dream_journal) = dream_journal {
+    // 11. Uni-sykli AJASTETTUNA TEHTÄVÄNÄ (Phase 4, D5): aiemman käsin koodatun
+    //     `tokio::sleep`-silmukan sijaan uni ajetaan `familyclaw-scheduler`:n
+    //     kautta [`DreamSkill`]-taitona. Hyödyt: idempotenssi (deterministinen
+    //     ajastinavain), havainnoitavuus (kulkee toiminto-ajoympäristön kautta),
+    //     yhtenäisyys (yksi ajastinmekanismi). Ajastin saa OMAN, eristetyn
+    //     `ActionRuntime`:n johon vain `DreamSkill` rekisteröidään — se ei jaa
+    //     agentin tool-runtimea. Spawnataan vain jos journal on olemassa EIKÄ
+    //     `FAMILYCLAW_DREAM_DISABLED` ole asetettu (taaksepäin-yhteensopiva).
+    let scheduler_signal: Option<CancellationSignal> = if let Some(dream_journal) = dream_journal {
         let dream_disabled = env::var("FAMILYCLAW_DREAM_DISABLED")
             .ok()
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         if dream_disabled {
-            tracing::info!(target: "familyclaw::dream", "runtime dream loop disabled (FAMILYCLAW_DREAM_DISABLED)");
+            tracing::info!(target: "familyclaw::dream", "scheduled dream task disabled (FAMILYCLAW_DREAM_DISABLED)");
             None
         } else {
-            let interval_secs: u64 = env::var("FAMILYCLAW_DREAM_INTERVAL_SECS")
+            let interval_secs: i64 = env::var("FAMILYCLAW_DREAM_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(6 * 3600);
-            let dream = tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-                    let store: &dyn familyclaw_memory::MemoryStore = &*dream_store;
-                    let journal: &(dyn Journal + Send + Sync) = &*dream_journal;
-                    let cycle = DreamCycle::new(store);
-                    match cycle.run(journal, time::now()).await {
-                        Ok(report) => {
-                            tracing::info!(target: "familyclaw::dream", scanned=report.scanned, merged=report.merged, dropped=report.dropped, strengthened=report.strengthened, archived=report.archived, absolutized=report.dates_absolutized, "Dream cycle completed");
-                        }
-                        Err(e) => tracing::warn!("Dream cycle failed: {e}"),
-                    }
-                }
-            });
-            Some(dream)
+
+            // Ajastimen oma toiminto-ajoympäristö: vain DreamSkill.
+            let mut sched_runtime = ActionRuntime::new();
+            let dream_skill = DreamSkill::new(Arc::clone(&dream_store), Arc::clone(&dream_journal));
+            if let Err(e) = sched_runtime.register_skill(dream_skill) {
+                tracing::warn!(target: "familyclaw::dream", error = %e, "failed to register dream skill — scheduled dream disabled");
+                None
+            } else {
+                let mut scheduler = Scheduler::new();
+                // Vakaa tehtävä-id (with_id) → idempotenssiavain pysyy
+                // vakaana prosessien yli.
+                let dream_task = ScheduledTask::new(
+                    DreamSkill::skill_id(),
+                    serde_json::json!({}),
+                    chrono::Duration::seconds(interval_secs),
+                    "dream",
+                );
+                scheduler.register(dream_task);
+                // Tikkiväli: min(intervalli, 60s) jotta erääntyminen huomataan
+                // ajoissa mutta tikki ei pyöri turhaan tiuhaan.
+                let tick_secs = interval_secs.clamp(1, 60);
+                #[allow(clippy::cast_sign_loss)]
+                let period = std::time::Duration::from_secs(tick_secs as u64);
+                let runner = SchedulerRunner::new(scheduler, sched_runtime, period);
+                tracing::info!(target: "familyclaw::dream", interval_secs, "scheduled dream task active");
+                Some(runner.run(time::now))
+            }
         }
     } else {
         None
@@ -631,12 +659,9 @@ pub async fn build_family(
 
     // 12. Kokoa runtime — omistaa busin, agentin ja taustatehtävät. `drain`
     //     pidetään ERILLÄÄN abortoitavista taskeista, jotta sammutus voi valuttaa
-    //     sen loppuun (in-flight-vastaukset) abortoinnin sijaan. Dream-kahva
-    //     lisätään vain jos se spawnattiin (gated FAMILYCLAW_DREAM_DISABLED).
-    let mut tasks = vec![pump];
-    if let Some(dream) = dream {
-        tasks.push(dream);
-    }
+    //     sen loppuun (in-flight-vastaukset) abortoinnin sijaan. Ajastimen
+    //     peruutussignaali talletetaan erikseen ja peruutetaan sammutuksessa.
+    let tasks = vec![pump];
     Ok(FamilyRuntime {
         bus,
         bridge,
@@ -645,6 +670,7 @@ pub async fn build_family(
         agents: vec![actor],
         drain,
         tasks,
+        scheduler_signal,
     })
 }
 
