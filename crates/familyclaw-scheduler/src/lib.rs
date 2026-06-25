@@ -49,7 +49,7 @@ pub mod runner;
 pub mod task;
 
 pub use decision::{firing_key, DueDecision};
-pub use dispatch::{DispatchSummary, Scheduler};
+pub use dispatch::{DispatchSummary, DueDispatch, Scheduler};
 pub use persistence::AgencyConfig;
 pub use runner::{run_until_cancelled, SchedulerHandle, SchedulerRunner};
 pub use task::{ScheduledTask, ScheduledTaskId};

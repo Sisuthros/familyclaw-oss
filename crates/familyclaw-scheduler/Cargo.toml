@@ -22,4 +22,5 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "time", "sync"] }
+async-trait = { workspace = true }

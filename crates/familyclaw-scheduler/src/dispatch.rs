@@ -15,8 +15,9 @@
 
 use std::collections::HashMap;
 
-use familyclaw_actions::{ActionRuntime, Result, SubmitOutcome};
+use familyclaw_actions::{ActionRuntime, Result, SkillId, SubmitOutcome};
 use familyclaw_core::time::Timestamp;
+use serde_json::Value;
 
 use crate::decision::{decide, due_tasks};
 use crate::task::{ScheduledTask, ScheduledTaskId};
@@ -38,6 +39,29 @@ impl DispatchSummary {
     pub fn fired_count(&self) -> usize {
         self.fired.len()
     }
+}
+
+/// Yhden erääntyneen tehtävän **lähetysohje**: kaikki mitä idempotenttiin
+/// lähetykseen tarvitaan, irrotettuna [`Scheduler`]:sta.
+///
+/// [`Scheduler::collect_due`] palauttaa nämä **lukon alla nopeasti** (puhdas
+/// erääntymispäätös + tehtävädatan kopiointi). Lähetys
+/// ([`ActionRuntime::submit_task_idempotent`]) voidaan sitten ajaa **ilman
+/// lukkoa**, jottei pitkä lähetys-I/O estä operaattoripinnan mutaatioita
+/// (esim. [`Scheduler::set_task_enabled`]). Sisältää vain geneerisiä tunnisteita
+/// ja payloadin — ei lukkoa, ei viittausta ajastimeen (KERROS A turvallinen).
+#[derive(Debug, Clone)]
+pub struct DueDispatch {
+    /// Erääntyneen tehtävän tunniste (`last_fired`-kirjausta varten).
+    pub task_id: ScheduledTaskId,
+    /// Deterministinen idempotenssiavain tälle laukaisulle.
+    pub key: String,
+    /// Olennon tunniste jonka nimissä lähetys tehdään.
+    pub being_id: String,
+    /// Suoritettavan taidon tunniste.
+    pub skill_id: SkillId,
+    /// Taidolle annettava payload.
+    pub payload: Value,
 }
 
 /// Intervalliperustainen ajastin: pitää joukkoa ajastettuja tehtäviä ja niiden
@@ -165,6 +189,48 @@ impl Scheduler {
         )
     }
 
+    /// Kerää tällä nykyhetkellä erääntyneiden tehtävien **lähetysohjeet**
+    /// ([`DueDispatch`]) **suorittamatta** mitään (puhdas, ei `await`).
+    ///
+    /// Tämä on tarkoituksella halpa ja synkroninen: erääntymispäätös
+    /// ([`crate::decision`]) lasketaan ja erääntyneiden tehtävien lähetysdata
+    /// (avain, olento, taito, payload) kopioidaan irti ajastimesta. Näin
+    /// jaetun ajastimen ([`crate::runner::SchedulerHandle`]) lukko voidaan
+    /// **vapauttaa** ennen varsinaista lähetys-I/O:ta, jottei pitkä lähetys estä
+    /// operaattoripinnan mutaatioita (esim. [`Scheduler::set_task_enabled`]).
+    /// Lähetyksen ajamisen jälkeen kutsu [`Scheduler::record_fired`] kullekin
+    /// onnistuneelle laukaisulle.
+    #[must_use]
+    pub fn collect_due(&self, now: Timestamp) -> Vec<DueDispatch> {
+        let mut out = Vec::new();
+        for decision in self.due_now(now) {
+            let Some(key) = decision.key else { continue };
+            let Some(task) = self.tasks.iter().find(|t| t.id == decision.task_id) else {
+                continue;
+            };
+            out.push(DueDispatch {
+                task_id: task.id,
+                key,
+                being_id: task.being_id.clone(),
+                skill_id: task.skill_id,
+                payload: task.payload.clone(),
+            });
+        }
+        out
+    }
+
+    /// Kirjaa yhden tehtävän laukaisuajan (`last_fired`) onnistuneen lähetyksen
+    /// jälkeen.
+    ///
+    /// Erotettu [`Scheduler::collect_due`]:sta jotta lähetys voidaan ajaa ilman
+    /// ajastimen lukkoa: kerää erääntyneet lukon alla → vapauta lukko → lähetä →
+    /// ota lukko lyhyesti takaisin ja kutsu tätä per onnistunut laukaisu. `now`
+    /// on sama nykyhetki jolla erääntyminen arvioitiin, jotta intervalli-ikkuna
+    /// pysyy johdonmukaisena.
+    pub fn record_fired(&mut self, task_id: ScheduledTaskId, now: Timestamp) {
+        self.last_fired.insert(task_id, now);
+    }
+
     /// Suorittaa yhden tikin: lähettää kaikki erääntyneet tehtävät
     /// idempotentisti ja kirjaa niiden `last_fired`-ajan.
     ///
@@ -175,6 +241,12 @@ impl Scheduler {
     /// jälkeen, joten ohimenevä virhe ei "kuluta" intervallia: tehtävä yrittää
     /// uudelleen seuraavalla tikillä (ja idempotenssiavain estää
     /// kaksoislaukaisun jos sivuvaikutus oli jo sitoutunut outboxiin).
+    ///
+    /// Sisäisesti tämä on [`Scheduler::collect_due`] + lähetys +
+    /// [`Scheduler::record_fired`]. Käytä sitä kun ajastin **ei** ole jaetun
+    /// lukon takana (esim. [`crate::runner::SchedulerRunner::run`]); jaetussa
+    /// ajossa ([`crate::runner::SchedulerRunner::run_shared`]) noita kahta
+    /// kutsutaan erikseen jottei lukkoa pidetä lähetyksen yli.
     ///
     /// # Errors
     /// Palauttaa ensimmäisen lähetysvirheen ([`ActionRuntime::submit_task_idempotent`]).
@@ -187,26 +259,24 @@ impl Scheduler {
     ) -> Result<DispatchSummary> {
         let mut summary = DispatchSummary::default();
 
-        // Päätökset lasketaan puhtaalla logiikalla; payload/skill/being haetaan
-        // tehtävämäärittelystä lähetystä varten.
-        let decisions = self.due_now(now);
-        for decision in decisions {
-            let Some(key) = decision.key else { continue };
-            let Some(task) = self.tasks.iter().find(|t| t.id == decision.task_id) else {
-                continue;
-            };
-            let being = task.being_id.clone();
-            let skill_id = task.skill_id;
-            let payload = task.payload.clone();
-            let task_id = task.id;
-
+        // Sama erääntymis- ja lähetyslogiikka kuin jaetussa polussa: kerää
+        // erääntyneet (puhdas), lähetä idempotentisti, kirjaa onnistuneet.
+        for dispatch in self.collect_due(now) {
             let outcome = runtime
-                .submit_task_idempotent(&key, &being, skill_id, payload, now)
+                .submit_task_idempotent(
+                    &dispatch.key,
+                    &dispatch.being_id,
+                    dispatch.skill_id,
+                    dispatch.payload,
+                    now,
+                )
                 .await?;
 
             // Kirjaa last_fired vasta onnistuneen lähetyksen jälkeen.
-            self.last_fired.insert(task_id, now);
-            summary.fired.push((task_id, key, outcome));
+            self.record_fired(dispatch.task_id, now);
+            summary
+                .fired
+                .push((dispatch.task_id, dispatch.key, outcome));
         }
 
         Ok(summary)
