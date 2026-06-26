@@ -205,7 +205,24 @@ impl LlmMessage {
 ///
 /// `PartialEq` (not `Eq`) because [`arguments`](Self::arguments) is a
 /// `serde_json::Value` (only `PartialEq` — may contain floats).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// **Wire shape vs. in-memory shape.** In memory this is a flat
+/// `{id, name, arguments}` triple with `arguments` as a parsed
+/// [`serde_json::Value`]. On the wire it is the `OpenAI` chat-completions tool
+/// call shape:
+///
+/// ```json
+/// {"id": "call_abc", "type": "function",
+///  "function": {"name": "fs_read", "arguments": "{\"path\":\"a.txt\"}"}}
+/// ```
+///
+/// Note that `function.arguments` is a **JSON-encoded string**, not a nested
+/// object. Custom [`Serialize`]/[`Deserialize`] impls below bridge the two
+/// forms, so the derived flat shape never reaches the wire. This is why a tool
+/// call response decoded with the *derived* impl failed: serde looked for a
+/// top-level `name`/`arguments`, but the provider nests them under `function`
+/// and stringifies the arguments.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
     /// Unique ID for this tool call
     pub id: String,
@@ -213,6 +230,110 @@ pub struct ToolCall {
     pub name: String,
     /// Arguments as JSON
     pub arguments: serde_json::Value,
+}
+
+/// `OpenAI` wire shape for a single tool call — the envelope the chat
+/// completions API both **emits** (in assistant responses) and **expects**
+/// (when an assistant message with tool calls is replayed in a request).
+///
+/// `function.arguments` is a JSON-encoded **string** on the wire. We keep it as
+/// a raw [`String`] here and (de)serialize it to/from [`ToolCall::arguments`]
+/// (a parsed [`serde_json::Value`]) in the [`ToolCall`] serde impls.
+#[derive(Serialize, Deserialize)]
+struct ToolCallWire {
+    id: String,
+    /// Always `"function"` for the only tool kind we support. `#[serde(default)]`
+    /// tolerates providers that omit it on the response.
+    #[serde(rename = "type", default = "tool_call_kind_function")]
+    kind: String,
+    function: ToolCallFunctionWire,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ToolCallFunctionWire {
+    name: String,
+    /// JSON-encoded arguments. Standard providers send a string
+    /// (e.g. `"{\"path\":\"a.txt\"}"`); see [`ToolCall`]'s `Deserialize` for how
+    /// a non-string (some providers send a raw object) is tolerated.
+    arguments: ArgumentsWire,
+}
+
+/// Tolerates both the standard string-encoded `arguments` and the non-standard
+/// raw-object form some `OpenAI`-compatible providers emit. Always serializes
+/// back to the standard JSON **string** form on the wire.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ArgumentsWire {
+    /// Standard: arguments are a JSON-encoded string.
+    Str(String),
+    /// Non-standard: a few providers inline the arguments as a raw JSON value.
+    Value(serde_json::Value),
+}
+
+impl ArgumentsWire {
+    /// Parses the wire arguments into a [`serde_json::Value`]. An empty or
+    /// whitespace-only string (some providers send `""` for a no-arg call)
+    /// decodes to an empty object so downstream skills receive a valid object.
+    fn into_value(self) -> Result<serde_json::Value, serde_json::Error> {
+        match self {
+            ArgumentsWire::Str(s) if s.trim().is_empty() => {
+                Ok(serde_json::Value::Object(serde_json::Map::new()))
+            }
+            ArgumentsWire::Str(s) => serde_json::from_str(&s),
+            ArgumentsWire::Value(v) => Ok(v),
+        }
+    }
+}
+
+const fn tool_call_kind_function() -> String {
+    String::new()
+}
+
+impl Serialize for ToolCall {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Emit the standard OpenAI wire shape: arguments as a JSON string.
+        let arguments =
+            serde_json::to_string(&self.arguments).map_err(serde::ser::Error::custom)?;
+        let wire = ToolCallWire {
+            id: self.id.clone(),
+            kind: "function".to_string(),
+            function: ToolCallFunctionWire {
+                name: self.name.clone(),
+                arguments: ArgumentsWire::Str(arguments),
+            },
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolCall {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ToolCallWire::deserialize(deserializer)?;
+        let arguments = wire
+            .function
+            .arguments
+            .into_value()
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            id: wire.id,
+            name: wire.function.name,
+            arguments,
+        })
+    }
+}
+
+impl Serialize for ArgumentsWire {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ArgumentsWire::Str(s) => serializer.serialize_str(s),
+            // Round-trip a raw-object form back out as a JSON string so requests
+            // we build stay standard-compliant regardless of how we decoded.
+            ArgumentsWire::Value(v) => {
+                let s = serde_json::to_string(v).map_err(serde::ser::Error::custom)?;
+                serializer.serialize_str(&s)
+            }
+        }
+    }
 }
 
 /// A tool the model is allowed to call.
@@ -1019,6 +1140,112 @@ mod tests {
             "expected retryable Timeout, got {err:?}"
         );
         assert!(err.is_retryable(), "timeout must be retryable for failover");
+    }
+
+    // ── tool-call response decoding (OpenAI wire shape) ─────────────────────
+
+    #[test]
+    fn deserializes_response_with_tool_calls_and_null_content() {
+        // Realistic chat-completions response: the assistant chose to call a
+        // tool, so `content` is null and `tool_calls` is populated in the
+        // OpenAI wire shape (`type` + nested `function` with STRING arguments).
+        // Regression for: derived ToolCall::Deserialize expected flat
+        // {id,name,arguments} and failed with "error decoding response body".
+        let body = r#"{
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_abc123",
+                        "type": "function",
+                        "function": {
+                            "name": "web_fetch",
+                            "arguments": "{\"url\":\"https://example.com\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }"#;
+
+        let resp: ChatCompletionsResponse =
+            serde_json::from_str(body).expect("tool_calls + null content must decode");
+
+        let choice = resp.choices.into_iter().next().expect("one choice");
+        assert!(
+            choice.message.content.is_none(),
+            "content should decode as None"
+        );
+        let calls = choice.message.tool_calls.expect("tool_calls present");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_abc123");
+        assert_eq!(calls[0].name, "web_fetch");
+        // arguments (a JSON STRING on the wire) parses into a Value object.
+        assert_eq!(calls[0].arguments["url"], "https://example.com");
+    }
+
+    #[test]
+    fn deserializes_tool_call_with_object_arguments_and_missing_type() {
+        // Robustness: some OpenAI-compatible providers omit `type` and inline
+        // `arguments` as a raw object instead of a JSON string. Both must decode.
+        let json = r#"{
+            "id": "c1",
+            "function": { "name": "fs_read", "arguments": {"path": "a.txt"} }
+        }"#;
+        let call: ToolCall = serde_json::from_str(json).expect("non-standard shape must decode");
+        assert_eq!(call.id, "c1");
+        assert_eq!(call.name, "fs_read");
+        assert_eq!(call.arguments["path"], "a.txt");
+    }
+
+    #[test]
+    fn deserializes_tool_call_with_empty_string_arguments() {
+        // A no-arg call: providers send arguments as "" — must decode to {}.
+        let json = r#"{
+            "id": "c2",
+            "type": "function",
+            "function": { "name": "ping", "arguments": "" }
+        }"#;
+        let call: ToolCall = serde_json::from_str(json).expect("empty args must decode");
+        assert_eq!(call.arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn tool_call_serializes_to_openai_wire_shape() {
+        // When an assistant message with tool calls is replayed in a request,
+        // each ToolCall must serialize back to the OpenAI shape: top-level
+        // `type:"function"` and `function.arguments` as a JSON STRING.
+        let call = ToolCall {
+            id: "call_xyz".into(),
+            name: "search".into(),
+            arguments: serde_json::json!({"q": "rust serde"}),
+        };
+        let v = serde_json::to_value(&call).expect("serialize");
+        assert_eq!(v["id"], "call_xyz");
+        assert_eq!(v["type"], "function");
+        assert_eq!(v["function"]["name"], "search");
+        // arguments must be a STRING on the wire, not an object.
+        let args = v["function"]["arguments"]
+            .as_str()
+            .expect("arguments must serialize as a JSON string");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(args).unwrap()["q"],
+            "rust serde"
+        );
+    }
+
+    #[test]
+    fn tool_call_wire_roundtrips_through_serde() {
+        // Serialize → deserialize preserves the in-memory shape (id/name/args).
+        let call = ToolCall {
+            id: "c3".into(),
+            name: "calc".into(),
+            arguments: serde_json::json!({"a": 1, "b": 2.5}),
+        };
+        let json = serde_json::to_string(&call).expect("ser");
+        let back: ToolCall = serde_json::from_str(&json).expect("de");
+        assert_eq!(call, back);
     }
 
     #[tokio::test]

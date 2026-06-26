@@ -4326,15 +4326,26 @@ mod tests {
         .to_string()
     }
 
-    /// OpenAI-vastausrunko jossa **yksi työkalukutsu**. `arguments` on JSON-arvo
-    /// (cratimme deserialisoija odottaa litteää `{id,name,arguments}`-muotoa).
+    /// OpenAI-vastausrunko jossa **yksi työkalukutsu** — tarkalleen sitä
+    /// chat-completions-muotoa jota oikeat providerit lähettävät:
+    /// `type:"function"` + sisäkkäinen `function`-olio, jonka `arguments` on
+    /// **JSON-merkkijono** (ei raaka olio), ja `content` on `null`. Tämä
+    /// peilaa tuotannon johtoa, joten testit nappaavat jatkossa dekoodausviat.
     fn body_tool_call(id: &str, name: &str, arguments: &serde_json::Value) -> String {
+        let arguments_str =
+            serde_json::to_string(arguments).expect("arguments serialize to JSON string");
         serde_json::json!({
             "choices": [ {
                 "message": {
+                    "role": "assistant",
                     "content": serde_json::Value::Null,
-                    "tool_calls": [ { "id": id, "name": name, "arguments": arguments } ]
-                }
+                    "tool_calls": [ {
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments_str }
+                    } ]
+                },
+                "finish_reason": "tool_calls"
             } ]
         })
         .to_string()

@@ -2979,14 +2979,24 @@ mod tests {
         format!("http://{addr}/v1")
     }
 
-    /// OpenAI-vastausrunko: **yksi työkalukutsu** (litteä `{id,name,arguments}`).
+    /// OpenAI-vastausrunko: **yksi työkalukutsu** chat-completions-johdon
+    /// muodossa — `type:"function"` + sisäkkäinen `function`, jonka `arguments`
+    /// on **JSON-merkkijono**, ja `content` on `null`. Peilaa oikeaa provideria.
     fn e2e_body_tool_call(id: &str, name: &str, arguments: &serde_json::Value) -> String {
+        let arguments_str =
+            serde_json::to_string(arguments).expect("arguments serialize to JSON string");
         serde_json::json!({
             "choices": [ {
                 "message": {
+                    "role": "assistant",
                     "content": serde_json::Value::Null,
-                    "tool_calls": [ { "id": id, "name": name, "arguments": arguments } ]
-                }
+                    "tool_calls": [ {
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments_str }
+                    } ]
+                },
+                "finish_reason": "tool_calls"
             } ]
         })
         .to_string()
