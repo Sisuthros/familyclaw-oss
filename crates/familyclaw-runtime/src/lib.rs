@@ -35,7 +35,7 @@ use std::sync::Arc;
 pub mod dream_skill;
 
 use dream_skill::DreamSkill;
-use familyclaw_actions::{ActionRuntime, AuditCollector};
+use familyclaw_actions::{ActionRuntime, AuditCollector, FsReadConfig};
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, resolve_profile_dir, Agent, EmotionCalibration,
     ErasedMemoryStore, JournalResumableStore, LlmEndpointResolver, MetricEvent, ResumableTurnStore,
@@ -523,12 +523,19 @@ pub async fn build_family(
     //     In-memory-polulla ([`ActionRuntime::with_default_skills`], ei data_diriä)
     //     kaikki kolme jäävät oletuksiinsa — ei levyä, ei kaatumiskestävyyttä,
     //     kuten muullakin in-memory-tilalla.
+    // Tutkimustaidon (fs_read) allowlist KERROS B -ympäristöstä. `build_family`
+    // (KERROS A) ei kovakoodaa yhtään polkua — operaattori antaa sallitut juuret
+    // ympäristössä, ja lippulaiva-taito [`FsReadAllowlisted`] rekisteröidään niillä
+    // jo rekisteröintihetkellä (kiinteä skill-id → ei voi rekisteröidä kahdesti).
+    // Ilman allowlistia taito jää tyhjään fail-closed-tilaan (hylkää kaikki polut),
+    // joten tämä on se kytkin joka tekee TIEDOSTOTUTKIMUKSEN oikeasti toimivaksi.
+    let fs_read_config = resolve_fs_read_config();
     let action_runtime = if let Some(dir) = action_data_dir.as_ref() {
         // Persistentti polku: durable pending + task + dispatch outbox YHDELLÄ
         // konstruktorilla — `with_durable_stores` avaa nyt itse kaatumiskestävän
         // journal-outboxin kolmannesta polusta, joten erillistä
         // `with_dispatch_outbox`-ketjutusta ei enää tarvita (eikä outbox-tiedostoa
-        // avata kahdesti). Sen jälkeen oletustaidot.
+        // avata kahdesti). Sen jälkeen oletustaidot (fs_read mahd. allowlistilla).
         let pending_path = dir.join("pending_approvals.jsonl");
         let task_path = dir.join("action_tasks.jsonl");
         let dispatch_path = dir.join("dispatch_outbox.jsonl");
@@ -537,13 +544,15 @@ pub async fn build_family(
             .map_err(|e| {
                 FamilyClawError::config(format!("durable action stores open failed: {e}"))
             })?;
-        rt.register_default_skills()
+        rt.register_default_skills_with_fs_read(fs_read_config)
             .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?;
         rt
     } else {
         // In-memory-polku: kaikki kolme pintaa oletuksissaan.
-        ActionRuntime::with_default_skills()
-            .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?
+        let mut rt = ActionRuntime::new();
+        rt.register_default_skills_with_fs_read(fs_read_config)
+            .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?;
+        rt
     };
     let actions: Arc<Mutex<ActionRuntime>> = Arc::new(Mutex::new(action_runtime));
     agent = agent.with_actions(Arc::clone(&actions));
@@ -776,6 +785,57 @@ fn load_profile_calibration(
             None
         }
     }
+}
+
+/// Ratkaisee lippulaiva-tutkimustaidon ([`FsReadAllowlisted`]) allowlistin
+/// ympäristöstä (KERROS B -data — `build_family` ei kovakoodaa polkuja).
+///
+/// - `FAMILYCLAW_FS_READ_ALLOW` — listaeroteltu joukko **sallittuja** juuria
+///   joiden alta agentti saa lukea tiedostoja tutkiakseen. Erotin on alustan
+///   polkulistain erotin ([`std::path::MAIN_SEPARATOR`]-perheen sijaan
+///   `;` Windowsilla, `:` muualla — sama kuin `PATH`), jotta Windows-polut
+///   (`C:\...`) eivät katkea väärin.
+/// - `FAMILYCLAW_FS_READ_TRUSTED` — sama muoto; näiden juurten alta luettu
+///   sisältö merkitään **luotetuksi** (taint poistuu). Aina sallittujen
+///   osajoukko ([`FsReadConfig::trusted_root`] lisää juuren myös sallittuihin).
+///
+/// Palauttaa `None` kun `FAMILYCLAW_FS_READ_ALLOW` puuttuu tai on tyhjä → taito
+/// jää oletukseen (tyhjä allowlist, fail-closed): rekisteröity ja työkaluna
+/// julkaistu, mutta hylkää kaikki polut. Tämä on turvallinen oletus.
+fn resolve_fs_read_config() -> Option<FsReadConfig> {
+    let allow_raw = env::var("FAMILYCLAW_FS_READ_ALLOW").ok()?;
+    let allow_roots: Vec<String> = env::split_paths(&allow_raw)
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    if allow_roots.is_empty() {
+        return None;
+    }
+
+    let trusted_roots: Vec<String> = env::var("FAMILYCLAW_FS_READ_TRUSTED")
+        .ok()
+        .map(|raw| {
+            env::split_paths(&raw)
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut config = FsReadConfig::new();
+    for root in &allow_roots {
+        config = config.allow_root(root);
+    }
+    for root in &trusted_roots {
+        config = config.trusted_root(root);
+    }
+    tracing::info!(
+        target: "familyclaw::actions",
+        allow_roots = allow_roots.len(),
+        trusted_roots = trusted_roots.len(),
+        "fs_read research skill allowlist configured from environment"
+    );
+    Some(config)
 }
 
 /// Lataa, **uudelleentarkistaa** ja persistoi agentin identiteetti-ankkurin.
@@ -1021,5 +1081,90 @@ mod tests {
 
         assert_eq!(runtime.bus().count().await.expect("count"), 1);
         runtime.shutdown().await;
+    }
+
+    /// TUTKIMUSTAIDOT KYTKETTY AGENTIN TOOL-LOOPPIIN: `build_family` rakentaa
+    /// agentin toiminto-ajoympäristön ([`FamilyRuntime::actions`]) niin että se
+    /// julkaisee molemmat tutkimustyökalut — `fs_read_allowlisted` (tiedoston
+    /// luku) ja `web_fetch` (web-haku) — agentin tool-loopille. Tämä on sama kahva
+    /// josta agentti lukee työkalut (`drive_tool_loop` → `rt.tool_definitions()`),
+    /// joten työkalujen läsnäolo tässä todistaa että agentti näkee ne ja voi
+    /// tutkia. Ilman tätä agentti vain juttelisi ilman työkaluja.
+    #[tokio::test]
+    async fn build_family_exposes_research_tools_to_agent() {
+        let channel = MockChannel::new("mock-research").expect("channel");
+        channel.close_inbound();
+
+        let resolver = EnvEndpointResolver::new();
+        let agent_cfg = AgentConfig::new("agent_r", ModelConfig::new("provider/model"));
+        let soul = Soul::from_essence("I am agent_r, a generic example being.");
+
+        let runtime = build_family(
+            None,
+            agent_cfg,
+            soul,
+            Box::new(channel),
+            "mock:room".to_string(),
+            &resolver,
+            None,
+        )
+        .await
+        .expect("runtime builds");
+
+        // Sama Arc<Mutex<ActionRuntime>> jonka agentin tool-loop omistaa.
+        let actions = runtime.actions();
+        let guard = actions.lock().await;
+        let tool_names: Vec<String> = guard
+            .tool_definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        drop(guard);
+
+        assert!(
+            tool_names.iter().any(|n| n == "fs_read_allowlisted"),
+            "agent must see the fs_read research tool, got: {tool_names:?}"
+        );
+        assert!(
+            tool_names.iter().any(|n| n == "web_fetch"),
+            "agent must see the web_fetch research tool, got: {tool_names:?}"
+        );
+
+        runtime.shutdown().await;
+    }
+
+    /// Allowlist-resolveri lukee `FAMILYCLAW_FS_READ_ALLOW`:n alustan
+    /// polkulistain erottimella ja muodostaa konfiguraation; ilman muuttujaa
+    /// palautuu `None` (fail-closed-oletus). Käyttää **vakio-mutexia**
+    /// rinnakkaisturvaan, koska prosessin env-tila on jaettu.
+    #[test]
+    fn resolve_fs_read_config_reads_env_paths() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Puuttuva muuttuja → None (fail-closed).
+        env::remove_var("FAMILYCLAW_FS_READ_ALLOW");
+        env::remove_var("FAMILYCLAW_FS_READ_TRUSTED");
+        assert!(resolve_fs_read_config().is_none());
+
+        // Kaksi juurta alustan erottimella → Some(config). Käytä alustakohtaista
+        // erotinta jotta Windows-ajopolut (C:\...) eivät katkea.
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let a = std::env::temp_dir().join("familyclaw_fsread_a");
+        let b = std::env::temp_dir().join("familyclaw_fsread_b");
+        let joined = format!("{}{sep}{}", a.display(), b.display());
+        env::set_var("FAMILYCLAW_FS_READ_ALLOW", &joined);
+        let cfg = resolve_fs_read_config();
+        env::remove_var("FAMILYCLAW_FS_READ_ALLOW");
+        assert!(cfg.is_some(), "two allow roots must produce a config");
+
+        // Tyhjä merkkijono → None (ei sallittuja juuria).
+        env::set_var("FAMILYCLAW_FS_READ_ALLOW", "");
+        let empty = resolve_fs_read_config();
+        env::remove_var("FAMILYCLAW_FS_READ_ALLOW");
+        assert!(empty.is_none(), "empty allow list must yield None");
     }
 }

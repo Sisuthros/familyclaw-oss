@@ -51,7 +51,7 @@ use crate::pending_store::{
 use crate::policy::{ActionRisk, SkillPermission};
 use crate::proof::ProofBundle;
 use crate::skills::{
-    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, FsReadAllowlisted,
+    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, FsReadAllowlisted, FsReadConfig,
     GithubIssueDraftMock, Pipeline, Skill, WebFetchSkill,
 };
 use crate::task::{ActionTask, DurableTaskQueue, TaskQueue, TaskStatus};
@@ -550,11 +550,47 @@ impl ActionRuntime {
     /// Palauttaa manifestin validoinnin tai duplikaattirekisteröinnin virheen,
     /// jos jokin sisäänrakennettu taito on virheellinen (ei pitäisi tapahtua).
     pub fn register_default_skills(&mut self) -> Result<()> {
+        self.register_default_skills_with_fs_read(None)
+    }
+
+    /// Rekisteröi oletustaidot, mutta antaa kutsujan **konfiguroida lippulaiva-
+    /// tutkimustaidon** [`FsReadAllowlisted`] allowlistin
+    /// ([`ActionRuntime::register_default_skills`]:n yliversio).
+    ///
+    /// [`FsReadAllowlisted`] jaetaan koko alustan kanssa **kiinteällä
+    /// tunnisteella** ([`FsReadAllowlisted::skill_id`]), joten sitä ei voi
+    /// rekisteröidä kahdesti (duplikaattihylkäys). Siksi sen allowlist on
+    /// annettava JO rekisteröintihetkellä — ei jälkikäteen
+    /// [`ActionRuntime::register_skill`]:llä toisella kopiolla.
+    ///
+    /// - `fs_read_config = None` → tyhjä allowlist (fail-closed, oletus): taito on
+    ///   luettelossa ja julkaistaan työkaluna, mutta hylkää kaikki polut.
+    /// - `fs_read_config = Some(cfg)` → taito rekisteröidään annetulla
+    ///   allowlistilla, jolloin sen alle osuva luku ajaa **automaattisesti** (taito
+    ///   on [`ActionRisk::ReadOnly`] + `AutoIfReadOnly`) ilman hyväksyntää.
+    ///
+    /// Allowlist (sallitut/luotetut juuret) on **KERROS B -dataa**: tämä julkisivu
+    /// ei kovakoodaa yhtään polkua — kutsuja (gateway/runtime) lukee ne
+    /// ympäristöstä ja antaa [`FsReadConfig`]:nä. Näin KERROS A pysyy geneerisenä.
+    ///
+    /// # Errors
+    /// Palauttaa manifestin validoinnin tai duplikaattirekisteröinnin virheen,
+    /// jos jokin sisäänrakennettu taito on virheellinen (ei pitäisi tapahtua).
+    pub fn register_default_skills_with_fs_read(
+        &mut self,
+        fs_read_config: Option<FsReadConfig>,
+    ) -> Result<()> {
         self.register_skill(EmailTriageMock::new())?;
         self.register_skill(GithubIssueDraftMock::new())?;
         self.register_skill(DiscordThreadSummaryMock::new())?;
         self.register_skill(FilePatchMock::new())?;
-        self.register_skill(FsReadAllowlisted::new())?;
+        // Lippulaiva-tutkimustaito: tyhjä allowlist (fail-closed) oletuksena, tai
+        // kutsujan antama KERROS B -allowlist jolloin luku tutkii oikeasti.
+        let fs_read = match fs_read_config {
+            Some(config) => FsReadAllowlisted::with_config(config),
+            None => FsReadAllowlisted::new(),
+        };
+        self.register_skill(fs_read)?;
         // 2026-06-25: aito tutkimustaito (read-only web-fetch, SSRF-vartioitu).
         self.register_skill(WebFetchSkill::new())?;
         Ok(())
@@ -1244,6 +1280,63 @@ mod tests {
         let rendered = serde_json::to_string(&skills).expect("serialize summaries");
         assert!(!rendered.contains("sk-"));
         assert!(!rendered.contains("Bearer "));
+    }
+
+    /// TUTKIMUSTAITO PÄÄLLE: kun [`ActionRuntime::register_default_skills_with_fs_read`]
+    /// saa allowlistin, lippulaiva-taito [`FsReadAllowlisted`] (a) pysyy edelleen
+    /// luettelossa eikä kahdennu (sama kiinteä skill-id), ja (b) lukee oikeasti
+    /// allowlistatun tiedoston **auto-run-polulla** (ei hyväksyntää) — eli agentti
+    /// pystyy tutkimaan tiedostoja. Ilman allowlistia sama taito hylkäisi kaiken.
+    #[tokio::test]
+    async fn fs_read_config_makes_research_skill_functional() {
+        // Eristetty allowlistattu hakemisto + tiedosto.
+        let dir = std::env::temp_dir().join(format!(
+            "familyclaw-facade-fsread-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let canonical = std::fs::canonicalize(&dir).expect("canonicalize");
+        let file = canonical.join("note.txt");
+        std::fs::write(&file, "first line of research\nsecond line\n").expect("write file");
+
+        let config = FsReadConfig::new().allow_root(&canonical);
+        let mut runtime = ActionRuntime::new();
+        runtime
+            .register_default_skills_with_fs_read(Some(config))
+            .expect("register with fs_read allowlist");
+
+        // (a) Kaikki kuusi taitoa yhä luettelossa (fs_read ei kahdentunut).
+        let names: Vec<String> = runtime.list_skills().into_iter().map(|s| s.name).collect();
+        assert_eq!(
+            names.len(),
+            6,
+            "all six default skills registered exactly once"
+        );
+        assert!(names.iter().any(|n| n == "fs_read_allowlisted"));
+        assert!(names.iter().any(|n| n == "web_fetch"));
+
+        // (b) Allowlistatun tiedoston luku ajaa auto-run-polulla (ReadOnly +
+        //     AutoIfReadOnly) → tehtävä valmistuu, ei jää hyväksyntää odottamaan.
+        let skill_id = runtime
+            .map_name_to_skill("fs_read_allowlisted")
+            .expect("fs_read registered");
+        let payload = json!({ "path": file.to_string_lossy() });
+        let outcome = runtime
+            .submit_task(skill_id, payload, at(1_700_000_000))
+            .await
+            .expect("submit fs_read");
+        assert!(
+            outcome.pending_approval.is_none(),
+            "read-only fs_read must auto-run, not wait for approval"
+        );
+        assert_eq!(
+            outcome.status,
+            TaskStatus::Done,
+            "allowlisted file read must complete"
+        );
+
+        let _ = std::fs::remove_dir_all(&canonical);
     }
 
     /// Oletuskokoonpano ([`ActionRuntime::with_default_skills`]) saa
