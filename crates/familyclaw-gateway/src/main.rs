@@ -1247,7 +1247,21 @@ async fn start_runtime(
     // vuoro EI enää täsmäisi heränneen agentin omistajuustarkistukseen (oma
     // suspendoitu vuoro näyttäisi "toiselle olennolle kuuluvalta" eikä sitä
     // voisi koskaan jatkaa). Nimestä johdettu id pysyy vakaana yli restartin.
-    let agent_cfg = AgentConfig::new_with_stable_id(&agent_name, ModelConfig::new(model));
+    // Mallikonfiguraatio: primary + valinnaiset varamallit
+    // (FAMILYCLAW_FALLBACK_MODELS). Ilman fallbackeja agentti ajaa VAIN
+    // primaryllä — jos se on alhaalla/quota loppu, koko olento on hiljaa.
+    // LlmFailover (llm_chain.rs) siirtyy seuraavaan kun primary epäonnistuu.
+    let mut model_cfg = ModelConfig::new(model);
+    let fallbacks = cfg.fallback_models();
+    if fallbacks.is_empty() {
+        info!(agent = %agent_name, "malli: vain primary (ei FAMILYCLAW_FALLBACK_MODELS)");
+    } else {
+        info!(agent = %agent_name, count = fallbacks.len(), "malli: primary + varamallit");
+        for fb in fallbacks {
+            model_cfg = model_cfg.with_fallback(fb);
+        }
+    }
+    let agent_cfg = AgentConfig::new_with_stable_id(&agent_name, model_cfg);
     let soul = load_agent_soul(&agent_name);
     let resolver = build_resolver();
 

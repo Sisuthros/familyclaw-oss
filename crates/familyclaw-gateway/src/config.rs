@@ -271,6 +271,24 @@ impl FamilyConfig {
     pub fn model(&self) -> &str {
         &self.provider.model
     }
+    /// Varamallit järjestyksessä, luettuna `FAMILYCLAW_FALLBACK_MODELS`-env-
+    /// muuttujasta (pilkulla erotettu lista, esim.
+    /// `"nvidia/nemotron-3-ultra-550b-a55b,deepseek-ai/deepseek-v4-pro"`).
+    /// Tyhjät ja primaryn kanssa identtiset karsitaan. Tyhjä lista = ei
+    /// fallbackeja (sama käytös kuin ennen). KERROS A: ei kovakoodattuja
+    /// mallinimiä — perheenjäsenkohtainen ketju tulee ympäristöstä.
+    pub fn fallback_models(&self) -> Vec<String> {
+        std::env::var("FAMILYCLAW_FALLBACK_MODELS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty() && *m != self.provider.model)
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     pub fn channel_kind(&self) -> &str {
         &self.channel.kind
     }
@@ -364,6 +382,32 @@ mod tests {
         // Siivous.
         std::env::remove_var(CANON);
         std::env::remove_var(ALIAS);
+    }
+
+    /// `FAMILYCLAW_FALLBACK_MODELS` parsitaan pilkulla erotetuksi listaksi;
+    /// tyhjät ja primaryn kanssa identtiset karsitaan; puuttuva env = tyhjä
+    /// (taaksepäin-yhteensopiva: agentti ajaa vain primaryllä kuten ennen).
+    /// Env on prosessin laajuinen → kaikki tapaukset peräkkäin + siivous.
+    #[test]
+    fn fallback_models_parsed_from_env() {
+        const VAR: &str = "FAMILYCLAW_FALLBACK_MODELS";
+        std::env::remove_var(VAR);
+
+        let mut cfg = FamilyConfig::default();
+        cfg.provider.model = "primary/model".to_string();
+
+        // Ei env → tyhjä lista (ennallaan).
+        assert!(cfg.fallback_models().is_empty(), "ei env → ei fallbackeja");
+
+        // Pilkkulista, välilyönnit + tyhjät + primary-duplikaatti karsitaan.
+        std::env::set_var(VAR, " a/one ,, primary/model , b/two ,");
+        assert_eq!(
+            cfg.fallback_models(),
+            vec!["a/one".to_string(), "b/two".to_string()],
+            "trim + tyhjien + primaryn karsinta"
+        );
+
+        std::env::remove_var(VAR);
     }
 
     /// Huoltajan `owner_id` latautuu TOML:sta DiscordCfg-kenttänä.
