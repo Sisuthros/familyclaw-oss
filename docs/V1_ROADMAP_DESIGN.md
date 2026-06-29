@@ -405,6 +405,28 @@ skill/policy update`.
 **Effort:** M (1.5-2 wk). **Proof-of-done:** a proposal flows end-to-end to the approval surface;
 an UNAPPROVED proposal NEVER mutates a skill/policy (test); an approved one applies + is audited.
 
+### STATUS (v1.0.1) — safe core SHIPPED; runtime wiring + apply path DEFERRED to v1.1
+
+The `familyclaw-growth` crate ships the **structurally-safe proposal core**: `Proposal`,
+`ProposalStore`, `ProposalKind`, and the `Pending/Approved/Denied` lifecycle. By construction it
+contains **no `apply` method and no path that mutates any skill, policy, or permission** — a
+proposal is inert, human-readable data carrying its proof sources + eval criterion. This half is
+**done, tested, and green** under every gate.
+
+What is **intentionally deferred to v1.1** (and therefore NOT counted as a shipped v1.0 capability):
+- **Stage-1/2 runtime producers** — nothing in the gateway/runtime yet *emits* a `Proposal` from
+  real proof bundles; the crate currently has no production caller (only its own tests). Wiring a
+  real producer is v1.1.
+- **Operator approve/deny surface** (gateway/CLI route to list/approve/deny proposals) — v1.1.
+- **Durable proposal store** (the in-memory store dies on crash; a journaled store is v1.1).
+- **The apply path itself** — deliberately a *separate, later, human-approval-gated PR*. The apply
+  step is an **escalation vector** (allowlist/permission expansion) and must land only with
+  canonicalization + denylist + TOCTOU-safe approval, never rushed. Until then the hard invariants
+  above hold trivially because no apply path exists.
+
+This is a safety decision, not an omission: a v1 that *cannot* silently self-modify is the correct
+v1. The growth loop graduates from "safe inert core" to "wired, gated, end-to-end" in v1.1.
+
 ---
 
 ## 7. What NOT to do
