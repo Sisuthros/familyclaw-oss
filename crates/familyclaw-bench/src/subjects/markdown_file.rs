@@ -45,6 +45,55 @@ use crate::subject::{
 /// vanhin katkaistaan hiljaa (OpenClawin dokumentoitu truncation-raja).
 pub const BOOTSTRAP_BUDGET: usize = 8;
 
+/// Nimetty kilpailijaprofiili tiedosto-pohjaiselle muistille.
+///
+/// Sama in-process-malli parametroituna kahden DOKUMENTOIDUN file-agentin
+/// käyttäytymisen mukaan, jotta `compare` tuottaa **nimetyn** vertailun yhden
+/// geneerisen baselinen sijaan. Edelleen rehellisesti *malli*, EI aito tuote
+/// (ks. tiedoston rehellisyysvaroitus) — vain raja-arvot ovat profiilikohtaisia.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompetitorProfile {
+    /// Geneerinen `MEMORY.md` oldest-first -truncation (oletus, rivibudjetti).
+    Generic,
+    /// OpenClaw-tyylinen: dokumentoitu `MEMORY.md` bootstrap-budjetti, hiljainen
+    /// oldest-first -truncation, ei suojattua ydintä.
+    OpenClaw,
+    /// Hermes-tyylinen: dokumentoitu kova merkkiraja (`MEMORY.md` ~2 200 merkkiä),
+    /// joka katkaisee vanhimman kun summa ylittyy.
+    Hermes,
+}
+
+impl CompetitorProfile {
+    /// Profiilin vakaa subjektinimi scorecardiin.
+    #[must_use]
+    pub fn subject_name(self) -> &'static str {
+        match self {
+            Self::Generic => "markdown-file-baseline",
+            Self::OpenClaw => "openclaw-memory-md-model",
+            Self::Hermes => "hermes-memory-2k-model",
+        }
+    }
+
+    /// Rivibudjetti (`None` = käytä merkkirajaa sen sijaan).
+    #[must_use]
+    fn line_budget(self) -> Option<usize> {
+        match self {
+            Self::Generic | Self::OpenClaw => Some(BOOTSTRAP_BUDGET),
+            Self::Hermes => None,
+        }
+    }
+
+    /// Kova merkkiraja (`None` = käytä rivibudjettia). Hermesin dokumentoitu
+    /// `MEMORY.md`-katto on ~2 200 merkkiä.
+    #[must_use]
+    fn char_budget(self) -> Option<usize> {
+        match self {
+            Self::Hermes => Some(2_200),
+            Self::Generic | Self::OpenClaw => None,
+        }
+    }
+}
+
 /// Rehellinen kilpailija-perustaso: tiedosto-pohjainen Markdown-muistimalli.
 ///
 /// Puhdas in-process — ei lapsiprosessia. Pitää yhtä `MEMORY.md`-tyylistä
@@ -65,6 +114,8 @@ pub struct MarkdownFileSubject {
     last_crash_clean: bool,
     /// Subjektin vakaa nimi scorecardia varten.
     name: String,
+    /// Nimetty kilpailijaprofiili (budjettiraja + nimi).
+    profile: CompetitorProfile,
 }
 
 impl Default for MarkdownFileSubject {
@@ -74,15 +125,23 @@ impl Default for MarkdownFileSubject {
 }
 
 impl MarkdownFileSubject {
-    /// Rakentaa tuoreen perustason tyhjällä muistipuskurilla.
+    /// Rakentaa tuoreen perustason tyhjällä muistipuskurilla (geneerinen profiili).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_profile(CompetitorProfile::Generic)
+    }
+
+    /// Rakentaa perustason nimetyllä kilpailijaprofiililla (OpenClaw/Hermes/geneerinen).
+    /// Budjettiraja ja subjektinimi tulevat profiilista; muu käytös on identtinen.
+    #[must_use]
+    pub fn with_profile(profile: CompetitorProfile) -> Self {
         Self {
             buffer: Vec::new(),
             task: None,
             completed_steps: 0,
             last_crash_clean: true,
-            name: "markdown-file-baseline".to_string(),
+            name: profile.subject_name().to_string(),
+            profile,
         }
     }
 
@@ -94,10 +153,21 @@ impl MarkdownFileSubject {
     /// triviaali rivi heti kun budjetti täyttyy.
     fn push_memory(&mut self, line: impl Into<String>) {
         self.buffer.push(line.into());
-        while self.buffer.len() > BOOTSTRAP_BUDGET {
-            // Vanhin ensin -truncation (puskurin alku). Hiljainen — ei lokia,
-            // ei suojausta: juuri tämä on dokumentoitu OpenClaw-epäonnistuminen.
-            self.buffer.remove(0);
+        // Profiilikohtainen oldest-first -truncation. Hiljainen — ei lokia,
+        // ei suojausta: juuri tämä on dokumentoitu file-agent-epäonnistuminen.
+        if let Some(max_lines) = self.profile.line_budget() {
+            while self.buffer.len() > max_lines {
+                self.buffer.remove(0);
+            }
+        }
+        if let Some(max_chars) = self.profile.char_budget() {
+            // Hermes-malli: kova merkkikatto (~2 200). Karsi vanhin kunnes
+            // koko puskurin merkkisumma mahtuu. Pidä aina vähintään uusin rivi.
+            while self.buffer.len() > 1
+                && self.buffer.iter().map(String::len).sum::<usize>() > max_chars
+            {
+                self.buffer.remove(0);
+            }
         }
     }
 
@@ -391,6 +461,51 @@ mod tests {
     async fn name_is_stable() {
         let subject = MarkdownFileSubject::new();
         assert_eq!(subject.name(), "markdown-file-baseline");
+    }
+
+    #[tokio::test]
+    async fn named_profiles_have_stable_distinct_names() {
+        assert_eq!(
+            MarkdownFileSubject::with_profile(CompetitorProfile::OpenClaw).name(),
+            "openclaw-memory-md-model"
+        );
+        assert_eq!(
+            MarkdownFileSubject::with_profile(CompetitorProfile::Hermes).name(),
+            "hermes-memory-2k-model"
+        );
+        assert_eq!(
+            MarkdownFileSubject::with_profile(CompetitorProfile::Generic).name(),
+            "markdown-file-baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn openclaw_profile_truncates_by_line_budget_oldest_first() {
+        let mut subject = MarkdownFileSubject::with_profile(CompetitorProfile::OpenClaw);
+        let important = "IDENTITY: maintainer is the family creator".to_string();
+        subject.push_memory(important.clone());
+        for i in 0..(BOOTSTRAP_BUDGET + 5) {
+            subject.push_memory(format!("trivia {i}"));
+        }
+        assert_eq!(subject.buffer().len(), BOOTSTRAP_BUDGET, "rivibudjetti");
+        assert!(
+            !subject.buffer().contains(&important),
+            "OpenClaw-malli katkaisee identiteetin hiljaa (oldest-first)"
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_profile_truncates_by_char_budget() {
+        let mut subject = MarkdownFileSubject::with_profile(CompetitorProfile::Hermes);
+        // ~2 200 merkin katto: työnnä reilusti yli → vanhimmat karsiutuvat,
+        // mutta rivimäärä EI ole rajattu (toisin kuin OpenClaw): char-katto hoitaa.
+        let big = "x".repeat(500);
+        for _ in 0..10 {
+            subject.push_memory(big.clone());
+        }
+        let total: usize = subject.buffer().iter().map(String::len).sum();
+        assert!(total <= 2_200, "Hermes-malli pitää merkkisumman katon alla");
+        assert!(!subject.buffer().is_empty(), "uusin rivi säilyy aina");
     }
 
     #[tokio::test]

@@ -14,4 +14,4 @@ pub mod familyclaw;
 pub mod markdown_file;
 
 pub use familyclaw::FamilyClawSubject;
-pub use markdown_file::MarkdownFileSubject;
+pub use markdown_file::{CompetitorProfile, MarkdownFileSubject};
