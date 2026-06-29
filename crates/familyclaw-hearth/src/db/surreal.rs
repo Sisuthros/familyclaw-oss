@@ -176,20 +176,26 @@ DEFINE FIELD decay_class ON anchor TYPE string;
         fn all(
             &self,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<Vec<familyclaw_memory::Memory>>> + Send + '_>,
+            Box<
+                dyn std::future::Future<Output = Result<Vec<familyclaw_memory::Memory>>>
+                    + Send
+                    + '_,
+            >,
         > {
             self.memory.all()
         }
 
         fn len(
             &self,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize>> + Send + '_>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize>> + Send + '_>>
+        {
             self.memory.len()
         }
 
         fn is_empty(
             &self,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>>
+        {
             self.memory.is_empty()
         }
 
@@ -213,7 +219,9 @@ DEFINE FIELD decay_class ON anchor TYPE string;
             at: familyclaw_core::Timestamp,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<familyclaw_memory::DecayReport>> + Send + '_,
+                dyn std::future::Future<Output = Result<familyclaw_memory::DecayReport>>
+                    + Send
+                    + '_,
             >,
         > {
             self.memory.run_decay(thresholds, at)
