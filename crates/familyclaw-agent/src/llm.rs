@@ -470,6 +470,30 @@ impl LlmClient {
         format!("{}/chat/completions", api_base.trim_end_matches('/'))
     }
 
+    /// **Failover gap #1, step 1.** Luokittelee ei-onnistuneen HTTP-vastauksen
+    /// oikeaan [`LlmError`]-varianttiin. Kutsutaan VAIN kun
+    /// `response.status().is_success()` on `false`. Poimii `Retry-After`-headerin
+    /// (429:lle), redaktoi bodyn auth-virheissä (401/403) avainvuotojen
+    /// estämiseksi, ja delegoi luokittelun puhtaalle [`LlmError::from_status`]:lle
+    /// joka on suoraan yksikkötestattavissa ilman verkkoa.
+    async fn error_from_response(response: reqwest::Response) -> LlmError {
+        let status = response.status().as_u16();
+        let retry_after = LlmError::parse_retry_after(
+            response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+        );
+        // Redact body for auth errors to prevent API key leakage in logs.
+        let is_auth = status == 401 || status == 403;
+        let detail = if is_auth {
+            "[redacted]".to_string()
+        } else {
+            response.text().await.unwrap_or_default()
+        };
+        LlmError::from_status(status, &detail, retry_after)
+    }
+
     /// Completes a chat conversation, returning the response text.
     ///
     /// # Errors
@@ -498,15 +522,7 @@ impl LlmClient {
             .map_err(|e| LlmError::from_reqwest("request failed", &e))?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            // Redact body for auth errors to prevent API key leakage in logs.
-            let is_auth = status.as_u16() == 401 || status.as_u16() == 403;
-            let detail = if is_auth {
-                "[redacted]".to_string()
-            } else {
-                response.text().await.unwrap_or_default()
-            };
-            return Err(LlmError::Http(format!("HTTP {status}: {detail}")));
+            return Err(Self::error_from_response(response).await);
         }
 
         let chat_response: ChatCompletionsResponse = response.json().await.map_err(|e| {
@@ -573,15 +589,7 @@ impl LlmClient {
             .map_err(|e| LlmError::from_reqwest("request failed", &e))?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            // Redact body for auth errors to prevent API key leakage in logs.
-            let is_auth = status.as_u16() == 401 || status.as_u16() == 403;
-            let detail = if is_auth {
-                "[redacted]".to_string()
-            } else {
-                response.text().await.unwrap_or_default()
-            };
-            return Err(LlmError::Http(format!("HTTP {status}: {detail}")));
+            return Err(Self::error_from_response(response).await);
         }
 
         let chat_response: ChatCompletionsResponse = response.json().await.map_err(|e| {
@@ -646,14 +654,46 @@ impl CompletionResult {
 }
 
 /// LLM error types.
+///
+/// **Failover gap #1, step 1 — error taxonomy.** Aiemmin *kaikki* ei-onnistuneet
+/// HTTP-statukset romahtivat yhteen [`LlmError::Http`]-luokkaan, jolloin 429
+/// (rate limit), 401/403 (auth/billing) ja 503/529 (overloaded) eivät
+/// erottuneet toisistaan — eriytetty backoff/rotation oli rakenteellisesti
+/// mahdotonta. Nämä variantit *erottavat* failoverille kriittiset tapaukset,
+/// jotta tuleva cooldown/key-rotation -kerros voi haaroittua niihin
+/// ([`LlmError::cooldown_hint`] tarjoaa siemenen). Tämä askel ei vielä rakenna
+/// itse backoff-tilakonetta — vain taksonomian ja sen propagoinnin.
 #[derive(Debug, Clone)]
 pub enum LlmError {
-    /// HTTP request failed (yhteysvirhe tai ei-onnistunut statuskoodi)
+    /// HTTP request failed (yhteysvirhe tai muu ei-onnistunut statuskoodi joka
+    /// ei kuulu tarkempaan luokkaan: yleinen 4xx/5xx, ECONNREFUSED yms.).
     Http(String),
     /// Pyyntö aikakatkaistiin (request- tai connect-timeout). **F1:** tämä on
     /// **retryable** — jumittunut primary antautuu timeoutilla, ja
     /// [`crate::llm_chain::LlmFailover`] siirtyy seuraavaan fallbackiin.
     Timeout(String),
+    /// HTTP 429 — provider rate-limited tämän avaimen/mallin. Retryable, mutta
+    /// **erotettu** [`LlmError::Http`]:sta tarkoituksella: tuleva backoff-kerros
+    /// kohtelee tätä erikseen (odota `retry_after` sekuntia ja/tai kierrätä
+    /// avain-pool). `retry_after` poimitaan `Retry-After`-headerista (sekunteja)
+    /// jos provider sen antaa. [Failover gap #1, step 1]
+    RateLimited {
+        /// Provider-viesti / -konteksti (lokeja varten).
+        message: String,
+        /// `Retry-After`-headerin arvo sekunteina, jos provider antoi sen.
+        retry_after: Option<u64>,
+    },
+    /// HTTP 401/403 — avain on virheellinen, vanhentunut tai laskutus on
+    /// loppunut. **Avain-poolin rotaatiosignaali, EI mallin-fallback-signaali:**
+    /// sama avain epäonnistuu jokaisella mallilla, joten tuleva kerros vaihtaa
+    /// avainta (ei mallia). Body redaktoidaan vuotojen estämiseksi.
+    /// [Failover gap #1, step 1]
+    AuthFailed(String),
+    /// HTTP 503/529 — provider on hetkellisesti ylikuormitettu. Retryable
+    /// backoffilla; **erotettu** [`LlmError::Http`]:sta jotta tuleva kerros voi
+    /// odottaa eskaloituvalla viiveellä saman providerin sijaan kuin jysäyttää
+    /// ketjun läpi. [Failover gap #1, step 1]
+    Overloaded(String),
     /// Response parsing failed
     Parse(String),
     /// No content in response
@@ -678,14 +718,100 @@ impl LlmError {
     /// **ei-retryable**:na, jotta ilmeisen rikkinäinen pyyntö (esim. väärä
     /// request-muoto) ei jauha koko ketjua turhaan; verkko-/timeout-/sisältö-
     /// luokat ovat retryable.
+    /// **Failover gap #1, step 1 — taksonomian propagointi:** uudet variantit
+    /// [`LlmError::RateLimited`], [`LlmError::AuthFailed`] ja
+    /// [`LlmError::Overloaded`] ovat KAIKKI tällä hetkellä retryable, jotta
+    /// ketju etenee *tänään* täsmälleen kuten ennen (yksikään näistä ei ole
+    /// terminaalinen). Ero on että variantit ovat nyt **erillisiä**, joten
+    /// tuleva cooldown/key-rotation -kerros voi haaroittua niihin:
+    /// `RateLimited` → odota `retry_after` ([`Self::cooldown_hint`]),
+    /// `AuthFailed` → kierrätä avain (ei mallia), `Overloaded` → eskaloituva
+    /// backoff. Vain [`LlmError::Parse`] ja [`LlmError::InvalidTool`] ovat
+    /// deterministisesti ei-retryable.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
-            LlmError::Timeout(_) | LlmError::Http(_) | LlmError::NoContent => true,
+            LlmError::Timeout(_)
+            | LlmError::Http(_)
+            | LlmError::NoContent
+            // RateLimited/AuthFailed/Overloaded: distinct variants, mutta tänään
+            // yhä retryable jotta ketju etenee (cooldown-kerros tulee myöhemmin).
+            | LlmError::RateLimited { .. }
+            | LlmError::AuthFailed(_)
+            | LlmError::Overloaded(_) => true,
             // Parse + InvalidTool are deterministic: the same request would fail
             // identically, so do not grind the whole chain.
             LlmError::Parse(_) | LlmError::InvalidTool(_) => false,
         }
+    }
+
+    /// **Failover gap #1, step 1 — siemen tulevalle backoff-tilakoneelle.**
+    /// Palauttaa *ehdotetun* odotusajan ennen kuin sama provider/avain kannattaa
+    /// uudelleenyrittää. Tämä on PUHDAS vihje (ei nuku, ei mutatoi tilaa): tuleva
+    /// cooldown/rotation -kerros kuluttaa sen — nykyinen [`LlmFailover`] ei vielä
+    /// käytä sitä, joten käytös ei muutu.
+    ///
+    /// - [`LlmError::RateLimited`] → `Retry-After`-arvo jos provider antoi sen
+    ///   (sekunteina), muuten oletus [`Self::DEFAULT_RATE_LIMIT_COOLDOWN`].
+    /// - [`LlmError::Overloaded`] → oletus [`Self::DEFAULT_OVERLOAD_COOLDOWN`]
+    ///   (provider toipuu — odota ennen samalle providerille palaamista).
+    /// - Kaikki muut → `None` (ei luonteva cooldown; failover vaihtaa
+    ///   klienttiä välittömästi).
+    ///
+    /// [`LlmFailover`]: crate::llm_chain::LlmFailover
+    #[must_use]
+    pub fn cooldown_hint(&self) -> Option<Duration> {
+        match self {
+            LlmError::RateLimited { retry_after, .. } => {
+                Some(retry_after.map_or(Self::DEFAULT_RATE_LIMIT_COOLDOWN, Duration::from_secs))
+            }
+            LlmError::Overloaded(_) => Some(Self::DEFAULT_OVERLOAD_COOLDOWN),
+            LlmError::Http(_)
+            | LlmError::Timeout(_)
+            | LlmError::AuthFailed(_)
+            | LlmError::Parse(_)
+            | LlmError::NoContent
+            | LlmError::InvalidTool(_) => None,
+        }
+    }
+
+    /// Oletus-cooldown 429:lle kun provider EI anna `Retry-After`-headeria.
+    /// Maltillinen 5 s — tulevan backoff-kerroksen lähtöarvo, ei lopullinen.
+    pub const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5);
+
+    /// Oletus-cooldown 503/529 (overloaded) -tapaukselle. 2 s: provider on
+    /// elossa mutta tukkoinen, lyhyempi odotus kuin rate-limitissä riittää.
+    pub const DEFAULT_OVERLOAD_COOLDOWN: Duration = Duration::from_secs(2);
+
+    /// **Failover gap #1, step 1 — testattava seam.** Kuvaa ei-onnistuneen
+    /// HTTP-statuskoodin oikeaan [`LlmError`]-varianttiin. `detail` on jo
+    /// (auth-tapauksessa redaktoitu) body/konteksti-viesti; `retry_after` on
+    /// `Retry-After`-headerista parsittu sekuntimäärä jos läsnä.
+    ///
+    /// - 429 → [`LlmError::RateLimited`] (`retry_after` mukaan).
+    /// - 401/403 → [`LlmError::AuthFailed`] (avain-rotaatiosignaali).
+    /// - 503/529 → [`LlmError::Overloaded`] (provider ylikuormitettu).
+    /// - muut → [`LlmError::Http`].
+    #[must_use]
+    fn from_status(status: u16, detail: &str, retry_after: Option<u64>) -> Self {
+        match status {
+            429 => LlmError::RateLimited {
+                message: format!("HTTP 429: {detail}"),
+                retry_after,
+            },
+            401 | 403 => LlmError::AuthFailed(format!("HTTP {status}: {detail}")),
+            503 | 529 => LlmError::Overloaded(format!("HTTP {status}: {detail}")),
+            _ => LlmError::Http(format!("HTTP {status}: {detail}")),
+        }
+    }
+
+    /// Parsii `Retry-After`-headerin **sekunneiksi**. OpenAI-yhteensopivat
+    /// providerit antavat tyypillisesti kokonaisluvun (delta-seconds); HTTP-date
+    /// -muotoa EI tueta tässä (palautuu `None`, jolloin oletus-cooldown astuu
+    /// voimaan). Puhdas funktio → suoraan testattavissa.
+    #[must_use]
+    fn parse_retry_after(value: Option<&str>) -> Option<u64> {
+        value?.trim().parse::<u64>().ok()
     }
 
     /// Kuvaa `reqwest::Error`:n oikeaan [`LlmError`]-luokkaan: aito timeout →
@@ -710,6 +836,15 @@ impl std::fmt::Display for LlmError {
         match self {
             LlmError::Http(msg) => write!(f, "HTTP error: {msg}"),
             LlmError::Timeout(msg) => write!(f, "Timeout error: {msg}"),
+            LlmError::RateLimited {
+                message,
+                retry_after,
+            } => match retry_after {
+                Some(s) => write!(f, "Rate limited (retry after {s}s): {message}"),
+                None => write!(f, "Rate limited: {message}"),
+            },
+            LlmError::AuthFailed(msg) => write!(f, "Auth failed: {msg}"),
+            LlmError::Overloaded(msg) => write!(f, "Provider overloaded: {msg}"),
             LlmError::Parse(msg) => write!(f, "Parse error: {msg}"),
             LlmError::NoContent => write!(f, "No content in response"),
             LlmError::InvalidTool(msg) => write!(f, "Invalid tool definition: {msg}"),
@@ -1105,6 +1240,160 @@ mod tests {
         let e = LlmError::Timeout("request failed: operation timed out".into());
         let s = format!("{e}");
         assert!(s.starts_with("Timeout error:"), "got: {s}");
+    }
+
+    // ── Failover gap #1, step 1 — error taxonomy ────────────────────────────
+
+    #[test]
+    fn new_variants_are_retryable_today() {
+        // Taksonomia erottaa variantit, mutta tänään kaikki kolme ovat yhä
+        // retryable jotta ketju etenee kuten ennen (cooldown-kerros tulee myöhemmin).
+        assert!(LlmError::RateLimited {
+            message: "429".into(),
+            retry_after: Some(3),
+        }
+        .is_retryable());
+        assert!(LlmError::AuthFailed("bad key".into()).is_retryable());
+        assert!(LlmError::Overloaded("503".into()).is_retryable());
+    }
+
+    #[test]
+    fn from_status_maps_429_to_rate_limited_with_retry_after() {
+        let e = LlmError::from_status(429, "slow down", Some(12));
+        match e {
+            LlmError::RateLimited {
+                message,
+                retry_after,
+            } => {
+                assert_eq!(retry_after, Some(12));
+                assert!(message.contains("429"), "got: {message}");
+                assert!(message.contains("slow down"), "got: {message}");
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_status_maps_429_without_retry_after() {
+        let e = LlmError::from_status(429, "limited", None);
+        assert!(matches!(
+            e,
+            LlmError::RateLimited {
+                retry_after: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn from_status_maps_auth_codes() {
+        assert!(matches!(
+            LlmError::from_status(401, "[redacted]", None),
+            LlmError::AuthFailed(_)
+        ));
+        assert!(matches!(
+            LlmError::from_status(403, "[redacted]", None),
+            LlmError::AuthFailed(_)
+        ));
+    }
+
+    #[test]
+    fn from_status_maps_overload_codes() {
+        assert!(matches!(
+            LlmError::from_status(503, "busy", None),
+            LlmError::Overloaded(_)
+        ));
+        assert!(matches!(
+            LlmError::from_status(529, "busy", None),
+            LlmError::Overloaded(_)
+        ));
+    }
+
+    #[test]
+    fn from_status_falls_back_to_http_for_other_codes() {
+        // 400/404/500 yms. eivät kuulu tarkkaan luokkaan → yleinen Http.
+        for code in [400_u16, 404, 418, 500, 502] {
+            assert!(
+                matches!(LlmError::from_status(code, "x", None), LlmError::Http(_)),
+                "status {code} should map to Http"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_retry_after_handles_integer_seconds() {
+        assert_eq!(LlmError::parse_retry_after(Some("30")), Some(30));
+        assert_eq!(LlmError::parse_retry_after(Some("  7 ")), Some(7));
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_non_integer_and_missing() {
+        // HTTP-date-muotoa ei tueta → None (oletus-cooldown astuu voimaan).
+        assert_eq!(
+            LlmError::parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(LlmError::parse_retry_after(Some("")), None);
+        assert_eq!(LlmError::parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn cooldown_hint_uses_retry_after_when_present() {
+        let e = LlmError::RateLimited {
+            message: "429".into(),
+            retry_after: Some(15),
+        };
+        assert_eq!(e.cooldown_hint(), Some(Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn cooldown_hint_defaults_for_rate_limit_without_retry_after() {
+        let e = LlmError::RateLimited {
+            message: "429".into(),
+            retry_after: None,
+        };
+        assert_eq!(
+            e.cooldown_hint(),
+            Some(LlmError::DEFAULT_RATE_LIMIT_COOLDOWN)
+        );
+    }
+
+    #[test]
+    fn cooldown_hint_for_overloaded_uses_default() {
+        assert_eq!(
+            LlmError::Overloaded("503".into()).cooldown_hint(),
+            Some(LlmError::DEFAULT_OVERLOAD_COOLDOWN)
+        );
+    }
+
+    #[test]
+    fn cooldown_hint_is_none_for_non_rate_errors() {
+        assert!(LlmError::AuthFailed("bad".into()).cooldown_hint().is_none());
+        assert!(LlmError::Http("conn".into()).cooldown_hint().is_none());
+        assert!(LlmError::Timeout("slow".into()).cooldown_hint().is_none());
+        assert!(LlmError::NoContent.cooldown_hint().is_none());
+        assert!(LlmError::Parse("bad".into()).cooldown_hint().is_none());
+        assert!(LlmError::InvalidTool("bad".into())
+            .cooldown_hint()
+            .is_none());
+    }
+
+    #[test]
+    fn new_variants_display_distinctly() {
+        let rl = LlmError::RateLimited {
+            message: "429: limited".into(),
+            retry_after: Some(9),
+        };
+        let s = format!("{rl}");
+        assert!(s.contains("Rate limited"), "got: {s}");
+        assert!(s.contains("retry after 9s"), "got: {s}");
+
+        assert!(
+            format!("{}", LlmError::AuthFailed("HTTP 401: [redacted]".into()))
+                .starts_with("Auth failed:")
+        );
+        assert!(format!("{}", LlmError::Overloaded("HTTP 503: x".into()))
+            .starts_with("Provider overloaded:"));
     }
 
     #[tokio::test]
