@@ -585,6 +585,32 @@ impl MemoryStore for LocalJsonStore {
     }
 }
 
+/// Vektoritason laajennus [`MemoryStore`]-toteutuksille (Phase 3b).
+///
+/// Tämä trait erottaa vektorien tallennuksen ja lähimmän naapurin haun
+/// [`MemoryStore`]-perusrajapinnasta, jotta semanttinen tier voidaan toteuttaa
+/// (esim. embedded-LanceDB) erillisessä cratessa ilman että `MemoryStore`-pohja
+/// muuttuu. Käytössä vain `vector-store`-feature päällä; oletuskäännös on
+/// tavu-identtinen tämän laajennuksen kanssa ja ilman.
+///
+/// Vektorit ovat [`crate::memory::Memory::embedding`]-kentän sisältöä, ja haun
+/// tulokset syöttävät [`crate::retrieval::RetrievalContext`]-cosine-polun.
+#[cfg(feature = "vector-store")]
+pub trait VectorStore: Send + Sync {
+    /// Tallentaa tai päivittää annetun muistin id:n embedding-vektorin.
+    ///
+    /// # Errors
+    /// Palauttaa virheen jos vektorin kirjoitus epäonnistuu.
+    fn upsert_vector(&self, id: MessageId, embedding: Vec<f32>) -> BoxFuture<'_, Result<()>>;
+
+    /// Palauttaa `k` lähintä `(id, cosine-score)`-paria kyselyvektorille,
+    /// lasketaan suurimmasta similariteetista pienimpään.
+    ///
+    /// # Errors
+    /// Palauttaa virheen jos vektorihaku epäonnistuu.
+    fn nearest(&self, query: &[f32], k: usize) -> BoxFuture<'_, Result<Vec<(MessageId, f32)>>>;
+}
+
 #[cfg(test)]
 mod tests {
     // Testit vertaavat tarkasti esitettäviä f32-vakioita — tarkka vertailu ok.

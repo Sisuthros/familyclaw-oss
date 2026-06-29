@@ -11,6 +11,12 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Vektoritason laajennus (Phase 3b). Oletuksena pois → oletuskäännös on
+# tavu-identtinen tämän kanssa ja ilman. Phase 3b (familyclaw-lancevec)
+# laajentaa tätä: lance = ["dep:familyclaw-lancevec", "vector-store"].
+vector-store = []
+
 [dependencies]
 familyclaw-core = { workspace = true }
 familyclaw-embeddings = { workspace = true }
