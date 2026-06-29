@@ -1047,6 +1047,13 @@ fn resolve_addr() -> Result<SocketAddr> {
 ///
 /// Muoto: `prefix=base_url=KEY_ENV` puolipistein eroteltuna, esim.
 /// `openai=https://api.openai.com/v1=OPENAI_API_KEY;deepseek=https://api.deepseek.com/v1=DEEPSEEK_API_KEY`.
+///
+/// **Key-pool (failover gap #1 step 3):** `KEY_ENV`-kenttä voi olla
+/// **pilkulla eroteltu lista** env-muuttujia, jolloin avaimet kierrätetään
+/// round-robinilla `AuthFailed`-tilanteessa ennen koko providerin jäähdytystä,
+/// esim. `openai=https://api.openai.com/v1=OPENAI_API_KEY_1,OPENAI_API_KEY_2`.
+/// Yhden avaimen syntaksi (`=OPENAI_API_KEY`) on yhä taaksepäin-yhteensopiva.
+///
 /// Tyhjä/asettamaton muuttuja → tyhjä resolveri (agentti ajaa ilman LLM:ää).
 /// Virheelliset rivit ohitetaan varoituksella — yksi typo ei kaada gatewayta.
 fn build_resolver() -> EnvEndpointResolver {
@@ -1056,15 +1063,22 @@ fn build_resolver() -> EnvEndpointResolver {
     };
     for entry in spec.split(';').filter(|s| !s.trim().is_empty()) {
         let parts: Vec<&str> = entry.splitn(3, '=').map(str::trim).collect();
-        if let [prefix, base_url, key_env] = parts.as_slice() {
-            if !prefix.is_empty() && !base_url.is_empty() && !key_env.is_empty() {
-                resolver = resolver.with_provider(*prefix, *base_url, *key_env);
+        if let [prefix, base_url, key_field] = parts.as_slice() {
+            // Avain-kenttä voi olla pilkulla eroteltu pool (round-robin-rotaatio).
+            let key_envs: Vec<String> = key_field
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect();
+            if !prefix.is_empty() && !base_url.is_empty() && !key_envs.is_empty() {
+                resolver = resolver.with_provider_keys(*prefix, *base_url, key_envs);
                 continue;
             }
         }
         warn!(
             entry,
-            "ohitetaan kelvoton {PROVIDERS_ENV}-rivi (odotettu prefix=base_url=KEY_ENV)"
+            "ohitetaan kelvoton {PROVIDERS_ENV}-rivi (odotettu prefix=base_url=KEY_ENV[,KEY_ENV2])"
         );
     }
     resolver
