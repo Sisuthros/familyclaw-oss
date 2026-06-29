@@ -1,28 +1,36 @@
-//! SurrealDB v3 backend for The Hearth.
+//! `SurrealDB` v3 backend for The Hearth.
 //!
-//! Implements [`HearthStore`] trait using SurrealDB (`surrealdb::Surreal<Any>`).
-//! Supports in-memory dev and RocksDB production backends via the same client.
+//! Implements [`HearthStore`] trait using `SurrealDB` (`surrealdb::Surreal<Any>`).
+//! Supports in-memory dev and `RocksDB` production backends via the same client.
 //!
 //! Feature-gated behind `surreal` flag.
 
+/// `SurrealDB`-pohjaiset Hearth-toteutukset (feature-gated `surreal`).
 #[cfg(feature = "surreal")]
+#[allow(clippy::module_inception)]
 pub mod surreal {
-    use crate::{
-        emotional_state::EmotionalVector, narrative::EventType, HearthStore, NarrativeThread,
-    };
+    use crate::{emotional_state::EmotionalVector, HearthStore, NarrativeThread};
     use familyclaw_core::Result;
+    use familyclaw_memory::LocalJsonStore;
     use std::sync::Arc;
     use surrealdb::{engine::any::Any, Surreal};
     use uuid::Uuid;
 
-    /// SurrealDB-backed HearthStore implementation.
+    /// `SurrealDB`-backed [`HearthStore`] implementation.
     #[derive(Clone)]
     pub struct SurrealHearthStore {
         db: Arc<Surreal<Any>>,
+        /// `MemoryStore`-supertraitin toteutus. `SurrealDB`-pohjainen
+        /// `MemoryStore`-backend ei ole vielä valmis (skeeman `memory_event`
+        /// -taulu on määritelty muttei kytketty), joten supertrait
+        /// delegoidaan kevyeen muistinvaraiseen [`LocalJsonStore`]:hen.
+        /// Tämä pitää `HearthStore: MemoryStore`-rajan tyydytettynä ilman
+        /// `todo!()`/`unimplemented!()`-paniikkeja.
+        memory: Arc<LocalJsonStore>,
     }
 
     impl SurrealHearthStore {
-        /// Connect to SurrealDB and initialize schema.
+        /// Connect to `SurrealDB` and initialize schema.
         ///
         /// # Arguments
         /// * `conn_str` - Connection string, e.g.:
@@ -53,13 +61,16 @@ pub mod surreal {
             // Initialize schema
             Self::init_schema(&db).await?;
 
-            Ok(Self { db: Arc::new(db) })
+            Ok(Self {
+                db: Arc::new(db),
+                memory: Arc::new(LocalJsonStore::in_memory()),
+            })
         }
 
         /// Initialize the Hearth schema (tables, indexes).
         async fn init_schema(db: &Surreal<Any>) -> Result<()> {
             // Hardcoded schema to avoid include_str issues
-            let schema_sql = r#"
+            let schema_sql = r"
 DEFINE TABLE memory_event SCHEMAFULL;
 DEFINE FIELD id ON memory_event TYPE string;
 DEFINE FIELD content ON memory_event TYPE string;
@@ -101,7 +112,7 @@ DEFINE FIELD agent_name ON anchor TYPE string;
 DEFINE FIELD content_hash ON anchor TYPE string;
 DEFINE FIELD protected ON anchor TYPE bool;
 DEFINE FIELD decay_class ON anchor TYPE string;
-"#;
+";
 
             db.query(schema_sql).await.map_err(|e| {
                 familyclaw_core::FamilyClawError::Memory(format!("Schema init failed: {e}"))
@@ -113,6 +124,99 @@ DEFINE FIELD decay_class ON anchor TYPE string;
         /// Get the underlying DB for advanced operations.
         pub fn db(&self) -> &Arc<Surreal<Any>> {
             &self.db
+        }
+    }
+
+    impl familyclaw_memory::MemoryStore for SurrealHearthStore {
+        fn add(
+            &self,
+            memory: familyclaw_memory::Memory,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<familyclaw_core::MessageId>> + Send + '_>,
+        > {
+            self.memory.add(memory)
+        }
+
+        fn get(
+            &self,
+            id: familyclaw_core::MessageId,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<familyclaw_memory::Memory>>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.memory.get(id)
+        }
+
+        fn update(
+            &self,
+            memory: familyclaw_memory::Memory,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+            self.memory.update(memory)
+        }
+
+        fn reinforce(
+            &self,
+            id: familyclaw_core::MessageId,
+            at: familyclaw_core::Timestamp,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+            self.memory.reinforce(id, at)
+        }
+
+        fn set_status(
+            &self,
+            id: familyclaw_core::MessageId,
+            status: familyclaw_memory::MemoryStatus,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+            self.memory.set_status(id, status)
+        }
+
+        fn all(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<familyclaw_memory::Memory>>> + Send + '_>,
+        > {
+            self.memory.all()
+        }
+
+        fn len(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize>> + Send + '_>> {
+            self.memory.len()
+        }
+
+        fn is_empty(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>> {
+            self.memory.is_empty()
+        }
+
+        fn retrieve(
+            &self,
+            ctx: &familyclaw_memory::RetrievalContext,
+            at: familyclaw_core::Timestamp,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<familyclaw_memory::RetrievalResult>>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.memory.retrieve(ctx, at)
+        }
+
+        fn run_decay(
+            &self,
+            thresholds: familyclaw_memory::DecayThresholds,
+            at: familyclaw_core::Timestamp,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<familyclaw_memory::DecayReport>> + Send + '_,
+            >,
+        > {
+            self.memory.run_decay(thresholds, at)
         }
     }
 
@@ -148,6 +252,14 @@ DEFINE FIELD decay_class ON anchor TYPE string;
                 }
 
                 let row = &rows[0];
+                // `narrative_thread` ei tallenna erillistä `updated_at`-kenttää
+                // (vrt. skeema), joten round-trippaa se `created_at`:sta kuten
+                // `NarrativeThread::new` (luonnissa `updated_at == created_at`).
+                let created_at = row
+                    .get("created_at")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map_or_else(chrono::Utc::now, |dt| dt.with_timezone(&chrono::Utc));
                 let thread = NarrativeThread {
                     id: Uuid::parse_str(row.get("id").and_then(|v| v.as_str()).unwrap_or(""))
                         .unwrap_or_else(|_| Uuid::nil()),
@@ -165,12 +277,8 @@ DEFINE FIELD decay_class ON anchor TYPE string;
                                 .collect()
                         })
                         .unwrap_or_default(),
-                    created_at: row
-                        .get("created_at")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .unwrap_or_else(chrono::Utc::now),
+                    created_at,
+                    updated_at: created_at,
                     events: Vec::new(), // Events loaded separately
                 };
                 Ok(Some(thread))
@@ -232,15 +340,30 @@ DEFINE FIELD decay_class ON anchor TYPE string;
 
                 let row = &rows[0];
                 Ok(EmotionalVector {
-                    joy: row.get("joy").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                    sadness: row.get("sadness").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                    curiosity: row.get("curiosity").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                    anxiety: row.get("anxiety").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    joy: row
+                        .get("joy")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0),
+                    sadness: row
+                        .get("sadness")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0),
+                    curiosity: row
+                        .get("curiosity")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0),
+                    anxiety: row
+                        .get("anxiety")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0),
                     confidence: row
                         .get("confidence")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0) as f32,
-                    affection: row.get("affection").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0),
+                    affection: row
+                        .get("affection")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0),
                 })
             })
         }
