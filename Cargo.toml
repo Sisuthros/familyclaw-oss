@@ -1,5 +1,9 @@
 [workspace]
 members = ["crates/*", "examples/minimal-gateway"]
+# NOTE: "compiler" (the experimental Claw language) is intentionally excluded from the
+# workspace build until it compiles cleanly. It is a future side-project, not part of the
+# agent runtime, and must not block the core build. Re-add once parser.rs is complete.
+exclude = ["compiler"]
 resolver = "2"
 
 [workspace.package]
