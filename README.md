@@ -13,14 +13,20 @@ and private runtime profiles that never enter the repository.
 > hardening, and a clear distinction between checkpoint-style persistence and
 > crash-safe external action dispatch.
 >
-> **Built — but not yet proven end-to-end:** live multi-agent orchestration
-> (`familyclaw-gateway orchestrate` — Orchestrator + `LiveTurnExecutor` exist and are
-> wired, but the multi-agent integration test still runs against a mock executor, so
-> the live coordination path is **built, unproven**, not "shipped"). Send-side latent
-> translation is a fenced research track, not production behavior.
+> **Proven end-to-end (2026-06):** live multi-agent orchestration. The
+> `Orchestrator` now runs a multi-node `design → review → deploy` DAG through the
+> real `LiveTurnExecutor` against an in-process HTTP LLM, deliverables pass the
+> contract boundary (output schema + postconditions), and a malformed LLM response
+> stops the DAG at that boundary instead of leaking downstream
+> (`crates/familyclaw-agent/tests/orchestration_live.rs`,
+> `tests/live_executor_http.rs`). The orchestrator itself was unchanged — only the
+> executor swapped from mock to live, exactly as the `TurnExecutor` seam was designed.
 >
-> **Next proofs:** live multi-agent integration, deeper WASM sandbox safety with
-> end-to-end tests, a practical action/skill runtime, and additional channel adapters.
+> **Still a fenced research track, not production behavior:** send-side latent
+> translation.
+>
+> **Next proofs:** deeper WASM sandbox safety scenarios, a broader action/skill
+> runtime surface, and additional channel adapters.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Rust 2021](https://img.shields.io/badge/Rust-2021%20edition-orange.svg)
@@ -264,9 +270,9 @@ Risk-first, proof-first, no private Layer B data in public repo.
 |-------|--------|---------|
 | **Phase 1 — reliability core** | **MERGED** | Tool loops, approval/resume, Discord hardening, at-most-once side-effect dispatch, CI green. |
 | **Post-merge polish** | **NOW** | README truth, release notes, crash-safe dispatch case study, tagged release candidate. |
-| **Action / Skill Runtime** | **NEXT** | Safe skills, task queue, MCP-ready boundary, approval gate, proof bundles, mocked real-world evals. |
-| **Live multi-agent proof** | **NEXT** | Replace mock executor proof with live `Orchestrator + LiveTurnExecutor` integration. |
-| **WASM sandbox e2e** | **NEXT** | Fuel exhaustion, denied capabilities, per-invocation credential isolation. |
+| **Live multi-agent proof** | **DONE (2026-06)** | `Orchestrator + LiveTurnExecutor` proven against an in-process HTTP LLM: multi-node DAG runs to completion through the contract boundary, malformed responses stop at that boundary (`orchestration_live.rs`, `live_executor_http.rs`). |
+| **Action / Skill Runtime** | **BUILT** | Safe skills, task queue, MCP-ready boundary, approval gate (TTL + payload-hash-bound), proof bundles, evals — `familyclaw-actions` (240+ tests). Broadening the skill surface is ongoing. |
+| **WASM sandbox e2e** | **DONE** | Fuel exhaustion stops an infinite loop, denied capabilities are enforced, run under the `wasmtime` feature in CI (`sandbox_integration.rs`). |
 | **Additional channel adapters** | **LATER** | Add adapters only after action/runtime and safety gates remain green. |
 
 ---

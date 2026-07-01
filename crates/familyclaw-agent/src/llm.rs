@@ -419,6 +419,13 @@ impl<'a> From<&'a ToolDefinition> for ToolEnvelope<'a> {
 }
 
 /// LLM client — stateless HTTP caller for OpenAI-compatible APIs.
+///
+/// `Clone` is cheap: [`LlmConfig`] is a small owned struct and
+/// [`reqwest::Client`] is an `Arc`-backed handle (cloning shares the same
+/// connection pool). The failover layer ([`crate::llm_chain::LlmFailover`])
+/// clones the active client handle out from under its lock so the HTTP `.await`
+/// happens without holding the mutex.
+#[derive(Clone)]
 pub struct LlmClient {
     config: LlmConfig,
     client: Client,
