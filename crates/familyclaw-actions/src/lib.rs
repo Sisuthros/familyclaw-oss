@@ -26,9 +26,14 @@
 //! ## OSS-raja (KERROS A)
 //! Tämä crate on julkaistava. Se sisältää vain **geneerisiä tyyppejä** — ei
 //! oikeita providereita, sieluja, API-avaimia, tokeneita, IP-osoitteita eikä
-//! henkilökohtaisia polkuja. Taidot ovat **mockeja**: ei oikeita Gmail-/GitHub-
-//! verkkokutsuja. Todistepaketit **redaktoivat** salaisuudelta näyttävät arvot
-//! ennen tallennusta.
+//! henkilökohtaisia polkuja. Mukana on **kaksi aitoa referenssitaitoa**
+//! ([`FsReadAllowlisted`] paikallinen tiedostonluku,
+//! [`WebFetchSkill`](skills::WebFetchSkill) read-only
+//! HTTP-GET SSRF-vartioinnilla) jotka tekevät oikeaa työtä ilman avaimia; loput
+//! taidot ovat **esimerkkimalleja** jotka näyttävät taidon sopimuksen ja joihin
+//! kytket oman tarjoajasi (ei oikeita Gmail-/GitHub-verkkokutsuja valmiina).
+//! Todistepaketit **redaktoivat** salaisuudelta näyttävät arvot ennen
+//! tallennusta.
 //!
 //! ## Suunnitteluperiaatteet
 //! - **Ei `unwrap()`/`expect()`/`panic!()` tuotantopolulla.** Kaikki virheet

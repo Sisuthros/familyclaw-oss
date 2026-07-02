@@ -1,11 +1,14 @@
-//! Mock-taito: paikallisen tiedoston muutosehdotus (patch) (KERROS A).
+//! Esimerkkimalli (reference pattern): paikallisen tiedoston muutosehdotus (patch) (KERROS A).
 //!
 //! [`FilePatchMock`] ottaa tiedoston sisällön ([`FilePatchInput::file_content`])
 //! ja pyydetyn muutoksen ([`FilePatchInput::requested_edit`]) ja tuottaa
-//! **patch-ehdotuksen** (yhtenäinen diff). Taito EI kirjoita levylle — se vain
-//! ehdottaa muutoksen. Varsinainen paikallinen kirjoitus
-//! ([`crate::policy::ActionRisk::WriteLocal`]) vaatii ihmisen hyväksynnän ennen
-//! suoritusta (manifestin käytäntö pakottaa hyväksynnän).
+//! **patch-ehdotuksen** (yhtenäinen diff). Tämä on **referenssimalli joka
+//! näyttää taidon sopimuksen** paikallista levykirjoitusta varten:
+//! suorituslogiikka on deterministinen ja muistinvarainen (se vain ehdottaa
+//! muutoksen), ja manifesti luokittelee sen paikalliseksi kirjoitukseksi
+//! ([`crate::policy::ActionRisk::WriteLocal`]) joka pakottaa ihmisen hyväksynnän
+//! ennen suoritusta. Kytke oma levylle-soveltaja tähän suoritusrunkoon, kun
+//! haluat oikeasti kirjoittaa patchin — hyväksyntäportti pysyy paikallaan.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

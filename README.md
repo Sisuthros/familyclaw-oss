@@ -130,7 +130,7 @@ paths, and ships unit tests in-module.
 | [`familyclaw-hearth`](crates/familyclaw-hearth) | **The Hearth** — shared family memory, narratives, emotional state and anchors. |
 | [`familyclaw-observability`](crates/familyclaw-observability) | **Observability** — metrics, event recording and per-role RBAC for the multi-agent fleet. |
 | [`familyclaw-runtime`](crates/familyclaw-runtime) | **Runtime assembly** — wires bus + agents + channels + reply pump (`build_family`). |
-| [`familyclaw-actions`](crates/familyclaw-actions) | **Action/Skill Runtime** — observe → plan → approve → execute → verify → persist proof → remember → report. Generic skill registry, capability policy, approval gate, redacting proof bundles and audit log. Mock skills only, no providers or keys. |
+| [`familyclaw-actions`](crates/familyclaw-actions) | **Action/Skill Runtime** — observe → plan → approve → execute → verify → persist proof → remember → report. Generic skill registry, capability policy, approval gate, redacting proof bundles and audit log. Ships **two real reference skills** (`fs_read`, `web_fetch`) plus example skill patterns that show the skill contract — no private providers or keys. See [Skills](#skills-two-real-reference-skills--example-patterns). |
 
 ---
 
@@ -164,6 +164,43 @@ powershell -File scripts/public-demo.ps1
 6. 🛑 Clean shutdown on Ctrl-C or timeout
 
 *No Telegram, Discord, or API keys needed. Pure Rust, pure demo.*
+
+### Run the gateway in 5 minutes (guest path — no family keys) 🧭
+
+Prefer a real, installed binary over `cargo run`? Install the gateway and start
+it in **keyless mode** (`FAMILYCLAW_CHANNEL_KIND=none`). No SOUL files, no API
+keys, no channel tokens — just the HTTP surface (`/healthz`, `/readyz`,
+`/metrics`) backed by an in-memory `MockChannel`. This is the fastest way for a
+newcomer to confirm the runtime is alive on their machine.
+
+```bash
+git clone https://github.com/Sisuthros/familyclaw
+cd familyclaw
+
+# 1. Install the gateway binary (name: familyclaw-gateway)
+cargo install --path crates/familyclaw-gateway
+
+# 2. Pre-flight checks (config resolution + effective settings, no network)
+familyclaw-gateway doctor
+
+# 3. Start it with NO family keys — keyless publish mode
+FAMILYCLAW_CHANNEL_KIND=none familyclaw-gateway serve
+#   listens on 127.0.0.1:8787 by default (override: FAMILYCLAW_GATEWAY_ADDR)
+
+# 4. In another terminal: confirm the HTTP surface is live
+curl -i http://127.0.0.1:8787/healthz   # -> 200 OK
+curl -i http://127.0.0.1:8787/readyz    # -> 200 OK (bus running)
+```
+
+On Windows PowerShell, set the env var inline:
+
+```powershell
+$env:FAMILYCLAW_CHANNEL_KIND = "none"; familyclaw-gateway serve
+```
+
+That is the whole guest loop: **install → doctor → serve → curl.** Once
+`/readyz` returns `200`, the platform (Layer A) is running on your box with zero
+private data. Wiring a real family (Layer B) is the next section.
 
 ### Full test suite
 ```bash
@@ -211,6 +248,40 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/... \
 cargo run -p familyclaw-agent --features familyclaw-channels/discord
 ```
 Inbound gateway: live — Ed25519 signature verification, slash command parsing (`crates/familyclaw-gateway/src/main.rs`, `handle_discord_interaction`).
+
+---
+
+## Skills: two real reference skills + example patterns
+
+The Action/Skill Runtime (`familyclaw-actions`) drives every skill through the
+same safety pipeline: **observe → plan → approve (if needed) → execute → verify
+→ persist proof → remember → report.** Policy is always derived from the skill
+manifest — never from the (possibly attacker-controlled) task payload.
+
+FamilyClaw ships **two genuinely functional reference skills** that exercise the
+full pipeline end to end. They exist so you can see the two real integration
+surfaces — one local, one public network — with the safety rails already in
+place:
+
+| Reference skill | What it really does | Why it's the template |
+|-----------------|---------------------|-----------------------|
+| [`fs_read`](crates/familyclaw-actions/src/skills/fs_read.rs) | Reads a **local file** through a canonicalized allowlist (resolves `..`, follows symlinks to their real target, rejects any escape). Proof records only a path hash + size, never the file body. | The pattern for a **local, filesystem-touching** skill: capability-scoped, taint-preserving, no data leakage into proofs. |
+| [`web_fetch`](crates/familyclaw-actions/src/skills/web_fetch.rs) | Performs a **real read-only HTTP GET** (`reqwest`) against a public URL, with structural SSRF guards (rejects non-`http(s)` schemes, `localhost`, private/loopback/link-local/CGNAT IPs incl. the cloud metadata address) and no redirect following. Response is size-capped; only the host is recorded. | The pattern for a **public-API / network** skill that needs no keys: shows how to reach the outside world safely. Fetched content is always tainted. |
+
+**The other bundled skills — `email_triage`, `github_issue_draft`, `file_patch`,
+`discord_thread_summary` — are example skill patterns**, not disabled stubs.
+Each is a complete, tested implementation of the skill *contract* (manifest,
+risk class, approval policy, input/output schema, taint handling) using
+deterministic in-memory logic and generic placeholder data (`user@example.com`,
+`example-org/example-repo`). They deliberately do **not** carry a provider or a
+credential. To turn one into a live integration, keep the manifest and pipeline
+wiring as-is and swap the execution body for your provider call (Gmail, the
+GitHub API, an on-disk patch apply, the Discord API). The surrounding approval
+gate, proof redaction, and audit log then apply to your real side effect for
+free.
+
+In short: `fs_read` and `web_fetch` prove the runtime does real work today;
+the others hand you a ready-made contract to wire your own provider into.
 
 ---
 

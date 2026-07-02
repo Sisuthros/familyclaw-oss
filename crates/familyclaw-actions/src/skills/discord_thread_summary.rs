@@ -1,10 +1,13 @@
-//! Mock-taito: Discord-keskusteluketjun tiivistys (KERROS A).
+//! Esimerkkimalli (reference pattern): Discord-keskusteluketjun tiivistys (KERROS A).
 //!
 //! [`DiscordThreadSummaryMock`] lukee keskusteluketjun viestit ([`ThreadMessage`])
 //! ja tuottaa lyhyen tiivistelmän sekä poimitut toimenpide-ehdotukset. Taito on
 //! **vain luku** ([`crate::policy::ActionRisk::ReadOnly`]) — se ei lähetä eikä
-//! muokkaa mitään, eikä tee oikeita Discord-verkkokutsuja. Käytetyt nimet ovat
-//! geneerisiä paikkamerkkejä (`agent_a`, `agent_b`, kanava `general`).
+//! muokkaa mitään. Tämä on **referenssimalli joka näyttää taidon sopimuksen**:
+//! suorituslogiikka on deterministinen ja muistinvarainen, ja käytetyt nimet
+//! ovat geneerisiä placeholder-merkkejä (`agent_a`, `agent_b`, kanava
+//! `general`). Kytke oma Discord-API-tarjoajasi tähän suoritusrunkoon, kun
+//! haluat lukea oikean ketjun — manifesti ja putki pysyvät ennallaan.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
