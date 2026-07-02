@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-acp"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "familyclaw-core",
  "serde",
@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-actions"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-agent"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -1574,7 +1574,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-bench"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-bridge"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1612,7 +1612,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-bus"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "familyclaw-core",
  "familyclaw-emotion",
@@ -1627,7 +1627,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-channels"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -1644,7 +1644,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-core"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1656,7 +1656,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-dream"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1674,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-durable"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "familyclaw-core",
@@ -1688,11 +1688,11 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-embeddings"
-version = "1.0.1"
+version = "1.2.0"
 
 [[package]]
 name = "familyclaw-emotion"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1700,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-gateway"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-gemu"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1744,7 +1744,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-growth"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "familyclaw-core",
  "serde",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-hearth"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "cfg-if",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-latent"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "familyclaw-core",
  "serde",
@@ -1784,7 +1784,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-memory"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "familyclaw-core",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-observability"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "familyclaw-bridge",
  "familyclaw-core",
@@ -1811,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-runtime"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -1837,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-sandbox"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "familyclaw-core",
  "serde",
@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-scheduler"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1866,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "familyclaw-security"
-version = "1.0.1"
+version = "1.2.0"
 dependencies = [
  "familyclaw-core",
  "serde",
