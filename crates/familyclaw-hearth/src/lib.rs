@@ -164,14 +164,17 @@ impl<S: HearthStore> Hearth<S> {
         }
         // Tick
         self.emotional_state.tick(&agents);
-        // Kirjoita takaisin storeen.
-        // TODO(perf): batch-kirjoitus — yksi query joka päivittää kaikki
-        // tunnetilat kerralla per-agentti-kutsujen sijaan (N round-trippiä).
-        for agent in &agents {
-            if let Some(&state) = self.emotional_state.get(agent) {
-                self.store.set_emotional_state(agent, state).await?;
-            }
-        }
+        // Kirjoita takaisin storeen yhtenä batch-kirjoituksena — yksi
+        // tietokantakierros N erillisen per-agentti-kutsun sijaan.
+        let updates: Vec<(String, emotional_state::EmotionalVector)> = agents
+            .iter()
+            .filter_map(|agent| {
+                self.emotional_state
+                    .get(agent)
+                    .map(|&state| (agent.clone(), state))
+            })
+            .collect();
+        self.store.set_emotional_states_batch(updates).await?;
         Ok(())
     }
 }
