@@ -134,3 +134,7 @@ plans/
 research/
 _stray-backup/
 PHASE2_RECON_PLAN_*.json
+
+# Experimental Claw language spike (excluded from workspace, WIP) + stray test files
+*.claw
+/compiler/

@@ -29,7 +29,7 @@ uuid = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-surrealdb = { version = "3", optional = true }
+surrealdb = { version = "3", optional = true, features = ["kv-mem"] }
 cfg-if = { version = "1", optional = true }
 
 [dev-dependencies]

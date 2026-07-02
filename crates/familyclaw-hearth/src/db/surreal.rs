@@ -1,6 +1,6 @@
 //! `SurrealDB` v3 backend for The Hearth.
 //!
-//! Implements [`HearthStore`] trait using `SurrealDB` (`surrealdb::Surreal<Any>`).
+//! Implements [`crate::HearthStore`] trait using `SurrealDB` (`surrealdb::Surreal<Any>`).
 //! Supports in-memory dev and `RocksDB` production backends via the same client.
 //!
 //! Feature-gated behind `surreal` flag.
