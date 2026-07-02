@@ -83,7 +83,7 @@ DEFINE FIELD participants ON memory_event TYPE array<string>;
 DEFINE INDEX idx_embedding ON memory_event FIELDS embedding HNSW DIMENSION 1536;
 
 DEFINE TABLE narrative_thread SCHEMAFULL;
-DEFINE FIELD id ON narrative_thread TYPE string;
+DEFINE FIELD thread_uid ON narrative_thread TYPE string;
 DEFINE FIELD title ON narrative_thread TYPE string;
 DEFINE FIELD participants ON narrative_thread TYPE array<string>;
 DEFINE FIELD created_at ON narrative_thread TYPE datetime;
@@ -240,7 +240,7 @@ DEFINE FIELD decay_class ON anchor TYPE string;
             let db = Arc::clone(&self.db);
             Box::pin(async move {
                 let rows: Vec<serde_json::Value> = db
-                    .query("SELECT * FROM narrative_thread WHERE id = $thread_id")
+                    .query("SELECT * FROM narrative_thread WHERE thread_uid = $thread_id")
                     .bind(("thread_id", thread_id.to_string()))
                     .await
                     .map_err(|e| {
@@ -269,8 +269,10 @@ DEFINE FIELD decay_class ON anchor TYPE string;
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .map_or_else(chrono::Utc::now, |dt| dt.with_timezone(&chrono::Utc));
                 let thread = NarrativeThread {
-                    id: Uuid::parse_str(row.get("id").and_then(|v| v.as_str()).unwrap_or(""))
-                        .unwrap_or_else(|_| Uuid::nil()),
+                    id: Uuid::parse_str(
+                        row.get("thread_uid").and_then(|v| v.as_str()).unwrap_or(""),
+                    )
+                    .unwrap_or_else(|_| Uuid::nil()),
                     title: row
                         .get("title")
                         .and_then(|v| v.as_str())
@@ -301,17 +303,34 @@ DEFINE FIELD decay_class ON anchor TYPE string;
             let id = thread.id.to_string();
             let title = thread.title;
             let participants = thread.participants;
+            // RFC3339-merkkijono castataan natiiviksi datetimeksi (`type::datetime`)
+            // koska skeema määrittelee `created_at TYPE datetime` — pelkkä string
+            // aiheutti hiljaisen tyyppirikkomuksen (sama bugi kuin emotional_statessa).
             let created_at = thread.created_at.to_rfc3339();
             Box::pin(async move {
-                db.query(
-                    "UPSERT narrative_thread SET id = $id, title = $title, participants = $participants, created_at = $created_at"
-                )
-                .bind(("id", id))
-                .bind(("title", title))
-                .bind(("participants", participants))
-                .bind(("created_at", created_at))
-                .await
-                .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("SurrealDB upsert failed: {e}")))?;
+                // Osoita rivi `type::record`:lla jotta UPSERT päivittää saman rivin
+                // paikallaan — bare `UPSERT narrative_thread SET id=...` loi joka
+                // kutsulla uuden satunnais-id-rivin eikä persistoinut oikein.
+                // Tallenna UUID myös erilliseen `thread_uid`-string-kenttään, jotta
+                // `get_thread` voi hakea sen tavallisena kenttänä (record-id palautuu
+                // record-linkkinä, ei plain-stringinä — vrt. emotional_state.agent_id).
+                let mut resp = db
+                    .query(
+                        "UPSERT type::record('narrative_thread', $id) SET thread_uid = $id, title = $title, participants = $participants, created_at = type::datetime($created_at)"
+                    )
+                    .bind(("id", id))
+                    .bind(("title", title))
+                    .bind(("participants", participants))
+                    .bind(("created_at", created_at))
+                    .await
+                    .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("SurrealDB upsert failed: {e}")))?;
+                // Statement-tason virheet eivät näy `.await`:ssa vaan `take_errors`:ssa.
+                let errors = resp.take_errors();
+                if !errors.is_empty() {
+                    return Err(familyclaw_core::FamilyClawError::Memory(format!(
+                        "SurrealDB set_thread statement error: {errors:?}"
+                    )));
+                }
                 Ok(())
             })
         }
@@ -505,6 +524,7 @@ mod tests {
     use super::surreal::SurrealHearthStore;
     use crate::emotional_state::EmotionalVector;
     use crate::HearthStore;
+    use crate::NarrativeThread;
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
@@ -733,5 +753,48 @@ mod tests {
         let got = store.get_emotional_state("a").await.expect("get");
         assert!(approx(got.joy, 1.0), "joy clamped");
         assert!(approx(got.sadness, 0.0), "sadness clamped");
+    }
+
+    /// Todistaa `set_thread`-korjauksen: thread persistoituu ja round-trippaa
+    /// oikein (aiempi bare-UPSERT + RFC3339-string-datetime esti persistoinnin).
+    #[tokio::test]
+    async fn surreal_thread_roundtrip() {
+        let store = SurrealHearthStore::connect("mem://")
+            .await
+            .expect("connect");
+        let thread = NarrativeThread::new("Euro-projekti", vec!["agent_alpha".into(), "agent_gamma".into()]);
+        let id = thread.id;
+        store.set_thread(thread.clone()).await.expect("set_thread");
+
+        let got = store.get_thread(id).await.expect("get_thread");
+        let got = got.expect("thread persisted (was silently dropped before fix)");
+        assert_eq!(got.id, id);
+        assert_eq!(got.title, "Euro-projekti");
+        assert_eq!(
+            got.participants,
+            vec!["agent_alpha".to_string(), "agent_gamma".to_string()]
+        );
+    }
+
+    /// Toistuva `set_thread` samalla id:llä päivittää saman rivin paikallaan,
+    /// ei luo duplikaatteja (bare-UPSERT loi joka kutsulla uuden satunnais-id-rivin).
+    #[tokio::test]
+    async fn surreal_thread_set_updates_in_place() {
+        let store = SurrealHearthStore::connect("mem://")
+            .await
+            .expect("connect");
+        let mut thread = NarrativeThread::new("v1", vec!["agent_alpha".into()]);
+        let id = thread.id;
+        store.set_thread(thread.clone()).await.expect("set v1");
+
+        thread.title = "v2".to_string();
+        store.set_thread(thread).await.expect("set v2");
+
+        let got = store
+            .get_thread(id)
+            .await
+            .expect("get")
+            .expect("still one thread");
+        assert_eq!(got.title, "v2", "update replaced in place");
     }
 }
