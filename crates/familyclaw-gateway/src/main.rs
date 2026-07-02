@@ -1174,6 +1174,9 @@ fn resolve_inject_token(cfg: &FamilyConfig) -> Option<Arc<str>> {
 }
 
 /// Palauttaa runtimen, Discord-kanavan (inject/interactions), inject-tokenin ja public keyn.
+// Kolme kanavahaaraa (none / discord / telegram), joista kukin kokoaa runtimen
+// omalla polullaan — pitkä mutta lineaarinen; jakaminen hämärtäisi luettavuutta.
+#[allow(clippy::too_many_lines)]
 async fn start_runtime(
     bridge: FamilyBridge,
 ) -> Result<(
@@ -1188,6 +1191,44 @@ async fn start_runtime(
     let channel_kind = cfg.channel_kind().to_string();
 
     let inject_token: Option<Arc<str>> = resolve_inject_token(&cfg);
+
+    // KANAVATON JULKAISUTILA (`FAMILYCLAW_CHANNEL_KIND=none`): käynnistä gateway
+    // ILMAN yhtään perhe-avainta, -sielua tai reply-kohdetta. Kokoaa runtimen
+    // taustalle [`MockChannel`]illä (muistinvarainen, ei ulkoista SDK:ta), joten
+    // tuore `cargo install` -käyttäjä voi `serve` + `status`-varmistaa HTTP-pinnan
+    // (`/healthz`, `/readyz`, `/metrics`) ENNEN kuin kytkee oikean kanavan. Tämä
+    // on julkaistavuuden edellytys: OSS-raja (KERROS A) tarkoittaa että alusta
+    // toimii tyhjällä profiililla — Telegram/Discord ovat KERROS B -lisukkeita.
+    if channel_kind == "none" {
+        info!(
+            "kanavaton julkaisutila (FAMILYCLAW_CHANNEL_KIND=none) — MockChannel, ei perhe-avaimia"
+        );
+        let mock = familyclaw_channels::MockChannel::new("familyclaw-none")
+            .map_err(FamilyClawError::from)?;
+        let channel: Box<dyn Channel> = Box::new(mock);
+        // Reply-kohdetta ei vaadita kanavattomassa tilassa — MockChannel nielee
+        // vastaukset outboxiinsa. Käytämme neutraalia paikanpitäjää joka ei
+        // reititä minnekään ulos.
+        let reply_target = "none".to_string();
+        let mut model_cfg = ModelConfig::new(cfg.model().to_string());
+        for fb in cfg.fallback_models() {
+            model_cfg = model_cfg.with_fallback(fb);
+        }
+        let agent_cfg = AgentConfig::new_with_stable_id(&agent_name, model_cfg);
+        let soul = load_agent_soul(&agent_name);
+        let resolver = build_resolver();
+        let runtime = build_family(
+            Some(DEFAULT_BUS_NAME.to_string()),
+            agent_cfg,
+            soul,
+            channel,
+            reply_target,
+            &resolver,
+            Some(bridge),
+        )
+        .await?;
+        return Ok((runtime, None, inject_token, None));
+    }
 
     let (channel, discord_ch): (Box<dyn Channel>, Option<Arc<DiscordChannel>>) = if channel_kind
         == "discord"
@@ -1626,6 +1667,9 @@ async fn status() -> Result<()> {
 /// # Errors
 /// [`FamilyClawError::invalid_input`] jos jokin tarkistus epäonnistuu, jolloin
 /// prosessi päättyy nollasta poikkeavalla exit-koodilla.
+// Peräkkäisiä tarkistuslohkoja (addr/port/env/durability/sandbox/…), kukin
+// tulostaa oman rivinsä — pitkä mutta suoraviivainen diagnostiikkasekvenssi.
+#[allow(clippy::too_many_lines)]
 async fn doctor() -> Result<()> {
     let cfg = FamilyConfig::load()?;
     let mut ok = true;
@@ -1655,7 +1699,13 @@ async fn doctor() -> Result<()> {
     // 3. Vaaditut env-muuttujat — vain läsnäolo, ei arvoja.
     //    (TELEGRAM_TOKEN on salaisuus → ehdottomasti vain set/MISSING.)
     let channel_kind = cfg.channel_kind().to_string();
-    let channel_keys: &[&str] = if channel_kind == "discord" {
+    // Kanavaton julkaisutila (`none`): ei vaadittuja kanava-envejä eikä reply-
+    // kohdetta — gateway ajaa MockChannelillä (HTTP-pinta + /metrics toimivat).
+    // Tämä on tuoreen `cargo install`in savutesti-tila: `serve` + `status`
+    // ilman perhe-avaimia. Ohitetaan kanavakohtaiset env-tarkistukset kokonaan.
+    let channel_keys: &[&str] = if channel_kind == "none" {
+        &[]
+    } else if channel_kind == "discord" {
         &[DISCORD_CHANNEL_ID_ENV, REPLY_TARGET_ENV]
     } else {
         &[
@@ -1664,7 +1714,11 @@ async fn doctor() -> Result<()> {
             REPLY_TARGET_ENV,
         ]
     };
-    println!("[INFO]     channel   {channel_kind}");
+    if channel_kind == "none" {
+        println!("[OK]      channel   none (channel-less serve — MockChannel, no family keys)");
+    } else {
+        println!("[INFO]     channel   {channel_kind}");
+    }
     for key in channel_keys {
         if std::env::var_os(key).is_some_and(|v| !v.is_empty()) {
             println!("[OK]      env       {key} set");
