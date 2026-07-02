@@ -60,3 +60,10 @@ path = "src/bin/crash_replay.rs"
 [[bin]]
 name = "continuity_daemon"
 path = "src/bin/continuity_daemon.rs"
+
+# Fable "family + continuity" showcase: two named agents share memory, feel
+# each other, dream overnight, and wake up behaving differently. Deterministic,
+# one-command, no keys. Run: cargo run -p familyclaw-agent --example two_agents_memory
+[[example]]
+name = "two_agents_memory"
+path = "examples/two_agents_memory.rs"

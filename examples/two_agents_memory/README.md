@@ -1,78 +1,111 @@
-# Two Agents Memory Demo
-**The Living Seed — Phase 0 Demo**
+# Two Agents Memory — Family + Continuity Demo
 
-This is the core FamilyClaw demo that proves the platform works end-to-end:
+**The one thing neither OpenClaw nor Hermes can show:** two *named* agents that
+share memory, feel each other, dream overnight, and **wake up behaving
+differently because of that dream.**
 
-## What It Demonstrates
+This is a single, deterministic, self-checking demo. Every line it prints is a
+value read back out of the live engine, and the program `assert!`s each
+invariant — so a stranger who runs it knows the numbers were not hand-typed.
 
-1. **Resonance Bus** — Ractor actor mesh starts, two agents join
-2. **Real Channel Transport** — MockChannel feeds messages to the bus (replaces Discord in demo)
-3. **Message Flow** — What `agent_a` says reaches `agent_b` through the bus
-4. **Memory Persists** — Each agent stores what it hears in Eternal Thread memory
-5. **Emotion Contagion** — An emotion pulse from one agent raises sibling's mood
-6. **Dream Consolidation** — Nightly cycle merges duplicates, absolutizes dates
-7. **Identity Anchors** — Core memories survive Ebbinghaus decay
-
-## Run It
+## Run it (one command, no keys)
 
 ```bash
-# From repo root
+cargo run -p familyclaw-agent --example two_agents_memory
+```
+
+That's it. No config, no API keys, no network. It finishes in well under a
+second and exits `0` only if all seven capabilities actually happened.
+
+## What it proves — 7 capabilities, each verified live
+
+| # | Capability | How it is *proven* (not just claimed) |
+|---|------------|----------------------------------------|
+| ① | **Resonance bus + two named agents** | Alice & Bob are `spawn()`ed as real actors; `bus.beings()` reports 2 registered beings. |
+| ② | **Shared memory** | Alice speaks; Bob runs the turn and stores it; Bob then *recalls* Alice's words (printed with relevance). |
+| ③ | **Emotion contagion** | Bob's `Joy` is printed **before** (0.0) and **after** (~19) Alice's joy pulse — the rise is asserted. |
+| ④ | **Dream consolidation** | A dream cycle merges two identical greetings (active count 3 → 2) **and** grounds a relative date: `"eilen"` → `"eilen (2026-07-02)"`. Both before/after strings are printed. |
+| ⑤ | **Next-day different behavior** | The **same** query (`"perhe sää"`) returns a **different** top memory on day 1 vs day 8 — the whole point. |
+| ⑥ | **Identity anchor survives decay** | Raw Ebbinghaus retention is printed: trivia `1.00 → 0.12` (Fast), anchor `1.00 → 1.00` (ProtectedCore). |
+| ⑦ | **Deterministic, one command, no keys** | You just ran it yourself. |
+
+### The heart of it: continuity that changes behavior (⑤ + ⑥)
+
+Bob starts day 1 with two memories that both match the day's small-talk query
+`"perhe sää"` ("family weather"):
+
+- **trivia** — fresh chit-chat (`Fast` decay), matches *both* query words.
+- **anchor** — his mission (`ProtectedCore`, never decays), matches only `perhe`.
+
+```
+DAY 1 → top memory: "Tänään perhe jutteli säästä ja grillasi yhdessä."   (the chatter wins)
+DAY 8 → top memory: "Perhe on se, jonka takia rakennan tätä maailmaa."   (the anchor wins)
+```
+
+Nothing was rewritten by hand between the two days. The *same* retrieval engine
+is scored against the *same* memories at two different clocks. Ebbinghaus decay
+erodes the trivial chatter (retention `1.00 → 0.12`) while the identity anchor
+holds at `1.00`. Bob literally woke up **more himself**.
+
+## Expected output (abridged)
+
+```
+① Two named agents join the resonance bus
+   ✓ resonance bus started, 2 beings registered on the mesh
+   · Alice (…)
+   · Bob   (…)
+
+② Shared memory: Alice tells Bob something, Bob remembers it
+   ✓ Bob stored the message — Bob now holds 1 memory/-ies
+   query "perhe" → top: "Perustimme perheen tänään …"  (relevance 0.111)
+
+③ Emotion contagion: Alice's joy raises Bob's mood (before → after)
+   Bob BEFORE : joy = 0.0, curiosity = 4.5
+   Bob AFTER  : joy = 19.1, curiosity = 18.8
+   ✓ Bob's joy rose by 19.1 …
+
+④ Dream consolidation: merge duplicates + absolutize relative dates
+   ✓ duplicate greeting merged (report.merged = 1); active memories: 3 → 2
+   ✓ relative date grounded to an absolute calendar date:
+       before: "Bob liittyi busiin eilen …"
+       after : "Bob liittyi busiin eilen (2026-07-02) …"
+
+⑤ Next day: the SAME question gets a DIFFERENT answer
+   DAY 1 → top: "Tänään perhe jutteli säästä ja grillasi yhdessä."
+   DAY 8 → top: "Perhe on se, jonka takia rakennan tätä maailmaa."
+
+⑥ Identity anchor survives Ebbinghaus decay; trivia fades
+   ANCHOR (ProtectedCore)   retention day1 = 1.00 → day8 = 1.00
+   trivia (Fast decay)      retention day1 = 1.00 → day8 = 0.12
+```
+
+## Notes on honesty
+
+- **Date grounding, not deletion.** The dream cycle *keeps* the human word and
+  appends the resolved calendar date (`"eilen"` → `"eilen (2026-07-02)"`), so a
+  relative date read a year later still points at the exact day it happened.
+- **Merge tombstones the duplicate.** Total stored rows stay the same; the
+  *active* (retrievable) count drops. The demo reports the active count.
+- **Direct turn-driving.** After proving the bus join with spawned actors, the
+  demo drives the two agents through `handle_turn` (the *same* code path the
+  actor runs) so it can read their inner memory/emotion state at every step.
+
+## Crash-proof continuity (separate demo)
+
+To see that memory survives a mid-run crash and replay, use the dedicated
+binary:
+
+```bash
+cargo run -p familyclaw-agent --bin crash_replay
+# or the runbook:
 ./scripts/demo-crash-replay.sh
 ```
 
-Or directly:
-```bash
-cargo run -p familyclaw-agent --bin familyclaw
-```
-
-## Expected Output (30 seconds)
-
-```
-═══════════════════════════════════════════════════════════
-  FamilyClaw Demo: Autonomous Agents with Memory & Emotion
-═══════════════════════════════════════════════════════════
-
-📡 Step 1: Spawning Resonance Bus...
-   ✓ Bus started
-
-🤖 Step 2: Spawning agent_a and agent_b on the bus...
-   ✓ 2 agents spawned
-   · agent_a (uuid)
-   · agent_b (uuid)
-
-💬 Step 4: Agents exchange messages (memory is stored)...
-   ✓ 3 messages exchanged and stored in memory
-
-💓 Step 5: Emotion contagion — joy spreads between agents...
-   ✓ Emotion pulse delivered — agent_b's emotional state influenced
-
-⏰ Step 6: Time jump — 7 days later, memory retention decays...
-   · agent_a's 'new family member' memory: retention ~70% (aging)
-   · agent_a's 'building for the world' memory: retention ~95% (identity-anchored)
-   ✓ Identity anchors preserve core facts despite decay
-
-🌙 Step 7: Dream cycle runs — consolidating memories...
-   ✓ Dream cycle complete
-
-📚 Step 8: Memory retrieval after dream cycle...
-   agent_a: 1 memories | top: "Hei agent_a! Olen iloinen osa perhettä."
-   agent_b: 2 memories | top: "Hei agent_b! Tervetuloa perheeseen."
-
-═══════════════════════════════════════════════════════════
-  Demo Complete!
-═══════════════════════════════════════════════════════════
-```
-
-## Crash-Proof Proof
-
-To prove memory survives restarts:
-1. Run the demo
-2. Kill it mid-run (Ctrl+C during message exchange)
-3. Restart
-4. Query agent's memory — it remembers
-
-The `familyclaw-durable` crate's journal-based replay ensures side effects aren't re-run, but memory persists.
+The `familyclaw-durable` crate's journal-based replay ensures side effects
+aren't re-run on restart, while memory persists.
 
 ---
 
-**Layer A Only** — This demo uses ONLY generic example agents (`agent_a`, `agent_b`). No real souls (agent_alpha, agent_beta, etc.), no private profiles, no API keys. Pure open platform.
+**Layer A only.** The two agents are generic (`Alice`, `Bob`). No real souls,
+no private calibration weights, no API keys, no personal paths. Pure open
+platform.
