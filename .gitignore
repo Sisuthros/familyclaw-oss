@@ -138,3 +138,10 @@ PHASE2_RECON_PLAN_*.json
 # Experimental Claw language spike (excluded from workspace, WIP) + stray test files
 *.claw
 /compiler/
+# Claw-lang spike spec — references a private agent identity by name (internal).
+CLAW_LANG_SPEC.md
+# Parallel-build planning doc — references private agent identities (internal).
+docs/PHASE3_PARALLEL_PLAN.md
+# Operator-only publish runbook — lists the private names it must keep OUT of
+# Layer A, so it is itself internal and must never be published.
+docs/PUBLISH_ORPHAN_PLAN.md
