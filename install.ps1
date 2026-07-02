@@ -105,19 +105,21 @@ function New-RunTemplate {
     # KERROS B: template — TÄYTÄ omat yksityiset arvot. ÄLÄ committaa gitiin.
     $content = @"
 @echo off
-REM FamilyClaw run-script — $Agent (KERROS B template, EI gitiin)
-REM Täytä Layer B -arvot alle. Salaisuudet voi lukea myös .env-tiedostosta.
+REM FamilyClaw run-script — $Agent (private config template; keep out of git)
+REM Fill in your private values below. Secrets can also be read from a .env file.
 set FAMILYCLAW_AGENT_NAME=$Agent
 set FAMILYCLAW_CHANNEL_KIND=discord
-set FAMILYCLAW_GATEWAY_ADDR=0.0.0.0:8789
-REM --- TÄYTÄ NÄMÄ (Layer B) ---
-REM set FAMILYCLAW_PROFILE_DIR=E:\path\to\private\profile
+REM Bind to localhost by default. Use 0.0.0.0 ONLY when you explicitly intend
+REM to expose the gateway on the network (and have a firewall / reverse proxy
+REM in front of it). The default is safe for a single-machine deployment.
+set FAMILYCLAW_GATEWAY_ADDR=127.0.0.1:8789
+REM --- Fill these in for your own deployment (private config, keep out of git) ---
+REM set FAMILYCLAW_PROFILE_DIR=C:\path\to\your\profile
 REM set DISCORD_BOT_TOKEN=...
 REM set FAMILYCLAW_REPLY_TARGET=...
-REM set FAMILYCLAW_PROVIDER_MODEL=deepseek/deepseek-v4-pro
-REM set FAMILYCLAW_FALLBACK_MODELS=nvidia/nvidia/nemotron-3-ultra-550b-a55b,deepseek/deepseek-v4-flash
-REM set DEEPSEEK_API_KEY=...
-REM set NVIDIA_API_KEY=...
+REM set FAMILYCLAW_PROVIDER_MODEL=your-provider/your-model
+REM set FAMILYCLAW_FALLBACK_MODELS=your-provider/fallback-a,your-provider/fallback-b
+REM set OPENAI_API_KEY=...
 "$bin" serve
 "@
     Set-Content -Path $runScript -Value $content -Encoding ASCII
