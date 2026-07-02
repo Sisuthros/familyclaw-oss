@@ -762,17 +762,20 @@ mod tests {
         let store = SurrealHearthStore::connect("mem://")
             .await
             .expect("connect");
-        let thread = NarrativeThread::new("Euro-projekti", vec!["agent_alpha".into(), "agent_gamma".into()]);
+        let thread = NarrativeThread::new(
+            "shared-project",
+            vec!["agent_alpha".into(), "agent_beta".into()],
+        );
         let id = thread.id;
         store.set_thread(thread.clone()).await.expect("set_thread");
 
         let got = store.get_thread(id).await.expect("get_thread");
         let got = got.expect("thread persisted (was silently dropped before fix)");
         assert_eq!(got.id, id);
-        assert_eq!(got.title, "Euro-projekti");
+        assert_eq!(got.title, "shared-project");
         assert_eq!(
             got.participants,
-            vec!["agent_alpha".to_string(), "agent_gamma".to_string()]
+            vec!["agent_alpha".to_string(), "agent_beta".to_string()]
         );
     }
 

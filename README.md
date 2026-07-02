@@ -6,6 +6,9 @@ Most AI agents die between runs. FamilyClaw gives them continuity:
 durable replay, persistent memory, actor-based coordination, sleep-time consolidation,
 and private runtime profiles that never enter the repository.
 
+> 📍 **[STATUS.md](STATUS.md) is the single source of truth** for what works today,
+> what is deferred, and where the project stands on release (`v1.2.0`). Start there.
+
 > **What Phase 1 proves today:** crash-safe durable replay with **at-most-once
 > external side-effect dispatch under crash** (idempotency-keyed: never fired twice;
 > a crash in the intent-only window fails closed), provenance-gated memory,
