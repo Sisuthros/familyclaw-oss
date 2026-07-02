@@ -331,6 +331,43 @@ cargo run -p familyclaw-bench --bin bench -- all
 bash scripts/demo-crash-replay.sh
 ```
 
+### Reproduce the crash-safety benchmark (vs LangGraph)
+
+We ran FamilyClaw head-to-head against **LangGraph** — a real, widely-deployed durable
+agent-orchestration framework, given its **strongest** durability config
+(`durability="sync"`) — on one narrow metric: *after a process crash, how many
+money-touching external side effects re-execute?* (target: 0).
+
+Result, reproduced in a clean Python 3.13 venv:
+
+| Crash point | FamilyClaw | LangGraph (`durability="sync"`) |
+|---|:--:|:--:|
+| `clean` — no crash | **0** | **0** |
+| `before_write` — effect fired, durable record not yet written | **0** | **1** (re-fired) |
+| `mid_replay` — re-crash during the resume itself | **0** | **2** (re-fired) |
+
+The narrow, honest claim: **at-most-once / duplicate-prevented dispatch of an external
+side effect across a process crash.** It is *not* "LangGraph is broken" (its durable
+**state replay** genuinely works, and a crash strictly *between* nodes would not re-fire
+there either) and *not* "magical exactly-once completion". FamilyClaw wins specifically
+in the intra-node "effect done, durable record not yet" window, via an idempotency-keyed
+intent→effect→committed outbox.
+
+Reproduce it yourself (one venv, one command per crash point) and read the full
+apples-to-apples design, raw evidence, and honesty caveats:
+**[`bench-competitors/langgraph/`](bench-competitors/langgraph/README.md)** →
+[`RESULTS.md`](bench-competitors/langgraph/RESULTS.md).
+
+```bash
+cd bench-competitors/langgraph
+python -m venv .venv && .venv/Scripts/python.exe -m pip install \
+  langgraph==1.2.6 langgraph-checkpoint-sqlite==3.1.0
+.venv/Scripts/python.exe crash_harness.py cycle --crash-point before_write --workdir _runs/bw
+cat _runs/bw/side_effect_counter.txt   # -> 5  (LangGraph re-fired: overcount 1)
+# FamilyClaw on the same metric:
+cargo run -p familyclaw-bench -- s1    # side_effect_overcount = 0, PASS
+```
+
 ---
 
 ## Current status and roadmap

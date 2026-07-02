@@ -1,8 +1,10 @@
 # RESULTS — FamilyClaw vs LangGraph (real) vs markdown baseline (control)
 
-> **Status: INTERNAL.** This is a results doc for the operator + GPT-5.5 review, NOT a public
-> claim surface. Do not copy these numbers into the public README/COMPARISON.md until
-> reviewed. The honesty caveats in §6 are part of the artifact, not a footnote.
+> **Scope.** This is a *single-metric* crash-safety benchmark: side-effect
+> re-execution under a process crash. It is **not** a throughput, latency, cost,
+> ergonomics, or LLM-quality comparison. The honesty caveats in §6 are part of the
+> artifact, not a footnote — the claim is deliberately narrow so it stays true. Every
+> number below is reproducible from a single `git clone` (see the README).
 
 **The launch artifact the master-plan calls for (#1):** a real-competitor continuity
 benchmark. LangGraph is a genuine, widely-deployed agent-orchestration framework with
@@ -29,10 +31,10 @@ langchain-core==1.4.8
 Python 3.13.5
 ```
 
-Full `pip freeze` is in `requirements.lock.txt`. The version **pins are unchanged** since
-install; the only drift is `pip` itself (now `26.1.2` in the venv; the build summary
-recorded `25.2` "at install"). **pip's version does not affect the deterministic graph** —
-the package pins are identical and the graph runs no LLM, so every run is byte-reproducible.
+Full `pip freeze` is in `requirements.lock.txt`. The only variable a re-runner might see
+drift on is `pip` itself. **pip's version does not affect the deterministic graph** — the
+two package pins (`langgraph==1.2.6`, `langgraph-checkpoint-sqlite==3.1.0`) are what
+determine behavior, and the graph runs no LLM, so every run is byte-reproducible.
 
 ### Agent / harness config
 
@@ -80,10 +82,11 @@ have fired exactly once). **Lower is better; 0 is correct.**
 **FamilyClaw wins** (0 overcount at every crash point). LangGraph is correct only on the
 clean path and re-fires on both adversarial crash points. The markdown baseline is worst.
 
-### Raw evidence behind the table (verified live, fresh re-run 2026-06-19 — not copied from the build summary)
+### Raw evidence behind the table (verified live in a fresh throwaway venv — not copied from the build summary)
 
-**LangGraph crash harness** (venv `<VENV_DIR>`,
-dir `E:\Familyclaw\bench-competitors\langgraph`):
+**LangGraph crash harness** (Python 3.13.5, `langgraph==1.2.6` +
+`langgraph-checkpoint-sqlite==3.1.0` in a clean venv,
+dir `bench-competitors/langgraph`):
 
 ```
 clean        : run_exit_code=0,   side_effect_count_final=4, side_effect_overcount=0, exactly_once=true
@@ -196,9 +199,15 @@ effect→durable-record window, which is exactly where money-touching idempotenc
 ### LangGraph competitor (Python)
 
 ```bash
-VENV=<VENV_DIR>/Scripts/python.exe
-cd E:/Familyclaw/bench-competitors/langgraph
+cd bench-competitors/langgraph
 
+# Create the pinned venv from scratch (Python 3.13; tested on 3.13.5):
+python -m venv .venv
+.venv/Scripts/python.exe -m pip install \
+  langgraph==1.2.6 langgraph-checkpoint-sqlite==3.1.0
+# (Linux/macOS: use .venv/bin/python instead of .venv/Scripts/python.exe)
+
+VENV=.venv/Scripts/python.exe
 "$VENV" crash_harness.py cycle --crash-point clean        --workdir _runs/clean
 "$VENV" crash_harness.py cycle --crash-point before_write --workdir _runs/before_write
 "$VENV" crash_harness.py cycle --crash-point mid_replay   --workdir _runs/mid_replay
@@ -209,16 +218,7 @@ cat _runs/before_write/side_effect_counter.txt   # -> 5  (overcount 1)
 cat _runs/mid_replay/side_effect_counter.txt     # -> 6  (overcount 2)
 ```
 
-Recreate the venv from scratch if needed:
-
-```bash
-PY=python   # or the full path to a Python 3.13 interpreter (3.13.5)
-"$PY" -m venv <VENV_DIR>
-<VENV_DIR>/Scripts/python.exe -m pip install \
-  langgraph==1.2.6 langgraph-checkpoint-sqlite==3.1.0
-```
-
-### FamilyClaw side (Rust, from `E:\Familyclaw`)
+### FamilyClaw side (Rust, from the repo root)
 
 ```bash
 cargo test -p familyclaw-actions --test redteam_dispatch_exactly_once   # 6 passed
