@@ -728,4 +728,154 @@ mod tests {
             "webhook url must not appear in Debug output"
         );
     }
+
+    // --- HTTP-virhepolut: send_body oikean reqwest-kuljetuksen yli ---
+    //
+    // Kartoitusaukko: `send_body`-onnistumispolku (pilkonta + tyhjän hylkäys) oli
+    // katettu, mutta Discord-REST:n ei-2xx-vastaukset (429 rate-limit, 5xx
+    // palvelinvirhe) ja verkkovirhe olivat testaamattomia. Nämä testit ajavat
+    // `send_body`:n oikealla `serenity::Http`-asiakkaalla joka on ohjattu
+    // `HttpBuilder::proxy`:llä paikalliseen mock-palvelimeen — todistavat että
+    // jokainen virhepolku palauttaa selkeän `ChannelError`:n (ei paniikkia, ei
+    // valheellista `Ok`:ta) ja että `map_send_error`-luokittelu pätee
+    // päästä päähän (429/5xx → uudelleenyritettävä Send; 401/403/404 → pysyvä
+    // Backend).
+    //
+    // Mock on pelkkä `std::net::TcpListener` (ei `wiremock`/`httpmock`-dependencyä
+    // → ei uusia dev-riippuvuuksia, ei `cargo-deny`-riskiä). Ratelimiter on
+    // poistettu käytöstä (`ratelimiter_disabled(true)`), jotta serenity ei jää
+    // uudelleenyrittämään 429:ää vaan palauttaa virheen heti.
+    mod http_error_paths {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use serenity::http::HttpBuilder;
+
+        /// Käynnistää minimaalisen HTTP/1.1-mockin joka vastaa `status`-koodilla
+        /// jokaiseen pyyntöön. Palauttaa `(proxy_base_url, call_counter)`. Discord
+        /// REST -reitit menevät proxyn kautta muodossa `<base>/api/v10/...`.
+        fn spawn_mock(status: u16) -> (String, Arc<AtomicUsize>) {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+            let addr = listener.local_addr().expect("local_addr");
+            let base_url = format!("http://{addr}");
+            let calls = Arc::new(AtomicUsize::new(0));
+
+            let calls_t = Arc::clone(&calls);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    calls_t.fetch_add(1, Ordering::SeqCst);
+
+                    let mut buf = [0_u8; 4096];
+                    let _ = stream.read(&mut buf).unwrap_or(0);
+
+                    let reason = match status {
+                        429 => "Too Many Requests",
+                        500 => "Internal Server Error",
+                        503 => "Service Unavailable",
+                        403 => "Forbidden",
+                        _ => "Error",
+                    };
+                    // Discord-tyylinen virherunko. Ratelimiter on pois → serenity
+                    // EI lue `retry-after`-headeria, joten 429 ei aiheuta
+                    // uudelleenyrityssilmukkaa; vastaus muuttuu suoraan
+                    // UnsuccessfulRequest-virheeksi.
+                    let body = format!(r#"{{"code":0,"message":"{reason}"}}"#);
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+
+            (base_url, calls)
+        }
+
+        /// Rakentaa serenity-`Http`:n joka lähettää REST-pyynnöt `proxy`-URL:iin
+        /// (mock), ratelimiter pois päältä.
+        fn http_pointing_at(proxy: &str) -> Http {
+            HttpBuilder::new("Bot test-token")
+                .proxy(proxy.to_string())
+                .ratelimiter_disabled(true)
+                .build()
+        }
+
+        #[tokio::test]
+        async fn send_body_429_rate_limit_is_retryable_send_error() {
+            // 429 → map_send_error luokittelee uudelleenyritettäväksi
+            // (ChannelError::Send), EI paniikkia eikä pysyvää Backend-virhettä.
+            let (base, calls) = spawn_mock(429);
+            let http = http_pointing_at(&base);
+
+            let err = DiscordChannel::send_body(&http, ChannelId::new(123), "discord-123", "hei")
+                .await
+                .expect_err("429 must surface as an error, not Ok");
+
+            assert!(
+                matches!(err, ChannelError::Send { .. }),
+                "429 is retryable → expected ChannelError::Send, got: {err:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one REST call");
+        }
+
+        #[tokio::test]
+        async fn send_body_500_server_error_is_retryable_send_error() {
+            // 5xx → uudelleenyritettävä Send (ei paniikki, ei valheellinen Ok).
+            let (base, _calls) = spawn_mock(500);
+            let http = http_pointing_at(&base);
+
+            let err = DiscordChannel::send_body(&http, ChannelId::new(123), "discord-123", "hei")
+                .await
+                .expect_err("500 must surface as an error");
+
+            assert!(
+                matches!(err, ChannelError::Send { .. }),
+                "5xx is retryable → expected ChannelError::Send, got: {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn send_body_403_forbidden_is_permanent_backend_error() {
+            // 403 = oikeudet väärin → PYSYVÄ virhe (Backend), ei uudelleenyritystä.
+            // Todistaa map_send_error:n 401/403/404-haaran oikean HTTP-vastauksen yli.
+            let (base, _calls) = spawn_mock(403);
+            let http = http_pointing_at(&base);
+
+            let err = DiscordChannel::send_body(&http, ChannelId::new(123), "discord-123", "hei")
+                .await
+                .expect_err("403 must surface as an error");
+
+            assert!(
+                matches!(err, ChannelError::Backend { .. }),
+                "403 is permanent → expected ChannelError::Backend, got: {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn send_body_network_error_is_send_error_not_panic() {
+            // Verkkovirhe: sido portti, lue osoite ja sulje listener heti →
+            // yhteys torjutaan (connection refused). Deterministinen korvike
+            // timeoutille; sama polku (reqwest-virhe, ei HttpError) → serenity
+            // palauttaa ei-Http-virheen jonka map_send_error luokittelee Send:ksi.
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            drop(listener);
+            let base = format!("http://{addr}");
+            let http = http_pointing_at(&base);
+
+            let err = DiscordChannel::send_body(&http, ChannelId::new(123), "discord-123", "hei")
+                .await
+                .expect_err("a refused connection must surface as an error, not Ok/panic");
+
+            assert!(
+                matches!(err, ChannelError::Send { .. }),
+                "network failure → expected ChannelError::Send, got: {err:?}"
+            );
+        }
+    }
 }
