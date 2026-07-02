@@ -90,6 +90,8 @@ jobs:
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
@@ -102,28 +104,30 @@ jobs:
       - name: Build continuity_daemon binary (familyclaw-bench prosessiraja)
         run: cargo build -p familyclaw-agent --bin continuity_daemon
 
-      # familyclaw-gateway is binary-only; --workspace (not --lib) includes its tests.
-      # NB: emme käytä --all-features koska se aktivoisi familyclaw-hearthin
-      # `surreal`-featuren, joka kääntää kytkemättömän, API-vanhentuneen
-      # SurrealDB-backendin (8 käännösvirhettä). `surreal` on KUOLLUT feature
-      # (mikään ei rakenna SurrealHearthStorea); sen korjaus koskee perheen
-      # muistisubstraattia ja vaatii erillisen päätöksen. Listataan sen sijaan
-      # kaikki ELÄVÄT ei-default-featuret eksplisiittisesti.
-      # Sandbox aktivoidaan gatewayn OMAN `wasmtime`-passthrough-piirteen kautta
-      # (familyclaw-gateway/wasmtime → familyclaw-sandbox/wasmtime), EI suoraan
-      # familyclaw-sandbox/wasmtime: muuten gatewayn käännösaikainen
-      # `cfg!(feature = "wasmtime")` jäisi pois päältä vaikka sandbox-backend on
-      # käännetty, ja `sandbox_label_matches_compiled_feature` epäonnistuisi
-      # (etiketti "wasmtime …" vs odotettu "none (noop)"). Gatewayn piirre pitää
-      # cfg:n ja todellisen backendin synkassa.
-      - name: cargo test (kaikki elävät featuret)
-        run: |
-          cargo test --workspace \
-            --features familyclaw-channels/discord \
-            --features familyclaw-channels/telegram \
-            --features familyclaw-channels/whatsapp \
-            --features familyclaw-channels/signal \
-            --features familyclaw-gateway/wasmtime
+      # Käytämme --all-features (EI eksplisiittistä featurelistaa) tarkoituksella:
+      # se on ainoa gate joka nappaa MINKÄ TAHANSA workspace-featuren rikkoutumisen,
+      # myös vasta lisätyn. Regressio jonka tämä estää (2026-07): familyclaw-hearthin
+      # `surreal`-feature rikkoutui (test + rustdoc) ja pääsi CI:stä läpi koska tämä
+      # job listasi featuret käsin ja jätti `surreal`n pois. Nyt kaikki featuret
+      # (surreal mukaan lukien) aktivoituvat, ja test + doc + clippy ajetaan niillä.
+      # Sandbox: --all-features aktivoi sekä familyclaw-gateway/wasmtime että
+      # familyclaw-sandbox/wasmtime, joten gatewayn oma `cfg!(feature = "wasmtime")`
+      # pysyy synkassa käännetyn backendin kanssa ja
+      # sandbox_label_matches_compiled_feature menee läpi (verifioitu lokaalisti).
+      - name: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features
+
+      # Doc all-featuresilla -D warnings: nappaa rikkinäiset rustdoc-linkit myös
+      # feature-gated moduuleissa (esim. surreal.rs), joita default/discord-doc ei kata.
+      - name: cargo doc --workspace --all-features (-D warnings)
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      # Clippy all-featuresilla -D warnings: nappaa lint-rikkoutumiset feature-gated
+      # koodissa jota discord-only-clippy (check + windows-msvc-lint) ei käännä.
+      - name: cargo clippy --workspace --all-features --all-targets (-D warnings)
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
   windows:
     name: Build and Test (Windows)
