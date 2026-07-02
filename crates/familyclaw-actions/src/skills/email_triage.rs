@@ -1,10 +1,14 @@
-//! Mock-taito: sähköpostien luokittelu (triage) (KERROS A).
+//! Esimerkkimalli (reference pattern): sähköpostien luokittelu (triage) (KERROS A).
 //!
 //! [`EmailTriageMock`] lukee listan sähköposteja ([`EmailItem`]) ja luokittelee
 //! kunkin kategoriaan sekä ehdottaa toimenpidettä. Taito on **vain luku**
 //! ([`crate::policy::ActionRisk::ReadOnly`]) — se ei lähetä, poista eikä muokkaa
-//! mitään, eikä tee oikeita Gmail-verkkokutsuja. Lähettäjäosoite on geneerinen
-//! `user@example.com` (KERROS A).
+//! mitään. Tämä on **referenssimalli joka näyttää taidon sopimuksen**
+//! (manifesti + read-only-riskiluokka + syöte/tuloste-skeema): suorituslogiikka
+//! on deterministinen ja muistinvarainen, ja lähettäjäosoite on geneerinen
+//! placeholder `user@example.com` (KERROS A). Kytke oma Gmail-tarjoajasi tähän
+//! suoritusrunkoon, kun haluat elävän integraation — manifesti ja putki pysyvät
+//! ennallaan.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

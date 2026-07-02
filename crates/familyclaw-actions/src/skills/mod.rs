@@ -1,18 +1,25 @@
-//! Realistiset mock-taidot ja niiden yhteinen putki (KERROS A, OSS).
+//! Taidot ja niiden yhteinen putki (KERROS A, OSS).
 //!
-//! Tämä alimoduuli kokoaa neljä realistista **mock-taitoa** ([`Skill`])
-//! sekä putken ([`Pipeline`]), joka ajaa koko toimintopinon:
+//! Tämä alimoduuli kokoaa taidot ([`Skill`]) sekä putken ([`Pipeline`]), joka
+//! ajaa koko toimintopinon:
 //!
 //! ```text
 //! observe → plan → request approval (jos tarpeen) → execute action
 //!         → verify → persist proof → remember → report
 //! ```
 //!
-//! Taidot ovat tarkoituksella **hermeettisiä**: ne eivät tee oikeita
-//! Gmail-/GitHub-verkkokutsuja, vaan tuottavat deterministisen tuloksen
-//! syötteestä. Jokainen taito tarjoaa oman [`SkillManifest`]-manifestinsa
-//! ([`Skill::manifest`]) ja toteuttaa [`ActionExecutor`]-rajapinnan
-//! suorituslogiikalle.
+//! Taitoja on kahdenlaisia. **Kaksi aitoa referenssitaitoa** tekevät oikeaa
+//! työtä koko putken läpi: [`FsReadAllowlisted`] lukee paikallisen tiedoston
+//! allowlistattuna, ja [`WebFetchSkill`] tekee aidon read-only HTTP-GETin
+//! SSRF-vartioinnilla. Loput ([`EmailTriageMock`], [`GithubIssueDraftMock`],
+//! [`FilePatchMock`], [`DiscordThreadSummaryMock`]) ovat **esimerkkimalleja**
+//! (reference patterns): ne toteuttavat taidon sopimuksen kokonaan (manifesti,
+//! riskiluokka, hyväksyntäkäytäntö, syöte/tuloste-skeema, taint) determinis-
+//! tisellä muistinvaraisella logiikalla ja geneerisellä placeholder-datalla.
+//! Ne näyttävät taidon rajapinnan muodon — kytke oma tarjoajasi
+//! (Gmail/GitHub/…) suoritusrunkoon, kun haluat elävän integraation. Jokainen
+//! taito tarjoaa oman [`SkillManifest`]-manifestinsa ([`Skill::manifest`]) ja
+//! toteuttaa [`ActionExecutor`]-rajapinnan suorituslogiikalle.
 //!
 //! ## Putki ([`Pipeline`])
 //! [`Pipeline`] sitoo yhteen rekisterin ([`SkillRegistry`]), tehtäväjonon

@@ -1,14 +1,16 @@
-//! Mock-taito: GitHub-issuen luonnos bugiraportista (KERROS A).
+//! Esimerkkimalli (reference pattern): GitHub-issuen luonnos bugiraportista (KERROS A).
 //!
 //! [`GithubIssueDraftMock`] muuntaa vapaamuotoisen bugiraportin
 //! ([`GithubIssueDraftInput::bug_report`]) jäsennellyksi issue-**luonnokseksi**
-//! (otsikko + runko). Taito EI tee oikeaa GitHub-verkkokutsua eikä luo issueta —
-//! se vain ehdottaa sisällön. Varsinainen ulkoinen kirjoitus
-//! ([`crate::policy::ActionRisk::WriteExternal`]) vaatii ihmisen hyväksynnän
-//! ennen suoritusta.
-//!
-//! Repo-slug on geneerinen `example-org/example-repo` (KERROS A — ei oikeita
-//! kohteita).
+//! (otsikko + runko). Tämä on **referenssimalli joka näyttää taidon sopimuksen**
+//! erityisesti hyväksyntää vaativalle kirjoitustaidolle: suorituslogiikka on
+//! deterministinen ja muistinvarainen (se vain ehdottaa sisällön), mutta
+//! manifesti luokittelee sen ulkoiseksi kirjoitukseksi
+//! ([`crate::policy::ActionRisk::WriteExternal`]) joka vaatii ihmisen
+//! hyväksynnän ennen suoritusta. Repo-slug on geneerinen placeholder
+//! `example-org/example-repo` (KERROS A — ei oikeita kohteita). Kytke oma
+//! GitHub-API-tarjoajasi tähän suoritusrunkoon, kun haluat luoda oikean issuen —
+//! hyväksyntäportti ja todiste-redaktio pätevät silloin oikeaan sivuvaikutukseen.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
