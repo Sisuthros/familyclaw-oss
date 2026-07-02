@@ -110,6 +110,34 @@ pub trait HearthStore: familyclaw_memory::MemoryStore {
         state: EmotionalVector,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
+    /// Asettaa monen agentin tunnetilat kerralla (batch).
+    ///
+    /// Tämä on semanttisesti identtinen sen kanssa että kutsuisi
+    /// [`HearthStore::set_emotional_state`]:ta jokaiselle `(agent_id, state)`
+    /// -parille — sama lopputila — mutta toteuttaja voi persistoida ne
+    /// **yhdellä tietokantakierroksella** (yksi transaktio / yksi query)
+    /// N erillisen sijaan.
+    ///
+    /// Default-toteutus delegoi per-agentti-kutsuihin, jotta olemassa olevat
+    /// [`HearthStore`]-toteutukset toimivat muuttumatta; tehokas backend
+    /// (esim. `SurrealDB`) ohittaa tämän niputetulla versiolla.
+    ///
+    /// # Errors
+    /// Palauttaa virheen jos jonkin tunnetilan tallennus epäonnistuu.
+    /// Virhetilanteessa osa tiloista on voitu jo kirjoittaa (kuten
+    /// per-agentti-silmukassakin).
+    fn set_emotional_states_batch(
+        &self,
+        states: Vec<(String, EmotionalVector)>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            for (agent_id, state) in states {
+                self.set_emotional_state(&agent_id, state).await?;
+            }
+            Ok(())
+        })
+    }
+
     /// Listaa kaikki agentit joilla on tunnetila.
     fn list_agents_with_emotion(
         &self,
@@ -319,6 +347,20 @@ impl<M: familyclaw_memory::MemoryStore + Send + Sync> HearthStore for InMemoryHe
         })
     }
 
+    fn set_emotional_states_batch(
+        &self,
+        states: Vec<(String, EmotionalVector)>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            // Yksi lukituksen otto koko batchille per-agentti-lukkojen sijaan.
+            let mut guard = self.emotional_states.write().await;
+            for (agent_id, state) in states {
+                guard.insert(agent_id, state.clamped());
+            }
+            Ok(())
+        })
+    }
+
     fn list_agents_with_emotion(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send + '_>> {
@@ -375,6 +417,190 @@ mod tests {
             .await
             .expect("list");
         assert!(agents.contains(&"agent_a".to_string()));
+    }
+
+    /// Batch-päivitys tuottaa saman lopputilan kuin per-agentti-kutsut.
+    #[tokio::test]
+    async fn batch_equals_per_agent_updates() {
+        let states = vec![
+            (
+                "agent_a".to_string(),
+                EmotionalVector {
+                    joy: 0.8,
+                    sadness: 0.1,
+                    curiosity: 0.6,
+                    anxiety: 0.2,
+                    confidence: 0.7,
+                    affection: 0.5,
+                },
+            ),
+            (
+                "agent_b".to_string(),
+                EmotionalVector {
+                    joy: 0.2,
+                    sadness: 0.7,
+                    curiosity: 0.3,
+                    anxiety: 0.6,
+                    confidence: 0.2,
+                    affection: 0.4,
+                },
+            ),
+            (
+                "agent_c".to_string(),
+                EmotionalVector {
+                    joy: 0.5,
+                    sadness: 0.5,
+                    curiosity: 0.9,
+                    anxiety: 0.1,
+                    confidence: 0.5,
+                    affection: 0.6,
+                },
+            ),
+        ];
+
+        // Store 1: per-agentti (referenssi).
+        let per_agent = InMemoryHearthStore::new(LocalJsonStore::in_memory());
+        for (agent, state) in &states {
+            HearthStore::set_emotional_state(&per_agent, agent, *state)
+                .await
+                .expect("set per-agent");
+        }
+
+        // Store 2: batch.
+        let batch = InMemoryHearthStore::new(LocalJsonStore::in_memory());
+        HearthStore::set_emotional_states_batch(&batch, states.clone())
+            .await
+            .expect("set batch");
+
+        // Molemmilla oltava identtinen tila jokaiselle agentille.
+        for (agent, _) in &states {
+            let a = HearthStore::get_emotional_state(&per_agent, agent)
+                .await
+                .expect("get per-agent");
+            let b = HearthStore::get_emotional_state(&batch, agent)
+                .await
+                .expect("get batch");
+            assert_eq!(a, b, "state mismatch for {agent}");
+        }
+
+        // Molemmilla sama agenttijoukko.
+        let mut agents_a = HearthStore::list_agents_with_emotion(&per_agent)
+            .await
+            .expect("list per-agent");
+        let mut agents_b = HearthStore::list_agents_with_emotion(&batch)
+            .await
+            .expect("list batch");
+        agents_a.sort();
+        agents_b.sort();
+        assert_eq!(agents_a, agents_b);
+    }
+
+    /// Reunatapaus: 0 agenttia — no-op, ei virhettä eikä rivejä.
+    #[tokio::test]
+    async fn batch_empty_is_noop() {
+        let store = InMemoryHearthStore::new(LocalJsonStore::in_memory());
+        HearthStore::set_emotional_states_batch(&store, vec![])
+            .await
+            .expect("empty batch");
+        let agents = HearthStore::list_agents_with_emotion(&store)
+            .await
+            .expect("list");
+        assert!(agents.is_empty());
+    }
+
+    /// Reunatapaus: 1 agentti.
+    #[tokio::test]
+    async fn batch_single_agent() {
+        let store = InMemoryHearthStore::new(LocalJsonStore::in_memory());
+        let state = EmotionalVector {
+            joy: 0.9,
+            ..EmotionalVector::neutral()
+        };
+        HearthStore::set_emotional_states_batch(&store, vec![("solo".to_string(), state)])
+            .await
+            .expect("single batch");
+        let got = HearthStore::get_emotional_state(&store, "solo")
+            .await
+            .expect("get");
+        assert!((got.joy - 0.9).abs() < f64::EPSILON);
+    }
+
+    /// Reunatapaus: batch-päivitys olemassa olevan tilan päälle korvaa sen.
+    #[tokio::test]
+    async fn batch_overwrites_existing() {
+        let store = InMemoryHearthStore::new(LocalJsonStore::in_memory());
+        // Alkuperäinen tila.
+        HearthStore::set_emotional_state(
+            &store,
+            "agent_a",
+            EmotionalVector {
+                joy: 0.1,
+                ..EmotionalVector::neutral()
+            },
+        )
+        .await
+        .expect("initial set");
+
+        // Batch korvaa agent_a:n + lisää agent_b:n.
+        HearthStore::set_emotional_states_batch(
+            &store,
+            vec![
+                (
+                    "agent_a".to_string(),
+                    EmotionalVector {
+                        joy: 0.95,
+                        ..EmotionalVector::neutral()
+                    },
+                ),
+                (
+                    "agent_b".to_string(),
+                    EmotionalVector {
+                        joy: 0.3,
+                        ..EmotionalVector::neutral()
+                    },
+                ),
+            ],
+        )
+        .await
+        .expect("batch overwrite");
+
+        let a = HearthStore::get_emotional_state(&store, "agent_a")
+            .await
+            .expect("get a");
+        let b = HearthStore::get_emotional_state(&store, "agent_b")
+            .await
+            .expect("get b");
+        assert!((a.joy - 0.95).abs() < f64::EPSILON, "agent_a overwritten");
+        assert!((b.joy - 0.3).abs() < f64::EPSILON, "agent_b inserted");
+
+        // Ei duplikaatteja: agent_a esiintyy tasan kerran.
+        let agents = HearthStore::list_agents_with_emotion(&store)
+            .await
+            .expect("list");
+        assert_eq!(agents.iter().filter(|x| *x == "agent_a").count(), 1);
+        assert_eq!(agents.len(), 2);
+    }
+
+    /// Batch clampaa arvot samoin kuin per-agentti-kutsu.
+    #[tokio::test]
+    async fn batch_clamps_like_per_agent() {
+        let store = InMemoryHearthStore::new(LocalJsonStore::in_memory());
+        let out_of_range = EmotionalVector {
+            joy: 1.5,
+            sadness: -0.3,
+            ..EmotionalVector::neutral()
+        };
+        HearthStore::set_emotional_states_batch(&store, vec![("a".to_string(), out_of_range)])
+            .await
+            .expect("batch");
+        let got = HearthStore::get_emotional_state(&store, "a")
+            .await
+            .expect("get");
+        assert!((got.joy - 1.0).abs() < f64::EPSILON, "joy clamped to 1.0");
+        assert!(
+            (got.sadness - 0.0).abs() < f64::EPSILON,
+            "sadness clamped to 0.0"
+        );
     }
 
     #[tokio::test]

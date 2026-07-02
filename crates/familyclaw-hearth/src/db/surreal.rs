@@ -383,27 +383,85 @@ DEFINE FIELD decay_class ON anchor TYPE string;
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
             let db = Arc::clone(&self.db);
             let agent_id = agent_id.to_string();
-            let updated_at = chrono::Utc::now().to_rfc3339();
-            let joy = state.joy;
-            let sadness = state.sadness;
-            let curiosity = state.curiosity;
-            let anxiety = state.anxiety;
-            let confidence = state.confidence;
-            let affection = state.affection;
+            let state = state.clamped();
             Box::pin(async move {
-                db.query(
-                    "UPSERT emotional_state SET agent_id = $agent_id, joy = $joy, sadness = $sadness, curiosity = $curiosity, anxiety = $anxiety, confidence = $confidence, affection = $affection, updated_at = $updated_at"
-                )
-                .bind(("agent_id", agent_id))
-                .bind(("joy", joy))
-                .bind(("sadness", sadness))
-                .bind(("curiosity", curiosity))
-                .bind(("anxiety", anxiety))
-                .bind(("confidence", confidence))
-                .bind(("affection", affection))
-                .bind(("updated_at", updated_at))
-                .await
-                .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("SurrealDB upsert failed: {e}")))?;
+                // Käytä eksplisiittistä record-id:tä (`emotional_state:<agent_id>`)
+                // `type::record`:lla, jotta UPSERT päivittää saman rivin paikallaan
+                // eikä luo uutta satunnais-id:tä joka kutsulla. `updated_at`
+                // asetetaan `time::now()`:lla (natiivi datetime, SCHEMAFULL-kenttä).
+                let mut resp = db
+                    .query(
+                        "UPSERT type::record('emotional_state', $agent_id) SET agent_id = $agent_id, joy = $joy, sadness = $sadness, curiosity = $curiosity, anxiety = $anxiety, confidence = $confidence, affection = $affection, updated_at = time::now()"
+                    )
+                    .bind(("agent_id", agent_id))
+                    .bind(("joy", state.joy))
+                    .bind(("sadness", state.sadness))
+                    .bind(("curiosity", state.curiosity))
+                    .bind(("anxiety", state.anxiety))
+                    .bind(("confidence", state.confidence))
+                    .bind(("affection", state.affection))
+                    .await
+                    .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("SurrealDB upsert failed: {e}")))?;
+                // Pinta lauseiden virheet (SCHEMAFULL-rikkomukset yms. eivät
+                // näy pelkässä `.await`:ssa vaan `take_errors`:ssa).
+                let errors = resp.take_errors();
+                if !errors.is_empty() {
+                    return Err(familyclaw_core::FamilyClawError::Memory(format!(
+                        "SurrealDB upsert statement error: {errors:?}"
+                    )));
+                }
+                Ok(())
+            })
+        }
+
+        fn set_emotional_states_batch(
+            &self,
+            states: Vec<(String, EmotionalVector)>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+            let db = Arc::clone(&self.db);
+            Box::pin(async move {
+                if states.is_empty() {
+                    return Ok(());
+                }
+
+                // Rakenna YKSI query joka niputtaa kaikki agenttien UPSERTit
+                // yhteen transaktioon → yksi tietokantakierros N:n sijaan.
+                // Jokaiselle agentille indeksoidut bind-parametrit ($agent_0,
+                // $joy_0, ...) — ei string-interpolaatiota arvoihin (injektiosuoja).
+                let mut sql = String::from("BEGIN TRANSACTION;\n");
+                for i in 0..states.len() {
+                    use std::fmt::Write as _;
+                    let _ = writeln!(
+                        sql,
+                        "UPSERT type::record('emotional_state', $agent_{i}) SET agent_id = $agent_{i}, joy = $joy_{i}, sadness = $sadness_{i}, curiosity = $curiosity_{i}, anxiety = $anxiety_{i}, confidence = $confidence_{i}, affection = $affection_{i}, updated_at = time::now();"
+                    );
+                }
+                sql.push_str("COMMIT TRANSACTION;");
+
+                let mut q = db.query(sql);
+                for (i, (agent_id, state)) in states.into_iter().enumerate() {
+                    let state = state.clamped();
+                    q = q
+                        .bind((format!("agent_{i}"), agent_id))
+                        .bind((format!("joy_{i}"), state.joy))
+                        .bind((format!("sadness_{i}"), state.sadness))
+                        .bind((format!("curiosity_{i}"), state.curiosity))
+                        .bind((format!("anxiety_{i}"), state.anxiety))
+                        .bind((format!("confidence_{i}"), state.confidence))
+                        .bind((format!("affection_{i}"), state.affection));
+                }
+
+                let mut resp = q.await.map_err(|e| {
+                    familyclaw_core::FamilyClawError::Memory(format!(
+                        "SurrealDB batch upsert failed: {e}"
+                    ))
+                })?;
+                let errors = resp.take_errors();
+                if !errors.is_empty() {
+                    return Err(familyclaw_core::FamilyClawError::Memory(format!(
+                        "SurrealDB batch upsert statement error: {errors:?}"
+                    )));
+                }
                 Ok(())
             })
         }
@@ -445,10 +503,235 @@ DEFINE FIELD decay_class ON anchor TYPE string;
 #[cfg(all(test, feature = "surreal"))]
 mod tests {
     use super::surreal::SurrealHearthStore;
+    use crate::emotional_state::EmotionalVector;
+    use crate::HearthStore;
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
 
     #[tokio::test]
     async fn surreal_hearth_store_connect_mem() {
         let store = SurrealHearthStore::connect("mem://").await;
         assert!(store.is_ok(), "Should connect to mem://");
+    }
+
+    /// Yksittäinen set/get round-trippaa oikein (todistaa että record-id +
+    /// `time::now()` -korjaus persistoi rivin — bare-UPSERT ei tehnyt).
+    #[tokio::test]
+    async fn surreal_emotional_state_single_roundtrip() {
+        let store = SurrealHearthStore::connect("mem://")
+            .await
+            .expect("connect");
+        let state = EmotionalVector {
+            joy: 0.8,
+            sadness: 0.1,
+            curiosity: 0.6,
+            anxiety: 0.2,
+            confidence: 0.7,
+            affection: 0.5,
+        };
+        store
+            .set_emotional_state("agent_a", state)
+            .await
+            .expect("set");
+        let got = store.get_emotional_state("agent_a").await.expect("get");
+        assert_eq!(got, state, "single write must round-trip exactly");
+    }
+
+    /// Toistuva set samalle agentille päivittää PAIKALLAAN — ei duplikaatteja.
+    #[tokio::test]
+    async fn surreal_repeated_set_updates_in_place() {
+        let store = SurrealHearthStore::connect("mem://")
+            .await
+            .expect("connect");
+        for joy in [0.8_f64, 0.2, 0.55] {
+            store
+                .set_emotional_state(
+                    "agent_a",
+                    EmotionalVector {
+                        joy,
+                        ..EmotionalVector::neutral()
+                    },
+                )
+                .await
+                .expect("set");
+        }
+        let got = store.get_emotional_state("agent_a").await.expect("get");
+        assert!(approx(got.joy, 0.55), "last write wins");
+        // Tasan yksi agentti rekisterissä (ei satunnais-id-duplikaatteja).
+        let agents = store.list_agents_with_emotion().await.expect("list");
+        assert_eq!(
+            agents.iter().filter(|a| *a == "agent_a").count(),
+            1,
+            "no duplicate rows"
+        );
+    }
+
+    /// Batch tuottaa saman lopputilan kuin per-agentti-kutsut samaan dataan.
+    #[tokio::test]
+    async fn surreal_batch_equals_per_agent() {
+        let states = vec![
+            (
+                "agent_a".to_string(),
+                EmotionalVector {
+                    joy: 0.8,
+                    sadness: 0.1,
+                    curiosity: 0.6,
+                    anxiety: 0.2,
+                    confidence: 0.7,
+                    affection: 0.5,
+                },
+            ),
+            (
+                "agent_b".to_string(),
+                EmotionalVector {
+                    joy: 0.2,
+                    sadness: 0.7,
+                    curiosity: 0.3,
+                    anxiety: 0.6,
+                    confidence: 0.2,
+                    affection: 0.4,
+                },
+            ),
+        ];
+
+        let per_agent = SurrealHearthStore::connect("mem://")
+            .await
+            .expect("connect");
+        for (agent, state) in &states {
+            per_agent
+                .set_emotional_state(agent, *state)
+                .await
+                .expect("set per-agent");
+        }
+
+        let batch = SurrealHearthStore::connect("mem://")
+            .await
+            .expect("connect");
+        batch
+            .set_emotional_states_batch(states.clone())
+            .await
+            .expect("batch");
+
+        for (agent, _) in &states {
+            let a = per_agent
+                .get_emotional_state(agent)
+                .await
+                .expect("get per-agent");
+            let b = batch.get_emotional_state(agent).await.expect("get batch");
+            assert_eq!(a, b, "batch vs per-agent mismatch for {agent}");
+        }
+
+        let mut la = per_agent.list_agents_with_emotion().await.expect("list a");
+        let mut lb = batch.list_agents_with_emotion().await.expect("list b");
+        la.sort();
+        lb.sort();
+        assert_eq!(la, lb, "agent sets must match");
+    }
+
+    /// Reunatapaus: 0 agenttia — no-op, ei virhettä, ei rivejä.
+    #[tokio::test]
+    async fn surreal_batch_empty_is_noop() {
+        let store = SurrealHearthStore::connect("mem://")
+            .await
+            .expect("connect");
+        store
+            .set_emotional_states_batch(vec![])
+            .await
+            .expect("empty batch");
+        let agents = store.list_agents_with_emotion().await.expect("list");
+        assert!(agents.is_empty());
+    }
+
+    /// Reunatapaus: 1 agentti batchissa.
+    #[tokio::test]
+    async fn surreal_batch_single_agent() {
+        let store = SurrealHearthStore::connect("mem://")
+            .await
+            .expect("connect");
+        let state = EmotionalVector {
+            joy: 0.9,
+            ..EmotionalVector::neutral()
+        };
+        store
+            .set_emotional_states_batch(vec![("solo".to_string(), state)])
+            .await
+            .expect("single batch");
+        let got = store.get_emotional_state("solo").await.expect("get");
+        assert_eq!(got, state);
+    }
+
+    /// Reunatapaus: batch olemassa olevan tilan päälle korvaa paikallaan.
+    #[tokio::test]
+    async fn surreal_batch_overwrites_existing() {
+        let store = SurrealHearthStore::connect("mem://")
+            .await
+            .expect("connect");
+        store
+            .set_emotional_state(
+                "agent_a",
+                EmotionalVector {
+                    joy: 0.1,
+                    ..EmotionalVector::neutral()
+                },
+            )
+            .await
+            .expect("initial");
+
+        store
+            .set_emotional_states_batch(vec![
+                (
+                    "agent_a".to_string(),
+                    EmotionalVector {
+                        joy: 0.95,
+                        ..EmotionalVector::neutral()
+                    },
+                ),
+                (
+                    "agent_b".to_string(),
+                    EmotionalVector {
+                        joy: 0.3,
+                        ..EmotionalVector::neutral()
+                    },
+                ),
+            ])
+            .await
+            .expect("batch overwrite");
+
+        let a = store.get_emotional_state("agent_a").await.expect("get a");
+        let b = store.get_emotional_state("agent_b").await.expect("get b");
+        assert!(approx(a.joy, 0.95), "agent_a overwritten in place");
+        assert!(approx(b.joy, 0.3), "agent_b inserted");
+
+        let agents = store.list_agents_with_emotion().await.expect("list");
+        assert_eq!(
+            agents.iter().filter(|x| *x == "agent_a").count(),
+            1,
+            "no duplicate agent_a"
+        );
+        assert_eq!(agents.len(), 2);
+    }
+
+    /// Batch clampaa arvot samoin kuin per-agentti-polku.
+    #[tokio::test]
+    async fn surreal_batch_clamps() {
+        let store = SurrealHearthStore::connect("mem://")
+            .await
+            .expect("connect");
+        store
+            .set_emotional_states_batch(vec![(
+                "a".to_string(),
+                EmotionalVector {
+                    joy: 1.5,
+                    sadness: -0.2,
+                    ..EmotionalVector::neutral()
+                },
+            )])
+            .await
+            .expect("batch");
+        let got = store.get_emotional_state("a").await.expect("get");
+        assert!(approx(got.joy, 1.0), "joy clamped");
+        assert!(approx(got.sadness, 0.0), "sadness clamped");
     }
 }
