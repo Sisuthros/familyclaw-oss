@@ -35,7 +35,7 @@ use std::sync::Arc;
 pub mod dream_skill;
 
 use dream_skill::DreamSkill;
-use familyclaw_actions::{ActionRuntime, AuditCollector, FsReadConfig};
+use familyclaw_actions::{ActionRuntime, AuditCollector, FileWriteConfig, FsReadConfig};
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, resolve_profile_dir, Agent, EmotionCalibration,
     ErasedMemoryStore, JournalResumableStore, LlmEndpointResolver, MetricEvent, ResumableTurnStore,
@@ -530,6 +530,11 @@ pub async fn build_family(
     // Ilman allowlistia taito jää tyhjään fail-closed-tilaan (hylkää kaikki polut),
     // joten tämä on se kytkin joka tekee TIEDOSTOTUTKIMUKSEN oikeasti toimivaksi.
     let fs_read_config = resolve_fs_read_config();
+    // Kirjoitustaidon (file_write) allowlist samasta KERROS B -ympäristöstä.
+    // Ilman sitä file_write jää fail-closed-tilaan (hylkää kaikki kirjoitukset) —
+    // tämä on se kytkin joka tekee TIEDOSTON KIRJOITTAMISEN oikeasti mahdolliseksi
+    // (kirjoitus pysyy silti aina hyväksynnän takana, AlwaysRequireApproval).
+    let file_write_config = resolve_file_write_config();
     let action_runtime = if let Some(dir) = action_data_dir.as_ref() {
         // Persistentti polku: durable pending + task + dispatch outbox YHDELLÄ
         // konstruktorilla — `with_durable_stores` avaa nyt itse kaatumiskestävän
@@ -544,13 +549,13 @@ pub async fn build_family(
             .map_err(|e| {
                 FamilyClawError::config(format!("durable action stores open failed: {e}"))
             })?;
-        rt.register_default_skills_with_fs_read(fs_read_config)
+        rt.register_default_skills_with_configs(fs_read_config, file_write_config)
             .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?;
         rt
     } else {
         // In-memory-polku: kaikki kolme pintaa oletuksissaan.
         let mut rt = ActionRuntime::new();
-        rt.register_default_skills_with_fs_read(fs_read_config)
+        rt.register_default_skills_with_configs(fs_read_config, file_write_config)
             .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?;
         rt
     };
@@ -834,6 +839,35 @@ fn resolve_fs_read_config() -> Option<FsReadConfig> {
         allow_roots = allow_roots.len(),
         trusted_roots = trusted_roots.len(),
         "fs_read research skill allowlist configured from environment"
+    );
+    Some(config)
+}
+
+/// Ratkaisee **kirjoitustaidon** ([`FileWriteAllowlisted`]) allowlistin KERROS B
+/// -ympäristöstä (`FAMILYCLAW_FILE_WRITE_ALLOW`, `PATH`-tyylinen erotinlista).
+///
+/// KERROS A ei kovakoodaa yhtään polkua — operaattori antaa sallitut
+/// kirjoitusjuuret ympäristössä. `None` (muuttuja asettamatta / tyhjä) → taito
+/// jää fail-closed-tilaan (hylkää kaikki kirjoitukset). Kirjoitus pysyy aina
+/// hyväksynnän takana ([`ApprovalPolicy::AlwaysRequireApproval`]); allowlist vain
+/// määrää **mihin** kirjoitus on ylipäätään sallittu hyväksynnän jälkeen.
+fn resolve_file_write_config() -> Option<FileWriteConfig> {
+    let allow_raw = env::var("FAMILYCLAW_FILE_WRITE_ALLOW").ok()?;
+    let allow_roots: Vec<String> = env::split_paths(&allow_raw)
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    if allow_roots.is_empty() {
+        return None;
+    }
+    let mut config = FileWriteConfig::new();
+    for root in &allow_roots {
+        config = config.allow_root(root);
+    }
+    tracing::info!(
+        target: "familyclaw::actions",
+        allow_roots = allow_roots.len(),
+        "file_write skill allowlist configured from environment"
     );
     Some(config)
 }

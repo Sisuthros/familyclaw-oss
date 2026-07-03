@@ -103,7 +103,10 @@ impl WebFetchSkill {
 /// # Errors
 /// Palauttaa [`ActionError::PolicyDenied`] jos URL on epäkelpo tai osoittaa
 /// ei-julkiseen kohteeseen (skeema, host, yksityinen/loopback/link-local IP).
-fn validate_url(raw: &str) -> Result<reqwest::Url> {
+///
+/// `pub(crate)`, jotta sisar-taidot (esim. `research`) voivat uudelleenkäyttää
+/// saman SSRF-vartioinnin ilman koodin kahdentamista.
+pub(crate) fn validate_url(raw: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(raw)
         .map_err(|e| ActionError::PolicyDenied(format!("epäkelpo URL (hylätty): {e}")))?;
 

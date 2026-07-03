@@ -51,8 +51,9 @@ use crate::pending_store::{
 use crate::policy::{ActionRisk, SkillPermission};
 use crate::proof::ProofBundle;
 use crate::skills::{
-    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, FsReadAllowlisted, FsReadConfig,
-    GithubIssueDraftMock, Pipeline, Skill, WebFetchSkill,
+    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, FileWriteAllowlisted,
+    FileWriteConfig, FsReadAllowlisted, FsReadConfig, GithubIssueDraftMock, Pipeline,
+    ResearchSkill, Skill, WebFetchSkill, WebSearchSkill,
 };
 use crate::task::{ActionTask, DurableTaskQueue, TaskQueue, TaskStatus};
 
@@ -580,6 +581,37 @@ impl ActionRuntime {
         &mut self,
         fs_read_config: Option<FsReadConfig>,
     ) -> Result<()> {
+        self.register_default_skills_with_configs(fs_read_config, None)
+    }
+
+    /// Rekisteröi oletustaidot ja antaa kutsujan **konfiguroida sekä
+    /// tiedostonluku- ([`FsReadAllowlisted`]) että tiedostonkirjoitus-
+    /// ([`FileWriteAllowlisted`]) taitojen allowlistit**.
+    ///
+    /// Molemmilla taidoilla on kiinteä skill-id, joten niiden allowlist on
+    /// annettava JO rekisteröintihetkellä (ei jälkikäteen — duplikaattihylkäys).
+    /// Molemmat noudattavat samaa fail-closed-oletusta:
+    ///
+    /// - `config = None` → tyhjä allowlist (hylkää kaikki polut). Taito on
+    ///   luettelossa ja julkaistaan työkaluna, mutta ei tee mitään ennen kuin
+    ///   allowlist annetaan.
+    /// - `config = Some(cfg)` → taito rekisteröidään annetulla allowlistilla,
+    ///   jolloin sen alle osuva operaatio toimii. `fs_read` (`ReadOnly`) ajaa
+    ///   automaattisesti; `file_write` (`WriteLocal`) pysähtyy silti aina
+    ///   hyväksyntään (`ApprovalPolicy::AlwaysRequireApproval`) — allowlist
+    ///   vain sallii että kirjoitus ylipäätään on mahdollinen sen jälkeen.
+    ///
+    /// Allowlistit ovat **KERROS B -dataa**: tämä julkisivu ei kovakoodaa yhtään
+    /// polkua — kutsuja (gateway/runtime) lukee ne ympäristöstä.
+    ///
+    /// # Errors
+    /// Palauttaa manifestin validoinnin tai duplikaattirekisteröinnin virheen,
+    /// jos jokin sisäänrakennettu taito on virheellinen (ei pitäisi tapahtua).
+    pub fn register_default_skills_with_configs(
+        &mut self,
+        fs_read_config: Option<FsReadConfig>,
+        file_write_config: Option<FileWriteConfig>,
+    ) -> Result<()> {
         self.register_skill(EmailTriageMock::new())?;
         self.register_skill(GithubIssueDraftMock::new())?;
         self.register_skill(DiscordThreadSummaryMock::new())?;
@@ -593,6 +625,20 @@ impl ActionRuntime {
         self.register_skill(fs_read)?;
         // 2026-06-25: aito tutkimustaito (read-only web-fetch, SSRF-vartioitu).
         self.register_skill(WebFetchSkill::new())?;
+        // 2026-07-03: functionality-parity executors (closes a real agent
+        // capability gap: web search, disk write, research).
+        // web_search + research ovat read-only (AutoIfReadOnly), joten ne ajavat
+        // ilman hyväksyntää.
+        self.register_skill(WebSearchSkill::new())?;
+        self.register_skill(ResearchSkill::new())?;
+        // file_write on WriteLocal + AlwaysRequireApproval. Tyhjä allowlist
+        // (fail-closed) oletuksena, tai kutsujan antama KERROS B -allowlist
+        // jolloin kirjoitus sen alle on mahdollinen (mutta yhä hyväksynnän takana).
+        let file_write = match file_write_config {
+            Some(config) => FileWriteAllowlisted::with_config(config),
+            None => FileWriteAllowlisted::new(),
+        };
+        self.register_skill(file_write)?;
         Ok(())
     }
 
@@ -1268,7 +1314,7 @@ mod tests {
     fn default_skills_are_listed_without_secrets() {
         let runtime = ActionRuntime::with_default_skills().expect("default skills");
         let skills = runtime.list_skills();
-        assert_eq!(skills.len(), 6, "all six default skills registered");
+        assert_eq!(skills.len(), 9, "all nine default skills registered");
 
         // Nimet aakkostettu → deterministinen järjestys.
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
@@ -1306,15 +1352,20 @@ mod tests {
             .register_default_skills_with_fs_read(Some(config))
             .expect("register with fs_read allowlist");
 
-        // (a) Kaikki kuusi taitoa yhä luettelossa (fs_read ei kahdentunut).
+        // (a) Kaikki yhdeksän taitoa yhä luettelossa (fs_read ei kahdentunut).
+        //     Kuusi alkuperäistä + kolme parity-executoria (2026-07-03).
         let names: Vec<String> = runtime.list_skills().into_iter().map(|s| s.name).collect();
         assert_eq!(
             names.len(),
-            6,
-            "all six default skills registered exactly once"
+            9,
+            "all nine default skills registered exactly once"
         );
         assert!(names.iter().any(|n| n == "fs_read_allowlisted"));
         assert!(names.iter().any(|n| n == "web_fetch"));
+        // Parity-executorit kytketty oletuksena (agent-capability-kuilu):
+        assert!(names.iter().any(|n| n == "web_search"));
+        assert!(names.iter().any(|n| n == "research"));
+        assert!(names.iter().any(|n| n == "file_write_allowlisted"));
 
         // (b) Allowlistatun tiedoston luku ajaa auto-run-polulla (ReadOnly +
         //     AutoIfReadOnly) → tehtävä valmistuu, ei jää hyväksyntää odottamaan.
@@ -1335,6 +1386,65 @@ mod tests {
             TaskStatus::Done,
             "allowlisted file read must complete"
         );
+
+        let _ = std::fs::remove_dir_all(&canonical);
+    }
+
+    /// KIRJOITUSTAITO PÄÄLLE: kun [`ActionRuntime::register_default_skills_with_configs`]
+    /// saa file_write-allowlistin, `file_write` (a) pysyy luettelossa, ja (b)
+    /// hyväksynnän jälkeen kirjoittaa OIKEASTI allowlistatun tiedoston levylle.
+    /// Ilman allowlistia sama taito hylkäisi kaiken (fail-closed). Tämä sulkee
+    /// gap:n jonka gap-recheck löysi: oletusajossa `file_write` oli fail-closed.
+    #[tokio::test]
+    async fn file_write_config_makes_write_skill_functional() {
+        let dir = std::env::temp_dir().join(format!(
+            "familyclaw-facade-filewrite-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let canonical = std::fs::canonicalize(&dir).expect("canonicalize");
+
+        let fw_config = FileWriteConfig::new().allow_root(&canonical);
+        let mut runtime = ActionRuntime::new();
+        runtime
+            .register_default_skills_with_configs(None, Some(fw_config))
+            .expect("register with file_write allowlist");
+
+        // file_write on WriteLocal + AlwaysRequireApproval → submit jää odottamaan.
+        let skill_id = runtime
+            .map_name_to_skill("file_write_allowlisted")
+            .expect("file_write registered");
+        let target = canonical.join("report.md");
+        let payload = json!({
+            "path": target.to_string_lossy(),
+            "content": "# Report\nwritten via the default skill registry\n",
+        });
+        let submitted = runtime
+            .submit_task(skill_id, payload, at(1_700_000_000))
+            .await
+            .expect("submit file_write");
+        let approval_id = submitted
+            .pending_approval
+            .expect("write must wait for approval");
+
+        // Ennen hyväksyntää tiedostoa EI ole (kirjoitus ei laukea).
+        assert!(!target.exists(), "no write before approval");
+
+        // Hyväksy → kirjoitus laukeaa ja valmistuu.
+        let approved = runtime
+            .approve(approval_id, at(1_700_000_001))
+            .await
+            .expect("approve file_write");
+        assert_eq!(
+            approved.status,
+            TaskStatus::Done,
+            "approved allowlisted write must complete"
+        );
+
+        // (b) Tiedosto on OIKEASTI levyllä oikealla sisällöllä.
+        let written = std::fs::read_to_string(&target).expect("file written to disk");
+        assert!(written.contains("written via the default skill registry"));
 
         let _ = std::fs::remove_dir_all(&canonical);
     }
@@ -1418,7 +1528,7 @@ mod tests {
     fn tool_definitions_mirror_skills_sorted_without_secrets() {
         let runtime = ActionRuntime::with_default_skills().expect("default skills");
         let tools = runtime.tool_definitions();
-        assert_eq!(tools.len(), 6, "one descriptor per registered skill");
+        assert_eq!(tools.len(), 9, "one descriptor per registered skill");
 
         // Sama vakautettu nimijärjestys kuin list_skills.
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
