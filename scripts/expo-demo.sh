@@ -36,8 +36,10 @@ step "1/2  Flagship continuity demo (two live agents on one bus)" \
     cargo run -p familyclaw-agent --example two_agents_memory
 
 # 3. Durable crash-replay proof (shortest deterministic crash proof).
+#    Pure cargo, no Bash indirection: `full` runs write, then spawns verify as a
+#    SEPARATE process, proving the memory survived a real process boundary.
 step "2/2  Durable crash-replay proof (write -> crash -> restart -> verify)" \
-    bash scripts/demo-crash-replay.sh
+    cargo run -p familyclaw-agent --bin crash_replay -- full
 
 # 4. LangGraph comparison summary — from the committed, reproducible artifact.
 echo ""
@@ -57,12 +59,14 @@ echo "  model-quality comparison. Full numbers: bench-competitors/langgraph/RESU
 echo ""
 echo "=== Reproduce everything yourself ==="
 echo "  Flagship demo : cargo run -p familyclaw-agent --example two_agents_memory"
-echo "  Crash replay  : bash scripts/demo-crash-replay.sh"
+echo "  Crash replay  : cargo run -p familyclaw-agent --bin crash_replay -- full"
 echo "  Scorecard (8) : cargo run -p familyclaw-bench --bin bench -- all"
-echo "  LangGraph bench (needs Python, separate):"
-echo "    cd bench-competitors/langgraph && python -m venv .venv \\"
-echo "      && .venv/bin/python -m pip install langgraph==1.2.6 langgraph-checkpoint-sqlite==3.1.0 \\"
-echo "      && .venv/bin/python crash_harness.py"
+echo "  LangGraph bench (needs Python 3, separate — the harness REQUIRES a"
+echo "  subcommand + args; a bare 'python crash_harness.py' will error):"
+echo "    cd bench-competitors/langgraph && python3 -m venv .venv \\"
+echo "      && .venv/bin/python -m pip install -r requirements.lock.txt \\"
+echo "      && .venv/bin/python crash_harness.py cycle --crash-point before_write --workdir _runs/before_write"
+echo "    (crash-point choices: clean | before_write | mid_replay; full runner in RESULTS.md)"
 
 # 6. Capability summary.
 echo ""

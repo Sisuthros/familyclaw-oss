@@ -65,10 +65,12 @@ Write-Host "=== Reproduce everything yourself ===" -ForegroundColor Cyan
 Write-Host "  Flagship demo : cargo run -p familyclaw-agent --example two_agents_memory"
 Write-Host "  Crash replay  : cargo run -p familyclaw-agent --bin crash_replay -- full"
 Write-Host "  Scorecard (8) : cargo run -p familyclaw-bench --bin bench -- all"
-Write-Host "  LangGraph bench (needs Python, separate):"
+Write-Host "  LangGraph bench (needs Python 3, separate - the harness REQUIRES a"
+Write-Host "  subcommand + args; a bare 'python crash_harness.py' will error):"
 Write-Host "    cd bench-competitors/langgraph; python -m venv .venv;"
-Write-Host "      .venv/Scripts/python.exe -m pip install langgraph==1.2.6 langgraph-checkpoint-sqlite==3.1.0;"
-Write-Host "      .venv/Scripts/python.exe crash_harness.py"
+Write-Host "      .venv/Scripts/python.exe -m pip install -r requirements.lock.txt;"
+Write-Host "      .venv/Scripts/python.exe crash_harness.py cycle --crash-point before_write --workdir _runs/before_write"
+Write-Host "    (crash-point choices: clean | before_write | mid_replay; full runner in RESULTS.md)"
 
 # 6. Capability summary.
 Write-Host ""
