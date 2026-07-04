@@ -151,6 +151,11 @@ const GATEWAY_TOKEN_ENV: &str = "FAMILYCLAW_GATEWAY_TOKEN";
 /// `{"id":"plan","nodes":[{"id":"n1","title":"...","description":"...","input":{...}}]}`.
 const PLAN_ENV: &str = "FAMILYCLAW_PLAN";
 
+/// Valinnainen LLM-output-katto (tokeneina). Ilman tätä LlmConfig-oletus on
+/// 2048, joka katkaisee pitkät vastaukset kesken lauseen. Aseta esim. 8192
+/// jotta agentti (esim. agent_delta tutkimusraportit) mahtuu vastaamaan kokonaan.
+const MAX_TOKENS_ENV: &str = "FAMILYCLAW_MAX_TOKENS";
+
 /// Oletusarvot joita `FamilyConfig` käyttää (KERROS B).
 const DEFAULT_BUS_NAME: &str = "familyclaw-gateway-bus";
 
@@ -1058,6 +1063,23 @@ fn resolve_addr() -> Result<SocketAddr> {
 /// Virheelliset rivit ohitetaan varoituksella — yksi typo ei kaada gatewayta.
 fn build_resolver() -> EnvEndpointResolver {
     let mut resolver = EnvEndpointResolver::new();
+    // Valinnainen output-token-katto envistä. Sovelletaan KAIKKIIN ratkaistuihin
+    // malleihin (apply_tunings). Ilman tätä oletus 2048 katkaisee pitkät vastaukset.
+    if let Ok(raw) = std::env::var(MAX_TOKENS_ENV) {
+        match raw.trim().parse::<u32>() {
+            Ok(max) if max > 0 => {
+                resolver = resolver.with_max_tokens(max);
+                info!(
+                    max_tokens = max,
+                    "LLM output-katto asetettu {MAX_TOKENS_ENV}:stä"
+                );
+            }
+            _ => warn!(
+                value = raw,
+                "ohitetaan kelvoton {MAX_TOKENS_ENV} (odotettu positiivinen kokonaisluku)"
+            ),
+        }
+    }
     let Ok(spec) = std::env::var(PROVIDERS_ENV) else {
         return resolver;
     };
