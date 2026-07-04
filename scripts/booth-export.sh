@@ -6,7 +6,7 @@
 # Produces a clean demo folder that is SAFE to put on a public booth machine:
 #   1. builds the release demo binaries,
 #   2. exports the tracked working tree via `git archive` (NO .git directory, so
-#      the private git history — which leaks Layer B names — is NOT carried),
+#      the private git history (which leaks Layer B names) is NOT carried),
 #   3. copies the prebuilt binaries into the export so the demo runs even with a
 #      broken toolchain or no network,
 #   4. records the source commit in <OUT_DIR>/COMMIT.txt.
@@ -59,7 +59,7 @@ EOF
 
 # 5. Privacy assertion: there must be no .git in the export.
 if [ -d "$OUT_DIR/.git" ]; then
-    echo "SAFETY FAIL: .git present in export — do NOT use this on a booth."
+    echo "SAFETY FAIL: .git present in export -- do NOT use this on a booth."
     exit 1
 fi
 

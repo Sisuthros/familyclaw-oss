@@ -215,8 +215,21 @@ Never narrate around a broken run. Move to something that passes.
 
 If `cargo` won't build on the booth machine (toolchain, disk, cold cache):
 
-1. **Use the prebuilt `booth/` binaries.** Preflight (§1) confirms they exist.
-   Run the same three demos from the prebuilt binaries instead of `cargo run`.
+0. **Prepare the `booth/` folder BEFORE the booth** (on a working machine):
+   ```powershell
+   powershell -File scripts/booth-export.ps1     # Windows
+   ```
+   ```bash
+   bash scripts/booth-export.sh                   # Linux/macOS
+   ```
+   This builds release binaries, exports the tracked tree **without `.git`**
+   (so private history never reaches the booth), and drops prebuilt binaries in
+   `booth/bin/`. Verified offline: these run with **no toolchain and no network**.
+1. **Use the prebuilt `booth/bin/` binaries** instead of `cargo run`:
+   - `booth/bin/two_agents_memory` — flagship continuity demo
+   - `booth/bin/crash_replay full` — durable crash-replay proof (the irreducible
+     one-command fallback; verified to print "Memory SURVIVED process boundary")
+   - `booth/bin/bench all` — 8-scenario deterministic scorecard
 2. **Show `docs/EXPO_VALIDATION_PROOF.md`** — the printed, exact, reproducible
    results of the full local verification suite (fmt, Layer B audit, build,
    clippy `-D warnings`, ~1721 tests, 8/8 scorecard, flagship + crash demos).

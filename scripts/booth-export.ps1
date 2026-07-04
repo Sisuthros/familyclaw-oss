@@ -5,7 +5,7 @@
 # Produces a clean demo folder that is SAFE to put on a public booth machine:
 #   1. builds the release demo binaries,
 #   2. exports the tracked working tree via `git archive` (NO .git directory, so
-#      the private git history — which leaks Layer B names — is NOT carried),
+#      the private git history (which leaks Layer B names) is NOT carried),
 #   3. copies the prebuilt binaries into the export so the demo runs even with a
 #      broken toolchain or no network,
 #   4. records the source commit in booth/COMMIT.txt.
@@ -34,7 +34,14 @@ if ($LASTEXITCODE -ne 0) { throw "release build failed" }
 if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
 New-Item -ItemType Directory -Path $OutDir | Out-Null
 Write-Host "Exporting tracked tree via git archive (no .git)..." -ForegroundColor Cyan
-git archive --format=tar HEAD | tar -x -C $OutDir
+# Write the tar to a file first. PowerShell's pipeline passes .NET objects, not
+# raw bytes, so piping the binary tar stream directly into 'tar -x' corrupts it.
+$tarPath = Join-Path $OutDir "_export.tar"
+git archive --format=tar -o $tarPath HEAD
+if ($LASTEXITCODE -ne 0) { throw "git archive failed" }
+tar -x -f $tarPath -C $OutDir
+if ($LASTEXITCODE -ne 0) { throw "tar extract failed" }
+Remove-Item $tarPath
 if (-not (Test-Path (Join-Path $OutDir "Cargo.toml"))) { throw "git archive export failed" }
 
 # 3. Copy prebuilt binaries into the export.
@@ -61,7 +68,7 @@ history to leak). Safe for a public booth machine.
 
 # 5. Privacy assertion: there must be no .git in the export.
 if (Test-Path (Join-Path $OutDir ".git")) {
-    throw "SAFETY FAIL: .git present in export — do NOT use this on a booth."
+    throw "SAFETY FAIL: .git present in export -- do NOT use this on a booth."
 }
 
 Write-Host ""
