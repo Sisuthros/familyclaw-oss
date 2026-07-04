@@ -2,9 +2,9 @@
 //!
 //! A single, deterministic, self-checking demo of the continuity substrate:
 //! **two named agents that are live on the same bus, send real messages to
-//! each other, feel each other's mood through the real delivery path, heal
-//! their memory while they sleep, and answer the same question differently as
-//! time passes.**
+//! each other, feel each other's mood through the real delivery path, reshape
+//! their memory while they sleep (merging duplicates and grounding relative
+//! dates), and answer the same question differently as time passes.**
 //!
 //! Everything printed here is *causally true*. Every claim is followed by a
 //! value read back out of the live runtime, and the program `assert!`s each
@@ -267,7 +267,13 @@ async fn main() -> Result<()> {
     );
 
     // ── Capability 4: dream consolidation on BOB's own memory ───────────────
-    banner("(4) Dream consolidation on Bob's memory: the dream changes what Bob recalls");
+    // TRUTHFUL FRAMING: the dream reshapes the memory SET (merges near-duplicate
+    // notes) and grounds relative dates ("yesterday" → ISO). It does NOT change
+    // the recall *answer* text for this query — the surviving greeting is the
+    // same string before and after. What provably changes is the active-memory
+    // count and the absolutized date, both asserted below. Recall *output* is
+    // changed by decay, shown separately in capability (5).
+    banner("(4) Dream consolidation on Bob's memory: reshapes the memory set and grounds relative dates");
     // Seed Bob with raw day-1 notes: two near-duplicate greetings + a note that
     // uses a relative date ("yesterday"). We add them directly to Bob's store to
     // set up a clean, deterministic dream input.
@@ -320,7 +326,9 @@ async fn main() -> Result<()> {
     );
     // Ask the SAME question AFTER the dream. The dream reduced Bob's active
     // memories (duplicates merged) and grounded the relative date, so the
-    // retrieval result Bob gives for the same query is provably changed.
+    // memory SET Bob holds is provably reshaped (the recall answer text for this
+    // query is the same surviving greeting — recall *output* change is decay's
+    // job, shown in capability 5).
     println!("   Bob's notes after the dream ({after_active} active):");
     print!("     ");
     let after_answer = top_recall(bob_ref, dream_query, day2).await?;
@@ -350,7 +358,7 @@ async fn main() -> Result<()> {
         grounded.contains(&expected_iso),
         "the grounded absolute date {expected_iso} must appear in Bob's note after the dream"
     );
-    println!("   ✓ Same query, causally changed recall: the dream merged Bob's duplicates");
+    println!("   ✓ Same query, reshaped memory set: the dream merged Bob's duplicates");
     println!(
         "       (active memories {before_active} → {after_active}) and grounded the relative date:"
     );

@@ -39,8 +39,10 @@ Invoke-Step "1/2  Flagship continuity demo - two live agents on one bus" {
 }
 
 # 3. Durable crash-replay proof (shortest deterministic crash proof).
+#    Pure cargo, no Bash: `full` runs write, then spawns verify as a SEPARATE
+#    process, proving the memory survived a real process boundary.
 Invoke-Step "2/2  Durable crash-replay proof - write, crash, restart, verify" {
-    bash scripts/demo-crash-replay.sh
+    cargo run -p familyclaw-agent --bin crash_replay -- full
 }
 
 # 4. LangGraph comparison summary - from the committed, reproducible artifact.
@@ -61,7 +63,7 @@ Write-Host "  model-quality comparison. Full numbers: bench-competitors/langgrap
 Write-Host ""
 Write-Host "=== Reproduce everything yourself ===" -ForegroundColor Cyan
 Write-Host "  Flagship demo : cargo run -p familyclaw-agent --example two_agents_memory"
-Write-Host "  Crash replay  : bash scripts/demo-crash-replay.sh"
+Write-Host "  Crash replay  : cargo run -p familyclaw-agent --bin crash_replay -- full"
 Write-Host "  Scorecard (8) : cargo run -p familyclaw-bench --bin bench -- all"
 Write-Host "  LangGraph bench (needs Python, separate):"
 Write-Host "    cd bench-competitors/langgraph; python -m venv .venv;"

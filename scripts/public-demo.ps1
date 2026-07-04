@@ -37,8 +37,9 @@ Invoke-Step "1/3  Flagship continuity demo (two_agents_memory)" {
 }
 
 # 2. Durable crash-replay proof — two-process, write then restart-and-verify.
+#    Pure cargo, no Bash: `full` writes, then spawns verify as a separate process.
 Invoke-Step "2/3  Durable crash-replay proof" {
-    bash scripts/demo-crash-replay.sh
+    cargo run -p familyclaw-agent --bin crash_replay -- full
 }
 
 # 3. Continuity scorecard — 8 deterministic scenarios (s1..s8).
@@ -59,8 +60,16 @@ if ($Full) {
     Invoke-Step "Full  Comparative benchmark (vs LangGraph harness)" {
         cargo run -p familyclaw-bench --bin bench -- compare
     }
-    Invoke-Step "Full  Layer B leak audit" {
-        bash scripts/audit-layer-b.sh
+    # Layer B leak audit is a Bash script (no pure-cargo equivalent). It is
+    # OPTIONAL and gated behind Bash availability so it never aborts the demo on
+    # a Windows box without Git-Bash/WSL.
+    if (Get-Command bash -ErrorAction SilentlyContinue) {
+        Invoke-Step "Full  Layer B leak audit" {
+            bash scripts/audit-layer-b.sh
+        }
+    } else {
+        Write-Host "  [skip] Layer B leak audit needs Bash (Git-Bash/WSL)." -ForegroundColor DarkGray
+        Write-Host "         Run manually in Git-Bash: bash scripts/audit-layer-b.sh" -ForegroundColor DarkGray
     }
 }
 

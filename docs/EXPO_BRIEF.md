@@ -30,10 +30,10 @@ Every item below is a capability verified in the current build:
 - **At-most-once / duplicate-prevented external dispatch** under tested crash conditions.
 - **Approval-gated action runtime** — external actions pass through a policy gate before execution.
 - **Live multi-agent orchestration** — multiple agents coordinating over a shared bus.
-- **Durable memory and consolidation** — memory that persists across runs, including consolidation that reshapes recall.
-- **LLM cooldown / backoff / key rotation** — provider failure handling that distinguishes throttling from a dead key.
-- **WASM sandbox** — isolated execution boundary for untrusted work.
-- **Layer A / Layer B separation** — a structural split between trusted and less-trusted execution surfaces.
+- **Durable memory and consolidation** — memory that persists across runs, including a nightly dream cycle that reshapes the memory set (merges near-duplicates, grounds relative dates); time-based decay separately changes what surfaces on recall.
+- **LLM cooldown / backoff / key rotation** — provider failure handling that distinguishes throttling (429, escalating cooldown) from a dead key (401/403, rotate within the key pool before cooling the provider).
+- **WASM sandbox** — isolated, deny-by-default execution boundary (Wasmtime + Cranelift + fuel metering) for untrusted skill code.
+- **Layer A / Layer B separation** — public generic infrastructure (Layer A: crates, runtime, buses, memory, sandbox — no names, keys, or paths) versus private identities, souls, calibrations, secrets, and machine-specific paths (Layer B: loaded at runtime, never committed). See `docs/LAYER_BOUNDARY.md`.
 - **Local deterministic benchmark suite** — reproducible measurement with no keys and no network.
 
 ## 5. Architecture diagram

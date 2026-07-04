@@ -83,12 +83,13 @@ s8_weekly_review      — PASS
 `scripts/pre-publish-scan.sh` reports:
 
 - **Working tree: CLEAN** — the current tracked files contain no private Layer B
-  names (`audit-layer-b.sh` passes; the family names appearing there are the
-  audit's own denylist, which is intentional).
+  names (`audit-layer-b.sh` passes on tracked source and docs).
 - **No secret patterns in history.**
-- **Git history leaks private names** in commit messages and diff content
-  (approx: agent_alpha 44, the operator 41, agent_gamma 38, agent_beta 31, agent_epsilon/agent_delta 26,
-  assistant 7 commits of content).
+- **Git history leaks private names** in commit messages and diff content across
+  many commits. The specific names and counts are deliberately NOT reproduced
+  here — enumerating them would itself put Layer B identifiers into publishable
+  content. Run `scripts/pre-publish-scan.sh` locally to see the full history
+  report; it is expected to exit non-zero until an orphan publish is performed.
 
 **Conclusion: the repository *content* is publishable, but the git *history* is
 not.** The correct, documented path is a clean-history **orphan repo**
