@@ -1270,7 +1270,18 @@ impl Agent {
         let query = bus_message_text(current_message);
 
         // ORIENT: hae relevantit muistot ENSIN (RAG — ennen LLM-kutsua).
-        let mut recall_ctx = RetrievalContext::new(query.clone()).with_limit(5);
+        // semantic_weight aktivoi vektorihaun (cosine); ilman sitä recall on
+        // pelkkää avainsana-/tärkeys-osumaa, joka jää heikoksi lyhyillä viesteillä
+        // (havaittu ~0.12 relevanssi). Env `FAMILYCLAW_SEMANTIC_WEIGHT` (oletus
+        // 0.6) sekoittaa semanttisen ja leksikaalisen; toimii täysin vasta kun
+        // muistilla on aidot embeddingit (FAMILYCLAW_EMBED_PROVIDER=ollama).
+        let semantic_weight = std::env::var("FAMILYCLAW_SEMANTIC_WEIGHT")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .map_or(0.6, |w| w.clamp(0.0, 1.0));
+        let mut recall_ctx = RetrievalContext::new(query.clone())
+            .with_limit(5)
+            .with_semantic_weight(semantic_weight);
         if let Some(origin) = self.session.as_ref() {
             recall_ctx = recall_ctx.with_required_tags([origin.session_tag()]);
         }

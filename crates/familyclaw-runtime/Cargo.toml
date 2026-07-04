@@ -11,6 +11,12 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Kytkee OllamaEmbedderin (aito semanttinen recall) passthrough-piirteenä
+# `familyclaw-embeddings/ollama`:aan. Oletuksena POIS: vetää reqwestin.
+# resolve_embedder() valitsee sen ajossa FAMILYCLAW_EMBED_PROVIDER=ollama.
+ollama = ["familyclaw-embeddings/ollama"]
+
 [dependencies]
 familyclaw-core = { workspace = true }
 familyclaw-bus = { workspace = true }

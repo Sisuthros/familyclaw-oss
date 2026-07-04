@@ -46,7 +46,7 @@ use familyclaw_bus::{BeingId, BusHandle, ResonanceBus, ResonanceMessage};
 use familyclaw_channels::Channel;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
 use familyclaw_durable::{DurableContext, FileJournal, InMemoryJournal, Journal};
-use familyclaw_embeddings::DeterministicEmbedder;
+use familyclaw_embeddings::{DeterministicEmbedder, EmbeddingProvider};
 use familyclaw_memory::{EmbeddingMemoryStore, LocalJsonStore};
 use familyclaw_scheduler::runner::CancellationSignal;
 use familyclaw_scheduler::{ScheduledTask, Scheduler, SchedulerHandle, SchedulerRunner};
@@ -391,7 +391,7 @@ pub async fn build_family(
             // `semantic_weight` on oletuksena 0.0, joten upotukset tuotetaan
             // mutta vektorihaku aktivoituu vasta kun kutsuja nostaa painon →
             // täysin taaksepäin-yhteensopiva.
-            let mem = EmbeddingMemoryStore::new(mem, Arc::new(DeterministicEmbedder::new()));
+            let mem = EmbeddingMemoryStore::new(mem, resolve_embedder());
             let dur = DurableContext::new(Arc::clone(&dream_j))
                 .map_err(|e| FamilyClawError::bus(e.to_string()))?;
             // Kaatumiskestävä jatkettavien vuorojen pinta `<data_dir>/resumable.jsonl`.
@@ -408,10 +408,7 @@ pub async fn build_family(
             )
         } else {
             // Phase 3: sama auto-upotuskääre myös muistinvaraisessa polussa.
-            let mem = EmbeddingMemoryStore::new(
-                LocalJsonStore::in_memory(),
-                Arc::new(DeterministicEmbedder::new()),
-            );
+            let mem = EmbeddingMemoryStore::new(LocalJsonStore::in_memory(), resolve_embedder());
             let memory: ErasedMemoryStore = Arc::new(mem);
             let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(InMemoryJournal::new());
             let durable = DurableContext::new(Arc::clone(&dream_j))
@@ -807,6 +804,35 @@ fn load_profile_calibration(
 /// Palauttaa `None` kun `FAMILYCLAW_FS_READ_ALLOW` puuttuu tai on tyhjä → taito
 /// jää oletukseen (tyhjä allowlist, fail-closed): rekisteröity ja työkaluna
 /// julkaistu, mutta hylkää kaikki polut. Tämä on turvallinen oletus.
+/// Valitsee muistin embedding-tarjoajan ympäristöstä (KERROS B).
+///
+/// - `FAMILYCLAW_EMBED_PROVIDER=ollama` → [`OllamaEmbedder`] (aito semanttinen
+///   recall, oletusmalli `nomic-embed-text`). Vaatii `ollama`-featuren.
+///   - `FAMILYCLAW_EMBED_MODEL` — malli (oletus `nomic-embed-text`)
+///   - `FAMILYCLAW_EMBED_URL` — Ollama base-url (oletus `http://127.0.0.1:11434`)
+/// - muu / asettamaton → [`DeterministicEmbedder`] (riippuvuudeton oletus).
+///
+/// Fail-safe: jos Ollama ei vastaa ajossa, `OllamaEmbedder` palauttaa
+/// nollavektorin (recall degradoituu, ei kaadu).
+fn resolve_embedder() -> Arc<dyn EmbeddingProvider + Send + Sync> {
+    match env::var("FAMILYCLAW_EMBED_PROVIDER").ok().as_deref() {
+        #[cfg(feature = "ollama")]
+        Some("ollama") => {
+            let model = env::var("FAMILYCLAW_EMBED_MODEL").unwrap_or_else(|_| {
+                familyclaw_embeddings::OllamaEmbedder::DEFAULT_MODEL.to_string()
+            });
+            let url = env::var("FAMILYCLAW_EMBED_URL").unwrap_or_else(|_| {
+                familyclaw_embeddings::OllamaEmbedder::DEFAULT_BASE_URL.to_string()
+            });
+            tracing::info!(model = %model, url = %url, "embedder: Ollama (semanttinen recall)");
+            Arc::new(familyclaw_embeddings::OllamaEmbedder::with_config(
+                url, model,
+            ))
+        }
+        _ => Arc::new(DeterministicEmbedder::new()),
+    }
+}
+
 fn resolve_fs_read_config() -> Option<FsReadConfig> {
     let allow_raw = env::var("FAMILYCLAW_FS_READ_ALLOW").ok()?;
     let allow_roots: Vec<String> = env::split_paths(&allow_raw)

@@ -21,6 +21,11 @@ path = "src/main.rs"
 # raportti ei voi valehdella saatavuudesta.
 wasmtime = ["familyclaw-sandbox/wasmtime"]
 
+# Kytkee OllamaEmbedderin (aito semanttinen muisti-recall) passthrough-piirteenä
+# `familyclaw-runtime/ollama`:aan. Aja gateway `--features ollama` + env
+# FAMILYCLAW_EMBED_PROVIDER=ollama, niin recall käyttää oikeaa embedderiä.
+ollama = ["familyclaw-runtime/ollama"]
+
 [lints]
 workspace = true
 
