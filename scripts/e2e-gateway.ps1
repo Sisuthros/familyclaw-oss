@@ -1,4 +1,4 @@
-# E2E: gateway doctor + optional serve (Layer B — private .env required).
+# E2E: gateway doctor + optional serve (Layer B -- private .env required).
 #
 # Prerequisites:
 #   1. Copy .env.example to a private path and fill secrets
@@ -17,7 +17,7 @@ $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
 
 if (-not $env:FAMILYCLAW_DATA_DIR) {
-    Write-Host "FAMILYCLAW_DATA_DIR unset — initializing .local/data ..."
+    Write-Host "FAMILYCLAW_DATA_DIR unset -- initializing .local/data ..."
     & "$PSScriptRoot\init-familyclaw-data.ps1"
     $repoRoot = Split-Path $PSScriptRoot -Parent
     $env:FAMILYCLAW_DATA_DIR = Join-Path $repoRoot ".local" "data"
