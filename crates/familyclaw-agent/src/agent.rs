@@ -469,6 +469,25 @@ pub struct Agent {
     /// säikeenturvallinen, vain-lisäävä (tamper-evident) pinta jota actions-kerros
     /// käyttää.
     turn_audit: Option<Arc<AuditCollector>>,
+    /// **Tunnetilan tarkkailukahva** (valinnainen introspection-seima).
+    ///
+    /// Kun agentti on spawnattu [`AgentActor`]iksi, sen `emotion`-kenttä elää
+    /// actorin sisällä eikä ole ulkopuolelta luettavissa (toisin kuin
+    /// [`memory`](Self::memory), joka on `Arc`-jaettu). Tämä valinnainen,
+    /// jaettu `Arc<Mutex<EmotionState>>` on **pienin turvallinen seima**, jonka
+    /// kautta ulkopuolinen tarkkailija (esim. esimerkki tai integraatiotesti)
+    /// voi lukea agentin tunnetilan busin yli tapahtuvan tunnetartunnan
+    /// jälkeen — **muuttamatta actorin `Msg`-tyyppiä eikä busin toimituspolkua**.
+    ///
+    /// `handle_turn_with_origin` peilaa `self.emotion`:in tähän jokaisen vuoron
+    /// lopussa (tartunta + homeostaasi sovellettuina). Oletus `None` → ei
+    /// peilausta, ei suorituskykyvaikutusta (täysin taaksepäin-yhteensopiva).
+    /// Sama vakiokuvio kuin [`familyclaw_bus::AffectiveState::emotion`].
+    ///
+    /// Käyttää `std::sync::Mutex`ia (ei tokion async-mutexia): peilaus on lyhyt,
+    /// synkroninen tarkkailukirjoitus vuoron lopussa — ei `.await`-rajan yli
+    /// pidettävää lukkoa. Sama tyyppi kuin bus-kerroksen `SharedEmotion`.
+    emotion_probe: Option<Arc<std::sync::Mutex<EmotionState>>>,
 }
 
 impl Agent {
@@ -515,6 +534,7 @@ impl Agent {
             tool_loop: ToolLoopConfig::default(),
             resumable: Arc::new(InMemoryResumableStore::new()),
             turn_audit: None,
+            emotion_probe: None,
         }
     }
 
@@ -525,6 +545,21 @@ impl Agent {
     #[must_use]
     pub fn with_reply_sink(mut self, sink: ReplySink) -> Self {
         self.reply_sink = Some(sink);
+        self
+    }
+
+    /// Asenna **tunnetilan tarkkailukahva** (valinnainen introspection-seima).
+    ///
+    /// Antaa ulkopuoliselle tarkkailijalle jaetun `Arc<Mutex<EmotionState>>`:n,
+    /// johon agentti peilaa lopullisen tunnetilansa jokaisen vuoron lopussa.
+    /// Tämän ainoa tarkoitus on tehdä spawnatun ([`Agent::spawn`]) agentin
+    /// tunnetila luettavaksi busin yli tapahtuvan tunnetartunnan jälkeen —
+    /// esimerkeille ja integraatiotesteille. `None` (oletus) = ei peilausta.
+    ///
+    /// Palauttaa `self` ketjutusta varten ([`Agent::new`]-signatuuri ei muutu).
+    #[must_use]
+    pub fn with_emotion_probe(mut self, probe: Arc<std::sync::Mutex<EmotionState>>) -> Self {
+        self.emotion_probe = Some(probe);
         self
     }
 
@@ -2849,6 +2884,21 @@ impl Agent {
         };
 
         self.turn_counter += 1;
+
+        // Introspection-seima: peilaa lopullinen tunnetila (tartunta +
+        // homeostaasi jo sovellettuina) valinnaiseen tarkkailukahvaan, jotta
+        // ulkopuolinen tarkkailija näkee spawnatun agentin tunnetilan busin yli
+        // tapahtuvan tartunnan jälkeen. No-op jos kahvaa ei ole asennettu.
+        if let Some(probe) = self.emotion_probe.as_ref() {
+            match probe.lock() {
+                Ok(mut guard) => *guard = self.emotion,
+                // Lukko voi olla myrkytetty vain jos tarkkailija panikoi sitä
+                // pidellessään; peilaa silti sen sijaan että levittäisimme
+                // paniikin tähän vuoroon.
+                Err(poisoned) => *poisoned.into_inner() = self.emotion,
+            }
+        }
+
         Ok(recorded)
     }
 
@@ -3497,6 +3547,47 @@ mod tests {
         // Joy 20*0.9 = 18.0, Curiosity 15*0.9 = 13.5.
         assert_eq!(agent.emotion().value(Dimension::Joy), 18.0);
         assert_eq!(agent.emotion().value(Dimension::Curiosity), 13.5);
+
+        bus.stop();
+    }
+
+    #[tokio::test]
+    async fn emotion_probe_reflects_state_after_bus_delivered_pulse() {
+        // Introspection-seiman round-trip: SPAWNATTU agentti, jonka tunnetila
+        // elää actorin sisällä, saa tunnepulssin OIKEAN busin yli, ja ulkopuolinen
+        // tarkkailija lukee muuttuneen tunnetilan `emotion_probe`-kahvasta.
+        // Tämä todistaa että seima ei riko busin toimitusta eikä actorin
+        // Msg-tyyppiä — tila kulkee bus → handle_turn → probe.
+        let bus = ResonanceBus::start(None).await.expect("bus");
+
+        // Vastaanottaja: oikea Agent, jaettu tunnetila-probe asennettuna.
+        let probe = Arc::new(std::sync::Mutex::new(EmotionState::neutral()));
+        let receiver = test_agent("agent_b", bus.clone()).with_emotion_probe(probe.clone());
+        let joy_before = probe.lock().expect("lock").value(Dimension::Joy);
+        assert_eq!(joy_before, 0.0, "probe alkaa neutraalina");
+
+        // Spawnaa vastaanottaja actoriksi — sen emotion elää nyt actorin sisällä.
+        let _receiver_ref = receiver.spawn().await.expect("spawn receiver");
+
+        // Lähettäjä: pelkkä olento, joka vuotaa korkean ilon pulssin busiin.
+        let sender_id = BeingId::new();
+        let mut pulse_state = EmotionState::neutral();
+        pulse_state.set(Dimension::Joy, 80.0);
+        bus.publish(sender_id, BusMessage::emotion_pulse(pulse_state))
+            .expect("publish pulse over real bus");
+
+        // Anna busin toimittaa ja actorin käsitellä vuoro.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Probe heijastaa nyt bus-toimitetun pulssin tuottaman tartunnan.
+        let joy_after = probe.lock().expect("lock").value(Dimension::Joy);
+        assert!(
+            joy_after > joy_before,
+            "bus-toimitettu pulssi nosti vastaanottajan iloa (probe: {joy_before} → {joy_after})"
+        );
+        // Contagion 80*0.25=20, homeostaasi -10% → 18.0 (sama matematiikka kuin
+        // suoralla handle_turnilla, mutta nyt busin ja actorin läpi).
+        assert_eq!(joy_after, 18.0, "tartunta kulki busin yli oikein");
 
         bus.stop();
     }
