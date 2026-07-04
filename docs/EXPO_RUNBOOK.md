@@ -380,18 +380,13 @@ scope).
 
 ## Appendix — Internal ops only (do NOT read out to visitors)
 
-**Family council roles** (internal; **not public marketing**):
+**Family council roles** are defined in the internal operating model, which is a
+**Layer B document kept OUTSIDE this repository** (it names real team members and
+private operating structure — it must never enter publishable content). The
+operator (the operator) holds it in the private workspace, not in `docs/`.
 
-| Member | Role |
-|--------|------|
-| **the operator** | CEO / final authority / customer relationships / approvals |
-| **agent_alpha** | Strategy / product synthesis / prioritization / decision framing |
-| **Claude (assistant)** | Engineering lead / implementation / technical audit / delivery |
-| **Grok** | Market intelligence / competitor analysis / adversarial review |
-| **agent_epsilon** | Lead research / personalized demos / outreach prep |
-| **agent_gamma** | QA / claim verification / counter-evidence |
-
-**Autonomy boundary.** Agents may autonomously research, analyze, draft, code in
+**Autonomy boundary** (safe to keep here — names only the operator and "agents"
+generically). Agents may autonomously research, analyze, draft, code in
 branches, test, prepare demos, and prepare outreach drafts. **the operator approval is
 REQUIRED before:** sending messages, publishing, merging to main, deployments,
 spending money, signing agreements, accessing customer production systems,
