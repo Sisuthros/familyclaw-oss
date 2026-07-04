@@ -1,24 +1,45 @@
 # Expo Validation Proof — v1.2.0
 
-> Exact, reproducible results of the full local verification suite run for the
-> `feat/expo-finish-pass` branch. This is the authoritative proof of what passes
-> locally. Hosted CI status is stated separately at the bottom (it runs on a
-> zero-spend GitHub account and is **not** claimed here as the source of truth).
+> Exact, reproducible results of the full local verification suite. This is the
+> authoritative proof of what passes locally. Hosted CI status is stated
+> separately at the bottom (it runs on a zero-spend GitHub account and is **not**
+> claimed here as the source of truth). **Local proof only — no claim is made
+> that hosted CI passed.**
 
-## Environment
+## Environment (integrated Expo tree — re-validated 2026-07-04)
 
 | Field | Value |
 |---|---|
-| Date | 2026-07-02 |
-| Branch | `feat/expo-finish-pass` |
-| Base commit | `a995bf3` (branch created from `main`) |
+| Date | 2026-07-04 |
+| Branch | `feat/expo-commercial-foundation` |
+| Commit | `2440f38` (merge: expo showcase onto the content-hash-approval base) |
 | OS | Windows 11 (win32), MINGW64 shell |
-| Rust | `rustc 1.95.0 (59807616e 2026-04-14)` |
+| Rust | `cargo 1.95.0 (f2d3ce0bd 2026-03-21)` / `rustc 1.95.0 (59807616e 2026-04-14)` |
 | Workspace | 23 crates + `examples/minimal-gateway` |
 | Version | `v1.2.0` |
 
-> The commit SHA of the validated tree is recorded in the PR; the results below
-> were produced on the branch tip with all seven Expo deliverables applied.
+> **Re-validation note (2026-07-04).** The tables below (V1–V17) were first
+> produced on `feat/expo-finish-pass`. They were re-run on the **integrated**
+> branch `feat/expo-commercial-foundation`, which merges the Expo showcase onto
+> the newest content-hash-approval base **and keeps all 5 executor skills** (the
+> 3 skills the finish-pass branch predated). Result of the re-run on the
+> integrated tree at commit `2440f38`, plus the honesty edits applied after it:
+>
+> | Step | Command | Exit | Count |
+> |---|---|:--:|---|
+> | fmt | `cargo fmt --all --check` | 0 | clean |
+> | clippy | `cargo clippy --workspace --all-targets --features discord -- -D warnings` | 0 | no warnings |
+> | test (discord) | `cargo test --workspace --features discord` | 0 | **1748 passed, 0 failed** |
+> | test (all-features) | `cargo test --workspace --all-features` | 0 | **1776 passed, 0 failed** |
+> | doc | `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --features discord` | 0 | clean |
+> | layer-b audit | `bash scripts/audit-layer-b.sh` | 0 | PASSED (after moving internal named-owner docs out of the tree) |
+> | flagship demo | `cargo run -p familyclaw-agent --example two_agents_memory` | 0 | self-asserts pass |
+> | crash replay | `cargo run -p familyclaw-agent --bin crash_replay -- full` | 0 | memory survived process boundary |
+> | preflight | `bash scripts/expo-preflight.sh` | 0 | PREFLIGHT PASS |
+>
+> The higher test counts vs the original run (1708/1736) are expected: the
+> integrated tree includes the 3 executor skills. The V1–V17 detail below is
+> retained as the original per-step record.
 
 ## Results
 
