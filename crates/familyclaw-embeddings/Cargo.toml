@@ -16,4 +16,15 @@ workspace = true
 # Tulevat pure-Rust-mallit (Phase-0-spiken valitsema) lisätään feature-gatein,
 # jottei oletusrakennus vedä raskasta riippuvuutta (köyhyys-rajoite + MSVC/deny).
 
+# feature `ollama` = OllamaEmbedder (oikea semanttinen embedder Ollaman kautta,
+# esim. nomic-embed-text). reqwest::blocking sopii synkroniseen embed()-traittiin
+# (upotus tapahtuu muistin KIRJOITUKSESSA, ei vastauksen hot-polulla).
+reqwest = { workspace = true, features = ["blocking", "json"], optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+ollama = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+
 [dev-dependencies]

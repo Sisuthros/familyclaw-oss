@@ -33,6 +33,17 @@
 //! assert_eq!(a, b); // deterministinen: sama teksti → sama vektori
 //! assert_eq!(a.len(), embedder.dimensions());
 //! ```
+//!
+//! ## Aito semanttinen embedder (feature `ollama`)
+//! Kun tarvitaan aitoa semanttista recallia (ei bag-of-words), ota käyttöön
+//! `ollama`-feature ja käytä [`OllamaEmbedder`]:ia (esim. `nomic-embed-text`).
+//! Se kutsuu paikallista Ollamaa ja fail-safe-degradoituu nollavektoriin jos
+//! Ollama ei vastaa.
+
+#[cfg(feature = "ollama")]
+pub mod ollama;
+#[cfg(feature = "ollama")]
+pub use ollama::OllamaEmbedder;
 
 /// Tekstistä vektoriksi -tarjoaja.
 ///
