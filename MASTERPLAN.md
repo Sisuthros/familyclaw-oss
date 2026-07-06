@@ -96,11 +96,13 @@ Lisätiedot: [docs/USERS.md](docs/USERS.md).
 | H1.3 | Gateway-restart-mute | `Agent::resume_live()` + `gateway_restart_*` testi — **PASS 2026-07-06** |
 | H1.4 | Discord dual-instance | Yksi `Arc` + `SharedDiscordChannel` — **korjattu** (verifioi `/inject` manuaalisesti) |
 | H1.5 | Scorecard CI-gate | `bench all` → `Err` kun epäonnistuu; CI-job `all-features` — **lisätty 2026-07-06** |
-| H1.6 | Rehellisyysportti | README/DEMO: 0 overclaimia; REAL vs SIMULATED taulukko täydellinen — **osittain** (README päivitetty) |
+| H1.6 | Rehellisyysportti | README "Should you use this?" + [docs/LAUNCH.md](docs/LAUNCH.md) — **2026-07-06** |
 
 ### Horisontti 2 — OSS-läpimurto: bench aseena
 
 **Tavoite:** skeptikko kloonaa, ajaa yhden komennon, näkee todisteen.
+
+**Launch-playbook:** [docs/LAUNCH.md](docs/LAUNCH.md) (Show HN / r/rust -luonnokset, checklist).
 
 **Launch-artefakti:**
 

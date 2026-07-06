@@ -10,6 +10,20 @@ and private runtime profiles that never enter the repository.
 > **[MASTERPLAN.md](MASTERPLAN.md)** — strategy, horizons, and priorities (one consolidated plan).
 > Start with STATUS for technical truth; MASTERPLAN for where we're going.
 
+## Should you use this?
+
+**Probably not** if your agent only reads and summarizes — stay in Python; every SDK and integration is already there.
+
+**Yes** if your agent *mutates the world and a crash costs real money or trust* — migrations, cloud teardowns, refunds. The gap FamilyClaw closes is not checkpointed state replay (many frameworks do that) but **duplicate-prevented external dispatch** when a process dies after the effect fired but before the durable record was written.
+
+Reproduce the claim yourself:
+
+```bash
+cargo run -p familyclaw-bench --bin bench -- all
+```
+
+Full profiles and the adoption gate: [docs/USERS.md](docs/USERS.md). Launch playbook: [docs/LAUNCH.md](docs/LAUNCH.md).
+
 ## See FamilyClaw in action
 
 One deterministic command, no API keys, no network — two named agents that are
