@@ -145,3 +145,8 @@ docs/PHASE3_PARALLEL_PLAN.md
 # Operator-only publish runbook — lists the private names it must keep OUT of
 # Layer A, so it is itself internal and must never be published.
 docs/PUBLISH_ORPHAN_PLAN.md
+docs/FAMILY_COUNCIL_OPERATING_MODEL.md
+docs/FIRST_30_DAYS.md
+
+# Booth export (git-archive of tracked tree + prebuilt binaries; regenerated, never committed)
+booth/

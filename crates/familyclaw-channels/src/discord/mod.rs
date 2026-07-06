@@ -39,7 +39,9 @@ pub mod split;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serenity::all::{ChannelId, CreateMessage, GatewayIntents, Message, Ready};
+use serenity::all::{
+    ActivityData, ChannelId, CreateMessage, GatewayIntents, Message, OnlineStatus, Ready,
+};
 use serenity::async_trait;
 use serenity::client::{Client, Context, EventHandler};
 use serenity::gateway::ShardManager;
@@ -165,8 +167,13 @@ impl DiscordChannel {
             owner_id: self.owner_id,
         };
 
+        // Aseta eksplisiittinen online-presence jo IDENTIFY-payloadiin. Ilman
+        // tätä serenity lähettää presence=null, jolloin botti näkyy OFFLINE
+        // Discordin jäsenlistalla vaikka gateway-yhteys on täysin terve.
         let mut client = Client::builder(&self.bot_token, intents)
             .event_handler(handler)
+            .status(OnlineStatus::Online)
+            .activity(ActivityData::custom("FamilyClaw"))
             .await
             .map_err(|e| ChannelError::backend(&self.channel_id, e.to_string()))?;
 
@@ -367,10 +374,17 @@ struct DiscordHandler {
 
 #[async_trait]
 impl EventHandler for DiscordHandler {
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         // Talleta botin oma id self-echo-suojaa varten (map_message self_id).
         self.self_id
             .store(ready.user.id.get(), std::sync::atomic::Ordering::Relaxed);
+        // Uudelleenvahvista online-presence jokaisen READYn kohdalla. RESUME ei
+        // lähetä presenceä uudelleen, joten tämä pitää botin online myös pitkän
+        // reconnect-ketjun jälkeen (builder-status kattaa vain ensimmäisen IDENTIFYn).
+        ctx.set_presence(
+            Some(ActivityData::custom("FamilyClaw")),
+            OnlineStatus::Online,
+        );
         info!(
             bot = %ready.user.name,
             guilds = ready.guilds.len(),

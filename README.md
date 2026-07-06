@@ -6,8 +6,36 @@ Most AI agents die between runs. FamilyClaw gives them continuity:
 durable replay, persistent memory, actor-based coordination, sleep-time consolidation,
 and private runtime profiles that never enter the repository.
 
-> 📍 **[STATUS.md](STATUS.md) is the single source of truth** for what works today,
-> what is deferred, and where the project stands on release (`v1.2.0`). Start there.
+> 📍 **[STATUS.md](STATUS.md)** — what works today, what is deferred, release (`v1.2.0`).
+> **[MASTERPLAN.md](MASTERPLAN.md)** — strategy, horizons, and priorities (one consolidated plan).
+> Start with STATUS for technical truth; MASTERPLAN for where we're going.
+
+## See FamilyClaw in action
+
+One deterministic command, no API keys, no network — two named agents that are
+live on one bus, send real messages to each other, feel each other's mood
+through the real delivery path, consolidate memory while they sleep, and answer
+the same question differently as time passes. Every printed claim is backed by
+an assertion; the process exits non-zero on any failed invariant.
+
+```bash
+cargo run -p familyclaw-agent --example two_agents_memory
+```
+
+Short Expo showcase (~2–4 min on a warm build — flagship demo + crash-replay
+proof + the crash-safety benchmark summary):
+
+```powershell
+powershell -File scripts/expo-demo.ps1
+```
+```bash
+bash scripts/expo-demo.sh
+```
+
+**Where the proof lives:** [STATUS.md](STATUS.md) ·
+[docs/EXPO_BRIEF.md](docs/EXPO_BRIEF.md) ·
+[docs/CRASH_SAFE_DISPATCH_CASE_STUDY.md](docs/CRASH_SAFE_DISPATCH_CASE_STUDY.md) ·
+[bench-competitors/langgraph/RESULTS.md](bench-competitors/langgraph/RESULTS.md)
 
 > **What Phase 1 proves today:** crash-safe durable replay with **at-most-once
 > external side-effect dispatch under crash** (idempotency-keyed: never fired twice;
@@ -315,9 +343,11 @@ cargo test --workspace \
   --features familyclaw-channels/signal \
   --features familyclaw-gateway/wasmtime
 
-# NB: `--all-features` is intentionally NOT used. The `surreal` feature in
-# familyclaw-hearth is a deferred backend and is excluded from CI until repaired
-# or removed. See .github/workflows/ci.yml for the canonical living-feature list.
+# --all-features is a first-class gate as of v1.2.0. The `surreal` backend in
+# familyclaw-hearth was repaired and a dedicated `all-features` CI job now runs
+# test + doc + clippy (-D warnings) under --all-features to guard against
+# feature-gated regressions:
+cargo test --workspace --all-features
 
 # Code quality
 cargo fmt --all -- --check

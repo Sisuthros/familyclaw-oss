@@ -1,9 +1,9 @@
 # FamilyClaw — Project Status
 
 > **This file is the single source of truth for what FamilyClaw is, what works
-> today, what is deferred, and where it stands on release.** It supersedes the
-> scattered roadmap / plan / phase documents as the *entry point*; those remain
-> in `docs/` as detailed design records (see [Detailed design docs](#detailed-design-docs)).
+> today, what is deferred, and where it stands on release.** Strategy and priorities
+> live in **[MASTERPLAN.md](MASTERPLAN.md)**. Older plan documents are archived in
+> [docs/archive/](docs/archive/) (see [Detailed design docs](#detailed-design-docs)).
 
 - **Version:** `v1.2.0` (workspace `Cargo.toml` `version = "1.2.0"`)
 - **License:** MIT
@@ -23,7 +23,7 @@ boundary.
 
 FamilyClaw does **not** try to win a breadth fight against larger agent
 frameworks (that goal was explicitly rejected during design review — see
-[V1_ROADMAP_DESIGN.md](docs/V1_ROADMAP_DESIGN.md) §1). Its three sharpened edges are:
+[docs/archive/V1_ROADMAP_DESIGN.md](docs/archive/V1_ROADMAP_DESIGN.md) §1). Its three sharpened edges are:
 
 1. **Family with continuity.** Many *persistent* agents — not one-shot chat
    sessions — with durable memory (Eternal Thread + Ebbinghaus decay), nightly
@@ -102,7 +102,7 @@ claimed as working today.
 
 | Item | Status | Why it is deferred |
 |---|---|---|
-| **Growth-loop wiring (apply path)** | 🚧 Deferred to v1.1 (safety decision) | The `familyclaw-growth` crate ships the structurally-safe proposal core (`Proposal`, `ProposalStore`, `Pending/Approved/Denied` lifecycle) — **by construction it has no `apply` method and cannot mutate any skill, policy, or permission**. The runtime producer that emits proposals, the operator approve/deny surface, a durable proposal store, and the apply path itself are deferred. Reason: the apply step is a permission-expansion escalation vector and must land only with canonicalization + denylist + TOCTOU-safe approval — *a v1 that cannot silently self-modify is the correct v1*. See [V1_ROADMAP_DESIGN.md](docs/V1_ROADMAP_DESIGN.md) §6.5 STATUS. |
+| **Growth-loop wiring (apply path)** | 🚧 Deferred to v1.1 (safety decision) | The `familyclaw-growth` crate ships the structurally-safe proposal core (`Proposal`, `ProposalStore`, `Pending/Approved/Denied` lifecycle) — **by construction it has no `apply` method and cannot mutate any skill, policy, or permission**. The runtime producer that emits proposals, the operator approve/deny surface, a durable proposal store, and the apply path itself are deferred. Reason: the apply step is a permission-expansion escalation vector and must land only with canonicalization + denylist + TOCTOU-safe approval — *a v1 that cannot silently self-modify is the correct v1*. See [docs/archive/V1_ROADMAP_DESIGN.md](docs/archive/V1_ROADMAP_DESIGN.md) §6.5 STATUS. |
 | **Send-side latent translation** | 🚧 Fenced research track | Siblings can exchange hidden-state vectors, but cross-model *send-side* latent translation remains a research track behind a feature fence, **always falling back to text** if incompatible. Not production behavior. |
 | **Semantic retrieval turned live** | 🚧 Infra ready, weight off by default | Embedding infra (`familyclaw-embeddings`, local candle MiniLM path), `VectorStore` trait, and cosine retrieval exist and are tested. `semantic_weight` is only turned on where a labeled recall fixture empirically shows semantic Hit@k > keyword Hit@k; otherwise ships keyword + provenance + temporal with semantic OFF (honest, not a loss). See [PHASE3_PARALLEL_PLAN.md](docs/PHASE3_PARALLEL_PLAN.md) §4. |
 | **Real provider skill integrations** | 🚧 Contracts ready, bodies are examples | `email_triage`, `github_issue_draft`, `file_patch`, `discord_thread_summary` are complete, tested implementations of the skill *contract* (manifest, risk class, approval policy, schema, taint) using deterministic placeholder data — not disabled stubs. Wiring a real provider (Gmail, GitHub API, on-disk patch, Discord API) is a swap of the execution body; the approval gate + proof redaction + audit then apply for free. |
@@ -136,23 +136,25 @@ claimed as working today.
 
 ## Detailed design docs
 
-STATUS.md is the entry point. The following remain as detailed, still-valuable
-design and evidence records (kept, not deleted):
+**Strategy:** [MASTERPLAN.md](MASTERPLAN.md) · **Technical status:** this file.
 
-- [docs/V1_ROADMAP_DESIGN.md](docs/V1_ROADMAP_DESIGN.md) — master v1 roadmap (architecture-review panel, phase breakdown, growth-loop §6.5).
+Archived superseded plans: [docs/archive/](docs/archive/). The following remain as
+detailed design and evidence records:
+
 - [docs/PHASE3_PARALLEL_PLAN.md](docs/PHASE3_PARALLEL_PLAN.md) — semantic-memory parallel plan (embeddings, vector store, recall benchmark).
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — full technical architecture overview.
 - [docs/LAYER_BOUNDARY.md](docs/LAYER_BOUNDARY.md) — Layer A / Layer B separation.
 - [docs/CRASH_SAFE_DISPATCH_CASE_STUDY.md](docs/CRASH_SAFE_DISPATCH_CASE_STUDY.md) — the at-most-once dispatch case study.
 - [docs/COMPARISON.md](docs/COMPARISON.md) — continuity comparison vs a competitor-shaped baseline.
 - [docs/SCORECARD.md](docs/SCORECARD.md) — 8-scenario continuity scorecard (regenerated by the bench).
+- [docs/USERS.md](docs/USERS.md) · [docs/COMMERCIAL_OFFER.md](docs/COMMERCIAL_OFFER.md) — go-to-market.
+- [docs/GIT_CONSOLIDATION.md](docs/GIT_CONSOLIDATION.md) — branch/worktree merge map (Horisontti 1).
 - [docs/QUICKSTART.md](docs/QUICKSTART.md) · [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) · [docs/RUNBOOK_WINDOWS.md](docs/RUNBOOK_WINDOWS.md) — running it.
 - [docs/PUBLISH_ORPHAN_PLAN.md](docs/PUBLISH_ORPHAN_PLAN.md) — OSS publish plan.
-- Release notes: [v1.0.0](docs/RELEASE_NOTES_v1.0.0.md) · [v1.0.1](docs/RELEASE_NOTES_v1.0.1.md).
+- Release notes: [v1.0.0](docs/RELEASE_NOTES_v1.0.0.md) · [v1.0.1](docs/RELEASE_NOTES_v1.0.1.md) · [v1.2.0](docs/RELEASE_NOTES_v1.2.0.md).
 
-> Older phase / demo / release-checklist documents in `docs/` are historical.
-> They may later be moved to `docs/archive/` for tidiness, but are intentionally
-> retained for their evidence value. **When in doubt, this file is the truth.**
+> Older phase / demo / release-checklist documents in `docs/` or `docs/archive/` are
+> historical evidence. **When in doubt: MASTERPLAN for strategy, STATUS for what ships.**
 
 ---
 
