@@ -36,7 +36,7 @@
 //!
 //! ## Aito semanttinen embedder (feature `ollama`)
 //! Kun tarvitaan aitoa semanttista recallia (ei bag-of-words), ota käyttöön
-//! `ollama`-feature ja käytä [`OllamaEmbedder`]:ia (esim. `nomic-embed-text`).
+//! `ollama`-feature ja käytä `OllamaEmbedder`:ia (esim. `nomic-embed-text`).
 //! Se kutsuu paikallista Ollamaa ja fail-safe-degradoituu nollavektoriin jos
 //! Ollama ei vastaa.
 

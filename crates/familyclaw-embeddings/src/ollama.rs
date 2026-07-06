@@ -8,7 +8,7 @@
 //!
 //! **Feature-gated (`ollama`)** — ei vedä `reqwest`-riippuvuutta oletusrakennukseen
 //! (Layer A / OSS -köyhyysrajoite). Upotus tapahtuu muistin KIRJOITUKSESSA
-//! ([`EmbeddingMemoryStore::add`]), ei vastauksen hot-polulla, joten synkroninen
+//! `familyclaw-memory`n `EmbeddingMemoryStore`-kirjoituspolulla, ei vastauksen hot-polulla, joten synkroninen
 //! `reqwest::blocking` on turvallinen (Ollama on paikallinen ja nopea).
 //!
 //! ## Fail-safe
