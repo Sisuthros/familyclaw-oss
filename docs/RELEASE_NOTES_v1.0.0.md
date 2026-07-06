@@ -2,7 +2,7 @@
 
 The first stable release of FamilyClaw — a Rust-native multi-agent runtime
 (Layer A = OSS). All six phases of the v1.0 roadmap
-(`docs/V1_ROADMAP_DESIGN.md`) are delivered.
+(`docs/archive/V1_ROADMAP_DESIGN.md`) are delivered.
 
 ## What's in v1.0.0
 

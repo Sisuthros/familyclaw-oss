@@ -129,6 +129,9 @@ jobs:
       - name: cargo clippy --workspace --all-features --all-targets (-D warnings)
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
+      - name: Continuity scorecard gate (bench all)
+        run: cargo run -p familyclaw-bench --bin bench -- all
+
   windows:
     name: Build and Test (Windows)
     needs: layer-b-audit

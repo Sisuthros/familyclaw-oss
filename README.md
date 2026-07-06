@@ -6,8 +6,9 @@ Most AI agents die between runs. FamilyClaw gives them continuity:
 durable replay, persistent memory, actor-based coordination, sleep-time consolidation,
 and private runtime profiles that never enter the repository.
 
-> 📍 **[STATUS.md](STATUS.md) is the single source of truth** for what works today,
-> what is deferred, and where the project stands on release (`v1.2.0`). Start there.
+> 📍 **[STATUS.md](STATUS.md)** — what works today, what is deferred, release (`v1.2.0`).
+> **[MASTERPLAN.md](MASTERPLAN.md)** — strategy, horizons, and priorities (one consolidated plan).
+> Start with STATUS for technical truth; MASTERPLAN for where we're going.
 
 ## See FamilyClaw in action
 

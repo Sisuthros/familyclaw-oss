@@ -153,7 +153,7 @@ const PLAN_ENV: &str = "FAMILYCLAW_PLAN";
 
 /// Valinnainen LLM-output-katto (tokeneina). Ilman tätä LlmConfig-oletus on
 /// 2048, joka katkaisee pitkät vastaukset kesken lauseen. Aseta esim. 8192
-/// jotta agentti (esim. agent_delta tutkimusraportit) mahtuu vastaamaan kokonaan.
+/// jotta agentti (esim. pitkät tutkimusraportit) mahtuu vastaamaan kokonaan.
 const MAX_TOKENS_ENV: &str = "FAMILYCLAW_MAX_TOKENS";
 
 /// Oletusarvot joita `FamilyConfig` käyttää (KERROS B).

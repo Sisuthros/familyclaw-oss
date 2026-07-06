@@ -1,6 +1,6 @@
 # FamilyClaw v1.0.0-rc.1 — Release Candidate
 
-> A **release candidate** for the v1.0 roadmap (`docs/V1_ROADMAP_DESIGN.md`).
+> A **release candidate** for the v1.0 roadmap (`docs/archive/V1_ROADMAP_DESIGN.md`).
 > All six roadmap phases are delivered at their v1.0 scope; this is tagged `-rc`
 > (not final `v1.0.0`) for two honest reasons stated under "Why -rc" below.
 
