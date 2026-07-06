@@ -73,9 +73,16 @@ bash scripts/expo-demo.sh
 > **Next proofs:** deeper WASM sandbox safety scenarios, a broader action/skill
 > runtime surface, and additional channel adapters.
 
+[![CI](https://github.com/Sisuthros/familyclaw/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Sisuthros/familyclaw/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Rust 2021](https://img.shields.io/badge/Rust-2021%20edition-orange.svg)
 ![unsafe: forbidden](https://img.shields.io/badge/unsafe-forbid-green.svg)
+![Continuity scorecard](https://img.shields.io/badge/continuity%20scorecard-8%2F8%20PASS-brightgreen.svg)
+
+> **Verify without cloning:** every `main` CI run regenerates the 8-scenario
+> continuity scorecard and publishes it in the run's **Summary** tab
+> ([latest runs](https://github.com/Sisuthros/familyclaw/actions/workflows/ci.yml?query=branch%3Amain)) —
+> including `side_effect_overcount = 0` for the crash matrix.
 
 ---
 

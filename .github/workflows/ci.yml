@@ -132,6 +132,19 @@ jobs:
       - name: Continuity scorecard gate (bench all)
         run: cargo run -p familyclaw-bench --bin bench -- all
 
+      # Julkinen todiste: scorecard näkyy suoraan run-sivun Summary-osiossa,
+      # jotta skeptikko näkee 8/8-tuloksen ilman kloonausta tai toolchainia.
+      - name: Publish scorecard to job summary
+        run: cat crates/familyclaw-bench/out/SCORECARD.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scorecard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuity-scorecard
+          path: |
+            crates/familyclaw-bench/out/SCORECARD.md
+            crates/familyclaw-bench/out/scorecard.json
+
   windows:
     name: Build and Test (Windows)
     needs: layer-b-audit
