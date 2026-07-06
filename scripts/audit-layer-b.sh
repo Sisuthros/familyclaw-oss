@@ -88,6 +88,8 @@ echo "8️⃣  Checking for real Layer B names in publishable content..."
 # Internal-only files must be untracked (.gitignore) — not whitelisted here.
 # `docs/archive/` holds superseded historical plans (Layer B names may appear);
 # quarantined from publishable scan — see MASTERPLAN.md.
+# `docs/GIT_CONSOLIDATION.md` references real git branch names (may contain
+# forbidden substrings) — internal ops only, not publishable marketing.
 #
 # Text-vs-binary is decided by CONTENT, not extension: `grep -Iq .` matches a
 # file iff it is text with at least one byte of content (GNU grep -I treats files
@@ -105,6 +107,7 @@ echo "8️⃣  Checking for real Layer B names in publishable content..."
 ALL_TRACKED=$(git ls-files 2>/dev/null \
     | grep -vE '(^|/)(target)/' \
     | grep -vE '(^|/)docs/archive/' \
+    | grep -vE '(^|/)docs/GIT_CONSOLIDATION\.md$' \
     | grep -vE '\.example($|\.)' \
     | grep -vE '(^|/)scripts/audit-layer-b\.sh$' || true)
 # Keep only TEXT files (content-based, no extension guessing). Iterate safely

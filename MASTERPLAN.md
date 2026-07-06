@@ -91,7 +91,7 @@ Lisätiedot: [docs/USERS.md](docs/USERS.md).
 
 | # | Tehtävä | Hyväksyntäkriteeri |
 |---|---------|-------------------|
-| H1.1 | Git-konsolidointi | Kartoitus valmis → [docs/GIT_CONSOLIDATION.md](docs/GIT_CONSOLIDATION.md); merge expo → main (alla) |
+| H1.1 | Git-konsolidointi | **Merge valmis 2026-07-06:** `feat/expo-commercial-foundation` → `main`. Kartta: [docs/GIT_CONSOLIDATION.md](docs/GIT_CONSOLIDATION.md) |
 | H1.2 | Layer-B turvaportti | `audit-layer-b.sh` skannaa `git ls-files` (ei allowlistia); `docs/archive/` karanteenissa — **PASS 2026-07-06** |
 | H1.3 | Gateway-restart-mute | `Agent::resume_live()` + `gateway_restart_*` testi — **PASS 2026-07-06** |
 | H1.4 | Discord dual-instance | Yksi `Arc` + `SharedDiscordChannel` — **korjattu** (verifioi `/inject` manuaalisesti) |
