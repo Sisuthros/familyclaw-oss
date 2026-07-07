@@ -51,6 +51,9 @@ const SKILL_UUID: uuid::Uuid = uuid::uuid!("55555555-5555-4555-8555-555555555555
 /// sisältö koskaan vuoda todisteeseen yhteenvedon kautta.
 const SUMMARY_MAX_BYTES: usize = 120;
 
+/// Hakemistolistan enimmäismäärä merkintöjä yhteenvedossa.
+const DIR_LIST_MAX_ENTRIES: usize = 64;
+
 /// Taidon syöte: luettavan tiedoston polku.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsReadInput {
@@ -212,9 +215,17 @@ impl FsReadAllowlisted {
     /// Palauttaa [`ActionError::ExecutionFailed`] jos tiedoston luku
     /// epäonnistuu.
     async fn read_proof(&self, canonical: &Path) -> Result<FsReadOutput> {
-        let bytes = tokio::fs::read(canonical).await.map_err(|e| {
-            ActionError::ExecutionFailed(format!("tiedoston luku epäonnistui: {e}"))
-        })?;
+        let meta = tokio::fs::metadata(canonical)
+            .await
+            .map_err(|e| map_fs_error(canonical, &e))?;
+
+        if meta.is_dir() {
+            return self.read_directory_proof(canonical).await;
+        }
+
+        let bytes = tokio::fs::read(canonical)
+            .await
+            .map_err(|e| map_fs_error(canonical, &e))?;
 
         let path_hash = hash_path(canonical);
         let size = bytes.len() as u64;
@@ -227,6 +238,73 @@ impl FsReadAllowlisted {
             summary,
             trusted,
         })
+    }
+
+    async fn read_directory_proof(&self, canonical: &Path) -> Result<FsReadOutput> {
+        let mut read_dir = tokio::fs::read_dir(canonical)
+            .await
+            .map_err(|e| map_fs_error(canonical, &e))?;
+
+        let mut entries = Vec::new();
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .map_err(|e| map_fs_error(canonical, &e))?
+        {
+            entries.push(entry);
+        }
+
+        entries.sort_by_key(|e| e.file_name());
+
+        let total = entries.len();
+        let mut names = Vec::new();
+        for e in entries.into_iter().take(DIR_LIST_MAX_ENTRIES) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let is_dir = e
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false);
+            names.push(if is_dir { format!("{name}/") } else { name });
+        }
+
+        let mut summary = if names.is_empty() {
+            "[tyhjä hakemisto]".to_string()
+        } else {
+            format!("dir: {}", names.join(", "))
+        };
+        if total > DIR_LIST_MAX_ENTRIES {
+            summary.push_str(&format!(" … (+{} lisää)", total - DIR_LIST_MAX_ENTRIES));
+        }
+        truncate_utf8(&mut summary, SUMMARY_MAX_BYTES * 4);
+
+        let path_hash = hash_path(canonical);
+        let trusted = path_is_under_any(canonical, &self.config.canonical_trusted_roots());
+
+        Ok(FsReadOutput {
+            path_hash,
+            size: total as u64,
+            summary,
+            trusted,
+        })
+    }
+}
+
+/// Muotoilee tiedostojärjestelmävirheen selkeäksi agentille.
+fn map_fs_error(path: &Path, err: &std::io::Error) -> ActionError {
+    use std::io::ErrorKind;
+    let path_display = path.to_string_lossy();
+    match err.kind() {
+        ErrorKind::NotFound => ActionError::ExecutionFailed(format!(
+            "polkua ei löydy: {path_display} (tarkista polku tai luo tiedosto file_write:lla)"
+        )),
+        ErrorKind::PermissionDenied => ActionError::ExecutionFailed(format!(
+            "käyttö estetty polulle {path_display} — tarkista että polku on allowlistilla \
+             eikä osoita kiellettyyn juureen"
+        )),
+        _ => ActionError::ExecutionFailed(format!(
+            "tiedoston luku epäonnistui ({path_display}): {err}"
+        )),
     }
 }
 
@@ -314,7 +392,11 @@ impl ActionExecutor for FsReadAllowlisted {
             "trusted": out.trusted,
         });
         let result = ActionResult::success(
-            format!("read {} byte(s) from allowlisted path", out.size),
+            if out.summary.starts_with("dir:") || out.summary == "[tyhjä hakemisto]" {
+                format!("listed {} entries in allowlisted directory", out.size)
+            } else {
+                format!("read {} byte(s) from allowlisted path", out.size)
+            },
             output,
             request.now,
         );
@@ -335,8 +417,8 @@ impl Skill for FsReadAllowlisted {
             id: Self::skill_id(),
             name: "fs_read_allowlisted".to_string(),
             version: "1.0.0".to_string(),
-            description: "Lukee paikallisen tiedoston vain allowlistatun juuren alta \
-                 (kanonisoitu polku, ei verkkoa); todiste = tiiviste + koko + yhteenveto."
+            description: "Lukee paikallisen tiedoston tai listaa hakemiston vain allowlistatun \
+                 juuren alta (kanonisoitu polku, ei verkkoa); todiste = tiiviste + koko + yhteenveto."
                 .to_string(),
             permissions: vec![SkillPermission::ReadFiles],
             risk: ActionRisk::ReadOnly,
@@ -703,6 +785,38 @@ mod tests {
             !res.status.is_success(),
             "empty allowlist must reject all paths"
         );
+    }
+
+    #[tokio::test]
+    async fn lists_directory_entries_when_path_is_dir() {
+        let dir = temp_dir("dir_list");
+        write_file(&dir, "b.txt", "beta");
+        write_file(&dir, "a.txt", "alpha");
+        std::fs::create_dir(dir.join("sub")).expect("subdir");
+
+        let skill = FsReadAllowlisted::with_config(FsReadConfig::new().allow_root(&dir));
+        let payload = serde_json::to_value(FsReadInput {
+            path: dir.to_string_lossy().to_string(),
+        })
+        .expect("serialize");
+        let req = ActionRequest::new(
+            ActionId::new(),
+            FsReadAllowlisted::skill_id(),
+            ActionTaskId::new(),
+            payload,
+            at(1),
+        );
+        let res = skill.execute(req).await.expect("execute");
+        assert!(res.status.is_success(), "directory listing must succeed");
+        let summary = res.raw_output_redacted["summary"]
+            .as_str()
+            .expect("summary");
+        assert!(
+            summary.starts_with("dir:"),
+            "summary must list dir: {summary}"
+        );
+        assert!(summary.contains("a.txt"), "must include a.txt");
+        assert!(summary.contains("sub/"), "must mark subdir with trailing /");
     }
 
     #[test]

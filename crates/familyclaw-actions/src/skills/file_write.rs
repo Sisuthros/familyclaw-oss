@@ -22,8 +22,10 @@
 //!
 //! ## Riskiluokka ja hyväksyntä
 //! Riski on [`ActionRisk::WriteLocal`] ja oikeus [`SkillPermission::WriteLocalFiles`].
-//! Käytäntö on [`ApprovalPolicy::AlwaysRequireApproval`]: levylle kirjoittaminen
-//! vaatii aina ihmisen hyväksynnän putkessa — se ei koskaan aja itsestään.
+//! Käytäntö on [`ApprovalPolicy::RequireApproval`]: allowlistatun juuren alle
+//! osuva paikallinen kirjoitus ajaa automaattisesti (sama malli kuin
+//! [`crate::skills::fs_read`]: allowlist on varsinainen turvallisuusraja).
+//! Allowlistin ulkopuolinen polku hylätään ennen kirjoitusta.
 //!
 //! ## Todistepaketti ei sisällä sisältöä
 //! Tulos sisältää vain kanonisen polun **tiivisteen** (SHA-256), kirjoitettujen
@@ -137,8 +139,8 @@ impl FileWriteConfig {
 /// Lippulaiva-taito allowlistatulle tiedoston kirjoitukselle (aito levykirjoitus).
 ///
 /// Riskiluokka on [`ActionRisk::WriteLocal`] ja käytäntö
-/// [`ApprovalPolicy::AlwaysRequireApproval`], joten kirjoitus vaatii aina
-/// hyväksynnän putkessa. Allowlistin ulkopuolinen kohde hylätään.
+/// [`ApprovalPolicy::RequireApproval`]: allowlistatun juuren alle osuva
+/// kirjoitus ajaa automaattisesti; allowlistin ulkopuolinen kohde hylätään.
 #[derive(Debug, Clone, Default)]
 pub struct FileWriteAllowlisted {
     /// Allowlist-kokoonpano (sallitut juuret).
@@ -393,7 +395,7 @@ impl Skill for FileWriteAllowlisted {
                 .to_string(),
             permissions: vec![SkillPermission::WriteLocalFiles],
             risk: ActionRisk::WriteLocal,
-            approval_policy: ApprovalPolicy::AlwaysRequireApproval,
+            approval_policy: ApprovalPolicy::RequireApproval,
             input_hint: Some("{ path, content, mode? }".to_string()),
             output_hint: Some("{ path_hash, bytes_written, mode }".to_string()),
             input_schema: json!({
@@ -453,12 +455,12 @@ mod tests {
     }
 
     #[test]
-    fn manifest_is_write_local_always_approve_and_generic() {
+    fn manifest_is_write_local_require_approval_and_generic() {
         let m = FileWriteAllowlisted::new().manifest();
         m.validate().expect("manifest validates");
         assert_eq!(m.name, "file_write_allowlisted");
         assert_eq!(m.risk, ActionRisk::WriteLocal);
-        assert_eq!(m.approval_policy, ApprovalPolicy::AlwaysRequireApproval);
+        assert_eq!(m.approval_policy, ApprovalPolicy::RequireApproval);
         assert_eq!(m.permissions, vec![SkillPermission::WriteLocalFiles]);
         assert_eq!(m.input_schema["properties"]["path"]["type"], "string");
         assert_eq!(m.input_schema["properties"]["content"]["type"], "string");

@@ -1411,7 +1411,7 @@ mod tests {
             .register_default_skills_with_configs(None, Some(fw_config))
             .expect("register with file_write allowlist");
 
-        // file_write on WriteLocal + AlwaysRequireApproval → submit jää odottamaan.
+        // file_write on WriteLocal + RequireApproval → allowlistattu kirjoitus ajaa heti.
         let skill_id = runtime
             .map_name_to_skill("file_write_allowlisted")
             .expect("file_write registered");
@@ -1424,25 +1424,16 @@ mod tests {
             .submit_task(skill_id, payload, at(1_700_000_000))
             .await
             .expect("submit file_write");
-        let approval_id = submitted
-            .pending_approval
-            .expect("write must wait for approval");
-
-        // Ennen hyväksyntää tiedostoa EI ole (kirjoitus ei laukea).
-        assert!(!target.exists(), "no write before approval");
-
-        // Hyväksy → kirjoitus laukeaa ja valmistuu.
-        let approved = runtime
-            .approve(approval_id, at(1_700_000_001))
-            .await
-            .expect("approve file_write");
+        assert!(
+            submitted.pending_approval.is_none(),
+            "allowlisted write must auto-run"
+        );
         assert_eq!(
-            approved.status,
+            submitted.status,
             TaskStatus::Done,
-            "approved allowlisted write must complete"
+            "allowlisted write must complete without manual approval"
         );
 
-        // (b) Tiedosto on OIKEASTI levyllä oikealla sisällöllä.
         let written = std::fs::read_to_string(&target).expect("file written to disk");
         assert!(written.contains("written via the default skill registry"));
 

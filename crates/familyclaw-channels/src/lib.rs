@@ -66,7 +66,7 @@ mod telegram;
 
 pub use channel::{Channel, MessageStream, SendFuture};
 pub use error::{ChannelError, ChannelResult};
-pub use message::{ChannelKind, InboundEnvelope, InboundMessage, OutboundMessage};
+pub use message::{ChannelKind, InboundEnvelope, InboundMessage, OutboundKind, OutboundMessage};
 pub use mock::{pump_to, MockChannel};
 
 #[cfg(feature = "discord")]

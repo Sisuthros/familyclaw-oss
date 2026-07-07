@@ -239,40 +239,77 @@ impl TelegramChannel {
     }
 
     async fn send_message(inner: &Inner, message: &OutboundMessage) -> ChannelResult<()> {
-        let payload = serde_json::json!({
-            "chat_id": message.target,
-            "text": message.body,
-        });
+        match message.kind {
+            crate::message::OutboundKind::Typing => {
+                let payload = serde_json::json!({
+                    "chat_id": message.target,
+                    "action": "typing",
+                });
+                let url = Self::method_url(inner, "sendChatAction");
+                let response = inner
+                    .client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .body(payload.to_string())
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ChannelError::send(
+                            &inner.channel_id,
+                            format!("sendChatAction HTTP error: {e}"),
+                        )
+                    })?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.status().to_string();
+                    return Err(ChannelError::send(
+                        &inner.channel_id,
+                        format!("sendChatAction returned {status}: {body}"),
+                    ));
+                }
+                debug!(channel = %inner.channel_id, "Telegram typing indicator sent");
+                Ok(())
+            }
+            crate::message::OutboundKind::Message | crate::message::OutboundKind::Progress => {
+                let payload = serde_json::json!({
+                    "chat_id": message.target,
+                    "text": message.body,
+                });
 
-        let url = Self::method_url(inner, "sendMessage");
-        let response = inner
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .body(payload.to_string())
-            .send()
-            .await
-            .map_err(|e| {
-                ChannelError::send(&inner.channel_id, format!("sendMessage HTTP error: {e}"))
-            })?;
+                let url = Self::method_url(inner, "sendMessage");
+                let response = inner
+                    .client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .body(payload.to_string())
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ChannelError::send(
+                            &inner.channel_id,
+                            format!("sendMessage HTTP error: {e}"),
+                        )
+                    })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            error!(
-                channel = %inner.channel_id,
-                %status,
-                %body,
-                "Telegram sendMessage returned error"
-            );
-            return Err(ChannelError::send(
-                &inner.channel_id,
-                format!("sendMessage returned {status}: {body}"),
-            ));
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    error!(
+                        channel = %inner.channel_id,
+                        %status,
+                        %body,
+                        "Telegram sendMessage returned error"
+                    );
+                    return Err(ChannelError::send(
+                        &inner.channel_id,
+                        format!("sendMessage returned {status}: {body}"),
+                    ));
+                }
+
+                debug!(channel = %inner.channel_id, "Telegram sendMessage sent successfully");
+                Ok(())
+            }
         }
-
-        debug!(channel = %inner.channel_id, "Telegram sendMessage sent successfully");
-        Ok(())
     }
 }
 

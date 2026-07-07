@@ -24,7 +24,9 @@ use familyclaw_actions::{
     ActionId, ActionRuntime, ActionTaskId, ApprovalId, AuditCollector, AuditKind, ExecAuditEvent,
     McpToolDescriptor,
 };
-use familyclaw_bus::{BeingId, BeingInfo, BusHandle, BusMessage, ResonanceMessage, TaskEventKind};
+use familyclaw_bus::{
+    BeingId, BeingInfo, BusHandle, BusMessage, MessageOrigin, ResonanceMessage, TaskEventKind,
+};
 use familyclaw_channels::OutboundMessage;
 use familyclaw_core::time::Timestamp;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
@@ -139,14 +141,27 @@ const RESUMABLE_DEFAULT_TTL_MINUTES: i64 = 60;
 const HOMEOSTASIS_RATE: f32 = 0.10;
 
 /// Montako PERÄKKÄISTÄ historiaviestiä (user+assistant) säilytetään per
-/// keskustelu LLM-kontekstia varten. 6 = ~3 vuoroparia: tarpeeksi jatkuvuuteen
-/// ("vastaa enemmän kuin kerran"), tarpeeksi vähän ettei kontekstia paisuteta.
-/// Vanhin pudotetaan kun katto ylittyy (liukuva ikkuna).
-const HISTORY_MAX_MESSAGES: usize = 6;
+/// keskustelu LLM-kontekstia varten. 20 = ~10 vuoroparia: riittää Discord-
+/// keskustelun jatkuvuuteen ilman kontekstin paisuttamista. Vanhin pudotetaan
+/// kun katto ylittyy (liukuva ikkuna).
+const HISTORY_MAX_MESSAGES: usize = 20;
 
 /// Yhden historiaviestin merkkikatto. Pitkä viesti typistetään tähän ennen
 /// historiaan tallennusta — estää yhden jättiviestin syömästä koko ikkunaa.
 const HISTORY_MAX_CHARS_PER_MSG: usize = 1500;
+
+/// Muistikerroksen tagi käyttäjän chat-viestille (session-scoped hydration).
+const CHAT_USER_TAG: &str = "chat:user";
+
+/// Muistikerroksen tagi agentin chat-vastaukselle (session-scoped hydration).
+const CHAT_ASSISTANT_TAG: &str = "chat:assistant";
+
+/// `Memory::source` chat-historian merkinnöille (erotetaan bus-muistoista).
+const CHAT_HISTORY_SOURCE: &str = "chat_history";
+
+/// Montako chat-roolitagilla merkittyä muistoa haetaan kylmäkäynnistyksessä
+/// (prosessin sisäinen RAM-historia tyhjä → hydrate storesta).
+const HISTORY_HYDRATE_LIMIT: usize = 20;
 
 /// Tool-loopin (Phase 1 keystone) konfiguraatio.
 ///
@@ -268,14 +283,13 @@ enum ToolLoopOutcome {
 /// ## Käyttäjärajan invariantti
 /// - [`Reply`](Self::Reply) → reititetään käyttäjälle (reply-kanava) ja
 ///   liitetään vuoron durable-yhteenvetoon.
-/// - [`Suspended`](Self::Suspended) → **EI KOSKAAN** reply-putkeen. Kutsuja
-///   kirjaa suspendin vuoron durable-tilaan (id + redaktoitu tiivistelmä)
-///   resumea varten ja vaikenee tällä vuorolla.
+/// - [`Suspended`](Self::Suspended) → vuoro keskeytyy hyväksyntää varten;
+///   kirjataan durable-tilaan (id + redaktoitu tiivistelmä) ja lähetetään
+///   käyttäjälle lyhyt ilmoitus (ei automaattista popupia).
 /// - [`NoReply`](Self::NoReply) → ei tehdä mitään (ei tekstiä, ei suspendia).
 ///
-/// Kutsuja, joka aiemmin suodatti `None`:n pois reply-putkesta, käsittelee nyt
-/// `Suspended`/`NoReply` samalla tavalla "ei käyttäjäreplyä tällä vuorolla" —
-/// mutta `Suspended` säilyttää lisäksi resume-tilan.
+/// Kutsuja käsittelee `NoReply`:n hiljaisuutena; `Suspended` säilyttää
+/// resume-tilan ja ilmoittaa käyttäjälle odotuksesta.
 ///
 /// ## Salaisuusinvariantti
 /// [`Suspended::redacted_summary`](Self::Suspended) on **operaattorille
@@ -1065,12 +1079,12 @@ impl Agent {
         let Some(llm) = self.llm.as_ref() else {
             return Ok(ThinkOutcome::NoReply);
         };
-        let (system_prompt, query) = self.build_think_context(current_message).await;
+        let (system_prompt, query) = self.build_think_context(current_message, origin).await;
 
-        // Lyhytmuisti: hae tämän keskustelun aiemmat vuorot, jotta malli näkee
-        // jatkumon (korjaa "vastaa vain kerran"). Tyhjä ensimmäisellä vuorolla.
+        // Lyhytmuisti: hae tämän keskustelun aiemmat vuorot (RAM + store-hydration
+        // kylmäkäynnistyksessä), jotta malli näkee jatkumon.
         let conv_key = self.conversation_key(origin);
-        let history = self.history_for(&conv_key);
+        let history = self.conversation_history(&conv_key, origin).await;
 
         match self.actions.as_ref() {
             // Yhden kerran -polku (taaksepäin-yhteensopiva): yksi LLM-kutsu,
@@ -1190,21 +1204,18 @@ impl Agent {
                         })
                     }
                     ToolLoopOutcome::MaxIterations { iterations } => {
-                        // Ohjaustila: raja täyttyi ilman vastausta. EI
-                        // robottimaista max-iter-merkkiä käyttäjälle → NoReply.
                         debug!(
                             agent = self.config.name,
                             iterations,
-                            "tool loop: reached max iterations without a final answer — no user reply"
+                            "tool loop: reached max iterations without a final answer — attempting recovery reply"
                         );
-                        // stop_reason = max-iter.
                         self.record_turn_audit(
                             turn_id,
                             AuditKind::TurnMaxIterations,
                             now,
                             format!("reached max iterations ({iterations}) without answer"),
                         );
-                        Ok(ThinkOutcome::NoReply)
+                        Ok(ThinkOutcome::Reply(recovery_fallback_reply()))
                     }
                 }
             }
@@ -1226,6 +1237,93 @@ impl Agent {
         self.reply_target
             .clone()
             .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// Palauttaa keskustelun lyhytmuistin viestit (vanhin→uusin) LLM-stackin
+    /// rakentamista varten. Käyttää ensin prosessin sisäistä RAM-ikkunaa; jos
+    /// tyhjä (kylmäkäynnistys / uusi prosessi), hydratoi viimeisimmät
+    /// `chat:*`-tagatut muistot session-scopella.
+    async fn conversation_history(
+        &self,
+        conv_key: &str,
+        origin: Option<&MessageOrigin>,
+    ) -> Vec<LlmMessage> {
+        let ram = self.history_for(conv_key);
+        if !ram.is_empty() {
+            return ram;
+        }
+        self.hydrate_history_from_store(origin).await
+    }
+
+    /// Hakee viimeisimmät session-kohtaiset chat-viestit muistivarastosta.
+    async fn hydrate_history_from_store(&self, origin: Option<&MessageOrigin>) -> Vec<LlmMessage> {
+        let Some(session_tag) = self.session_tag_for_recall(origin) else {
+            return Vec::new();
+        };
+        let all = match self.memory.all().await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("chat history hydration failed (non-fatal): {e}");
+                return Vec::new();
+            }
+        };
+        let mut chat: Vec<(Timestamp, LlmMessage)> = all
+            .into_iter()
+            .filter(|m| {
+                m.source == CHAT_HISTORY_SOURCE
+                    && m.tags.iter().any(|t| t == &session_tag)
+                    && m.status == familyclaw_memory::MemoryStatus::Active
+            })
+            .filter_map(|m| {
+                let role = if m.tags.iter().any(|t| t == CHAT_USER_TAG) {
+                    Some(LlmMessage::user(truncate_for_history(&m.content)))
+                } else if m.tags.iter().any(|t| t == CHAT_ASSISTANT_TAG) {
+                    Some(LlmMessage::assistant(truncate_for_history(&m.content)))
+                } else {
+                    None
+                };
+                role.map(|msg| (m.created_at, msg))
+            })
+            .collect();
+        chat.sort_by_key(|a| a.0);
+        if chat.len() > HISTORY_HYDRATE_LIMIT {
+            chat.drain(0..chat.len() - HISTORY_HYDRATE_LIMIT);
+        }
+        chat.into_iter().map(|(_, msg)| msg).collect()
+    }
+
+    /// Johda session-tag per-viesti originista tai staattisesta `with_session`.
+    fn session_tag_for_recall(&self, origin: Option<&MessageOrigin>) -> Option<String> {
+        origin.map(session_tag_from_origin).or_else(|| {
+            self.session
+                .as_ref()
+                .map(crate::session::MessageOrigin::session_tag)
+        })
+    }
+
+    /// Tallentaa yhden chat-roolin viestin muistivarastoon session-scopella
+    /// (kylmäkäynnistyksen hydration). Ei-duplikaatti: `turn_key` puuttuu →
+    /// jokainen vuoro on oma merkintä.
+    async fn persist_chat_turn(
+        &self,
+        origin: &MessageOrigin,
+        role_tag: &str,
+        text: &str,
+    ) -> Result<()> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(());
+        }
+        let memory = Memory::builder(truncate_for_history(text))
+            .source(CHAT_HISTORY_SOURCE)
+            .decay_policy(DecayPolicy::Normal)
+            .tags([session_tag_from_origin(origin), role_tag.to_string()])
+            .build();
+        self.memory
+            .add(memory)
+            .await
+            .map_err(|e| FamilyClawError::memory(format!("chat history persist failed: {e}")))?;
+        Ok(())
     }
 
     /// Palauttaa keskustelun lyhytmuistin viestit (vanhin→uusin) LLM-stackin
@@ -1266,15 +1364,14 @@ impl Agent {
     /// työkaluja asennettu. F4 sessio-isolaatio: jos sessio on asetettu,
     /// recall vaatii session-tagin (vain tämän session muistot näkyvät).
     #[allow(clippy::format_push_string)]
-    async fn build_think_context(&self, current_message: &BusMessage) -> (String, String) {
+    async fn build_think_context(
+        &self,
+        current_message: &BusMessage,
+        origin: Option<&MessageOrigin>,
+    ) -> (String, String) {
         let query = bus_message_text(current_message);
 
         // ORIENT: hae relevantit muistot ENSIN (RAG — ennen LLM-kutsua).
-        // semantic_weight aktivoi vektorihaun (cosine); ilman sitä recall on
-        // pelkkää avainsana-/tärkeys-osumaa, joka jää heikoksi lyhyillä viesteillä
-        // (havaittu ~0.12 relevanssi). Env `FAMILYCLAW_SEMANTIC_WEIGHT` (oletus
-        // 0.6) sekoittaa semanttisen ja leksikaalisen; toimii täysin vasta kun
-        // muistilla on aidot embeddingit (FAMILYCLAW_EMBED_PROVIDER=ollama).
         let semantic_weight = std::env::var("FAMILYCLAW_SEMANTIC_WEIGHT")
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
@@ -1282,8 +1379,8 @@ impl Agent {
         let mut recall_ctx = RetrievalContext::new(query.clone())
             .with_limit(5)
             .with_semantic_weight(semantic_weight);
-        if let Some(origin) = self.session.as_ref() {
-            recall_ctx = recall_ctx.with_required_tags([origin.session_tag()]);
+        if let Some(tag) = self.session_tag_for_recall(origin) {
+            recall_ctx = recall_ctx.with_required_tags([tag]);
         }
         let memories = self.recall(&recall_ctx).await.unwrap_or_else(|e| {
             warn!("recall failed in think (non-fatal): {e}");
@@ -1357,6 +1454,8 @@ impl Agent {
         being_id: &str,
         turn_audit: Option<&Arc<AuditCollector>>,
         metrics_sink: Option<&MetricEventSink>,
+        progress_sink: Option<ReplySink>,
+        progress_target: Option<String>,
         mut messages: Vec<LlmMessage>,
         mut last_text: String,
         budget: u32,
@@ -1459,6 +1558,14 @@ impl Agent {
                 let dispatch_step = format!("turn-{turn}-dispatch-{dispatch_index}");
                 dispatch_index += 1;
                 let replaying = durable.is_replaying();
+                if !replaying {
+                    if let (Some(sink), Some(target)) = (&progress_sink, &progress_target) {
+                        let label = tool_progress_label(&call.name);
+                        if let Ok(msg) = OutboundMessage::progress(target, label) {
+                            let _ = sink.send(msg);
+                        }
+                    }
+                }
                 // Sekä replay- että tuore-ajo-haara journaloi/replayttaa SAMAN
                 // tyypin ([`DispatchRecord`]), jotta serde-muoto täsmää (askelnimi
                 // ja tyyppi ovat deterministisiä replayssa). Mahdollinen
@@ -1546,7 +1653,7 @@ impl Agent {
                         );
                         messages.push(LlmMessage::tool_result(
                             call.id,
-                            format!("error: tool '{}' failed: {e}", call.name),
+                            format_tool_failure_for_model(&call.name, &e),
                         ));
                         continue;
                     }
@@ -1605,6 +1712,9 @@ impl Agent {
         }
 
         if last_text.is_empty() {
+            if let Some(recovered) = recover_user_visible_reply(llm, &messages).await {
+                return Ok(ToolLoopOutcome::Answer(recovered));
+            }
             Ok(ToolLoopOutcome::MaxIterations { iterations: budget })
         } else {
             Ok(ToolLoopOutcome::Answer(last_text))
@@ -1660,12 +1770,10 @@ impl Agent {
         // Klooni mittarisinkki ennen `&mut self.durable`-lainaa (disjoint-borrow).
         let metrics_sink = self.metrics_sink.clone();
 
-        let (system_prompt, query) = self.build_think_context(message).await;
-        // Lyhytmuisti: tämän keskustelun aiemmat vuorot mukaan (korjaa "vastaa
-        // vain kerran" myös actions/tool-loop-polulla). Rakennetaan ennen
-        // `&mut self.durable`-lainaa, koska `history_for` lainaa `&self`:iä.
+        let (system_prompt, query) = self.build_think_context(message, origin).await;
+        // Lyhytmuisti: tämän keskustelun aiemmat vuorot mukaan (RAM + store).
         let conv_key = self.conversation_key(origin);
-        let history = self.history_for(&conv_key);
+        let history = self.conversation_history(&conv_key, origin).await;
         let now = time::now();
         let turn_id = ActionId::new();
         // TURN-AUDIT-kirjaukset eivät kuulu replatuun vuoroon (jälki kirjattiin
@@ -1689,6 +1797,8 @@ impl Agent {
         let Some(llm) = self.llm.as_ref() else {
             return Ok((None, None));
         };
+        let progress_sink = self.reply_sink.clone();
+        let progress_target = self.reply_target_for_origin(origin);
         let outcome = Self::drive_tool_loop_durable(
             llm,
             &actions,
@@ -1699,6 +1809,8 @@ impl Agent {
             &being_id.to_string(),
             turn_audit.as_ref(),
             metrics_sink.as_ref(),
+            progress_sink,
+            progress_target,
             messages,
             String::new(),
             max_iterations,
@@ -1802,11 +1914,15 @@ impl Agent {
                     now,
                     format!("reached max iterations ({iterations}) without answer"),
                 );
-                let _ = self
+                let text = recovery_fallback_reply();
+                let thought = self
                     .durable
-                    .step(&think_step, || Ok(String::new()))
+                    .step(&think_step, {
+                        let text = text.clone();
+                        move || Ok(text)
+                    })
                     .map_err(|e| FamilyClawError::bus(format!("durable think step failed: {e}")))?;
-                Ok((None, None))
+                Ok((Some(thought).filter(|s| !s.is_empty()), None))
             }
         }
     }
@@ -2136,7 +2252,7 @@ impl Agent {
                         );
                         messages.push(LlmMessage::tool_result(
                             call.id,
-                            format!("error: tool '{}' failed: {e}", call.name),
+                            format_tool_failure_for_model(&call.name, &e),
                         ));
                     }
                 }
@@ -2150,6 +2266,9 @@ impl Agent {
         //    `iterations` raportoi tälle ajolle annetun budjetin (resume jatkaa
         //    jäljellä olevalla budjetilla, joten luku heijastaa oikeaa rajaa).
         if last_text.is_empty() {
+            if let Some(recovered) = recover_user_visible_reply(llm, &messages).await {
+                return Ok(ToolLoopOutcome::Answer(recovered));
+            }
             Ok(ToolLoopOutcome::MaxIterations { iterations: budget })
         } else {
             Ok(ToolLoopOutcome::Answer(last_text))
@@ -2426,14 +2545,13 @@ impl Agent {
                 })
             }
             ToolLoopOutcome::MaxIterations { iterations } => {
-                // stop_reason = max-iter.
                 self.record_turn_audit(
                     turn_id,
                     AuditKind::TurnMaxIterations,
                     now,
                     format!("reached max iterations ({iterations}) without answer"),
                 );
-                Ok(ThinkOutcome::NoReply)
+                Ok(ThinkOutcome::Reply(recovery_fallback_reply()))
             }
         }
     }
@@ -2661,7 +2779,7 @@ impl Agent {
         // replayssa muisto kirjataan uudelleen ja store ignooraa sen.
         if recorded.remembered {
             let memory_store = Arc::clone(&self.memory);
-            let mut memory = self.build_memory(sender, message);
+            let mut memory = self.build_memory(sender, message, origin);
             memory.turn_key = Some(format!("{}:turn-{}", self.config.name, turn));
             memory_store
                 .add(memory)
@@ -2700,6 +2818,13 @@ impl Agent {
             let gov = EmotionActionGovernor::new(g);
             gov.decide(&self.emotion) == ActionDecision::Hesitate
         });
+        let will_think = self.llm.is_some() && !governor_filtered_pulse && !governor_hesitate;
+        let typing_abort = if !self.durable.is_replaying() && will_think {
+            self.notify_turn_started(origin);
+            self.spawn_typing_heartbeat(origin)
+        } else {
+            None
+        };
         // `thought_response` = mallin tekstivastaus (jos `ThinkOutcome::Reply`),
         // `suspend` = vuoron keskeytys hyväksyntää varten (jos
         // `ThinkOutcome::Suspended`). Ne ovat toisensa poissulkevia: yksi vuoro
@@ -2742,7 +2867,13 @@ impl Agent {
             // metodin sisällä. Korvaa entisen "yksi `-think`-askel koko
             // think:lle" -mallin, joka menetti vuoron sisäisen edistymisen
             // kahden lähetyksen välisessä kaatumisessa (red-team-löydös).
-            let (thought, susp) = self.think_actions_durable(message, origin, turn).await?;
+            let (thought, susp) = match self.think_actions_durable(message, origin, turn).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!("think_actions_durable failed (non-fatal): {e}");
+                    (Some(recovery_fallback_reply()), None)
+                }
+            };
             suspend = susp;
             thought.filter(|s| !s.is_empty())
         } else if self.durable.is_replaying() {
@@ -2797,10 +2928,14 @@ impl Agent {
                 Ok(ThinkOutcome::NoReply) => None,
                 Err(e) => {
                     warn!("think failed (non-fatal): {e}");
-                    None
+                    Some(recovery_fallback_reply())
                 }
             }
         };
+
+        if let Some(handle) = typing_abort {
+            handle.abort();
+        }
 
         // 5a½. Lyhytmuisti: liitä onnistunut vaihto (käyttäjä → agentti) tämän
         //      keskustelun historiaan, jotta SEURAAVA vuoro näkee jatkumon.
@@ -2813,6 +2948,20 @@ impl Agent {
                 let user_text = bus_message_text(message);
                 let conv_key = self.conversation_key(origin);
                 self.append_history(&conv_key, &user_text, reply);
+                if let Some(origin) = origin {
+                    if let Err(e) = self
+                        .persist_chat_turn(origin, CHAT_USER_TAG, &user_text)
+                        .await
+                    {
+                        warn!("chat user persist failed (non-fatal): {e}");
+                    }
+                    if let Err(e) = self
+                        .persist_chat_turn(origin, CHAT_ASSISTANT_TAG, reply)
+                        .await
+                    {
+                        warn!("chat assistant persist failed (non-fatal): {e}");
+                    }
+                }
                 // Phase 2: tuore vuoro tuotti vastauksen → mittariin (turn-laskuri).
                 self.emit_metric(MetricEvent::TurnCompleted);
             }
@@ -2847,7 +2996,15 @@ impl Agent {
             }
         });
         if !self.durable.is_replaying() && reply_decision_blocks.is_none() {
-            if let Some(thought) = thought_response.as_deref().filter(|s| !s.is_empty()) {
+            let outbound_text: Option<String> = thought_response
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    suspend
+                        .as_ref()
+                        .map(|(_, summary)| suspended_approval_user_reply(summary))
+                });
+            if let Some(thought) = outbound_text.as_deref() {
                 // F2: johda reply-kohde per viesti. Origin ENSIN (se keskustelu
                 // josta viesti tuli), FALLBACK staattiseen reply-kohteeseen.
                 // Näin >1 keskustelu reitittyy oikein, ja yhden kanavan +
@@ -2917,7 +3074,12 @@ impl Agent {
     ///
     /// Puhtaasti synkroninen: ei kosketa muistitallennusta, joten kutsuja voi
     /// viedä valmiin [`Memory`]:n `.await`-rajan yli ilman `&self`-lainaa.
-    fn build_memory(&self, sender: BeingId, message: &BusMessage) -> Memory {
+    fn build_memory(
+        &self,
+        sender: BeingId,
+        message: &BusMessage,
+        origin: Option<&MessageOrigin>,
+    ) -> Memory {
         let content = match message {
             BusMessage::Text { body } => body.clone(),
             BusMessage::Latent { text_shadow, .. } => text_shadow.clone(),
@@ -2935,7 +3097,9 @@ impl Agent {
         // Ilman sessiota (None) vain `from:`-tag → jaettu scope (nykyinen
         // käytös, taaksepäin-yhteensopiva).
         let mut tags = vec![format!("from:{sender}")];
-        if let Some(origin) = self.session.as_ref() {
+        if let Some(tag) = self.session_tag_for_recall(origin) {
+            tags.push(tag);
+        } else if let Some(origin) = self.session.as_ref() {
             tags.push(origin.session_tag());
         }
         let mut builder = Memory::builder(content)
@@ -3054,6 +3218,49 @@ impl Agent {
         }
     }
 
+    /// Palauttaa tämän vuoron reply-kohteen (origin ensin, sitten staattinen fallback).
+    fn reply_target_for_origin(&self, origin: Option<&MessageOrigin>) -> Option<String> {
+        origin
+            .map(MessageOrigin::reply_target)
+            .map(str::to_owned)
+            .or_else(|| self.reply_target.clone())
+    }
+
+    /// Lähettää heti ack-viestin + typing-indikaattorin pitkän vuoron alkuun.
+    fn notify_turn_started(&self, origin: Option<&MessageOrigin>) {
+        let Some(target) = self.reply_target_for_origin(origin) else {
+            return;
+        };
+        if let Ok(ack) = OutboundMessage::progress(&target, "Selvä, tutkin… ✦") {
+            if let Err(e) = self.route_reply(ack) {
+                warn!("turn-start ack failed (non-fatal): {e}");
+            }
+        }
+        if let Ok(typing) = OutboundMessage::typing(&target) {
+            if let Err(e) = self.route_reply(typing) {
+                warn!("turn-start typing failed (non-fatal): {e}");
+            }
+        }
+    }
+
+    /// Pitää Discord/Telegram typing-indikaattorin hengissä (~8 s välein).
+    fn spawn_typing_heartbeat(
+        &self,
+        origin: Option<&MessageOrigin>,
+    ) -> Option<tokio::task::AbortHandle> {
+        let target = self.reply_target_for_origin(origin)?;
+        let sink = self.reply_sink.clone()?;
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                if let Ok(typing) = OutboundMessage::typing(&target) {
+                    let _ = sink.send(typing);
+                }
+            }
+        });
+        Some(handle.abort_handle())
+    }
+
     /// Julkaisee tehtävätapahtuman busiin (kevyt signaali sisaruksille).
     ///
     /// # Errors
@@ -3121,6 +3328,69 @@ fn bus_message_text(message: &BusMessage) -> String {
         BusMessage::Text { body } => body.clone(),
         BusMessage::Latent { text_shadow, .. } => text_shadow.clone(),
         other => format!("[{}]", other.kind_label()),
+    }
+}
+
+/// Session-tag per-viesti [`MessageOrigin`]:sta (F4, sama muoto kuin `session.rs`).
+fn session_tag_from_origin(origin: &MessageOrigin) -> String {
+    format!("session:{}:{}", origin.channel_id, origin.conversation)
+}
+
+/// Geneerinen käyttäjälle näkyvä varavastaus kun LLM/tool-loop ei tuota tekstiä.
+fn recovery_fallback_reply() -> String {
+    "Anteeksi — en saanut vietyä pyyntöä loppuun (työkalu epäonnistui tai turvaraja täyttyi). \
+     Yritä uudelleen tai kerro tarkemmin mitä tarvitset."
+        .to_string()
+}
+
+/// Geneerinen väliraportti työkalun nimestä (OpenClaw/Hermes-tyyli).
+fn tool_progress_label(tool_name: &str) -> String {
+    let action = match tool_name {
+        n if n.contains("file_write") => "Kirjoitan tiedostoa…",
+        n if n.contains("file_patch") => "Muokkaan tiedostoa…",
+        n if n.contains("fs_read") => "Luen tiedostoa…",
+        n if n.contains("web_search") || n.contains("research") => "Haen tietoa verkosta…",
+        n if n.contains("web_fetch") => "Haen sivua verkosta…",
+        n if n.contains("github") => "Käytän GitHub-työkalua…",
+        n if n.contains("email") || n.contains("discord") => "Käytän integraatiota…",
+        _ => "Käytän työkalua…",
+    };
+    format!("↳ {action}")
+}
+
+/// Käyttäjälle näkyvä ilmoitus kun vuoro jää odottamaan harvinaista hyväksyntää.
+fn suspended_approval_user_reply(redacted_summary: &str) -> String {
+    format!(
+        "Jatkan heti kun tämä toiminto on kuitattu (harvinainen turvapysäytys). \
+         Yhteenveto: {redacted_summary}. \
+         Operaattori voi jatkaa gatewayn kautta — popup-ilmoitusta ei lähetetä automaattisesti."
+    )
+}
+
+/// Muotoilee työkaluvirheen mallille selkeäksi SYSTEM-palautteeksi (anti-silence).
+fn format_tool_failure_for_model(tool_name: &str, error: &impl std::fmt::Display) -> String {
+    format!(
+        "SYSTEM: Your previous action '{tool_name}' failed with error: {error}. \
+         Acknowledge this failure to the user, explain what went wrong in plain language, \
+         and suggest a corrected approach. Do not silently stop."
+    )
+}
+
+/// Yksi LLM-kutsu ilman työkaluja stall-tilanteen jälkeen.
+async fn recover_user_visible_reply(llm: &LlmFailover, messages: &[LlmMessage]) -> Option<String> {
+    let mut recovery_messages = messages.to_vec();
+    recovery_messages.push(LlmMessage::user(
+        "SYSTEM: Your previous tool calls failed or the turn hit the iteration limit. \
+         Reply to the user in plain language: acknowledge the failure, summarize errors \
+         from the tool results above, and suggest next steps. Do not call more tools.",
+    ));
+    match llm.complete(&recovery_messages).await {
+        Ok(text) if !text.trim().is_empty() => Some(text),
+        Ok(_) => None,
+        Err(e) => {
+            warn!("recovery LLM call failed (non-fatal): {e}");
+            None
+        }
     }
 }
 
@@ -3283,10 +3553,17 @@ fn tool_result_text_for(
     task_id: ActionTaskId,
     status: familyclaw_actions::task::TaskStatus,
 ) -> String {
+    let failed = matches!(status, familyclaw_actions::task::TaskStatus::Failed);
     if let Some(proof) = runtime.proof(task_id) {
         let body =
             serde_json::to_string(&proof.redacted_output).unwrap_or_else(|_| "{}".to_string());
-        format!("status={status:?}; {}; output={body}", proof.output_summary)
+        let prefix = if failed { "FAILED: " } else { "" };
+        format!(
+            "{prefix}status={status:?}; {}; output={body}",
+            proof.output_summary
+        )
+    } else if failed {
+        format!("FAILED: status={status:?}; action did not succeed (no proof bundle)")
     } else {
         format!("status={status:?}; no proof produced")
     }
@@ -4841,19 +5118,16 @@ mod tests {
             });
 
         // Silmukka pysähtyy rajaan ilman paniikkia/hangia. Koska malli ei
-        // koskaan tuottanut tekstiä, käyttäjälle EI synny vastausta: `think`
-        // palauttaa `ThinkOutcome::NoReply` (sisäinen MaxIterations-ohjaustila
-        // käännetty), EIKÄ raakaa max-iter-merkkijonoa vuoda käyttäjärajan yli.
+        // koskaan tuottanut tekstiä, anti-silence-polku palauttaa geneerisen
+        // käyttäjäystävällisen varavastauksen (ei raakaa max-iter-merkkiä).
         let out = agent
             .think(&BusMessage::text("ikuinen työkalupyyntö"))
             .await
             .expect("max-iter ei saa palauttaa virhettä");
-        // Ydinväite: ei käyttäjäreplyä eikä sisäistä merkkiä — NoReply.
-        // (Erityisesti EI Reply joka voisi kantaa max-iter-merkkijonon.)
         assert_eq!(
             out,
-            ThinkOutcome::NoReply,
-            "ilman mallin tekstiä max-iter ei tuota käyttäjävastausta, sai: {out:?}"
+            ThinkOutcome::Reply(recovery_fallback_reply()),
+            "max-iter ilman mallin tekstiä tuottaa varavastauksen, ei hiljaisuutta, sai: {out:?}"
         );
         bus.stop();
     }
@@ -4912,10 +5186,9 @@ mod tests {
         bus.stop();
     }
 
-    /// (f2) **Suspended EI tuota käyttäjäreplyä koko vuoron läpi.** Tämä ajaa
-    /// suspendin `handle_turn`:n kautta reply-sinkin kanssa ja todistaa että
-    /// kanavan recv-pää **ei saa mitään** — suspend kirjataan vuoron durable-
-    /// tilaan, ei reply-putkeen (1B-vuodon regressiovahti).
+    /// (f2) **Suspended ilmoittaa käyttäjälle** ettei vuoro jää hiljaiseksi.
+    /// Hyväksyntää vaativa työkalu kirjataan durable-tilaan JA lähetetään
+    /// lyhyt Discord-viesti (ei popup-ilmoitusta).
     #[tokio::test]
     async fn suspended_turn_produces_no_user_reply() {
         let bus = ResonanceBus::start(None).await.expect("bus");
@@ -4936,10 +5209,27 @@ mod tests {
             .await
             .expect("vuoro ei saa kaatua suspendiin");
 
-        // Kanavan recv-pää EI saa mitään — suspend ei vuoda reply-putkeen.
+        let ack = rx
+            .try_recv()
+            .expect("pitkän vuoron pitää alkaa ack-viestillä");
         assert!(
-            rx.try_recv().is_err(),
-            "suspended-vuoro ei saa lähettää käyttäjäreplyä"
+            ack.body.contains("tutkin"),
+            "ack-viestin pitää kertoa työstä, sai: {}",
+            ack.body
+        );
+        let mut suspend_body = None;
+        while let Ok(msg) = rx.try_recv() {
+            if msg.body.contains("turvapysäytys") || msg.body.contains("hyväksyntää") {
+                suspend_body = Some(msg.body);
+                break;
+            }
+        }
+        let reply_body = suspend_body.expect(
+            "suspended-vuoron pitää ilmoittaa käyttäjälle ettei jäädä hiljaisuuteen",
+        );
+        assert!(
+            reply_body.contains("turvapysäytys") || reply_body.contains("hyväksyntää"),
+            "suspend-ilmoituksen pitää kertoa odotuksesta, sai: {reply_body}"
         );
         // Vuoron yhteenveto kirjaa suspendin (resume-/auditointikonteksti),
         // mutta EI raakaa payloadia.

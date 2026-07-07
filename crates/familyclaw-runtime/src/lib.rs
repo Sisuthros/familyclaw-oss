@@ -530,7 +530,7 @@ pub async fn build_family(
     // Kirjoitustaidon (file_write) allowlist samasta KERROS B -ympäristöstä.
     // Ilman sitä file_write jää fail-closed-tilaan (hylkää kaikki kirjoitukset) —
     // tämä on se kytkin joka tekee TIEDOSTON KIRJOITTAMISEN oikeasti mahdolliseksi
-    // (kirjoitus pysyy silti aina hyväksynnän takana, AlwaysRequireApproval).
+    // (kirjoitus allowlistin sisällä ajaa automaattisesti, RequireApproval).
     let file_write_config = resolve_file_write_config();
     let action_runtime = if let Some(dir) = action_data_dir.as_ref() {
         // Persistentti polku: durable pending + task + dispatch outbox YHDELLÄ
@@ -875,7 +875,8 @@ fn resolve_fs_read_config() -> Option<FsReadConfig> {
 /// KERROS A ei kovakoodaa yhtään polkua — operaattori antaa sallitut
 /// kirjoitusjuuret ympäristössä. `None` (muuttuja asettamatta / tyhjä) → taito
 /// jää fail-closed-tilaan (hylkää kaikki kirjoitukset). Kirjoitus pysyy aina
-/// hyväksynnän takana ([`ApprovalPolicy::AlwaysRequireApproval`]); allowlist vain
+/// hyväksynnän takana vain korkeamman riskin toiminnoille; allowlistattu
+/// paikallinen kirjoitus ajaa automaattisesti ([`ApprovalPolicy::RequireApproval`]).
 /// määrää **mihin** kirjoitus on ylipäätään sallittu hyväksynnän jälkeen.
 fn resolve_file_write_config() -> Option<FileWriteConfig> {
     let allow_raw = env::var("FAMILYCLAW_FILE_WRITE_ALLOW").ok()?;

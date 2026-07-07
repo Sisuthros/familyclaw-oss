@@ -484,6 +484,8 @@ impl Channel for DiscordChannel {
             .filter(|&id| id != 0)
             .unwrap_or(self.target_channel_id);
         let channel_id = self.channel_id.clone();
+        let kind = message.kind;
+        let body = message.body;
         Box::pin(async move {
             if target_id == 0 {
                 return Err(ChannelError::invalid_input(format!(
@@ -493,7 +495,19 @@ impl Channel for DiscordChannel {
                 )));
             }
             let target = ChannelId::new(target_id);
-            Self::send_body(&http, target, &channel_id, &message.body).await
+            match kind {
+                crate::message::OutboundKind::Typing => {
+                    target
+                        .broadcast_typing(&http)
+                        .await
+                        .map_err(|e| map_send_error(&channel_id, &e))?;
+                    debug!(channel = %channel_id, "typing indicator sent to Discord");
+                    Ok(())
+                }
+                crate::message::OutboundKind::Message | crate::message::OutboundKind::Progress => {
+                    Self::send_body(&http, target, &channel_id, &body).await
+                }
+            }
         })
     }
 

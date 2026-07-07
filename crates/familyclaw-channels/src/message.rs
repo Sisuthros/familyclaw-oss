@@ -77,6 +77,19 @@ impl std::fmt::Display for ChannelKind {
     }
 }
 
+/// Ulospäin lähetettävän signaalin tyyppi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundKind {
+    /// Tavallinen tekstiviesti käyttäjälle.
+    #[default]
+    Message,
+    /// Kanavan "kirjoittaa…" -ilmaisin (Discord typing, Telegram chat action).
+    Typing,
+    /// Lyhyt väliraportti pitkän työkaluvuoron aikana (ei lopullinen vastaus).
+    Progress,
+}
+
 /// Alustalta ulospäin lähetettävä viesti.
 ///
 /// `target` on kanavakohtainen vastaanottaja-osoite (esim. Discord-kanavan
@@ -85,8 +98,11 @@ impl std::fmt::Display for ChannelKind {
 pub struct OutboundMessage {
     /// Kanavakohtainen kohde (kanava-id, chat-id, puhelinnumero, …).
     pub target: String,
-    /// Viestin tekstisisältö.
+    /// Viestin tekstisisältö (`Typing`-tyypillä jätetään tyhjäksi).
     pub body: String,
+    /// Signaalin tyyppi — oletus on tavallinen viesti.
+    #[serde(default)]
+    pub kind: OutboundKind,
 }
 
 impl OutboundMessage {
@@ -107,7 +123,56 @@ impl OutboundMessage {
                 "outbound body must not be empty",
             ));
         }
-        Ok(Self { target, body })
+        Ok(Self {
+            target,
+            body,
+            kind: OutboundKind::Message,
+        })
+    }
+
+    /// Rakentaa typing-indikaattorin annetulle kanavakohteelle.
+    ///
+    /// # Errors
+    /// [`crate::ChannelError::InvalidInput`] jos kohde on tyhjä.
+    pub fn typing(target: impl Into<String>) -> crate::ChannelResult<Self> {
+        let target = target.into();
+        if target.trim().is_empty() {
+            return Err(crate::ChannelError::invalid_input(
+                "outbound target must not be empty",
+            ));
+        }
+        Ok(Self {
+            target,
+            body: String::new(),
+            kind: OutboundKind::Typing,
+        })
+    }
+
+    /// Rakentaa lyhyen väliraportin pitkän työkaluvuoron aikana.
+    ///
+    /// # Errors
+    /// [`crate::ChannelError::InvalidInput`] jos kohde tai sisältö on tyhjä.
+    pub fn progress(
+        target: impl Into<String>,
+        body: impl Into<String>,
+    ) -> crate::ChannelResult<Self> {
+        let target = target.into();
+        let body = body.into();
+        if target.trim().is_empty() {
+            return Err(crate::ChannelError::invalid_input(
+                "outbound target must not be empty",
+            ));
+        }
+        if body.is_empty() {
+            return Err(crate::ChannelError::invalid_input(
+                "progress body must not be empty",
+            ));
+        }
+        Ok(Self {
+            target,
+            body,
+            kind: OutboundKind::Progress,
+        })
     }
 }
 

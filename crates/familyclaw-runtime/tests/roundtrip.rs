@@ -33,13 +33,27 @@ use std::time::Duration;
 use axum::routing::post;
 use axum::{Json, Router};
 use familyclaw_agent::EnvEndpointResolver;
-use familyclaw_channels::{InboundMessage, MockChannel};
+use familyclaw_channels::{InboundMessage, MockChannel, OutboundKind, OutboundMessage};
 use familyclaw_core::{AgentConfig, ModelConfig};
 use familyclaw_runtime::build_family;
 
 /// Kiinteä teksti, jonka mock-LLM aina palauttaa. Roundtripin "todiste":
 /// jos tämä teksti päätyy `MockChannel.outbox`-jonoon, koko ketju toimi.
 const FIXED_LLM_REPLY: &str = "AGENT-A-REPLY-OK: hei, tämä tuli aivoista asti";
+
+/// Palauttaa lopullisen LLM-vastauksen outboxista (ei ack/typing/progress-viestejä).
+fn find_llm_reply<'a>(sent: &'a [OutboundMessage]) -> Option<&'a OutboundMessage> {
+    sent.iter().find(|m| {
+        m.kind == OutboundKind::Message && m.body == FIXED_LLM_REPLY
+    })
+}
+
+/// Laskee lopulliset LLM-vastaukset (yksi inbound → yksi tällainen viesti).
+fn count_llm_replies(sent: &[OutboundMessage]) -> usize {
+    sent.iter()
+        .filter(|m| m.kind == OutboundKind::Message && m.body == FIXED_LLM_REPLY)
+        .count()
+}
 
 /// Käynnistää OpenAI-yhteensopivan mock-LLM-palvelimen satunnaiselle portille.
 /// Palauttaa base-URL:n muodossa `http://127.0.0.1:<port>/v1` (resolverille).
@@ -141,19 +155,19 @@ async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
     let mut sent = Vec::new();
     for _ in 0..60 {
         sent = outbox_probe.sent();
-        if !sent.is_empty() {
+        if find_llm_reply(&sent).is_some() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // 8. TODISTE: tasan yksi ulosmenevä viesti, oikea kohde, sisältö = mock-LLM.
+    // 8. TODISTE: yksi lopullinen vastaus, oikea kohde, sisältö = mock-LLM.
     assert_eq!(
-        sent.len(),
+        count_llm_replies(&sent),
         1,
-        "yksi inbound → yksi outbound (ei kahdennusta, ei pudotusta)"
+        "yksi inbound → yksi lopullinen outbound (ack/typing sallittu, ei kahdennusta)"
     );
-    let reply = &sent[0];
+    let reply = find_llm_reply(&sent).expect("LLM reply in outbox");
     assert_eq!(
         reply.target, reply_target,
         "vastaus ohjautui oikeaan keskusteluun (staattinen reply_target)"
@@ -225,7 +239,7 @@ async fn dead_primary_fails_over_to_live_fallback() {
     let mut sent = Vec::new();
     for _ in 0..60 {
         sent = outbox_probe.sent();
-        if !sent.is_empty() {
+        if find_llm_reply(&sent).is_some() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -233,13 +247,14 @@ async fn dead_primary_fails_over_to_live_fallback() {
 
     // 6. TODISTE: vastaus tuli silti läpi (fallbackin kautta), oikealla kohteella.
     assert_eq!(
-        sent.len(),
+        count_llm_replies(&sent),
         1,
-        "kuollut primary → failover fallbackiin → yksi vastaus"
+        "kuollut primary → failover fallbackiin → yksi lopullinen vastaus"
     );
-    assert_eq!(sent[0].target, reply_target, "vastaus oikeaan keskusteluun");
+    let reply = find_llm_reply(&sent).expect("LLM reply");
+    assert_eq!(reply.target, reply_target, "vastaus oikeaan keskusteluun");
     assert_eq!(
-        sent[0].body, FIXED_LLM_REPLY,
+        reply.body, FIXED_LLM_REPLY,
         "vastaus tuli fallback-mallilta (live mock-LLM)"
     );
 
@@ -329,7 +344,7 @@ async fn timeout_primary_fails_over_to_live_fallback() {
     let mut sent = Vec::new();
     for _ in 0..120 {
         sent = outbox_probe.sent();
-        if !sent.is_empty() {
+        if find_llm_reply(&sent).is_some() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -338,13 +353,14 @@ async fn timeout_primary_fails_over_to_live_fallback() {
     // 5. TODISTE: vastaus tuli läpi fallbackin kautta — failover laukesi
     //    TIMEOUTISTA (ei ECONNREFUSED), oikealla kohteella.
     assert_eq!(
-        sent.len(),
+        count_llm_replies(&sent),
         1,
-        "hyytynyt primary → timeout → failover fallbackiin → yksi vastaus"
+        "hyytynyt primary → timeout → failover fallbackiin → yksi lopullinen vastaus"
     );
-    assert_eq!(sent[0].target, reply_target, "vastaus oikeaan keskusteluun");
+    let reply = find_llm_reply(&sent).expect("LLM reply");
+    assert_eq!(reply.target, reply_target, "vastaus oikeaan keskusteluun");
     assert_eq!(
-        sent[0].body, FIXED_LLM_REPLY,
+        reply.body, FIXED_LLM_REPLY,
         "vastaus tuli fallback-mallilta (live mock-LLM) timeoutin jälkeen"
     );
 
@@ -420,14 +436,28 @@ async fn two_origins_route_replies_to_correct_targets_no_leak() {
     bus.publish_with_origin(channel_seat, BusMessage::text("viesti B:lta"), origin_b)
         .expect("publish B");
 
-    // 6. Keraa kaksi vastausta reply-sinkista (timeoutilla, ei kiinteaa unta).
+    // 6. Kerää kaksi lopullista vastausta (ack/typing ohitetaan).
     let mut targets = Vec::new();
-    for _ in 0..2 {
-        let out = tokio::time::timeout(Duration::from_secs(5), reply_rx.recv())
-            .await
-            .expect("reply within timeout")
-            .expect("reply present");
-        targets.push(out.target);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while targets.len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timeout waiting for two LLM replies"
+        );
+        while let Ok(out) = reply_rx.try_recv() {
+            if out.kind == OutboundKind::Message && out.body == FIXED_LLM_REPLY {
+                targets.push(out.target);
+            }
+        }
+        if targets.len() < 2 {
+            if let Ok(Some(out)) =
+                tokio::time::timeout(Duration::from_millis(100), reply_rx.recv()).await
+            {
+                if out.kind == OutboundKind::Message && out.body == FIXED_LLM_REPLY {
+                    targets.push(out.target);
+                }
+            }
+        }
     }
     targets.sort();
 
@@ -548,7 +578,7 @@ async fn run_one_persistent_turn(data_dir: &std::path::Path, body: &str, api_bas
     let mut sent = Vec::new();
     for _ in 0..80 {
         sent = outbox_probe.sent();
-        if !sent.is_empty() {
+        if find_llm_reply(&sent).is_some() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -556,7 +586,7 @@ async fn run_one_persistent_turn(data_dir: &std::path::Path, body: &str, api_bas
     // Anna durable+muisti-kirjoituksen levähtää levylle ennen sammutusta.
     tokio::time::sleep(Duration::from_millis(50)).await;
     runtime.shutdown().await;
-    sent.len()
+    count_llm_replies(&sent)
 }
 
 /// **Gateway-restart-todiste (blocker-regressio):** rakenna persistentti
@@ -588,8 +618,8 @@ async fn gateway_restart_processes_new_message_fresh_not_replayed_mute() {
         .expect("open mem 1");
     assert_eq!(
         mem_after_1.len().await.expect("len 1"),
-        1,
-        "ajo 1: yksi muistorivi"
+        3,
+        "ajo 1: vuosimuisti + chat user + chat assistant"
     );
 
     // --- Ajo 2: UUSI viesti, sama data-dir → restart-skenaario. ---
@@ -607,8 +637,8 @@ async fn gateway_restart_processes_new_message_fresh_not_replayed_mute() {
         .expect("open mem 2");
     assert_eq!(
         mem_after_2.len().await.expect("len 2"),
-        2,
-        "ajo 2: toinen muistorivi syntyi (turn_key ei törmännyt replayn duplikaattiin)"
+        6,
+        "ajo 2: toinen vuoro lisää kolme muistoriviä (ei turn_key-törmäystä)"
     );
 
     // Siivous (edition 2021: `remove_var` on turvallinen).
