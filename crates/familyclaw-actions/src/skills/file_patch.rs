@@ -141,6 +141,8 @@ impl Skill for FilePatchMock {
                 "required": ["file_content", "requested_edit"],
                 "additionalProperties": false
             }),
+            publisher: None,
+            signature: None,
         }
     }
 }

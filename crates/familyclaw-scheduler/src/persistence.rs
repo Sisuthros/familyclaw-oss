@@ -24,16 +24,86 @@ use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
 
-use crate::task::ScheduledTaskId;
+use chrono::Duration;
+use familyclaw_actions::SkillId;
+
+use crate::dispatch::Scheduler;
+use crate::task::{ScheduledTask, ScheduledTaskId};
+
+/// Persistoitu ajastettu tehtävä agency-configissa.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgencyScheduledTask {
+    /// Tehtävän vakaa tunniste (UUID-merkkijono).
+    pub id: String,
+    /// Suoritettavan taidon tunniste (UUID-merkkijono).
+    pub skill_id: String,
+    /// Taidolle annettava geneerinen JSON-payload.
+    pub payload: Value,
+    /// Cron-lauseke; kun asetettu, ohittaa `interval_secs`:n.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_expression: Option<String>,
+    /// Intervalli sekunteina (taaksepäin-yhteensopiva; käytetään jos ei cron).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<i64>,
+    /// Olennon geneerinen tunniste lähetykselle.
+    #[serde(default = "default_being_id")]
+    pub being_id: String,
+    /// Onko tehtävä aktiivinen (oletus `true`).
+    #[serde(default = "default_task_enabled")]
+    pub enabled: bool,
+}
+
+fn default_being_id() -> String {
+    "operator".to_string()
+}
+
+const fn default_task_enabled() -> bool {
+    true
+}
+
+impl AgencyScheduledTask {
+    /// Muuntaa config-merkinnän ajastimen [`ScheduledTask`]:ksi.
+    ///
+    /// Palauttaa virheen jos tunnisteet eivät ole kelvollisia UUID:ita tai
+    /// aikataulua ei voi johtaa (ei cron eikä intervallia).
+    pub fn to_scheduled_task(&self) -> Result<ScheduledTask, String> {
+        let id =
+            Uuid::parse_str(&self.id).map_err(|e| format!("invalid task id {}: {e}", self.id))?;
+        let skill = Uuid::parse_str(&self.skill_id)
+            .map_err(|e| format!("invalid skill id {}: {e}", self.skill_id))?;
+        let interval = self
+            .interval_secs
+            .map_or_else(|| Duration::seconds(60), Duration::seconds);
+        let mut task = ScheduledTask::with_id(
+            ScheduledTaskId::from_uuid(id),
+            SkillId::from_uuid(skill),
+            self.payload.clone(),
+            interval,
+            self.being_id.clone(),
+        )
+        .with_enabled(self.enabled);
+        if let Some(ref cron) = self.cron_expression {
+            task = task.with_cron_expression(cron);
+        } else if self.interval_secs.is_none() {
+            return Err("scheduled task needs cron_expression or interval_secs".to_string());
+        }
+        Ok(task)
+    }
+}
 
 /// Persistoitu perhe-agency-tila: mitkä ajastetut tehtävät on otettu pois
-/// käytöstä (kill-switch). Käyttöön otetut ovat oletus eikä niitä listata.
+/// käytöstä (kill-switch) ja mitkä cron/intervalli-tehtävät on rekisteröity.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgencyConfig {
     /// Pois käytöstä otettujen tehtävien tunnisteet UUID-merkkijonoina.
     #[serde(default)]
     pub disabled: Vec<String>,
+    /// Agentin tai operaattorin rekisteröimät ajastetut tehtävät.
+    #[serde(default)]
+    pub scheduled_tasks: Vec<AgencyScheduledTask>,
 }
 
 impl AgencyConfig {
@@ -89,6 +159,37 @@ impl AgencyConfig {
             self.disabled.retain(|d| d != &id_str);
         } else if !self.disabled.iter().any(|d| d == &id_str) {
             self.disabled.push(id_str);
+        }
+    }
+
+    /// Lisää tai päivittää ajastetun tehtävän configissa (idempotentti `id`:llä).
+    pub fn upsert_scheduled_task(&mut self, task: AgencyScheduledTask) {
+        if let Some(slot) = self
+            .scheduled_tasks
+            .iter_mut()
+            .find(|entry| entry.id == task.id)
+        {
+            *slot = task;
+        } else {
+            self.scheduled_tasks.push(task);
+        }
+    }
+
+    /// Rekisteröi configin `scheduled_tasks`-merkinnät ajastimeen.
+    ///
+    /// Virheelliset merkinnät ohitetaan hiljaisesti (boot ei kaadu yhden
+    /// rikkinäisen rivin takia). `disabled`-lista sovelletaan erikseen
+    /// [`Scheduler::apply_agency_config`]:lla.
+    pub fn register_scheduled_tasks(&self, scheduler: &mut Scheduler) {
+        for entry in &self.scheduled_tasks {
+            match entry.to_scheduled_task() {
+                Ok(task) => scheduler.register(task),
+                Err(e) => tracing::warn!(
+                    task_id = %entry.id,
+                    error = %e,
+                    "skipping invalid agency scheduled task"
+                ),
+            }
         }
     }
 }
@@ -149,6 +250,39 @@ mod tests {
         assert!(!loaded.is_disabled(id(1)));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scheduled_task_roundtrips_to_scheduler_task() {
+        let entry = AgencyScheduledTask {
+            id: Uuid::from_u128(99).to_string(),
+            skill_id: Uuid::from_u128(100).to_string(),
+            payload: serde_json::json!({ "x": 1 }),
+            cron_expression: Some("0 * * * *".to_string()),
+            interval_secs: None,
+            being_id: "agent_a".to_string(),
+            enabled: true,
+        };
+        let task = entry.to_scheduled_task().expect("valid cron task");
+        assert_eq!(task.cron_expression.as_deref(), Some("0 * * * *"));
+        assert_eq!(task.being_id, "agent_a");
+    }
+
+    #[test]
+    fn register_scheduled_tasks_applies_to_scheduler() {
+        let mut scheduler = Scheduler::new();
+        let mut cfg = AgencyConfig::default();
+        cfg.scheduled_tasks.push(AgencyScheduledTask {
+            id: Uuid::from_u128(200).to_string(),
+            skill_id: Uuid::from_u128(201).to_string(),
+            payload: serde_json::json!({}),
+            cron_expression: Some("0 0 * * *".to_string()),
+            interval_secs: None,
+            being_id: "operator".to_string(),
+            enabled: true,
+        });
+        cfg.register_scheduled_tasks(&mut scheduler);
+        assert_eq!(scheduler.task_ids().len(), 1);
     }
 
     #[test]

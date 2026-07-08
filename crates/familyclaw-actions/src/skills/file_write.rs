@@ -128,7 +128,8 @@ impl FileWriteConfig {
 
     /// Kanonisoi sallitut juuret. Olemassaolemattomat tai kanonisoitumattomat
     /// juuret ohitetaan hiljaa (niiden alle ei voi koskaan osua).
-    fn canonical_allow_roots(&self) -> Vec<PathBuf> {
+    /// Kanonisoi sallitut juuret (myös [`super::file_patch_apply`]).
+    pub(crate) fn canonical_allow_roots(&self) -> Vec<PathBuf> {
         self.allow_roots
             .iter()
             .filter_map(|root| std::fs::canonicalize(root).ok())
@@ -418,6 +419,8 @@ impl Skill for FileWriteAllowlisted {
                 "required": ["path", "content"],
                 "additionalProperties": false
             }),
+            publisher: None,
+            signature: None,
         }
     }
 }

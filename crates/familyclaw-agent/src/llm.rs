@@ -5,8 +5,11 @@
 //!
 //! **KERROS A only:** No family-specific names, souls, or private data.
 
+use std::pin::Pin;
 use std::time::Duration;
 
+use futures_util::Stream;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -554,6 +557,64 @@ impl LlmClient {
             .ok_or(LlmError::NoContent)
     }
 
+    /// Avaa SSE-striimauksen (`stream: true`) ja palauttaa tekstipätkien virran.
+    ///
+    /// # Errors
+    /// Palauttaa virheen jos HTTP-pyyntö epäonnistuu ennen striimin avaamista.
+    pub async fn complete_stream(
+        &self,
+        messages: &[LlmMessage],
+    ) -> std::result::Result<LlmChunkStream, LlmError> {
+        let endpoint = Self::build_endpoint(&self.config.api_base);
+        let request_body = ChatCompletionsStreamRequest {
+            model: &self.config.model,
+            messages,
+            max_tokens: self.config.max_tokens,
+            stream: true,
+            tools: Vec::new(),
+            tool_choice: None,
+        };
+
+        let response = self
+            .client
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| LlmError::from_reqwest("stream request failed", &e))?;
+
+        if !response.status().is_success() {
+            return Err(Self::error_from_response(response).await);
+        }
+
+        let byte_stream = response.bytes_stream();
+        let stream = async_stream::stream! {
+            let mut buffer = String::new();
+            futures_util::pin_mut!(byte_stream);
+            while let Some(chunk) = byte_stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(line_end) = buffer.find('\n') {
+                            let line = buffer[..line_end].trim_end_matches('\r').to_string();
+                            buffer = buffer[line_end + 1..].to_string();
+                            if let Some(delta) = parse_sse_delta_line(&line) {
+                                yield Ok(delta);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        yield Err(LlmError::from_reqwest("stream read failed", &e));
+                        break;
+                    }
+                }
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+
     /// Completes a chat conversation, advertising the given `tools`, and returns
     /// both text and any tool calls the model chose to make.
     ///
@@ -659,6 +720,9 @@ impl CompletionResult {
         self.content.as_deref().unwrap_or("")
     }
 }
+
+/// Striimattujen tekstipätkien virta ([`LlmClient::complete_stream`]).
+pub type LlmChunkStream = Pin<Box<dyn Stream<Item = std::result::Result<String, LlmError>> + Send>>;
 
 /// LLM error types.
 ///
@@ -864,6 +928,18 @@ impl std::error::Error for LlmError {}
 // Internal request/response structs for the OpenAI API
 
 #[derive(Serialize)]
+struct ChatCompletionsStreamRequest<'a, 'b> {
+    model: &'a str,
+    messages: &'b [LlmMessage],
+    max_tokens: u32,
+    stream: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ToolEnvelope<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+}
+
+#[derive(Serialize)]
 struct ChatCompletionsRequest<'a, 'b> {
     model: &'a str,
     messages: &'b [LlmMessage],
@@ -891,6 +967,36 @@ struct ChatChoice {
 struct ChatMessage {
     content: Option<String>,
     tool_calls: Option<Vec<ToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct StreamDelta {
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
+}
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    choices: Vec<StreamChoice>,
+}
+
+/// Poimii yhden SSE-`data:`-rivin delta-sisällön. Palauttaa `None` `[DONE]`-riveille.
+fn parse_sse_delta_line(line: &str) -> Option<String> {
+    let payload = line.strip_prefix("data:")?.trim();
+    if payload == "[DONE]" {
+        return None;
+    }
+    let chunk: StreamChunk = serde_json::from_str(payload).ok()?;
+    chunk
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|c| c.delta.content)
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -974,6 +1080,15 @@ mod tests {
         let back: LlmMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(msg.role, back.role);
         assert_eq!(msg.content, back.content);
+    }
+
+    #[test]
+    fn parse_sse_delta_line_extracts_content_delta() {
+        let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
+        assert_eq!(parse_sse_delta_line(line).as_deref(), Some("hello"));
+        assert_eq!(parse_sse_delta_line("data: [DONE]"), None);
+        assert_eq!(parse_sse_delta_line("event: ping"), None);
+        assert_eq!(parse_sse_delta_line(""), None);
     }
 
     #[test]

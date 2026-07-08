@@ -1041,6 +1041,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
+name = "croner"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aa42bcd3d846ebf66e15bd528d1087f75d1c6c1c66ebff626178a106353c576"
+dependencies = [
+ "chrono",
+ "derive_builder",
+ "strum 0.27.2",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1241,6 +1252,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive_builder"
+version = "0.20.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "507dfb09ea8b7fa618fcf76e953f4f5e192547945816d5358edffe39f6f94947"
+dependencies = [
+ "derive_builder_macro",
+]
+
+[[package]]
+name = "derive_builder_core"
+version = "0.20.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d5bcf7b024d6835cfb3d473887cd966994907effbe9227e8c8219824d06c4e8"
+dependencies = [
+ "darling",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "derive_builder_macro"
+version = "0.20.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab63b0e2bf4d5928aff72e83a7dace85d7bba5fe12dcc3c5a572d78caffd3f3c"
+dependencies = [
+ "derive_builder_core",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "deunicode"
 version = "1.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1400,6 +1442,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2",
  "subtle",
@@ -1523,6 +1566,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "familyclaw-bridge",
  "familyclaw-core",
  "familyclaw-durable",
@@ -1541,6 +1585,7 @@ dependencies = [
 name = "familyclaw-agent"
 version = "1.2.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "base64",
  "chrono",
@@ -1555,6 +1600,7 @@ dependencies = [
  "familyclaw-emotion",
  "familyclaw-memory",
  "familyclaw-sandbox",
+ "futures-util",
  "ractor",
  "reqwest 0.12.28",
  "serde",
@@ -1784,6 +1830,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "familyclaw-mcp"
+version = "1.2.0"
+dependencies = [
+ "async-trait",
+ "familyclaw-actions",
+ "familyclaw-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "familyclaw-memory"
 version = "1.2.0"
 dependencies = [
@@ -1827,7 +1889,9 @@ dependencies = [
  "familyclaw-durable",
  "familyclaw-embeddings",
  "familyclaw-hearth",
+ "familyclaw-mcp",
  "familyclaw-memory",
+ "familyclaw-sandbox",
  "familyclaw-scheduler",
  "ractor",
  "serde_json",
@@ -1856,6 +1920,7 @@ version = "1.2.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "croner",
  "familyclaw-actions",
  "familyclaw-core",
  "serde",
@@ -3950,7 +4015,7 @@ dependencies = [
  "dashmap 6.2.1",
  "futures",
  "once_cell",
- "strum",
+ "strum 0.26.3",
  "tokio",
  "tracing",
 ]
@@ -5047,7 +5112,16 @@ version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
 dependencies = [
- "strum_macros",
+ "strum_macros 0.26.4",
+]
+
+[[package]]
+name = "strum"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+dependencies = [
+ "strum_macros 0.27.2",
 ]
 
 [[package]]
@@ -5060,6 +5134,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
  "syn 2.0.117",
 ]
 

@@ -360,6 +360,8 @@ impl Skill for ResearchSkill {
                 "required": ["topic"],
                 "additionalProperties": false
             }),
+            publisher: None,
+            signature: None,
         }
     }
 }

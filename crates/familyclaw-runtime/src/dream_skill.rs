@@ -116,6 +116,8 @@ impl Skill for DreamSkill {
             input_hint: Some("{} (ei syötettä)".to_string()),
             output_hint: Some("uni-raportin laskurit (scanned/merged/dropped/...)".to_string()),
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            publisher: None,
+            signature: None,
         }
     }
 }

@@ -75,7 +75,14 @@ pub struct ScheduledTask {
     pub payload: Value,
     /// Aikaväli laukaisujen välillä. Oletetaan positiiviseksi; ei-positiivinen
     /// intervalli kohdellaan "aina erääntyneenä" ([`crate::decision`]).
+    ///
+    /// Ohitetaan kun [`cron_expression`] on asetettu — silloin erääntyminen
+    /// johdetaan cron-lausekkeesta.
     pub interval: Duration,
+    /// Valinnainen cron-lauseke (esim. `"0 * * * *"`). Kun asetettu, tehtävä
+    /// laukeaa cron-aikataulun mukaan ([`crate::decision`]); muuten käytetään
+    /// [`interval`]:ia (taaksepäin-yhteensopiva oletus).
+    pub cron_expression: Option<String>,
     /// Olennon (being) geneerinen tunniste jonka nimissä lähetys tehdään
     /// (rate-limit-laskentaa varten toimintopinossa).
     pub being_id: String,
@@ -118,6 +125,7 @@ impl ScheduledTask {
             skill_id,
             payload,
             interval,
+            cron_expression: None,
             being_id: being_id.into(),
             enabled: true,
             expire_after_idle: None,
@@ -141,10 +149,21 @@ impl ScheduledTask {
             skill_id,
             payload,
             interval,
+            cron_expression: None,
             being_id: being_id.into(),
             enabled: true,
             expire_after_idle: None,
         }
+    }
+
+    /// Asettaa cron-lausekkeen ja palauttaa `self` ketjutusta varten.
+    ///
+    /// Kun asetettu, [`crate::decision`] käyttää cron-erääntymistä
+    /// [`ScheduledTask::interval`]:in sijaan.
+    #[must_use]
+    pub fn with_cron_expression(mut self, cron_expression: impl Into<String>) -> Self {
+        self.cron_expression = Some(cron_expression.into());
+        self
     }
 
     /// Asettaa [`ScheduledTask::enabled`]-tilan (perhe-agency-kontrolli).

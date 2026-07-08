@@ -446,6 +446,8 @@ mod tests {
                 input_hint: None,
                 output_hint: None,
                 input_schema: serde_json::json!({ "type": "object" }),
+                publisher: None,
+                signature: None,
             }
         }
     }

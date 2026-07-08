@@ -12,6 +12,9 @@ rust-version.workspace = true
 workspace = true
 
 [features]
+# Kytkee Wasmtime-sandboxin passthrough-piirteenä `familyclaw-sandbox/wasmtime`:aan.
+# `FAMILYCLAW_SANDBOX_SKILLS=1` + tämä feature → agentti saa oikean hiekkalaatikon.
+wasmtime = ["familyclaw-sandbox/wasmtime"]
 # Kytkee OllamaEmbedderin (aito semanttinen recall) passthrough-piirteenä
 # `familyclaw-embeddings/ollama`:aan. Oletuksena POIS: vetää reqwestin.
 # resolve_embedder() valitsee sen ajossa FAMILYCLAW_EMBED_PROVIDER=ollama.
@@ -36,6 +39,8 @@ familyclaw-durable = { workspace = true }
 familyclaw-dream = { workspace = true }
 familyclaw-scheduler = { workspace = true }
 familyclaw-hearth = { workspace = true }
+familyclaw-mcp = { workspace = true }
+familyclaw-sandbox = { workspace = true }
 ractor = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

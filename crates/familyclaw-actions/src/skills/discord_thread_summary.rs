@@ -177,6 +177,8 @@ impl Skill for DiscordThreadSummaryMock {
                 "required": ["thread"],
                 "additionalProperties": false
             }),
+            publisher: None,
+            signature: None,
         }
     }
 }

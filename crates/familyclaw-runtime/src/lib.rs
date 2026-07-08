@@ -33,9 +33,12 @@ use std::env;
 use std::sync::Arc;
 
 pub mod dream_skill;
+pub mod subagent;
 
 use dream_skill::DreamSkill;
-use familyclaw_actions::{ActionRuntime, AuditCollector, FileWriteConfig, FsReadConfig};
+use familyclaw_actions::{
+    ActionRuntime, AuditCollector, FileWriteConfig, FsReadConfig, ShellExecConfig,
+};
 use familyclaw_agent::{
     build_llm_chain, new_reply_channel, resolve_profile_dir, Agent, EmotionCalibration,
     ErasedMemoryStore, JournalResumableStore, LlmEndpointResolver, MetricEvent, ResumableTurnStore,
@@ -48,6 +51,7 @@ use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
 use familyclaw_durable::{DurableContext, FileJournal, InMemoryJournal, Journal};
 use familyclaw_embeddings::{DeterministicEmbedder, EmbeddingProvider};
 use familyclaw_memory::{EmbeddingMemoryStore, LocalJsonStore};
+use familyclaw_sandbox::{default_sandbox, sandbox_availability, CodeSandbox};
 use familyclaw_scheduler::runner::CancellationSignal;
 use familyclaw_scheduler::{ScheduledTask, Scheduler, SchedulerHandle, SchedulerRunner};
 use ractor::ActorRef;
@@ -233,6 +237,17 @@ impl FamilyRuntime {
     }
 }
 
+/// Yhden lisäagentin kokoonpanon palaset ([`build_family`]:n `extra_agents`).
+#[derive(Debug, Clone)]
+pub struct AgentBuildSpec {
+    /// Lisäagentin kokoonpano (malli, taidot, kanavat).
+    pub config: AgentConfig,
+    /// Lisäagentin sielu (identiteetti, ääni, rajat).
+    pub soul: Soul,
+    /// Per-agentti reply-kohde; `None` → perheen oletus `reply_target`.
+    pub reply_target: Option<String>,
+}
+
 /// C5-kokooja: rakentaa elävän [`FamilyRuntime`]:n yhdellä kutsulla.
 ///
 /// Kytkee `Channel::receive()` → [`familyclaw_agent::pump_channel_to_bus`] → bus → `Agent`
@@ -289,11 +304,16 @@ impl FamilyRuntime {
 // durable → agentti → kanava → dream). Numeroidut askeleet luetaan ylhäältä alas;
 // paloittelu apufunktioihin hajottaisi tämän kokoamiskertomuksen ja kasvattaisi
 // argumenttien lankoja ilman selvyyshyötyä.
-#[allow(clippy::too_many_lines)]
+//
+// 8 argumenttia (raja 7) on tietoinen valinta: kukin on itsenäinen kokoamisen
+// palanen ilman luonnollista ryhmittelyä params-structiksi, ja funktio on koko
+// runtimen julkinen sisääntulo — allekirjoituksen muutos rikkoisi kaikki kutsujat.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn build_family(
     bus_name: Option<String>,
     agent_cfg: AgentConfig,
     soul: Soul,
+    extra_agents: Vec<AgentBuildSpec>,
     channel: Box<dyn Channel>,
     reply_target: String,
     resolver: &dyn LlmEndpointResolver,
@@ -311,7 +331,10 @@ pub async fn build_family(
     // 2. Reply-kanava (C1 Malli A): agentti työntää vastaukset sinkkiin,
     //    runtime omistaa recv-pään ja kutsuu Channel::send (alla, askel 9).
     let (sink, mut reply_rx) = new_reply_channel();
+    let shared_reply_sink = sink.clone();
 
+    let primary_model = agent_cfg.model.clone();
+    let default_reply = reply_target.clone();
     // 3. LLM-failover-ketju (valinnainen): jos yksikään malli ei ratkea
     //    endpointiksi (esim. avain/endpoint puuttuu), agentti toimii ilman
     //    LLM:ää. Rakennetaan KOKO ketju (primary + fallbackit) — F1: primaryn
@@ -454,7 +477,8 @@ pub async fn build_family(
     // — havainnoitavuussilta (askel 7d) julkaisee rekisteröinnin näillä arvoilla.
     let agent_id = agent_cfg.id;
     let agent_name = agent_cfg.name.clone();
-    let mut agent = Agent::new(agent_cfg, soul, memory, durable, bus.clone(), None, None);
+    let sandbox = resolve_sandbox_skills();
+    let mut agent = Agent::new(agent_cfg, soul, memory, durable, bus.clone(), None, sandbox);
     // Gateway-restart-korjaus (durable-replay): siirrä kursori replayn loppuun
     // ja palauta turn_counter seuraavaan vapaaseen vuoropaikkaan VAIN
     // persistentillä polulla (FAMILYCLAW_DATA_DIR). In-memory-journal on tyhjä.
@@ -532,6 +556,7 @@ pub async fn build_family(
     // tämä on se kytkin joka tekee TIEDOSTON KIRJOITTAMISEN oikeasti mahdolliseksi
     // (kirjoitus allowlistin sisällä ajaa automaattisesti, RequireApproval).
     let file_write_config = resolve_file_write_config();
+    let shell_exec_config = resolve_shell_exec_config();
     let action_runtime = if let Some(dir) = action_data_dir.as_ref() {
         // Persistentti polku: durable pending + task + dispatch outbox YHDELLÄ
         // konstruktorilla — `with_durable_stores` avaa nyt itse kaatumiskestävän
@@ -546,14 +571,50 @@ pub async fn build_family(
             .map_err(|e| {
                 FamilyClawError::config(format!("durable action stores open failed: {e}"))
             })?;
-        rt.register_default_skills_with_configs(fs_read_config, file_write_config)
-            .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?;
+        rt.register_default_skills_with_configs(
+            fs_read_config,
+            file_write_config,
+            shell_exec_config,
+        )
+        .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?;
+        if let Err(e) = register_mcp_from_env(&mut rt).await {
+            tracing::warn!(
+                target: "familyclaw::mcp",
+                error = %e,
+                "MCP skill registration from FAMILYCLAW_MCP_SERVERS failed (non-fatal)"
+            );
+        }
+        let spawner = Arc::new(subagent::BusSubagentSpawner::new(
+            bus.clone(),
+            primary_model.clone(),
+            Arc::new(familyclaw_agent::EnvEndpointResolver::new()),
+            default_reply.clone(),
+        ));
+        subagent::register_spawn_subagent_skill(&mut rt, spawner)?;
         rt
     } else {
         // In-memory-polku: kaikki kolme pintaa oletuksissaan.
         let mut rt = ActionRuntime::new();
-        rt.register_default_skills_with_configs(fs_read_config, file_write_config)
-            .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?;
+        rt.register_default_skills_with_configs(
+            fs_read_config,
+            file_write_config,
+            shell_exec_config,
+        )
+        .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?;
+        if let Err(e) = register_mcp_from_env(&mut rt).await {
+            tracing::warn!(
+                target: "familyclaw::mcp",
+                error = %e,
+                "MCP skill registration from FAMILYCLAW_MCP_SERVERS failed (non-fatal)"
+            );
+        }
+        let spawner = Arc::new(subagent::BusSubagentSpawner::new(
+            bus.clone(),
+            primary_model.clone(),
+            Arc::new(familyclaw_agent::EnvEndpointResolver::new()),
+            default_reply.clone(),
+        ));
+        subagent::register_spawn_subagent_skill(&mut rt, spawner)?;
         rt
     };
     let actions: Arc<Mutex<ActionRuntime>> = Arc::new(Mutex::new(action_runtime));
@@ -600,15 +661,9 @@ pub async fn build_family(
 
     // 7. Spawnaa agentti actorina (rekisteröi busiin).
     let actor = agent.spawn().await?;
+    let mut agents = vec![actor];
 
-    // 7d. Havainnoitavuussilta (valinnainen): jos kutsuja antoi siltakerroksen
-    //     tapahtumaväylän, julkaise agentin rekisteröinti REAALISENA
-    //     ajonaikaisena virstanpylväänä ([`EventKind::AgentRegistered`]). Gateway
-    //     on jo tilannut sillan `EventRecorder`illa (tilausjärjestys, ks.
-    //     funktion doc), joten tapahtuma päivittää jaetun `MetricsRegistry`:n
-    //     `agents_online`-gaugen elävästi. Rekisteröinnin epäonnistuminen ei saa
-    //     kaataa kokoonpanoa — havainnoitavuus on lisätieto, ei kriittinen polku;
-    //     virhe lokitetaan ja kokoaminen jatkuu.
+    // 7d. Havainnoitavuussilta (valinnainen): primary-agentin rekisteröinti.
     if let Some(bridge) = &bridge {
         let info = AgentInfo::new(agent_id, &agent_name, AgentRole::Executor, HostKind::Local);
         if let Err(e) = bridge.register_agent(info).await {
@@ -620,6 +675,70 @@ pub async fn build_family(
                  agents_online gauge will not reflect this agent"
             );
         }
+    }
+
+    // 7e. Lisäagentit (moniagentti-serve): sama bus, jaettu actions/audit, oma sielu/reply.
+    for spec in extra_agents {
+        let extra_id = spec.config.id;
+        let extra_name = spec.config.name.clone();
+        let extra_reply = spec
+            .reply_target
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| default_reply.clone());
+        let extra_failover = match build_llm_chain(&spec.config.model, resolver) {
+            Ok(chain) => Some(chain),
+            Err(e) => {
+                tracing::warn!(
+                    target: "familyclaw::llm",
+                    agent = %extra_name,
+                    error = %e,
+                    "extra agent LLM chain unresolved — running without text replies"
+                );
+                None
+            }
+        };
+        let extra_mem: ErasedMemoryStore = Arc::new(EmbeddingMemoryStore::new(
+            LocalJsonStore::in_memory(),
+            resolve_embedder(),
+        ));
+        let extra_journal: Arc<dyn Journal + Send + Sync> = dream_journal
+            .clone()
+            .unwrap_or_else(|| Arc::new(InMemoryJournal::new()));
+        let extra_durable = DurableContext::new(Arc::clone(&extra_journal))
+            .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+        let mut extra_agent = Agent::new(
+            spec.config,
+            spec.soul,
+            extra_mem,
+            extra_durable,
+            bus.clone(),
+            None,
+            None,
+        )
+        .with_reply_sink(shared_reply_sink.clone())
+        .with_reply_target(extra_reply)
+        .with_actions(Arc::clone(&actions))
+        .with_turn_audit(Arc::clone(&turn_audit));
+        if persistent {
+            extra_agent = extra_agent.resume_live();
+        }
+        if let Some(failover) = extra_failover {
+            extra_agent = extra_agent.with_failover(failover);
+        }
+        let extra_actor = extra_agent.spawn().await?;
+        if let Some(bridge) = &bridge {
+            let info = AgentInfo::new(extra_id, &extra_name, AgentRole::Executor, HostKind::Local);
+            if let Err(e) = bridge.register_agent(info).await {
+                tracing::warn!(
+                    target: "familyclaw::observability",
+                    agent = %extra_name,
+                    error = %e,
+                    "extra agent registration on observability bridge failed (non-fatal)"
+                );
+            }
+        }
+        agents.push(extra_actor);
     }
 
     // 8. Kanavan oma bus-seat — ERI kuin agentin being_id, muuten AgentActor
@@ -698,6 +817,7 @@ pub async fn build_family(
                     let agency_path = dir.join("agency.json");
                     match familyclaw_scheduler::AgencyConfig::load(&agency_path) {
                         Ok(cfg) => {
+                            cfg.register_scheduled_tasks(&mut scheduler);
                             scheduler.apply_agency_config(&cfg);
                             if !cfg.disabled.is_empty() {
                                 tracing::info!(target: "familyclaw::scheduler", disabled = cfg.disabled.len(), "applied persisted agency config");
@@ -741,7 +861,7 @@ pub async fn build_family(
         bridge,
         actions,
         turn_audit,
-        agents: vec![actor],
+        agents,
         drain,
         tasks,
         scheduler_signal,
@@ -833,6 +953,40 @@ fn resolve_embedder() -> Arc<dyn EmbeddingProvider + Send + Sync> {
     }
 }
 
+/// Kytkee agentin wasmtime-sandboxin kun `FAMILYCLAW_SANDBOX_SKILLS=1`.
+///
+/// Kolmannen osapuolen taidot tulisi ajaa hiekkalaatikossa (ks.
+/// [`docs/SECURITY_MODEL.md`](../../docs/SECURITY_MODEL.md)). Tämä env-kytkin
+/// preferoi [`default_sandbox`]:n polkua `build_family`:ssa — palauttaa `None`
+/// jos kytkin on pois, alustus epäonnistuu, tai vain noop-backend on käännetty.
+fn resolve_sandbox_skills() -> Option<Arc<dyn CodeSandbox>> {
+    let enabled = env::var("FAMILYCLAW_SANDBOX_SKILLS")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    if !enabled {
+        return None;
+    }
+
+    match default_sandbox() {
+        Ok(sandbox) => {
+            tracing::info!(
+                target: "familyclaw::sandbox",
+                availability = sandbox_availability(),
+                "FAMILYCLAW_SANDBOX_SKILLS=1: sandbox wired to agent"
+            );
+            Some(Arc::from(sandbox))
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "familyclaw::sandbox",
+                error = %error,
+                "FAMILYCLAW_SANDBOX_SKILLS=1 but sandbox init failed — agent runs without sandbox"
+            );
+            None
+        }
+    }
+}
+
 fn resolve_fs_read_config() -> Option<FsReadConfig> {
     let allow_raw = env::var("FAMILYCLAW_FS_READ_ALLOW").ok()?;
     let allow_roots: Vec<String> = env::split_paths(&allow_raw)
@@ -895,6 +1049,35 @@ fn resolve_file_write_config() -> Option<FileWriteConfig> {
         target: "familyclaw::actions",
         allow_roots = allow_roots.len(),
         "file_write skill allowlist configured from environment"
+    );
+    Some(config)
+}
+
+/// Ratkaisee **`shell_exec`**-taidon kokoonpanon KERROS B -ympäristöstä.
+///
+/// - `FAMILYCLAW_SHELL_MODE` — `manual` (oletus), `smart`, `off`
+/// - `FAMILYCLAW_SHELL_CWD_ALLOWLIST` — puolipiste-eroteltu työhakemisto-allowlist
+///
+/// Palauttaa `None` kun kumpikaan muuttuja ei ole asetettu → taito rekisteröityy
+/// fail-closed-oletuksella (`ShellExec::new()`).
+fn resolve_shell_exec_config() -> Option<ShellExecConfig> {
+    let mode_explicit = env::var("FAMILYCLAW_SHELL_MODE")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let cwd_nonempty = env::var("FAMILYCLAW_SHELL_CWD_ALLOWLIST")
+        .ok()
+        .is_some_and(|raw| raw.split(';').any(|p| !p.trim().is_empty()));
+
+    if mode_explicit.is_none() && !cwd_nonempty {
+        return None;
+    }
+
+    let config = ShellExecConfig::from_env();
+    tracing::info!(
+        target: "familyclaw::actions",
+        mode = ?config.shell_mode(),
+        cwd_roots = config.cwd_root_count(),
+        "shell_exec skill configured from environment"
     );
     Some(config)
 }
@@ -995,6 +1178,20 @@ pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Rekisteröi MCP-palvelimet `FAMILYCLAW_MCP_SERVERS`-ympäristöstä
+/// [`ActionRuntime`]:iin (valinnainen, ei-fataali virhe `build_family`:ssa).
+///
+/// Muoto: `name=command args` (stdio) tai `name=http://host/mcp` (HTTP).
+/// Useita palvelimia erotetaan puolipisteellä.
+///
+/// # Errors
+/// Ympäristön jäsennys, yhteys tai taidon rekisteröinti epäonnistuu.
+pub async fn register_mcp_from_env(runtime: &mut ActionRuntime) -> Result<()> {
+    familyclaw_mcp::register_from_env(runtime)
+        .await
+        .map_err(|e| FamilyClawError::config(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1090,6 +1287,7 @@ mod tests {
             None,
             agent_cfg,
             soul,
+            vec![],
             Box::new(channel),
             "mock:general".to_string(),
             &resolver,
@@ -1132,6 +1330,7 @@ mod tests {
             Some("runtime-test-bus".to_string()),
             agent_cfg,
             soul,
+            vec![],
             Box::new(channel),
             "mock:room".to_string(),
             &resolver,
@@ -1164,6 +1363,7 @@ mod tests {
             None,
             agent_cfg,
             soul,
+            vec![],
             Box::new(channel),
             "mock:room".to_string(),
             &resolver,

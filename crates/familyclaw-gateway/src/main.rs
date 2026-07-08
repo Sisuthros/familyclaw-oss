@@ -110,6 +110,7 @@ use familyclaw_bridge::{
 use familyclaw_bus::{BeingId, BusHandle, BusMessage};
 use tokio::sync::Mutex;
 mod config;
+mod readiness;
 use config::FamilyConfig;
 use familyclaw_channels::{
     verify_signature, Channel, ChannelKind, ChannelResult, DiscordChannel, DiscordInteraction,
@@ -118,7 +119,7 @@ use familyclaw_channels::{
 };
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
 use familyclaw_observability::{EventRecorder, MetricsRegistry};
-use familyclaw_runtime::{build_family, FamilyRuntime};
+use familyclaw_runtime::{build_family, AgentBuildSpec, FamilyRuntime};
 use familyclaw_scheduler::{AgencyConfig, ScheduledTaskId, SchedulerHandle};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -155,6 +156,7 @@ const PLAN_ENV: &str = "FAMILYCLAW_PLAN";
 /// 2048, joka katkaisee pitkät vastaukset kesken lauseen. Aseta esim. 8192
 /// jotta agentti (esim. pitkät tutkimusraportit) mahtuu vastaamaan kokonaan.
 const MAX_TOKENS_ENV: &str = "FAMILYCLAW_MAX_TOKENS";
+const REQUEST_TIMEOUT_MS_ENV: &str = "FAMILYCLAW_REQUEST_TIMEOUT_MS";
 
 /// Oletusarvot joita `FamilyConfig` käyttää (KERROS B).
 const DEFAULT_BUS_NAME: &str = "familyclaw-gateway-bus";
@@ -188,11 +190,11 @@ enum Command {
     /// Tulostaa tilan ja palaa exit-koodilla `0` vain kun `/readyz` = 200.
     Status,
     /// Tarkista kokoonpano käynnistämättä palvelinta (offline-diagnostiikka).
-    ///
-    /// Vahvistaa kuunteluosoitteen jäsentymisen, portin vapauden ja vaaditut
-    /// ympäristömuuttujat. Salaisuuksista raportoidaan **vain läsnäolo**
-    /// (asetettu/puuttuu) — arvoja ei koskaan tulosteta.
-    Doctor,
+    Doctor {
+        /// Korjaa automaattisesti mitä voidaan (data-hakemisto, vanhat jumit, …).
+        #[arg(long)]
+        fix: bool,
+    },
     /// Aja monivaiheinen orkesterointisuunnitelma kerran ja tulosta raportti.
     ///
     /// Tämä on multi-agent DAG -ajon **elävä sisäänkäynti**: kokoaa
@@ -207,7 +209,10 @@ enum Command {
     /// ractor-agenteilla/`ResonanceBus`illa. Tämä tekee DAG-orkesteroinnista
     /// ajettavan oikeilla LLM-kutsuilla; fuusio eläviin runtime-agentteihin on
     /// erillinen, isompi työ.
+    /// DAG-orkesterointi (bridge-substraatti, ei FamilyRuntime-agentteja).
     Orchestrate,
+    /// Interaktiivinen onboarding-wizard (TOML + data-hakemisto alle 5 min).
+    Init,
 }
 
 /// Gatewayn jaettu ajonaikainen tila, johon HTTP-handlerit viittaavat.
@@ -285,6 +290,31 @@ struct GatewayState {
     /// on vain numeeriset arvot, ei payloadia). `None` vain tiloissa joissa
     /// rekisteriä ei ole kytketty (esim. osa testeistä).
     metrics: Option<MetricsRegistry>,
+    /// Syvä readyz / kanarialintu: LLM-malli, Discord, journal-polku.
+    readiness: readiness::ReadinessProbe,
+}
+
+/// Tyhjä gateway-tila testeihin.
+//
+// Jaettu testifikstuuri: säilytetään testien apuvälineenä, vaikka nykyiset
+// testit rakentavat `GatewayState`:n toistaiseksi inline. `#[cfg(test)]`
+// pitää sen pois tuotantobinääristä; `dead_code`-allow estää varoituksen
+// niin kauan kuin yksikään testi ei vielä kutsu sitä.
+#[cfg(test)]
+#[allow(dead_code)]
+fn test_gateway_state() -> GatewayState {
+    GatewayState {
+        bus: None,
+        discord_channel: None,
+        inject_token: None,
+        discord_public_key: None,
+        actions: None,
+        turn_audit: None,
+        scheduler: None,
+        agency_config_path: None,
+        metrics: None,
+        readiness: readiness::ReadinessProbe::default(),
+    }
 }
 
 /// Yhden odottavan hyväksynnän **operaattorille turvallinen, redaktoitu**
@@ -312,17 +342,21 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Valmiustarkistus: `200 OK` vain kun Resonance Bus on käynnissä, muuten
-/// `503 Service Unavailable`. Kuormantasaaja/orkestroija voi käyttää tätä
-/// päättääkseen, ohjataanko liikennettä tälle instanssille.
+/// Valmiustarkistus: syvä tarkistus (bus + LLM + Discord + journal).
 async fn readyz(
     axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
-) -> (StatusCode, &'static str) {
-    if state.bus.is_some() {
-        (StatusCode::OK, "ready")
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
-    }
+) -> (StatusCode, axum::Json<readiness::ReadyzResponse>) {
+    let bus_ok = state.bus.is_some();
+    readiness::deep_readyz(bus_ok, &state.readiness).await
+}
+
+/// Kanarialintu: synteettinen LLM-ping + infratarkistukset.
+async fn canary(
+    axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
+) -> std::result::Result<axum::Json<readiness::CanaryResponse>, StatusCode> {
+    readiness::run_canary(&state.readiness)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// Vakioaikainen tavujonojen vertailu (defense-in-depth bearer-tokenille).
@@ -1009,6 +1043,7 @@ fn build_router(state: Arc<GatewayState>) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/canary", post(canary))
         // Prometheus-mittarit (jaettu MetricsRegistry, with_fleet_defaults).
         // Rekisteröidään aina; kun rekisteriä ei ole kytketty
         // ([`GatewayState::metrics`] = `None`), handler vastaa 503. Suojaamaton
@@ -1077,6 +1112,21 @@ fn build_resolver() -> EnvEndpointResolver {
             _ => warn!(
                 value = raw,
                 "ohitetaan kelvoton {MAX_TOKENS_ENV} (odotettu positiivinen kokonaisluku)"
+            ),
+        }
+    }
+    if let Ok(raw) = std::env::var(REQUEST_TIMEOUT_MS_ENV) {
+        match raw.trim().parse::<u64>() {
+            Ok(ms) if ms >= 5_000 => {
+                resolver = resolver.with_request_timeout_ms(ms);
+                info!(
+                    request_timeout_ms = ms,
+                    "LLM request-timeout asetettu {REQUEST_TIMEOUT_MS_ENV}:stä"
+                );
+            }
+            _ => warn!(
+                value = raw,
+                "ohitetaan kelvoton {REQUEST_TIMEOUT_MS_ENV} (odotettu >= 5000 ms)"
             ),
         }
     }
@@ -1195,6 +1245,22 @@ fn resolve_inject_token(cfg: &FamilyConfig) -> Option<Arc<str>> {
     }
 }
 
+fn build_extra_agent_specs(cfg: &FamilyConfig, model_cfg: &ModelConfig) -> Vec<AgentBuildSpec> {
+    cfg.all_agents()
+        .into_iter()
+        .skip(1)
+        .map(|a| AgentBuildSpec {
+            config: AgentConfig::new_with_stable_id(&a.name, model_cfg.clone()),
+            soul: load_agent_soul(&a.name),
+            reply_target: if a.reply_target.is_empty() {
+                None
+            } else {
+                Some(a.reply_target)
+            },
+        })
+        .collect()
+}
+
 /// Palauttaa runtimen, Discord-kanavan (inject/interactions), inject-tokenin ja public keyn.
 // Kolme kanavahaaraa (none / discord / telegram), joista kukin kokoaa runtimen
 // omalla polullaan — pitkä mutta lineaarinen; jakaminen hämärtäisi luettavuutta.
@@ -1208,9 +1274,16 @@ async fn start_runtime(
     Option<Arc<str>>,
 )> {
     let cfg = FamilyConfig::load()?;
-    let agent_name = cfg.agent_name().to_string();
+    let all_agents = cfg.all_agents();
+    let primary = &all_agents[0];
+    let agent_name = primary.name.clone();
     let model = cfg.model().to_string();
     let channel_kind = cfg.channel_kind().to_string();
+    let mut model_cfg = ModelConfig::new(model.clone());
+    for fb in cfg.fallback_models() {
+        model_cfg = model_cfg.with_fallback(fb);
+    }
+    let extra_agents = build_extra_agent_specs(&cfg, &model_cfg);
 
     let inject_token: Option<Arc<str>> = resolve_inject_token(&cfg);
 
@@ -1232,17 +1305,14 @@ async fn start_runtime(
         // vastaukset outboxiinsa. Käytämme neutraalia paikanpitäjää joka ei
         // reititä minnekään ulos.
         let reply_target = "none".to_string();
-        let mut model_cfg = ModelConfig::new(cfg.model().to_string());
-        for fb in cfg.fallback_models() {
-            model_cfg = model_cfg.with_fallback(fb);
-        }
-        let agent_cfg = AgentConfig::new_with_stable_id(&agent_name, model_cfg);
+        let agent_cfg = AgentConfig::new_with_stable_id(&agent_name, model_cfg.clone());
         let soul = load_agent_soul(&agent_name);
         let resolver = build_resolver();
         let runtime = build_family(
             Some(DEFAULT_BUS_NAME.to_string()),
             agent_cfg,
             soul,
+            extra_agents.clone(),
             channel,
             reply_target,
             &resolver,
@@ -1328,17 +1398,16 @@ async fn start_runtime(
     // (FAMILYCLAW_FALLBACK_MODELS). Ilman fallbackeja agentti ajaa VAIN
     // primaryllä — jos se on alhaalla/quota loppu, koko olento on hiljaa.
     // LlmFailover (llm_chain.rs) siirtyy seuraavaan kun primary epäonnistuu.
-    let mut model_cfg = ModelConfig::new(model);
-    let fallbacks = cfg.fallback_models();
-    if fallbacks.is_empty() {
+    if cfg.fallback_models().is_empty() {
         info!(agent = %agent_name, "malli: vain primary (ei FAMILYCLAW_FALLBACK_MODELS)");
     } else {
-        info!(agent = %agent_name, count = fallbacks.len(), "malli: primary + varamallit");
-        for fb in fallbacks {
-            model_cfg = model_cfg.with_fallback(fb);
-        }
+        info!(
+            agent = %agent_name,
+            count = cfg.fallback_models().len(),
+            "malli: primary + varamallit"
+        );
     }
-    let agent_cfg = AgentConfig::new_with_stable_id(&agent_name, model_cfg);
+    let agent_cfg = AgentConfig::new_with_stable_id(&agent_name, model_cfg.clone());
     let soul = load_agent_soul(&agent_name);
     let resolver = build_resolver();
 
@@ -1347,6 +1416,7 @@ async fn start_runtime(
         Some(DEFAULT_BUS_NAME.to_string()),
         agent_cfg,
         soul,
+        extra_agents,
         channel,
         reply_target,
         &resolver,
@@ -1385,7 +1455,8 @@ async fn main() -> Result<()> {
     match Cli::parse().command.unwrap_or(Command::Serve) {
         Command::Serve => serve().await,
         Command::Status => status().await,
-        Command::Doctor => doctor().await,
+        Command::Doctor { fix } => doctor(fix).await,
+        Command::Init => init_wizard(),
         Command::Orchestrate => orchestrate().await,
     }
 }
@@ -1447,6 +1518,26 @@ async fn serve() -> Result<()> {
     // siltakerroksen `task.*`/`contract.*`/`llm.*`/… -tapahtumat kasvattavat
     // vastaavia sarjoja recorderin kautta. Rekisteri jaetaan GatewayState:lle
     // Arc-jako-mallilla → /metrics näkee tarkalleen recorderin kasvattamat luvut.
+    let discord_probe = discord_ch.as_ref().and_then(|dc| {
+        let token_set = !std::env::var("DISCORD_BOT_TOKEN")
+            .unwrap_or_default()
+            .is_empty();
+        if token_set {
+            Some(Arc::clone(dc))
+        } else {
+            None
+        }
+    });
+    let readiness_probe = readiness::build_probe(
+        FamilyConfig::load().ok().map(|c| c.model_config()),
+        discord_probe,
+    );
+    if let Some(ref dir) = readiness_probe.data_dir {
+        if let Err(e) = readiness::cleanup_stale_approval_tasks(dir, 7).await {
+            warn!("stale action_tasks cleanup failed: {e}");
+        }
+    }
+
     let state = Arc::new(GatewayState {
         bus: Some(runtime.bus().clone()),
         discord_channel: discord_ch,
@@ -1457,6 +1548,7 @@ async fn serve() -> Result<()> {
         scheduler,
         agency_config_path,
         metrics: Some(metrics),
+        readiness: readiness_probe,
     });
     info!("operaattorin hyväksyntäpinta valmis — GET /approvals/pending, POST /approvals/{{id}}/approve");
     let app = build_router(state);
@@ -1692,7 +1784,7 @@ async fn status() -> Result<()> {
 // Peräkkäisiä tarkistuslohkoja (addr/port/env/durability/sandbox/…), kukin
 // tulostaa oman rivinsä — pitkä mutta suoraviivainen diagnostiikkasekvenssi.
 #[allow(clippy::too_many_lines)]
-async fn doctor() -> Result<()> {
+async fn doctor(fix: bool) -> Result<()> {
     let cfg = FamilyConfig::load()?;
     let mut ok = true;
 
@@ -1812,6 +1904,42 @@ async fn doctor() -> Result<()> {
         println!("[OK]      inject    {GATEWAY_TOKEN_ENV} set — POST /inject requires bearer");
     }
 
+    if fix {
+        println!("[FIX]     doctor --fix aktiivinen");
+        let data_dir = std::env::var("FAMILYCLAW_DATA_DIR").unwrap_or_else(|_| {
+            let home = std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .unwrap_or_else(|_| ".".into());
+            format!("{home}/.local/share/familyclaw")
+        });
+        if std::fs::create_dir_all(&data_dir).is_ok() {
+            std::env::set_var("FAMILYCLAW_DATA_DIR", &data_dir);
+            println!("[FIX]      data_dir  {data_dir}");
+            match readiness::cleanup_stale_approval_tasks(std::path::Path::new(&data_dir), 0).await
+            {
+                Ok(cancelled) if cancelled > 0 => {
+                    println!("[OK]      cleanup   cancelled {cancelled} needs_approval task(s)");
+                }
+                Ok(_) => {
+                    println!("[OK]      cleanup   no pending needs_approval tasks");
+                }
+                Err(e) => {
+                    println!("[WARN]    cleanup   pending tasks: {e}");
+                }
+            }
+        }
+        let config_path = FamilyConfig::find_path();
+        if !config_path.exists() {
+            if let Some(parent) = config_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let template = include_str!("../../../familyclaw.toml.example");
+            if std::fs::write(&config_path, template).is_ok() {
+                println!("[FIX]      config    wrote {}", config_path.display());
+            }
+        }
+    }
+
     if ok {
         println!("doctor: ok");
         Ok(())
@@ -1820,6 +1948,43 @@ async fn doctor() -> Result<()> {
             "doctor: one or more checks failed",
         ))
     }
+}
+
+/// Interaktiivinen onboarding-wizard: luo TOML + data-hakemisto.
+fn init_wizard() -> Result<()> {
+    println!("FamilyClaw init — alle 5 min onboarding\n");
+
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".into());
+    let data_dir = format!("{home}/.local/share/familyclaw");
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| FamilyClawError::config(format!("data_dir create failed: {e}")))?;
+    std::env::set_var("FAMILYCLAW_DATA_DIR", &data_dir);
+    println!("[OK] data_dir  {data_dir}");
+
+    let config_path = FamilyConfig::find_path();
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if config_path.exists() {
+        println!("[SKIP] config  {} exists", config_path.display());
+    } else {
+        let template = include_str!("../../../familyclaw.toml.example");
+        std::fs::write(&config_path, template)
+            .map_err(|e| FamilyClawError::config(format!("config write failed: {e}")))?;
+        println!("[OK] config    {}", config_path.display());
+    }
+
+    println!("\nSeuraavat askeleet:");
+    println!(
+        "  1. Muokkaa {} (kanava, provider, avaimet)",
+        config_path.display()
+    );
+    println!("  2. Aseta salaisuudet ympäristöön (DISCORD_BOT_TOKEN, OPENAI_API_KEY, …)");
+    println!("  3. familyclaw-gateway doctor --fix");
+    println!("  4. familyclaw-gateway serve");
+    Ok(())
 }
 
 /// Jäsentää [`PLAN_ENV`]-suunnitelman tai palauttaa savutesti-oletuksen.
@@ -1981,6 +2146,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         let (status, _) = readyz(State(not_ready)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1997,6 +2163,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         let (status, _) = readyz(State(ready)).await;
         assert_eq!(status, StatusCode::OK);
@@ -2016,6 +2183,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         }));
     }
 
@@ -2046,7 +2214,7 @@ mod tests {
         assert!(matches!(status.command, Some(Command::Status)));
 
         let doctor = Cli::parse_from(["familyclaw-gateway", "doctor"]);
-        assert!(matches!(doctor.command, Some(Command::Doctor)));
+        assert!(matches!(doctor.command, Some(Command::Doctor { fix: _ })));
 
         let orch = Cli::parse_from(["familyclaw-gateway", "orchestrate"]);
         assert!(matches!(orch.command, Some(Command::Orchestrate)));
@@ -2138,6 +2306,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         };
         assert!(check_inject_auth(&state, &HeaderMap::new()).is_ok());
         // Ylimääräinen otsikko ei haittaa kun suojausta ei ole.
@@ -2157,6 +2326,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         };
         assert!(check_inject_auth(&state, &headers_with_auth("Bearer s3cret-token")).is_ok());
     }
@@ -2174,6 +2344,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         };
         // Väärä token.
         assert_eq!(
@@ -2214,6 +2385,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         (state, actions)
     }
@@ -2278,6 +2450,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         let (status, _) = list_pending_approvals(State(state), HeaderMap::new()).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -2323,6 +2496,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         let (status, _) = list_pending_approvals(State(state), HeaderMap::new()).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -2377,6 +2551,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         let (status, _) = approve_pending(
             State(state),
@@ -2400,6 +2575,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         })
     }
 
@@ -2430,6 +2606,7 @@ mod tests {
             scheduler: Some(sched),
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         // Epäkelpo UUID → 400.
         let (status, _) = set_task_enabled_route(
@@ -2476,6 +2653,7 @@ mod tests {
             scheduler: Some(Arc::clone(&sched)),
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
 
         // Tunnettu tehtävä → 200, tila päivittyy.
@@ -2537,6 +2715,7 @@ mod tests {
             scheduler: Some(Arc::clone(&sched)),
             agency_config_path: Some(path.clone()),
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
 
         // Disabloi reitin kautta → pitää persistoitua tiedostoon.
@@ -2634,6 +2813,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         let id = submit_pending(&actions).await;
 
@@ -2694,6 +2874,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         let (status, headers, body) = metrics_handler(State(state)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -2720,6 +2901,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: Some(registry),
+            readiness: readiness::ReadinessProbe::default(),
         });
 
         let (status, headers, body) = metrics_handler(State(state)).await;
@@ -2767,6 +2949,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: Some(registry),
+            readiness: readiness::ReadinessProbe::default(),
         });
         let app = build_router(state);
 
@@ -2876,6 +3059,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: Some(metrics),
+            readiness: readiness::ReadinessProbe::default(),
         });
         let (status, _headers, body) = metrics_handler(State(state)).await;
         assert_eq!(status, StatusCode::OK);
@@ -3154,6 +3338,8 @@ mod tests {
                 input_hint: None,
                 output_hint: None,
                 input_schema: familyclaw_actions::manifest::default_input_schema(),
+                publisher: None,
+                signature: None,
             }
         }
     }
@@ -3282,6 +3468,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         let app = build_router(state);
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -3545,6 +3732,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         let app = build_router(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -3621,6 +3809,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         let app = build_router(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -3765,6 +3954,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         let app = build_router(state);
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -3917,6 +4107,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            readiness: readiness::ReadinessProbe::default(),
         });
         let app = build_router(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

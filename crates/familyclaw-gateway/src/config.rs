@@ -12,6 +12,10 @@ pub const CONFIG_FILE_NAME: &str = "familyclaw.toml";
 #[derive(Default)]
 pub struct FamilyConfig {
     pub agent: AgentCfg,
+    /// Valinnainen moniagentti-lista (`[[agents]]` TOML:ssa). Tyhjä → käytetään
+    /// vain [`FamilyConfig::agent`]-kenttää (taaksepäin-yhteensopiva yksi agentti).
+    #[serde(default)]
+    pub agents: Vec<AgentCfg>,
     pub channel: ChannelCfg,
     pub provider: ProviderCfg,
     pub memory: MemoryCfg,
@@ -22,6 +26,9 @@ pub struct FamilyConfig {
 #[serde(default)]
 pub struct AgentCfg {
     pub name: String,
+    /// Valinnainen per-agentti reply-kohde (ylikirjoittaa kanavan oletuksen).
+    #[serde(default)]
+    pub reply_target: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -89,6 +96,7 @@ impl Default for AgentCfg {
     fn default() -> Self {
         Self {
             name: "agent_a".into(),
+            reply_target: String::new(),
         }
     }
 }
@@ -168,7 +176,7 @@ impl FamilyConfig {
         Ok(cfg)
     }
 
-    fn find_path() -> PathBuf {
+    pub fn find_path() -> PathBuf {
         if let Ok(p) = std::env::var("FAMILYCLAW_CONFIG") {
             return PathBuf::from(p);
         }
@@ -265,8 +273,22 @@ impl FamilyConfig {
 
 // Accessor helpers
 impl FamilyConfig {
+    // Osa julkista accessor-pintaa `model()`/`all_agents()`:n rinnalla.
+    // Nykyinen koodi lukee `agent.name`-kentän suoraan, joten metodia ei
+    // vielä kutsuta — säilytetään API-symmetrian vuoksi.
+    #[allow(dead_code)]
     pub fn agent_name(&self) -> &str {
         &self.agent.name
+    }
+
+    /// Palauttaa kaikki serve-agentit: `[[agents]]` jos asetettu, muuten yksi
+    /// [`Self::agent`].
+    pub fn all_agents(&self) -> Vec<AgentCfg> {
+        if self.agents.is_empty() {
+            vec![self.agent.clone()]
+        } else {
+            self.agents.clone()
+        }
     }
     pub fn model(&self) -> &str {
         &self.provider.model
@@ -288,6 +310,14 @@ impl FamilyConfig {
                     .collect()
             })
             .unwrap_or_default()
+    }
+    /// Primary + varamallit ajettavaksi [`ModelConfig`]:ksi (sama kuin serve-polku).
+    pub fn model_config(&self) -> familyclaw_core::ModelConfig {
+        let mut cfg = familyclaw_core::ModelConfig::new(self.model().to_string());
+        for fb in self.fallback_models() {
+            cfg = cfg.with_fallback(fb);
+        }
+        cfg
     }
     pub fn channel_kind(&self) -> &str {
         &self.channel.kind
@@ -484,5 +514,31 @@ owner_id = 123456789
             "default model '{}' must be provider/model form",
             cfg.model
         );
+    }
+
+    /// `[[agents]]` parsitaan TOML-listana; tyhjä lista → vain `[agent]`.
+    #[test]
+    fn agents_table_parses_from_toml() {
+        let toml = r#"
+[[agents]]
+name = "agent_a"
+
+[[agents]]
+name = "agent_b"
+reply_target = "telegram:99"
+"#;
+        let cfg: FamilyConfig = toml::from_str(toml).expect("parse");
+        let all = cfg.all_agents();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].name, "agent_a");
+        assert_eq!(all[1].name, "agent_b");
+        assert_eq!(all[1].reply_target, "telegram:99");
+    }
+
+    #[test]
+    fn empty_agents_list_falls_back_to_single_agent() {
+        let cfg = FamilyConfig::default();
+        assert_eq!(cfg.all_agents().len(), 1);
+        assert_eq!(cfg.all_agents()[0].name, "agent_a");
     }
 }

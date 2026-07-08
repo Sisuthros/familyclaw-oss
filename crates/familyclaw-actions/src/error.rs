@@ -31,6 +31,10 @@ pub enum ActionError {
     #[error("secret detected in manifest: {0}")]
     SecretInManifest(String),
 
+    /// Ulkoisen taidon Ed25519-allekirjoituksen verifiointi epäonnistui.
+    #[error("skill signature invalid: {0}")]
+    SignatureInvalid(String),
+
     /// Viitattua taitoa ei löytynyt rekisteristä.
     #[error("unknown skill: {0}")]
     UnknownSkill(String),

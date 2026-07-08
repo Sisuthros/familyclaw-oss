@@ -8,21 +8,26 @@
 //!
 //! ## Erääntymissääntö
 //! Tehtävä on **erääntynyt** kun
-//! `now >= last_fired + interval`. Jos tehtävä ei ole koskaan laukennut
-//! (`last_fired = None`), se on erääntynyt heti ensimmäisellä arvioinnilla.
-//! Ei-positiivinen intervalli kohdellaan "aina erääntyneenä" (turvallinen
-//! degeneraatio; tuotannossa intervallin oletetaan olevan positiivinen).
+//! - **intervalli:** `now >= last_fired + interval` (oletus), tai
+//! - **cron:** nykyhetkeen `<= now` osuva cron-esiintymä on uudempi kuin
+//!   `last_fired` (ks. [`is_due_cron`]).
+//!
+//! Jos tehtävä ei ole koskaan laukennut (`last_fired = None`), se on erääntynyt
+//! heti ensimmäisellä arvioinnilla (intervalli) tai kun cron-esiintymä on
+//! saavutettu (cron). Ei-positiivinen intervalli kohdellaan "aina erääntyneenä"
+//! (turvallinen degeneraatio; tuotannossa intervallin oletetaan olevan
+//! positiivinen).
 //!
 //! ## Idempotenssiavaimen vakaus
-//! Laukaisun avain on `schedule-{task_id}-{epoch_bucket}`, jossa
-//! `epoch_bucket = floor(now_unix / interval_secs)`. Saman intervalli-ikkunan
-//! sisällä **mikä tahansa** `now` tuottaa saman `epoch_bucket`-arvon ja siten
-//! saman avaimen. Näin sama looginen laukaisu → sama avain, myös jos prosessi
-//! kaatuu ja arvioi saman ikkunan uudelleen restartin jälkeen
-//! ([`firing_key`]).
+//! Laukaisun avain on `schedule-{task_id}-{epoch_bucket}` (intervalli) tai
+//! `schedule-{task_id}-{occurrence_unix}` (cron), jossa `occurrence_unix` on
+//! cron-esiintymän Unix-aika. Saman intervalli-ikkunan tai cron-esiintymän
+//! sisällä **mikä tahansa** `now` tuottaa saman avaimen.
 
 use chrono::Duration;
+use croner::Cron;
 use familyclaw_core::time::Timestamp;
+use std::str::FromStr;
 
 use crate::task::{ScheduledTask, ScheduledTaskId};
 
@@ -69,6 +74,48 @@ pub fn firing_key(task_id: ScheduledTaskId, interval: Duration, now: Timestamp) 
     format!("schedule-{task_id}-{bucket}")
 }
 
+/// Jäsentää cron-lausekkeen. Palauttaa `None` virheelliselle lausekkeelle.
+#[must_use]
+pub fn parse_cron(expression: &str) -> Option<Cron> {
+    Cron::from_str(expression).ok()
+}
+
+/// Palauttaa nykyhetkeen `<= now` osuvan viimeisimmän cron-esiintymän.
+#[must_use]
+pub fn cron_occurrence_at(expression: &str, now: Timestamp) -> Option<Timestamp> {
+    let cron = parse_cron(expression)?;
+    cron.find_previous_occurrence(&now, true).ok()
+}
+
+/// Onko cron-tehtävä erääntynyt annetulla nykyhetkellä.
+///
+/// `last_fired = None` → erääntynyt kun cron-esiintymä on löydettävissä.
+/// Muuten erääntynyt kun viimeisin cron-esiintymä `<= now` on uudempi kuin
+/// `last_fired`. Virheellinen lauseke → ei koskaan erääntynyt (fail-closed).
+#[must_use]
+pub fn is_due_cron(expression: &str, last_fired: Option<Timestamp>, now: Timestamp) -> bool {
+    let Some(occurrence) = cron_occurrence_at(expression, now) else {
+        return false;
+    };
+    match last_fired {
+        None => true,
+        Some(last) => last < occurrence,
+    }
+}
+
+/// Johtaa deterministisen idempotenssiavaimen yhdelle cron-laukaisulle.
+///
+/// Avain on `schedule-{task_id}-{occurrence_unix}`, jossa `occurrence_unix` on
+/// [`cron_occurrence_at`]:n palauttama esiintymä. Virheellinen lauseke palauttaa
+/// avaimen suffiksilla `invalid` (ei-erääntynyt tehtävä ei käytä sitä).
+#[must_use]
+pub fn cron_firing_key(task_id: ScheduledTaskId, expression: &str, now: Timestamp) -> String {
+    match cron_occurrence_at(expression, now) {
+        Some(occurrence) => format!("schedule-{task_id}-{}", occurrence.timestamp()),
+        None => format!("schedule-{task_id}-invalid"),
+    }
+}
+
 /// Onko tehtävä erääntynyt annetulla nykyhetkellä.
 ///
 /// `last_fired = None` tarkoittaa "ei koskaan laukennut" → erääntynyt heti.
@@ -101,11 +148,20 @@ pub fn decide(
     // ihmisen kill-switch ohittaa erääntymisen kokonaan. JA: vanhene-jos-ei-
     // ihmistä — jos idle-katto on asetettu ja ihmisaktiivisuudesta on kulunut
     // liikaa, tehtävä hiljenee (ei laukea), kunnes ihminen palaa.
+    let schedule_due = if let Some(ref cron) = task.cron_expression {
+        is_due_cron(cron, last_fired, now)
+    } else {
+        is_due(task.interval, last_fired, now)
+    };
     let due = task.enabled
         && !idle_expired(task.expire_after_idle, last_human_activity, now)
-        && is_due(task.interval, last_fired, now);
+        && schedule_due;
     let key = if due {
-        Some(firing_key(task.id, task.interval, now))
+        if let Some(ref cron) = task.cron_expression {
+            Some(cron_firing_key(task.id, cron, now))
+        } else {
+            Some(firing_key(task.id, task.interval, now))
+        }
     } else {
         None
     };
@@ -183,6 +239,10 @@ mod tests {
             interval,
             "being",
         )
+    }
+
+    fn task_with_cron(cron: &str) -> ScheduledTask {
+        task_with(Duration::seconds(120)).with_cron_expression(cron)
     }
 
     // (1) Puhdas erääntymislogiikka injektoidulla kellolla.
@@ -340,5 +400,61 @@ mod tests {
         assert!(decide(&task, None, Some(at(0)), at(0)).due);
         // Ihminen 200s sitten → idle ylittyi → ei laukea.
         assert!(!decide(&task, None, Some(at(0)), at(200)).due);
+    }
+
+    #[test]
+    fn parse_cron_accepts_standard_expression() {
+        assert!(parse_cron("0 * * * *").is_some());
+        assert!(parse_cron("not a cron").is_none());
+    }
+
+    #[test]
+    fn cron_fires_on_schedule_not_before_occurrence() {
+        // Joka tunti minuutilla 0 (UTC).
+        let cron = "0 * * * *";
+        let hour_start = at(3_600); // 01:00:00
+
+        // Ei koskaan laukennut → erääntynyt ensimmäisellä esiintymällä.
+        assert!(is_due_cron(cron, None, hour_start));
+
+        // Laukesi 01:00 → ei uudelleen 01:30 (sama tunti-ikkuna).
+        let last = Some(hour_start);
+        assert!(!is_due_cron(cron, last, at(3_600 + 1_800)));
+
+        // Seuraava tunnin alku 02:00 → erääntynyt taas.
+        assert!(is_due_cron(cron, last, at(7_200)));
+    }
+
+    #[test]
+    fn cron_firing_key_is_stable_within_occurrence() {
+        let task = task_with_cron("0 * * * *");
+        let key_a = cron_firing_key(task.id, "0 * * * *", at(3_650));
+        let key_b = cron_firing_key(task.id, "0 * * * *", at(3_699));
+        assert_eq!(key_a, key_b, "sama tunti-esiintymä → sama avain");
+        assert!(key_a.starts_with("schedule-"));
+
+        let next_hour = cron_firing_key(task.id, "0 * * * *", at(7_200));
+        assert_ne!(key_a, next_hour, "eri esiintymä → eri avain");
+    }
+
+    #[test]
+    fn decide_uses_cron_when_expression_set() {
+        let task = task_with_cron("* * * * *");
+        let decision = decide(&task, None, None, at(60));
+        assert!(decision.due);
+        let key = decision.key.expect("cron due has key");
+        assert_eq!(key, cron_firing_key(task.id, "* * * * *", at(60)));
+
+        // Intervalli 120s estäisi (90 < 0+120), mutta minuutticron laukeaa (viim. esiintymä 60s).
+        let interval_task = task_with(Duration::seconds(120));
+        assert!(!decide(&interval_task, Some(at(0)), None, at(90)).due);
+        assert!(decide(&task, Some(at(0)), None, at(90)).due);
+    }
+
+    #[test]
+    fn invalid_cron_expression_is_never_due() {
+        let task = task_with(Duration::seconds(60)).with_cron_expression("not valid");
+        assert!(!decide(&task, None, None, at(0)).due);
+        assert!(decide(&task, None, None, at(0)).key.is_none());
     }
 }

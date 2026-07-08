@@ -51,9 +51,9 @@ use crate::pending_store::{
 use crate::policy::{ActionRisk, SkillPermission};
 use crate::proof::ProofBundle;
 use crate::skills::{
-    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, FileWriteAllowlisted,
-    FileWriteConfig, FsReadAllowlisted, FsReadConfig, GithubIssueDraftMock, Pipeline,
-    ResearchSkill, Skill, WebFetchSkill, WebSearchSkill,
+    DiscordThreadSummaryMock, EmailTriageMock, FilePatchApply, FileWriteAllowlisted,
+    FileWriteConfig, FsReadAllowlisted, FsReadConfig, GithubIssueSkill, Pipeline, ResearchSkill,
+    ScheduleTaskSkill, ShellExec, ShellExecConfig, Skill, WebFetchSkill, WebSearchSkill,
 };
 use crate::task::{ActionTask, DurableTaskQueue, TaskQueue, TaskStatus};
 
@@ -547,6 +547,20 @@ impl ActionRuntime {
     /// rekisteröidään tyhjällä allowlistilla (fail-closed), kuten
     /// [`ActionRuntime::with_default_skills`]:ssä.
     ///
+    /// ## Kolmannen osapuolen taidot ja wasmtime-sandbox
+    ///
+    /// Nämä oletustaidot ovat sisäänrakennettuja Layer A -referenssejä (puhdas
+    /// Rust, ei allekirjoitusta). **Kolmannen osapuolen taidot** tulisi ajaa
+    /// [`familyclaw-sandbox`]:n Wasmtime-hiekkalaatikossa (fuel-katto,
+    /// host-import-esto, capability-grantit) — ks.
+    /// [`docs/SECURITY_MODEL.md`](../../docs/SECURITY_MODEL.md) kerros 6.
+    ///
+    /// Runtime kokooja [`build_family`] (`familyclaw-runtime`) kytkee sandboxin
+    /// agenttiin kun `FAMILYCLAW_SANDBOX_SKILLS=1` ja
+    /// `familyclaw-sandbox::default_sandbox()` on käytettävissä. Ulkoiset
+    /// manifestit vaativat lisäksi Ed25519-allekirjoituksen
+    /// (`FAMILYCLAW_SKILL_REGISTRY`).
+    ///
     /// # Errors
     /// Palauttaa manifestin validoinnin tai duplikaattirekisteröinnin virheen,
     /// jos jokin sisäänrakennettu taito on virheellinen (ei pitäisi tapahtua).
@@ -581,7 +595,7 @@ impl ActionRuntime {
         &mut self,
         fs_read_config: Option<FsReadConfig>,
     ) -> Result<()> {
-        self.register_default_skills_with_configs(fs_read_config, None)
+        self.register_default_skills_with_configs(fs_read_config, None, None)
     }
 
     /// Rekisteröi oletustaidot ja antaa kutsujan **konfiguroida sekä
@@ -611,11 +625,16 @@ impl ActionRuntime {
         &mut self,
         fs_read_config: Option<FsReadConfig>,
         file_write_config: Option<FileWriteConfig>,
+        shell_exec_config: Option<ShellExecConfig>,
     ) -> Result<()> {
         self.register_skill(EmailTriageMock::new())?;
-        self.register_skill(GithubIssueDraftMock::new())?;
+        self.register_skill(GithubIssueSkill::new())?;
         self.register_skill(DiscordThreadSummaryMock::new())?;
-        self.register_skill(FilePatchMock::new())?;
+        let file_patch = match file_write_config.clone() {
+            Some(config) => FilePatchApply::with_config(config),
+            None => FilePatchApply::new(),
+        };
+        self.register_skill(file_patch)?;
         // Lippulaiva-tutkimustaito: tyhjä allowlist (fail-closed) oletuksena, tai
         // kutsujan antama KERROS B -allowlist jolloin luku tutkii oikeasti.
         let fs_read = match fs_read_config {
@@ -639,6 +658,13 @@ impl ActionRuntime {
             None => FileWriteAllowlisted::new(),
         };
         self.register_skill(file_write)?;
+        self.register_skill(ScheduleTaskSkill::new())?;
+        // shell_exec: Hermes-tyylinen kovaa esto + tilat manual/smart/off.
+        let shell_exec = match shell_exec_config {
+            Some(config) => ShellExec::with_config(config),
+            None => ShellExec::new(),
+        };
+        self.register_skill(shell_exec)?;
         Ok(())
     }
 
@@ -1314,7 +1340,7 @@ mod tests {
     fn default_skills_are_listed_without_secrets() {
         let runtime = ActionRuntime::with_default_skills().expect("default skills");
         let skills = runtime.list_skills();
-        assert_eq!(skills.len(), 9, "all nine default skills registered");
+        assert_eq!(skills.len(), 11, "all eleven default skills registered");
 
         // Nimet aakkostettu → deterministinen järjestys.
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
@@ -1357,8 +1383,8 @@ mod tests {
         let names: Vec<String> = runtime.list_skills().into_iter().map(|s| s.name).collect();
         assert_eq!(
             names.len(),
-            9,
-            "all nine default skills registered exactly once"
+            11,
+            "all eleven default skills registered exactly once"
         );
         assert!(names.iter().any(|n| n == "fs_read_allowlisted"));
         assert!(names.iter().any(|n| n == "web_fetch"));
@@ -1408,7 +1434,7 @@ mod tests {
         let fw_config = FileWriteConfig::new().allow_root(&canonical);
         let mut runtime = ActionRuntime::new();
         runtime
-            .register_default_skills_with_configs(None, Some(fw_config))
+            .register_default_skills_with_configs(None, Some(fw_config), None)
             .expect("register with file_write allowlist");
 
         // file_write on WriteLocal + RequireApproval → allowlistattu kirjoitus ajaa heti.
@@ -1519,7 +1545,7 @@ mod tests {
     fn tool_definitions_mirror_skills_sorted_without_secrets() {
         let runtime = ActionRuntime::with_default_skills().expect("default skills");
         let tools = runtime.tool_definitions();
-        assert_eq!(tools.len(), 9, "one descriptor per registered skill");
+        assert_eq!(tools.len(), 11, "one descriptor per registered skill");
 
         // Sama vakautettu nimijärjestys kuin list_skills.
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -1970,6 +1996,8 @@ mod tests {
                 input_hint: None,
                 output_hint: None,
                 input_schema: crate::manifest::default_input_schema(),
+                publisher: None,
+                signature: None,
             }
         }
     }
@@ -2054,6 +2082,8 @@ mod tests {
                 input_hint: None,
                 output_hint: None,
                 input_schema: crate::manifest::default_input_schema(),
+                publisher: None,
+                signature: None,
             }
         }
     }

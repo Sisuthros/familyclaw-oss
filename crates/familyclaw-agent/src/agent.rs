@@ -18,7 +18,11 @@
 //! profiilihakemistosta. Esimerkit käyttävät geneerisiä nimiä.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use futures_util::StreamExt;
 
 use familyclaw_actions::{
     ActionId, ActionRuntime, ActionTaskId, ApprovalId, AuditCollector, AuditKind, ExecAuditEvent,
@@ -27,7 +31,7 @@ use familyclaw_actions::{
 use familyclaw_bus::{
     BeingId, BeingInfo, BusHandle, BusMessage, MessageOrigin, ResonanceMessage, TaskEventKind,
 };
-use familyclaw_channels::OutboundMessage;
+use familyclaw_channels::{OutboundKind, OutboundMessage};
 use familyclaw_core::time::Timestamp;
 use familyclaw_core::{time, AgentConfig, FamilyClawError, Result};
 use familyclaw_durable::{DurableContext, Journal};
@@ -46,6 +50,7 @@ use crate::llm::{LlmConfig, LlmMessage, ToolCall, ToolDefinition};
 use crate::llm_chain::LlmFailover;
 use crate::resumable::{InMemoryResumableStore, ResumableTurn, ResumableTurnStore};
 use crate::soul::Soul;
+use crate::watchdog;
 use familyclaw_sandbox::{CodeSandbox, SandboxOutput, SandboxRequest};
 
 /// Type-erased memory store for trait-object-based agents.
@@ -354,6 +359,12 @@ pub struct Agent {
     bus: BusHandle,
     /// Kuinka monta vuoroa on käsitelty (durable-askelten nimien sekvensointiin).
     turn_counter: u64,
+    /// Turn-watchdog: lähetettiinkö käyttäjälle vastaus (Message/Progress) tällä vuorolla.
+    turn_user_reply_sent: AtomicBool,
+    /// Turn-watchdog: vastaus tarkoituksella estetty (governor Hesitate/Reflect, pulse).
+    turn_reply_suppressed: AtomicBool,
+    /// Aktiivinen typing-heartbeat; peruutetaan kun vuoro päättyy tai watchdog katkaisee.
+    typing_abort: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
     /// Per-keskustelu lyhytmuisti LLM-kontekstiin (liukuva ikkuna, enintään
     /// [`HISTORY_MAX_MESSAGES`] viestiä per avain). Avain rakennetaan
     /// [`Agent::conversation_key`]:llä viestin alkuperästä (`channel_id` +
@@ -535,6 +546,9 @@ impl Agent {
             durable,
             bus,
             turn_counter: 0,
+            turn_user_reply_sent: AtomicBool::new(false),
+            turn_reply_suppressed: AtomicBool::new(false),
+            typing_abort: std::sync::Mutex::new(None),
             history: HashMap::new(),
             llm,
             sandbox,
@@ -1091,10 +1105,9 @@ impl Agent {
             // ei työkaluja. Sama käytös kuin ennen tool-loopia → teksti Reply:nä.
             None => {
                 let messages = build_message_stack(system_prompt, &history, query);
-                let text = llm
-                    .complete(&messages)
-                    .await
-                    .map_err(|e| FamilyClawError::llm(e.to_string()))?;
+                let text = self
+                    .llm_complete_with_progress(llm, &messages, origin)
+                    .await?;
                 Ok(ThinkOutcome::Reply(text))
             }
             // Tool-loop-polku: anna mallille työkalut ja kierrä kunnes se
@@ -1220,6 +1233,60 @@ impl Agent {
                 }
             }
         }
+    }
+
+    /// `FAMILYCLAW_STREAMING=1` → LLM-vastaus striimataan ja progress päivitetään ~2 s välein.
+    fn llm_streaming_enabled() -> bool {
+        std::env::var("FAMILYCLAW_STREAMING")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    }
+
+    /// Yksi LLM-kutsu; striimauksella lähettää [`OutboundKind::Progress`]-päivityksiä.
+    async fn llm_complete_with_progress(
+        &self,
+        llm: &LlmFailover,
+        messages: &[LlmMessage],
+        origin: Option<&familyclaw_bus::MessageOrigin>,
+    ) -> Result<String> {
+        if !Self::llm_streaming_enabled() {
+            return llm
+                .complete(messages)
+                .await
+                .map_err(|e| FamilyClawError::llm(e.to_string()));
+        }
+        let target = origin
+            .map(familyclaw_bus::MessageOrigin::reply_target)
+            .or(self.reply_target.as_deref());
+        let mut stream = llm
+            .complete_stream(messages)
+            .await
+            .map_err(|e| FamilyClawError::llm(e.to_string()))?;
+        let mut full = String::new();
+        let emit_progress = should_emit_public_progress(origin);
+        let mut last_progress = Instant::now();
+        let frames = ["▱▱▱", "▰▱▱", "▰▰▱", "▰▰▰"];
+        let mut frame_idx = 0usize;
+        let mut progress_gate = ProgressGate::new();
+        while let Some(chunk) = stream.next().await {
+            let delta = chunk.map_err(|e| FamilyClawError::llm(e.to_string()))?;
+            full.push_str(&delta);
+            if emit_progress
+                && last_progress.elapsed() >= PROGRESS_MIN_INTERVAL
+                && progress_gate.allow()
+            {
+                if let (Some(sink), Some(target)) = (&self.reply_sink, target) {
+                    let body = format!("↳ {} Drafting response…", frames[frame_idx]);
+                    if let Ok(msg) = OutboundMessage::progress(target, body) {
+                        let _ = sink.send(msg);
+                        progress_gate.record();
+                    }
+                    frame_idx = (frame_idx + 1) % frames.len();
+                }
+                last_progress = Instant::now();
+            }
+        }
+        Ok(full)
     }
 
     /// Rakentaa keskustelu-avaimen viestin alkuperästä lyhytmuistia varten.
@@ -1386,9 +1453,13 @@ impl Agent {
             warn!("recall failed in think (non-fatal): {e}");
             Vec::new()
         });
+        let memories = crate::identity::filter_memories_for_operator(memories, origin, |hit| {
+            hit.memory.content.as_str()
+        });
 
         // System prompt: sielun ydin + muistit kontekstina.
         let mut system_prompt = self.soul.essence.clone();
+        system_prompt.push_str(&crate::identity::identity_guard_prompt(origin));
         if !memories.is_empty() {
             system_prompt.push_str("\n\n[RELEVANT MEMORIES FROM ETERNAL THREAD]:\n");
             for (i, mem) in memories.iter().enumerate() {
@@ -1461,6 +1532,7 @@ impl Agent {
         budget: u32,
         now: Timestamp,
         turn_id: ActionId,
+        origin: Option<&MessageOrigin>,
     ) -> Result<ToolLoopOutcome> {
         // Phase 2: emittoi tool-call-mittarin jos sinkki on asennettu. Kutsutaan
         // jokaisessa dispatch-kohdassa `!replaying`-vartioituna (replay ei saa
@@ -1478,6 +1550,11 @@ impl Agent {
         // nollaudu per kierros), jotta jokainen askel saa uniikin,
         // deterministisen nimen.
         let mut dispatch_index = dispatch_base;
+        let emit_progress = should_emit_public_progress(origin);
+        let mut last_progress_label: Option<String> = None;
+        let mut progress_gate = ProgressGate::new();
+        let mut tool_use_counts: HashMap<String, u32> = HashMap::new();
+        let mut fs_read_count = 0u32;
         for iteration in 0..budget {
             // D1: kääri **myös LLM-kutsu** durable-askeleeseen. Ilman tätä replay
             // kutsuisi LLM:ää uudelleen (ei-deterministinen + verkkokutsu), ja
@@ -1533,6 +1610,31 @@ impl Agent {
             );
 
             for call in tool_calls {
+                let tool_key = call.name.clone();
+                let per_tool = tool_use_counts.entry(tool_key.clone()).or_insert(0);
+                *per_tool += 1;
+                let is_fs_read = tool_key.contains("fs_read");
+                if is_fs_read {
+                    fs_read_count += 1;
+                }
+                if *per_tool > TOOL_BUDGET_PER_NAME
+                    || (is_fs_read && fs_read_count > TOOL_BUDGET_FS_READ)
+                {
+                    emit_tool(durable.is_replaying());
+                    record_turn_audit_into(
+                        turn_audit,
+                        turn_id,
+                        AuditKind::ToolDispatched,
+                        now,
+                        format!("tool '{}' skipped: per-turn budget exceeded", call.name),
+                    );
+                    messages.push(LlmMessage::tool_result(
+                        call.id,
+                        "SYSTEM: Tool budget exceeded for this turn. Reply to the operator now with your best answer — do not call more tools.",
+                    ));
+                    continue;
+                }
+
                 let Some(skill_id) = actions.lock().await.map_name_to_skill(&call.name) else {
                     emit_tool(durable.is_replaying());
                     record_turn_audit_into(
@@ -1558,11 +1660,19 @@ impl Agent {
                 let dispatch_step = format!("turn-{turn}-dispatch-{dispatch_index}");
                 dispatch_index += 1;
                 let replaying = durable.is_replaying();
-                if !replaying {
+                if emit_progress && !replaying {
                     if let (Some(sink), Some(target)) = (&progress_sink, &progress_target) {
                         let label = tool_progress_label(&call.name);
-                        if let Ok(msg) = OutboundMessage::progress(target, label) {
-                            let _ = sink.send(msg);
+                        let should_send = last_progress_label.as_deref() != Some(label.as_str())
+                            && progress_gate.allow();
+                        if should_send {
+                            let step = dispatch_index;
+                            let body = format!("↳ Step {step} · {label}");
+                            if let Ok(msg) = OutboundMessage::progress(target, body) {
+                                let _ = sink.send(msg);
+                                progress_gate.record();
+                            }
+                            last_progress_label = Some(label);
                         }
                     }
                 }
@@ -1797,8 +1907,16 @@ impl Agent {
         let Some(llm) = self.llm.as_ref() else {
             return Ok((None, None));
         };
-        let progress_sink = self.reply_sink.clone();
-        let progress_target = self.reply_target_for_origin(origin);
+        let progress_sink = if should_emit_public_progress(origin) {
+            self.reply_sink.clone()
+        } else {
+            None
+        };
+        let progress_target = if should_emit_public_progress(origin) {
+            self.reply_target_for_origin(origin)
+        } else {
+            None
+        };
         let outcome = Self::drive_tool_loop_durable(
             llm,
             &actions,
@@ -1816,6 +1934,7 @@ impl Agent {
             max_iterations,
             now,
             turn_id,
+            origin,
         )
         .await?;
 
@@ -2740,6 +2859,8 @@ impl Agent {
         origin: Option<&familyclaw_bus::MessageOrigin>,
     ) -> Result<TurnOutcome> {
         let turn = self.turn_counter;
+        self.turn_user_reply_sent.store(false, Ordering::Relaxed);
+        self.turn_reply_suppressed.store(false, Ordering::Relaxed);
         let step_name = format!("turn-{turn}");
 
         // 1. Deterministinen, sivuvaikutukseton päättely durable-askeleessa:
@@ -2818,13 +2939,35 @@ impl Agent {
             let gov = EmotionActionGovernor::new(g);
             gov.decide(&self.emotion) == ActionDecision::Hesitate
         });
+        if governor_filtered_pulse || governor_hesitate {
+            self.turn_reply_suppressed.store(true, Ordering::Relaxed);
+        }
         let will_think = self.llm.is_some() && !governor_filtered_pulse && !governor_hesitate;
+        // Operator diagnostics fast path + brief ping fast path:
+        // skip LLM when we can answer deterministically.
+        let brief_ping_response = if will_think && !self.durable.is_replaying() {
+            let diag = crate::identity::operator_diagnostic_reply(message, origin);
+            if diag.is_some() {
+                diag
+            } else {
+                crate::identity::brief_ping_reply(&self.config.name, message)
+            }
+        } else {
+            None
+        };
+        let will_think = will_think && brief_ping_response.is_none();
         let typing_abort = if !self.durable.is_replaying() && will_think {
             self.notify_turn_started(origin);
             self.spawn_typing_heartbeat(origin)
         } else {
             None
         };
+        if let Ok(mut slot) = self.typing_abort.lock() {
+            if let Some(old) = slot.take() {
+                old.abort();
+            }
+            *slot = typing_abort;
+        }
         // `thought_response` = mallin tekstivastaus (jos `ThinkOutcome::Reply`),
         // `suspend` = vuoron keskeytys hyväksyntää varten (jos
         // `ThinkOutcome::Suspended`). Ne ovat toisensa poissulkevia: yksi vuoro
@@ -2832,7 +2975,16 @@ impl Agent {
         // kirjataan vuoron durable-tilaan resumea varten (id + redaktoitu
         // tiivistelmä), eikä koskaan reititetä käyttäjälle.
         let mut suspend: Option<(ApprovalId, String)> = None;
-        let thought_response: Option<String> = if self.llm.is_none() {
+        let thought_response: Option<String> = if let Some(ref brief) = brief_ping_response {
+            if !self.durable.is_replaying() {
+                let think_step = format!("{step_name}-think");
+                let _ = self.durable.step(&think_step, {
+                    let brief = brief.clone();
+                    move || Ok(brief)
+                });
+            }
+            brief_ping_response
+        } else if self.llm.is_none() {
             None
         } else if governor_filtered_pulse {
             // Phase 1: EmotionPulse = "verta", ei ajatella. Kirjaa lokiin
@@ -2933,9 +3085,7 @@ impl Agent {
             }
         };
 
-        if let Some(handle) = typing_abort {
-            handle.abort();
-        }
+        self.clear_typing_heartbeat();
 
         // 5a½. Lyhytmuisti: liitä onnistunut vaihto (käyttäjä → agentti) tämän
         //      keskustelun historiaan, jotta SEURAAVA vuoro näkee jatkumon.
@@ -2990,6 +3140,7 @@ impl Agent {
                         agent = self.config.name,
                         "governor: Hesitate/Reflect decision blocks reply (silenced)"
                     );
+                    self.turn_reply_suppressed.store(true, Ordering::Relaxed);
                     Some(())
                 }
                 _ => None,
@@ -3097,6 +3248,12 @@ impl Agent {
         // Ilman sessiota (None) vain `from:`-tag → jaettu scope (nykyinen
         // käytös, taaksepäin-yhteensopiva).
         let mut tags = vec![format!("from:{sender}")];
+        if let Some(origin) = origin {
+            tags.push(crate::identity::peer_tag(&origin.sender));
+            if crate::identity::is_operator_origin(Some(origin)) {
+                tags.push(crate::identity::scope_operator_tag().to_string());
+            }
+        }
         if let Some(tag) = self.session_tag_for_recall(origin) {
             tags.push(tag);
         } else if let Some(origin) = self.session.as_ref() {
@@ -3186,6 +3343,40 @@ impl Agent {
             .publish(self.being_id, BusMessage::emotion_pulse(self.emotion))
     }
 
+    /// Pakottaa watchdog-vastauksen kanavalle kun vuoro jää jumiin tai epäonnistuu.
+    pub fn force_watchdog_reply(&self, origin: Option<&MessageOrigin>, body: &str) -> Result<()> {
+        let Some(target) = self.reply_target_for_origin(origin) else {
+            return Ok(());
+        };
+        let reply = OutboundMessage::new(target, body)
+            .map_err(|e| FamilyClawError::bus(format!("watchdog reply build failed: {e}")))?;
+        self.route_reply(reply)
+    }
+
+    /// Turn-watchdog: lähetä hiljaisuusvaroitus jos käyttäjäviesti ei tuottanut vastausta.
+    pub fn enforce_watchdog_after_turn(
+        &self,
+        message: &BusMessage,
+        origin: Option<&MessageOrigin>,
+    ) -> Result<()> {
+        if !watchdog::message_expects_user_reply(message) {
+            return Ok(());
+        }
+        if self.turn_reply_suppressed.load(Ordering::Relaxed)
+            || self.turn_user_reply_sent.load(Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        if self.reply_target_for_origin(origin).is_none() {
+            return Ok(());
+        }
+        warn!(
+            agent = self.config.name,
+            "turn-watchdog: user message produced no reply — sending fallback"
+        );
+        self.force_watchdog_reply(origin, watchdog::WATCHDOG_SILENCE_MSG)
+    }
+
     /// Julkaisee tekstiviestin busiin agentin puolesta.
     ///
     /// # Errors
@@ -3209,6 +3400,9 @@ impl Agent {
     /// [`FamilyClawError::Bus`] jos sink on asennettu mutta vastaanottopää on
     /// suljettu (gateway lopetti) — vastausta ei voitu toimittaa.
     pub fn route_reply(&self, msg: OutboundMessage) -> Result<()> {
+        if matches!(msg.kind, OutboundKind::Message) {
+            self.turn_user_reply_sent.store(true, Ordering::Relaxed);
+        }
         match self.reply_sink.as_ref() {
             Some(sink) => sink
                 .send(msg)
@@ -3226,14 +3420,25 @@ impl Agent {
             .or_else(|| self.reply_target.clone())
     }
 
+    /// Peruuttaa aktiivisen typing-heartbeatin (vuoron loppu tai watchdog).
+    fn clear_typing_heartbeat(&self) {
+        if let Ok(mut slot) = self.typing_abort.lock() {
+            if let Some(handle) = slot.take() {
+                handle.abort();
+            }
+        }
+    }
+
     /// Lähettää heti ack-viestin + typing-indikaattorin pitkän vuoron alkuun.
     fn notify_turn_started(&self, origin: Option<&MessageOrigin>) {
         let Some(target) = self.reply_target_for_origin(origin) else {
             return;
         };
-        if let Ok(ack) = OutboundMessage::progress(&target, "Selvä, tutkin… ✦") {
-            if let Err(e) = self.route_reply(ack) {
-                warn!("turn-start ack failed (non-fatal): {e}");
+        if should_emit_public_progress(origin) {
+            if let Ok(ack) = OutboundMessage::progress(&target, "Working on it… ✦") {
+                if let Err(e) = self.route_reply(ack) {
+                    warn!("turn-start ack failed (non-fatal): {e}");
+                }
             }
         }
         if let Ok(typing) = OutboundMessage::typing(&target) {
@@ -3346,16 +3551,58 @@ fn recovery_fallback_reply() -> String {
 /// Geneerinen väliraportti työkalun nimestä (OpenClaw/Hermes-tyyli).
 fn tool_progress_label(tool_name: &str) -> String {
     let action = match tool_name {
-        n if n.contains("file_write") => "Kirjoitan tiedostoa…",
-        n if n.contains("file_patch") => "Muokkaan tiedostoa…",
-        n if n.contains("fs_read") => "Luen tiedostoa…",
-        n if n.contains("web_search") || n.contains("research") => "Haen tietoa verkosta…",
-        n if n.contains("web_fetch") => "Haen sivua verkosta…",
-        n if n.contains("github") => "Käytän GitHub-työkalua…",
-        n if n.contains("email") || n.contains("discord") => "Käytän integraatiota…",
-        _ => "Käytän työkalua…",
+        n if n.contains("file_write") => "Writing files",
+        n if n.contains("file_patch") => "Applying patch",
+        n if n.contains("fs_read") => "Reading files",
+        n if n.contains("web_search") || n.contains("research") => "Searching the web",
+        n if n.contains("web_fetch") => "Fetching a page",
+        n if n.contains("github") => "Working with GitHub",
+        n if n.contains("email") || n.contains("discord") => "Calling an integration",
+        _ => "Running a tool",
     };
-    format!("↳ {action}")
+    action.to_string()
+}
+
+/// Julkiset progress-viestit pidetään päällä, jotta käyttäjä näkee etenemisen.
+fn should_emit_public_progress(origin: Option<&MessageOrigin>) -> bool {
+    let _ = origin;
+    true
+}
+
+const MAX_PROGRESS_PER_TURN: u32 = 5;
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(4);
+const TOOL_BUDGET_PER_NAME: u32 = 3;
+const TOOL_BUDGET_FS_READ: u32 = 8;
+
+struct ProgressGate {
+    sent: u32,
+    last_at: Option<Instant>,
+}
+
+impl ProgressGate {
+    fn new() -> Self {
+        Self {
+            sent: 0,
+            last_at: None,
+        }
+    }
+
+    fn allow(&self) -> bool {
+        if self.sent >= MAX_PROGRESS_PER_TURN {
+            return false;
+        }
+        if let Some(last) = self.last_at {
+            if Instant::now().duration_since(last) < PROGRESS_MIN_INTERVAL {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn record(&mut self) {
+        self.sent += 1;
+        self.last_at = Some(Instant::now());
+    }
 }
 
 /// Käyttäjälle näkyvä ilmoitus kun vuoro jää odottamaan harvinaista hyväksyntää.
@@ -3711,22 +3958,46 @@ impl Actor for AgentActor {
         // F2: per-viesti-alkuperä kirjekuoresta → reply-kohde johdetaan per
         // viesti (origin.reply_target()), fallback staattiseen kohteeseen.
         let origin = envelope.origin.clone();
-        match agent
-            .handle_turn_with_origin(sender, &envelope.payload, origin.as_ref())
-            .await
-        {
-            Ok(outcome) => {
+        let payload = envelope.payload.clone();
+        let watchdog_secs = watchdog::turn_watchdog_secs();
+        let turn_result = tokio::time::timeout(
+            std::time::Duration::from_secs(watchdog_secs),
+            agent.handle_turn_with_origin(sender, &payload, origin.as_ref()),
+        )
+        .await;
+
+        match turn_result {
+            Ok(Ok(outcome)) => {
                 debug!(
                     agent = agent.name(),
                     turn = outcome.turn,
                     remembered = outcome.remembered,
                     "vuoro käsitelty"
                 );
+                if let Err(err) = agent.enforce_watchdog_after_turn(&payload, origin.as_ref()) {
+                    warn!(agent = agent.name(), error = %err, "turn-watchdog silence fallback failed");
+                }
             }
-            Err(err) => {
-                // Yhden vuoron epäonnistuminen ei saa kaataa olentoa — loki ja
-                // jatka (supervision pitää busin elossa joka tapauksessa).
+            Ok(Err(err)) => {
                 warn!(agent = agent.name(), error = %err, "vuoron käsittely epäonnistui");
+                if let Err(e) =
+                    agent.force_watchdog_reply(origin.as_ref(), watchdog::WATCHDOG_ERROR_MSG)
+                {
+                    warn!(agent = agent.name(), error = %e, "turn-watchdog error reply failed");
+                }
+            }
+            Err(_) => {
+                agent.clear_typing_heartbeat();
+                warn!(
+                    agent = agent.name(),
+                    secs = watchdog_secs,
+                    "turn-watchdog: vuoro ylitti aikarajan"
+                );
+                if let Err(e) =
+                    agent.force_watchdog_reply(origin.as_ref(), watchdog::WATCHDOG_TIMEOUT_MSG)
+                {
+                    warn!(agent = agent.name(), error = %e, "turn-watchdog timeout reply failed");
+                }
             }
         }
         Ok(())
@@ -4814,6 +5085,8 @@ mod tests {
                 input_hint: None,
                 output_hint: None,
                 input_schema: familyclaw_actions::manifest::default_input_schema(),
+                publisher: None,
+                signature: None,
             }
         }
     }
@@ -4868,6 +5141,8 @@ mod tests {
                 input_hint: None,
                 output_hint: None,
                 input_schema: familyclaw_actions::manifest::default_input_schema(),
+                publisher: None,
+                signature: None,
             }
         }
     }
@@ -4932,6 +5207,8 @@ mod tests {
                 input_hint: None,
                 output_hint: None,
                 input_schema: familyclaw_actions::manifest::default_input_schema(),
+                publisher: None,
+                signature: None,
             }
         }
     }
@@ -5213,7 +5490,7 @@ mod tests {
             .try_recv()
             .expect("pitkän vuoron pitää alkaa ack-viestillä");
         assert!(
-            ack.body.contains("tutkin"),
+            ack.body.contains("Working on it"),
             "ack-viestin pitää kertoa työstä, sai: {}",
             ack.body
         );
@@ -5224,9 +5501,8 @@ mod tests {
                 break;
             }
         }
-        let reply_body = suspend_body.expect(
-            "suspended-vuoron pitää ilmoittaa käyttäjälle ettei jäädä hiljaisuuteen",
-        );
+        let reply_body = suspend_body
+            .expect("suspended-vuoron pitää ilmoittaa käyttäjälle ettei jäädä hiljaisuuteen");
         assert!(
             reply_body.contains("turvapysäytys") || reply_body.contains("hyväksyntää"),
             "suspend-ilmoituksen pitää kertoa odotuksesta, sai: {reply_body}"
@@ -6608,6 +6884,8 @@ mod tests {
                 input_hint: None,
                 output_hint: None,
                 input_schema: familyclaw_actions::manifest::default_input_schema(),
+                publisher: None,
+                signature: None,
             }
         }
     }

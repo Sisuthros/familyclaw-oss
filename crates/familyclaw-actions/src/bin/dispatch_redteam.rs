@@ -202,6 +202,8 @@ impl Skill for CountingExecutor {
             input_hint: None,
             output_hint: None,
             input_schema: default_input_schema(),
+            publisher: None,
+            signature: None,
         }
     }
 }
@@ -281,6 +283,8 @@ impl Skill for ApprovalCountingExecutor {
             input_hint: None,
             output_hint: None,
             input_schema: default_input_schema(),
+            publisher: None,
+            signature: None,
         }
     }
 }

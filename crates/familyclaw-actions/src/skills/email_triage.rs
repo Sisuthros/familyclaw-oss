@@ -184,6 +184,8 @@ impl Skill for EmailTriageMock {
                 "required": ["emails"],
                 "additionalProperties": false
             }),
+            publisher: None,
+            signature: None,
         }
     }
 }

@@ -553,6 +553,8 @@ impl Skill for WebSearchSkill {
                 "required": ["query"],
                 "additionalProperties": false
             }),
+            publisher: None,
+            signature: None,
         }
     }
 }

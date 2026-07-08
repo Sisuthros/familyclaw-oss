@@ -1,0 +1,35 @@
+[package]
+name = "familyclaw-mcp"
+description = "MCP client transport and ActionRuntime skill bridge (KERROS A, OSS)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["http"]
+http = ["dep:reqwest"]
+
+[dependencies]
+familyclaw-actions = { workspace = true }
+familyclaw-core = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "process", "rt-multi-thread", "macros", "sync"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true, optional = true }
+
+[[bin]]
+name = "mock-mcp-stdio-server"
+path = "src/bin/mock_mcp_stdio_server.rs"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }

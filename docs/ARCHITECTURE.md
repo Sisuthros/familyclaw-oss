@@ -172,3 +172,14 @@ cargo run -p familyclaw-agent --bin familyclaw   # the living-seed demo
 The `wasmtime` backend in `familyclaw-sandbox` is feature-gated, so the default
 build needs no WASM toolchain; the security/capability logic is testable without
 it via `NoopSandbox`.
+
+---
+
+## 7. Related documents
+
+| Document | Topic |
+|----------|-------|
+| [LAYER_BOUNDARY.md](./LAYER_BOUNDARY.md) | Layer A / Layer B isolation |
+| [SECURITY_MODEL.md](./SECURITY_MODEL.md) | Eight defense layers |
+| [RUFLO_MAPPING.md](./RUFLO_MAPPING.md) | Ruflo vs FamilyClaw — what to borrow vs reject |
+| [COMPARISON.md](./COMPARISON.md) | Continuity benchmark vs baseline |

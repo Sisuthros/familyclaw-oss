@@ -29,6 +29,7 @@
 //! tuloste merkitään luotetuksi. Näin ulkopuolelta tuotu sisältö ei pese
 //! itseään puhtaaksi.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -54,12 +55,19 @@ const SUMMARY_MAX_BYTES: usize = 120;
 /// Hakemistolistan enimmäismäärä merkintöjä yhteenvedossa.
 const DIR_LIST_MAX_ENTRIES: usize = 64;
 
+/// Täyden sisällön enimmäiskoko tavuina tool-tuloksessa (`read_full_content`).
+const FULL_CONTENT_MAX_BYTES: usize = 64 * 1024;
+
 /// Taidon syöte: luettavan tiedoston polku.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FsReadInput {
     /// Luettavan tiedoston polku (suhteellinen tai absoluuttinen). Polku
     /// kanonisoidaan ja sen on pysyttävä allowlistatun juuren alla.
     pub path: String,
+    /// Kun `true`, palauttaa myös `content`-kentän (typistettynä rajaan asti).
+    /// Oletus `false` — vain tiiviste + yhteenveto todisteeseen.
+    #[serde(default)]
+    pub read_full_content: bool,
 }
 
 /// Taidon tulos: todistepaketin ydin (tiiviste + koko + yhteenveto).
@@ -254,17 +262,13 @@ impl FsReadAllowlisted {
             entries.push(entry);
         }
 
-        entries.sort_by_key(|e| e.file_name());
+        entries.sort_by_key(tokio::fs::DirEntry::file_name);
 
         let total = entries.len();
         let mut names = Vec::new();
         for e in entries.into_iter().take(DIR_LIST_MAX_ENTRIES) {
             let name = e.file_name().to_string_lossy().into_owned();
-            let is_dir = e
-                .file_type()
-                .await
-                .map(|ft| ft.is_dir())
-                .unwrap_or(false);
+            let is_dir = e.file_type().await.is_ok_and(|ft| ft.is_dir());
             names.push(if is_dir { format!("{name}/") } else { name });
         }
 
@@ -274,7 +278,7 @@ impl FsReadAllowlisted {
             format!("dir: {}", names.join(", "))
         };
         if total > DIR_LIST_MAX_ENTRIES {
-            summary.push_str(&format!(" … (+{} lisää)", total - DIR_LIST_MAX_ENTRIES));
+            let _ = write!(summary, " … (+{} lisää)", total - DIR_LIST_MAX_ENTRIES);
         }
         truncate_utf8(&mut summary, SUMMARY_MAX_BYTES * 4);
 
@@ -384,13 +388,24 @@ impl ActionExecutor for FsReadAllowlisted {
             }
         };
 
-        let trusted = out.trusted;
-        let output: Value = json!({
+        let mut output: Value = json!({
             "path_hash": out.path_hash,
             "size": out.size,
             "summary": out.summary,
             "trusted": out.trusted,
         });
+
+        if input.read_full_content && !canonical.is_dir() {
+            if let Ok(bytes) = tokio::fs::read(&canonical).await {
+                let mut content = String::from_utf8_lossy(&bytes).into_owned();
+                truncate_utf8(&mut content, FULL_CONTENT_MAX_BYTES);
+                if let Some(obj) = output.as_object_mut() {
+                    obj.insert("content".to_string(), json!(content));
+                }
+            }
+        }
+
+        let trusted = out.trusted;
         let result = ActionResult::success(
             if out.summary.starts_with("dir:") || out.summary == "[tyhjä hakemisto]" {
                 format!("listed {} entries in allowlisted directory", out.size)
@@ -418,24 +433,31 @@ impl Skill for FsReadAllowlisted {
             name: "fs_read_allowlisted".to_string(),
             version: "1.0.0".to_string(),
             description: "Lukee paikallisen tiedoston tai listaa hakemiston vain allowlistatun \
-                 juuren alta (kanonisoitu polku, ei verkkoa); todiste = tiiviste + koko + yhteenveto."
+                 juuren alta (kanonisoitu polku, ei verkkoa). Oletus: tiiviste + yhteenveto; \
+                 `read_full_content: true` palauttaa myös sisällön (max 64 KiB)."
                 .to_string(),
             permissions: vec![SkillPermission::ReadFiles],
             risk: ActionRisk::ReadOnly,
             approval_policy: ApprovalPolicy::AutoIfReadOnly,
             input_hint: Some("{ path }".to_string()),
-            output_hint: Some("{ path_hash, size, summary, trusted }".to_string()),
+            output_hint: Some("{ path_hash, size, summary, trusted, content? }".to_string()),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "Luettavan tiedoston polku (kanonisoidaan; on pysyttävä allowlistatun juuren alla)."
+                    },
+                    "read_full_content": {
+                        "type": "boolean",
+                        "description": "Kun true, palauttaa myös tiedoston sisällön (max 64 KiB). Oletus false."
                     }
                 },
                 "required": ["path"],
                 "additionalProperties": false
             }),
+            publisher: None,
+            signature: None,
         }
     }
 }
@@ -514,6 +536,7 @@ mod tests {
 
         let payload = serde_json::to_value(FsReadInput {
             path: dir.join("doc.txt").to_string_lossy().to_string(),
+            ..Default::default()
         })
         .expect("serialize");
         let req = ActionRequest::new(
@@ -530,6 +553,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_full_content_returns_body() {
+        let dir = temp_dir("full");
+        write_file(&dir, "doc.txt", "full body text for operator");
+        let skill = FsReadAllowlisted::with_config(FsReadConfig::new().allow_root(&dir));
+
+        let payload = serde_json::to_value(FsReadInput {
+            path: dir.join("doc.txt").to_string_lossy().to_string(),
+            read_full_content: true,
+        })
+        .expect("serialize");
+        let req = ActionRequest::new(
+            ActionId::new(),
+            FsReadAllowlisted::skill_id(),
+            ActionTaskId::new(),
+            payload,
+            at(1_700_000_000),
+        );
+        let res = skill.execute(req).await.expect("execute");
+        assert!(res.status.is_success());
+        assert_eq!(
+            res.raw_output_redacted["content"],
+            json!("full body text for operator")
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_outside_allowlist() {
         let allowed = temp_dir("allowed");
         let other = temp_dir("other");
@@ -539,6 +588,7 @@ mod tests {
 
         let payload = serde_json::to_value(FsReadInput {
             path: other.join("secret.txt").to_string_lossy().to_string(),
+            ..Default::default()
         })
         .expect("serialize");
         let req = ActionRequest::new(
@@ -572,6 +622,7 @@ mod tests {
         let traversal = allowed.join("..").join("outside.txt");
         let payload = serde_json::to_value(FsReadInput {
             path: traversal.to_string_lossy().to_string(),
+            ..Default::default()
         })
         .expect("serialize");
         let req = ActionRequest::new(
@@ -604,6 +655,7 @@ mod tests {
 
         let payload = serde_json::to_value(FsReadInput {
             path: link.to_string_lossy().to_string(),
+            ..Default::default()
         })
         .expect("serialize");
         let req = ActionRequest::new(
@@ -641,6 +693,7 @@ mod tests {
         let escape = escape.join("secret.txt");
         let payload = serde_json::to_value(FsReadInput {
             path: escape.to_string_lossy().to_string(),
+            ..Default::default()
         })
         .expect("serialize");
         let req = ActionRequest::new(
@@ -668,6 +721,7 @@ mod tests {
 
         let payload = serde_json::to_value(FsReadInput {
             path: dir.join("doc.txt").to_string_lossy().to_string(),
+            ..Default::default()
         })
         .expect("serialize");
         let req = ActionRequest::new(
@@ -722,6 +776,7 @@ mod tests {
         // Epäluotetun juuren alta luettu → tuloste pysyy taintattuna.
         let untrusted_payload = serde_json::to_value(FsReadInput {
             path: untrusted_dir.join("u.txt").to_string_lossy().to_string(),
+            ..Default::default()
         })
         .expect("serialize");
         let untrusted_request = ActionRequest::new(
@@ -745,6 +800,7 @@ mod tests {
         // Luotetun juuren alta luettu → taint poistuu.
         let trusted_payload = serde_json::to_value(FsReadInput {
             path: trusted_dir.join("t.txt").to_string_lossy().to_string(),
+            ..Default::default()
         })
         .expect("serialize");
         let trusted_request = ActionRequest::new(
@@ -771,6 +827,7 @@ mod tests {
         let skill = FsReadAllowlisted::new();
         let payload = serde_json::to_value(FsReadInput {
             path: dir.join("doc.txt").to_string_lossy().to_string(),
+            ..Default::default()
         })
         .expect("serialize");
         let req = ActionRequest::new(
@@ -797,6 +854,7 @@ mod tests {
         let skill = FsReadAllowlisted::with_config(FsReadConfig::new().allow_root(&dir));
         let payload = serde_json::to_value(FsReadInput {
             path: dir.to_string_lossy().to_string(),
+            ..Default::default()
         })
         .expect("serialize");
         let req = ActionRequest::new(

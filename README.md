@@ -51,6 +51,27 @@ bash scripts/expo-demo.sh
 [docs/CRASH_SAFE_DISPATCH_CASE_STUDY.md](docs/CRASH_SAFE_DISPATCH_CASE_STUDY.md) ·
 [bench-competitors/langgraph/RESULTS.md](bench-competitors/langgraph/RESULTS.md)
 
+## Public crash demo
+
+Reproduce crash-safe memory and dispatch continuity without API keys or private data:
+
+| Artifact | What it proves |
+|----------|----------------|
+| [`crash_replay` binary](crates/familyclaw-agent/src/bin/crash_replay.rs) | `FileJournal` + `LocalJsonStore` survive process restart; memory recalled after `write` → `verify` across a true process boundary |
+| [Continuity scorecard](docs/SCORECARD.md) | Eight deterministic scenarios (crash matrix, retention, dream quality, …) — `side_effect_overcount = 0` under crash |
+| `familyclaw-bench` | Regenerates the scorecard: `cargo run -p familyclaw-bench --bin bench -- all` |
+
+```bash
+# Crash replay (two-process proof)
+cargo run -p familyclaw-agent --bin crash_replay -- write
+cargo run -p familyclaw-agent --bin crash_replay -- verify
+
+# Full continuity benchmark + scorecard
+cargo run -p familyclaw-bench --bin bench -- all
+```
+
+See also [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) (layer 7: at-most-once dispatch).
+
 > **What Phase 1 proves today:** crash-safe durable replay with **at-most-once
 > external side-effect dispatch under crash** (idempotency-keyed: never fired twice;
 > a crash in the intent-only window fails closed), provenance-gated memory,

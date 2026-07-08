@@ -76,6 +76,7 @@ async fn main() -> Result<()> {
         Some(bus_name.to_string()),
         agent_a_cfg,
         soul_a,
+        vec![],
         channel_a,
         "mock-a".to_string(), // reply_target
         &resolver,

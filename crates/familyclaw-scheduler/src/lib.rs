@@ -12,7 +12,7 @@
 //!
 //! ## Tarkoituksella minimaalinen (roadmap D5)
 //! Tämä crate **ei**:
-//! - jäsennä cron-lausekkeita (cron on lykätty — vain kiinteä intervalli),
+//! - jäsentää cron-lausekkeita ([`croner`]) valinnaisesti tehtäväkohtaisesti,
 //! - tee LLM-kutsuja,
 //! - sisällä mitään autonomiaa, suostumuslogiikkaa eikä "toimii itse" -käytöstä
 //!   (perheen hallintakytkimet ovat eri vaihe, eivät tässä cratessa),
@@ -50,6 +50,6 @@ pub mod task;
 
 pub use decision::{firing_key, DueDecision};
 pub use dispatch::{DispatchSummary, DueDispatch, Scheduler};
-pub use persistence::AgencyConfig;
+pub use persistence::{AgencyConfig, AgencyScheduledTask};
 pub use runner::{run_until_cancelled, SchedulerHandle, SchedulerRunner};
 pub use task::{ScheduledTask, ScheduledTaskId};

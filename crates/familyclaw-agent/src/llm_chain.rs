@@ -753,6 +753,47 @@ impl LlmFailover {
         Err(last_err.unwrap_or(LlmError::NoContent))
     }
 
+    /// Kuten [`complete`](Self::complete), mutta SSE-striimauksella.
+    ///
+    /// # Errors
+    /// Viimeisin [`LlmError`] jos kaikki ketjun entryt epäonnistuvat.
+    pub async fn complete_stream(
+        &self,
+        messages: &[LlmMessage],
+    ) -> std::result::Result<crate::llm::LlmChunkStream, LlmError> {
+        let mut last_err: Option<LlmError> = None;
+        for (idx, client) in self.healthy_clients(self.clock.now()) {
+            match client.complete_stream(messages).await {
+                Ok(stream) => {
+                    self.record_success(idx);
+                    return Ok(stream);
+                }
+                Err(e) => {
+                    last_err = Some(e.clone());
+                    if !e.is_retryable() {
+                        return Err(e);
+                    }
+                    let _ = self.record_failure(idx, e, &mut std::collections::BTreeSet::new());
+                }
+            }
+        }
+        for (idx, client) in self.all_clients() {
+            match client.complete_stream(messages).await {
+                Ok(stream) => {
+                    self.record_success(idx);
+                    return Ok(stream);
+                }
+                Err(e) => {
+                    last_err = Some(e.clone());
+                    if !e.is_retryable() {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or(LlmError::NoContent))
+    }
+
     /// Kuten [`complete`](Self::complete), mutta mainostaa `tools`-työkalut ja
     /// palauttaa [`CompletionResult`]:n (teksti + mahdolliset tool-callit).
     /// Sama cooldown/rotation-logiikka (PASS 1 terveet, PASS 2 viimeinen keino).

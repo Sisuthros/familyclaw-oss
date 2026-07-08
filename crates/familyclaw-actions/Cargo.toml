@@ -33,10 +33,12 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["fs", "io-util", "process", "rt-multi-thread", "macros"] }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2.2", features = ["std"] }
 
 [dev-dependencies]
+ed25519-dalek = { version = "2.2", features = ["std", "rand_core"] }
 tokio = { workspace = true, features = ["test-util"] }

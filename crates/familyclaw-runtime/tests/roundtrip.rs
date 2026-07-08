@@ -42,10 +42,9 @@ use familyclaw_runtime::build_family;
 const FIXED_LLM_REPLY: &str = "AGENT-A-REPLY-OK: hei, tämä tuli aivoista asti";
 
 /// Palauttaa lopullisen LLM-vastauksen outboxista (ei ack/typing/progress-viestejä).
-fn find_llm_reply<'a>(sent: &'a [OutboundMessage]) -> Option<&'a OutboundMessage> {
-    sent.iter().find(|m| {
-        m.kind == OutboundKind::Message && m.body == FIXED_LLM_REPLY
-    })
+fn find_llm_reply(sent: &[OutboundMessage]) -> Option<&OutboundMessage> {
+    sent.iter()
+        .find(|m| m.kind == OutboundKind::Message && m.body == FIXED_LLM_REPLY)
 }
 
 /// Laskee lopulliset LLM-vastaukset (yksi inbound → yksi tällainen viesti).
@@ -134,6 +133,7 @@ async fn inbound_message_roundtrips_to_channel_send_via_mock_llm() {
         Some("roundtrip-bus".to_string()),
         agent_cfg,
         soul,
+        vec![],
         Box::new(channel),
         reply_target.clone(),
         &resolver,
@@ -227,6 +227,7 @@ async fn dead_primary_fails_over_to_live_fallback() {
         Some("failover-bus".to_string()),
         agent_cfg,
         soul,
+        vec![],
         Box::new(channel),
         reply_target.clone(),
         &resolver,
@@ -331,6 +332,7 @@ async fn timeout_primary_fails_over_to_live_fallback() {
         Some("timeout-failover-bus".to_string()),
         agent_cfg,
         soul,
+        vec![],
         Box::new(channel),
         reply_target.clone(),
         &resolver,
@@ -496,6 +498,7 @@ async fn without_llm_no_reply_is_emitted() {
         None,
         agent_cfg,
         soul,
+        vec![],
         Box::new(channel),
         "c".to_string(),
         &resolver,
@@ -504,13 +507,14 @@ async fn without_llm_no_reply_is_emitted() {
     .await
     .expect("build_family");
 
-    // Anna ketjun pyöriä — viesti pumppautuu ja muistetaan, mutta ei reply:ä.
+    // Anna ketjun pyöriä — viesti pumppautuu; turn-watchdog lähettää hiljaisuusvaroituksen
+    // koska LLM:ää ei ole eikä varsinaista vastausta synny.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert_eq!(
         outbox_probe.sent_count(),
-        0,
-        "ilman LLM:ää think() palauttaa ThinkOutcome::NoReply → ei ulosmenevää vastausta"
+        1,
+        "ilman LLM:ää turn-watchdog lähettää fallback-vastauksen (ei hiljaista kuolemaa)"
     );
 
     runtime.shutdown().await;
@@ -566,6 +570,7 @@ async fn run_one_persistent_turn(data_dir: &std::path::Path, body: &str, api_bas
         Some(format!("restart-bus-{body}")),
         agent_cfg,
         soul,
+        vec![],
         Box::new(channel),
         "restart-chat".to_string(),
         &resolver,
@@ -712,6 +717,7 @@ async fn build_family_in_memory_path_writes_no_resumable_journal() {
         None,
         agent_cfg,
         soul,
+        vec![],
         Box::new(channel),
         "c".to_string(),
         &resolver,
@@ -758,6 +764,7 @@ async fn build_family_wires_durable_dispatch_outbox_on_persistent_path() {
         Some("dispatch-outbox-bus".to_string()),
         agent_cfg,
         soul,
+        vec![],
         Box::new(channel),
         "dispatch-chat".to_string(),
         &resolver,
@@ -794,6 +801,7 @@ async fn build_family_wires_durable_dispatch_outbox_on_persistent_path() {
         Some("dispatch-outbox-bus-2".to_string()),
         agent_cfg2,
         soul2,
+        vec![],
         Box::new(channel2),
         "dispatch-chat".to_string(),
         &resolver,
@@ -842,6 +850,7 @@ async fn build_family_in_memory_path_uses_in_memory_dispatch_outbox() {
         None,
         agent_cfg,
         soul,
+        vec![],
         Box::new(channel),
         "c".to_string(),
         &resolver,
@@ -917,6 +926,8 @@ impl familyclaw_actions::Skill for CountingSideEffect {
             input_hint: None,
             output_hint: None,
             input_schema: familyclaw_actions::manifest::default_input_schema(),
+            publisher: None,
+            signature: None,
         }
     }
 }
@@ -1016,6 +1027,7 @@ async fn product_path_build_family_honors_persisted_dispatch_outbox_no_double_fi
         Some("product-path-outbox-bus".to_string()),
         agent_cfg,
         soul,
+        vec![],
         Box::new(channel),
         "outbox-chat".to_string(),
         &resolver,
@@ -1118,6 +1130,7 @@ async fn inbound_reaches_agent_over_bus() {
         None,
         agent_cfg,
         soul,
+        vec![],
         Box::new(channel),
         "c".to_string(),
         &resolver,
@@ -1172,6 +1185,7 @@ async fn build_family_wires_durable_pending_store_on_persistent_path() {
         Some("pending-store-bus".to_string()),
         agent_cfg,
         soul,
+        vec![],
         Box::new(channel),
         "pending-chat".to_string(),
         &resolver,
@@ -1208,6 +1222,7 @@ async fn build_family_wires_durable_pending_store_on_persistent_path() {
         Some("pending-store-bus-2".to_string()),
         agent_cfg2,
         soul2,
+        vec![],
         Box::new(channel2),
         "pending-chat".to_string(),
         &resolver,
@@ -1255,6 +1270,7 @@ async fn build_family_in_memory_path_uses_in_memory_pending_store() {
         None,
         agent_cfg,
         soul,
+        vec![],
         Box::new(channel),
         "c".to_string(),
         &resolver,
@@ -1359,6 +1375,7 @@ async fn product_path_build_family_reloads_pending_approval_after_restart() {
         Some("product-path-pending-bus".to_string()),
         agent_cfg,
         soul,
+        vec![],
         Box::new(channel),
         "pending-reload-chat".to_string(),
         &resolver,

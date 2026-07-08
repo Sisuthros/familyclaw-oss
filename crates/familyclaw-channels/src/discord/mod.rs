@@ -243,6 +243,12 @@ impl DiscordChannel {
         Ok(())
     }
 
+    /// Onko bot-gateway käynnissä (`start()` onnistui). Webhook-tilassa `false`.
+    #[must_use]
+    pub async fn is_gateway_connected(&self) -> bool {
+        self.shard_manager.lock().await.is_some()
+    }
+
     /// Rakentaa Discord-kanavan **webhook/HTTP-inbound-polkua** varten (gatewayn
     /// `/inject` + `/discord/interactions`-reitit). Tässä mallissa saapuva
     /// liikenne tulee [`DiscordChannel::inject`]:n kautta — serenity-gatewaytä ei

@@ -33,6 +33,7 @@ async-trait = "0.1"
 axum = "0.7"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+croner = "3"
 familyclaw-actions = { path = "crates/familyclaw-actions" }
 familyclaw-agent = { path = "crates/familyclaw-agent" }
 familyclaw-bench = { path = "crates/familyclaw-bench" }
@@ -49,6 +50,7 @@ familyclaw-growth = { path = "crates/familyclaw-growth" }
 familyclaw-hearth = { path = "crates/familyclaw-hearth" }
 familyclaw-latent = { path = "crates/familyclaw-latent" }
 familyclaw-memory = { path = "crates/familyclaw-memory" }
+familyclaw-mcp = { path = "crates/familyclaw-mcp" }
 familyclaw-observability = { path = "crates/familyclaw-observability" }
 familyclaw-runtime = { path = "crates/familyclaw-runtime" }
 familyclaw-sandbox = { path = "crates/familyclaw-sandbox" }

@@ -111,9 +111,10 @@ pub use resource_budget::{AcquireOutcome, BudgetLimits, ResourceBudget, Resource
 #[allow(deprecated)]
 pub use skills::MockSkill;
 pub use skills::{
-    DiscordThreadSummaryMock, EmailTriageMock, FilePatchMock, FileWriteAllowlisted,
-    FileWriteConfig, FsReadAllowlisted, FsReadConfig, GithubIssueDraftMock, MemoryRecord, Pipeline,
-    PipelineOutcome, ResearchSkill, Skill, WebSearchSkill,
+    DiscordThreadSummaryMock, EmailTriageMock, FilePatchApply, FilePatchMock, FileWriteAllowlisted,
+    FileWriteConfig, FsReadAllowlisted, FsReadConfig, GithubIssueDraftMock, GithubIssueSkill,
+    MemoryRecord, Pipeline, PipelineOutcome, ResearchSkill, ShellExec, ShellExecConfig, ShellMode,
+    Skill, SpawnSubagentSkill, SubagentSpawner, WebSearchSkill,
 };
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).

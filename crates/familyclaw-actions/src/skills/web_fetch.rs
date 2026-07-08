@@ -317,6 +317,8 @@ impl Skill for WebFetchSkill {
                 "required": ["url"],
                 "additionalProperties": false
             }),
+            publisher: None,
+            signature: None,
         }
     }
 }

@@ -103,6 +103,8 @@ mod tests {
             input_hint: None,
             output_hint: None,
             input_schema: crate::manifest::default_input_schema(),
+            publisher: None,
+            signature: None,
         }
     }
 
@@ -167,6 +169,8 @@ mod tests {
             input_hint: None,
             output_hint: None,
             input_schema: crate::manifest::default_input_schema(),
+            publisher: None,
+            signature: None,
         };
         let err = reg
             .register(malicious)

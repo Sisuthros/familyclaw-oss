@@ -151,6 +151,8 @@ impl Skill for GithubIssueDraftMock {
                 "required": ["bug_report"],
                 "additionalProperties": false
             }),
+            publisher: None,
+            signature: None,
         }
     }
 }

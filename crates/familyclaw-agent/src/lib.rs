@@ -64,12 +64,14 @@
 
 pub mod agent;
 pub mod channel_bridge;
+pub mod identity;
 pub mod live_executor;
 pub mod llm;
 pub mod llm_chain;
 pub mod resumable;
 pub mod session;
 pub mod soul;
+pub mod watchdog;
 
 pub use agent::{
     new_reply_channel, Agent, AgentActor, ErasedMemoryStore, MetricEvent, MetricEventSink,
