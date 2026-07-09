@@ -206,7 +206,16 @@ pub fn build_probe(
 /// Provider-resolver readyz/canary-probeille (`FAMILYCLAW_PROVIDERS`).
 fn probe_resolver_from_env() -> EnvEndpointResolver {
     const PROVIDERS_ENV: &str = "FAMILYCLAW_PROVIDERS";
-    let mut resolver = EnvEndpointResolver::new();
+    // Probe-viritys (Fable 5 -diagnoosi 2026-07-09): ping tarvitsee vain pari
+    // tokenia. Ilman näitä probe perii llm.rs:n oletukset (max_tokens 2048,
+    // timeout 60s), jolloin reasoning-malli (v4-pro/nemotron) polttaa koko 2048
+    // tokenin budjetin thinking-jaaritteluun "ping"-viestille = 29-62s, ja
+    // readyz:n ~25s budjetti ylittyy. Katkaise reasoning 32 tokeniin ja rajaa
+    // yksi yritys 8s:iin, jotta täysi 4 mallin fallback-kävelykin mahtuu budjettiin.
+    let mut resolver = EnvEndpointResolver::new()
+        .with_max_tokens(32)
+        .with_request_timeout_ms(8_000)
+        .with_connect_timeout_ms(3_000);
     let Ok(spec) = std::env::var(PROVIDERS_ENV) else {
         return resolver;
     };
