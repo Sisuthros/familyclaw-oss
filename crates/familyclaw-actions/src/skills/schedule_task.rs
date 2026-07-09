@@ -153,6 +153,16 @@ impl ScheduleTaskSkill {
                 "cron_expression must not be empty".to_string(),
             ));
         }
+        // TURVAKORJAUS 2026-07-09 (audit-löytö [5]): validoi cron-lauseke
+        // KIRJOITUSHETKELLÄ samalla parserilla jota scheduler käyttää ajossa
+        // (croner::Cron). Ilman tätä esim. "not a cron" / "99 99 99" tallentui
+        // ja jäi hiljaa ikuisesti laukeamatta.
+        {
+            use std::str::FromStr as _;
+            croner::Cron::from_str(cron).map_err(|e| {
+                ActionError::Proof(format!("invalid cron_expression '{cron}': {e}"))
+            })?;
+        }
         Uuid::parse_str(&input.skill_id).map_err(|_| {
             ActionError::Proof(format!("invalid skill_id UUID: {}", input.skill_id))
         })?;
@@ -269,6 +279,25 @@ mod tests {
             ..input.clone()
         };
         assert!(ScheduleTaskSkill::build_entry(&bad_cron).is_err());
+
+        // TURVAKORJAUS 2026-07-09 (audit [5]): jäsentymätön cron on estettävä
+        // kirjoitushetkellä (ennen: tallentui, jäi hiljaa laukeamatta ikuisesti).
+        for junk in ["not a cron", "99 99 99 99 99", "* * *", "@nonsense"] {
+            let bad = ScheduleTaskInput {
+                cron_expression: junk.to_string(),
+                ..input.clone()
+            };
+            assert!(
+                ScheduleTaskSkill::build_entry(&bad).is_err(),
+                "jäsentymätön cron '{junk}' pitäisi estää"
+            );
+        }
+        // Kelvollinen 5-kenttäinen cron sallitaan.
+        let ok = ScheduleTaskInput {
+            cron_expression: "*/15 * * * *".to_string(),
+            ..input.clone()
+        };
+        assert!(ScheduleTaskSkill::build_entry(&ok).is_ok());
     }
 
     #[tokio::test]

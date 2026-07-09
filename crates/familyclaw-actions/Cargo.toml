@@ -29,6 +29,9 @@ familyclaw-durable = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { version = "0.8" }
+# Cron-validointi schedule_task-skilliin (sama parseri kuin familyclaw-scheduler;
+# ei scheduler-depiä koska scheduler jo riippuu actionsista = sirkulaari).
+croner = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
