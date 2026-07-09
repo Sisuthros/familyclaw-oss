@@ -291,11 +291,20 @@ impl ShellExec {
             )));
         }
 
-        if self.config.mode == ShellMode::Smart && !is_safe_readonly_command(command) {
-            return Err(ActionError::PolicyDenied(
-                "smart-tilassa vain turvalliset read-only-komennot sallitaan automaattisesti"
-                    .to_string(),
-            ));
+        if self.config.mode == ShellMode::Smart {
+            // TURVAKORJAUS 2026-07-09 (audit-löytö [3], oli LIVE agent_delta-tuotannossa):
+            // is_safe_readonly validoi ENNEN vain komennon nimen, ei argumentteja —
+            // esim. `cat /etc/passwd` / `head ~/.ssh/id_rsa` ajettiin ilman hyväksyntää
+            // koska cat/head olivat sallittujen listalla, vaikka cwd-allowlist rajaa vain
+            // työhakemiston. Nyt tiedostoja lukevat komennot (cat/head/tail/type/ls/dir/gci)
+            // saavat tiedostoargumentteja VAIN allowlistin sisältä.
+            let roots = canonicalize_roots(&self.config.cwd_allowlist);
+            if !is_safe_readonly_command(command, &roots) {
+                return Err(ActionError::PolicyDenied(
+                    "smart-tilassa vain turvalliset read-only-komennot allowlistin sisällä sallitaan automaattisesti"
+                        .to_string(),
+                ));
+            }
         }
 
         Ok(())
@@ -587,20 +596,38 @@ fn command_basename(token: &str) -> &str {
     token.rsplit(['/', '\\']).next().unwrap_or(token)
 }
 
+/// Komennot jotka lukevat tiedoston argumentista → tiedostoargumentit on
+/// rajattava cwd-allowlistiin (muuten `cat /etc/passwd` vuotaisi mielivaltaisen
+/// tiedoston smart-tilassa ilman hyväksyntää).
+fn reads_file_args(base: &str) -> bool {
+    matches!(
+        base,
+        "cat" | "type" | "head" | "tail" | "ls" | "dir" | "gci" | "get-childitem"
+    )
+}
+
 /// Turvalliset read-only-komennot smart-tilassa (koko ketju).
-fn is_safe_readonly_command(command: &str) -> bool {
+/// `roots` = kanonisoidut cwd-allowlist-juuret; tiedostoargumentit on pysyttävä
+/// niiden alla tiedostoja lukeville komennoille.
+fn is_safe_readonly_command(command: &str, roots: &[PathBuf]) -> bool {
     if command.contains('>') || command.contains('<') || command.contains('|') {
         return false;
     }
-    for segment in split_command_segments(&normalize_for_detection(command)) {
-        if !segment_is_safe_readonly(&segment) {
+    // Normalisoitu (lowercase, backslashit poistettu) komennon-nimen/blocklist-
+    // logiikkaan; ALKUPERÄINEN polkuvalidointiin (normalize rikkoo Windows-polut:
+    // C:\Users\... -> c:users...). Segmentoidaan molemmat ja pariutetaan indeksillä.
+    let norm_segments = split_command_segments(&normalize_for_detection(command));
+    let raw_segments = split_command_segments(command);
+    for (i, segment) in norm_segments.iter().enumerate() {
+        let raw = raw_segments.get(i).map_or(segment.as_str(), String::as_str);
+        if !segment_is_safe_readonly(segment, raw, roots) {
             return false;
         }
     }
     true
 }
 
-fn segment_is_safe_readonly(segment: &str) -> bool {
+fn segment_is_safe_readonly(segment: &str, raw_segment: &str, roots: &[PathBuf]) -> bool {
     let tokens: Vec<&str> = segment.split_whitespace().collect();
     if tokens.is_empty() {
         return false;
@@ -615,7 +642,7 @@ fn segment_is_safe_readonly(segment: &str) -> bool {
         return false;
     }
     let base = command_basename(tokens[0]);
-    matches!(
+    let base_ok = matches!(
         base,
         "ls" | "dir"
             | "echo"
@@ -634,7 +661,31 @@ fn segment_is_safe_readonly(segment: &str) -> bool {
             | "get-location"
             | "gci"
             | "get-childitem"
-    )
+    );
+    if !base_ok {
+        return false;
+    }
+    // TURVAKORJAUS 2026-07-09: tiedostoja lukevat komennot saavat tiedosto-
+    // argumentteja VAIN allowlistin sisältä. Ei-tiedosto-tokenit (liput kuten -la,
+    // numeeriset kuten `tail -n 5`) sallitaan; tiedostopolut validoidaan roots-alle.
+    if reads_file_args(base) {
+        // Käytä ALKUPERÄISIÄ argumentteja (raw_segment) — normalisoitu segment on
+        // lowercasattu + backslashit poistettu, mikä rikkoo Windows-polut.
+        let raw_tokens: Vec<&str> = raw_segment.split_whitespace().collect();
+        for arg in raw_tokens.iter().skip(1) {
+            // Ohita liput ja pelkät numerot (esim. `head -n 20`, `tail -5`).
+            if arg.starts_with('-') || arg.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            // Tiedostoargumentti: on kanonisoiduttava allowlistin alle.
+            match std::fs::canonicalize(arg) {
+                Ok(p) if path_is_under_any(&p, roots) => {}
+                // Ei kanonisoidu (ei ole vielä olemassa) TAI ei allowlistissa → estä.
+                _ => return false,
+            }
+        }
+    }
+    true
 }
 
 fn summarize_bytes(bytes: &[u8]) -> String {
@@ -855,17 +906,49 @@ mod tests {
 
     #[test]
     fn safe_readonly_allows_ls_echo_pwd() {
-        assert!(is_safe_readonly_command("ls -la"));
-        assert!(is_safe_readonly_command("echo hello"));
-        assert!(is_safe_readonly_command("pwd"));
-        #[cfg(windows)]
-        assert!(is_safe_readonly_command("dir"));
+        // Ei-tiedosto-komennot ja pelkät liput ok ilman allowlistia.
+        let no_roots: &[PathBuf] = &[];
+        assert!(is_safe_readonly_command("echo hello", no_roots));
+        assert!(is_safe_readonly_command("pwd", no_roots));
+        assert!(is_safe_readonly_command("whoami", no_roots));
     }
 
     #[test]
     fn safe_readonly_rejects_redirection_and_rm() {
-        assert!(!is_safe_readonly_command("echo hi > out.txt"));
-        assert!(!is_safe_readonly_command("rm file.txt"));
+        let no_roots: &[PathBuf] = &[];
+        assert!(!is_safe_readonly_command("echo hi > out.txt", no_roots));
+        assert!(!is_safe_readonly_command("rm file.txt", no_roots));
+    }
+
+    #[test]
+    fn safe_readonly_blocks_file_read_outside_allowlist() {
+        // TURVAKORJAUS 2026-07-09 (audit [3]): cat/head/tail/ls tiedostoargumentit
+        // ON pysyttävä cwd-allowlistin sisällä. Ilman tätä `cat /etc/passwd` ajettiin
+        // smart-tilassa ilman hyväksyntää.
+        let dir = temp_dir("shellsafe");
+        let roots = canonicalize_roots(std::slice::from_ref(&dir));
+
+        // Tiedosto allowlistin sisällä → sallittu.
+        let inside = dir.join("ok.txt");
+        std::fs::write(&inside, b"hello").unwrap();
+        let inside_cmd = format!("cat {}", inside.to_string_lossy());
+        assert!(
+            is_safe_readonly_command(&inside_cmd, &roots),
+            "allowlistin sisäinen tiedosto pitäisi sallia"
+        );
+
+        // Tiedosto allowlistin ULKOPUOLELLA → estetty (aiemmin: LÄPI).
+        #[cfg(unix)]
+        assert!(
+            !is_safe_readonly_command("cat /etc/passwd", &roots),
+            "cat /etc/passwd EI saa läpäistä smart-tilaa"
+        );
+        assert!(
+            !is_safe_readonly_command("head ../../secret.txt", &roots),
+            "allowlistin ulkopuolinen head EI saa läpäistä"
+        );
+        // Liput ja numerot ilman tiedostoa ok (head -n 5 ilman polkua).
+        assert!(is_safe_readonly_command("date", &roots));
     }
 
     #[tokio::test]
