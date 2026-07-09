@@ -457,6 +457,12 @@ fn first_secret_in_json(value: &Value, path: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    // TESTIKORJAUS 2026-07-09 (audit): FAMILYCLAW_SKILL_REGISTRY on prosessin-
+    // globaali env-var. Kaksi testiä set_var/remove_var:aavat sitä → rinnakkain
+    // ajettuna toisen remove_var pyyhkii toisen set_var:in ja validaatio failaa
+    // satunnaisesti (flaky CI). Serialisoidaan ne tällä lukolla.
+    static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Apuri: rakentaa kelvollisen perusmanifestin annetulla tunnisteella.
     fn valid_manifest() -> SkillManifest {
         SkillManifest {
@@ -710,6 +716,10 @@ approval_policy = "auto_if_read_only"
     fn external_skill_with_valid_signature_accepted() {
         use ed25519_dalek::{Signer, SigningKey};
         use std::io::Write;
+        // Serialisoi globaalin REGISTRY-env-varin muutokset (flaky-race-korjaus).
+        let _env_guard = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
         let verifying_key = signing_key.verifying_key();
@@ -744,6 +754,10 @@ approval_policy = "auto_if_read_only"
     fn external_skill_with_tampered_signature_rejected() {
         use ed25519_dalek::SigningKey;
         use std::io::Write;
+        // Serialisoi globaalin REGISTRY-env-varin muutokset (flaky-race-korjaus).
+        let _env_guard = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
         let public_key_hex = bytes_to_hex(&signing_key.verifying_key().to_bytes());
