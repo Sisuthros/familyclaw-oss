@@ -222,6 +222,46 @@ impl ActionExecutor for WebFetchSkill {
             }
         };
 
+        // TURVAKORJAUS 2026-07-09 (audit [2], SSRF/DNS-rebinding): validate_url
+        // tarkistaa ei-julkisen IP:n VAIN jos host on kirjaimellinen IP. Domain-nimi
+        // (esim. hyökkääjän attacker.com joka resolvoituu 169.254.169.254 = AWS IMDS)
+        // ohitti tarkistuksen. Nyt resolvoidaan host ja hylätään jos MIKÄ TAHANSA
+        // resolvoitu IP on ei-julkinen. Resolvointi juuri ennen fetchiä kaventaa
+        // myös rebinding-ikkunaa (ei täysin sulje sitä ilman resolved-IP-pinning:iä,
+        // mutta reqwest osuu samaan DNS-cacheen tässä prosessissa).
+        {
+            let host = url.host_str().unwrap_or("").to_string();
+            // Ohita jos host on jo kirjaimellinen IP (validate_url hoiti sen).
+            if host.parse::<IpAddr>().is_err() && !host.is_empty() {
+                let port = url.port_or_known_default().unwrap_or(443);
+                let probe = format!("{host}:{port}");
+                let resolved = tokio::task::spawn_blocking(move || {
+                    use std::net::ToSocketAddrs as _;
+                    probe
+                        .to_socket_addrs()
+                        .map(|it| it.map(|sa| sa.ip()).collect::<Vec<_>>())
+                })
+                .await;
+                match resolved {
+                    Ok(Ok(ips)) if !ips.is_empty() => {
+                        if let Some(bad) = ips.iter().find(|ip| !is_public_ip(**ip)) {
+                            return Ok(ActionResult::failure(
+                                format!("host {host} resolvoituu ei-julkiseen IP:hen {bad} (SSRF, hylätty)"),
+                                request.now,
+                            ));
+                        }
+                    }
+                    // DNS ei resolvoinut / tyhjä / tehtävä epäonnistui → fail-closed.
+                    _ => {
+                        return Ok(ActionResult::failure(
+                            format!("host {host} ei resolvoitunut (hylätty, fail-closed)"),
+                            request.now,
+                        ));
+                    }
+                }
+            }
+        }
+
         let cap = input
             .max_bytes
             .unwrap_or(DEFAULT_MAX_BYTES)
@@ -359,6 +399,31 @@ mod tests {
         assert!(validate_url("http://example.com/").is_ok());
         assert!(validate_url("https://example.com/path?q=1").is_ok());
         assert!(validate_url("https://8.8.8.8/").is_ok());
+    }
+
+    #[test]
+    fn ssrf_resolved_ip_classification_blocks_internal() {
+        // TURVAKORJAUS 2026-07-09 (audit [2]): execute-tason SSRF-resolvointi
+        // hylkää hostin jos MIKÄ TAHANSA resolvoitu IP on ei-julkinen. Tämä
+        // testaa luokitteluvartijan (is_public_ip) jota resolvointi käyttää —
+        // domain joka resolvoituu näihin IP:hin estetään execute():ssa.
+        // (Täysi domain→IP-rebinding-testi vaatisi mock-DNS:n; luokittelu on ydin.)
+        for internal in [
+            "127.0.0.1",      // loopback (attacker.com → localhost)
+            "169.254.169.254",// AWS/GCP IMDS
+            "10.0.0.1",       // yksityinen
+            "192.168.1.1",
+            "100.64.0.1",     // CGNAT
+        ] {
+            let ip: IpAddr = internal.parse().unwrap();
+            assert!(
+                !is_public_ip(ip),
+                "resolvoitu sisäinen IP {internal} pitäisi luokitella ei-julkiseksi → SSRF-esto"
+            );
+        }
+        // Julkiset resolvoinnit sallitaan.
+        assert!(is_public_ip("8.8.8.8".parse().unwrap()));
+        assert!(is_public_ip("1.1.1.1".parse().unwrap()));
     }
 
     #[test]
