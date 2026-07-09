@@ -81,22 +81,39 @@ pub async fn check_journal_writable(data_dir: &std::path::Path) -> CheckResult {
     }
 }
 
+/// Kokonaisdeadline koko `llm_ping`-probelle. Per-yritys-timeout on 8s
+/// (`probe_resolver_from_env`), mutta ilman KOKONAIS-deadlinea failover kävelee
+/// 4 mallia x 2 pass = pahimmillaan 8x8s = 64s (audit-löytö [1]: mitattu 3.5-19.7s).
+/// 20s katkaisee failover-jumin MUTTA päästää hitaan yksittäisen LLM-pingin läpi
+/// (canary-mittaus 3.9-8s NIM-reitillä). watchdog.ps1 readyz-timeout on 60s, joten
+/// 20s on turvallisesti sen alla eikä katkaise kelvollisia pingejä (10s oli liian
+/// tiukka: ~40% pingeistä osui siihen, mitattu agent_delta 2026-07-09).
+const LLM_PING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Kevyt LLM-ping (yksi lyhyt completion) — käyttää samaa provider-resolveria kuin serve.
 pub async fn check_llm_ping(model_cfg: &ModelConfig) -> CheckResult {
     let resolver = probe_resolver_from_env();
     match build_llm_chain(model_cfg, &resolver) {
         Ok(chain) => {
             let messages = [LlmMessage::user("ping")];
-            match chain.complete(&messages).await {
-                Ok(_) => CheckResult {
+            // TURVAKORJAUS 2026-07-09 (audit [1]): kokonaisdeadline koko
+            // failover-kävelyn ympärille — muuten readyz aikakatkeaa kun useampi
+            // malli timeouttaa 8s peräkkäin.
+            match tokio::time::timeout(LLM_PING_DEADLINE, chain.complete(&messages)).await {
+                Ok(Ok(_)) => CheckResult {
                     name: "llm_ping",
                     ok: true,
                     detail: "completion ok".into(),
                 },
-                Err(e) => CheckResult {
+                Ok(Err(e)) => CheckResult {
                     name: "llm_ping",
                     ok: false,
                     detail: format!("completion failed: {e}"),
+                },
+                Err(_) => CheckResult {
+                    name: "llm_ping",
+                    ok: false,
+                    detail: format!("llm_ping deadline {}s exceeded", LLM_PING_DEADLINE.as_secs()),
                 },
             }
         }
