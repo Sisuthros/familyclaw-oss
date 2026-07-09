@@ -37,7 +37,18 @@ COPY . .
 # Build only the gateway binary in release mode. The gateway crate's own
 # Cargo.toml pulls in familyclaw-channels with the telegram + discord
 # features, so this single command yields the "living" gateway.
-RUN cargo build --release -p familyclaw-gateway
+#
+# TURVAKORJAUS 2026-07-09 (audit [4], Layer 6): wasmtime-sandbox on POIS
+# oletuksena (iso Cranelift+JIT-dep, kasvattaa build-aikaa/imagea). Ilman sita
+# 3rd-party-skillit ovat fail-closed (NoopSandbox = NotImplemented, ei aja).
+# Ota kayttoon kun rekisteroit ensimmaisen 3rd-party-skillin:
+#   docker build --build-arg FAMILYCLAW_FEATURES=wasmtime ...
+ARG FAMILYCLAW_FEATURES=""
+RUN if [ -n "$FAMILYCLAW_FEATURES" ]; then \
+      cargo build --release -p familyclaw-gateway --features "$FAMILYCLAW_FEATURES"; \
+    else \
+      cargo build --release -p familyclaw-gateway; \
+    fi
 
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime

@@ -967,6 +967,22 @@ fn resolve_sandbox_skills() -> Option<Arc<dyn CodeSandbox>> {
         return None;
     }
 
+    // TURVAKORJAUS 2026-07-09 (audit [4], puolustussyvyys): kun operaattori pyytää
+    // SANDBOX_SKILLS=1 MUTTA vain noop-backend on käännetty (ei --features wasmtime),
+    // aiempi koodi logitti harhaanjohtavasti "sandbox wired to agent". NoopSandbox on
+    // fail-closed (ei aja 3rd-party-koodia hostissa, palauttaa NotImplemented) — mutta
+    // operaattorin on TIEDETTÄVÄ ettei saanut oikeaa sandboxia. Tehdään ero näkyväksi.
+    if !familyclaw_sandbox::wasmtime_available() {
+        tracing::warn!(
+            target: "familyclaw::sandbox",
+            availability = sandbox_availability(),
+            "FAMILYCLAW_SANDBOX_SKILLS=1 pyydetty MUTTA wasmtime-backendia EI ole kaannetty. \
+             NoopSandbox estaa 3rd-party-koodin ajon fail-closed (turvallinen), mutta oikean \
+             sandboxin saat rakentamalla: cargo build --features wasmtime. Ilman sita 3rd-party- \
+             skillit EIVAT voi ajaa lainkaan (NotImplemented) = tarkoituksellinen fail-closed."
+        );
+    }
+
     match default_sandbox() {
         Ok(sandbox) => {
             tracing::info!(
@@ -977,10 +993,12 @@ fn resolve_sandbox_skills() -> Option<Arc<dyn CodeSandbox>> {
             Some(Arc::from(sandbox))
         }
         Err(error) => {
+            // fail-closed: sandbox pyydetty muttei alustunut -> agentti ajaa ilman
+            // 3rd-party-sandboxia. NoopSandbox suojaa silti (execute = NotImplemented).
             tracing::warn!(
                 target: "familyclaw::sandbox",
                 error = %error,
-                "FAMILYCLAW_SANDBOX_SKILLS=1 but sandbox init failed — agent runs without sandbox"
+                "FAMILYCLAW_SANDBOX_SKILLS=1 but sandbox init failed — agent runs without sandbox (3rd-party skills fail-closed)"
             );
             None
         }
