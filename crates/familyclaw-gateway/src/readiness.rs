@@ -87,7 +87,7 @@ pub async fn check_journal_writable(data_dir: &std::path::Path) -> CheckResult {
 /// 20s katkaisee failover-jumin MUTTA päästää hitaan yksittäisen LLM-pingin läpi
 /// (canary-mittaus 3.9-8s NIM-reitillä). watchdog.ps1 readyz-timeout on 60s, joten
 /// 20s on turvallisesti sen alla eikä katkaise kelvollisia pingejä (10s oli liian
-/// tiukka: ~40% pingeistä osui siihen, mitattu agent_delta 2026-07-09).
+/// tiukka: ~40% pingeistä osui siihen, mitattu tuotantoagentilla 2026-07-09).
 const LLM_PING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Kevyt LLM-ping (yksi lyhyt completion) — käyttää samaa provider-resolveria kuin serve.

@@ -1,5 +1,5 @@
 # FamilyClaw gateway watchdog — kanarialintu 5 min välein.
-# Layer B: kopioi/kytke operaattorin data-hakemistoon (esim. agent_delta-deploy).
+# Layer B: kopioi/kytke operaattorin data-hakemistoon (esim. operaattoriagentin deploy).
 #
 # Käyttö:
 #   .\scripts\watchdog.ps1

@@ -90,18 +90,18 @@ fn memory_is_roleplay_noise(content: &str) -> bool {
     [
         "sisaresi ",
         "sister ",
-        "— agent_epsilon",
-        "agent_epsilon täältä",
-        "agent_epsilon täällä",
+        "— vega",
+        "vega täältä",
+        "vega täällä",
         "your sister",
         "cronjob response:",
-        "he i agent_epsilon",
+        "he i vega",
     ]
     .iter()
     .any(|m| lower.contains(m))
 }
 
-/// `true` for short agent-name pings like "agent_delta?!" (≤4 words, ≤48 chars).
+/// `true` for short agent-name pings like "Nova?!" (≤4 words, ≤48 chars).
 #[must_use]
 pub fn is_brief_ping(query: &str, agent_name: &str) -> bool {
     let t = query.trim();
@@ -152,7 +152,7 @@ pub fn operator_diagnostic_reply(
     let q = query.trim().to_lowercase();
     if q.contains("minne siirrät") || q.contains("where are you moving") {
         return Some(
-            "Siirrän tutkimusmateriaalit tähän polkuun:\n- E:\\agent_delta\\home\\research\\legacy\\2026-07\n\nKasvuun liittyvät legacyt tähän:\n- E:\\agent_delta\\home\\growth\\legacy\\2026-07\n\nEn siirrä salaisuuksia sisältäviä tiedostoja (.env, secrets).".to_string(),
+            "Siirrän tutkimusmateriaalit tähän polkuun:\n- E:\\Nova\\home\\research\\legacy\\2026-07\n\nKasvuun liittyvät legacyt tähän:\n- E:\\Nova\\home\\growth\\legacy\\2026-07\n\nEn siirrä salaisuuksia sisältäviä tiedostoja (.env, secrets).".to_string(),
         );
     }
     if q.contains("pystyt nyt toimimaan")
@@ -268,11 +268,11 @@ mod tests {
 
     #[test]
     fn brief_ping_detects_short_call() {
-        assert!(is_brief_ping("agent_delta?!", "agent_delta"));
-        assert!(is_brief_ping("agent_delta?", "agent_delta"));
+        assert!(is_brief_ping("Nova?!", "Nova"));
+        assert!(is_brief_ping("nova?", "Nova"));
         assert!(!is_brief_ping(
-            "agent_delta, read your SOUL and write a full report",
-            "agent_delta"
+            "Nova, read your SOUL and write a full report",
+            "Nova"
         ));
     }
 
@@ -284,7 +284,7 @@ mod tests {
         let origin = MessageOrigin::new("discord-1", "100", "42");
         let memories = vec![
             "normal operator question".to_string(),
-            "Hei agent_delta! Sisaresi agent_epsilon täältä.".to_string(),
+            "Hei Nova! Sisaresi Vega täältä.".to_string(),
         ];
         let filtered = filter_memories_for_operator(memories, Some(&origin), |s| s.as_str());
         assert_eq!(filtered.len(), 1);
@@ -306,7 +306,7 @@ mod tests {
         let origin = MessageOrigin::new("discord-1", "100", "42");
         let moved = operator_diagnostic_reply(&BusMessage::text("Minne siirrät?"), Some(&origin))
             .expect("direct move question should be fast-pathed");
-        assert!(moved.contains("E:\\agent_delta\\home\\research\\legacy\\2026-07"));
+        assert!(moved.contains("E:\\Nova\\home\\research\\legacy\\2026-07"));
         let can_work =
             operator_diagnostic_reply(&BusMessage::text("Pystyt nyt toimimaan?"), Some(&origin))
                 .expect("direct status question should be fast-pathed");

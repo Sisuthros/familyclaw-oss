@@ -292,7 +292,7 @@ impl ShellExec {
         }
 
         if self.config.mode == ShellMode::Smart {
-            // TURVAKORJAUS 2026-07-09 (audit-löytö [3], oli LIVE agent_delta-tuotannossa):
+            // TURVAKORJAUS 2026-07-09 (audit-löytö [3], oli LIVE agenttituotannossa):
             // is_safe_readonly validoi ENNEN vain komennon nimen, ei argumentteja —
             // esim. `cat /etc/passwd` / `head ~/.ssh/id_rsa` ajettiin ilman hyväksyntää
             // koska cat/head olivat sallittujen listalla, vaikka cwd-allowlist rajaa vain
