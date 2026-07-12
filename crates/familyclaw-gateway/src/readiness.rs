@@ -113,7 +113,10 @@ pub async fn check_llm_ping(model_cfg: &ModelConfig) -> CheckResult {
                 Err(_) => CheckResult {
                     name: "llm_ping",
                     ok: false,
-                    detail: format!("llm_ping deadline {}s exceeded", LLM_PING_DEADLINE.as_secs()),
+                    detail: format!(
+                        "llm_ping deadline {}s exceeded",
+                        LLM_PING_DEADLINE.as_secs()
+                    ),
                 },
             }
         }

@@ -409,11 +409,11 @@ mod tests {
         // domain joka resolvoituu näihin IP:hin estetään execute():ssa.
         // (Täysi domain→IP-rebinding-testi vaatisi mock-DNS:n; luokittelu on ydin.)
         for internal in [
-            "127.0.0.1",      // loopback (attacker.com → localhost)
-            "169.254.169.254",// AWS/GCP IMDS
-            "10.0.0.1",       // yksityinen
+            "127.0.0.1",       // loopback (attacker.com → localhost)
+            "169.254.169.254", // AWS/GCP IMDS
+            "10.0.0.1",        // yksityinen
             "192.168.1.1",
-            "100.64.0.1",     // CGNAT
+            "100.64.0.1", // CGNAT
         ] {
             let ip: IpAddr = internal.parse().unwrap();
             assert!(
