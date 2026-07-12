@@ -467,6 +467,32 @@ fn is_catastrophic_rm_target(target: &str) -> bool {
     ) || target.starts_with("/dev/sd")
         || target.starts_with("/dev/nvme")
         || target.starts_with("/dev/hd")
+        || is_named_user_home_root(target)
+}
+
+/// Hard-block a NAMED user-home root and its immediate contents — the gap the
+/// literal `matches!` list missed (e.g. `rm -rf /home/operator`, `/Users/the operator`).
+/// Wiping a whole user home is exactly the reported destructive-agent incident.
+/// We block the home root and its top-level sweep (`/home/operator`, `/home/operator/*`)
+/// but deliberately allow deeper, more specific paths (`/home/operator/project/build`)
+/// through to the normal approval gate — those are ordinary, intentional deletes.
+fn is_named_user_home_root(target: &str) -> bool {
+    // Normalize a trailing "/*" (whole-directory sweep) to the bare dir so
+    // `/home/operator` and `/home/operator/*` are treated identically.
+    let bare = target.strip_suffix("/*").unwrap_or(target);
+    let bare = bare.strip_suffix('/').unwrap_or(bare);
+    // NOTE: `target` reaches here already lowercased by normalize_for_detection,
+    // so prefixes must be lowercase (`/users/`, not `/Users/`) to match.
+    for prefix in ["/home/", "/users/", "/root/", "/export/home/"] {
+        if let Some(rest) = bare.strip_prefix(prefix) {
+            // rest is the user segment; block iff it is a single non-empty
+            // component (the home root itself), not a deeper subpath.
+            if !rest.is_empty() && !rest.contains('/') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn is_dd_to_block_device(s: &str) -> bool {
@@ -878,6 +904,30 @@ mod tests {
         assert!(
             ShellExec::detect_hardline_block("r\\m -rf /").is_some(),
             "backslash escape must not bypass"
+        );
+    }
+
+    #[test]
+    fn hardline_blocks_named_user_home() {
+        // The reported destructive-agent incident wiped a HOME directory. A named
+        // user-home root (not the literal `/home`) must hard-block, not merely
+        // fall through to the approval gate.
+        for cmd in [
+            "rm -rf /home/operator",
+            "rm -rf /home/operator/*",
+            "rm -rf /Users/the operator",
+            "rm -rf /root/subuser",
+        ] {
+            assert!(
+                ShellExec::detect_hardline_block(cmd).is_some(),
+                "named user home must hard-block: {cmd}"
+            );
+        }
+        // Deeper, specific project paths stay allowed (approval gate handles them);
+        // hard-block would be too blunt and break ordinary cleanups.
+        assert!(
+            ShellExec::detect_hardline_block("rm -rf /home/operator/project/build").is_none(),
+            "deep project subpath must not hard-block"
         );
     }
 
