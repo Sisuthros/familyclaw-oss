@@ -3,7 +3,10 @@
 //! Prevents wrong-name addressing when semantic recall pulls roleplay/channel
 //! fiction into operator DMs. Uses `FAMILYCLAW_OWNER_ID` only — no private names.
 
+use std::path::{Path, PathBuf};
+
 use familyclaw_bus::{BusMessage, MessageOrigin};
+use serde_json::{json, Value};
 
 /// Reads designated operator user id from `FAMILYCLAW_OWNER_ID`.
 #[must_use]
@@ -164,12 +167,6 @@ pub fn operator_diagnostic_reply(
                 .to_string(),
         );
     }
-    if is_operator_go_ahead(&q) {
-        return Some(operator_top20_go_ahead_reply());
-    }
-    if is_operator_continue(&q) {
-        return Some(operator_continue_reply());
-    }
     if q.contains("miten sinusta saadaan")
         || q.contains("kunnolla toimiva")
         || q.contains("how to make you work")
@@ -186,6 +183,30 @@ pub fn operator_diagnostic_reply(
     Some(
         "P0\n- turn-timeoutit ja fallback-polku täysin deterministisiksi (ei tyhjää vastausta)\n- shell_exec-väärinkäyttö pois analyysistä (fs_read ensisijainen)\n- typing katkeaa heti timeout/error-tilassa\n\nP1\n- vastaukset aina teknisinä prioriteetteina (ei roolipeliä)\n- työkalukutsuista suora tulos + todiste, ei metapuhetta\n- approval-jumit auto-siivoukseen hallitusti\n\nP2\n- yhtenäinen tutkimusartefakti-pohja (tiivistelmä, vertailu, next action)\n- regressiotestit: väärä persona, tyhjä vastaus, shell_exec-looppi\n- observability: lokiin selkeä malli/fallback-syy per vuoro".to_string(),
     )
+}
+
+/// First allowlisted workspace root (`FAMILYCLAW_FILE_WRITE_ALLOW` or read allow).
+#[must_use]
+pub fn operator_home_root() -> Option<PathBuf> {
+    let raw = std::env::var("FAMILYCLAW_FILE_WRITE_ALLOW")
+        .or_else(|_| std::env::var("FAMILYCLAW_FS_READ_ALLOW"))
+        .ok()?;
+    std::env::split_paths(&raw).next()
+}
+
+/// `true` when operator sends execute-now phrasing ("Tee se!", "JATKA", …).
+#[must_use]
+pub fn operator_execute_message(message: &BusMessage, origin: Option<&MessageOrigin>) -> bool {
+    if !is_operator_origin(origin) {
+        return false;
+    }
+    let query = match message {
+        BusMessage::Text { body } => body.as_str(),
+        BusMessage::Latent { text_shadow, .. } => text_shadow.as_str(),
+        _ => return false,
+    };
+    let q = query.trim().to_lowercase();
+    is_operator_go_ahead(&q) || is_operator_continue(&q)
 }
 
 fn is_operator_go_ahead(q: &str) -> bool {
@@ -245,26 +266,77 @@ pub fn operator_how_to_work_reply() -> String {
     .join("\n")
 }
 
-/// Deterministic TOP 20 #1 kickoff — no tool loop for operator "go ahead".
+/// File-write payloads for TOP 20 #1 bootstrap (`file_write_allowlisted`).
 #[must_use]
-pub fn operator_top20_go_ahead_reply() -> String {
-    [
-        "TOP 20 #1 — aloitan nyt:",
-        "",
-        "**Muistijärjestelmä istuntojen yli**",
-        "- Varmistan `home/memory.md` -pohjan",
-        "- Päivitän `home/research/log.md` ensimmäisellä merkinnällä",
-        "- Pidän tutkimuspolun: `home/research/`",
-        "",
-        "En käytä shell_exec-moveja. Raportoin kun ensimmäinen askel on kirjattu.",
+pub fn operator_top20_bootstrap_plan(home: &Path, now_iso: &str) -> Vec<(String, Value)> {
+    let memory_path = home.join("memory.md");
+    let log_path = home.join("research").join("log.md");
+    let memory_entry = format!(
+        "\n## {now_iso}\n- DONE: TOP 20 #1 operator bootstrap (file_write)\n- Canonical memory: `{}`\n- Research log: `{}`\n",
+        memory_path.display(),
+        log_path.display()
+    );
+    let log_entry = format!(
+        "\n## {now_iso}\n- DONE: TOP 20 #1 memory bootstrap\n- Updated: `memory.md`\n- Operator command: Tee se / JATKA\n"
+    );
+    vec![
+        (
+            memory_path.display().to_string(),
+            json!({
+                "path": memory_path.display().to_string(),
+                "content": memory_entry,
+                "mode": "append"
+            }),
+        ),
+        (
+            log_path.display().to_string(),
+            json!({
+                "path": log_path.display().to_string(),
+                "content": log_entry,
+                "mode": "append"
+            }),
+        ),
     ]
-    .join("\n")
+}
+
+/// Reply after successful bootstrap writes.
+#[must_use]
+pub fn operator_top20_bootstrap_done_reply(home: &Path, written: &[String]) -> String {
+    let memory = home.join("memory.md");
+    let log = home.join("research").join("log.md");
+    format!(
+        "DONE: TOP 20 #1 — muistijärjestelmä päivitetty.\n\nKirjoitetut tiedostot:\n{}\n\nTodiste:\n- `{}`\n- `{}`\n\nSeuraava: yksi `web_search` → tallennus `home/research/<aihe>/report.md`.",
+        written
+            .iter()
+            .map(|p| format!("- `{p}`"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        memory.display(),
+        log.display()
+    )
+}
+
+/// Reply when bootstrap could not complete (approval block, write error).
+#[must_use]
+pub fn operator_top20_bootstrap_blocked_reply(reason: &str) -> String {
+    format!(
+        "BLOCKED: TOP 20 #1 bootstrap — {reason}\nNEXT: hyväksy odottavat tehtävät gatewayssä (`/approvals`) tai aja `familyclaw-gateway doctor --fix`."
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use familyclaw_bus::MessageOrigin;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_test_lock() -> MutexGuard<'static, ()> {
+        ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn brief_ping_detects_short_call() {
@@ -279,6 +351,7 @@ mod tests {
     #[test]
     fn operator_identity_guard_and_recall_filter() {
         const ENV: &str = "FAMILYCLAW_OWNER_ID";
+        let _lock = env_test_lock();
         let prior = std::env::var(ENV).ok();
         std::env::set_var(ENV, "42");
         let origin = MessageOrigin::new("discord-1", "100", "42");
@@ -301,23 +374,37 @@ mod tests {
     #[test]
     fn operator_diagnostic_fast_paths_cover_direct_questions() {
         const ENV: &str = "FAMILYCLAW_OWNER_ID";
+        let _lock = env_test_lock();
         let prior = std::env::var(ENV).ok();
         std::env::set_var(ENV, "42");
         let origin = MessageOrigin::new("discord-1", "100", "42");
         let moved = operator_diagnostic_reply(&BusMessage::text("Minne siirrät?"), Some(&origin))
             .expect("direct move question should be fast-pathed");
-        assert!(moved.contains("E:\\Nova\\home\\research\\legacy\\2026-07"));
+        assert!(moved.contains(r"E:\Nova\home\research\legacy\2026-07"));
         let can_work =
             operator_diagnostic_reply(&BusMessage::text("Pystyt nyt toimimaan?"), Some(&origin))
                 .expect("direct status question should be fast-pathed");
         assert!(can_work.to_lowercase().contains("pystyn toimimaan"));
-        let go = operator_diagnostic_reply(&BusMessage::text("Tee se!"), Some(&origin))
-            .expect("go-ahead should be fast-pathed");
-        assert!(go.contains("TOP 20 #1"));
-        let cont = operator_diagnostic_reply(&BusMessage::text("JATKA."), Some(&origin))
-            .expect("continue should be fast-pathed");
-        assert!(cont.contains("gateway"));
-        assert!(!cont.contains("turn-timeoutit"));
+        assert!(
+            operator_diagnostic_reply(&BusMessage::text("Tee se!"), Some(&origin)).is_none(),
+            "go-ahead must run bootstrap tools, not text-only fast path"
+        );
+        assert!(
+            operator_diagnostic_reply(&BusMessage::text("JATKA."), Some(&origin)).is_none(),
+            "continue must run bootstrap tools, not text-only fast path"
+        );
+        assert!(operator_execute_message(
+            &BusMessage::text("Tee se!"),
+            Some(&origin)
+        ));
+        assert!(operator_execute_message(
+            &BusMessage::text("JATKA."),
+            Some(&origin)
+        ));
+        let plan =
+            operator_top20_bootstrap_plan(Path::new(r"E:\agent_home"), "2026-07-14T12:00:00Z");
+        assert_eq!(plan.len(), 2);
+        assert!(plan[0].1.get("mode").and_then(|v| v.as_str()) == Some("append"));
         let how = operator_diagnostic_reply(
             &BusMessage::text("Miten sinusta saadaan kunnolla toimiva!"),
             Some(&origin),

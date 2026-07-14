@@ -1831,6 +1831,85 @@ impl Agent {
         }
     }
 
+    /// Deterministic TOP 20 #1 bootstrap for operator "Tee se!" / "JATKA".
+    ///
+    /// Runs real `file_write_allowlisted` tasks (memory.md + research/log.md),
+    /// journals the final reply for replay, and never hallucinates completion.
+    async fn execute_operator_top20_bootstrap(&mut self, step_name: &str) -> Result<String> {
+        let bootstrap_step = format!("{step_name}-operator-bootstrap");
+        if self.durable.is_replaying() {
+            return self
+                .durable
+                .step(&bootstrap_step, || {
+                    Err("unreachable: replay returns journaled bootstrap reply".to_string())
+                })
+                .map_err(|e| FamilyClawError::bus(format!("bootstrap replay failed: {e}")));
+        }
+
+        let actions = self.actions.as_ref().ok_or_else(|| {
+            FamilyClawError::config("operator bootstrap requires ActionRuntime".to_string())
+        })?;
+        let home = crate::identity::operator_home_root().ok_or_else(|| {
+            FamilyClawError::config(
+                "operator bootstrap requires FAMILYCLAW_FILE_WRITE_ALLOW or FAMILYCLAW_FS_READ_ALLOW"
+                    .to_string(),
+            )
+        })?;
+        let now = time::now();
+        let now_iso = familyclaw_core::time::to_rfc3339(now);
+        let writes = crate::identity::operator_top20_bootstrap_plan(&home, &now_iso);
+        let being_id = self.being_id.to_string();
+        let mut written = Vec::new();
+        let mut blocked: Option<String> = None;
+
+        for (idx, (rel_display, payload)) in writes.into_iter().enumerate() {
+            let dispatch_step = format!("{step_name}-bootstrap-{idx}");
+            let skill_id = {
+                let rt = actions.lock().await;
+                rt.map_name_to_skill("file_write_allowlisted")
+                    .ok_or_else(|| {
+                        FamilyClawError::config(
+                            "file_write_allowlisted not registered in ActionRuntime".to_string(),
+                        )
+                    })?
+            };
+            let outcome = {
+                let mut rt = actions.lock().await;
+                rt.submit_task_idempotent(&dispatch_step, &being_id, skill_id, payload, now)
+                    .await?
+            };
+            if outcome.awaiting_approval() {
+                blocked = Some(format!(
+                    "file_write odottaa hyväksyntää (task {})",
+                    outcome.task_id
+                ));
+                break;
+            }
+            if outcome.status != familyclaw_actions::task::TaskStatus::Done {
+                blocked = Some(format!(
+                    "file_write status {:?} for {rel_display}",
+                    outcome.status
+                ));
+                break;
+            }
+            written.push(rel_display);
+        }
+
+        let reply = if let Some(reason) = blocked {
+            crate::identity::operator_top20_bootstrap_blocked_reply(&reason)
+        } else {
+            crate::identity::operator_top20_bootstrap_done_reply(&home, &written)
+        };
+
+        self.durable
+            .step(&bootstrap_step, {
+                let reply = reply.clone();
+                move || Ok(reply)
+            })
+            .map_err(|e| FamilyClawError::bus(format!("bootstrap step failed: {e}")))?;
+        Ok(reply)
+    }
+
     /// **Tuore actions-vuoron ajattelu durable-journaloituna** (D1 production
     /// path). Ajaa [`drive_tool_loop_durable`](Self::drive_tool_loop_durable):n
     /// `&mut self.durable`:n yli, kirjaa lopputuloksen (`-think` teksti tai
@@ -2943,9 +3022,29 @@ impl Agent {
             self.turn_reply_suppressed.store(true, Ordering::Relaxed);
         }
         let will_think = self.llm.is_some() && !governor_filtered_pulse && !governor_hesitate;
+        // Operator TOP20 bootstrap: deterministic file_write (no LLM theater).
+        let operator_bootstrap_response = if will_think
+            && !self.durable.is_replaying()
+            && self.actions.is_some()
+            && crate::identity::operator_execute_message(message, origin)
+        {
+            match self.execute_operator_top20_bootstrap(&step_name).await {
+                Ok(reply) => Some(reply),
+                Err(e) => {
+                    warn!("operator bootstrap failed (non-fatal): {e}");
+                    Some(crate::identity::operator_top20_bootstrap_blocked_reply(
+                        &e.to_string(),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
         // Operator diagnostics fast path + brief ping fast path:
         // skip LLM when we can answer deterministically.
-        let brief_ping_response = if will_think && !self.durable.is_replaying() {
+        let brief_ping_response = if operator_bootstrap_response.is_some() {
+            operator_bootstrap_response
+        } else if will_think && !self.durable.is_replaying() {
             let diag = crate::identity::operator_diagnostic_reply(message, origin);
             if diag.is_some() {
                 diag
