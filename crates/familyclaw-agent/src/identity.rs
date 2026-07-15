@@ -61,6 +61,9 @@ pub fn identity_guard_prompt(origin: Option<&MessageOrigin>) -> String {
         "Do NOT call shell_exec for normal analysis or file reading; use fs_read_allowlisted instead.",
         "When reading files for operator work, call fs_read with read_full_content: true.",
         "Only use shell_exec when the operator explicitly asks for a shell command.",
+        "[TOOL CONTRACT]",
+        "Tools are the ONLY way to read/write disk or search the web. Never claim a file was written or read unless a tool_result in THIS turn confirms it.",
+        "If you have not called tools yet, say what you would do next — do not invent evidence paths or DONE lines.",
         "For operator diagnostics, use technical style: concise bullets, concrete issues, concrete fixes.",
         "Do NOT use roleplay/family prose in operator diagnostics (no sibling narrative, no emotional framing).",
         "When asked what is missing/failing, provide prioritized list (P0/P1/P2) with actionable items.",
@@ -85,6 +88,7 @@ pub fn filter_memories_for_operator<T>(
     memories
         .into_iter()
         .filter(|m| !memory_is_roleplay_noise(content(m)))
+        .filter(|m| !crate::grounding::memory_is_unverified_tool_claim(content(m)))
         .collect()
 }
 
@@ -138,6 +142,32 @@ pub fn brief_ping_reply(agent_name: &str, message: &BusMessage) -> Option<String
     Some(format!("Tässä! ✦ ({agent_name} kuulee — mitä tarvitset?)"))
 }
 
+/// `true` when the operator explicitly asks for a tool invocation — must not use
+/// canned diagnostic fast paths (e.g. TOP 20 summary vs. `fs_read` on `top20.md`).
+#[must_use]
+fn explicit_tool_request(query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    [
+        "fs_read",
+        "file_write",
+        "web_search",
+        "web_fetch",
+        "shell_exec",
+        "read_full_content",
+        "käytä työkalu",
+        "käytä fs_read",
+        "use fs_read",
+        "use tool",
+        "älä keksi",
+        "don't make up",
+        "do not invent",
+    ]
+    .iter()
+    .any(|needle| q.contains(needle))
+        || q.starts_with("lue ")
+        || (q.contains("lue ") && q.contains(".md"))
+}
+
 /// Fast technical reply for operator efficiency/diagnostic prompts.
 #[must_use]
 pub fn operator_diagnostic_reply(
@@ -152,6 +182,9 @@ pub fn operator_diagnostic_reply(
         BusMessage::Latent { text_shadow, .. } => text_shadow.as_str(),
         _ => return None,
     };
+    if explicit_tool_request(query) {
+        return None;
+    }
     let q = query.trim().to_lowercase();
     if q.contains("minne siirrät") || q.contains("where are you moving") {
         return Some(
@@ -161,11 +194,10 @@ pub fn operator_diagnostic_reply(
     if q.contains("pystyt nyt toimimaan")
         || q.contains("can you work now")
         || q.contains("are you working now")
+        || q.contains("toimitko")
+        || q.contains("toimit?")
     {
-        return Some(
-            "Kyllä — pystyn toimimaan. Teen nyt suorat vastaukset, käytän progress-mittaria ja vältän turhan metapuheen.\nJos haluat, käynnistän heti ensimmäisen konkreettisen tehtävän TOP 20 -listalta."
-                .to_string(),
-        );
+        return None;
     }
     if q.contains("miten sinusta saadaan")
         || q.contains("kunnolla toimiva")
@@ -192,6 +224,106 @@ pub fn operator_home_root() -> Option<PathBuf> {
         .or_else(|_| std::env::var("FAMILYCLAW_FS_READ_ALLOW"))
         .ok()?;
     std::env::split_paths(&raw).next()
+}
+
+/// `true` for operator status checks ("Toimitko?", "status", …) — runs disk-backed bootstrap.
+#[must_use]
+pub fn operator_status_message(message: &BusMessage, origin: Option<&MessageOrigin>) -> bool {
+    if !is_operator_origin(origin) {
+        return false;
+    }
+    let query = match message {
+        BusMessage::Text { body } => body.as_str(),
+        BusMessage::Latent { text_shadow, .. } => text_shadow.as_str(),
+        _ => return false,
+    };
+    let q = query.trim().to_lowercase();
+    q.contains("toimitko")
+        || q.contains("toimit?")
+        || q == "status"
+        || q.contains("status report")
+        || q.contains("pystyt nyt")
+        || q.contains("are you working")
+}
+
+/// Parses operator `APPROVE <uuid>` / `DENY <uuid>` chat commands.
+#[must_use]
+pub fn parse_operator_approval_command(message: &BusMessage) -> Option<OperatorApprovalCommand> {
+    let query = match message {
+        BusMessage::Text { body } => body.trim(),
+        BusMessage::Latent { text_shadow, .. } => text_shadow.trim(),
+        _ => return None,
+    };
+    let lower = query.to_lowercase();
+    let rest = if lower.strip_prefix("approve ").is_some() {
+        Some(("approve", query[8..].trim()))
+    } else if lower.strip_prefix("deny ").is_some() {
+        Some(("deny", query[5..].trim()))
+    } else if lower.strip_prefix("hyväksy ").is_some() {
+        Some(("approve", query[8..].trim()))
+    } else if lower.strip_prefix("hylkää ").is_some() {
+        Some(("deny", query[7..].trim()))
+    } else {
+        None
+    };
+    let (kind, id_str) = rest?;
+    if id_str.len() < 8 {
+        return None;
+    }
+    if kind == "approve" {
+        Some(OperatorApprovalCommand::Approve(id_str.to_string()))
+    } else {
+        Some(OperatorApprovalCommand::Deny(id_str.to_string()))
+    }
+}
+
+/// Operator chat gateway command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorApprovalCommand {
+    /// Approve pending action by approval UUID.
+    Approve(String),
+    /// Deny pending action by approval UUID.
+    Deny(String),
+}
+
+/// Builds a factual status report from canonical home files (no LLM).
+#[must_use]
+pub fn operator_status_report(home: &Path) -> String {
+    let files = [
+        ("memory.md", home.join("memory.md")),
+        (
+            "priorities/top20.md",
+            home.join("priorities").join("top20.md"),
+        ),
+        ("research/log.md", home.join("research").join("log.md")),
+    ];
+    let mut lines = vec![
+        "STATUS (levyltä, ei LLM)".to_string(),
+        format!("Home: `{}`", home.display()),
+        String::new(),
+    ];
+    for (label, path) in files {
+        if path.exists() {
+            let meta = std::fs::metadata(&path).ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = meta
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| {
+                    let dt: chrono::DateTime<chrono::Utc> = t.into();
+                    Some(dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                })
+                .unwrap_or_else(|| "?".to_string());
+            lines.push(format!("- `{label}`: {size} B, mtime {mtime}"));
+        } else {
+            lines.push(format!("- `{label}`: **puuttuu**"));
+        }
+    }
+    lines.push(String::new());
+    lines.push(
+        "Jos tarvitset työn: `Tee se!` (TOP20 bootstrap) tai anna konkreettinen tehtävä (käytän työkaluja)."
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 /// `true` when operator sends execute-now phrasing ("Tee se!", "JATKA", …).
@@ -382,9 +514,13 @@ mod tests {
             .expect("direct move question should be fast-pathed");
         assert!(moved.contains(r"E:\Nova\home\research\legacy\2026-07"));
         let can_work =
+            operator_status_message(&BusMessage::text("Pystyt nyt toimimaan?"), Some(&origin));
+        assert!(can_work);
+        assert!(
             operator_diagnostic_reply(&BusMessage::text("Pystyt nyt toimimaan?"), Some(&origin))
-                .expect("direct status question should be fast-pathed");
-        assert!(can_work.to_lowercase().contains("pystyn toimimaan"));
+                .is_none(),
+            "status questions must use disk bootstrap, not text fast path"
+        );
         assert!(
             operator_diagnostic_reply(&BusMessage::text("Tee se!"), Some(&origin)).is_none(),
             "go-ahead must run bootstrap tools, not text-only fast path"
@@ -392,6 +528,16 @@ mod tests {
         assert!(
             operator_diagnostic_reply(&BusMessage::text("JATKA."), Some(&origin)).is_none(),
             "continue must run bootstrap tools, not text-only fast path"
+        );
+        assert!(
+            operator_diagnostic_reply(
+                &BusMessage::text(
+                    "Lue priorities/top20.md read_full_content true ja kerro mikä on TOP 20 #1. Älä keksi — käytä fs_read."
+                ),
+                Some(&origin),
+            )
+            .is_none(),
+            "explicit fs_read must reach tool loop, not TOP20 diagnostic fast path"
         );
         assert!(operator_execute_message(
             &BusMessage::text("Tee se!"),

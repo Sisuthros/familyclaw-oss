@@ -837,6 +837,50 @@ async fn approve_pending(
     )
 }
 
+/// `POST /approvals/{approval_id}/deny` — hylkää odottavan hyväksynnän ja peruuttaa tehtävän.
+async fn deny_pending(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(approval_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if check_inject_auth(&state, &headers).is_err() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        );
+    }
+    let Some(actions) = state.actions.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "action runtime not configured" })),
+        );
+    };
+    let Ok(id) = ApprovalId::from_str(approval_id.trim()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid approval id" })),
+        );
+    };
+    let now = familyclaw_core::time::now();
+    let mut rt = actions.lock().await;
+    match rt.deny_pending(id, now).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "approval_id": approval_id,
+                "status": "denied"
+            })),
+        ),
+        Err(e) => {
+            warn!(approval = %id, error = %e, "approvals: deny failed");
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
+    }
+}
+
 /// `POST /tasks/{task_id}/enabled` — **perhe-agency kill-switch** (Phase 4):
 /// kytkee ajastetun tehtävän päälle tai pois.
 ///
@@ -1058,6 +1102,7 @@ fn build_router(state: Arc<GatewayState>) -> Router {
         // axum 0.7 (matchit 0.7) käyttää `:param`-syntaksia polkukaappaukseen;
         // `{approval_id}` tulkittaisiin LITERAALIksi segmentiksi → 404 HTTP:n yli.
         .route("/approvals/:approval_id/approve", post(approve_pending))
+        .route("/approvals/:approval_id/deny", post(deny_pending))
         // Perhe-agency kill-switch (Phase 4): kytkee ajastetun tehtävän
         // päälle/pois. Rekisteröidään aina; kun ajastinta ei ole kytketty
         // ([`GatewayState::scheduler`] = `None`), handler vastaa 503. Bearer-

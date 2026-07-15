@@ -63,7 +63,14 @@ pub(crate) const SCAFFOLDED: bool = true;
 
 /// Hyväksyntäpyynnön oletus-TTL kun operaattori myöntää hyväksynnän
 /// (`submit-task` jättää tehtävän odottamaan; hyväksyntä on voimassa tämän ajan).
-const DEFAULT_APPROVAL_TTL_MINUTES: i64 = 60;
+const DEFAULT_APPROVAL_TTL_MINUTES: i64 = 1440;
+
+fn approval_ttl_minutes() -> i64 {
+    std::env::var("FAMILYCLAW_APPROVAL_TTL_MINUTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_APPROVAL_TTL_MINUTES)
+}
 
 /// Vaarallisten (hyväksyntää vaativien) työkalukutsujen per-olento-rate-limitin
 /// **liukuvan ikkunan** oletuspituus sekunteina (1 tunti).
@@ -871,7 +878,7 @@ impl ActionRuntime {
                 outcome.action_id,
                 &payload,
                 now,
-                Duration::minutes(DEFAULT_APPROVAL_TTL_MINUTES),
+                Duration::minutes(approval_ttl_minutes()),
             )?;
             let approval_id = approval.id;
             // Redaktoitu tiivistelmä: vain taidon nimi ja tunnisteet — EI raakaa
@@ -1148,6 +1155,24 @@ impl ActionRuntime {
             status: outcome.status,
             pending_approval: None,
         })
+    }
+
+    /// Hylkää odottavan hyväksynnän — poistaa pending-kirjauksen ja peruuttaa tehtävän.
+    ///
+    /// # Errors
+    /// [`ActionError::ApprovalMissing`] jos hyväksyntää ei odoteta.
+    pub async fn deny_pending(&mut self, approval_id: ApprovalId, now: Timestamp) -> Result<()> {
+        let entry = self
+            .pending
+            .get(approval_id)?
+            .ok_or_else(|| ActionError::ApprovalMissing(approval_id.to_string()))?;
+        self.pending.remove(approval_id)?;
+        self.pipeline
+            .queue()
+            .transition(entry.task_id, TaskStatus::Cancelled, now)
+            .await?;
+        self.snapshot_task_if_durable(entry.task_id).await?;
+        Ok(())
     }
 
     /// Palauttaa tehtävän tilan tunnisteella; `None` jos tehtävää ei ole jonossa.

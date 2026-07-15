@@ -9,9 +9,13 @@
 - **License:** MIT
 - **Language:** Rust 2021, MSRV 1.88, `unsafe` forbidden workspace-wide
 - **Workspace:** 23 crates (`crates/*`) + `examples/minimal-gateway`
-- **Last verified:** 2026-07-02
+- **Last verified:** 2026-07-12
+
+> **Hygiene sprint (2026-07-12):** Untracked root-level internal blueprint document (containing non-generic identifiers) removed from the working tree. All public-facing docs and code remain strictly generic Layer A only. Boundary continues to be enforced by `.gitignore` (quarantine list) + `scripts/audit-layer-b.sh`. No changes to tracked files or published content.
 
 ---
+
+
 
 ## What FamilyClaw is (positioning)
 

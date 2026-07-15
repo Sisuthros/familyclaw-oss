@@ -574,9 +574,13 @@ impl LlmFailover {
         client: LlmClient,
         messages: &[LlmMessage],
         tools: &[ToolDefinition],
+        tool_choice: Option<&str>,
         tried_keys: &mut std::collections::BTreeSet<usize>,
     ) -> Attempt<CompletionResult> {
-        match client.complete_with_tools(messages, tools).await {
+        match client
+            .complete_with_tools_choice(messages, tools, tool_choice)
+            .await
+        {
             Ok(result) => {
                 self.record_success(idx);
                 Attempt::Ok(result)
@@ -807,6 +811,16 @@ impl LlmFailover {
         messages: &[LlmMessage],
         tools: &[ToolDefinition],
     ) -> std::result::Result<CompletionResult, LlmError> {
+        self.complete_with_tools_choice(messages, tools, None).await
+    }
+
+    /// Like [`complete`](Self::complete_with_tools) with explicit `tool_choice`.
+    pub async fn complete_with_tools_choice(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[ToolDefinition],
+        tool_choice: Option<&str>,
+    ) -> std::result::Result<CompletionResult, LlmError> {
         let mut last_err: Option<LlmError> = None;
 
         // PASS 1: terveet entryt.
@@ -814,7 +828,14 @@ impl LlmFailover {
             let mut tried_keys = std::collections::BTreeSet::new();
             loop {
                 match self
-                    .try_entry_complete_with_tools(idx, client, messages, tools, &mut tried_keys)
+                    .try_entry_complete_with_tools(
+                        idx,
+                        client,
+                        messages,
+                        tools,
+                        tool_choice,
+                        &mut tried_keys,
+                    )
                     .await
                 {
                     Attempt::Ok(result) => return Ok(result),
@@ -836,7 +857,14 @@ impl LlmFailover {
             let mut tried_keys = std::collections::BTreeSet::new();
             loop {
                 match self
-                    .try_entry_complete_with_tools(idx, client, messages, tools, &mut tried_keys)
+                    .try_entry_complete_with_tools(
+                        idx,
+                        client,
+                        messages,
+                        tools,
+                        tool_choice,
+                        &mut tried_keys,
+                    )
                     .await
                 {
                     Attempt::Ok(result) => return Ok(result),

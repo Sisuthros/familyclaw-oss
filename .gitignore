@@ -69,6 +69,15 @@ recv.py
 tmp-*
 fix*.py
 fixlib.ps1
+# Agent debug/probe scripts (2026-07-14) — self-labeled Layer B in their own
+# header comments; one hardcodes a gateway token, so these must never reach
+# the Layer A (published) tree. audit-layer-b.sh's secret scan only covers
+# crates/*.rs|toml|json and its name scan only covers already-tracked files,
+# so untracked scripts/ files like these were never caught by the automated
+# audit — quarantined here explicitly instead.
+scripts/agent_acceptance_test.py
+scripts/agent_clean_memory.py
+scripts/probe_tool_calling.ps1
 # Rust build intermediates.
 *.rlib
 # Runtime config binds a private identity + channel; publish only the blanked

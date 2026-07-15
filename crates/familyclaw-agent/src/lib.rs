@@ -64,6 +64,7 @@
 
 pub mod agent;
 pub mod channel_bridge;
+pub mod grounding;
 pub mod identity;
 pub mod live_executor;
 pub mod llm;

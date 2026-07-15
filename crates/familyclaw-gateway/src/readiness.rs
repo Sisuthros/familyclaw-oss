@@ -7,7 +7,7 @@ use std::time::Instant;
 use axum::http::StatusCode;
 use axum::Json;
 use familyclaw_actions::task::{DurableTaskQueue, TaskQueue, TaskStatus};
-use familyclaw_agent::llm::LlmMessage;
+use familyclaw_agent::llm::{LlmMessage, ToolDefinition};
 use familyclaw_agent::{build_llm_chain, EnvEndpointResolver};
 use familyclaw_channels::DiscordChannel;
 use familyclaw_core::{FamilyClawError, ModelConfig, Result};
@@ -89,6 +89,7 @@ pub async fn check_journal_writable(data_dir: &std::path::Path) -> CheckResult {
 /// 20s on turvallisesti sen alla eikä katkaise kelvollisia pingejä (10s oli liian
 /// tiukka: ~40% pingeistä osui siihen, mitattu tuotantoagentilla 2026-07-09).
 const LLM_PING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+const LLM_TOOLS_PING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// Kevyt LLM-ping (yksi lyhyt completion) — käyttää samaa provider-resolveria kuin serve.
 pub async fn check_llm_ping(model_cfg: &ModelConfig) -> CheckResult {
@@ -128,6 +129,65 @@ pub async fn check_llm_ping(model_cfg: &ModelConfig) -> CheckResult {
     }
 }
 
+/// LLM tool-calling probe — varmistaa että primary palauttaa `tool_calls`.
+pub async fn check_llm_tools_ping(model_cfg: &ModelConfig) -> CheckResult {
+    let resolver = probe_resolver_from_env();
+    match build_llm_chain(model_cfg, &resolver) {
+        Ok(chain) => {
+            let tools = [ToolDefinition {
+                name: "fs_read_allowlisted".to_string(),
+                description: "Read allowlisted file".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "read_full_content": { "type": "boolean" }
+                    },
+                    "required": ["path"]
+                }),
+            }];
+            let messages = [LlmMessage::user(
+                "Call fs_read_allowlisted on path memory.md with read_full_content false.",
+            )];
+            match tokio::time::timeout(
+                LLM_TOOLS_PING_DEADLINE,
+                chain.complete_with_tools_choice(&messages, &tools, Some("required")),
+            )
+            .await
+            {
+                Ok(Ok(result)) if result.has_tool_calls() => CheckResult {
+                    name: "llm_tools_ping",
+                    ok: true,
+                    detail: "tool_calls ok".into(),
+                },
+                Ok(Ok(_)) => CheckResult {
+                    name: "llm_tools_ping",
+                    ok: false,
+                    detail: "completion ok but no tool_calls".into(),
+                },
+                Ok(Err(e)) => CheckResult {
+                    name: "llm_tools_ping",
+                    ok: false,
+                    detail: format!("tool completion failed: {e}"),
+                },
+                Err(_) => CheckResult {
+                    name: "llm_tools_ping",
+                    ok: false,
+                    detail: format!(
+                        "llm_tools_ping deadline {}s exceeded",
+                        LLM_TOOLS_PING_DEADLINE.as_secs()
+                    ),
+                },
+            }
+        }
+        Err(e) => CheckResult {
+            name: "llm_tools_ping",
+            ok: false,
+            detail: format!("resolver failed: {e}"),
+        },
+    }
+}
+
 /// Discord-gateway-yhteyden tila.
 pub async fn check_discord(dc: &DiscordChannel) -> CheckResult {
     let connected = dc.is_gateway_connected().await;
@@ -156,6 +216,7 @@ pub async fn deep_readyz(
 
     if let Some(model) = probe.model.as_ref() {
         checks.push(check_llm_ping(model).await);
+        checks.push(check_llm_tools_ping(model).await);
     }
 
     if let Some(dc) = &probe.discord {

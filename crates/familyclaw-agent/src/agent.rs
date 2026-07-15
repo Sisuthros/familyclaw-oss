@@ -1472,6 +1472,14 @@ impl Agent {
             }
             system_prompt.push_str("[END MEMORIES]\n");
         }
+        if self.actions.is_some() {
+            system_prompt.push_str(
+                "\n[TOOL CONTRACT]\n\
+                 Disk and web changes require tool calls in THIS turn. \
+                 Never claim DONE/evidence/file paths without a tool_result. \
+                 If unsure, say what tool you will call next.\n",
+            );
+        }
 
         (system_prompt, query)
     }
@@ -1533,7 +1541,8 @@ impl Agent {
         now: Timestamp,
         turn_id: ActionId,
         origin: Option<&MessageOrigin>,
-    ) -> Result<ToolLoopOutcome> {
+        user_query: &str,
+    ) -> Result<(ToolLoopOutcome, u32)> {
         // Phase 2: emittoi tool-call-mittarin jos sinkki on asennettu. Kutsutaan
         // jokaisessa dispatch-kohdassa `!replaying`-vartioituna (replay ei saa
         // kaksoislaskea). Geneerinen, ei kanna käyttäjä-/Kerros B -dataa.
@@ -1555,6 +1564,7 @@ impl Agent {
         let mut progress_gate = ProgressGate::new();
         let mut tool_use_counts: HashMap<String, u32> = HashMap::new();
         let mut fs_read_count = 0u32;
+        let mut dispatch_count = 0u32;
         for iteration in 0..budget {
             // D1: kääri **myös LLM-kutsu** durable-askeleeseen. Ilman tätä replay
             // kutsuisi LLM:ää uudelleen (ei-deterministinen + verkkokutsu), ja
@@ -1583,7 +1593,23 @@ impl Agent {
                         .complete_with_tools(&messages, &tools)
                         .await
                         .map_err(|e| FamilyClawError::llm(e.to_string()))?;
-                    let projection = (result.content.clone(), result.tool_calls.clone());
+                    let mut content = result.content;
+                    let mut tool_calls_opt = result.tool_calls;
+                    let no_tools = tool_calls_opt.as_ref().map_or(true, |c| c.is_empty());
+                    if no_tools
+                        && iteration == 0
+                        && dispatch_index == dispatch_base
+                        && !tools.is_empty()
+                        && crate::grounding::looks_like_action_request(user_query)
+                    {
+                        let retry = llm
+                            .complete_with_tools_choice(&messages, &tools, Some("required"))
+                            .await
+                            .map_err(|e| FamilyClawError::llm(e.to_string()))?;
+                        content = retry.content;
+                        tool_calls_opt = retry.tool_calls;
+                    }
+                    let projection = (content.clone(), tool_calls_opt.clone());
                     durable
                         .step(&llm_step, {
                             let projection = projection.clone();
@@ -1591,7 +1617,8 @@ impl Agent {
                         })
                         .map_err(|e| {
                             FamilyClawError::bus(format!("durable llm step failed: {e}"))
-                        })?
+                        })?;
+                    (content, tool_calls_opt)
                 };
 
             let text = content.clone().unwrap_or_default();
@@ -1601,7 +1628,8 @@ impl Agent {
 
             let Some(tool_calls) = tool_calls_opt.filter(|c| !c.is_empty()) else {
                 let answer = content.filter(|c| !c.is_empty()).unwrap_or(last_text);
-                return Ok(ToolLoopOutcome::Answer(answer));
+                let guarded = crate::grounding::apply_grounding_guard(&answer, dispatch_count);
+                return Ok((ToolLoopOutcome::Answer(guarded), dispatch_count));
             };
 
             messages.push(
@@ -1789,14 +1817,21 @@ impl Agent {
                             call.name
                         ),
                     );
-                    return Ok(ToolLoopOutcome::AwaitingApproval {
-                        tool: call.name.clone(),
-                        approval_id,
-                        redacted_summary,
-                        messages: messages.clone(),
-                        tool_call_id: call.id.clone(),
-                        arguments: call.arguments.clone(),
-                    });
+                    return Ok((
+                        ToolLoopOutcome::AwaitingApproval {
+                            tool: call.name.clone(),
+                            approval_id,
+                            redacted_summary,
+                            messages: messages.clone(),
+                            tool_call_id: call.id.clone(),
+                            arguments: call.arguments.clone(),
+                        },
+                        dispatch_count,
+                    ));
+                }
+
+                if record.error.is_none() {
+                    dispatch_count = dispatch_count.saturating_add(1);
                 }
 
                 // Turvallinen / auto-run: syötä (redaktoitu) tulos takaisin malliin.
@@ -1823,12 +1858,100 @@ impl Agent {
 
         if last_text.is_empty() {
             if let Some(recovered) = recover_user_visible_reply(llm, &messages).await {
-                return Ok(ToolLoopOutcome::Answer(recovered));
+                let guarded = crate::grounding::apply_grounding_guard(&recovered, dispatch_count);
+                return Ok((ToolLoopOutcome::Answer(guarded), dispatch_count));
             }
-            Ok(ToolLoopOutcome::MaxIterations { iterations: budget })
+            Ok((
+                ToolLoopOutcome::MaxIterations { iterations: budget },
+                dispatch_count,
+            ))
         } else {
-            Ok(ToolLoopOutcome::Answer(last_text))
+            let guarded = crate::grounding::apply_grounding_guard(&last_text, dispatch_count);
+            Ok((ToolLoopOutcome::Answer(guarded), dispatch_count))
         }
+    }
+
+    /// Disk-backed operator status (no LLM theater).
+    async fn execute_operator_status_bootstrap(&mut self, step_name: &str) -> Result<String> {
+        let bootstrap_step = format!("{step_name}-operator-status");
+        if self.durable.is_replaying() {
+            return self
+                .durable
+                .step(&bootstrap_step, || {
+                    Err("unreachable: replay returns journaled status reply".to_string())
+                })
+                .map_err(|e| FamilyClawError::bus(format!("status replay failed: {e}")));
+        }
+        let home = crate::identity::operator_home_root().ok_or_else(|| {
+            FamilyClawError::config(
+                "operator status requires FAMILYCLAW_FS_READ_ALLOW or FAMILYCLAW_FILE_WRITE_ALLOW"
+                    .to_string(),
+            )
+        })?;
+        let reply = crate::identity::operator_status_report(&home);
+        self.durable
+            .step(&bootstrap_step, {
+                let reply = reply.clone();
+                move || Ok(reply)
+            })
+            .map_err(|e| FamilyClawError::bus(format!("status step failed: {e}")))?;
+        Ok(reply)
+    }
+
+    /// Handles operator APPROVE/DENY chat commands via ActionRuntime.
+    async fn handle_operator_approval_command(
+        &self,
+        message: &BusMessage,
+        origin: Option<&MessageOrigin>,
+    ) -> Result<Option<String>> {
+        if !crate::identity::is_operator_origin(origin) || self.durable.is_replaying() {
+            return Ok(None);
+        }
+        let Some(cmd) = crate::identity::parse_operator_approval_command(message) else {
+            return Ok(None);
+        };
+        let Some(actions) = self.actions.as_ref() else {
+            return Ok(Some("ActionRuntime ei ole kytketty.".to_string()));
+        };
+        let now = time::now();
+        match cmd {
+            crate::identity::OperatorApprovalCommand::Approve(id_str) => {
+                let id: ApprovalId = id_str.parse().map_err(|_| {
+                    FamilyClawError::config(format!("invalid approval id: {id_str}"))
+                })?;
+                {
+                    let mut rt = actions.lock().await;
+                    rt.approve(id, now)
+                        .await
+                        .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+                }
+                self.handle_resume_signal(&id.to_string(), now).await?;
+                Ok(Some(format!(
+                    "APPROVE OK: {id} — resume signaali lähetetty."
+                )))
+            }
+            crate::identity::OperatorApprovalCommand::Deny(id_str) => {
+                let id: ApprovalId = id_str.parse().map_err(|_| {
+                    FamilyClawError::config(format!("invalid approval id: {id_str}"))
+                })?;
+                let mut rt = actions.lock().await;
+                rt.deny_pending(id, now)
+                    .await
+                    .map_err(|e| FamilyClawError::bus(e.to_string()))?;
+                Ok(Some(format!("DENY OK: {id} — tehtävä peruutettu.")))
+            }
+        }
+    }
+
+    async fn record_verified_tool_memory(&self, dispatch_count: u32, summary: &str) -> Result<()> {
+        let snippet: String = summary.chars().take(240).collect();
+        let content = format!("verified tool turn (dispatch={dispatch_count}): {snippet}");
+        let memory = Memory::builder(content)
+            .source("tool_verified")
+            .tags(["verified:tool".to_string()])
+            .build();
+        self.memory.add(memory).await?;
+        Ok(())
     }
 
     /// Deterministic TOP 20 #1 bootstrap for operator "Tee se!" / "JATKA".
@@ -1974,7 +2097,7 @@ impl Agent {
         };
         record_turn_audit_into(audit, turn_id, AuditKind::TurnStarted, now, "turn started");
 
-        let messages = build_message_stack(system_prompt, &history, query);
+        let messages = build_message_stack(system_prompt, &history, query.clone());
         // LLM-kahva on `LlmFailover` (ei `Clone`); luetaan se `self`:stä
         // erikseen samaan aikaan kuin `&mut self.durable` — disjoint field
         // borrow toimii koska `llm` ja `durable` ovat eri kenttiä.
@@ -2014,12 +2137,16 @@ impl Agent {
             now,
             turn_id,
             origin,
+            &query,
         )
         .await?;
 
         let think_step = format!("turn-{turn}-think");
-        match outcome {
+        match outcome.0 {
             ToolLoopOutcome::Answer(text) => {
+                if outcome.1 > 0 && !self.durable.is_replaying() {
+                    let _ = self.record_verified_tool_memory(outcome.1, &text).await;
+                }
                 record_turn_audit_into(
                     audit,
                     turn_id,
@@ -3040,10 +3167,37 @@ impl Agent {
         } else {
             None
         };
+        let operator_status_response = if operator_bootstrap_response.is_none()
+            && will_think
+            && !self.durable.is_replaying()
+            && crate::identity::operator_status_message(message, origin)
+        {
+            match self.execute_operator_status_bootstrap(&step_name).await {
+                Ok(reply) => Some(reply),
+                Err(e) => {
+                    warn!("operator status bootstrap failed (non-fatal): {e}");
+                    Some(format!("STATUS ERROR: {e}"))
+                }
+            }
+        } else {
+            None
+        };
+        let operator_approval_response = if !self.durable.is_replaying() {
+            match self.handle_operator_approval_command(message, origin).await {
+                Ok(reply) => reply,
+                Err(e) => Some(format!("Approval command failed: {e}")),
+            }
+        } else {
+            None
+        };
         // Operator diagnostics fast path + brief ping fast path:
         // skip LLM when we can answer deterministically.
         let brief_ping_response = if operator_bootstrap_response.is_some() {
             operator_bootstrap_response
+        } else if operator_approval_response.is_some() {
+            operator_approval_response
+        } else if operator_status_response.is_some() {
+            operator_status_response
         } else if will_think && !self.durable.is_replaying() {
             let diag = crate::identity::operator_diagnostic_reply(message, origin);
             if diag.is_some() {
@@ -3252,7 +3406,7 @@ impl Agent {
                 .or_else(|| {
                     suspend
                         .as_ref()
-                        .map(|(_, summary)| suspended_approval_user_reply(summary))
+                        .map(|(id, summary)| suspended_approval_user_reply(*id, summary))
                 });
             if let Some(thought) = outbound_text.as_deref() {
                 // F2: johda reply-kohde per viesti. Origin ENSIN (se keskustelu
@@ -3705,11 +3859,12 @@ impl ProgressGate {
 }
 
 /// Käyttäjälle näkyvä ilmoitus kun vuoro jää odottamaan harvinaista hyväksyntää.
-fn suspended_approval_user_reply(redacted_summary: &str) -> String {
+fn suspended_approval_user_reply(approval_id: ApprovalId, redacted_summary: &str) -> String {
     format!(
-        "Jatkan heti kun tämä toiminto on kuitattu (harvinainen turvapysäytys). \
-         Yhteenveto: {redacted_summary}. \
-         Operaattori voi jatkaa gatewayn kautta — popup-ilmoitusta ei lähetetä automaattisesti."
+        "BLOCKED (hyväksyntä): {redacted_summary}\n\
+         ID: `{approval_id}`\n\
+         Operaattori Discordissa: `APPROVE {approval_id}` tai `DENY {approval_id}`\n\
+         Tai gateway: POST /approvals/{approval_id}/approve"
     )
 }
 

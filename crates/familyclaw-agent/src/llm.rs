@@ -620,8 +620,8 @@ impl LlmClient {
     ///
     /// When `tools` is empty this advertises no tools (and the wire request is
     /// identical to [`Self::complete`] plus the tool-aware response parse).
-    /// `tool_choice` is set to `"auto"` whenever tools are present, letting the
-    /// model decide whether to call one.
+    /// `tool_choice` is `"auto"` by default when tools are present; callers may
+    /// pass `"required"` to force at least one tool call (action-request escalation).
     ///
     /// # Errors
     /// Returns an error if the HTTP request fails or the response is invalid.
@@ -629,6 +629,16 @@ impl LlmClient {
         &self,
         messages: &[LlmMessage],
         tools: &[ToolDefinition],
+    ) -> Result<CompletionResult, LlmError> {
+        self.complete_with_tools_choice(messages, tools, None).await
+    }
+
+    /// Like [`Self::complete_with_tools`] with explicit OpenAI `tool_choice`.
+    pub async fn complete_with_tools_choice(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[ToolDefinition],
+        tool_choice: Option<&str>,
     ) -> Result<CompletionResult, LlmError> {
         // Validate every tool BEFORE sending — a malformed name/schema is a
         // deterministic config error, caught at the boundary, not on the wire.
@@ -643,7 +653,14 @@ impl LlmClient {
             messages,
             max_tokens: self.config.max_tokens,
             tools: tools.iter().map(ToolEnvelope::from).collect(),
-            tool_choice: if tools.is_empty() { None } else { Some("auto") },
+            tool_choice: if tools.is_empty() {
+                None
+            } else {
+                Some(match tool_choice {
+                    Some("required") => "required",
+                    _ => "auto",
+                })
+            },
         };
 
         let response = self
