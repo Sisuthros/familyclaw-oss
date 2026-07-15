@@ -56,6 +56,7 @@ pub mod error;
 pub mod file;
 pub mod journal;
 pub mod memory;
+pub mod time_machine;
 
 pub use context::DurableContext;
 pub use entry::{EntryKind, JournalEntry, StepId};
@@ -63,6 +64,10 @@ pub use error::{DurableError, Result};
 pub use file::FileJournal;
 pub use journal::Journal;
 pub use memory::InMemoryJournal;
+pub use time_machine::{
+    DryRunRecorder, RecordedIntent, StepDiff, StepOutcome, TimeMachine, Timeline, TimelineDiff,
+    TimelineStep, FORK_MARKER,
+};
 
 /// Craten versio build-aikana (`CARGO_PKG_VERSION`).
 #[must_use]

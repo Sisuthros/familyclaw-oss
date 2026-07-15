@@ -305,14 +305,14 @@ pub fn operator_status_report(home: &Path) -> String {
     for (label, path) in files {
         if path.exists() {
             let meta = std::fs::metadata(&path).ok();
-            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let mtime = meta
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| {
+            let size = meta.as_ref().map_or(0, std::fs::Metadata::len);
+            let mtime = meta.and_then(|m| m.modified().ok()).map_or_else(
+                || "?".to_string(),
+                |t| {
                     let dt: chrono::DateTime<chrono::Utc> = t.into();
-                    Some(dt.format("%Y-%m-%d %H:%M UTC").to_string())
-                })
-                .unwrap_or_else(|| "?".to_string());
+                    dt.format("%Y-%m-%d %H:%M UTC").to_string()
+                },
+            );
             lines.push(format!("- `{label}`: {size} B, mtime {mtime}"));
         } else {
             lines.push(format!("- `{label}`: **puuttuu**"));

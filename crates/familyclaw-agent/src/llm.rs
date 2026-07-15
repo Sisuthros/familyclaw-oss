@@ -633,7 +633,7 @@ impl LlmClient {
         self.complete_with_tools_choice(messages, tools, None).await
     }
 
-    /// Like [`Self::complete_with_tools`] with explicit OpenAI `tool_choice`.
+    /// Like [`Self::complete_with_tools`] with explicit `OpenAI` `tool_choice`.
     pub async fn complete_with_tools_choice(
         &self,
         messages: &[LlmMessage],

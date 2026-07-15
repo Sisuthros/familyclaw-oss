@@ -1595,7 +1595,7 @@ impl Agent {
                         .map_err(|e| FamilyClawError::llm(e.to_string()))?;
                     let mut content = result.content;
                     let mut tool_calls_opt = result.tool_calls;
-                    let no_tools = tool_calls_opt.as_ref().map_or(true, |c| c.is_empty());
+                    let no_tools = tool_calls_opt.as_ref().is_none_or(Vec::is_empty);
                     if no_tools
                         && iteration == 0
                         && dispatch_index == dispatch_base
@@ -1872,7 +1872,7 @@ impl Agent {
     }
 
     /// Disk-backed operator status (no LLM theater).
-    async fn execute_operator_status_bootstrap(&mut self, step_name: &str) -> Result<String> {
+    fn execute_operator_status_bootstrap(&mut self, step_name: &str) -> Result<String> {
         let bootstrap_step = format!("{step_name}-operator-status");
         if self.durable.is_replaying() {
             return self
@@ -1898,7 +1898,7 @@ impl Agent {
         Ok(reply)
     }
 
-    /// Handles operator APPROVE/DENY chat commands via ActionRuntime.
+    /// Handles operator APPROVE/DENY chat commands via `ActionRuntime`.
     async fn handle_operator_approval_command(
         &self,
         message: &BusMessage,
@@ -3172,7 +3172,7 @@ impl Agent {
             && !self.durable.is_replaying()
             && crate::identity::operator_status_message(message, origin)
         {
-            match self.execute_operator_status_bootstrap(&step_name).await {
+            match self.execute_operator_status_bootstrap(&step_name) {
                 Ok(reply) => Some(reply),
                 Err(e) => {
                     warn!("operator status bootstrap failed (non-fatal): {e}");
@@ -3182,13 +3182,13 @@ impl Agent {
         } else {
             None
         };
-        let operator_approval_response = if !self.durable.is_replaying() {
+        let operator_approval_response = if self.durable.is_replaying() {
+            None
+        } else {
             match self.handle_operator_approval_command(message, origin).await {
                 Ok(reply) => reply,
                 Err(e) => Some(format!("Approval command failed: {e}")),
             }
-        } else {
-            None
         };
         // Operator diagnostics fast path + brief ping fast path:
         // skip LLM when we can answer deterministically.

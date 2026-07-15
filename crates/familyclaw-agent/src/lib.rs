@@ -69,6 +69,7 @@ pub mod identity;
 pub mod live_executor;
 pub mod llm;
 pub mod llm_chain;
+pub mod replay_cli;
 pub mod resumable;
 pub mod session;
 pub mod soul;
@@ -85,6 +86,7 @@ pub use live_executor::LiveTurnExecutor;
 pub use llm_chain::{
     build_llm_chain, primary_llm_config, EnvEndpointResolver, LlmEndpointResolver, LlmFailover,
 };
+pub use replay_cli::{ReplayCommand, ReplayError};
 pub use resumable::{
     InMemoryResumableStore, JournalResumableStore, ResumableError, ResumableTurn,
     ResumableTurnStore,

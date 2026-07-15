@@ -61,6 +61,17 @@ pub enum DurableError {
         /// Sulkimen palauttama virheviesti.
         message: String,
     },
+
+    /// Timeline-haarautus (fork) epäonnistui — esim. leikkauspiste on lokin
+    /// askelmäärän ulkopuolella tai kohdejournal ei ollut tyhjä.
+    ///
+    /// Fork on **fail-closed**: epäselvässä tilanteessa haarautus kieltäytyy
+    /// sen sijaan että tuottaisi hiljaa vääränmuotoisen aikajanan.
+    #[error("invalid timeline fork: {reason}")]
+    InvalidFork {
+        /// Ihmisluettava syy miksi haarautus hylättiin.
+        reason: String,
+    },
 }
 
 impl DurableError {
@@ -76,6 +87,13 @@ impl DurableError {
     pub fn corrupt(line: u64, reason: impl Into<String>) -> Self {
         Self::CorruptEntry {
             line,
+            reason: reason.into(),
+        }
+    }
+
+    /// Rakentaa [`DurableError::InvalidFork`]-variantin.
+    pub fn invalid_fork(reason: impl Into<String>) -> Self {
+        Self::InvalidFork {
             reason: reason.into(),
         }
     }

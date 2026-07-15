@@ -1793,6 +1793,7 @@ name = "familyclaw-growth"
 version = "1.2.0"
 dependencies = [
  "familyclaw-core",
+ "familyclaw-durable",
  "serde",
  "serde_json",
  "sha2",

@@ -58,6 +58,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+pub mod evidence;
+
+pub use evidence::{
+    evaluate_for_approval, EvidenceLedger, EvidenceVerdict, ImprovementMetric, ReplayEvidence,
+};
+
 /// Ehdotuksen yksilöivä tunniste.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ProposalId(Uuid);

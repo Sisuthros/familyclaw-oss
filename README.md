@@ -358,6 +358,57 @@ the others hand you a ready-made contract to wire your own provider into.
 
 ---
 
+## Time Machine: rewind, fork, and prove an improvement
+
+The durable journal is append-only and replay is deterministic, so any past
+workflow can be **inspected**, **forked**, and **diffed** without ever
+touching the original run:
+
+- **Inspect** — `familyclaw_durable::Timeline` decodes a journal into a
+  human-readable step list (what happened, in what order, what succeeded or
+  failed) — a black-box reader over the raw log.
+- **Fork with audit marker** — `TimeMachine::fork` copies the timeline's
+  prefix into a new journal and cuts it at a chosen step. The fork replays
+  deterministically up to the cut point, then runs fresh from there. Every
+  fork writes a `timeline_forked` audit row recording how many steps were
+  kept vs. the source total, so a forked timeline's origin is always
+  provable from the log itself.
+- **Counterfactual dry-run** — `DryRunRecorder` captures *intended* external
+  side effects as intents. The type has **no dispatch path by construction**:
+  a captured intent can never reach a real external system through it. Same
+  fail-closed principle as the rest of the platform — safety from structure,
+  not policy.
+- **Timeline diff** — `TimeMachine::diff` compares two timelines step by
+  step and produces a deterministic, serializable report: what stayed the
+  same, what changed, where the timelines diverged.
+
+CLI (`familyclaw` binary, `crates/familyclaw-agent/src/replay_cli.rs`):
+
+```bash
+# Inspect a journal (Markdown by default, --json for machine output)
+cargo run -p familyclaw-agent --bin familyclaw -- replay inspect --journal run.jsonl
+
+# Fork at step 5, write the new branch to a fresh journal (fails if --out exists)
+cargo run -p familyclaw-agent --bin familyclaw -- replay fork --journal run.jsonl --keep 5 --out forked.jsonl
+
+# Diff two timelines
+cargo run -p familyclaw-agent --bin familyclaw -- replay diff --before a.jsonl --after b.jsonl
+```
+
+**Replay-proven promotion evidence** (`familyclaw-growth::evidence`) builds on
+the same primitives: a growth-loop promotion proposal can attach a
+`TimelineDiff` between a baseline and a candidate run, and a caller-supplied
+`ImprovementMetric` decides — and records *why* — whether the candidate
+improved. Missing evidence or a measured regression yields an
+`EvidenceVerdict::insufficient`, fail-closed. This evidence layer does not
+grant approval by itself and — like the rest of `familyclaw-growth` — has
+**no apply path**: it can inform an operator's approve/deny decision but
+cannot mutate any skill, policy, or permission on its own.
+
+See [STATUS.md](STATUS.md) ("Time Machine" row) for verification status.
+
+---
+
 ## Loading Your Own Family (Layer B)
 
 After the public demo works, load private profiles at runtime — **they never live in the repo**:

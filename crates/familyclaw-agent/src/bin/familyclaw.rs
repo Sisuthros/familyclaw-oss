@@ -10,11 +10,23 @@
 //! 7. Shows memory decay vs identity anchors
 //!
 //! Run with: `cargo run -p familyclaw-agent`
+//!
+//! ## Alikomennot
+//! Ilman argumentteja binääri ajaa yllä kuvatun demon. Lisäksi se tarjoaa
+//! `replay`-alikomentoperheen durable-journalien tarkasteluun
+//! (Time Machine — ks. [`familyclaw_agent::replay_cli`]):
+//!
+//! ```text
+//! familyclaw replay inspect --journal <path> [--json]
+//! familyclaw replay fork    --journal <path> --keep <N> --out <path>
+//! familyclaw replay diff    --before <path> --after <path> [--json]
+//! familyclaw replay demo    [--dir <path>]
+//! ```
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use familyclaw_agent::{publish_envelope, Agent, ErasedMemoryStore, Soul};
+use familyclaw_agent::{publish_envelope, replay_cli, Agent, ErasedMemoryStore, Soul};
 use familyclaw_bus::{BeingId, BusHandle, BusMessage, ResonanceBus};
 use familyclaw_channels::{Channel, ChannelKind, InboundMessage, MockChannel};
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
@@ -77,9 +89,50 @@ async fn report_memory(name: &str, mem: &ErasedMemoryStore, query: &str) -> Resu
     Ok(())
 }
 
+/// Käsittelee `replay`-alikomennon jos ensimmäinen argumentti on `replay`.
+///
+/// Palauttaa `Some(exit_code)` kun alikomento tunnistettiin ja suoritettiin
+/// (jolloin kutsuja poistuu ilman että demoa ajetaan), tai `None` kun
+/// argumentteja ei ollut tai ne kuuluvat demolle. Time Machine -polku on
+/// kokonaan synkroninen, joten se ei tarvitse tokio-ajastinta.
+///
+/// Fail-closed: virheellinen syöte tulostaa selkeän virheviestin + usage-
+/// tekstin `stderr`:iin ja palauttaa nollasta poikkeavan paluukoodin. Ei
+/// koskaan paniikkia.
+fn try_handle_replay() -> Option<i32> {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("replay") => Some(run_replay(args)),
+        _ => None,
+    }
+}
+
+/// Suorittaa `replay`-alikomennon jäljellä olevilla argumenteilla ja palauttaa
+/// prosessin paluukoodin (`0` = onnistui).
+fn run_replay<I: Iterator<Item = String>>(args: I) -> i32 {
+    match replay_cli::run(args) {
+        Ok(output) => {
+            println!("{output}");
+            0
+        }
+        Err(err) => {
+            eprintln!("familyclaw replay: {err}\n");
+            eprintln!("{}", replay_cli::usage());
+            1
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Alikomennot ennen demoa: `replay ...` on synkroninen Time Machine -polku.
+    // Ilman argumentteja (tai muilla argumenteilla) ajetaan alla oleva demo
+    // täsmälleen kuten ennen.
+    if let Some(code) = try_handle_replay() {
+        std::process::exit(code);
+    }
+
     // Initialize tracing for info-level output
     tracing_subscriber::fmt()
         .with_env_filter(
