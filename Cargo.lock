@@ -1620,6 +1620,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "familyclaw-actions",
  "familyclaw-agent",
  "familyclaw-bus",
  "familyclaw-core",
@@ -1629,12 +1630,14 @@ dependencies = [
  "familyclaw-emotion",
  "familyclaw-hearth",
  "familyclaw-memory",
+ "familyclaw-sandbox",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wat",
 ]
 
 [[package]]

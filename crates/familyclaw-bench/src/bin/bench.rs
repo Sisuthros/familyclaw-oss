@@ -32,8 +32,8 @@ use familyclaw_bench::scenarios::{
     RetentionCurve, SemanticRetrieval, WeeklyReviewScenario,
 };
 use familyclaw_bench::{
-    BenchError, ComparativeScorecard, FamilyClawSubject, Harness, MarkdownFileSubject, Result,
-    Scenario, Scorecard,
+    run_security_suite, to_security_markdown, BenchError, ComparativeScorecard, FamilyClawSubject,
+    Harness, MarkdownFileSubject, Result, Scenario, Scorecard,
 };
 use familyclaw_core::time;
 
@@ -47,10 +47,12 @@ const FIXED_CLOCK_RFC3339: &str = "2026-06-04T12:00:00Z";
 #[derive(Parser)]
 #[command(name = "bench", about = "FamilyClaw continuity benchmark harness")]
 struct Cli {
-    /// Ajettava skenaario tunnisteella, `all` kaikille FamilyClawlla, tai
+    /// Ajettava skenaario tunnisteella, `all` kaikille FamilyClawlla,
     /// `compare` ajamaan kaikki skenaariot **molemmilla** subjekteilla
     /// (FamilyClaw vs kilpailijan-muotoinen perustaso) ja kirjoittamaan
-    /// vertailuraportti (esim. `s1`, `all`, `compare`).
+    /// vertailuraportti, tai `security` ajamaan turvaskenaariosarja SEC1–SEC4
+    /// (fuel-, capability-, SSRF- ja hyväksyntäportti) ja kirjoittamaan
+    /// SECURITY_SCORECARD (esim. `s1`, `all`, `compare`, `security`).
     #[arg(value_name = "SCENARIO")]
     scenario: String,
 }
@@ -75,6 +77,14 @@ async fn main() -> Result<()> {
     // vertailuraportin; muut tunnisteet ajavat vain FamilyClawn (kuten ennen).
     if cli.scenario == "compare" {
         return run_compare(clock).await;
+    }
+
+    // `security` ajaa turvaskenaariosarjan (SEC1–SEC4) ja kirjoittaa
+    // SECURITY_SCORECARD.md + json. Se EI tarvitse continuity_daemon-binääriä
+    // (ajetaan kokonaan in-process oikeaa sandbox/actions-rajapintaa vasten),
+    // joten se ohittaa `ensure_daemon_env`:in kuten `compare`.
+    if cli.scenario == "security" {
+        return run_security(clock).await;
     }
 
     // Valitse ajettavat skenaariot tunnisteen perusteella.
@@ -163,6 +173,71 @@ async fn run_compare(clock: familyclaw_core::Timestamp) -> Result<()> {
         tracing::warn!("comparison complete: FamilyClaw advantage NOT established this run");
     }
 
+    Ok(())
+}
+
+/// Ajaa turvaskenaariosarjan (SEC1–SEC4) ja kirjoittaa turva-scorecardin.
+///
+/// Sarja ajetaan kokonaan in-process oikeaa sandbox/actions-rajapintaa vasten
+/// (ei daemonia). Tuloste kirjoitetaan `out/SECURITY_SCORECARD.md` +
+/// `out/security_scorecard.json` (sekä kopio `docs/SECURITY_SCORECARD.md`).
+/// Prosessi palauttaa `Err`:n jos jokin skenaario ei läpäissyt, jotta CI voi
+/// portittaa tähän (sama kuvio kuin jatkuvuusbenchissä).
+///
+/// # Errors
+/// [`BenchError`] jos skenaario ei voi suorittua tai kirjoitus epäonnistuu, tai
+/// jos yksikin turvaskenaario epäonnistui (`passed = false`).
+async fn run_security(clock: familyclaw_core::Timestamp) -> Result<()> {
+    tracing::info!(
+        clock = %FIXED_CLOCK_RFC3339,
+        "running SECURITY benchmark (SEC1 fuel, SEC2 capability, SEC3 SSRF, SEC4 approval)"
+    );
+
+    let card = run_security_suite(clock).await?;
+
+    write_security_outputs(&card)?;
+
+    // Tulosta turva-markdown stdoutiin (ihmiselle).
+    println!("{}", to_security_markdown(&card));
+
+    if card.all_passed() {
+        tracing::info!("security benchmark complete: ALL SCENARIOS PASSED (0 escapes)");
+        Ok(())
+    } else {
+        // CI-portti: epäonnistunut turvaskenaario epäonnistuttaa prosessin.
+        tracing::error!("security benchmark complete: SOME SCENARIOS FAILED");
+        Err(BenchError::scenario(
+            "security benchmark failed: one or more scenarios did not pass",
+        ))
+    }
+}
+
+/// Kirjoittaa turva-scorecardin `out/`-hakemistoon ja julkiseen `docs/`:iin.
+///
+/// # Errors
+/// [`BenchError::Io`]/[`BenchError::Serde`] jos kirjoitus tai sarjallistus epäonnistuu.
+fn write_security_outputs(card: &Scorecard) -> Result<()> {
+    let root = workspace_crate_root();
+    let out_dir = root.join("out");
+    std::fs::create_dir_all(&out_dir)?;
+
+    let json = card.to_json()?;
+    let md = to_security_markdown(card);
+
+    write_atomic(&out_dir.join("security_scorecard.json"), json.as_bytes())?;
+    write_atomic(&out_dir.join("SECURITY_SCORECARD.md"), md.as_bytes())?;
+
+    // Julkinen artefakti repon `docs/`-hakemistoon (rinnan SCORECARD.md:n kanssa).
+    if let Some(docs_dir) = root
+        .parent()
+        .and_then(Path::parent)
+        .map(|ws| ws.join("docs"))
+    {
+        std::fs::create_dir_all(&docs_dir)?;
+        write_atomic(&docs_dir.join("SECURITY_SCORECARD.md"), md.as_bytes())?;
+    }
+
+    tracing::info!(out = %out_dir.display(), "security scorecard written");
     Ok(())
 }
 

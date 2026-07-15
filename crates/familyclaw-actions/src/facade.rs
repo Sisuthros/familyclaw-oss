@@ -52,8 +52,9 @@ use crate::policy::{ActionRisk, SkillPermission};
 use crate::proof::ProofBundle;
 use crate::skills::{
     DiscordThreadSummaryMock, EmailTriageMock, FilePatchApply, FileWriteAllowlisted,
-    FileWriteConfig, FsReadAllowlisted, FsReadConfig, GithubIssueSkill, Pipeline, ResearchSkill,
-    ScheduleTaskSkill, ShellExec, ShellExecConfig, Skill, WebFetchSkill, WebSearchSkill,
+    FileWriteConfig, FsReadAllowlisted, FsReadConfig, GithubIssueDraftMock, Pipeline,
+    ResearchSkill, ScheduleTaskSkill, ShellExec, ShellExecConfig, Skill, WebFetchSkill,
+    WebSearchSkill,
 };
 use crate::task::{ActionTask, DurableTaskQueue, TaskQueue, TaskStatus};
 
@@ -635,7 +636,15 @@ impl ActionRuntime {
         shell_exec_config: Option<ShellExecConfig>,
     ) -> Result<()> {
         self.register_skill(EmailTriageMock::new())?;
-        self.register_skill(GithubIssueSkill::new())?;
+        // github_issue_draft on aito, tunnuksettomani taito: se tuottaa luonnoksen
+        // ja voi tallentaa sen allowlistattuun artefaktiin (ei verkkokutsua). Sama
+        // KERROS B -allowlist kuin file_write; kirjoitus pysyy hyväksynnän takana
+        // (WriteExternal + RequireApproval).
+        let issue_draft = match file_write_config.clone() {
+            Some(config) => GithubIssueDraftMock::with_config(config),
+            None => GithubIssueDraftMock::new(),
+        };
+        self.register_skill(issue_draft)?;
         self.register_skill(DiscordThreadSummaryMock::new())?;
         let file_patch = match file_write_config.clone() {
             Some(config) => FilePatchApply::with_config(config),
