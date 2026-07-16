@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(a.local_read(), MesiState::Shared);
         // A kirjoittaa: Shared → Modified (B pitäisi mitätöidä, mutta B oli I).
         assert_eq!(a.local_write(), MesiState::Modified);
-        assert!(b.state() == MesiState::Invalid);
+        assert_eq!(b.state(), MesiState::Invalid);
 
         // B lukee → snooppaa A:n: A Modified → Shared (write-back), B → Shared.
         let a_out = a.remote_read();
