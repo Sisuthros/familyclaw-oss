@@ -66,6 +66,7 @@ pub mod agent;
 pub mod channel_bridge;
 pub mod grounding;
 pub mod identity;
+pub mod import_cli;
 pub mod live_executor;
 pub mod llm;
 pub mod llm_chain;
@@ -82,6 +83,7 @@ pub use agent::{
 pub use channel_bridge::{
     envelope_origin, envelope_to_bus_message, publish_envelope, pump_channel_to_bus,
 };
+pub use import_cli::{ImportCommand, ImportError, ImportSource, ImportedBundle};
 pub use live_executor::LiveTurnExecutor;
 pub use llm_chain::{
     build_llm_chain, primary_llm_config, EnvEndpointResolver, LlmEndpointResolver, LlmFailover,

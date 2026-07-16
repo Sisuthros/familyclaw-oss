@@ -22,11 +22,19 @@
 //! familyclaw replay diff    --before <path> --after <path> [--json]
 //! familyclaw replay demo    [--dir <path>]
 //! ```
+//!
+//! sekä `import`-alikomennon toisen ajoympäristön datan migraatioon
+//! (ks. [`familyclaw_agent::import_cli`]) — tuodut taidot menevät
+//! **karanteeniin** eivätkä koskaan aktivoidu:
+//!
+//! ```text
+//! familyclaw import --from openclaw|hermes --input <path> [--out <dir>] [--json]
+//! ```
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use familyclaw_agent::{publish_envelope, replay_cli, Agent, ErasedMemoryStore, Soul};
+use familyclaw_agent::{import_cli, publish_envelope, replay_cli, Agent, ErasedMemoryStore, Soul};
 use familyclaw_bus::{BeingId, BusHandle, BusMessage, ResonanceBus};
 use familyclaw_channels::{Channel, ChannelKind, InboundMessage, MockChannel};
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
@@ -107,6 +115,39 @@ fn try_handle_replay() -> Option<i32> {
     }
 }
 
+/// Käsittelee `import`-alikomennon jos ensimmäinen argumentti on `import`.
+///
+/// Palauttaa `Some(exit_code)` kun alikomento tunnistettiin ja suoritettiin,
+/// tai `None` muutoin. Migraatiopolku on synkroninen (ei tokio-ajastinta).
+///
+/// Fail-closed: virheellinen syöte tulostaa selkeän virheviestin + usage-
+/// tekstin `stderr`:iin ja palauttaa nollasta poikkeavan paluukoodin. Ei
+/// koskaan paniikkia. **Turvallisuus:** tuodut taidot menevät karanteeniin
+/// eivätkä koskaan rekisteröidy tai suoritu.
+fn try_handle_import() -> Option<i32> {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("import") => Some(run_import(args)),
+        _ => None,
+    }
+}
+
+/// Suorittaa `import`-alikomennon jäljellä olevilla argumenteilla ja palauttaa
+/// prosessin paluukoodin (`0` = onnistui).
+fn run_import<I: Iterator<Item = String>>(args: I) -> i32 {
+    match import_cli::run(args) {
+        Ok(output) => {
+            println!("{output}");
+            0
+        }
+        Err(err) => {
+            eprintln!("familyclaw import: {err}\n");
+            eprintln!("{}", import_cli::usage());
+            1
+        }
+    }
+}
+
 /// Suorittaa `replay`-alikomennon jäljellä olevilla argumenteilla ja palauttaa
 /// prosessin paluukoodin (`0` = onnistui).
 fn run_replay<I: Iterator<Item = String>>(args: I) -> i32 {
@@ -130,6 +171,12 @@ async fn main() -> Result<()> {
     // Ilman argumentteja (tai muilla argumenteilla) ajetaan alla oleva demo
     // täsmälleen kuten ennen.
     if let Some(code) = try_handle_replay() {
+        std::process::exit(code);
+    }
+
+    // `import ...` on synkroninen migraatiopolku (OpenClaw/Hermes → FamilyClaw).
+    // Tuodut taidot menevät karanteeniin; muistot saavat matalan luottamuksen.
+    if let Some(code) = try_handle_import() {
         std::process::exit(code);
     }
 
