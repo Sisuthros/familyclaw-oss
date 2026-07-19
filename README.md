@@ -1,6 +1,6 @@
 # FamilyClaw
 
-<!-- TODO(launch): demo GIF — record scripts/demo-crash-replay.sh with asciinema -->
+![Crash replay demo: write memory, kill the process, restart, memory survives](docs/demo-crash-replay.gif)
 
 **A Rust agent runtime where in-flight work survives a crash — at-most-once external side effects, durable memory, contract-checked coordination.**
 
