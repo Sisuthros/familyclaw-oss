@@ -1,29 +1,29 @@
 # familyclaw-core
 
-FamilyClaw-alustan ydincrate: yhteiset tyypit, virheenkäsittely,
-konfiguraatio ja ajan apufunktiot. Tämä on KERROS A:n (OSS) perustus, jonka
-päälle kaikki muut crateit rakentuvat. Riippumaton muista familyclaw-crateista.
+The FamilyClaw platform's core crate: shared types, error handling,
+configuration, and time helpers. This is the Layer A (OSS) foundation on
+which all other crates are built. Independent of other familyclaw crates.
 
-## Sisältö
+## Contents
 
-| Moduuli | Vastuu |
+| Module | Responsibility |
 |---------|--------|
-| `error` | `FamilyClawError` (thiserror) + `Result<T>` — config/io/serde/bus/memory/not-found/invalid-input -variantit |
-| `ids` | `AgentId`, `FamilyId`, `MessageId` — UUID-pohjaiset newtype-tunnisteet (serde-transparent) |
-| `config` | `FamilyConfig`, `AgentConfig`, `ModelConfig` — ladattavissa JSON:sta, validointi mukana |
-| `time` | UTC-aikaleimat (`Timestamp`), RFC 3339 / Unix -muunnokset |
+| `error` | `FamilyClawError` (thiserror) + `Result<T>` — config/io/serde/bus/memory/not-found/invalid-input variants |
+| `ids` | `AgentId`, `FamilyId`, `MessageId` — UUID-based newtype identifiers (serde-transparent) |
+| `config` | `FamilyConfig`, `AgentConfig`, `ModelConfig` — loadable from JSON, with validation |
+| `time` | UTC timestamps (`Timestamp`), RFC 3339 / Unix conversions |
 
-## Periaatteet
+## Principles
 
-- **Ei `unwrap()`/`expect()`/`panic!()` tuotantopolulla.** Kaikki virheet
-  kulkevat `Result`-tyypin kautta.
-- **Tyypitetyt tunnisteet** estävät tunnisteiden sekoittamisen
-  käännösaikana.
-- **OSS-raja (KERROS A):** ei kovakoodattuja sieluja, avaimia, tokeneita,
-  IP-osoitteita tai henkilökohtaisia polkuja. Agenttiprofiilit ladataan
-  ajonaikaisesti (`AgentConfig::profile_dir`, vrt. `FAMILYCLAW_PROFILE_DIR`).
+- **No `unwrap()`/`expect()`/`panic!()` on the production path.** All
+  errors flow through the `Result` type.
+- **Typed identifiers** prevent identifiers from being mixed up at
+  compile time.
+- **OSS boundary (Layer A):** no hardcoded souls, keys, tokens, IP
+  addresses, or personal paths. Agent profiles are loaded at runtime
+  (`AgentConfig::profile_dir`, cf. `FAMILYCLAW_PROFILE_DIR`).
 
-## Esimerkki
+## Example
 
 ```rust
 use familyclaw_core::{AgentConfig, FamilyConfig, ModelConfig};
@@ -35,4 +35,4 @@ let family = FamilyConfig::new("demo_family").with_agent(AgentConfig::new(
 family.validate().expect("valid config");
 ```
 
-Lisenssi: MIT.
+License: MIT.

@@ -1,18 +1,17 @@
-//! RED-TEAM: partial-fsync / OS-buffer-loss -hyökkäys durable-journaalia vastaan.
+//! RED-TEAM: a partial-fsync / OS-buffer-loss attack against the durable journal.
 //!
-//! Hyökkäyksen väite jota yritetään RIKKOA (design §5):
+//! The claim under attack, which we try to BREAK (design §5):
 //! *"kill mid-task -> resumes exact step, side-effects exactly once,
-//! never silently wrong"* — myös kun OS-bufferi katoaa ja journal-tiedosto
-//! typistyy **keskelle JSON-entryä** (ei vain repeytynyt viimeinen RIVI vaan
-//! repeytynyt viimeinen TAVU), TAI kun keskimmäinen rivi N on roskaa.
+//! never silently wrong"* — even when the OS buffer is lost and the journal
+//! file is truncated **mid-JSON-entry** (not just a torn last LINE but a torn
+//! last BYTE), OR when an interior line N is garbage.
 //!
-//! Vaatimus: palautuu viimeiseen ehjään askeleeseen ILMAN sivuvaikutusten
-//! toistoa, TAI epäonnistuu ÄÄNEKKÄÄSTI ([`DurableError::CorruptEntry`]).
-//! EI KOSKAAN hiljaa väärin.
+//! Requirement: recover to the last intact step WITHOUT replaying side
+//! effects, OR fail LOUDLY ([`DurableError::CorruptEntry`]). NEVER silently wrong.
 //!
-//! Tämä testi ajaa OIKEAA tuotantokoodia: [`FileJournal`] + [`DurableContext`]
-//! `familyclaw-durable`-cratesta. Kello injektoidaan [`Timestamp`]-arvona,
-//! järjestelmäkelloa ei lueta (design §2.2).
+//! This test runs REAL production code: [`FileJournal`] + [`DurableContext`]
+//! from the `familyclaw-durable` crate. The clock is injected as a
+//! [`Timestamp`] value; the system clock is never read (design §2.2).
 
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
@@ -21,8 +20,8 @@ use std::path::{Path, PathBuf};
 
 use familyclaw_durable::{DurableContext, DurableError, FileJournal, Journal};
 
-/// RAII-temp-tiedosto ilman ulkoisia crateja (sama malli kuin durable-craten
-/// omat testit). Siivoaa myös oheistiedostot.
+/// RAII temp file without external crates (same pattern as the durable
+/// crate's own tests). Also cleans up sidecar files.
 struct TempPath(PathBuf);
 
 impl TempPath {
@@ -51,12 +50,12 @@ impl Drop for TempPath {
     }
 }
 
-/// Ajaa kolmen askeleen workflow'n annettua journalia vasten, kasvattaen
-/// `effects`-laskuria joka kerta kun suljin OIKEASTI ajetaan (= sivuvaikutus).
-/// Replayssa suljinta EI pitäisi ajaa → laskuri ei kasva.
+/// Runs a three-step workflow against the given journal, incrementing the
+/// `effects` counter every time the closure is REALLY run (= a side effect).
+/// During replay the closure should NOT run → the counter does not increase.
 ///
-/// Palauttaa kolmen askeleen summan tuloksena (deterministinen: 1+2+3 = 6 kun
-/// kaikki kolme ajetaan).
+/// Returns the sum of the three steps as the result (deterministic: 1+2+3 = 6
+/// when all three run).
 fn run_workflow<J: Journal>(journal: J, effects: &Cell<u32>) -> familyclaw_durable::Result<i64> {
     let mut ctx = DurableContext::new(journal)?;
     let a: i64 = ctx.step("alpha", || {
@@ -74,8 +73,8 @@ fn run_workflow<J: Journal>(journal: J, effects: &Cell<u32>) -> familyclaw_durab
     Ok(c)
 }
 
-/// Typistää tiedoston annettuun tavupituuteen (simuloi OS-bufferin menetystä
-/// ennen viimeisen entryn fsyncia: tiedosto loppuu KESKELLE JSON-entryä).
+/// Truncates the file to the given byte length (simulates loss of the OS
+/// buffer before the last entry's fsync: the file ends MID-JSON-entry).
 fn truncate_to(path: &Path, len: u64) {
     let f = OpenOptions::new()
         .write(true)
@@ -85,7 +84,7 @@ fn truncate_to(path: &Path, len: u64) {
     f.sync_all().expect("sync truncate");
 }
 
-/// Lukee tiedoston tavut.
+/// Reads the file's bytes.
 fn read_bytes(path: &Path) -> Vec<u8> {
     let mut f = File::open(path).expect("open for read");
     let mut buf = Vec::new();
@@ -93,35 +92,35 @@ fn read_bytes(path: &Path) -> Vec<u8> {
     buf
 }
 
-/// ATTACK 1 — torn mid-JSON: typistä journal KESKELLE viimeistä entryä
-/// (ei rivinvaihtorajalla). Toinen askel "beta" jää puoliksi levylle.
+/// ATTACK 1 — torn mid-JSON: truncate the journal MID the last entry (not on
+/// a newline boundary). The second step "beta" is left half-written to disk.
 ///
-/// Väite: replay palautuu viimeiseen EHJÄÄN askeleeseen ("alpha") ja jatkaa
-/// loppuun ilman että "alpha":n sivuvaikutus toistuu.
+/// Claim: replay recovers to the last INTACT step ("alpha") and continues to
+/// completion without "alpha"'s side effect repeating.
 #[test]
 fn attack_torn_mid_json_recovers_to_last_good_step() {
     let tmp = TempPath::new("torn-mid-json");
 
-    // Vaihe 1: kirjoita kaksi ehjää askelta fsyncattuna.
+    // Step 1: write two intact steps, fsynced.
     {
         let mut j = FileJournal::open(tmp.path()).expect("open");
         let mut ctx = DurableContext::new(j).expect("ctx");
-        // Aja vain kaksi askelta käsin niin tunnemme tarkat tavurajat.
+        // Run only two steps by hand so we know the exact byte boundaries.
         let _a: i64 = ctx.step("alpha", || Ok(1)).expect("alpha");
         let _b: i64 = ctx.step("beta", || Ok(3)).expect("beta");
         j = ctx.finish();
-        // Varmista että molemmat ovat levyllä.
+        // Make sure both are on disk.
         assert_eq!(j.replay_all().expect("replay").len(), 2);
     }
 
-    // Etsi toisen rivin rivinvaihdon tavu-offset.
+    // Find the byte offset of the second line's newline.
     let bytes = read_bytes(tmp.path());
     let first_nl = bytes
         .iter()
         .position(|&b| b == b'\n')
         .expect("first newline exists");
-    // Typistä KESKELLE toista entryä: ensimmäinen rivi + sen \n + muutama
-    // tavu toisesta entrystä, mutta EI sen rivinvaihtoa → torn mid-JSON.
+    // Truncate MID the second entry: the first line + its \n + a few bytes
+    // of the second entry, but NOT its newline → torn mid-JSON.
     let torn_len = (first_nl as u64) + 1 + 6;
     assert!(
         torn_len < bytes.len() as u64,
@@ -129,7 +128,7 @@ fn attack_torn_mid_json_recovers_to_last_good_step() {
     );
     truncate_to(tmp.path(), torn_len);
 
-    // Varmista todella: viimeinen tavu EI ole rivinvaihto (= repeytynyt).
+    // Actually verify: the last byte is NOT a newline (= torn).
     let after = read_bytes(tmp.path());
     assert_ne!(
         *after.last().expect("nonempty"),
@@ -137,16 +136,16 @@ fn attack_torn_mid_json_recovers_to_last_good_step() {
         "torn file must NOT end in newline"
     );
 
-    // Hyökkäys: avaa uudelleen ja yritä replayta + jatkaa.
+    // Attack: reopen and try to replay + continue.
     let effects = Cell::new(0u32);
     let journal = FileJournal::open(tmp.path()).expect("reopen after tear");
 
-    // read_all_entries EI saa palauttaa hiljaa väärää dataa.
+    // read_all_entries must not silently return wrong data.
     let recovered = journal.replay_all();
     match &recovered {
         Ok(entries) => {
-            // Hyväksyttävä lopputulos A: sieti torn viimeinen rivi → vain
-            // ensimmäinen ehjä askel jää.
+            // Acceptable outcome A: tolerated the torn last line → only the
+            // first intact step survives.
             assert_eq!(
                 entries.len(),
                 1,
@@ -156,19 +155,19 @@ fn attack_torn_mid_json_recovers_to_last_good_step() {
             assert_eq!(entries[0].step_name(), Some("alpha"));
         }
         Err(DurableError::CorruptEntry { .. }) => {
-            // Hyväksyttävä lopputulos B: epäonnistui äänekkäästi. Ei hiljaa
-            // väärin → väite pitää tällöinkin.
+            // Acceptable outcome B: failed loudly. Not silently wrong → the
+            // claim holds in this case too.
         }
         Err(other) => panic!("unexpected error variant on torn mid-json: {other:?}"),
     }
 
-    // Jos replay onnistui (tapaus A), jatka workflow loppuun ja varmista että
-    // "alpha":n sivuvaikutus EI toistu (kerran-ja-vain-kerran).
+    // If replay succeeded (case A), continue the workflow to completion and
+    // verify that "alpha"'s side effect does NOT repeat (exactly-once).
     if recovered.is_ok() {
         let result = run_workflow(journal, &effects).expect("resume after tear");
         assert_eq!(result, 6, "final result must equal no-crash baseline 1+2+3");
-        // "alpha" tuli lokista (ei sivuvaikutusta); vain beta+gamma ajetaan
-        // tuoreina → täsmälleen 2 uutta sivuvaikutusta.
+        // "alpha" came from the log (no side effect); only beta+gamma run
+        // fresh → exactly 2 new side effects.
         assert_eq!(
             effects.get(),
             2,
@@ -177,17 +176,17 @@ fn attack_torn_mid_json_recovers_to_last_good_step() {
     }
 }
 
-/// ATTACK 2 — middle-line corruption: ehjä rivi N korvataan roskalla, rivi N+1
-/// on edelleen ehjä JSON. Tiedosto päättyy rivinvaihtoon (= EI repeytynyt
-/// viimeinen rivi vaan aito sisäkorruptio).
+/// ATTACK 2 — middle-line corruption: an intact line N is replaced with
+/// garbage, line N+1 is still intact JSON. The file ends in a newline (= NOT
+/// a torn last line but genuine interior corruption).
 ///
-/// Väite: TÄYTYY epäonnistua äänekkäästi ([`DurableError::CorruptEntry`]),
-/// EI palauttaa hiljaa rivin N ohittavaa "ehjää" dataa.
+/// Claim: MUST fail loudly ([`DurableError::CorruptEntry`]), must NOT
+/// silently return "intact" data that skips line N.
 #[test]
 fn attack_corrupt_middle_line_fails_loud() {
     let tmp = TempPath::new("corrupt-middle");
 
-    // Kirjoita kolme ehjää askelta.
+    // Write three intact steps.
     {
         let mut j = FileJournal::open(tmp.path()).expect("open");
         let mut ctx = DurableContext::new(j).expect("ctx");
@@ -198,8 +197,8 @@ fn attack_corrupt_middle_line_fails_loud() {
         assert_eq!(j.replay_all().expect("replay").len(), 3);
     }
 
-    // Korvaa KESKIMMÄINEN rivi (rivi 2, "beta") roskalla — säilytä rivimäärä
-    // ja rivinvaihdot. Tavut: [rivi1\n][rivi2\n][rivi3\n].
+    // Replace the MIDDLE line (line 2, "beta") with garbage — preserve the
+    // line count and newlines. Bytes: [line1\n][line2\n][line3\n].
     let bytes = read_bytes(tmp.path());
     let nl_positions: Vec<usize> = bytes
         .iter()
@@ -209,13 +208,13 @@ fn attack_corrupt_middle_line_fails_loud() {
     assert_eq!(nl_positions.len(), 3, "expected 3 newline-terminated lines");
 
     let line2_start = nl_positions[0] + 1;
-    let line2_end_inclusive_nl = nl_positions[1]; // sijainti rivin 2 \n:lle
+    let line2_end_inclusive_nl = nl_positions[1]; // position of line 2's \n
 
-    // Rakenna uusi sisältö: rivi1 + roskarivi2 + rivi3, kaikki \n-päätteisiä.
+    // Build the new content: line1 + garbage-line2 + line3, all newline-terminated.
     let mut corrupted: Vec<u8> = Vec::new();
-    corrupted.extend_from_slice(&bytes[..line2_start]); // rivi1 + \n
-    corrupted.extend_from_slice(b"{this is not valid json at all]}\n"); // roskarivi2 + \n
-    corrupted.extend_from_slice(&bytes[line2_end_inclusive_nl + 1..]); // rivi3 + \n
+    corrupted.extend_from_slice(&bytes[..line2_start]); // line1 + \n
+    corrupted.extend_from_slice(b"{this is not valid json at all]}\n"); // garbage-line2 + \n
+    corrupted.extend_from_slice(&bytes[line2_end_inclusive_nl + 1..]); // line3 + \n
 
     {
         let mut f = OpenOptions::new()
@@ -226,7 +225,7 @@ fn attack_corrupt_middle_line_fails_loud() {
         f.write_all(&corrupted).expect("write corrupted");
         f.sync_all().expect("sync corrupted");
     }
-    // Tiedosto päättyy rivinvaihtoon → EI repeytynyt viimeinen rivi.
+    // The file ends in a newline → NOT a torn last line.
     let final_bytes = read_bytes(tmp.path());
     assert_eq!(
         *final_bytes.last().expect("nonempty"),
@@ -234,7 +233,7 @@ fn attack_corrupt_middle_line_fails_loud() {
         "corrupted file ends in newline (interior corruption, not torn tail)"
     );
 
-    // Hyökkäys: replay TÄYTYY epäonnistua äänekkäästi rivillä 2.
+    // Attack: replay MUST fail loudly at line 2.
     let journal = FileJournal::open(tmp.path()).expect("reopen corrupted");
     let result = journal.replay_all();
     match result {
@@ -248,8 +247,8 @@ fn attack_corrupt_middle_line_fails_loud() {
         Err(other) => panic!("wrong error variant (must be CorruptEntry): {other:?}"),
     }
 
-    // Ja DurableContext::new TÄYTYY myös vuotaa virheen läpi (ei rakentaa
-    // kontekstia hiljaa rikkinäisestä lokista).
+    // And DurableContext::new MUST also propagate the error (not silently
+    // build a context from a broken log).
     let journal2 = FileJournal::open(tmp.path()).expect("reopen corrupted 2");
     let ctx = DurableContext::new(journal2);
     assert!(
@@ -258,13 +257,13 @@ fn attack_corrupt_middle_line_fails_loud() {
     );
 }
 
-/// ATTACK 3 — torn LAST byte mid-number: typistä yhden tavun verran niin että
-/// viimeinen entry on JSON jonka prefix on syntaktisesti laillinen mutta
-/// vajaa (klassinen partial-fsync: bufferi katkesi kesken numeron/merkkijonon).
+/// ATTACK 3 — torn LAST byte mid-number: truncate by one byte so the last
+/// entry is JSON whose prefix is syntactically legal but incomplete (a
+/// classic partial-fsync: the buffer cut off mid-number/mid-string).
 ///
-/// Tämä erikoistapaus testaa ettei "vahingossa-validi" JSON-prefiksi pääse
-/// hiljaa läpi väärällä arvolla. Väite: viimeinen torn rivi pudotetaan TAI
-/// virhe nostetaan; aiemmat askeleet säilyvät oikein.
+/// This special case tests that an "accidentally-valid" JSON prefix does not
+/// silently get through with a wrong value. Claim: the torn last line is
+/// dropped OR an error is raised; earlier steps are preserved correctly.
 #[test]
 fn attack_torn_last_byte_no_silent_wrong_value() {
     let tmp = TempPath::new("torn-last-byte");
@@ -278,15 +277,15 @@ fn attack_torn_last_byte_no_silent_wrong_value() {
         assert_eq!(j.replay_all().expect("replay").len(), 2);
     }
 
-    // Poista täsmälleen viimeinen tavu (toisen entryn päättävä \n + 0..n).
-    // Poistetaan viimeinen rivinvaihto JA yksi tavu sisältöä → torn JSON.
+    // Remove exactly the last byte (the \n + 0..n ending the second entry).
+    // This removes the last newline AND one byte of content → torn JSON.
     let bytes = read_bytes(tmp.path());
-    // Etsi viimeisen rivin alku.
+    // Find the start of the last line.
     let last_nl = bytes
         .iter()
         .rposition(|&b| b == b'\n')
         .expect("trailing newline");
-    // Typistä keskelle toista entryä: jätä ensimmäinen rivi + \n + 8 tavua.
+    // Truncate mid the second entry: keep the first line + \n + 8 bytes.
     let first_nl = bytes.iter().position(|&b| b == b'\n').expect("first nl");
     assert!(last_nl > first_nl);
     let torn_len = (first_nl as u64) + 1 + 8;
@@ -295,25 +294,25 @@ fn attack_torn_last_byte_no_silent_wrong_value() {
     let journal = FileJournal::open(tmp.path()).expect("reopen");
     match journal.replay_all() {
         Ok(entries) => {
-            // Vain ehjä alpha saa selvitä; torn beta-prefix EI saa palautua
-            // minkäänlaisena arvona.
+            // Only the intact alpha may survive; the torn beta prefix must
+            // NOT reappear as any kind of value.
             assert_eq!(entries.len(), 1, "only the intact alpha entry survives");
             assert_eq!(entries[0].step_name(), Some("alpha"));
-            // Varmista ettei mikään selvinnyt entry ole "beta" väärällä arvolla.
+            // Verify no surviving entry is "beta" with a wrong value.
             assert!(
                 entries.iter().all(|e| e.step_name() != Some("beta")),
                 "torn beta must NOT silently reappear"
             );
         }
         Err(DurableError::CorruptEntry { .. }) => {
-            // Äänekäs epäonnistuminen on myös hyväksyttävä.
+            // Failing loudly is also acceptable.
         }
         Err(other) => panic!("unexpected error on torn last byte: {other:?}"),
     }
 }
 
-/// Apuvälineiden olemassaolon varmistus (estää dead-code-varoitukset jos jokin
-/// haara ei suoriudu).
+/// A smoke check that the helpers exist (prevents dead-code warnings if some
+/// branch doesn't execute).
 #[test]
 fn helpers_smoke() {
     let tmp = TempPath::new("smoke");

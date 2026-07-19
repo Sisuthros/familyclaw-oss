@@ -1,7 +1,7 @@
-//! Mock MCP stdio -palvelin integraatiotesteille (KERROS A).
+//! Mock MCP stdio server for integration tests (Layer A).
 //!
-//! Lukee JSON-RPC-rivejä stdinistä ja vastaa `initialize`, `tools/list` ja
-//! `tools/call` -metodeihin.
+//! Reads JSON-RPC lines from stdin and responds to the `initialize`,
+//! `tools/list`, and `tools/call` methods.
 
 use std::io::{self, BufRead, Write};
 

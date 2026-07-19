@@ -1,47 +1,48 @@
 # familyclaw-dream
 
-**Dreaming — yöllinen muistikonsolidaatio (hippokampus-malli).**
+**Dreaming — nightly memory consolidation (hippocampal model).**
 
-FamilyClaw-alustan (KERROS A, OSS) "uni"-vaihe. Peilaa Anthropicin
-Dreaming-mallin (6.5.2026) ja perheen Amplifier-muistiproteesin natiiviksi
-muistin huolloksi: yöllinen `DreamCycle` lukee muistit
-[`familyclaw-memory`]-tallennuksesta ja ristiriitatiedon durable-journalista,
-ja siivoaa muistin viidessä vaiheessa.
+The "sleep" phase of the `FamilyClaw` platform (Layer A, OSS). Mirrors
+Anthropic's Dreaming model (2026-05-06) and a family's Amplifier memory
+prosthesis as native memory maintenance: a nightly `DreamCycle` reads
+memories from [`familyclaw-memory`] storage and conflict data from the
+durable journal, and cleans up memory in five phases.
 
-## Viisi vaihetta
+## Five phases
 
-1. **`merge_duplicates`** — lähes-identtiset muistot yhdistetään yhdeksi
-   vahvistetuksi edustajaksi (tunteet + tägit unioidaan, muut haudataan).
-   Samankaltaisuus on riippuvuusvapaa Jaccard-sananjoukko.
-2. **`drop_contradicted`** — durable-journalin ristiriitaisiksi merkitsemät
-   muistot haudataan. Journal on totuuden lähde — unijakso ei arvaa.
-3. **`absolutize_dates`** — suhteelliset päiväsanat ("eilen", "tomorrow")
-   muutetaan absoluuttisiksi ISO-päivämääriksi (`<sana> (YYYY-MM-DD)`).
-   Ratkaisee konkreettisesti "eilen vanhenee" -ongelman.
-4. **`consolidate`** — korkean tärkeyden muistot vahvistuvat, matalan
-   retention (R < kynnys) muistot arkistoituvat.
-5. tuottaa `DreamReport`:n johon jokainen vaihe kirjaa `Reflection`:nsa.
+1. **`merge_duplicates`** — near-identical memories are merged into a
+   single reinforced representative (emotions + tags are unioned, the
+   rest are tombstoned). Similarity is a dependency-free Jaccard word set.
+2. **`drop_contradicted`** — memories the durable journal has flagged as
+   contradicted are tombstoned. The journal is the source of truth — the
+   dream cycle doesn't guess.
+3. **`absolutize_dates`** — relative date words ("yesterday", "tomorrow")
+   are converted to absolute ISO dates (`<word> (YYYY-MM-DD)`). Concretely
+   solves the "yesterday expires" problem.
+4. **`consolidate`** — high-importance memories are reinforced, low-retention
+   (R < threshold) memories are archived.
+5. produces a `DreamReport` in which every phase records its `Reflection`.
 
-Vaiheet ajetaan kiinteässä järjestyksessä → sama syöte tuottaa saman
-raportin (deterministinen, toistettava).
+Phases run in a fixed order → the same input produces the same report
+(deterministic, repeatable).
 
-## Identiteetti-ankkurit ovat pyhiä
+## Identity anchors are sacred
 
-Mikään vaihe ei koskaan hauta tai arkistoi `ProtectedCore`-muistoa —
-identiteetti ei vaimene unessa (anchor λ = 0.0).
+No phase ever tombstones or archives a `ProtectedCore` memory — identity
+does not decay during sleep (anchor λ = 0.0).
 
-## Julkinen API
+## Public API
 
-| Tyyppi / funktio | Vastuu |
+| Type / function | Responsibility |
 |------------------|--------|
-| `DreamCycle` | unijakson moottori (`run`, `run_without_journal`) |
-| `DreamConfig` | vaiheiden kynnykset + kytkimet |
-| `DreamReport` / `Reflection` / `ReflectionKind` | tulosraportti |
-| `mark_contradicted` / `contradicted_ids` | ristiriitamerkinnät journaliin |
-| `jaccard` / `is_near_duplicate` | tekstisamankaltaisuus |
-| `absolutize` / `AbsolutizeResult` | päiväysten absolutisointi |
+| `DreamCycle` | the dream-cycle engine (`run`, `run_without_journal`) |
+| `DreamConfig` | phase thresholds + switches |
+| `DreamReport` / `Reflection` / `ReflectionKind` | result report |
+| `mark_contradicted` / `contradicted_ids` | conflict markers in the journal |
+| `jaccard` / `is_near_duplicate` | text similarity |
+| `absolutize` / `AbsolutizeResult` | date absolutization |
 
-## Esimerkki
+## Example
 
 ```rust,ignore
 use familyclaw_dream::{DreamCycle, DreamConfig};
@@ -58,10 +59,10 @@ let report = cycle.run(&journal, familyclaw_core::time::now()).await?;
 assert!(report.merged >= 1);
 ```
 
-## OSS-raja (KERROS A)
+## OSS boundary (Layer A)
 
-Geneeristä alustakoodia. Ei kovakoodattuja sieluja, kalibrointeja, avaimia,
-tokeneita, IP-osoitteita eikä henkilökohtaisia polkuja. Kaikki perhe-spesifit
-muistot ja kynnykset annetaan ajonaikaisesti.
+Generic platform code. No hardcoded souls, calibrations, keys, tokens, IP
+addresses, or personal paths. All family-specific memories and thresholds
+are supplied at runtime.
 
 [`familyclaw-memory`]: ../familyclaw-memory

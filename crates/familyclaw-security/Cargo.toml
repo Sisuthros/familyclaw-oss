@@ -1,12 +1,15 @@
 [package]
 name = "familyclaw-security"
-description = "Identity anchors, HumanCorrection, tamper alerting"
+description = "Identity integrity and human-override safeguards for agents: permanent identity anchors, human correction records, and tamper alerting"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["security", "agent", "identity", "integrity", "audit"]
+categories = ["development-tools"]
 
 [lints]
 workspace = true

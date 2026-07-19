@@ -1,62 +1,63 @@
-//! Muistin vaimeneminen: [`DecayPolicy`] ja Ebbinghaus-pohjainen retentio.
+//! Memory decay: [`DecayPolicy`] and Ebbinghaus-based retention.
 //!
-//! Muistot eivät katoa tasaisesti. Eternal Thread mallintaa unohtamista
-//! Ebbinghausin unohtamiskäyrällä — eksponentiaalinen retentio jonka
-//! nopeutta säätää muistille valittu [`DecayPolicy`]. Identiteetti-ankkurit
-//! (`ProtectedCore`, λ = 0.0) eivät koskaan vaimene; arkipäiväiset
-//! havainnot (`Fast`) haihtuvat nopeasti.
+//! Memories do not fade uniformly. Eternal Thread models forgetting using
+//! the Ebbinghaus forgetting curve — exponential retention whose rate is
+//! controlled by the [`DecayPolicy`] chosen for a memory. Identity anchors
+//! (`ProtectedCore`, λ = 0.0) never decay; everyday
+//! observations (`Fast`) fade quickly.
 //!
-//! ## Ebbinghausin malli
-//! Retentio ajanhetkellä `t` (kulunut aika sekunteina):
+//! ## Ebbinghaus model
+//! Retention at time `t` (elapsed time in seconds):
 //!
 //! ```text
 //! R(t) = e^(-λ · t / S)
 //! ```
 //!
-//! - `λ` (lambda) = politiikan vaimennusvakio (`decay_lambda`),
-//! - `S` = muistin **vahvuus** (stability), joka kasvaa tärkeyden ja
-//!   vahvistuksen myötä (suuremmat muistot säilyvät pidempään),
-//! - `R(t)` ∈ `0.0..=1.0` — jäljellä oleva retentio (1.0 = täysin tuore).
+//! - `λ` (lambda) = the policy's decay constant (`decay_lambda`),
+//! - `S` = the memory's **stability**, which grows with importance and
+//!   reinforcement (stronger memories persist longer),
+//! - `R(t)` ∈ `0.0..=1.0` — remaining retention (1.0 = fully fresh).
 //!
-//! Politiikan λ-arvot on poimittu `FamilyClaw` v2 -designista (§2.3, §5):
+//! The policy λ values are taken from the `FamilyClaw` v2 design (§2.3, §5):
 //! `ProtectedCore = 0.0`, `Slow = 0.02`, `Normal = 0.18`, `Fast = 0.5`.
 
 use serde::{Deserialize, Serialize};
 
-/// Vakausparametrin (stability `S`) yksikköskaala sekunteina.
+/// Unit scale for the stability parameter (`S`), in seconds.
 ///
-/// Vahvuus `S = 1.0` vastaa noin yhden vuorokauden aikaskaalaa: tällä
-/// arvolla retentio noudattaa puhtaasti politiikan λ:aa päivätasolla.
-/// Suurempi vahvuus venyttää muistia pidemmälle ajalle.
+/// A stability of `S = 1.0` corresponds to roughly a one-day time scale: at
+/// this value, retention follows the policy's λ purely on a daily basis.
+/// Higher stability stretches the memory over a longer time span.
 const STABILITY_TIME_SCALE_SECS: f32 = 86_400.0;
 
-/// Pienin sallittu vahvuus, jottei nollalla jaeta retentiokaavassa.
+/// Minimum allowed stability, to avoid division by zero in the retention
+/// formula.
 const MIN_STABILITY: f32 = 0.05;
 
-/// Kuinka nopeasti muisti vaimenee Ebbinghausin käyrällä.
+/// How quickly a memory decays along the Ebbinghaus curve.
 ///
-/// Jokainen variantti kantaa kiinteän λ-vaimennusvakion (`decay_lambda`).
-/// Pienempi λ = hitaampi unohtaminen. `ProtectedCore` (λ = 0.0) ei vaimene
-/// koskaan — se on identiteetti-ankkuri (design §2: `ProtectedCore`).
+/// Each variant carries a fixed λ decay constant (`decay_lambda`).
+/// A smaller λ means slower forgetting. `ProtectedCore` (λ = 0.0) never
+/// decays — it is an identity anchor (design §2: `ProtectedCore`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecayPolicy {
-    /// Identiteetin ydin — ei vaimene koskaan (λ = 0.0).
+    /// Core of identity — never decays (λ = 0.0).
     ///
-    /// Käytetään muistoille jotka muodostavat olennon identiteetin
-    /// (esim. nimi, perhe, kantava arvo). Nämä ankkurit pysyvät tuoreina
-    /// määräämättömän ajan.
+    /// Used for memories that form the entity's identity
+    /// (e.g. name, family, a core value). These anchors remain fresh
+    /// indefinitely.
     ProtectedCore,
-    /// Hidas vaimeneminen (λ = 0.02) — merkityksellinen, kestävä muisti.
+    /// Slow decay (λ = 0.02) — meaningful, durable memory.
     Slow,
-    /// Tavanomainen vaimeneminen (λ = 0.18) — Ebbinghausin perusarvo.
+    /// Ordinary decay (λ = 0.18) — the Ebbinghaus baseline value.
     Normal,
-    /// Nopea vaimeneminen (λ = 0.5) — ohimenevä, arkinen havainto.
+    /// Fast decay (λ = 0.5) — transient, everyday observation.
     Fast,
 }
 
 impl DecayPolicy {
-    /// Kaikki politiikat hitaimmasta nopeimpaan vaimenemiseen.
+    /// All policies from slowest to fastest decay.
     pub const ALL: [DecayPolicy; 4] = [
         DecayPolicy::ProtectedCore,
         DecayPolicy::Slow,
@@ -64,9 +65,9 @@ impl DecayPolicy {
         DecayPolicy::Fast,
     ];
 
-    /// Politiikan Ebbinghaus-vaimennusvakio `λ`.
+    /// The policy's Ebbinghaus decay constant `λ`.
     ///
-    /// `0.0` tarkoittaa "ei koskaan vaimene" ([`DecayPolicy::ProtectedCore`]).
+    /// `0.0` means "never decays" ([`DecayPolicy::ProtectedCore`]).
     #[must_use]
     pub const fn decay_lambda(self) -> f32 {
         match self {
@@ -77,13 +78,14 @@ impl DecayPolicy {
         }
     }
 
-    /// Onko tämä suojattu identiteetti-ankkuri (ei koskaan vaimene).
+    /// Is this a protected identity anchor (never decays)?
     #[must_use]
     pub const fn is_protected(self) -> bool {
         matches!(self, DecayPolicy::ProtectedCore)
     }
 
-    /// Vakaa, kone-luettava nimi (`snake_case`) — sama kuin serde-esitys.
+    /// Stable, machine-readable name (`snake_case`) — same as the serde
+    /// representation.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -94,29 +96,29 @@ impl DecayPolicy {
         }
     }
 
-    /// Ebbinghaus-retentio kuluneen ajan `dt_secs` jälkeen annetulla
-    /// muistin vahvuudella `stability`.
+    /// Ebbinghaus retention after elapsed time `dt_secs`, at the given
+    /// memory `stability`.
     ///
-    /// Palauttaa arvon välillä `0.0..=1.0`: `1.0` = täysin tuore,
-    /// lähestyy `0.0`:aa kun muisto unohtuu. `ProtectedCore` palauttaa aina
-    /// `1.0`. Negatiivinen tai ei-äärellinen `dt_secs` käsitellään nollana
-    /// (tuore); ei-positiivinen vahvuus puristetaan turvalliseen minimiin.
+    /// Returns a value in `0.0..=1.0`: `1.0` = fully fresh,
+    /// approaching `0.0` as the memory is forgotten. `ProtectedCore` always
+    /// returns `1.0`. A negative or non-finite `dt_secs` is treated as zero
+    /// (fresh); a non-positive stability is clamped to a safe minimum.
     ///
-    /// Kaava: `R = e^(-λ · t / (S · TIME_SCALE))`.
+    /// Formula: `R = e^(-λ · t / (S · TIME_SCALE))`.
     #[must_use]
     pub fn retention(self, dt_secs: f32, stability: f32) -> f32 {
         let lambda = self.decay_lambda();
-        // Suojattu ydin tai nolla-λ ei vaimene koskaan.
+        // A protected core or zero λ never decays.
         if lambda <= 0.0 {
             return 1.0;
         }
-        // Kelvoton/negatiivinen aikadelta = muisto on yhä tuore.
+        // Invalid/negative time delta = memory is still fresh.
         let dt = if dt_secs.is_finite() && dt_secs > 0.0 {
             dt_secs
         } else {
             0.0
         };
-        // Vahvuus puristetaan turvalliseen minimiin, jottei jaeta nollalla.
+        // Stability is clamped to a safe minimum to avoid division by zero.
         let s = if stability.is_finite() && stability > MIN_STABILITY {
             stability
         } else {
@@ -124,7 +126,7 @@ impl DecayPolicy {
         };
         let exponent = -lambda * dt / (s * STABILITY_TIME_SCALE_SECS);
         let r = exponent.exp();
-        // Numeerinen varmistus rajoihin.
+        // Numerical safeguard to keep within bounds.
         r.clamp(0.0, 1.0)
     }
 }
@@ -136,7 +138,7 @@ impl std::fmt::Display for DecayPolicy {
 }
 
 impl Default for DecayPolicy {
-    /// Oletuspolitiikka on [`DecayPolicy::Normal`] — Ebbinghausin perusarvo.
+    /// The default policy is [`DecayPolicy::Normal`] — the Ebbinghaus baseline value.
     fn default() -> Self {
         DecayPolicy::Normal
     }
@@ -144,7 +146,7 @@ impl Default for DecayPolicy {
 
 #[cfg(test)]
 mod tests {
-    // Testit vertaavat tarkasti esitettäviä f32-vakioita — tarkka vertailu ok.
+    // Tests compare exactly representable f32 constants — exact comparison is fine.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -161,7 +163,7 @@ mod tests {
     fn protected_core_never_decays() {
         let p = DecayPolicy::ProtectedCore;
         assert!(p.is_protected());
-        // Mielivaltaisen pitkä aika, pieni vahvuus → retentio yhä täysi.
+        // Arbitrarily long time, small stability → retention still full.
         assert_eq!(p.retention(0.0, 1.0), 1.0);
         assert_eq!(p.retention(1e9, 0.01), 1.0);
         assert_eq!(p.retention(f32::MAX, 0.0), 1.0);
@@ -179,7 +181,7 @@ mod tests {
         for p in DecayPolicy::ALL {
             assert!(
                 (p.retention(0.0, 1.0) - 1.0).abs() < 1e-6,
-                "{p} ei tuore nollalla"
+                "{p} not fresh at zero"
             );
         }
     }
@@ -192,7 +194,7 @@ mod tests {
         assert!(r_day < 1.0);
         assert!(
             r_week < r_day,
-            "viikon retentio {r_week} ei ole alle päivän {r_day}"
+            "week retention {r_week} is not below day retention {r_day}"
         );
         assert!(r_week > 0.0);
     }
@@ -203,8 +205,8 @@ mod tests {
         let slow = DecayPolicy::Slow.retention(t, 1.0);
         let normal = DecayPolicy::Normal.retention(t, 1.0);
         let fast = DecayPolicy::Fast.retention(t, 1.0);
-        assert!(fast < normal, "fast {fast} ei alle normal {normal}");
-        assert!(normal < slow, "normal {normal} ei alle slow {slow}");
+        assert!(fast < normal, "fast {fast} is not below normal {normal}");
+        assert!(normal < slow, "normal {normal} is not below slow {slow}");
     }
 
     #[test]
@@ -215,18 +217,18 @@ mod tests {
         let strong = p.retention(t, 4.0);
         assert!(
             strong > weak,
-            "vahva muisto {strong} ei säily pidempään kuin heikko {weak}"
+            "strong memory {strong} does not persist longer than weak {weak}"
         );
     }
 
     #[test]
     fn retention_known_value_at_one_unit() {
-        // Normal λ=0.18, dt = 1 päivä, S = 1.0 → R = e^(-0.18) ≈ 0.8353.
+        // Normal λ=0.18, dt = 1 day, S = 1.0 → R = e^(-0.18) ≈ 0.8353.
         let r = DecayPolicy::Normal.retention(STABILITY_TIME_SCALE_SECS, 1.0);
         let expected = (-0.18_f32).exp();
         assert!(
             (r - expected).abs() < 1e-4,
-            "retentio {r} ei vastaa odotettua {expected}"
+            "retention {r} does not match expected {expected}"
         );
     }
 
@@ -256,7 +258,7 @@ mod tests {
                     let r = p.retention(t, s);
                     assert!(
                         (0.0..=1.0).contains(&r),
-                        "{p} t={t} s={s} → r={r} ulkona rajoista"
+                        "{p} t={t} s={s} → r={r} out of bounds"
                     );
                 }
             }

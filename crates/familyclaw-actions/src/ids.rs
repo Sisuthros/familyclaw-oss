@@ -1,15 +1,15 @@
-//! Tyypitetyt tunnisteet (newtype) toiminto- ja todistepinolle.
+//! Typed identifiers (newtype) for the action and proof stack.
 //!
-//! Sama suunnitteluperiaate kuin `familyclaw-core::ids`: jokainen tunniste
-//! kääri [`uuid::Uuid`]-arvon omaan tyyppiinsä, jotta kääntäjä estää eri
-//! tunnistetyyppien sekoittamisen (esim. ettei [`SkillId`]-arvoa voi
-//! vahingossa antaa [`ActionTaskId`]-paikkaan).
+//! Same design principle as `familyclaw-core::ids`: each identifier wraps a
+//! [`uuid::Uuid`] value in its own type, so the compiler prevents mixing up
+//! different identifier types (e.g. so a [`SkillId`] value can't
+//! accidentally be passed where an [`ActionTaskId`] is expected).
 //!
-//! Kaikki tunnisteet:
-//! - sarjallistuvat samaan muotoon kuin alla oleva UUID (`serde transparent`),
-//! - tukevat `v4`-satunnaisgenerointia [`SkillId::new`]-tyylisellä konstruktorilla,
-//! - jäsentyvät merkkijonosta [`std::str::FromStr`]-toteutuksella,
-//! - tulostuvat kanonisena UUID-merkkijonona [`std::fmt::Display`]-toteutuksella.
+//! All identifiers:
+//! - serialize to the same form as the underlying UUID (`serde transparent`),
+//! - support `v4` random generation via a [`SkillId::new`]-style constructor,
+//! - parse from a string via the [`std::str::FromStr`] implementation,
+//! - print as a canonical UUID string via the [`std::fmt::Display`] implementation.
 
 use std::fmt;
 use std::str::FromStr;
@@ -17,10 +17,10 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Generoi newtype-tunnistetyypin annetulla nimellä ja dokumentaatiolla.
+/// Generates a newtype identifier type with the given name and documentation.
 ///
-/// Makro pitää toteutukset identtisinä kaikille tunnisteille ja vähentää
-/// toistoa ilman että julkinen API muuttuu.
+/// The macro keeps the implementations identical across all identifiers and
+/// reduces repetition without changing the public API.
 macro_rules! define_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -31,37 +31,37 @@ macro_rules! define_id {
         pub struct $name(Uuid);
 
         impl $name {
-            /// Luo uuden satunnaisen (`v4`) tunnisteen.
+            /// Creates a new random (`v4`) identifier.
             #[must_use]
             pub fn new() -> Self {
                 Self(Uuid::new_v4())
             }
 
-            /// Kääri olemassa olevan [`Uuid`]-arvon tähän tunnistetyyppiin.
+            /// Wraps an existing [`Uuid`] value into this identifier type.
             #[must_use]
             pub const fn from_uuid(uuid: Uuid) -> Self {
                 Self(uuid)
             }
 
-            /// Palauttaa sisällä olevan [`Uuid`]-arvon.
+            /// Returns the inner [`Uuid`] value.
             #[must_use]
             pub const fn as_uuid(&self) -> &Uuid {
                 &self.0
             }
 
-            /// Kuluttaa tunnisteen ja palauttaa sisällä olevan [`Uuid`]-arvon.
+            /// Consumes the identifier and returns the inner [`Uuid`] value.
             #[must_use]
             pub const fn into_uuid(self) -> Uuid {
                 self.0
             }
 
-            /// `nil`-tunniste (kaikki nollia) — käytetään oletus-/tyhjäarvona.
+            /// The `nil` identifier (all zeros) — used as a default/empty value.
             #[must_use]
             pub const fn nil() -> Self {
                 Self(Uuid::nil())
             }
 
-            /// Onko tämä `nil`-tunniste.
+            /// Whether this is the `nil` identifier.
             #[must_use]
             pub fn is_nil(&self) -> bool {
                 self.0.is_nil()
@@ -69,8 +69,8 @@ macro_rules! define_id {
         }
 
         impl Default for $name {
-            /// Oletuksena uusi satunnainen tunniste — jotta entiteetit
-            /// saavat aina ainutkertaisen identiteetin ilman erillistä kutsua.
+            /// Defaults to a new random identifier — so entities always get
+            /// a unique identity without a separate call.
             fn default() -> Self {
                 Self::new()
             }
@@ -105,35 +105,35 @@ macro_rules! define_id {
 }
 
 define_id! {
-    /// Yksittäisen taidon (skill) tunniste rekisterissä.
+    /// Identifier for a single skill in the registry.
     SkillId
 }
 
 define_id! {
-    /// Suoritettavan toimintotehtävän tunniste (action-task).
+    /// Identifier for an executable action task.
     ///
-    /// Erillinen `familyclaw-bridge`-tehtävien tunnisteesta: tämä viittaa
-    /// toimintopinon (observe→…→report) tehtävään, ei orkesteroinnin tauluun.
+    /// Distinct from `familyclaw-bridge` task identifiers: this refers to a
+    /// task in the action stack (observe→…→report), not the orchestration table.
     ActionTaskId
 }
 
 define_id! {
-    /// Hyväksyntäpyynnön (human-in-the-loop) tunniste.
+    /// Identifier for an approval request (human-in-the-loop).
     ApprovalId
 }
 
 define_id! {
-    /// Todistepaketin (proof bundle) tunniste.
+    /// Identifier for a proof bundle.
     ProofBundleId
 }
 
 define_id! {
-    /// Yksittäisen suoritetun toiminnon tunniste.
+    /// Identifier for a single executed action.
     ActionId
 }
 
 define_id! {
-    /// Audit-lokin yksittäisen tapahtuman tunniste.
+    /// Identifier for a single audit-log event.
     AuditEventId
 }
 

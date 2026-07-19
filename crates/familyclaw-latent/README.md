@@ -1,35 +1,35 @@
 # familyclaw-latent
 
-**Latent-telepatia** — sisarusten välinen *hidden-state*-siirto, joka palaa
-**aina** tekstiin jos latent ei onnistu. FamilyClaw v2:n korkein viestintämuoto
-(design §2.4), ei ainoa: viestintä ei koskaan katkea.
+**Latent telepathy** — a *hidden-state* transfer between siblings that
+**always** falls back to text if latent fails. FamilyClaw v2's highest
+communication mode (design §2.4), not the only one: communication never breaks.
 
-## Mitä tämä crate tarjoaa
+## What this crate provides
 
-| Tyyppi | Vastuu |
+| Type | Responsibility |
 |--------|--------|
-| `LatentVector { dims: Vec<f32>, model_id: String }` | Agentin piilotila (hidden state) + sen tuottanut malli. |
-| `RecursiveLink` | Lineaarinen dimensio-silta agentti A:n latent-avaruudesta agentti B:n avaruuteen (`pad` / `truncate` / `resize` / `identity`). |
-| `ProjectedLatent` / `ProjectionStrategy` | Projektion tulos + metatieto (häviötön vai ei). |
-| `LatentChannel` (trait) | `send`/`receive`-tyyppinen siirto sisäänrakennetulla teksti-fallbackilla. |
-| `TransmissionMode { Latent, Text }` | Korkein onnistunut siirtomuoto. |
-| `FallbackReason` | Miksi latentista jouduttiin tekstiin (mittausta varten). |
-| `InMemoryLatentChannel` | Testi-/kehityskanava, joka kerää toimitukset muistiin. |
+| `LatentVector { dims: Vec<f32>, model_id: String }` | An agent's hidden state + the model that produced it. |
+| `RecursiveLink` | A linear dimension bridge from agent A's latent space to agent B's space (`pad` / `truncate` / `resize` / `identity`). |
+| `ProjectedLatent` / `ProjectionStrategy` | The projection result + metadata (lossless or not). |
+| `LatentChannel` (trait) | A `send`/`receive`-style transfer with a built-in text fallback. |
+| `TransmissionMode { Latent, Text }` | The highest successful transmission mode. |
+| `FallbackReason` | Why latent had to fall back to text (for measurement). |
+| `InMemoryLatentChannel` | A test/development channel that collects deliveries in memory. |
 
-## Ydinperiaate: aina teksti-fallback
+## Core principle: always a text fallback
 
-`LatentChannel::transmit` **ei koskaan palauta virhettä pelkän
-yhteensopimattomuuden takia**. Se valitsee korkeimman mahdollisen tason ja
-palaa tekstiin jos:
+`LatentChannel::transmit` **never returns an error for mere
+incompatibility**. It picks the highest possible tier and falls back to
+text if:
 
-1. vastaanottaja ei tue latenttia (`ReceiverTextOnly`),
-2. viestissä ei ole piilotilaa (`NoLatentAvailable`),
-3. lähettäjältä ei ole `RecursiveLink`-siltaa kohde-malliin (`NoLink`),
-4. dimensio-projektio epäonnistuu (`ProjectionFailed`, esim. `NaN`/`inf`).
+1. the receiver doesn't support latent (`ReceiverTextOnly`),
+2. the message has no hidden state (`NoLatentAvailable`),
+3. the sender has no `RecursiveLink` bridge to the target model (`NoLink`),
+4. the dimension projection fails (`ProjectionFailed`, e.g. `NaN`/`inf`).
 
-Virhe palautuu **vain** todellisesta kuljetusviasta (`deliver`).
+An error is returned **only** for a genuine transport failure (`deliver`).
 
-## Esimerkki
+## Example
 
 ```rust
 use familyclaw_latent::{
@@ -48,21 +48,22 @@ let result = channel.transmit(&message, &receiver).unwrap();
 assert_eq!(result.mode, TransmissionMode::Latent);
 ```
 
-## Tutkimusrehellisyys (rajat dokumentoitu, ei piiloteltu)
+## Research honesty (limits documented, not hidden)
 
-Tämä on **rehellinen luuranko** LatentMAS-tyyppiselle (ICML 2026 Spotlight)
-sisarusviestinnälle:
+This is a **deliberately honest skeleton** for LatentMAS-style (ICML 2026
+Spotlight) sibling communication:
 
-- `RecursiveLink` tekee vain **yksinkertaisen lineaarisen sovituksen**
-  (pad/truncate/resize). Se **ei** ole opittu, semanttisesti kohdistettu
-  projektio — eri mallien latent-avaruudet eivät ole linjassa, joten pad/
-  truncate ei takaa merkityksen säilymistä. Oikea koulutettu projektiomatriisi
-  tulee myöhempänä iteraationa.
-- Siksi teksti-fallback on **kantava periaate**, ei varajärjestelmä: latent on
-  opportunistinen optimointi, teksti on totuuden lähde.
+- `RecursiveLink` performs only a **simple linear fit**
+  (pad/truncate/resize). It is **not** a learned, semantically aligned
+  projection — different models' latent spaces are not aligned, so pad/
+  truncate does not guarantee that meaning is preserved. A real trained
+  projection matrix comes as a later iteration.
+- That's why the text fallback is a **load-bearing principle**, not a
+  backup system: latent is an opportunistic optimization, text is the
+  source of truth.
 
-## OSS-raja (KERROS A)
+## OSS boundary (Layer A)
 
-Crate ei kovakoodaa perheenjäsenten sieluja, mallinimiä, avaimia eikä polkuja.
-Kaikki mallitunnisteet ja dimensiot annetaan ajonaikaisesti. Esimerkit käyttävät
-geneerisiä nimiä (`agent_a`, `agent_b`).
+The crate does not hardcode family members' souls, model names, keys, or
+paths. All model identifiers and dimensions are supplied at runtime.
+Examples use generic names (`agent_a`, `agent_b`).

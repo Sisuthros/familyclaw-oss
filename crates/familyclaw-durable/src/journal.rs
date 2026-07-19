@@ -1,78 +1,83 @@
-//! [`Journal`]-trait ja siihen liittyvät tyypit.
+//! The [`Journal`] trait and its associated types.
 //!
-//! Journal on append-only tapahtumaloki. Toteutukset ([`crate::InMemoryJournal`],
-//! [`crate::FileJournal`]) tarjoavat saman rajapinnan; [`crate::DurableContext`]
-//! rakentuu trait-objektin tai geneerisen parametrin päälle, joten taustamuoto
-//! (muisti vs. tiedosto) on vaihdettavissa testaamatta logiikkaa uudelleen.
+//! A journal is an append-only event log. Implementations ([`crate::InMemoryJournal`],
+//! [`crate::FileJournal`]) provide the same interface; [`crate::DurableContext`]
+//! is built on top of either a trait object or a generic parameter, so the
+//! backing format (memory vs. file) can be swapped without retesting the logic.
 //!
 //! ## Object Safety
-//! Kaikki metodit ottavat `&self` (ei `&mut self`), jotta trait on `dyn`-yhteensopiva.
-//! Sisäinen mutaatiotila on `Mutex`:ssa toteutuksissa.
+//! All methods take `&self` (not `&mut self`) so the trait is `dyn`-compatible.
+//! Internal mutable state lives in a `Mutex` in the implementations.
 
 use crate::entry::{JournalEntry, StepId};
 use crate::error::Result;
 
-/// Append-only tapahtumaloki durable-suoritukselle.
+/// Append-only event log for durable execution.
 ///
-/// # Invariantit
-/// - **Append-only:** [`append`](Journal::append) lisää aina lokin loppuun;
-///   olemassa olevia rivejä ei koskaan muuteta. Tämä takaa replay-determinismin.
-/// - **Järjestys säilyy:** [`replay_from`](Journal::replay_from) palauttaa rivit
-///   samassa järjestyksessä kuin ne lisättiin.
-/// - **Paniikiton:** kaikki epäonnistumiset palautuvat [`Result`]:na.
+/// # Invariants
+/// - **Append-only:** [`append`](Journal::append) always adds to the end of
+///   the log; existing rows are never modified. This guarantees replay
+///   determinism.
+/// - **Order is preserved:** [`replay_from`](Journal::replay_from) returns
+///   rows in the same order they were appended.
+/// - **Panic-free:** all failures are returned as a [`Result`].
 pub trait Journal: Send + Sync {
-    /// Lisää rivin lokin loppuun ja varmistaa että se on kestävästi
-    /// tallennettu (tiedostototeutuksessa: flush + fsync ennen paluuta).
+    /// Appends a row to the end of the log and ensures it is durably
+    /// stored (in the file implementation: flush + fsync before returning).
     ///
     /// # Errors
-    /// [`crate::DurableError::Io`] tai [`crate::DurableError::Serde`] jos
-    /// taustatallennus epäonnistuu.
+    /// [`crate::DurableError::Io`] or [`crate::DurableError::Serde`] if the
+    /// backing storage fails.
     fn append(&self, entry: JournalEntry) -> Result<()>;
 
-    /// Palauttaa kaikki rivit annetusta sekvenssipaikasta alkaen (ml. `from`).
+    /// Returns all rows starting from the given sequence position
+    /// (inclusive of `from`).
     ///
-    /// `StepId::ZERO` palauttaa koko lokin. Tätä käytetään replayssä lataamaan
-    /// aiemmin tallennetut askeleet.
+    /// `StepId::ZERO` returns the entire log. This is used during replay to
+    /// load previously recorded steps.
     ///
     /// # Errors
-    /// [`crate::DurableError::Io`], [`crate::DurableError::Serde`] tai
-    /// [`crate::DurableError::CorruptEntry`] jos lokia ei voi lukea/jäsentää.
+    /// [`crate::DurableError::Io`], [`crate::DurableError::Serde`], or
+    /// [`crate::DurableError::CorruptEntry`] if the log cannot be
+    /// read/parsed.
     fn replay_from(&self, from: StepId) -> Result<Vec<JournalEntry>>;
 
-    /// Palauttaa lokin kaikki rivit alusta loppuun.
+    /// Returns all rows in the log from start to end.
     ///
-    /// Oletustoteutus delegoi [`replay_from`](Journal::replay_from):lle
-    /// `StepId::ZERO`:lla.
+    /// The default implementation delegates to
+    /// [`replay_from`](Journal::replay_from) with `StepId::ZERO`.
     ///
     /// # Errors
-    /// Sama kuin [`replay_from`](Journal::replay_from).
+    /// Same as [`replay_from`](Journal::replay_from).
     fn replay_all(&self) -> Result<Vec<JournalEntry>> {
         self.replay_from(StepId::ZERO)
     }
 
-    /// Kirjoittaa snapshot-rivin joka tiivistää nykytilan yhdeksi pisteeksi.
+    /// Writes a snapshot row that condenses the current state into a
+    /// single point.
     ///
-    /// Snapshot ei poista aiempia rivejä — se on lisärivi josta replay voi
-    /// nopeasti palauttaa tilan ajamatta kaikkia aiempia askelia uudelleen.
+    /// A snapshot does not remove earlier rows — it is an additional row
+    /// from which replay can quickly restore state without re-running all
+    /// prior steps.
     ///
     /// # Errors
-    /// Sama kuin [`append`](Journal::append).
+    /// Same as [`append`](Journal::append).
     fn snapshot(&self, step_id: StepId, state: serde_json::Value) -> Result<()> {
         self.append(JournalEntry::snapshot(step_id, state))
     }
 
-    /// Palauttaa lokin rivien lukumäärän.
+    /// Returns the number of rows in the log.
     ///
     /// # Errors
-    /// Sama kuin [`replay_all`](Journal::replay_all).
+    /// Same as [`replay_all`](Journal::replay_all).
     fn len(&self) -> Result<usize> {
         Ok(self.replay_all()?.len())
     }
 
-    /// Onko loki tyhjä.
+    /// Whether the log is empty.
     ///
     /// # Errors
-    /// Sama kuin [`len`](Journal::len).
+    /// Same as [`len`](Journal::len).
     fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
     }
@@ -141,9 +146,9 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
-    /// Minimaalinen testitoteutus joka todistaa että trait-oletusmetodit
-    /// (`replay_all`, `snapshot`, `len`, `is_empty`) toimivat pelkän
-    /// `append`/`replay_from` päälle.
+    /// Minimal test implementation that proves the trait's default methods
+    /// (`replay_all`, `snapshot`, `len`, `is_empty`) work correctly on top of
+    /// just `append`/`replay_from`.
     #[derive(Default)]
     struct VecJournal {
         entries: Mutex<Vec<JournalEntry>>,

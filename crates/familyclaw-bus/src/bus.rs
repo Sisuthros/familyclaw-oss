@@ -1,21 +1,21 @@
-//! Resonance Bus -actor — affektiivisen hermoston ydin.
+//! The Resonance Bus actor — the core of the affective nervous system.
 //!
-//! [`ResonanceBus`] on Ractor-actor, joka:
-//! 1. **rekisteröi olennot** ([`BusOp::Register`]) ja poistaa heidät
+//! [`ResonanceBus`] is a Ractor actor that:
+//! 1. **registers beings** ([`BusOp::Register`]) and removes them
 //!    ([`BusOp::Deregister`]),
-//! 2. **lähettää viestit kaikille** muille olennoille ([`BusOp::Publish`]) —
-//!    affektiivisen hermoston "veri",
-//! 3. **leviää tunnepulssina** (affective contagion): kun olento julkaisee
-//!    [`BusMessage::EmotionPulse`]:n, kaikki *muut* olennot saavat sen ja
-//!    voivat reagoida toistensa mielialaan,
-//! 4. **listaa liittyneet olennot** ([`BusOp::ListBeings`]) — palautettava
-//!    lista EI saa olla tyhjä kun olentoja on liittynyt (korjaa live-3500
-//!    `beings:[]`, design §2.2),
-//! 5. **kestää kaatumiset** (supervision): yksittäisen olennon kuolema ei
-//!    kaada busia, vaan poistaa vain kyseisen olennon rekisteristä.
+//! 2. **sends messages to all** other beings ([`BusOp::Publish`]) — the
+//!    affective nervous system's "blood",
+//! 3. **spreads emotion as a pulse** (affective contagion): when a being
+//!    publishes a [`BusMessage::EmotionPulse`], all *other* beings receive
+//!    it and can react to each other's mood,
+//! 4. **lists joined beings** ([`BusOp::ListBeings`]) — the returned list
+//!    must NOT be empty when beings have joined (fixes the live-3500
+//!    `beings:[]` bug, design §2.2),
+//! 5. **survives crashes** (supervision): a single being's death does not
+//!    bring down the bus, it only removes that being from the registry.
 //!
-//! Ergonominen rajapinta on [`BusHandle`], joka kääri raa'an
-//! [`ActorRef`]-viitteen turvalliseksi (ei `unwrap`) API:ksi.
+//! The ergonomic interface is [`BusHandle`], which wraps the raw
+//! [`ActorRef`] reference into a safe (no `unwrap`) API.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,65 +30,65 @@ use familyclaw_core::{FamilyClawError, Result};
 use crate::being::{BeingInfo, BeingSnapshot};
 use crate::message::{BeingId, BusMessage, ResonanceMessage};
 
-/// Oletusaikakatkaisu synkronisille `call`-kyselyille (esim. olentolista).
+/// Default timeout for synchronous `call` queries (e.g. the being list).
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Busin ohjausprotokolla — viestit, joita [`ResonanceBus`]-actor käsittelee.
+/// The bus's control protocol — messages the [`ResonanceBus`] actor handles.
 ///
-/// Tämä on busin *sisäinen* viestityyppi (ohjaus), erotuksena olentojen
-/// välisestä [`ResonanceMessage`]-liikenteestä (hyötykuorma). Useimmissa
-/// tapauksissa kannattaa käyttää [`BusHandle`]-rajapintaa suoran `cast`/`call`
-/// -kutsun sijaan.
+/// This is the bus's *internal* message type (control), as opposed to the
+/// [`ResonanceMessage`] traffic (payload) between beings. In most cases it's
+/// better to use the [`BusHandle`] interface instead of a direct `cast`/`call`.
 pub enum BusOp {
-    /// Rekisteröi olento busiin. Jos sama tunniste on jo olemassa, tiedot
-    /// korvataan (uudelleenliittyminen).
+    /// Register a being on the bus. If the same identifier already exists,
+    /// its data is replaced (re-registration).
     Register(BeingInfo),
 
-    /// Poista olento busista tunnisteen perusteella.
+    /// Remove a being from the bus by identifier.
     Deregister(BeingId),
 
-    /// Julkaise viesti: kirjekuori toimitetaan kaikille **muille** kuin
-    /// lähettäjälle. Tunnepulssi leviää samaa reittiä (affective contagion).
+    /// Publish a message: the envelope is delivered to all beings **other**
+    /// than the sender. An emotion pulse spreads via the same route
+    /// (affective contagion).
     Publish(ResonanceMessage),
 
-    /// Pyydä tilannekuva liittyneistä olennoista. Vastaus palautetaan
-    /// [`RpcReplyPort`]:n kautta.
+    /// Request a snapshot of joined beings. The reply is returned via the
+    /// [`RpcReplyPort`].
     ListBeings(RpcReplyPort<Vec<BeingSnapshot>>),
 
-    /// Pyydä liittyneiden olentojen lukumäärä.
+    /// Request the count of joined beings.
     Count(RpcReplyPort<usize>),
 }
 
-/// `ractor::pg`-prosessiryhmien nimien yhteinen etuliite. Jokainen
-/// bus-instanssi saa tästä johdetun **uniikin** ryhmänimen (ks. [`BUS_SEQ`]),
-/// jotta rinnakkaiset busit eivät jaa samaa jäsenpoolia.
+/// The shared prefix for `ractor::pg` process group names. Each bus instance
+/// gets a **unique** group name derived from this (see [`BUS_SEQ`]), so
+/// concurrent buses do not share the same member pool.
 const PG_GROUP_PREFIX: &str = "resonance-bus";
 
-/// Prosessin-uniikki juokseva laskuri bus-instanssien pg-ryhmänimille.
+/// A process-unique running counter for bus instances' pg group names.
 ///
-/// Jokainen [`ResonanceBus`] saa `pre_start`issa oman ryhmänsä
-/// (`resonance-bus-{n}`), joten kahden eri busin olennot eivät koskaan näy
-/// toistensa [`pg::get_members`]-tuloksessa. `ractor::pg` on prosessi-globaali
-/// nimiavaruus, joten pelkkä prosessin-sisäinen uniikkius riittää — ei kelloa
-/// eikä satunnaislukua tarvita.
+/// Each [`ResonanceBus`] gets its own group in `pre_start`
+/// (`resonance-bus-{n}`), so two different buses' beings never show up in
+/// each other's [`pg::get_members`] results. `ractor::pg` is a
+/// process-global namespace, so plain process-internal uniqueness is
+/// enough — no clock or random number is needed.
 static BUS_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// [`ResonanceBus`]-actorin sisäinen tila: rekisteröidyt olennot.
+/// [`ResonanceBus`] actor's internal state: registered beings.
 ///
-/// Säilyttää HashMap-metadatan (nimet, `BeingInfo`) ListBeings-kyselyjä varten
-/// ja käyttää `ractor::pg` prosessiryhmää (`pg_group`) jäsenten hallintaan ja
-/// jakeluun (broadcast).
+/// Keeps a `HashMap` of metadata (names, `BeingInfo`) for `ListBeings` queries,
+/// and uses a `ractor::pg` process group (`pg_group`) for member management
+/// and distribution (broadcast).
 pub struct BusState {
-    /// Liittyneet olennot tunnisteen mukaan indeksoituna (metatiedot).
+    /// Joined beings indexed by identifier (metadata).
     beings: HashMap<BeingId, BeingInfo>,
-    /// Tämän bus-instanssin oma, prosessi-uniikki `ractor::pg`-ryhmän nimi.
-    /// Eristää tämän busin jäsenpoolin kaikista muista prosessin buseista.
+    /// This bus instance's own, process-unique `ractor::pg` group name.
+    /// Isolates this bus's member pool from every other bus in the process.
     pg_group: String,
 }
 
 impl BusState {
-    /// Toimittaa kirjekuoren kaikille muille kuin lähettäjälle
-    /// käyttäen `ractor::pg` prosessiryhmää.
+    /// Delivers the envelope to everyone other than the sender, using the
+    /// `ractor::pg` process group.
     fn broadcast(&self, envelope: &ResonanceMessage, _myself: &ActorRef<BusOp>) -> usize {
         let cells = pg::get_members(&self.pg_group);
         let mut delivered = 0;
@@ -106,7 +106,7 @@ impl BusState {
                         warn!(
                             being = %cell.get_id(),
                             error = %err,
-                            "viestin toimitus olennolle epäonnistui (postilaatikko suljettu?)"
+                            "failed to deliver message to being (mailbox closed?)"
                         );
                     }
                 }
@@ -121,7 +121,7 @@ impl BusState {
                         warn!(
                             being = %cell.get_id(),
                             error = %err,
-                            "viestin toimitus olennolle epäonnistui (postilaatikko suljettu?)"
+                            "failed to deliver message to being (mailbox closed?)"
                         );
                     }
                 }
@@ -131,11 +131,11 @@ impl BusState {
     }
 }
 
-/// Resonance Bus -actor.
+/// The Resonance Bus actor.
 ///
-/// Spawnataan [`ResonanceBus::start`]-funktiolla, joka palauttaa ergonomisen
-/// [`BusHandle`]:n. Actorilla ei ole konstruktiorargumentteja — tila alkaa
-/// tyhjänä olentorekisterinä.
+/// Spawned via [`ResonanceBus::start`], which returns an ergonomic
+/// [`BusHandle`]. The actor takes no constructor arguments — state starts as
+/// an empty being registry.
 pub struct ResonanceBus;
 
 impl Actor for ResonanceBus {
@@ -148,7 +148,7 @@ impl Actor for ResonanceBus {
         _myself: ActorRef<Self::Msg>,
         (): Self::Arguments,
     ) -> std::result::Result<Self::State, ActorProcessingErr> {
-        // Mintataan tälle instanssille oma, prosessi-uniikki pg-ryhmänimi.
+        // Mint a unique, process-unique pg group name for this instance.
         let seq = BUS_SEQ.fetch_add(1, Ordering::Relaxed);
         let pg_group = format!("{PG_GROUP_PREFIX}-{seq}");
         Ok(BusState {
@@ -171,19 +171,19 @@ impl Actor for ResonanceBus {
                     pg::leave(state.pg_group.clone(), vec![old_info.inbox().get_cell()]);
                     old_info.inbox().get_cell().unlink(myself.get_cell());
                 }
-                // Linkitä olento busin alaiseksi (bus = supervisor)
+                // Link the being as a child of the bus (bus = supervisor)
                 info.inbox().get_cell().link(myself.get_cell());
-                // Liitä prosessiryhmään jakelua varten
+                // Join the process group for distribution
                 pg::join(state.pg_group.clone(), vec![info.inbox().get_cell()]);
-                debug!(being = %id, name = info.name(), "olento rekisteröity busiin");
+                debug!(being = %id, name = info.name(), "being registered on bus");
                 state.beings.insert(id, info);
             }
             BusOp::Deregister(id) => {
                 if let Some(info) = state.beings.remove(&id) {
                     info.inbox().get_cell().unlink(myself.get_cell());
-                    // Poista prosessiryhmästä
+                    // Leave the process group
                     pg::leave(state.pg_group.clone(), vec![info.inbox().get_cell()]);
-                    debug!(being = %id, "olento poistettu busista");
+                    debug!(being = %id, "being removed from bus");
                 }
             }
             BusOp::Publish(envelope) => {
@@ -193,30 +193,30 @@ impl Actor for ResonanceBus {
                     from = %envelope.from,
                     kind,
                     recipients = n,
-                    "viesti julkaistu busiin"
+                    "message published to bus"
                 );
             }
             BusOp::ListBeings(reply) => {
                 let snapshot: Vec<BeingSnapshot> =
                     state.beings.values().map(BeingSnapshot::from).collect();
-                // Vastaanottaja on saattanut antaa periksi (timeout) — älä
-                // panikoi, jos portti on jo suljettu.
+                // The receiver may have given up (timeout) — don't panic if
+                // the port is already closed.
                 if reply.send(snapshot).is_err() {
-                    warn!("olentolistan vastaus hylättiin (vastaanottaja kadonnut)");
+                    warn!("being-list reply dropped (receiver gone)");
                 }
             }
             BusOp::Count(reply) => {
                 if reply.send(state.beings.len()).is_err() {
-                    warn!("olentomäärän vastaus hylättiin (vastaanottaja kadonnut)");
+                    warn!("being-count reply dropped (receiver gone)");
                 }
             }
         }
         Ok(())
     }
 
-    /// Supervision: jos linkitetty olento kaatuu tai päättyy, poista se
-    /// rekisteristä — **bus pysyy elossa**. Tämä korvaa Ractorin oletuksen
-    /// (joka pysäyttäisi supervisorin lapsen kaatuessa).
+    /// Supervision: if a linked being crashes or terminates, remove it from
+    /// the registry — **the bus stays alive**. This overrides Ractor's
+    /// default (which would stop the supervisor when a child crashes).
     async fn handle_supervisor_evt(
         &self,
         _myself: ActorRef<Self::Msg>,
@@ -227,24 +227,24 @@ impl Actor for ResonanceBus {
             SupervisionEvent::ActorTerminated(cell, _, reason) => {
                 let removed = remove_by_cell_id(state, cell.get_id());
                 if let Some(id) = removed {
-                    debug!(being = %id, ?reason, "olento päättyi — poistettu rekisteristä");
+                    debug!(being = %id, ?reason, "being terminated — removed from registry");
                 }
             }
             SupervisionEvent::ActorFailed(cell, err) => {
                 let removed = remove_by_cell_id(state, cell.get_id());
                 if let Some(id) = removed {
-                    warn!(being = %id, error = %err, "olento kaatui — poistettu rekisteristä, bus jatkaa");
+                    warn!(being = %id, error = %err, "being crashed — removed from registry, bus continues");
                 }
             }
-            // Muut tapahtumat (ActorStarted, ryhmämuutokset) eivät vaadi toimia.
+            // Other events (ActorStarted, group changes) require no action.
             _ => {}
         }
         Ok(())
     }
 }
 
-/// Poistaa rekisteristä olennon, jonka postilaatikko-actorilla on annettu
-/// [`ractor::ActorId`]. Palauttaa poistetun olennon tunnisteen jos löytyi.
+/// Removes from the registry the being whose mailbox actor has the given
+/// [`ractor::ActorId`]. Returns the removed being's identifier if found.
 fn remove_by_cell_id(state: &mut BusState, cell_id: ractor::ActorId) -> Option<BeingId> {
     let found = state
         .beings
@@ -257,78 +257,79 @@ fn remove_by_cell_id(state: &mut BusState, cell_id: ractor::ActorId) -> Option<B
     found
 }
 
-/// Ergonominen kahva [`ResonanceBus`]-actoriin.
+/// An ergonomic handle to the [`ResonanceBus`] actor.
 ///
-/// Kääri raa'an [`ActorRef<BusOp>`]-viitteen API:ksi, joka:
-/// - ei käytä `unwrap`/`expect`/`panic!` tuotantopolulla,
-/// - muuntaa Ractor-virheet [`FamilyClawError::Bus`]-varianteiksi,
-/// - tarjoaa selkeät metodit ([`register`](BusHandle::register),
+/// Wraps the raw [`ActorRef<BusOp>`] reference into an API that:
+/// - does not use `unwrap`/`expect`/`panic!` on the production path,
+/// - converts Ractor errors into [`FamilyClawError::Bus`] variants,
+/// - provides clear methods ([`register`](BusHandle::register),
 ///   [`publish`](BusHandle::publish), [`beings`](BusHandle::beings), …).
 ///
-/// `BusHandle` on `Clone` — sama bus voidaan jakaa usealle olennolle.
+/// `BusHandle` is `Clone` — the same bus can be shared with multiple beings.
 #[derive(Clone)]
 pub struct BusHandle {
     actor: ActorRef<BusOp>,
 }
 
 impl BusHandle {
-    /// Käärii olemassa olevan actor-viitteen kahvaksi.
+    /// Wraps an existing actor reference into a handle.
     #[must_use]
     pub fn from_ref(actor: ActorRef<BusOp>) -> Self {
         Self { actor }
     }
 
-    /// Palauttaa alla olevan actor-viitteen (esim. olentojen linkittämiseen).
+    /// Returns the underlying actor reference (e.g. for linking beings).
     #[must_use]
     pub fn actor_ref(&self) -> &ActorRef<BusOp> {
         &self.actor
     }
 
-    /// Rekisteröi olennon busiin.
+    /// Registers a being on the bus.
     ///
     /// # Errors
-    /// [`FamilyClawError::Bus`] jos viestin lähetys actorille epäonnistuu.
+    /// [`FamilyClawError::Bus`] if sending the message to the actor fails.
     pub fn register(&self, info: BeingInfo) -> Result<()> {
         self.actor
             .cast(BusOp::Register(info))
             .map_err(|e| FamilyClawError::bus(format!("register failed: {e}")))
     }
 
-    /// Poistaa olennon busista tunnisteen perusteella.
+    /// Removes a being from the bus by identifier.
     ///
     /// # Errors
-    /// [`FamilyClawError::Bus`] jos viestin lähetys actorille epäonnistuu.
+    /// [`FamilyClawError::Bus`] if sending the message to the actor fails.
     pub fn deregister(&self, id: BeingId) -> Result<()> {
         self.actor
             .cast(BusOp::Deregister(id))
             .map_err(|e| FamilyClawError::bus(format!("deregister failed: {e}")))
     }
 
-    /// Julkaisee valmiin kirjekuoren busiin.
+    /// Publishes a ready-made envelope to the bus.
     ///
     /// # Errors
-    /// [`FamilyClawError::Bus`] jos viestin lähetys actorille epäonnistuu.
+    /// [`FamilyClawError::Bus`] if sending the message to the actor fails.
     pub fn publish_envelope(&self, envelope: ResonanceMessage) -> Result<()> {
         self.actor
             .cast(BusOp::Publish(envelope))
             .map_err(|e| FamilyClawError::bus(format!("publish failed: {e}")))
     }
 
-    /// Julkaisee hyötykuorman lähettäjän puolesta (rakentaa kirjekuoren).
+    /// Publishes a payload on the sender's behalf (builds the envelope).
     ///
     /// # Errors
-    /// [`FamilyClawError::Bus`] jos viestin lähetys actorille epäonnistuu.
+    /// [`FamilyClawError::Bus`] if sending the message to the actor fails.
     pub fn publish(&self, from: BeingId, payload: BusMessage) -> Result<()> {
         self.publish_envelope(ResonanceMessage::new(from, payload))
     }
 
-    /// Julkaisee hyötykuorman **per-viesti-alkuperän** kanssa (F2): kirjekuori
-    /// kantaa [`crate::message::MessageOrigin`]:n, josta vastaanottava agentti johtaa
-    /// vastauksen kohteen per viesti. Käytetään kanavakerroksen sillassa, kun
-    /// saapuva viesti tulee ulkomaailmasta tunnetusta keskustelusta.
+    /// Publishes a payload with a **per-message origin** (F2): the envelope
+    /// carries a [`crate::message::MessageOrigin`], from which the
+    /// receiving agent derives the reply target per message. Used in the
+    /// channel-layer bridge when an incoming message comes from the outside
+    /// world in a known conversation.
     ///
     /// # Errors
-    /// [`FamilyClawError::Bus`] jos viestin lähetys actorille epäonnistuu.
+    /// [`FamilyClawError::Bus`] if sending the message to the actor fails.
     pub fn publish_with_origin(
         &self,
         from: BeingId,
@@ -338,12 +339,12 @@ impl BusHandle {
         self.publish_envelope(ResonanceMessage::new(from, payload).with_origin(origin))
     }
 
-    /// Palauttaa tilannekuvan liittyneistä olennoista.
+    /// Returns a snapshot of joined beings.
     ///
-    /// **Tämä lista ei ole tyhjä kun olentoja on liittynyt** (design §2.2).
+    /// **This list is not empty when beings have joined** (design §2.2).
     ///
     /// # Errors
-    /// [`FamilyClawError::Bus`] jos kysely epäonnistuu tai aikakatkaistaan.
+    /// [`FamilyClawError::Bus`] if the query fails or times out.
     pub async fn beings(&self) -> Result<Vec<BeingSnapshot>> {
         self.actor
             .call(BusOp::ListBeings, Some(DEFAULT_CALL_TIMEOUT))
@@ -352,10 +353,10 @@ impl BusHandle {
             .success_or_else(|| FamilyClawError::bus("list beings: no reply (timeout)"))
     }
 
-    /// Palauttaa liittyneiden olentojen lukumäärän.
+    /// Returns the count of joined beings.
     ///
     /// # Errors
-    /// [`FamilyClawError::Bus`] jos kysely epäonnistuu tai aikakatkaistaan.
+    /// [`FamilyClawError::Bus`] if the query fails or times out.
     pub async fn count(&self) -> Result<usize> {
         self.actor
             .call(BusOp::Count, Some(DEFAULT_CALL_TIMEOUT))
@@ -364,20 +365,20 @@ impl BusHandle {
             .success_or_else(|| FamilyClawError::bus("count: no reply (timeout)"))
     }
 
-    /// Pysäyttää busin siististi.
+    /// Stops the bus cleanly.
     pub fn stop(&self) {
         self.actor.stop(None);
     }
 }
 
 impl ResonanceBus {
-    /// Spawnaa Resonance Bus -actorin ja palauttaa ergonomisen [`BusHandle`]:n.
+    /// Spawns the Resonance Bus actor and returns an ergonomic [`BusHandle`].
     ///
-    /// `name` on valinnainen rekisteröintinimi globaalia hakua varten
+    /// `name` is an optional registration name for global lookup
     /// ([`ractor::registry`]).
     ///
     /// # Errors
-    /// [`FamilyClawError::Bus`] jos actorin käynnistys epäonnistuu.
+    /// [`FamilyClawError::Bus`] if starting the actor fails.
     pub async fn start(name: Option<String>) -> Result<BusHandle> {
         let (actor, _join) = Actor::spawn(name, ResonanceBus, ())
             .await
@@ -388,8 +389,8 @@ impl ResonanceBus {
 
 #[cfg(test)]
 mod tests {
-    // Testit vertaavat tarkkoja, esitettäviä f32-tunnetila-arvoja (esim. 80.0),
-    // jotka kulkevat busin läpi muuttumattomina — tarkka vertailu on tässä oikein.
+    // Tests compare exact, representable f32 emotion-state values (e.g. 80.0)
+    // that travel through the bus unchanged — exact comparison is correct here.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -399,7 +400,7 @@ mod tests {
     use ractor::Actor;
     use std::time::Duration as StdDuration;
 
-    /// Apuri: spawnaa keräävän olennon ja rekisteröi sen busiin.
+    /// Helper: spawns a collector being and registers it on the bus.
     async fn join_being(
         bus: &BusHandle,
         name: &str,
@@ -414,7 +415,7 @@ mod tests {
         (id, actor, log)
     }
 
-    /// Apuri: pieni odotus, jotta asynkroninen toimitus ehtii valmistua.
+    /// Helper: a short wait so asynchronous delivery has time to complete.
     async fn settle() {
         tokio::time::sleep(StdDuration::from_millis(50)).await;
     }
@@ -436,7 +437,7 @@ mod tests {
         assert_eq!(
             beings.len(),
             2,
-            "beings[] EI saa olla tyhjä kun olentoja on"
+            "beings[] must NOT be empty when beings have joined"
         );
         assert_eq!(bus.count().await.expect("count"), 2);
 
@@ -454,13 +455,13 @@ mod tests {
         let (_id_b, _b, log_b) = join_being(&bus, "agent_b").await;
         let (_id_c, _c, log_c) = join_being(&bus, "agent_c").await;
 
-        bus.publish(id_a, BusMessage::text("hei kaikki"))
+        bus.publish(id_a, BusMessage::text("hello everyone"))
             .expect("publish");
         settle().await;
 
-        // Lähettäjä ei saa omaa viestiään kaikuna.
+        // The sender does not receive its own message as an echo.
         assert_eq!(log_len(&log_a), 0);
-        // Muut saavat sen.
+        // The others receive it.
         assert_eq!(log_len(&log_b), 1);
         assert_eq!(log_len(&log_c), 1);
 
@@ -477,7 +478,7 @@ mod tests {
         let (id_a, _a, _la) = join_being(&bus, "agent_a").await;
         let (_id_b, _b, log_b) = join_being(&bus, "agent_b").await;
 
-        // agent_a "luovassa virtauksessa" → pulssi vuotaa busiin.
+        // agent_a "in a creative flow" → the pulse leaks into the bus.
         let mut state = EmotionState::neutral();
         state.stimulate(Dimension::Curiosity, 80.0);
         state.stimulate(Dimension::Joy, 60.0);
@@ -490,14 +491,14 @@ mod tests {
         assert_eq!(received.len(), 1);
         assert!(
             received[0].is_emotion_pulse(),
-            "sisarus aistii tunnepulssin"
+            "the sibling senses the emotion pulse"
         );
         if let BusMessage::EmotionPulse { state: got } = &received[0].payload {
-            // Sisaruksen vastaanottama tila vastaa lähetettyä — contagion-data
-            // on ehjä, joten vastaanottaja voi reagoida siihen.
+            // The state the sibling received matches what was sent — the
+            // contagion data is intact, so the receiver can react to it.
             assert_eq!(got.value(Dimension::Curiosity), 80.0);
         } else {
-            panic!("odotettiin EmotionPulse");
+            panic!("expected EmotionPulse");
         }
 
         bus.stop();
@@ -513,10 +514,14 @@ mod tests {
         settle().await;
         assert_eq!(bus.count().await.expect("count"), 1);
 
-        bus.publish(id_a, BusMessage::text("vielä siellä?"))
+        bus.publish(id_a, BusMessage::text("still there?"))
             .expect("publish");
         settle().await;
-        assert_eq!(log_len(&log_b), 0, "poistettu olento ei saa viestejä");
+        assert_eq!(
+            log_len(&log_b),
+            0,
+            "a removed being does not receive messages"
+        );
 
         bus.stop();
     }
@@ -541,7 +546,7 @@ mod tests {
                 assert_eq!(event, &TaskEventKind::Completed);
                 assert_eq!(task_id, "task-7");
             }
-            other => panic!("odotettiin TaskEvent, saatiin {other:?}"),
+            other => panic!("expected TaskEvent, got {other:?}"),
         }
 
         bus.stop();
@@ -555,23 +560,23 @@ mod tests {
 
         assert_eq!(bus.count().await.expect("count"), 2);
 
-        // Tapa toinen olento "kovasti" — simuloi kaatumista.
+        // Kill the second being "hard" — simulates a crash.
         actor_b.kill();
 
-        // Anna supervision-tapahtuman levitä ja siivota rekisteri.
+        // Let the supervision event propagate and clean up the registry.
         settle().await;
 
-        // Bus elää yhä ja palvelee kyselyt.
+        // The bus is still alive and serves queries.
         let count = bus.count().await.expect("bus survives crash");
-        assert_eq!(count, 1, "kaatunut olento poistettu, bus jatkaa");
+        assert_eq!(count, 1, "the crashed being was removed, the bus continues");
 
-        // Jäljellä oleva olento saa yhä viestejä.
-        bus.publish(BeingId::new(), BusMessage::text("bus elossa?"))
+        // The remaining being still receives messages.
+        bus.publish(BeingId::new(), BusMessage::text("bus alive?"))
             .expect("publish after crash");
         settle().await;
         assert_eq!(log_len(&log_a), 1);
 
-        // Lähettäjä id_a:n osoite on yhä rekisterissä.
+        // Sender id_a's entry is still in the registry.
         let beings = bus.beings().await.expect("beings");
         assert_eq!(beings.len(), 1);
         assert_eq!(beings[0].id, id_a);
@@ -584,7 +589,7 @@ mod tests {
         let bus = ResonanceBus::start(None).await.expect("start bus");
         let id = BeingId::new();
 
-        // Ensimmäinen postilaatikko.
+        // First mailbox.
         let log1 = CollectorBeing::new_log();
         let (actor1, _h1) = Actor::spawn(None, CollectorBeing, log1.clone())
             .await
@@ -592,7 +597,7 @@ mod tests {
         bus.register(BeingInfo::new(id, "agent_a", actor1.clone()))
             .expect("register 1");
 
-        // Sama tunniste, uusi postilaatikko (uudelleenliittyminen).
+        // Same identifier, new mailbox (re-registration).
         let log2 = CollectorBeing::new_log();
         let (actor2, _h2) = Actor::spawn(None, CollectorBeing, log2.clone())
             .await
@@ -601,14 +606,14 @@ mod tests {
             .expect("register 2");
         settle().await;
 
-        assert_eq!(bus.count().await.expect("count"), 1, "ei duplikaattia");
+        assert_eq!(bus.count().await.expect("count"), 1, "no duplicate");
 
-        // Toinen olento lähettää — vain uusin postilaatikko saa viestin.
-        bus.publish(BeingId::new(), BusMessage::text("kumpi saa?"))
+        // Another being sends — only the newest mailbox receives the message.
+        bus.publish(BeingId::new(), BusMessage::text("which one gets it?"))
             .expect("publish");
         settle().await;
-        assert_eq!(log_len(&log1), 0, "vanha postilaatikko ei enää saa");
-        assert_eq!(log_len(&log2), 1, "uusi postilaatikko saa");
+        assert_eq!(log_len(&log1), 0, "the old mailbox no longer receives");
+        assert_eq!(log_len(&log2), 1, "the new mailbox receives");
 
         bus.stop();
     }
@@ -623,46 +628,63 @@ mod tests {
         bus.stop();
     }
 
-    /// Regressiotesti: kaksi samanaikaista busia EIVÄT jaa pg-jäsenpoolia.
+    /// Regression test: two concurrent buses do NOT share a pg member pool.
     ///
-    /// Vanha globaali `const PG_GROUP = "resonance-bus"` -malli sai testin A
-    /// olennot näkymään testin B `pg::get_members`-tuloksessa → broadcast-laskut
-    /// vuotivat ristiin (rinnakkais-flakiness). Per-instanssi-ryhmänimen kanssa
-    /// kummankin busin näkymä on tiukasti oma. Tämä testi epäonnistuisi vanhaa
-    /// koodia vastaan.
+    /// The old global `const PG_GROUP = "resonance-bus"` model made test A's
+    /// beings show up in test B's `pg::get_members` result → broadcast counts
+    /// leaked across tests (parallel flakiness). With a per-instance group
+    /// name, each bus's view is strictly its own. This test would fail
+    /// against the old code.
     #[tokio::test]
     async fn two_buses_have_isolated_member_pools() {
         let bus1 = ResonanceBus::start(None).await.expect("start bus1");
         let bus2 = ResonanceBus::start(None).await.expect("start bus2");
 
-        // Liitä kaksi olentoa busiin 1 ja kolme busiin 2.
+        // Join two beings to bus 1 and three to bus 2.
         let (_a1, _ra1, log1_a) = join_being(&bus1, "b1_agent_a").await;
         let (id1_b, _rb1, log1_b) = join_being(&bus1, "b1_agent_b").await;
         let (_a2, _ra2, log2_a) = join_being(&bus2, "b2_agent_a").await;
         let (_b2, _rb2, log2_b) = join_being(&bus2, "b2_agent_b").await;
         let (_c2, _rc2, log2_c) = join_being(&bus2, "b2_agent_c").await;
 
-        // Lukumäärät ovat instanssikohtaisia — eivät jaettuja.
+        // Counts are per-instance — not shared.
         assert_eq!(bus1.count().await.expect("count bus1"), 2);
         assert_eq!(bus2.count().await.expect("count bus2"), 3);
 
-        // Broadcast busissa 1 tavoittaa VAIN busin 1 muut olennot (agent_a),
-        // EI busin 2 kolmea olentoa. Tämä on testin ydin: vanha globaali
-        // `PG_GROUP` vuotaisi viestin busin 2 olennoille (`pg::get_members`
-        // palauttaisi myös ne) → alla olevat `== 0`-väitteet kaatuisivat.
-        bus1.publish(id1_b, BusMessage::text("vain perheelle 1"))
+        // A broadcast on bus 1 reaches ONLY bus 1's other beings (agent_a),
+        // NOT bus 2's three beings. This is the test's core: the old global
+        // `PG_GROUP` would leak the message to bus 2's beings
+        // (`pg::get_members` would return them too) → the `== 0` assertions
+        // below would fail.
+        bus1.publish(id1_b, BusMessage::text("family 1 only"))
             .expect("publish bus1");
         settle().await;
 
-        // Lähettäjä ei saa omaa viestiään kaikuna.
-        assert_eq!(log_len(&log1_b), 0, "lähettäjä ei saa omaa viestiään");
-        // Busin 1 toinen olento saa sen (broadcast toimii busin sisällä).
-        assert_eq!(log_len(&log1_a), 1, "busin 1 sisarus saa viestin");
-        // Busin 2 olennot EIVÄT saa mitään — tämä kaatuu vanhaa globaalia
-        // jäsenpoolia vastaan (ristiinvuoto-regression vartija).
-        assert_eq!(log_len(&log2_a), 0, "busin 2 olento ei saa busin 1 viestiä");
-        assert_eq!(log_len(&log2_b), 0, "busin 2 olento ei saa busin 1 viestiä");
-        assert_eq!(log_len(&log2_c), 0, "busin 2 olento ei saa busin 1 viestiä");
+        // The sender does not receive its own message as an echo.
+        assert_eq!(
+            log_len(&log1_b),
+            0,
+            "the sender does not receive its own message"
+        );
+        // Bus 1's other being receives it (broadcast works within the bus).
+        assert_eq!(log_len(&log1_a), 1, "bus 1's sibling receives the message");
+        // Bus 2's beings receive NOTHING — this fails against the old global
+        // member pool (a guard against cross-leak regression).
+        assert_eq!(
+            log_len(&log2_a),
+            0,
+            "bus 2's being does not receive bus 1's message"
+        );
+        assert_eq!(
+            log_len(&log2_b),
+            0,
+            "bus 2's being does not receive bus 1's message"
+        );
+        assert_eq!(
+            log_len(&log2_c),
+            0,
+            "bus 2's being does not receive bus 1's message"
+        );
 
         bus1.stop();
         bus2.stop();

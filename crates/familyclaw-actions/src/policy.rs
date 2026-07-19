@@ -1,90 +1,90 @@
-//! Käytäntökerros (policy): toiminnon riskiluokka, vaaditut capabilityt
-//! (oikeudet) ja hyväksyntäkäytäntö (KERROS A, geneerinen — ei oikeita
-//! providereita, sieluja eikä avaimia).
+//! Policy layer: an action's risk class, required capabilities
+//! (permissions), and approval policy (Layer A, generic — no real
+//! providers, personas, or keys).
 //!
-//! Tämä moduuli määrittelee:
-//! - [`SkillPermission`] — yksittäinen capability jota taito tarvitsee,
-//! - [`ActionRisk`] — toiminnon riskiluokka,
-//! - [`ApprovalPolicy`] — milloin ihmisen hyväksyntä vaaditaan,
-//! - [`detect_secret_like`] — heuristinen tunnistin merkkijonoille jotka
-//!   muistuttavat salaisuutta (käytetään manifestin validoinnissa ja
-//!   todisteiden redaktoinnissa).
+//! This module defines:
+//! - [`SkillPermission`] — a single capability a skill needs,
+//! - [`ActionRisk`] — an action's risk class,
+//! - [`ApprovalPolicy`] — when human approval is required,
+//! - [`detect_secret_like`] — a heuristic detector for strings that
+//!   resemble a secret (used in manifest validation and
+//!   proof redaction).
 //!
-//! Determinismi: tämä moduuli ei lue kelloa eikä tee verkkokutsuja.
+//! Determinism: this module does not read the clock or make network calls.
 
 use serde::{Deserialize, Serialize};
 
-/// Moduulin valmiusaste (luuranko-yhteensopivuus).
+/// Module readiness level (scaffold compatibility).
 ///
-/// Säilytetään, jotta [`crate::all_modules_scaffolded`] kääntyy edelleen
-/// muiden vielä luurankovaiheessa olevien moduulien rinnalla.
+/// Kept so that [`crate::all_modules_scaffolded`] still compiles alongside
+/// other modules that are still in the scaffold stage.
 pub(crate) const SCAFFOLDED: bool = true;
 
-/// Yksittäinen capability (oikeus) jonka taito tarvitsee toimiakseen.
+/// A single capability (permission) that a skill needs in order to operate.
 ///
-/// Geneerinen — ei viittauksia oikeisiin providereihin tai palveluihin.
-/// Käytäntö ([`ApprovalPolicy`]) ja riskiluokka ([`ActionRisk`]) johdetaan
-/// osittain näistä oikeuksista.
+/// Generic — no references to real providers or services.
+/// The policy ([`ApprovalPolicy`]) and risk class ([`ActionRisk`]) are derived
+/// in part from these permissions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillPermission {
-    /// Lukea paikallisia tiedostoja.
+    /// Read local files.
     ReadFiles,
-    /// Kirjoittaa paikallisia tiedostoja (palautettavissa).
+    /// Write local files (reversible).
     WriteLocalFiles,
-    /// Lukea dataa verkosta (vain luku, ei sivuvaikutuksia).
+    /// Read data from the network (read-only, no side effects).
     NetworkRead,
-    /// Lähettää viestin (esim. chat-kanavalle) — sivuvaikutuksellinen.
+    /// Send a message (e.g. to a chat channel) — has side effects.
     SendMessage,
-    /// Suorittaa koodia.
+    /// Execute code.
     ExecuteCode,
-    /// Käyttää rahaa (maksutapahtuma).
+    /// Spend money (a payment transaction).
     SpendMoney,
-    /// Kirjoittaa ulkoiseen järjestelmään (palauttamaton sivuvaikutus).
+    /// Write to an external system (an unrecoverable side effect).
     WriteExternal,
 }
 
-/// Toiminnon riskiluokka, kasvavassa vaarallisuusjärjestyksessä mielessä.
+/// An action's risk class, intended in increasing order of danger.
 ///
-/// Luokka ohjaa oletushyväksyntää ([`ApprovalPolicy::requires_human`]) ja
-/// audit-kirjauksen painotusta.
+/// The class drives the default approval behavior
+/// ([`ApprovalPolicy::requires_human`]) and the weight given to audit logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionRisk {
-    /// Vain luku — ei sivuvaikutuksia.
+    /// Read-only — no side effects.
     ReadOnly,
-    /// Paikallinen kirjoitus (palautettavissa).
+    /// Local write (reversible).
     WriteLocal,
-    /// Ulkoinen kirjoitus (vaikuttaa kolmannen osapuolen järjestelmään).
+    /// External write (affects a third-party system).
     WriteExternal,
-    /// Palauttamaton toiminto.
+    /// An irreversible action.
     Irreversible,
-    /// Rahankäyttö.
+    /// Spending money.
     SpendMoney,
-    /// Viestin lähetys (näkyy ulospäin).
+    /// Sending a message (externally visible).
     SendMessage,
-    /// Koodin suoritus.
+    /// Code execution.
     ExecuteCode,
 }
 
 impl ActionRisk {
-    /// Onko tämä riskiluokka pelkkä luku (ei sivuvaikutuksia).
+    /// Whether this risk class is read-only (no side effects).
     #[must_use]
     pub const fn is_read_only(self) -> bool {
         matches!(self, Self::ReadOnly)
     }
 
-    /// Voiko tämä riskiluokka *koskaan* tuottaa automaattisen ajon
-    /// ([`ApprovalRequirement::AutoRun`]) jollain käytännöllä.
+    /// Whether this risk class can *ever* produce an automatic run
+    /// ([`ApprovalRequirement::AutoRun`]) under some policy.
     ///
-    /// Vain [`ActionRisk::ReadOnly`] ja [`ActionRisk::WriteLocal`] voivat ajaa
-    /// automaattisesti (luku aina, paikallinen kirjoitus `RequireApproval`-
-    /// käytännöllä). Korkeamman riskin luokat (raha, peruuttamaton, ulkoinen
-    /// kirjoitus, viesti, koodi) vaativat aina hyväksynnän käytännöstä
-    /// riippumatta — ne **eivät** ole auto-ajettavissa.
+    /// Only [`ActionRisk::ReadOnly`] and [`ActionRisk::WriteLocal`] can run
+    /// automatically (read always, local write under the `RequireApproval`
+    /// policy). Higher-risk classes (money, irreversible, external
+    /// write, message, code) always require approval regardless of
+    /// policy — they are **not** auto-runnable.
     ///
-    /// Tätä käytetään manifestin ristiintarkistuksessa: korkean riskin oikeutta
-    /// ei saa merkitä auto-ajettavaan riskiluokkaan.
+    /// Used in manifest cross-validation: a high-risk permission must not
+    /// be tagged with an auto-runnable risk class.
     #[must_use]
     pub const fn is_auto_runnable_class(self) -> bool {
         matches!(self, Self::ReadOnly | Self::WriteLocal)
@@ -92,124 +92,127 @@ impl ActionRisk {
 }
 
 impl SkillPermission {
-    /// Vaatiiko tämä oikeus että ilmoitettu riskiluokka EI ole auto-ajettava
-    /// (eli oikeus on aina hyväksyntää vaativa sivuvaikutus).
+    /// Whether this permission requires that the declared risk class NOT be
+    /// auto-runnable (i.e. the permission is always a side effect requiring
+    /// approval).
     ///
-    /// Manifestin ristiintarkistus ([`crate::manifest::SkillManifest::validate`])
-    /// käyttää tätä estääkseen tilanteen, jossa rahaa käyttävä
-    /// ([`SkillPermission::SpendMoney`]) tai ulkoisesti kirjoittava
-    /// ([`SkillPermission::WriteExternal`]) taito merkitään esim.
-    /// [`ActionRisk::ReadOnly`]-riskiksi ja näin ohittaa hyväksynnän putkessa.
+    /// Manifest cross-validation ([`crate::manifest::SkillManifest::validate`])
+    /// uses this to prevent a situation where a money-spending
+    /// ([`SkillPermission::SpendMoney`]) or externally-writing
+    /// ([`SkillPermission::WriteExternal`]) skill is tagged as e.g.
+    /// [`ActionRisk::ReadOnly`] risk and thereby bypasses approval in the
+    /// pipeline.
     #[must_use]
     pub const fn forbids_auto_run_risk(self) -> bool {
         matches!(self, Self::SpendMoney | Self::WriteExternal)
     }
 
-    /// Vaatiiko tämä oikeus että ilmoitettu riskiluokka on täsmälleen
-    /// [`ActionRisk::SpendMoney`].
+    /// Whether this permission requires that the declared risk class be
+    /// exactly [`ActionRisk::SpendMoney`].
     ///
-    /// Rahankäyttö ([`SkillPermission::SpendMoney`]) ei saa naamioitua
-    /// lievemmäksi riskiksi: jos oikeus on mukana, riskiluokan on oltava
-    /// [`ActionRisk::SpendMoney`], jotta audit ja hyväksyntä kohtelevat sitä
-    /// rahankäyttönä.
+    /// Spending money ([`SkillPermission::SpendMoney`]) must not masquerade
+    /// as a lower risk: if the permission is present, the risk class must be
+    /// [`ActionRisk::SpendMoney`], so that audit and approval treat it as
+    /// spending money.
     #[must_use]
     pub const fn requires_spend_money_risk(self) -> bool {
         matches!(self, Self::SpendMoney)
     }
 }
 
-/// Hyväksyntäkäytäntö: milloin ihmisen hyväksyntä vaaditaan ennen suoritusta.
+/// Approval policy: when human approval is required before execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalPolicy {
-    /// Hyväksyntä ohitetaan vain jos toiminto on luku-tyyppinen
-    /// ([`ActionRisk::ReadOnly`]); muutoin hyväksyntä vaaditaan.
+    /// Approval is skipped only if the action is read-only
+    /// ([`ActionRisk::ReadOnly`]); otherwise approval is required.
     AutoIfReadOnly,
-    /// Hyväksyntä vaaditaan, ellei riskiluokka ole pelkkä luku.
+    /// Approval is required unless the risk class is read-only.
     RequireApproval,
-    /// Hyväksyntä vaaditaan aina, riskiluokasta riippumatta.
+    /// Approval is always required, regardless of risk class.
     AlwaysRequireApproval,
 }
 
-/// Hyväksyntävaatimus jonka [`required_approval`] palauttaa: saako toiminnon
-/// ajaa automaattisesti vai vaaditaanko ihmisen hyväksyntä ensin.
+/// The approval requirement returned by [`required_approval`]: whether an
+/// action may run automatically or human approval is required first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalRequirement {
-    /// Toiminnon saa ajaa ilman erillistä hyväksyntää.
+    /// The action may run without separate approval.
     AutoRun,
-    /// Toiminto vaatii ihmisen hyväksynnän ennen suoritusta.
+    /// The action requires human approval before execution.
     RequireApproval,
 }
 
 impl ApprovalRequirement {
-    /// Vaatiiko vaatimus ihmisen hyväksynnän.
+    /// Whether the requirement mandates human approval.
     #[must_use]
     pub const fn requires_approval(self) -> bool {
         matches!(self, Self::RequireApproval)
     }
 }
 
-/// Ratkaisee hyväksyntävaatimuksen riskiluokan ja käytännön perusteella.
+/// Resolves the approval requirement based on the risk class and policy.
 ///
-/// Sääntölogiikka (fail-safe — epävarmassa tilanteessa vaaditaan hyväksyntä):
-/// - [`ActionRisk::SpendMoney`] ja [`ActionRisk::Irreversible`] vaativat
-///   **aina** hyväksynnän, vaikka käytäntö yrittäisi ohittaa sen
-///   (esim. manifesti pyytäisi auto-run). Nämä eivät koskaan aja itsestään.
-/// - [`ActionRisk::WriteExternal`], [`ActionRisk::SendMessage`] ja
-///   [`ActionRisk::ExecuteCode`] vaativat oletuksena hyväksynnän.
-/// - [`ActionRisk::ReadOnly`] ja [`ActionRisk::WriteLocal`] saavat ajaa
-///   automaattisesti **ellei** käytäntö pakota hyväksyntää
-///   ([`ApprovalPolicy::AlwaysRequireApproval`], tai mikä tahansa
-///   käytäntö joka ei salli auto-runia ei-luku-luokalle).
+/// Rule logic (fail-safe — approval is required in uncertain situations):
+/// - [`ActionRisk::SpendMoney`] and [`ActionRisk::Irreversible`] **always**
+///   require approval, even if the policy tries to bypass it
+///   (e.g. the manifest requests auto-run). These never run on their own.
+/// - [`ActionRisk::WriteExternal`], [`ActionRisk::SendMessage`] and
+///   [`ActionRisk::ExecuteCode`] require approval by default.
+/// - [`ActionRisk::ReadOnly`] and [`ActionRisk::WriteLocal`] may run
+///   automatically **unless** the policy forces approval
+///   ([`ApprovalPolicy::AlwaysRequireApproval`], or any policy that does
+///   not permit auto-run for a non-read-only class).
 ///
-/// Käytännön rooli: [`ApprovalPolicy::AutoIfReadOnly`] sallii auto-runin vain
-/// luku-luokalle; [`ApprovalPolicy::RequireApproval`] sallii sen luku- ja
-/// paikallisen kirjoituksen luokille; [`ApprovalPolicy::AlwaysRequireApproval`]
-/// ei salli koskaan. Korkean riskin luokat (raha, peruuttamaton, ulkoinen,
-/// viesti, koodi) eivät koskaan aja automaattisesti käytännöstä riippumatta.
+/// Role of the policy: [`ApprovalPolicy::AutoIfReadOnly`] permits auto-run
+/// only for the read-only class; [`ApprovalPolicy::RequireApproval`] permits
+/// it for the read-only and local-write classes;
+/// [`ApprovalPolicy::AlwaysRequireApproval`] never permits it. High-risk
+/// classes (money, irreversible, external, message, code) never run
+/// automatically regardless of policy.
 #[must_use]
 pub const fn required_approval(risk: ActionRisk, policy: ApprovalPolicy) -> ApprovalRequirement {
     use ActionRisk::{ExecuteCode, Irreversible, ReadOnly, SendMessage, SpendMoney, WriteLocal};
 
-    // Fail-safe: raha + peruuttamaton vaativat aina hyväksynnän.
+    // Fail-safe: money + irreversible always require approval.
     if matches!(risk, SpendMoney | Irreversible) {
         return ApprovalRequirement::RequireApproval;
     }
 
-    // Sivuvaikutukselliset ulospäin näkyvät luokat vaativat oletuksena
-    // hyväksynnän (ulkoinen kirjoitus, viesti, koodin suoritus).
+    // Externally visible classes with side effects require approval by
+    // default (external write, message, code execution).
     if matches!(risk, ExecuteCode | SendMessage) {
         return ApprovalRequirement::RequireApproval;
     }
 
-    // Käytäntö joka pakottaa aina → hyväksyntä.
+    // A policy that always forces approval → require approval.
     if matches!(policy, ApprovalPolicy::AlwaysRequireApproval) {
         return ApprovalRequirement::RequireApproval;
     }
 
-    // Loput (ReadOnly, WriteLocal, WriteExternal) käytännön mukaan.
+    // The rest (ReadOnly, WriteLocal, WriteExternal) follow the policy.
     match (risk, policy) {
-        // Vain luku saa ajaa automaattisesti molemmilla ei-pakottavilla käytännöillä.
+        // Read-only may run automatically under both non-forcing policies.
         (ReadOnly, ApprovalPolicy::AutoIfReadOnly | ApprovalPolicy::RequireApproval) => {
             ApprovalRequirement::AutoRun
         }
-        // Paikallinen kirjoitus saa ajaa vain RequireApproval-käytännöllä
-        // (joka sallii sivuvaikutuksettomamman paikallisen kirjoituksen),
-        // EI AutoIfReadOnly-käytännöllä joka sallii vain puhtaan luvun.
+        // Local write may run only under the RequireApproval policy
+        // (which permits the less side-effect-prone local write),
+        // NOT under AutoIfReadOnly which permits only pure reads.
         (WriteLocal, ApprovalPolicy::RequireApproval) => ApprovalRequirement::AutoRun,
-        // Ulkoinen kirjoitus ja kaikki muut yhdistelmät → hyväksyntä.
+        // External write and all other combinations → require approval.
         _ => ApprovalRequirement::RequireApproval,
     }
 }
 
 impl ApprovalPolicy {
-    /// Vaaditaanko annetulla riskiluokalla ihmisen hyväksyntä.
+    /// Whether the given risk class requires human approval.
     ///
-    /// - [`ApprovalPolicy::AlwaysRequireApproval`] vaatii aina.
-    /// - [`ApprovalPolicy::AutoIfReadOnly`] ja
-    ///   [`ApprovalPolicy::RequireApproval`] vaativat aina paitsi kun
-    ///   riskiluokka on [`ActionRisk::ReadOnly`].
+    /// - [`ApprovalPolicy::AlwaysRequireApproval`] always requires it.
+    /// - [`ApprovalPolicy::AutoIfReadOnly`] and
+    ///   [`ApprovalPolicy::RequireApproval`] always require it except when
+    ///   the risk class is [`ActionRisk::ReadOnly`].
     #[must_use]
     pub const fn requires_human(self, risk: ActionRisk) -> bool {
         match self {
@@ -218,37 +221,36 @@ impl ApprovalPolicy {
         }
     }
 
-    /// Onko tämä käytäntö sellainen, joka aidosti voi vaatia hyväksynnän
-    /// (eli **ei** koskaan automaattisesti ohita sivuvaikutuksellisia toimia).
+    /// Whether this policy is one that can genuinely require approval
+    /// (i.e. it **never** automatically bypasses actions with side effects).
     ///
-    /// Käytetään validoinnissa: ulkoinen kirjoitus
-    /// ([`SkillPermission::WriteExternal`]) ei saa olla puhtaasti
-    /// luku-automaation varassa.
+    /// Used in validation: an external write
+    /// ([`SkillPermission::WriteExternal`]) must not rely purely on
+    /// read-only automation.
     #[must_use]
     pub const fn can_require_approval(self) -> bool {
         matches!(self, Self::RequireApproval | Self::AlwaysRequireApproval)
     }
 }
 
-/// Tunnistaa heuristisesti salaisuudelta näyttävän merkkijonon.
+/// Heuristically detects a string that looks like a secret.
 ///
-/// Käytetään kahteen tarkoitukseen:
-/// 1. **Manifestin validointi** — manifestin tekstikentät eivät saa sisältää
-///    salaisuuksia (avaimia/tokeneita).
-/// 2. **Todisteiden redaktointi** — saman heuristiikan avulla redaktoidaan
-///    salaisuudelta näyttävät arvot todistepaketeista.
+/// Used for two purposes:
+/// 1. **Manifest validation** — manifest text fields must not contain
+///    secrets (keys/tokens).
+/// 2. **Proof redaction** — the same heuristic is used to redact
+///    secret-looking values from proof bundles.
 ///
-/// Tunnistettavat kuviot:
-/// - `sk-`-etuliite jota seuraa ≥8 sanamerkkiä (OpenAI-tyyliset avaimet),
-/// - AWS-tyyliset access key -tunnukset (`AKIA` + 16 isoa kirjainta/numeroa),
-/// - `Bearer <token>` -muotoiset Authorization-arvot,
-/// - pitkät yhtenäiset hex- tai base64-jonot (≥32 merkkiä),
-/// - kenttämuotoiset paljastukset kuten `api_key=...`, `apikey: ...`,
+/// Patterns detected:
+/// - an `sk-` prefix followed by ≥8 word characters (OpenAI-style keys),
+/// - AWS-style access key IDs (`AKIA` + 16 uppercase letters/digits),
+/// - `Bearer <token>`-style Authorization values,
+/// - long contiguous hex or base64 strings (≥32 characters),
+/// - field-style disclosures such as `api_key=...`, `apikey: ...`,
 ///   `secret=...`, `password=...`, `token=...`.
 ///
-/// Heuristiikka on tarkoituksella varovainen (false-positive ennemmin kuin
-/// false-negative), koska salaisuuden vuotaminen on vakavampi kuin liiallinen
-/// redaktointi.
+/// The heuristic is deliberately cautious (false positives rather than
+/// false negatives), since leaking a secret is worse than over-redacting.
 #[must_use]
 pub fn detect_secret_like(value: &str) -> bool {
     let trimmed = value.trim();
@@ -267,7 +269,7 @@ pub fn detect_secret_like(value: &str) -> bool {
     has_secret_field_assignment(trimmed)
 }
 
-/// `sk-`-etuliite jota seuraa vähintään 8 sanamerkkiä.
+/// An `sk-` prefix followed by at least 8 word characters.
 fn has_sk_prefix(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.split(|c: char| !is_token_char(c)).any(|chunk| {
@@ -278,7 +280,7 @@ fn has_sk_prefix(value: &str) -> bool {
     })
 }
 
-/// AWS-tyylinen access key id: `AKIA` + 16 isoa aakkosnumeerista merkkiä.
+/// AWS-style access key id: `AKIA` + 16 uppercase alphanumeric characters.
 fn has_aws_access_key(value: &str) -> bool {
     value
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -291,7 +293,7 @@ fn has_aws_access_key(value: &str) -> bool {
         })
 }
 
-/// `Bearer <token>` -muotoinen Authorization-arvo (token ≥8 merkkiä).
+/// A `Bearer <token>`-style Authorization value (token ≥8 characters).
 fn has_bearer_token(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     let Some(pos) = lower.find("bearer ") else {
@@ -302,14 +304,14 @@ fn has_bearer_token(value: &str) -> bool {
     token.len() >= 8
 }
 
-/// Pitkä yhtenäinen hex- tai base64-tyylinen jono (≥32 merkkiä).
+/// A long contiguous hex- or base64-style string (≥32 characters).
 fn has_long_token_run(value: &str) -> bool {
     value
         .split(|c: char| !is_base64_char(c))
         .any(|chunk| chunk.len() >= 32 && looks_high_entropy(chunk))
 }
 
-/// Kenttämuotoinen paljastus, esim. `api_key=...`, `secret: ...`, `token=...`.
+/// A field-style disclosure, e.g. `api_key=...`, `secret: ...`, `token=...`.
 fn has_secret_field_assignment(value: &str) -> bool {
     const FIELD_NAMES: [&str; 6] = ["api_key", "apikey", "secret", "password", "token", "passwd"];
     let lower = value.to_ascii_lowercase();
@@ -317,7 +319,7 @@ fn has_secret_field_assignment(value: &str) -> bool {
         let mut search_from = 0;
         while let Some(rel) = lower[search_from..].find(name) {
             let idx = search_from + rel;
-            // Varmista että kenttänimeä edeltää sananraja (ei esim. "mytoken").
+            // Make sure the field name is preceded by a word boundary (not e.g. "mytoken").
             let boundary_ok = idx == 0
                 || !lower.as_bytes()[idx - 1].is_ascii_alphanumeric()
                     && lower.as_bytes()[idx - 1] != b'_';
@@ -331,7 +333,8 @@ fn has_secret_field_assignment(value: &str) -> bool {
     false
 }
 
-/// Onko kenttänimen jälkeen `=`/`:` ja vähintään yksi tokenmerkki arvona.
+/// Whether the field name is followed by `=`/`:` and at least one token
+/// character as the value.
 fn assignment_has_value(after: &str) -> bool {
     let after = after.trim_start();
     let Some(rest) = after.strip_prefix('=').or_else(|| after.strip_prefix(':')) else {
@@ -341,19 +344,19 @@ fn assignment_has_value(after: &str) -> bool {
     rest.chars().next().is_some_and(is_token_char)
 }
 
-/// Onko merkki sallittu token-merkki (aakkosnumeerinen, `-` tai `_`).
+/// Whether the character is an allowed token character (alphanumeric, `-` or `_`).
 const fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_'
 }
 
-/// Onko merkki tyypillinen base64/hex-aakkosto (sis. `+`, `/`, `=`).
+/// Whether the character is a typical base64/hex alphabet member (incl. `+`, `/`, `=`).
 const fn is_base64_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' || c == '-' || c == '_'
 }
 
-/// Karkea entropia-arvio: jonossa on sekä kirjaimia että numeroita, tai se on
-/// puhdasta pitkää hexiä. Estää esim. pitkän pelkän kirjainjonon (sana)
-/// luokittelun salaisuudeksi.
+/// A rough entropy estimate: the string has both letters and digits, or it
+/// is pure long hex. Prevents e.g. a long plain letter string (a word) from
+/// being classified as a secret.
 fn looks_high_entropy(chunk: &str) -> bool {
     let has_digit = chunk.chars().any(|c| c.is_ascii_digit());
     let has_alpha = chunk.chars().any(|c| c.is_ascii_alphabetic());
@@ -411,7 +414,7 @@ mod tests {
             required_approval(ActionRisk::ReadOnly, ApprovalPolicy::RequireApproval),
             ApprovalRequirement::AutoRun
         );
-        // Käytäntö pakottaa hyväksynnän jopa lukutoiminnolle.
+        // The policy forces approval even for a read-only action.
         assert_eq!(
             required_approval(ActionRisk::ReadOnly, ApprovalPolicy::AlwaysRequireApproval),
             ApprovalRequirement::RequireApproval
@@ -451,8 +454,8 @@ mod tests {
 
     #[test]
     fn spend_money_and_irreversible_always_require_approval_even_if_auto() {
-        // Fail-safe: vaikka käytäntö olisi kaikkein salliva, näitä ei aja koskaan
-        // automaattisesti.
+        // Fail-safe: even if the policy is the most permissive one, these must
+        // never run automatically.
         for risk in [ActionRisk::SpendMoney, ActionRisk::Irreversible] {
             assert_eq!(
                 required_approval(risk, ApprovalPolicy::AutoIfReadOnly),
@@ -488,7 +491,7 @@ mod tests {
 
     #[test]
     fn detects_sk_prefix_secret() {
-        // Rakennetaan ajonaikana ettei lähdekoodissa ole pitkää literaalia.
+        // Built at runtime so there is no long literal in the source code.
         let fake = format!("sk-{}", "live".repeat(4));
         assert!(detect_secret_like(&fake));
     }
@@ -507,7 +510,7 @@ mod tests {
 
     #[test]
     fn detects_long_hex_run() {
-        let fake = "a1b2".repeat(10); // 40 hex-merkkiä
+        let fake = "a1b2".repeat(10); // 40 hex characters
         assert!(detect_secret_like(&fake));
     }
 
@@ -522,6 +525,8 @@ mod tests {
         assert!(!detect_secret_like(
             "Lähettää tervehdysviestin kanavalle general."
         ));
+        // Note: this is a Finnish test-data string literal being asserted
+        // against, not a comment — left unchanged per instructions.
         assert!(!detect_secret_like(""));
         assert!(!detect_secret_like("mock-1"));
         assert!(!detect_secret_like("example-org/example-repo"));

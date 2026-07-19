@@ -1,22 +1,22 @@
-//! Cron-yhteensopiva entrypoint unijaksoille.
+//! Cron-compatible entrypoint for dream cycles.
 //!
-//! Tämä moduuli tarjoaa komentorivityökalun joka:
+//! This module provides a command-line tool that:
 //!
-//! 1. Laskee viimeisimmän unijakson ajankohdan ([`DesireClock`])
-//! 2. Tarkistaa onko se jo ajettu ([`DurableContext`] logiikka)
-//! 3. Jos ei, ajaa [`DreamCycle`] ja kirjaa tuloksen durable-lokiin
+//! 1. Computes the most recent dream cycle time ([`DesireClock`])
+//! 2. Checks whether it has already run ([`DurableContext`] logic)
+//! 3. If not, runs [`DreamCycle`] and records the result to the durable log
 //!
-//! Käyttö:
+//! Usage:
 //! ```bash
-//! # Ajaa unijakson jos viimeisin jäi väliin
+//! # Runs the dream cycle if the most recent one was missed
 //! cargo run --bin dream-cron-job
 //! ```
 //!
-//! Ympäristömuuttujat:
-//! - `FAMILYCLAW_DATA_DIR` — hakemisto jossa `memory.json` ja `journal.jsonl` sijaitsevat (pakollinen)
-//! - `FAMILYCLAW_AGENT_NAME` — agentin nimi lokitusta varten (oletus: "dream")
-//! - `FAMILYCLAW_PROFILE_DIR` — profiilikansio (valinnainen, tämä ei lue SOUL:ia MVP:ssä)
-//! - `RUST_LOG` — logitaso (oletus: info)
+//! Environment variables:
+//! - `FAMILYCLAW_DATA_DIR` — directory where `memory.json` and `journal.jsonl` are located (required)
+//! - `FAMILYCLAW_AGENT_NAME` — agent name for logging (default: "dream")
+//! - `FAMILYCLAW_PROFILE_DIR` — profile directory (optional, not read for SOUL in the MVP)
+//! - `RUST_LOG` — log level (default: info)
 
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ use familyclaw_memory::LocalJsonStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Alusta lokitus
+    // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("Käynnistetään unijakso...");
 
-    // Lue data-hakemisto ympäristöstä
+    // Read the data directory from the environment
     let data_dir = std::env::var("FAMILYCLAW_DATA_DIR").map_err(|_| {
         FamilyClawError::config(
             "FAMILYCLAW_DATA_DIR ei asetettu — vaaditaan memory.json ja journal.jsonl",
@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
     let journal_path = data_path.join("journal.jsonl");
     let memory_path = data_path.join("memory.json");
 
-    // Avaa (tai luo) tallennukset — ei vaadi valmiita tiedostoja etukäteen.
+    // Open (or create) the stores — no pre-existing files required.
     let journal = Arc::new(FileJournal::open(&journal_path)?);
     let store = Arc::new(LocalJsonStore::open(&memory_path).await?);
 
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     let now = time::now();
     let _clock = DesireClock::default();
 
-    // Tarkista onko unijakso jo ajettu tänä yölle (päiväkohtainen idempotenssi)
+    // Check whether the dream cycle has already run tonight (per-day idempotence)
     let mut context = DurableContext::new(journal.clone())?;
     let step_name = format!("dream_cycle:{}", now.format("%Y-%m-%d"));
     let already_run = context.has_run_step(&step_name)?;
@@ -75,13 +75,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Aja unijakso
+    // Run the dream cycle
     tracing::info!(%step_name, "Ajetaan unijakso...");
     println!("Ajetaan unijakso...");
 
     let cycle = DreamCycle::with_config(store.as_ref(), DreamConfig::default());
 
-    // Suorita unijakso
+    // Execute the dream cycle
     let report = cycle.run(&*journal, now).await?;
 
     tracing::info!(
@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
         report.dates_absolutized, report.strengthened, report.archived,
     );
 
-    // Kirjaa askel durable-kontekstiin (idempotentti turn_keyn kautta)
+    // Record the step in the durable context (idempotent via turn_key)
     context.step(&step_name, move || Ok(report))?;
 
     Ok(())

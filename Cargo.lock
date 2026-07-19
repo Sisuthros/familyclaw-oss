@@ -1779,19 +1779,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "familyclaw-gemu"
-version = "1.2.0"
-dependencies = [
- "anyhow",
- "clap",
- "familyclaw-core",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
 name = "familyclaw-growth"
 version = "1.2.0"
 dependencies = [

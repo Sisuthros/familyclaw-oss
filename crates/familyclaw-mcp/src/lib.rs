@@ -1,7 +1,8 @@
 //! # familyclaw-mcp
 //!
-//! MCP-asiakas FamilyClaw-alustalle (KERROS A, OSS): stdio- ja HTTP-kuljetus,
-//! työkalujen listaus/kutsu sekä silta [`ActionRuntime`]-taidoiksi.
+//! An MCP client for the `FamilyClaw` platform (Layer A, OSS): stdio and
+//! HTTP transport, tool listing/invocation, and a bridge to
+//! [`ActionRuntime`] skills.
 
 pub mod bridge;
 pub mod client;
@@ -15,7 +16,7 @@ pub use client::McpClient;
 pub use env::{load_mcp_servers_from_env, McpServerConfig, McpTransportConfig};
 pub use error::{McpError, Result};
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

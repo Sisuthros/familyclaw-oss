@@ -1,8 +1,8 @@
-//! Väliaikainen apuagentti resonance-busilla (KERROS A).
+//! Temporary helper subagent over the resonance bus (Layer A).
 //!
-//! [`SpawnSubagentSkill`] delegoi tehtävän [`SubagentSpawner`]-toteutukselle,
-//! joka runtime kytketään jaetuun busiin. Tulos palautuu vanhemmalle agentille
-//! tool-loopin kautta.
+//! [`SpawnSubagentSkill`] delegates a task to a [`SubagentSpawner`]
+//! implementation, which the runtime wires up to the shared bus. The result
+//! is returned to the parent agent via the tool loop.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -18,21 +18,21 @@ use super::Skill;
 
 const SKILL_UUID: uuid::Uuid = uuid::uuid!("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
 
-/// Syöte: tehtäväkuvaus ja valinnainen apuagentin nimi.
+/// Input: task description and optional helper agent name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnSubagentInput {
-    /// Tehtävä joka delegoidaan apuagentille.
+    /// The task delegated to the helper agent.
     pub task: String,
-    /// Valinnainen apuagentin nimi (geneerinen, esim. `helper_agent`).
+    /// Optional helper agent name (generic, e.g. `helper_agent`).
     #[serde(default)]
     pub helper_name: Option<String>,
 }
 
-/// Rajapinta väliaikaiselle apuagentille. Toteutus runtime-kerroksessa (ei
-/// syklistä riippuvuutta `familyclaw-agent`:iin).
+/// Interface for a temporary helper agent. Implemented in the runtime layer
+/// (no cyclic dependency on `familyclaw-agent`).
 #[async_trait]
 pub trait SubagentSpawner: Send + Sync {
-    /// Suorittaa tehtävän apuagentilla ja palauttaa vastauksen.
+    /// Runs the task with the helper agent and returns the response.
     async fn spawn_and_run(
         &self,
         task: &str,
@@ -40,14 +40,14 @@ pub trait SubagentSpawner: Send + Sync {
     ) -> std::result::Result<String, String>;
 }
 
-/// Taito: delegoi tehtävän väliaikaiselle apuagentille busilla.
+/// Skill: delegates a task to a temporary helper agent over the bus.
 #[derive(Clone)]
 pub struct SpawnSubagentSkill {
     spawner: Option<std::sync::Arc<dyn SubagentSpawner>>,
 }
 
 impl SpawnSubagentSkill {
-    /// Luo taidon annetulla apuagentti-spawnerilla.
+    /// Creates the skill with the given helper agent spawner.
     #[must_use]
     pub fn new(spawner: std::sync::Arc<dyn SubagentSpawner>) -> Self {
         Self {
@@ -55,13 +55,13 @@ impl SpawnSubagentSkill {
         }
     }
 
-    /// Fail-closed: ei spawneria → taito rekisteröityy mutta hylkää kutsut.
+    /// Fail-closed: no spawner → the skill registers but rejects calls.
     #[must_use]
     pub fn disabled() -> Self {
         Self { spawner: None }
     }
 
-    /// Taidon kiinteä tunniste.
+    /// The skill's fixed identifier.
     #[must_use]
     pub fn skill_id() -> SkillId {
         SkillId::from_uuid(SKILL_UUID)

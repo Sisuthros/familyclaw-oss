@@ -1,36 +1,37 @@
-//! Tunnetilan *inertia* — kevyt HMM-tyylinen tilasiirtymä.
+//! Emotional-state *inertia* — a lightweight HMM-style state transition.
 //!
-//! Tämä moduuli on **inspiroitu** EQ-Negotiatorin (arXiv 2511.03370)
-//! HMM-pohjaisesta tunnetilan seurannasta, mutta se **ei ole täysi
-//! piilotettu Markov-malli**: ei emissiojakaumia, ei Viterbiä, ei
-//! Baum–Welch-opetusta. Tarjolla on yksi kevyt idea: *emotionaalinen
-//! inertia* — edellinen tunnetila vaikuttaa seuraavaan, jottei affekti
-//! hyppää epäuskottavasti hetkestä toiseen.
+//! This module is **inspired by** EQ-Negotiator's (arXiv 2511.03370)
+//! HMM-based emotional-state tracking, but it is **not a full hidden
+//! Markov model**: no emission distributions, no Viterbi, no
+//! Baum–Welch training. What it offers is one lightweight idea:
+//! *emotional inertia* — the previous emotional state influences the
+//! next one, so affect doesn't jump implausibly from one moment to
+//! the next.
 //!
 //! ## Idea
-//! HMM:ssä tilan siirtymätodennäköisyys suosii pysymistä samassa
-//! tilassa (diagonaalin painotus). Tässä mallinnamme saman jatkuvana:
-//! seuraava tila on *interpolaatio* edellisen (priori) ja havaitun uuden
-//! (evidenssi) tilan välillä. `inertia` säätää kuinka paljon menneisyys
-//! painaa.
+//! In an HMM, the state transition probability favors staying in the
+//! same state (diagonal weighting). Here we model the same idea
+//! continuously: the next state is an *interpolation* between the
+//! previous (prior) and the newly observed (evidence) state. `inertia`
+//! controls how much the past weighs in.
 
 use crate::dimension::Dimension;
 use crate::state::EmotionState;
 
-/// Kevyt tunnetilan siirtymä, joka mallintaa emotionaalisen inertian.
+/// A lightweight emotional-state transition that models emotional inertia.
 ///
-/// Käytä [`EmotionTransition::new`] jotta `inertia` puristetaan rajoihin
-/// `0.0..=1.0`.
+/// Use [`EmotionTransition::new`] so that `inertia` is clamped to the
+/// range `0.0..=1.0`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EmotionTransition {
-    /// Kuinka paljon edellinen tila painaa seuraavassa, `0.0..=1.0`.
-    /// `0.0` = ei inertiaa (uusi havainto korvaa kokonaan), `1.0` =
-    /// täysi inertia (tila ei muutu lainkaan). Tyypillinen arvo ~0.6.
+    /// How much the previous state weighs in the next one, `0.0..=1.0`.
+    /// `0.0` = no inertia (the new observation fully replaces it), `1.0` =
+    /// full inertia (the state doesn't change at all). Typical value ~0.6.
     inertia: f32,
 }
 
 impl EmotionTransition {
-    /// Rakentaa siirtymän annetulla inertialla (puristetaan `0.0..=1.0`,
+    /// Builds a transition with the given inertia (clamped to `0.0..=1.0`,
     /// NaN → [`DEFAULT_INERTIA`]).
     #[must_use]
     pub fn new(inertia: f32) -> Self {
@@ -43,28 +44,28 @@ impl EmotionTransition {
         }
     }
 
-    /// Rungon oletusinertialla rakennettu siirtymä.
+    /// A transition built with the crate's default inertia.
     #[must_use]
     pub fn balanced() -> Self {
         Self::new(DEFAULT_INERTIA)
     }
 
-    /// Aktiivinen inertia-arvo (`0.0..=1.0`).
+    /// The active inertia value (`0.0..=1.0`).
     #[must_use]
     pub const fn inertia(self) -> f32 {
         self.inertia
     }
 
-    /// Yhdistää edellisen tilan (`prev`) ja havaitun uuden tilan
-    /// (`observed`) inertian mukaan.
+    /// Blends the previous state (`prev`) with the newly observed state
+    /// (`observed`) according to the inertia.
     ///
-    /// Jokaiselle dimensiolle:
+    /// For each dimension:
     /// `next = inertia * prev + (1 - inertia) * observed`.
     ///
-    /// Suuri inertia → seuraava tila pysyy lähellä edellistä (hidas,
-    /// uskottava muutos). Pieni inertia → uusi havainto vie nopeasti.
-    /// Tulos puristetaan [`EmotionState`]:n omiin rajoihin
-    /// (`from_values` siivoaa arvot).
+    /// High inertia → the next state stays close to the previous one
+    /// (slow, believable change). Low inertia → the new observation
+    /// takes over quickly. The result is clamped to [`EmotionState`]'s
+    /// own bounds (`from_values` sanitizes the values).
     #[must_use]
     pub fn blend(self, prev: &EmotionState, observed: &EmotionState) -> EmotionState {
         let keep = self.inertia;
@@ -73,7 +74,7 @@ impl EmotionTransition {
         for dim in Dimension::ALL {
             let p = prev.value(dim);
             let o = observed.value(dim);
-            // p*keep + o*take, ilmaistuna mul_add-muodossa.
+            // p*keep + o*take, expressed via mul_add.
             let v = o.mul_add(take, p * keep);
             next.set(dim, v);
         }
@@ -87,12 +88,12 @@ impl Default for EmotionTransition {
     }
 }
 
-/// Rungon oletusinertia — kohtuullinen "menneisyys painaa, muttei lukitse".
+/// The crate's default inertia — a reasonable "the past weighs in, but doesn't lock in".
 pub const DEFAULT_INERTIA: f32 = 0.6;
 
 #[cfg(test)]
 mod tests {
-    // Tarkat f32-vertailut ovat näissä tietoisesti sallittuja.
+    // Exact f32 comparisons are deliberately allowed here.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -148,7 +149,7 @@ mod tests {
 
     #[test]
     fn inertia_slows_change() {
-        // Suurempi inertia → seuraava tila lähempänä edellistä.
+        // Higher inertia → the next state stays closer to the previous one.
         let prev = {
             let mut s = EmotionState::neutral();
             s.set(Dimension::Joy, 100.0);
@@ -165,7 +166,7 @@ mod tests {
 
     #[test]
     fn blend_result_stays_in_bounds() {
-        // Vaikka molemmat ääripäissä, tulos pysyy 0..100.
+        // Even with both at the extremes, the result stays within 0..100.
         let prev = EmotionState::from_values([100.0; crate::dimension::DIMENSION_COUNT]);
         let observed = EmotionState::neutral();
         let next = EmotionTransition::balanced().blend(&prev, &observed);
@@ -180,7 +181,7 @@ mod tests {
 
     #[test]
     fn repeated_application_converges_toward_observation() {
-        // Toistuva sama havainto → tila lähestyy havaintoa (inertia <1).
+        // Repeating the same observation → the state approaches the observation (inertia <1).
         let observed = {
             let mut s = EmotionState::neutral();
             s.set(Dimension::Hope, 90.0);

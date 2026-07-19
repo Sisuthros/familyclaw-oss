@@ -1,12 +1,15 @@
 [package]
 name = "familyclaw-sandbox"
-description = "wasmtime-based code sandbox (fuel + capabilities)"
+description = "Isolated code execution sandbox for agent-generated code, backed by wasmtime with fuel limits and a deny-by-default capability model"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["wasm", "wasmtime", "sandbox", "security", "agent"]
+categories = ["wasm", "development-tools"]
 
 [lints]
 workspace = true

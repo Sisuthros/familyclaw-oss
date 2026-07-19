@@ -1,100 +1,101 @@
-//! Virhetyypit koko FamilyClaw-alustalle.
+//! Error types for the entire `FamilyClaw` platform.
 //!
-//! Yksi keskitetty virhetyyppi [`FamilyClawError`] kattaa kaikki kerrokset
-//! (config, IO, sarjallistus, bus, muisti). Crateit voivat kääriä omat
-//! virheensä tähän tai määritellä omat tyyppinsä jotka muuntuvat tähän
-//! [`From`]-toteutuksilla. Tuotantopolulla EI käytetä `unwrap()`/`expect()`/
-//! `panic!()` — kaikki virheet kulkevat [`Result`]-tyypin kautta.
+//! One centralized error type, [`FamilyClawError`], covers all layers
+//! (config, IO, serialization, bus, memory). Crates can wrap their own
+//! errors into this type or define their own types that convert into it via
+//! [`From`] implementations. The production code path does NOT use
+//! `unwrap()`/`expect()`/`panic!()` — all errors flow through the
+//! [`Result`] type.
 
 use std::io;
 
 use thiserror::Error;
 
-/// FamilyClaw-alustan keskitetty virhetyyppi.
+/// The centralized error type for the `FamilyClaw` platform.
 ///
-/// Jokainen variantti vastaa yhtä virheluokkaa jonka alusta voi kohdata.
-/// Tyyppi on `#[non_exhaustive]` jotta uusia variantteja voi lisätä
-/// myöhemmin rikkomatta downstream-koodia.
+/// Each variant corresponds to one error category the platform can
+/// encounter. The type is `#[non_exhaustive]` so new variants can be added
+/// later without breaking downstream code.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum FamilyClawError {
-    /// Konfiguraation lataus tai validointi epäonnistui.
+    /// Configuration loading or validation failed.
     #[error("config error: {0}")]
     Config(String),
 
-    /// Tiedosto- tai verkko-IO epäonnistui.
+    /// File or network IO failed.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
 
-    /// JSON-sarjallistus tai -jäsennys epäonnistui.
+    /// JSON serialization or parsing failed.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
 
-    /// Resonance Bus -tason virhe (actor-viestintä, kanavat, mailbox).
+    /// Resonance Bus-level error (actor messaging, channels, mailbox).
     #[error("bus error: {0}")]
     Bus(String),
 
-    /// Muisti-substraatin virhe (Eternal Thread, vektorit, decay).
+    /// Memory substrate error (Eternal Thread, vectors, decay).
     #[error("memory error: {0}")]
     Memory(String),
 
-    /// Pyydettyä resurssia (agentti, perhe, viesti) ei löytynyt.
+    /// The requested resource (agent, family, message) was not found.
     #[error("not found: {0}")]
     NotFound(String),
 
-    /// Annettu syöte oli kelvoton (validointivirhe).
+    /// The given input was invalid (validation error).
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
-    /// LLM-pyyntö epäonnistui (verkko- tai API-virhe).
+    /// The LLM request failed (network or API error).
     #[error("llm error: {0}")]
     Llm(String),
 
-    /// Sandbox-suoritus epäonnistui (WASM, fuel, capability).
+    /// Sandbox execution failed (WASM, fuel, capability).
     #[error("sandbox error: {0}")]
     Sandbox(String),
 }
 
 impl FamilyClawError {
-    /// Rakentaa [`FamilyClawError::Config`]-variantin mistä tahansa
-    /// merkkijonoksi muunnettavasta arvosta.
+    /// Builds a [`FamilyClawError::Config`] variant from any value
+    /// convertible into a string.
     pub fn config(msg: impl Into<String>) -> Self {
         Self::Config(msg.into())
     }
 
-    /// Rakentaa [`FamilyClawError::Bus`]-variantin.
+    /// Builds a [`FamilyClawError::Bus`] variant.
     pub fn bus(msg: impl Into<String>) -> Self {
         Self::Bus(msg.into())
     }
 
-    /// Rakentaa [`FamilyClawError::Memory`]-variantin.
+    /// Builds a [`FamilyClawError::Memory`] variant.
     pub fn memory(msg: impl Into<String>) -> Self {
         Self::Memory(msg.into())
     }
 
-    /// Rakentaa [`FamilyClawError::NotFound`]-variantin.
+    /// Builds a [`FamilyClawError::NotFound`] variant.
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self::NotFound(msg.into())
     }
 
-    /// Rakentaa [`FamilyClawError::InvalidInput`]-variantin.
+    /// Builds a [`FamilyClawError::InvalidInput`] variant.
     pub fn invalid_input(msg: impl Into<String>) -> Self {
         Self::InvalidInput(msg.into())
     }
 
-    /// Rakentaa [`FamilyClawError::Llm`]-variantin.
+    /// Builds a [`FamilyClawError::Llm`] variant.
     pub fn llm(msg: impl Into<String>) -> Self {
         Self::Llm(msg.into())
     }
 
-    /// Rakentaa [`FamilyClawError::Sandbox`]-variantin.
+    /// Builds a [`FamilyClawError::Sandbox`] variant.
     pub fn sandbox(msg: impl Into<String>) -> Self {
         Self::Sandbox(msg.into())
     }
 }
 
-/// Alustan vakiotulostyyppi: [`std::result::Result`] jonka virhe on
-/// aina [`FamilyClawError`].
+/// The platform's standard result type: [`std::result::Result`] whose
+/// error is always [`FamilyClawError`].
 pub type Result<T> = std::result::Result<T, FamilyClawError>;
 
 #[cfg(test)]

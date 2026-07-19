@@ -1,100 +1,104 @@
-//! Embedding-tarjoajat agenttialustalle (KERROS A, OSS).
+//! Embedding providers for the agent platform (Layer A, OSS).
 //!
-//! Tämä crate antaa tekstille vektoriedustuksen, jota
-//! [`familyclaw-memory`](../familyclaw_memory/index.html)n vektorihaku
-//! (cosine-similarity) voi käyttää. Suunnittelu noudattaa v1.0-roadmapin
-//! päätöstä **D4**:
+//! This crate gives text a vector representation that
+//! [`familyclaw-memory`](../familyclaw_memory/index.html)'s vector search
+//! (cosine similarity) can use. The design follows v1.0 roadmap decision
+//! **D4**:
 //!
-//! - **Oletus = deterministinen, riippuvuudeton** ([`DeterministicEmbedder`]).
-//!   Ei verkkoa, ei mallitiedostoa, ei natiivilinkkiä — kunnioittaa köyhyys-
-//!   rajoitetta ja pysyy MSVC/`cargo deny`-vihreänä ilman lisätyötä. Tuottaa
-//!   *vakaat* vektorit (sama teksti → sama vektori, aina), joten replay ja
-//!   testit ovat deterministisiä.
-//! - **Aidot mallit (pure-Rust) tulevat feature-gatein** myöhemmässä PR:ssä
-//!   (Phase-0-spiken valitsema backend). Oletusrakennus ei vedä raskasta
-//!   riippuvuutta.
+//! - **Default = deterministic, dependency-free** ([`DeterministicEmbedder`]).
+//!   No network, no model file, no native linking — respects the resource-
+//!   constraint requirement and stays MSVC/`cargo deny`-green with no extra
+//!   work. Produces *stable* vectors (same text → same vector, always), so
+//!   replay and tests are deterministic.
+//! - **Real (pure-Rust) models arrive behind feature gates** in a later PR
+//!   (the backend chosen by the Phase 0 spike). The default build does not
+//!   pull in a heavy dependency.
 //!
-//! ## Mitä deterministinen oletus EI ole
-//! [`DeterministicEmbedder`] on **feature-hashing-pohjainen bag-of-words**
-//! -edustus, ei opittu semanttinen malli. Se vangitsee *sanojen päällekkäisyyden*
-//! (jaetut tokenit → korkeampi cosine), ei syvää merkitystä. Se on
-//! tarkoituksellinen perustaso: parempi kuin ei vektoria, deterministinen, ja
-//! antaa vektorihaun rakentua ennen kuin aito malli on saatavilla. Älä mainosta
-//! sitä semanttisena hakuna — semanttinen laatu mitataan recall-benchmarkilla
-//! ennen kuin aito malli kytketään (roadmap D4).
+//! ## What the deterministic default is NOT
+//! [`DeterministicEmbedder`] is a **feature-hashing-based bag-of-words**
+//! representation, not a learned semantic model. It captures *word overlap*
+//! (shared tokens → higher cosine), not deep meaning. It is a deliberate
+//! baseline: better than no vector, deterministic, and lets vector search
+//! be built before a real model is available. Don't advertise it as
+//! semantic search — semantic quality is measured with a recall benchmark
+//! before a real model is wired in (roadmap D4).
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_embeddings::{DeterministicEmbedder, EmbeddingProvider};
 //!
 //! let embedder = DeterministicEmbedder::new();
 //! let a = embedder.embed("kissa istuu matolla");
 //! let b = embedder.embed("kissa istuu matolla");
-//! assert_eq!(a, b); // deterministinen: sama teksti → sama vektori
+//! assert_eq!(a, b); // deterministic: same text -> same vector
 //! assert_eq!(a.len(), embedder.dimensions());
 //! ```
 //!
-//! ## Aito semanttinen embedder (feature `ollama`)
-//! Kun tarvitaan aitoa semanttista recallia (ei bag-of-words), ota käyttöön
-//! `ollama`-feature ja käytä `OllamaEmbedder`:ia (esim. `nomic-embed-text`).
-//! Se kutsuu paikallista Ollamaa ja fail-safe-degradoituu nollavektoriin jos
-//! Ollama ei vastaa.
+//! ## A real semantic embedder (feature `ollama`)
+//! When real semantic recall is needed (not bag-of-words), enable the
+//! `ollama` feature and use `OllamaEmbedder` (e.g. `nomic-embed-text`). It
+//! calls a local Ollama instance and fail-safe-degrades to a zero vector if
+//! Ollama does not respond.
 
 #[cfg(feature = "ollama")]
 pub mod ollama;
 #[cfg(feature = "ollama")]
 pub use ollama::OllamaEmbedder;
 
-/// Tekstistä vektoriksi -tarjoaja.
+/// A text-to-vector provider.
 ///
-/// Toteuttajat tuottavat kiinteäulotteisen `f32`-vektorin annetulle tekstille.
-/// Saman tarjoajan on tuotettava **sama vektori samalle tekstille** (vakaus on
-/// välttämätön determinismille ja replaylle). Vektorit on tarkoitettu
-/// cosine-similarity-vertailuun, joten ne palautetaan **L2-normalisoituina**
-/// (yksikköpituus) ellei tarjoaja erikseen muuta dokumentoi.
+/// Implementers produce a fixed-dimensional `f32` vector for a given text.
+/// The same provider must produce **the same vector for the same text**
+/// (stability is required for determinism and replay). Vectors are intended
+/// for cosine-similarity comparison, so they are returned **L2-normalized**
+/// (unit length) unless a provider documents otherwise.
 pub trait EmbeddingProvider {
-    /// Vakaa tunniste tälle tarjoajalle (esim. `"deterministic-hash-v1"`).
+    /// A stable identifier for this provider (e.g. `"deterministic-hash-v1"`).
     ///
-    /// Käytetään raportointiin (`status`/`doctor`) ja sen varmistamiseen, ettei
-    /// eri tarjoajilla tuotettuja vektoreita verrata keskenään.
+    /// Used for reporting (`status`/`doctor`) and to make sure vectors
+    /// produced by different providers are never compared against each
+    /// other.
     fn id(&self) -> &str;
 
-    /// Tuotettujen vektorien ulottuvuus (pituus). Kiinteä tarjoajaa kohden.
+    /// The dimensionality (length) of produced vectors. Fixed per provider.
     fn dimensions(&self) -> usize;
 
-    /// Upottaa tekstin kiinteäulotteiseksi, L2-normalisoiduksi vektoriksi.
+    /// Embeds text into a fixed-dimensional, L2-normalized vector.
     ///
-    /// Tyhjä tai pelkkiä erottimia sisältävä syöte palauttaa nollavektorin
-    /// (kaikki nollia) — kutsujan (cosine) on käsiteltävä nollanormi (palauttaa
-    /// 0.0 similariteetin), mikä on oikein: tyhjällä tekstillä ei ole
-    /// semanttista naapuria.
+    /// Empty input, or input containing only separators, returns a zero
+    /// vector (all zeros) — the caller (cosine) must handle a zero norm
+    /// (returning a 0.0 similarity), which is correct: empty text has no
+    /// semantic neighbor.
     fn embed(&self, text: &str) -> Vec<f32>;
 }
 
-/// Deterministinen, riippuvuudeton oletus-embedder (feature-hashing / "hashing
-/// trick" -bag-of-words).
+/// A deterministic, dependency-free default embedder (feature-hashing /
+/// "hashing trick" bag-of-words).
 ///
-/// Pilkkoo tekstin tokeneiksi (ASCII-pienennys + ei-alfanumeeriset erottimina),
-/// hashaa kunkin tokenin deterministisellä FNV-1a:lla kahteen asiaan:
-/// **ämpäri-indeksiin** (`% dimensions`) ja **etumerkkiin** (vähentää
-/// hash-kollisioiden harhaa), kasaa laskurit ja L2-normalisoi. Sama teksti →
-/// sama vektori joka kerta, ilman ulkoista tilaa.
+/// Splits the text into tokens (ASCII lowercasing + non-alphanumeric
+/// characters as separators), hashes each token with a deterministic
+/// FNV-1a into two things: a **bucket index** (`% dimensions`) and a
+/// **sign** (reduces hash-collision bias), accumulates the counters, and
+/// L2-normalizes. Same text -> same vector every time, with no external
+/// state.
 ///
-/// Ulottuvuus on oletuksena [`DeterministicEmbedder::DEFAULT_DIMENSIONS`].
+/// The dimensionality defaults to
+/// [`DeterministicEmbedder::DEFAULT_DIMENSIONS`].
 #[derive(Debug, Clone)]
 pub struct DeterministicEmbedder {
     dimensions: usize,
 }
 
 impl DeterministicEmbedder {
-    /// Oletusulottuvuus. 256 on tasapaino: tarpeeksi väljä kollisioiden
-    /// vähentämiseksi tavallisilla viesteillä, tarpeeksi pieni muistille.
+    /// The default dimensionality. 256 is a balance: wide enough to reduce
+    /// collisions for typical messages, small enough for memory.
     pub const DEFAULT_DIMENSIONS: usize = 256;
 
-    /// Vakaa tunniste tälle tarjoajalle.
+    /// A stable identifier for this provider.
     pub const ID: &'static str = "deterministic-hash-v1";
 
-    /// Luo oletus-embedderin [`Self::DEFAULT_DIMENSIONS`]-ulottuvuudella.
+    /// Creates the default embedder with
+    /// [`Self::DEFAULT_DIMENSIONS`] dimensions.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -102,10 +106,10 @@ impl DeterministicEmbedder {
         }
     }
 
-    /// Luo embedderin annetulla ulottuvuudella.
+    /// Creates an embedder with the given dimensionality.
     ///
-    /// Ulottuvuus pakotetaan vähintään 1:ksi (0-ulotteinen vektori ei ole
-    /// hyödyllinen eikä cosine-yhteensopiva).
+    /// The dimensionality is clamped to at least 1 (a 0-dimensional vector
+    /// is not useful and is not cosine-compatible).
     #[must_use]
     pub const fn with_dimensions(dimensions: usize) -> Self {
         Self {
@@ -120,8 +124,8 @@ impl Default for DeterministicEmbedder {
     }
 }
 
-/// FNV-1a 64-bit -hash (deterministinen, riippuvuudeton). Vakio-siemen, joten
-/// sama tavujono → sama hash joka ajossa ja koneessa.
+/// FNV-1a 64-bit hash (deterministic, dependency-free). A fixed seed, so
+/// the same byte sequence -> the same hash on every run and machine.
 fn fnv1a(bytes: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -145,16 +149,16 @@ impl EmbeddingProvider for DeterministicEmbedder {
     fn embed(&self, text: &str) -> Vec<f32> {
         let mut vec = vec![0.0f32; self.dimensions];
 
-        // Tokenisointi: ASCII-pienennys, ei-alfanumeeriset erottimina.
-        // Pidetään tokenit yksinkertaisina ja deterministisinä (ei lokaali-
-        // riippuvaista unicode-foldausta, joka voisi vaihdella ympäristöittäin).
+        // Tokenization: ASCII lowercasing, non-alphanumeric characters as
+        // separators. Keep tokens simple and deterministic (no locale-
+        // dependent unicode folding, which could vary across environments).
         let lower = text.to_ascii_lowercase();
         for token in lower.split(|c: char| !c.is_alphanumeric()) {
             if token.is_empty() {
                 continue;
             }
             let h = fnv1a(token.as_bytes());
-            // Alabitit ämpäri-indeksiin, yksi ylempi bitti etumerkkiin.
+            // Low bits for the bucket index, one high bit for the sign.
             #[allow(clippy::cast_possible_truncation)]
             let bucket = (h % self.dimensions as u64) as usize;
             let sign = if (h >> 63) & 1 == 1 { -1.0 } else { 1.0 };
@@ -166,8 +170,8 @@ impl EmbeddingProvider for DeterministicEmbedder {
     }
 }
 
-/// Normalisoi vektorin yksikköpituuteen (L2) paikallaan. Nollavektori jätetään
-/// nollaksi (ei jakoa nollalla) — cosine käsittelee sen 0.0:na.
+/// Normalizes a vector to unit length (L2) in place. A zero vector is left
+/// as zero (no division by zero) — cosine treats it as 0.0.
 fn l2_normalize(vec: &mut [f32]) {
     let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
     if norm_sq <= 0.0 {
@@ -186,7 +190,7 @@ mod tests {
 
     fn cosine(a: &[f32], b: &[f32]) -> f32 {
         let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-        dot // molemmat L2-normalisoituja → piste = cosine
+        dot // both are L2-normalized -> dot product = cosine
     }
 
     #[test]
@@ -220,8 +224,8 @@ mod tests {
         let e = DeterministicEmbedder::new();
         let v = e.embed("");
         assert_eq!(v.len(), e.dimensions());
-        assert!(v.iter().all(|&x| x == 0.0), "tyhjä teksti → nollavektori");
-        // Vain erottimet → myös nollavektori.
+        assert!(v.iter().all(|&x| x == 0.0), "empty text -> zero vector");
+        // Only separators -> also a zero vector.
         assert!(e.embed("   !!! ").iter().all(|&x| x == 0.0));
     }
 
@@ -230,20 +234,20 @@ mod tests {
         let e = DeterministicEmbedder::new();
         let v = e.embed("kissa koira hevonen");
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "L2-normi ~1, oli {norm}");
+        assert!((norm - 1.0).abs() < 1e-5, "L2 norm ~1, was {norm}");
     }
 
     #[test]
     fn shared_words_score_higher_than_disjoint() {
         let e = DeterministicEmbedder::new();
         let base = e.embed("kissa istuu matolla");
-        let overlap = e.embed("kissa istuu tuolilla"); // 2/3 jaettua
-        let disjoint = e.embed("auto ajaa moottoritiellä"); // ei jaettua
+        let overlap = e.embed("kissa istuu tuolilla"); // 2/3 shared
+        let disjoint = e.embed("auto ajaa moottoritiellä"); // no overlap
         let sim_overlap = cosine(&base, &overlap);
         let sim_disjoint = cosine(&base, &disjoint);
         assert!(
             sim_overlap > sim_disjoint,
-            "jaetut sanat → korkeampi cosine: overlap={sim_overlap}, disjoint={sim_disjoint}"
+            "shared words -> higher cosine: overlap={sim_overlap}, disjoint={sim_disjoint}"
         );
     }
 
@@ -263,16 +267,16 @@ mod tests {
 
     #[test]
     fn fnv1a_is_stable() {
-        // Lukitse hash-vakaus: jos tämä muuttuu, kaikki tallennetut vektorit
-        // muuttuvat → tarkoituksellinen rikkova muutos, ei vahinko.
+        // Lock in hash stability: if this changes, all stored vectors
+        // change -> a deliberate breaking change, not an accident.
         assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
     }
 
     #[test]
     fn trait_object_usable() {
-        // Varmista että trait on objektiturvallinen (dyn) — runtime valitsee
-        // tarjoajan ajonaikaisesti.
+        // Verify the trait is object-safe (dyn) — the runtime selects the
+        // provider at runtime.
         let provider: Box<dyn EmbeddingProvider> = Box::new(DeterministicEmbedder::new());
         assert_eq!(provider.dimensions(), 256);
         assert_eq!(provider.embed("test").len(), 256);

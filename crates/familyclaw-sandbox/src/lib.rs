@@ -1,36 +1,39 @@
 //! # familyclaw-sandbox
 //!
-//! Eristetty koodisuoritus FamilyClaw-alustalle: WASM-pohjainen sandbox jossa
-//! **polttoaine (fuel) pakottaa suorituskaton** ja **kyvykkyysmalli rajaa
-//! pääsyn** (design §2 turva). Tämä on KERROS A:n (OSS) crate — se ei
-//! kovakoodaa perheenjäsenten sieluja, avaimia eikä polkuja.
+//! Isolated code execution for the `FamilyClaw` platform: a WASM-based
+//! sandbox where **fuel enforces an execution ceiling** and a
+//! **capability model restricts access** (design §2 security). This is a
+//! Layer A (OSS) crate — it does not hardcode family members' souls, keys,
+//! or paths.
 //!
-//! ## Rakenne
-//! Crate on tarkoituksella kerroksittainen jotta turvalogiikka on testattavaa
-//! ilman raskasta wasmtime-riippuvuutta:
+//! ## Structure
+//! The crate is deliberately layered so the security logic is testable
+//! without the heavy wasmtime dependency:
 //!
-//! - [`CodeSandbox`] — backend-riippumaton rajapinta
+//! - [`CodeSandbox`] — a backend-independent interface
 //!   ([`execute`](CodeSandbox::execute)).
-//! - [`Capability`] / [`CapabilitySet`] — "deny by default" -kyvykkyysmalli
-//!   (verkko, tiedostot, ympäristömuuttujat).
-//! - [`FuelLimit`] / [`FuelMeter`] — polttoainebudjetti ja sen mittaus.
-//! - [`NoopSandbox`] — **oletustoteutus** joka ei aja koodia (palauttaa
-//!   [`SandboxError::NotImplemented`]). Turvallinen kun wasmtimea ei tarvita.
-//! - `WasmtimeSandbox` — oikea wasmtime-pohjainen toteutus
-//!   **`wasmtime`-featuren takana** (ks. alla).
+//! - [`Capability`] / [`CapabilitySet`] — a "deny by default" capability
+//!   model (network, files, environment variables).
+//! - [`FuelLimit`] / [`FuelMeter`] — the fuel budget and its measurement.
+//! - [`NoopSandbox`] — the **default implementation** that does not run
+//!   code (returns [`SandboxError::NotImplemented`]). Safe when wasmtime
+//!   isn't needed.
+//! - `WasmtimeSandbox` — the real wasmtime-based implementation, **behind
+//!   the `wasmtime` feature** (see below).
 //!
-//! ## Feature-flagit
-//! - **`wasmtime`** (ei oletuksena): kytkee
-//!   `WasmtimeSandbox`-toteutuksen. wasmtime on iso
-//!   riippuvuus (Cranelift + JIT), joten se on optional ettei se hidasta koko
-//!   workspacen buildia. Ilman tätä featurea vain [`NoopSandbox`] on saatavilla.
+//! ## Feature flags
+//! - **`wasmtime`** (not default): enables the
+//!   `WasmtimeSandbox` implementation. wasmtime is a large
+//!   dependency (Cranelift + JIT), so it's optional to avoid slowing down
+//!   the whole workspace build. Without this feature only [`NoopSandbox`]
+//!   is available.
 //!
 //! ```toml
 //! [dependencies]
 //! familyclaw-sandbox = { version = "0.1", features = ["wasmtime"] }
 //! ```
 //!
-//! ## Esimerkki (oletus, ilman wasmtimea)
+//! ## Example (default, without wasmtime)
 //! ```
 //! use familyclaw_sandbox::{CodeSandbox, NoopSandbox, SandboxRequest};
 //!
@@ -38,51 +41,52 @@
 //! assert!(!sandbox.can_execute());
 //!
 //! let request = SandboxRequest::new(vec![0x00, 0x61, 0x73, 0x6d]);
-//! // NoopSandbox validoi pyynnön mutta ei aja koodia.
+//! // NoopSandbox validates the request but does not run the code.
 //! let result = sandbox.execute(&request);
 //! assert!(result.is_err());
 //! ```
 //!
-//! ## Turvaperiaatteet
-//! - **Deny by default:** ilman myönnettyä [`Capability`]:ia ajettavalla
-//!   koodilla ei ole verkkoa, tiedostoja eikä ympäristömuuttujia.
-//! - **Polttoaine pakottaa rajan:** ikuinen silmukka keskeytyy
-//!   [`SandboxError::FuelExhausted`]:lla.
-//! - **Determinismi:** sama [`SandboxRequest`] tuottaa saman tuloksen
-//!   (durable-replayn edellytys).
+//! ## Security principles
+//! - **Deny by default:** without a granted [`Capability`], executed code
+//!   has no network, file, or environment variable access.
+//! - **Fuel enforces the limit:** an infinite loop is interrupted with
+//!   [`SandboxError::FuelExhausted`].
+//! - **Determinism:** the same [`SandboxRequest`] produces the same result
+//!   (a prerequisite for durable replay).
 //!
-//! ## Containment-vaatimukset (2604.23425) — missä crate pakottaa kunkin
+//! ## Containment requirements (2604.23425) — where the crate enforces each one
 //!
-//! Paperi johtaa 698:n incidentin analyysistä viisi arkkitehtonista
-//! vaatimusta eristetylle koodisuoritukselle. Tämä crate kartoittuu niihin
-//! seuraavasti:
+//! The paper derives five architectural requirements for isolated code
+//! execution from an analysis of 698 incidents. This crate maps onto them
+//! as follows:
 //!
-//! 1. **Resurssirajat (resource limits)** — [`FuelLimit`] / [`FuelMeter`].
-//!    Polttoainebudjetti katkaisee ikuiset silmukat ja resurssien
-//!    väärinkäytön; ylitys palauttaa [`SandboxError::FuelExhausted`].
-//! 2. **Verkkoeristys (network isolation)** — [`CapabilitySet`]
+//! 1. **Resource limits** — [`FuelLimit`] / [`FuelMeter`]. The fuel budget
+//!    cuts off infinite loops and resource abuse; exceeding it returns
+//!    [`SandboxError::FuelExhausted`].
+//! 2. **Network isolation** — [`CapabilitySet`]
 //!    ([`allows_network_host`](CapabilitySet::allows_network_host)).
-//!    Oletuksena ([`deny_all`](CapabilitySet::deny_all)) verkkoa ei ole;
-//!    pääsy vain eksplisiittisesti myönnettyihin isäntiin.
-//! 3. **Tiedostojärjestelmän eristys (filesystem sandboxing)** —
+//!    By default ([`deny_all`](CapabilitySet::deny_all)) there is no
+//!    network access; access only to explicitly granted hosts.
+//! 3. **Filesystem sandboxing** —
 //!    [`CapabilitySet`]
 //!    ([`allows_read_path`](CapabilitySet::allows_read_path)).
-//!    Komponenttitason etuliitevertailu rajaa luvun myönnettyihin
-//!    alipuihin; muu polkupääsy evätään.
-//! 4. **Kyvykkyyspääsy (capability access)** — [`Capability`] /
-//!    [`CapabilitySet`] kokonaisuutena: additiivinen "deny by default"
-//!    -malli, jonka [`validate`](CapabilitySet::validate) hylkää
-//!    huonosti muodostetut myönnöt.
-//! 5. **Tarkastusloki (audit logging)** — [`AuditLog`] /
-//!    [`AuditedCapabilities`]. Append-only-loki kirjaa jokaisen
-//!    kyvykkyystarkistuksen (myönnetty/evätty) sekä suoritusten alun ja
-//!    lopun. Kytketään **valinnaisena** koukkuna muuttamatta olemassa
-//!    olevien tyyppien julkista rajapintaa.
+//!    Component-level prefix comparison restricts reads to granted
+//!    subtrees; other path access is denied.
+//! 4. **Capability access** — [`Capability`] /
+//!    [`CapabilitySet`] as a whole: an additive "deny by default"
+//!    model, where [`validate`](CapabilitySet::validate) rejects
+//!    malformed grants.
+//! 5. **Audit logging** — [`AuditLog`] /
+//!    [`AuditedCapabilities`]. An append-only log records every
+//!    capability check (granted/denied) as well as the start and end of
+//!    executions. Wired in as an **optional** hook without changing the
+//!    public interface of existing types.
 //!
-//! Lisäksi [`replay`](mod@replay) toteuttaa LOOP-mekanismin (2605.14237): suoritus
-//! tallennetaan [`ExecutionTrace`]:ksi ja toistetaan deterministisesti
-//! pelkästä lokista, mikä mahdollistaa containment-tapahtumien bitintarkan
-//! jälkitarkastelun ilman alkuperäistä backendia.
+//! In addition, [`replay`](mod@replay) implements the LOOP mechanism
+//! (2605.14237): execution is recorded as an [`ExecutionTrace`] and
+//! replayed deterministically from the log alone, which enables
+//! bit-exact post-hoc review of containment events without the original
+//! backend.
 
 pub mod audit;
 pub mod capability;
@@ -106,29 +110,29 @@ pub use sandbox::{CodeSandbox, SandboxOutput, SandboxRequest, SandboxResult};
 #[cfg(feature = "wasmtime")]
 pub use wasmtime_backend::WasmtimeSandbox;
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Kertoo onko oikea wasmtime-pohjainen sandbox käännetty mukaan.
+/// Reports whether the real wasmtime-based sandbox was compiled in.
 ///
-/// `true` kun `wasmtime`-feature on aktiivinen (host-import-esto + fuel-katto
-/// pakotettu, [`default_sandbox`] palauttaa `WasmtimeSandbox`:n); `false` kun
-/// vain [`NoopSandbox`] on saatavilla. Tämä on käännösaikaisesti vakio, joten
-/// kutsuja (esim. gateway-`doctor`/`status`) voi raportoida hiekkalaatikon
-/// saatavuuden ilman riippuvuutta `cfg!`-makroon omassa cratessa.
+/// `true` when the `wasmtime` feature is active (host-import denial + fuel
+/// cap enforced, [`default_sandbox`] returns a `WasmtimeSandbox`); `false`
+/// when only [`NoopSandbox`] is available. This is a compile-time constant,
+/// so a caller (e.g. the gateway's `doctor`/`status`) can report sandbox
+/// availability without depending on the `cfg!` macro in its own crate.
 #[must_use]
 pub const fn wasmtime_available() -> bool {
     cfg!(feature = "wasmtime")
 }
 
-/// Palauttaa ihmisluettavan hiekkalaatikon saatavuus-etiketin.
+/// Returns a human-readable sandbox availability label.
 ///
-/// `wasmtime (host-import denial + fuel cap)` kun [`wasmtime_available`] on
-/// `true`, muuten `none (noop)`. Tarkoitettu operaattorin tilatulosteeseen
-/// (gateway `doctor`/`status`); deterministinen ja salaisuudeton.
+/// `wasmtime (host-import denial + fuel cap)` when [`wasmtime_available`] is
+/// `true`, otherwise `none (noop)`. Intended for operator-facing status
+/// output (gateway `doctor`/`status`); deterministic and secret-free.
 #[must_use]
 pub const fn sandbox_availability() -> &'static str {
     if wasmtime_available() {
@@ -138,16 +142,16 @@ pub const fn sandbox_availability() -> &'static str {
     }
 }
 
-/// Palauttaa oletussandboxin laatikoituna trait-objektina.
+/// Returns the default sandbox boxed as a trait object.
 ///
-/// `wasmtime`-featuren kanssa tämä on
-/// `WasmtimeSandbox`; ilman sitä
-/// [`NoopSandbox`]. Tämä antaa kutsujalle backend-riippumattoman tavan saada
-/// "paras saatavilla oleva" sandbox.
+/// With the `wasmtime` feature this is a
+/// `WasmtimeSandbox`; without it,
+/// [`NoopSandbox`]. This gives the caller a backend-independent way to get
+/// the "best available" sandbox.
 ///
 /// # Errors
-/// [`SandboxError::Setup`] jos `wasmtime`-backendin alustus epäonnistuu.
-/// Noop-tapauksessa ei koskaan epäonnistu.
+/// [`SandboxError::Setup`] if the `wasmtime` backend fails to initialize.
+/// The noop case never fails.
 pub fn default_sandbox() -> Result<Box<dyn CodeSandbox>> {
     #[cfg(feature = "wasmtime")]
     {
@@ -170,7 +174,7 @@ mod tests {
 
     #[test]
     fn sandbox_availability_matches_compiled_feature() {
-        // Saatavuus-etiketti + lippu seuraavat käännösaikaista wasmtime-piirrettä.
+        // The availability label + flag follow the compile-time wasmtime feature.
         if cfg!(feature = "wasmtime") {
             assert!(wasmtime_available());
             assert_eq!(
@@ -185,7 +189,7 @@ mod tests {
 
     #[test]
     fn public_api_is_reexported() {
-        // Varmistaa että julkinen pinta on saatavilla juuresta.
+        // Confirms the public surface is available from the crate root.
         let _cap: Capability = Capability::network("h");
         let _caps: CapabilitySet = CapabilitySet::deny_all();
         let _limit: FuelLimit = FuelLimit::default();
@@ -203,7 +207,7 @@ mod tests {
     #[test]
     fn default_sandbox_is_constructible_and_usable() {
         let sandbox = default_sandbox().expect("default sandbox builds");
-        // Pyyntö validoidaan riippumatta backendista.
+        // The request is validated regardless of the backend.
         let bad = SandboxRequest::new(Vec::<u8>::new());
         assert!(sandbox.execute(&bad).is_err());
     }

@@ -1,43 +1,45 @@
-//! RED-TEAM: exactly-once-lähetys SIGKILL:n yli kesken lähetyksen.
+//! RED-TEAM: exactly-once dispatch across a SIGKILL mid-dispatch.
 //!
-//! Hyökkäys (GPT-5.5:n löytö): agenttikerros ajaa [`ActionRuntime`]:n
-//! sivuvaikutuksen (`submit_task`) ENNEN kuin se journaloi dispatch-rivin. Jos
-//! prosessi tapetaan (SIGKILL) siinä ikkunassa — sivuvaikutus on jo tapahtunut,
-//! journal-riviä ei ole — replay/restart luulee askelta ajamattomaksi ja **ajaa
-//! sivuvaikutuksen uudelleen** (kaksoislaukaisu).
+//! Attack (GPT-5.5's discovery): the agent layer runs [`ActionRuntime`]'s
+//! side effect (`submit_task`) BEFORE it journals the dispatch row. If the
+//! process is killed (SIGKILL) within that window — the side effect has
+//! already happened, the journal row does not exist — replay/restart thinks
+//! the step never ran and **re-runs the side effect** (double-fire).
 //!
-//! Tämä ajetaan **aidon prosessirajan yli**: erillinen `dispatch_redteam`-prosessi
-//! poistuu exit-koodilla 137 (SIGKILL-tyyli) juuri siinä ikkunassa, ja toinen
-//! prosessi yrittää jatkaa. Kello injektoidaan → deterministinen.
+//! This is run **across a genuine process boundary**: a separate
+//! `dispatch_redteam` process exits with exit code 137 (SIGKILL-style) right
+//! in that window, and a second process attempts to resume. The clock is
+//! injected → deterministic.
 //!
-//! ## Kaksi ikkunaa, molemmat todistettu prosessirajan yli
-//! - **COMMITTED-ikkuna** (`crash` → `resume`): outbox on jo täysin kirjoitettu
-//!   (intent + committed), vain agenttikerroksen journal-rivi puuttuu. Replay
-//!   palauttaa **arvo-identtisen** lopputuloksen ajamatta sivuvaikutusta uudelleen
-//!   → **exactly-once**.
-//! - **INTENT-ONLY-ikkuna** (`crash_intent` → `resume_intent`): prosessi tapetaan
-//!   `record_intent`:n JA sivuvaikutuksen jälkeen mutta ENNEN `record_committed`:ä.
-//!   Replay näkee `InProgress` → `submit_task_idempotent` palauttaa `PolicyDenied`
-//!   fail-closed, eikä sivuvaikutus aja uudelleen → **at-most-once**. Tämä on se
-//!   aidosti vaarallinen ikkuna jonka GPT-5.5 nosti esiin; aiemmin se oli
-//!   todistettu vain saman prosessin sisäisellä yksikkötestillä.
+//! ## Two windows, both proven across the process boundary
+//! - **COMMITTED window** (`crash` → `resume`): the outbox has already been
+//!   fully written (intent + committed), only the agent layer's journal row
+//!   is missing. Replay returns a **value-identical** outcome without
+//!   re-running the side effect → **exactly-once**.
+//! - **INTENT-ONLY window** (`crash_intent` → `resume_intent`): the process
+//!   is killed after `record_intent` AND the side effect but BEFORE
+//!   `record_committed`. Replay sees `InProgress` → `submit_task_idempotent`
+//!   returns `PolicyDenied` fail-closed, and the side effect does not re-run
+//!   → **at-most-once**. This is the genuinely dangerous window that GPT-5.5
+//!   raised; previously it had only been proven by an in-process unit test.
 //!
-//! ## Kolme väitettä
-//! - **Vanha polku (`--mode old`, `submit_task_as` ilman outboxia):** bugi ON
-//!   olemassa → sivuvaikutuslaskuri = 2 (double-fire), lopputulos ei identtinen.
-//!   Tämä todistaa että testi PALJASTAA bugin (epäonnistuisi korjaamattomalla
-//!   koodilla).
-//! - **Uusi polku, COMMITTED-ikkuna (`--mode new`, `submit_task_idempotent` +
-//!   kaatumiskestävä outbox):** bugi KORJATTU → sivuvaikutuslaskuri = 1 (tasan
-//!   kerran), ja jatkettu lopputulos on **arvo-identtinen** kaatuneen kanssa
-//!   (sama `task_id`).
-//! - **Uusi polku, INTENT-ONLY-ikkuna:** kaatuminen intentin jälkeen ennen
-//!   committedia → replay on `PolicyDenied` ja laskuri pysyy 1:ssä (at-most-once).
+//! ## Three claims
+//! - **Old path (`--mode old`, `submit_task_as` without an outbox):** the bug
+//!   DOES exist → side-effect counter = 2 (double-fire), outcome not
+//!   identical. This proves the test DOES catch the bug (would fail on
+//!   unfixed code).
+//! - **New path, COMMITTED window (`--mode new`, `submit_task_idempotent` +
+//!   crash-resilient outbox):** bug FIXED → side-effect counter = 1 (exactly
+//!   once), and the resumed outcome is **value-identical** to the crashed one
+//!   (same `task_id`).
+//! - **New path, INTENT-ONLY window:** crash after the intent but before the
+//!   committed record → replay is `PolicyDenied` and the counter stays at 1
+//!   (at-most-once).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Paikantaa `dispatch_redteam`-binäärin saman profiilin kansiosta.
+/// Locates the `dispatch_redteam` binary from the same profile directory.
 fn harness_bin() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
     let deps = exe.parent().expect("deps dir");
@@ -55,10 +57,10 @@ fn harness_bin() -> PathBuf {
     bin
 }
 
-/// Kiinteä injektoitu kello (RFC 3339) — reprodusoitavuus.
+/// Fixed injected clock (RFC 3339) — for reproducibility.
 const CLOCK: &str = "2024-05-29T18:13:20+00:00"; // = unix 1_717_000_000
 
-/// Uniikki väliaikaishakemisto tälle hyökkäysajolle.
+/// Unique temp directory for this attack run.
 fn tempdir(tag: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
     dir.push(format!(
@@ -72,7 +74,7 @@ fn tempdir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Ajaa harness-prosessin ja palauttaa (`exit_ok`, stdout, stderr).
+/// Runs the harness process and returns (`exit_ok`, stdout, stderr).
 fn run(bin: &Path, args: &[&str]) -> (bool, String, String) {
     let out = Command::new(bin)
         .args(args)
@@ -85,12 +87,12 @@ fn run(bin: &Path, args: &[&str]) -> (bool, String, String) {
     )
 }
 
-/// Ajaa harness-prosessin annetuilla ympäristömuuttujilla ja palauttaa
+/// Runs the harness process with the given environment variables and returns
 /// (`exit_code`, `exit_ok`, stdout, stderr).
 ///
-/// Tarvitaan intent-only-kaatumiseen, joka aseistetaan
-/// `FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1`:llä. `exit_code` palautetaan
-/// erikseen jotta voidaan vaatia tasan 137 (SIGKILL-tyyli).
+/// Needed for the intent-only crash, which is armed via
+/// `FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1`. `exit_code` is returned
+/// separately so that we can require exactly 137 (SIGKILL-style).
 fn run_env(
     bin: &Path,
     args: &[&str],
@@ -110,7 +112,7 @@ fn run_env(
     )
 }
 
-/// Poimii stdoutin `RESULT <json>`-rivin jäsennettynä Valueksi.
+/// Extracts the stdout's `RESULT <json>` line, parsed as a Value.
 fn result_json(stdout: &str) -> serde_json::Value {
     let line = stdout
         .lines()
@@ -119,7 +121,7 @@ fn result_json(stdout: &str) -> serde_json::Value {
     serde_json::from_str(line).expect("parse RESULT json")
 }
 
-/// Rakentaa yhden `run`-vaiheen argumentit.
+/// Builds the arguments for a single `run` phase.
 fn phase_args<'a>(
     mode: &'a str,
     phase: &'a str,
@@ -144,7 +146,7 @@ fn phase_args<'a>(
     ]
 }
 
-/// Lukee sivuvaikutuslaskurin raakana (0 jos tiedostoa ei ole).
+/// Reads the side-effect counter raw (0 if the file does not exist).
 fn read_counter(path: &Path) -> u64 {
     std::fs::read_to_string(path)
         .ok()
@@ -152,12 +154,12 @@ fn read_counter(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// **VANHA polku todistaa bugin:** `submit_task_as` ilman outboxia → kaatuminen
-/// kesken lähetyksen + re-drive AJAA SIVUVAIKUTUKSEN UUDELLEEN (double-fire).
+/// **OLD path proves the bug:** `submit_task_as` without an outbox → crash
+/// mid-dispatch + re-drive RE-RUNS THE SIDE EFFECT (double-fire).
 ///
-/// Tämä testi VARMISTAA että red-team-harness oikeasti paljastaa bugin: jos
-/// korjaus poistettaisiin (palaisi `submit_task_as`:iin), uuden polun testi
-/// epäonnistuisi — tässä todistetaan että vanha koodi tuottaa laskurin 2.
+/// This test VERIFIES that the red-team harness genuinely exposes the bug: if
+/// the fix were removed (reverting to `submit_task_as`), the new-path test
+/// would fail — here we prove that the old code produces a counter of 2.
 #[test]
 fn old_path_double_fires_side_effect_across_crash() {
     let bin = harness_bin();
@@ -171,7 +173,7 @@ fn old_path_double_fires_side_effect_across_crash() {
         outcome.to_string_lossy().into_owned(),
     );
 
-    // Vaihe 1 (crash): aja lähetys (sivuvaikutus +1), poistu 137 ennen journalointia.
+    // Phase 1 (crash): run the dispatch (side effect +1), exit 137 before journaling.
     let (ok1, _o1, e1) = run(&bin, &phase_args("old", "crash", &ob, &ct, &oc));
     assert!(!ok1, "crash phase must exit non-zero. stderr={e1}");
     assert_eq!(
@@ -180,13 +182,13 @@ fn old_path_double_fires_side_effect_across_crash() {
         "side effect ran once before crash"
     );
 
-    // Vaihe 2 (resume): re-drive SAMA lähetys — vanhalla polulla ei idempotenssia.
+    // Phase 2 (resume): re-drive the SAME dispatch — no idempotence on the old path.
     let (ok2, o2, e2) = run(&bin, &phase_args("old", "resume", &ob, &ct, &oc));
     assert!(ok2, "resume phase must succeed. stderr={e2}");
     let report = result_json(&o2);
     eprintln!("[old resume] {report}");
 
-    // BUGIN TODISTE: sivuvaikutus laukesi KAHDESTI (kaatumisikkuna + re-drive).
+    // PROOF OF THE BUG: the side effect fired TWICE (crash window + re-drive).
     assert_eq!(
         report["side_effect_count"], 2,
         "OLD path: side effect double-fires across the crash window (THIS is the bug)"
@@ -196,7 +198,7 @@ fn old_path_double_fires_side_effect_across_crash() {
         2,
         "disk counter confirms double-fire"
     );
-    // Eikä lopputulos ole identtinen (uusi satunnais-task_id re-drivessä).
+    // And the outcome is not identical (a new random task_id on re-drive).
     assert_eq!(
         report["value_identical"],
         serde_json::Value::Bool(false),
@@ -206,9 +208,9 @@ fn old_path_double_fires_side_effect_across_crash() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **UUSI polku todistaa korjauksen:** `submit_task_idempotent` + kaatumiskestävä
-/// outbox → kaatuminen kesken lähetyksen + re-drive EI aja sivuvaikutusta
-/// uudelleen, ja jatkettu lopputulos on arvo-identtinen kaatuneen kanssa.
+/// **NEW path proves the fix:** `submit_task_idempotent` + crash-resilient
+/// outbox → crash mid-dispatch + re-drive does NOT re-run the side effect,
+/// and the resumed outcome is value-identical to the crashed one.
 #[test]
 fn new_path_side_effect_exactly_once_and_value_identical() {
     let bin = harness_bin();
@@ -222,8 +224,8 @@ fn new_path_side_effect_exactly_once_and_value_identical() {
         outcome.to_string_lossy().into_owned(),
     );
 
-    // Vaihe 1 (crash): aja idempotentti lähetys (intent + sivuvaikutus + committed),
-    // poistu 137 ennen kuin agentti ehtisi journaloida dispatch-rivin.
+    // Phase 1 (crash): run the idempotent dispatch (intent + side effect + committed),
+    // exit 137 before the agent layer can journal the dispatch row.
     let (ok1, _o1, e1) = run(&bin, &phase_args("new", "crash", &ob, &ct, &oc));
     assert!(!ok1, "crash phase must exit non-zero. stderr={e1}");
     assert_eq!(
@@ -232,14 +234,14 @@ fn new_path_side_effect_exactly_once_and_value_identical() {
         "side effect ran once before crash"
     );
 
-    // Vaihe 2 (resume): re-drive SAMA lähetys samalla idempotenssi-avaimella.
-    // Outbox palauttaa committed-lopputuloksen ajamatta sivuvaikutusta uudelleen.
+    // Phase 2 (resume): re-drive the SAME dispatch with the same idempotence key.
+    // The outbox returns the committed outcome without re-running the side effect.
     let (ok2, o2, e2) = run(&bin, &phase_args("new", "resume", &ob, &ct, &oc));
     assert!(ok2, "resume phase must succeed. stderr={e2}");
     let report = result_json(&o2);
     eprintln!("[new resume] {report}");
 
-    // KORJAUKSEN TODISTE 1 (exactly-once): sivuvaikutus laukesi TASAN KERRAN.
+    // PROOF OF THE FIX 1 (exactly-once): the side effect fired EXACTLY ONCE.
     assert_eq!(
         report["side_effect_count"], 1,
         "NEW path: side effect must NOT re-fire after the crash (exactly-once)"
@@ -250,7 +252,7 @@ fn new_path_side_effect_exactly_once_and_value_identical() {
         "disk counter confirms side effect ran exactly once"
     );
 
-    // KORJAUKSEN TODISTE 2 (arvo-identtisyys): jatkettu lopputulos = kaatunut.
+    // PROOF OF THE FIX 2 (value identity): resumed outcome = crashed outcome.
     assert_eq!(
         report["value_identical"],
         serde_json::Value::Bool(true),
@@ -260,33 +262,34 @@ fn new_path_side_effect_exactly_once_and_value_identical() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Ympäristömuuttuja joka aseistaa intent-only-kaatumiskoukun harness-binäärissä.
+/// Environment variable that arms the intent-only crash hook in the harness binary.
 const CRASH_AFTER_INTENT_ENV: &str = "FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT";
 
-/// Lukee outbox-journalin raakana (tyhjä jos tiedostoa ei ole).
+/// Reads the outbox journal raw (empty if the file does not exist).
 fn read_outbox(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-/// **INTENT-ONLY-IKKUNA todistaa at-most-once fail-closed AIDON prosessirajan yli.**
+/// **INTENT-ONLY WINDOW proves at-most-once fail-closed across a GENUINE process boundary.**
 ///
-/// Tämä sulkee sen kaveatin jonka GPT-5.5:n adversariaalinen katselmointi nosti
-/// esiin: aiempi `crash`-vaihe poistui VASTA `record_committed`:n jälkeen (hyvänlaatuinen
-/// committed-replay-kohta). Aidosti vaarallinen ikkuna on `record_intent`:n JA
-/// sivuvaikutuksen jälkeen mutta ENNEN `record_committed`:ä — siellä replayn ON
-/// palautettava `InProgress` → `PolicyDenied`, eikä sivuvaikutus saa laueta toiste.
+/// This closes the caveat that GPT-5.5's adversarial review raised: the earlier
+/// `crash` phase only exited AFTER `record_committed` (a benign committed-replay
+/// case). The genuinely dangerous window is after `record_intent` AND the side
+/// effect but BEFORE `record_committed` — there, replay MUST return
+/// `InProgress` → `PolicyDenied`, and the side effect must not fire again.
 ///
-/// Vaihe 1 (`crash_intent`, koukku aseistettu): `record_intent` levylle, sivuvaikutus
-/// laukeaa (laskuri = 1), sitten prosessi abortoi `record_committed`:n alussa →
-/// poistuu 137. Levyllä: intent-marker LÄSNÄ, committed-marker POISSA.
+/// Phase 1 (`crash_intent`, hook armed): `record_intent` to disk, the side effect
+/// fires (counter = 1), then the process aborts at the start of `record_committed`
+/// → exits 137. On disk: intent marker PRESENT, committed marker ABSENT.
 ///
-/// Vaihe 2 (`resume_intent`, sama avain): outbox-lookup näkee intentin ilman
-/// committedia → `InProgress` → `submit_task_idempotent` palauttaa `PolicyDenied`.
-/// Laskuri PYSYY 1:ssä (sivuvaikutus EI aja uudelleen) → at-most-once.
+/// Phase 2 (`resume_intent`, same key): the outbox lookup sees the intent without
+/// a committed record → `InProgress` → `submit_task_idempotent` returns
+/// `PolicyDenied`. The counter STAYS at 1 (the side effect does NOT re-run) →
+/// at-most-once.
 ///
-/// Testi epäonnistuisi jos järjestys olisi väärin: jos `record_intent` tulisi
-/// sivuvaikutuksen JÄLKEEN, replay ei havaitsisi keskeneräisyyttä ja
-/// double-firaisi (tai re-runaisi hiljaa) → tämä testi pyydystää sen.
+/// The test would fail if the ordering were wrong: if `record_intent` came
+/// AFTER the side effect, replay would not detect the in-progress state and
+/// would double-fire (or silently re-run) → this test catches that.
 #[test]
 fn intent_window_crash_is_at_most_once() {
     let bin = harness_bin();
@@ -300,7 +303,7 @@ fn intent_window_crash_is_at_most_once() {
         outcome.to_string_lossy().into_owned(),
     );
 
-    // Vaihe 1 (crash_intent): aseistettu koukku → abort record_committed:n alussa.
+    // Phase 1 (crash_intent): armed hook → abort at the start of record_committed.
     let (code1, ok1, _o1, e1) = run_env(
         &bin,
         &phase_args("new", "crash_intent", &ob, &ct, &oc),
@@ -316,16 +319,16 @@ fn intent_window_crash_is_at_most_once() {
         "crash_intent must exit 137 (SIGKILL-style) from the crash hook. stderr={e1}"
     );
 
-    // Sivuvaikutus laukesi TASAN KERRAN ennen kaatumista (CountingExecutorin ulkoinen
-    // levymerkki). Tämä todistaa että kaatuminen tapahtui sivuvaikutuksen JÄLKEEN.
+    // The side effect fired EXACTLY ONCE before the crash (CountingExecutor's external
+    // on-disk marker). This proves the crash happened AFTER the side effect.
     assert_eq!(
         read_counter(&counter),
         1,
         "side effect fired exactly once before the intent-only crash"
     );
 
-    // Levyllä: intent-marker LÄSNÄ, committed-marker POISSA → todennettu
-    // intent-only-tila aidon prosessirajan yli (ei in-process-simulaatio).
+    // On disk: intent marker PRESENT, committed marker ABSENT → the
+    // intent-only state is verified across a genuine process boundary (not an in-process simulation).
     let on_disk = read_outbox(&outbox);
     assert!(
         on_disk.contains("dispatch_intent"),
@@ -337,12 +340,12 @@ fn intent_window_crash_is_at_most_once() {
          disk={on_disk:?}"
     );
 
-    // Vaihe 2 (resume_intent): tuore prosessi, sama avain → InProgress →
-    // PolicyDenied fail-closed, eikä sivuvaikutus aja uudelleen.
+    // Phase 2 (resume_intent): fresh process, same key → InProgress →
+    // PolicyDenied fail-closed, and the side effect does not re-run.
     let (code2, ok2, o2, e2) = run_env(
         &bin,
         &phase_args("new", "resume_intent", &ob, &ct, &oc),
-        // EI aseistusta resumessa — koukkua ei käytetä resume_intent-vaiheessa.
+        // NOT armed on resume — the hook is not used in the resume_intent phase.
         &[],
     );
     assert!(
@@ -352,14 +355,14 @@ fn intent_window_crash_is_at_most_once() {
     let report = result_json(&o2);
     eprintln!("[intent-window resume] {report}");
 
-    // AT-MOST-ONCE TODISTE 1: replay on PolicyDenied fail-closed (ei hiljainen re-run).
+    // AT-MOST-ONCE PROOF 1: replay is PolicyDenied fail-closed (not a silent re-run).
     assert_eq!(
         report["policy_denied"],
         serde_json::Value::Bool(true),
         "INTENT-ONLY replay must be PolicyDenied (fail-closed), not a silent re-run"
     );
 
-    // AT-MOST-ONCE TODISTE 2: laskuri PYSYY 1:ssä — sivuvaikutus EI lauennut toiste.
+    // AT-MOST-ONCE PROOF 2: the counter STAYS at 1 — the side effect did NOT fire again.
     assert_eq!(
         report["side_effect_count"], 1,
         "INTENT-ONLY replay must NOT re-fire the side effect (at-most-once)"
@@ -373,12 +376,12 @@ fn intent_window_crash_is_at_most_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Rakentaa `run`-vaiheen argumentit eksplisiittisellä idempotenssi-avaimella.
+/// Builds the `run` phase arguments with an explicit idempotence key.
 ///
-/// `phase_args` käyttää binäärin oletusavainta (`turn-0-dispatch-0`); jatkon
-/// lähetyspolun (`resume_continuation_*`) vaiheet tarvitsevat
-/// `resume-{id}-dispatch-{k}`-muotoisen avaimen, joten ne annetaan tässä
-/// nimenomaisesti `--key`:llä.
+/// `phase_args` uses the binary's default key (`turn-0-dispatch-0`); the
+/// continuation dispatch path's (`resume_continuation_*`) phases need a key
+/// of the form `resume-{id}-dispatch-{k}`, so those are given here explicitly
+/// via `--key`.
 fn phase_args_keyed<'a>(
     mode: &'a str,
     phase: &'a str,
@@ -393,42 +396,44 @@ fn phase_args_keyed<'a>(
     args
 }
 
-/// Jatkon lähetysavain — tasan se muoto jonka tuotannon `drive_tool_loop`
-/// muodostaa hyväksynnän myöntämisen JÄLKEEN (`resume-{approval_id}-dispatch-{k}`).
-/// `approval_id` on tässä kiinteä UUID determinismin vuoksi.
+/// Continuation dispatch key — exactly the form that production's `drive_tool_loop`
+/// builds AFTER an approval is granted (`resume-{approval_id}-dispatch-{k}`).
+/// `approval_id` is a fixed UUID here for determinism.
 const RESUME_KEY: &str = "resume-00000000-0000-4000-8000-0000000000ab-dispatch-0";
 
-/// **JATKON LÄHETYSPOLKU, INTENT-ONLY-IKKUNA todistaa at-most-once fail-closed
-/// aidon prosessirajan yli — avaimella `resume-{id}-dispatch-{k}` (EI `turn-*`
-/// eikä `approval-*`).**
+/// **CONTINUATION DISPATCH PATH, INTENT-ONLY WINDOW proves at-most-once fail-closed
+/// across a genuine process boundary — with the key `resume-{id}-dispatch-{k}` (NOT
+/// `turn-*` and not `approval-*`).**
 ///
-/// Tämä sulkee viimeisen kaveatin: aiemmat cross-process-todisteet kattoivat
-/// `submit_task`-avaimet (`turn-*`) ja hyväksyntäavaimet (`approval-{id}`), MUTTA
-/// EI hyväksynnän jälkeisen jatkon lähetysavainta. Skenaario: keskeytetty vuoro
-/// hyväksytään → malli pyytää jatkossa TOISEN työkalun → kaatuminen sen toisen
-/// työkalun lähetysikkunassa (intent levyllä + sivuvaikutus lauennut, committed
-/// kirjoittamatta) → tuore prosessi jatkaa → sivuvaikutus EI saa laueta toiste.
+/// This closes the last caveat: earlier cross-process proofs covered
+/// `submit_task` keys (`turn-*`) and approval keys (`approval-{id}`), BUT NOT
+/// the post-approval continuation dispatch key. Scenario: an interrupted turn
+/// is approved → the model requests ANOTHER tool on continuation → crash inside
+/// that second tool's dispatch window (intent on disk + side effect fired,
+/// committed not written) → a fresh process resumes → the side effect must NOT
+/// fire again.
 ///
-/// Tuotannossa tämän lähetyksen ajaa `drive_tool_loop`, joka muodostaa avaimen
-/// `{prefix}-dispatch-{k}` prefiksistä `resume-{approval_id}` (ks. `agent.rs`
-/// kohdat 2129 ja 1798). Tässä avain rakennetaan suoraan TÄHÄN samaan muotoon —
-/// se on juuri se, mikä outbox-dedupin todistamiseen ratkaisee.
+/// In production this dispatch is run by `drive_tool_loop`, which builds the
+/// key `{prefix}-dispatch-{k}` from the prefix `resume-{approval_id}` (see
+/// `agent.rs` around lines 2129 and 1798). Here the key is built directly in
+/// this same form — that is exactly what matters for proving the outbox dedup.
 ///
-/// Vaihe 1 (`resume_continuation_crash`, koukku aseistettu): `record_intent`
-/// fsyncataan resume-avaimella, sivuvaikutus laukeaa (laskuri = 1), sitten
-/// prosessi abortoi `record_committed`:n alussa → poistuu 137. Levyllä:
-/// intent-marker LÄSNÄ avaimella `resume-*`, committed-marker POISSA.
+/// Phase 1 (`resume_continuation_crash`, hook armed): `record_intent` is
+/// fsynced with the resume key, the side effect fires (counter = 1), then the
+/// process aborts at the start of `record_committed` → exits 137. On disk:
+/// intent marker PRESENT with key `resume-*`, committed marker ABSENT.
 ///
-/// Vaihe 2 (`resume_continuation_resume`, sama avain): outbox-lookup näkee
-/// intentin ilman committedia → `InProgress` → `submit_task_idempotent` palauttaa
-/// `PolicyDenied`. Laskuri PYSYY 1:ssä → at-most-once.
+/// Phase 2 (`resume_continuation_resume`, same key): the outbox lookup sees
+/// the intent without a committed record → `InProgress` →
+/// `submit_task_idempotent` returns `PolicyDenied`. The counter STAYS at 1 →
+/// at-most-once.
 ///
-/// **Mutaatiotodiste:** tämä todistaa nimenomaan resume-avaimen idempotenssin —
-/// jos jatkon lähetys käyttäisi `submit_task_as`:ia `submit_task_idempotent`:n
-/// sijaan (ts. ei outbox-avainta lainkaan), re-drive ajaisi sivuvaikutuksen
-/// uudelleen → laskuri = 2 ja `policy_denied = false`. Vrt. `--mode old`
-/// kontrastivaihe alla, joka ajaa juuri sen ei-idempotentin polun samalla
-/// resume-avaimella ja double-firaa.
+/// **Mutation proof:** this specifically proves the idempotence of the resume
+/// key — if the continuation dispatch used `submit_task_as` instead of
+/// `submit_task_idempotent` (i.e. no outbox key at all), the re-drive would
+/// re-run the side effect → counter = 2 and `policy_denied = false`. Compare
+/// the `--mode old` contrast phase below, which runs exactly that
+/// non-idempotent path with the same resume key and double-fires.
 #[test]
 fn resume_continuation_intent_crash_is_at_most_once() {
     let bin = harness_bin();
@@ -442,8 +447,8 @@ fn resume_continuation_intent_crash_is_at_most_once() {
         outcome.to_string_lossy().into_owned(),
     );
 
-    // Vaihe 1 (resume_continuation_crash): aseistettu koukku → abort
-    // record_committed:n alussa, resume-avaimella.
+    // Phase 1 (resume_continuation_crash): armed hook → abort at the start of
+    // record_committed, with the resume key.
     let (code1, ok1, _o1, e1) = run_env(
         &bin,
         &phase_args_keyed(
@@ -466,14 +471,14 @@ fn resume_continuation_intent_crash_is_at_most_once() {
         "resume_continuation_crash must exit 137 (SIGKILL-style) from the crash hook. stderr={e1}"
     );
 
-    // Sivuvaikutus laukesi TASAN KERRAN ennen kaatumista.
+    // The side effect fired EXACTLY ONCE before the crash.
     assert_eq!(
         read_counter(&counter),
         1,
         "side effect fired exactly once before the resume-continuation intent-only crash"
     );
 
-    // Levyllä: intent-marker LÄSNÄ avaimella resume-*, committed-marker POISSA.
+    // On disk: intent marker PRESENT with key resume-*, committed marker ABSENT.
     let on_disk = read_outbox(&outbox);
     assert!(
         on_disk.contains("dispatch_intent"),
@@ -491,8 +496,8 @@ fn resume_continuation_intent_crash_is_at_most_once() {
          disk={on_disk:?}"
     );
 
-    // Vaihe 2 (resume_continuation_resume): tuore prosessi, sama resume-avain →
-    // InProgress → PolicyDenied fail-closed, eikä sivuvaikutus aja uudelleen.
+    // Phase 2 (resume_continuation_resume): fresh process, same resume key →
+    // InProgress → PolicyDenied fail-closed, and the side effect does not re-run.
     let (code2, ok2, o2, e2) = run_env(
         &bin,
         &phase_args_keyed(
@@ -503,7 +508,7 @@ fn resume_continuation_intent_crash_is_at_most_once() {
             &oc,
             RESUME_KEY,
         ),
-        // EI aseistusta resumessa — koukkua ei käytetä.
+        // NOT armed on resume — the hook is not used.
         &[],
     );
     assert!(
@@ -513,7 +518,7 @@ fn resume_continuation_intent_crash_is_at_most_once() {
     let report = result_json(&o2);
     eprintln!("[resume-continuation resume] {report}");
 
-    // AT-MOST-ONCE TODISTE 1: replay on PolicyDenied fail-closed (ei hiljainen re-run).
+    // AT-MOST-ONCE PROOF 1: replay is PolicyDenied fail-closed (not a silent re-run).
     assert_eq!(
         report["policy_denied"],
         serde_json::Value::Bool(true),
@@ -521,7 +526,7 @@ fn resume_continuation_intent_crash_is_at_most_once() {
          not a silent re-run"
     );
 
-    // AT-MOST-ONCE TODISTE 2: laskuri PYSYY 1:ssä — sivuvaikutus EI lauennut toiste.
+    // AT-MOST-ONCE PROOF 2: the counter STAYS at 1 — the side effect did NOT fire again.
     assert_eq!(
         report["side_effect_count"], 1,
         "RESUME-CONTINUATION intent-only replay must NOT re-fire the side effect (at-most-once)"
@@ -532,7 +537,7 @@ fn resume_continuation_intent_crash_is_at_most_once() {
         "disk counter confirms the resume-continuation side effect fired AT MOST once (1, never 2)"
     );
 
-    // Avain-muodon todiste: tuore prosessi ajoi nimenomaan resume-*-dispatch-*-avaimen.
+    // Key-shape proof: the fresh process specifically ran the resume-*-dispatch-* key.
     assert_eq!(
         report["dispatch_key"], RESUME_KEY,
         "the dedup key proven across the crash is the resume-continuation key shape"
@@ -541,16 +546,17 @@ fn resume_continuation_intent_crash_is_at_most_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **MUTAATIOTODISTE jatkon lähetyspolulle:** sama resume-avain, mutta
-/// ei-idempotentilla polulla (`--mode old`, `submit_task_as`) → kaatuminen +
-/// re-drive AJAA SIVUVAIKUTUKSEN UUDELLEEN (double-fire, laskuri = 2).
+/// **MUTATION PROOF for the continuation dispatch path:** the same resume key,
+/// but on the non-idempotent path (`--mode old`, `submit_task_as`) → crash +
+/// re-drive RE-RUNS THE SIDE EFFECT (double-fire, counter = 2).
 ///
-/// Tämä on suora todiste siitä, että ylempi testi
-/// (`resume_continuation_intent_crash_is_at_most_once`) EPÄONNISTUISI jos jatkon
-/// lähetys käyttäisi `submit_task_as`:ia `submit_task_idempotent`:n sijaan — eli
-/// että se aidosti todistaa resume-avaimen idempotenssin, ei vahingossa onnistu.
-/// (`--mode old` ohittaa outbox-avaimen kokonaan; `--key` jätetään huomiotta
-/// vanhalla polulla, mutta annetaan rehellisyyden vuoksi resume-muodossa.)
+/// This is direct proof that the test above
+/// (`resume_continuation_intent_crash_is_at_most_once`) WOULD FAIL if the
+/// continuation dispatch used `submit_task_as` instead of
+/// `submit_task_idempotent` — i.e. that it genuinely proves the resume key's
+/// idempotence rather than passing by accident. (`--mode old` bypasses the
+/// outbox key entirely; `--key` is ignored on the old path, but is supplied in
+/// resume form for honesty.)
 #[test]
 fn resume_continuation_old_path_double_fires() {
     let bin = harness_bin();
@@ -564,9 +570,9 @@ fn resume_continuation_old_path_double_fires() {
         outcome.to_string_lossy().into_owned(),
     );
 
-    // `--mode old` käyttää `crash`/`resume`-vaiheita (submit_task_as, EI outboxia).
-    // Avain annetaan resume-muodossa korostamaan, että ID on sama — vanha polku
-    // vain EI dedupaa sitä.
+    // `--mode old` uses the `crash`/`resume` phases (submit_task_as, NOT the outbox).
+    // The key is supplied in resume form to emphasize that the ID is the same — the
+    // old path simply does NOT dedup it.
     let (ok1, _o1, e1) = run(
         &bin,
         &phase_args_keyed("old", "crash", &ob, &ct, &oc, RESUME_KEY),
@@ -586,7 +592,7 @@ fn resume_continuation_old_path_double_fires() {
     let report = result_json(&o2);
     eprintln!("[resume-continuation mutation] {report}");
 
-    // MUTAATION TODISTE: ilman idempotenssi-avainta sivuvaikutus laukeaa KAHDESTI.
+    // MUTATION PROOF: without the idempotence key, the side effect fires TWICE.
     assert_eq!(
         report["side_effect_count"], 2,
         "NON-IDEMPOTENT resume continuation double-fires across the crash (the mutation \
@@ -601,8 +607,9 @@ fn resume_continuation_old_path_double_fires() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Erottava väite: vanha ja uusi polku eroavat TÄSMÄLLEEN tässä — vanha
-/// double-firaa (2), uusi ei (1). Tämä on koko korjauksen ydin yhdellä rivillä.
+/// Distinguishing claim: the old and new paths differ EXACTLY here — the old
+/// path double-fires (2), the new one does not (1). This is the entire fix's
+/// essence in one line.
 #[test]
 fn old_double_fires_but_new_does_not() {
     let bin = harness_bin();
@@ -638,22 +645,22 @@ fn old_double_fires_but_new_does_not() {
 }
 
 // ============================================================================
-// HYVÄKSYNTÄPOLKU (avaimet `approval-*`) — at-most-once aidon prosessirajan yli
+// APPROVAL PATH (`approval-*` keys) — at-most-once across a genuine process boundary
 // ============================================================================
 //
-// Tämä sulkee katselmoinnin löydöksen: aiempi cross-process-todiste kattoi vain
-// `submit_task`-avaimet (`turn-*`), EI hyväksyntä-avaimia (`approval-{id}`).
-// `ActionRuntime::approve` on idempotentti SAMAN dispatch-outboxin kautta
-// (avain `approval-{id}`: lookup → record_intent → run_after_approval
-// (sivuvaikutus) → record_committed → pending.remove), ja tässä todistetaan se
-// AIDON SIGKILL:n (exit 137) yli — durable pending (Wire-vaihe) sallii tuoreen
-// prosessin ladata SAMAN odottavan hyväksynnän levyltä ja uudelleenhyväksyä sen.
+// This closes a review finding: the earlier cross-process proof covered only
+// `submit_task` keys (`turn-*`), NOT approval keys (`approval-{id}`).
+// `ActionRuntime::approve` is idempotent through the SAME dispatch outbox
+// (key `approval-{id}`: lookup → record_intent → run_after_approval
+// (side effect) → record_committed → pending.remove), and here that is proven
+// across a GENUINE SIGKILL (exit 137) — durable pending (the Wire phase) lets
+// a fresh process load the SAME pending approval from disk and re-approve it.
 
-/// Ympäristömuuttuja joka aseistaa committed-ikkunan kaatumiskoukun harnessissa.
+/// Environment variable that arms the committed-window crash hook in the harness.
 const CRASH_AFTER_COMMITTED_ENV: &str = "FAMILYCLAW_REDTEAM_CRASH_AFTER_COMMITTED";
 
-/// Rakentaa hyväksyntäpolun `run`-vaiheen argumentit (`--pending` + `--task-queue`
-/// lisätty `phase_args`:n päälle, koska durable pending = Wire-vaihe).
+/// Builds the approval path's `run` phase arguments (`--pending` + `--task-queue`
+/// added on top of `phase_args`, since durable pending = the Wire phase).
 #[allow(clippy::too_many_arguments)]
 fn approval_phase_args<'a>(
     phase: &'a str,
@@ -684,27 +691,28 @@ fn approval_phase_args<'a>(
     ]
 }
 
-/// **HYVÄKSYNTÄPOLKU, INTENT-ONLY-IKKUNA todistaa at-most-once fail-closed aidon
-/// prosessirajan yli — avaimella `approval-{id}` (EI `turn-*`).**
+/// **APPROVAL PATH, INTENT-ONLY WINDOW proves at-most-once fail-closed across a
+/// genuine process boundary — with key `approval-{id}` (NOT `turn-*`).**
 ///
-/// Tämä on katselmoinnin löydöksen suora sulkeminen: aiempi cross-process-todiste
-/// kattoi vain `submit_task`-avaimet. Nyt sama SIGKILL-todiste pätee
-/// [`ActionRuntime::approve`]:n sivuvaikutus-ikkunaan.
+/// This is the direct closing of the review finding: the earlier cross-process
+/// proof covered only `submit_task` keys. Now the same SIGKILL proof applies
+/// to [`ActionRuntime::approve`]'s side-effect window.
 ///
-/// Vaihe 1 (`approve_crash_intent`, koukku aseistettu): lähetä hyväksyntää vaativa
-/// tehtävä → hyväksy → `run_after_approval` ajaa sivuvaikutuksen (laskuri = 1),
-/// `record_intent` fsyncataan, prosessi abortoi `record_committed`:n alussa →
-/// poistuu 137. Levyllä: intent-marker LÄSNÄ, committed-marker POISSA, odottava
-/// hyväksyntä yhä durable-pinnalla.
+/// Phase 1 (`approve_crash_intent`, hook armed): dispatch a task requiring
+/// approval → approve it → `run_after_approval` runs the side effect
+/// (counter = 1), `record_intent` is fsynced, the process aborts at the start
+/// of `record_committed` → exits 137. On disk: intent marker PRESENT,
+/// committed marker ABSENT, the pending approval still on the durable surface.
 ///
-/// Vaihe 2 (`approve_resume`, tuore prosessi): durable pending ladataan levyltä
-/// (Wire), SAMA `ApprovalId` poimitaan ja uudelleenhyväksytään → outbox-lookup
-/// näkee `InProgress` → `approve` palauttaa `PolicyDenied` fail-closed. Laskuri
-/// PYSYY 1:ssä (sivuvaikutus EI aja uudelleen) → at-most-once.
+/// Phase 2 (`approve_resume`, fresh process): durable pending is loaded from
+/// disk (Wire), the SAME `ApprovalId` is picked up and re-approved → the
+/// outbox lookup sees `InProgress` → `approve` returns `PolicyDenied`
+/// fail-closed. The counter STAYS at 1 (the side effect does NOT re-run) →
+/// at-most-once.
 ///
-/// Testi epäonnistuisi jos `approve` EI olisi idempotentti (outbox ohitettu):
-/// re-approve ajaisi `run_after_approval`:n uudelleen → laskuri = 2. (Mutaatio-
-/// todiste tehty erikseen poistamalla outbox-haara `approve`:sta.)
+/// The test would fail if `approve` were NOT idempotent (outbox bypassed):
+/// re-approving would re-run `run_after_approval` → counter = 2. (A separate
+/// mutation proof is done by removing the outbox branch from `approve`.)
 #[test]
 #[allow(clippy::too_many_lines)]
 fn approval_path_intent_crash_is_at_most_once() {
@@ -723,8 +731,8 @@ fn approval_path_intent_crash_is_at_most_once() {
         task_queue.to_string_lossy().into_owned(),
     );
 
-    // Vaihe 1 (approve_crash_intent): aseistettu intent-koukku → abort
-    // record_committed:n alussa hyväksynnän jälkeen.
+    // Phase 1 (approve_crash_intent): armed intent hook → abort at the start of
+    // record_committed after the approval.
     let (code1, ok1, _o1, e1) = run_env(
         &bin,
         &approval_phase_args("approve_crash_intent", &ob, &ct, &oc, &pd, &tq),
@@ -740,15 +748,15 @@ fn approval_path_intent_crash_is_at_most_once() {
         "approve_crash_intent must exit 137 (SIGKILL-style) from the crash hook. stderr={e1}"
     );
 
-    // Sivuvaikutus laukesi TASAN KERRAN ennen kaatumista (approve ajoi
-    // run_after_approval:n, joka bumppasi laskurin).
+    // The side effect fired EXACTLY ONCE before the crash (approve ran
+    // run_after_approval, which bumped the counter).
     assert_eq!(
         read_counter(&counter),
         1,
         "side effect fired exactly once before the approval intent-only crash"
     );
 
-    // Levyllä: intent-marker LÄSNÄ avaimella approval-*, committed-marker POISSA.
+    // On disk: intent marker PRESENT with key approval-*, committed marker ABSENT.
     let on_disk = read_outbox(&outbox);
     assert!(
         on_disk.contains("dispatch_intent"),
@@ -763,7 +771,7 @@ fn approval_path_intent_crash_is_at_most_once() {
         "committed marker must be ABSENT on disk (crash hit before record_committed). \
          disk={on_disk:?}"
     );
-    // Odottava hyväksyntä SÄILYI durable-pinnalla (Wire) → resume voi ladata sen.
+    // The pending approval PERSISTED on the durable surface (Wire) → resume can load it.
     let pending_on_disk = std::fs::read_to_string(&pending).unwrap_or_default();
     assert!(
         pending_on_disk.contains("pending_approval_put"),
@@ -771,12 +779,12 @@ fn approval_path_intent_crash_is_at_most_once() {
          (Wire phase). pending={pending_on_disk:?}"
     );
 
-    // Vaihe 2 (approve_resume): tuore prosessi, lataa sama ApprovalId levyltä,
-    // uudelleenhyväksyy → InProgress → PolicyDenied fail-closed.
+    // Phase 2 (approve_resume): fresh process, loads the same ApprovalId from disk,
+    // re-approves → InProgress → PolicyDenied fail-closed.
     let (code2, ok2, o2, e2) = run_env(
         &bin,
         &approval_phase_args("approve_resume", &ob, &ct, &oc, &pd, &tq),
-        // EI aseistusta resumessa — koukkua ei käytetä.
+        // NOT armed on resume — the hook is not used.
         &[],
     );
     assert!(
@@ -786,14 +794,14 @@ fn approval_path_intent_crash_is_at_most_once() {
     let report = result_json(&o2);
     eprintln!("[approval-intent resume] {report}");
 
-    // AT-MOST-ONCE TODISTE 1: uudelleenhyväksyntä on PolicyDenied fail-closed.
+    // AT-MOST-ONCE PROOF 1: the re-approval is PolicyDenied fail-closed.
     assert_eq!(
         report["policy_denied"],
         serde_json::Value::Bool(true),
         "APPROVAL intent-only replay must be PolicyDenied (fail-closed), not a silent re-run"
     );
 
-    // AT-MOST-ONCE TODISTE 2: laskuri PYSYY 1:ssä — sivuvaikutus EI lauennut toiste.
+    // AT-MOST-ONCE PROOF 2: the counter STAYS at 1 — the side effect did NOT fire again.
     assert_eq!(
         report["side_effect_count"], 1,
         "APPROVAL intent-only replay must NOT re-fire the side effect (at-most-once)"
@@ -804,7 +812,7 @@ fn approval_path_intent_crash_is_at_most_once() {
         "disk counter confirms the approval side effect fired AT MOST once (1, never 2)"
     );
 
-    // Wire-vaiheen todiste: tuore prosessi todella latasi SAMAN hyväksynnän levyltä.
+    // Wire-phase proof: the fresh process genuinely loaded the SAME approval from disk.
     assert!(
         report["reloaded_approval_id"].is_string(),
         "fresh process must have reloaded the durable pending approval id"
@@ -813,17 +821,18 @@ fn approval_path_intent_crash_is_at_most_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **HYVÄKSYNTÄPOLKU, COMMITTED-IKKUNA todistaa arvo-identtisen replayn aidon
-/// prosessirajan yli — avaimella `approval-{id}`.**
+/// **APPROVAL PATH, COMMITTED WINDOW proves value-identical replay across a
+/// genuine process boundary — with key `approval-{id}`.**
 ///
-/// Vaihe 1 (`approve_crash_committed`, koukku aseistettu): hyväksy → sivuvaikutus
-/// laukeaa (laskuri = 1), `record_committed` fsyncataan, prosessi abortoi VASTA
-/// committedin jälkeen mutta ENNEN `pending.remove`:a → poistuu 137. Levyllä:
-/// intent + committed LÄSNÄ.
+/// Phase 1 (`approve_crash_committed`, hook armed): approve → the side effect
+/// fires (counter = 1), `record_committed` is fsynced, the process aborts ONLY
+/// after the committed record but BEFORE `pending.remove` → exits 137. On
+/// disk: intent + committed PRESENT.
 ///
-/// Vaihe 2 (`approve_resume`): tuore prosessi lataa saman `ApprovalId`:n →
-/// outbox-lookup näkee `Committed` → palauttaa arvo-identtisen `SubmitOutcome`:n
-/// (sama `task_id`, status Done) ajamatta sivuvaikutusta uudelleen. Laskuri = 1.
+/// Phase 2 (`approve_resume`): a fresh process loads the same `ApprovalId` →
+/// the outbox lookup sees `Committed` → returns the value-identical
+/// `SubmitOutcome` (same `task_id`, status Done) without re-running the side
+/// effect. Counter = 1.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn approval_path_committed_crash_is_value_identical() {
@@ -842,7 +851,7 @@ fn approval_path_committed_crash_is_value_identical() {
         task_queue.to_string_lossy().into_owned(),
     );
 
-    // Vaihe 1 (approve_crash_committed): koukku abortoi VASTA committedin jälkeen.
+    // Phase 1 (approve_crash_committed): the hook aborts ONLY after the committed record.
     let (code1, ok1, _o1, e1) = run_env(
         &bin,
         &approval_phase_args("approve_crash_committed", &ob, &ct, &oc, &pd, &tq),
@@ -863,7 +872,7 @@ fn approval_path_committed_crash_is_value_identical() {
         "side effect fired exactly once before the committed-window crash"
     );
 
-    // Levyllä: intent + committed LÄSNÄ, avain approval-*.
+    // On disk: intent + committed PRESENT, key approval-*.
     let on_disk = read_outbox(&outbox);
     assert!(
         on_disk.contains("dispatch_intent") && on_disk.contains("dispatch_committed"),
@@ -874,7 +883,7 @@ fn approval_path_committed_crash_is_value_identical() {
         "outbox key must be approval-* on the approval path. disk={on_disk:?}"
     );
 
-    // Vaihe 2 (approve_resume): sama ApprovalId → Committed → arvo-identtinen.
+    // Phase 2 (approve_resume): same ApprovalId → Committed → value-identical.
     let (code2, ok2, o2, e2) = run_env(
         &bin,
         &approval_phase_args("approve_resume", &ob, &ct, &oc, &pd, &tq),
@@ -887,7 +896,7 @@ fn approval_path_committed_crash_is_value_identical() {
     let report = result_json(&o2);
     eprintln!("[approval-committed resume] {report}");
 
-    // KORJAUKSEN TODISTE 1 (arvo-identtisyys): re-approve palauttaa saman task_id:n.
+    // PROOF OF THE FIX 1 (value identity): re-approve returns the same task_id.
     assert_eq!(
         report["value_identical"],
         serde_json::Value::Bool(true),
@@ -899,7 +908,7 @@ fn approval_path_committed_crash_is_value_identical() {
         "APPROVAL committed replay must NOT be denied (it returns the committed outcome)"
     );
 
-    // KORJAUKSEN TODISTE 2 (at-most-once): laskuri PYSYY 1:ssä.
+    // PROOF OF THE FIX 2 (at-most-once): the counter STAYS at 1.
     assert_eq!(
         report["side_effect_count"], 1,
         "APPROVAL committed replay must NOT re-fire the side effect (exactly-once dispatch)"

@@ -1,36 +1,37 @@
-//! Lippulaiva-taito: allowlistattu paikallisen tiedoston KIRJOITUS (KERROS A).
+//! Flagship skill: allowlisted local file WRITE (Layer A).
 //!
-//! [`FileWriteAllowlisted`] on aito levylle kirjoittava suorittaja — toisin kuin
-//! [`crate::skills::file_patch::FilePatchMock`], joka on determinis­tinen
-//! ehdotus-mock. Tämä taito **kirjoittaa oikeasti** tiedoston levylle, mutta
-//! vain allowlistatun juuren alle, ja peilaa [`crate::skills::fs_read`]-taidon
-//! allowlist- ja kanonisointimallia.
+//! [`FileWriteAllowlisted`] is a genuine disk-writing executor — unlike
+//! [`crate::skills::file_patch::FilePatchMock`], which is a deterministic
+//! proposal mock. This skill **actually writes** a file to disk, but only
+//! under an allowlisted root, and mirrors the allowlist and canonicalization
+//! pattern of the [`crate::skills::fs_read`] skill.
 //!
-//! ## Kuormaa kantava turvallisuus: kanonisointi + allowlist
-//! Taito ottaa polun ([`FileWriteInput::path`]) ja varmistaa että kohde pysyy
-//! **jonkin allowlistatun juuren alla** ENNEN kirjoitusta:
-//! 1. **kanonisoi** kohteen vanhempihakemiston ([`std::fs::canonicalize`]) —
-//!    purkaa `..`-segmentit ja seuraa symlinkit niiden todelliseen kohteeseen;
-//!    jos vanhempaa ei vielä ole, kiivetään ylös lähimpään olemassa olevaan
-//!    esivanhempaan ja kanonisoidaan se,
-//! 2. varmistaa että kanoninen kohde pysyy jonkin (kanonisoidun) juuren alla,
-//! 3. **hylkää** kaikki kohteet allowlistin ulkopuolella — mukaan lukien
-//!    `..`-pakenemiset ja symlink-pakenemiset (allowlistin sisällä oleva linkki
-//!    joka osoittaa ulos kanonisoituu ulkopuoliseksi ja hylätään).
+//! ## Load-bearing safety: canonicalization + allowlist
+//! The skill takes a path ([`FileWriteInput::path`]) and ensures the target
+//! stays **under some allowlisted root** BEFORE writing:
+//! 1. **canonicalizes** the target's parent directory
+//!    ([`std::fs::canonicalize`]) — resolves `..` segments and follows
+//!    symlinks to their real target; if the parent does not yet exist, climbs
+//!    up to the nearest existing ancestor and canonicalizes that,
+//! 2. verifies the canonical target stays under some (canonicalized) root,
+//! 3. **rejects** any target outside the allowlist — including `..` escapes
+//!    and symlink escapes (a link inside the allowlist that points outward
+//!    canonicalizes to an external location and is rejected).
 //!
-//! Tyhjä allowlist (oletus) hylkää **kaikki** polut — fail-closed.
+//! An empty allowlist (default) rejects **all** paths — fail-closed.
 //!
-//! ## Riskiluokka ja hyväksyntä
-//! Riski on [`ActionRisk::WriteLocal`] ja oikeus [`SkillPermission::WriteLocalFiles`].
-//! Käytäntö on [`ApprovalPolicy::RequireApproval`]: allowlistatun juuren alle
-//! osuva paikallinen kirjoitus ajaa automaattisesti (sama malli kuin
-//! [`crate::skills::fs_read`]: allowlist on varsinainen turvallisuusraja).
-//! Allowlistin ulkopuolinen polku hylätään ennen kirjoitusta.
+//! ## Risk class and approval
+//! The risk is [`ActionRisk::WriteLocal`] and the permission is
+//! [`SkillPermission::WriteLocalFiles`]. The policy is
+//! [`ApprovalPolicy::RequireApproval`]: a local write landing under an
+//! allowlisted root runs automatically (the same pattern as
+//! [`crate::skills::fs_read`]: the allowlist is the actual security
+//! boundary). A path outside the allowlist is rejected before writing.
 //!
-//! ## Todistepaketti ei sisällä sisältöä
-//! Tulos sisältää vain kanonisen polun **tiivisteen** (SHA-256), kirjoitettujen
-//! tavujen **määrän** sekä tilan (`overwrite`/`append`) — EI koskaan kirjoitetun
-//! sisällön runkoa. Näin todiste ei vuoda kirjoitettua dataa.
+//! ## The proof bundle contains no content
+//! The result contains only the **hash** (SHA-256) of the canonical path, the
+//! **count** of bytes written, and the mode (`overwrite`/`append`) — NEVER the
+//! body of the written content. This way the proof does not leak the written data.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -47,22 +48,22 @@ use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 
 use super::Skill;
 
-/// Taidon kiinteä tunniste (1–6 ovat varattuja muille oletustaidoille).
+/// Fixed identifier for the skill (1–6 are reserved for other default skills).
 const SKILL_UUID: uuid::Uuid = uuid::uuid!("99999999-9999-4999-8999-999999999999");
 
-/// Kirjoitustila: korvaa tiedosto vai lisää loppuun.
+/// Write mode: replace the file or append to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteMode {
-    /// Korvaa tiedoston koko sisältö (luo jos puuttuu). Oletus.
+    /// Replaces the file's entire content (creates it if missing). Default.
     #[default]
     Overwrite,
-    /// Lisää sisältö tiedoston loppuun (luo jos puuttuu).
+    /// Appends content to the end of the file (creates it if missing).
     Append,
 }
 
 impl WriteMode {
-    /// Ihmisluettava nimi tilalle (tulosteessa käytettävä).
+    /// Human-readable name for the mode (used in output).
     const fn as_str(self) -> &'static str {
         match self {
             Self::Overwrite => "overwrite",
@@ -71,64 +72,65 @@ impl WriteMode {
     }
 }
 
-/// Taidon syöte: kirjoitettavan tiedoston polku, sisältö ja valinnainen tila.
+/// Skill input: the path of the file to write, its content, and an optional mode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileWriteInput {
-    /// Kirjoitettavan tiedoston polku. Kanonisoidaan ja sen on pysyttävä
-    /// allowlistatun juuren alla.
+    /// Path of the file to write. Canonicalized and must stay under an
+    /// allowlisted root.
     pub path: String,
-    /// Kirjoitettava sisältö.
+    /// Content to write.
     pub content: String,
-    /// Kirjoitustila (`overwrite`/`append`). Oletus `overwrite`.
+    /// Write mode (`overwrite`/`append`). Default `overwrite`.
     #[serde(default)]
     pub mode: WriteMode,
 }
 
-/// Taidon tulos: todistepaketin ydin (tiiviste + tavumäärä + tila).
+/// Skill result: the proof bundle's core (hash + byte count + mode).
 ///
-/// **EI** sisällä kirjoitettua sisältöä — vain kuormaa kantavat metatiedot.
+/// Does **NOT** contain the written content — only load-bearing metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileWriteOutput {
-    /// Kanonisen kohdepolun SHA-256-tiiviste (heksa) — EI raakaa polkua.
+    /// SHA-256 hash (hex) of the canonical target path — NOT the raw path.
     pub path_hash: String,
-    /// Kirjoitettujen tavujen määrä.
+    /// Number of bytes written.
     pub bytes_written: u64,
-    /// Käytetty kirjoitustila (`overwrite`/`append`).
+    /// Write mode used (`overwrite`/`append`).
     pub mode: String,
 }
 
-/// Allowlist-kokoonpano: sallitut juurihakemistot kirjoitukselle.
+/// Allowlist configuration: allowed root directories for writing.
 ///
-/// Kokoonpano on **konfiguroitavissa** — taito ei kovakoodaa mitään polkua,
-/// joten julkaistava lähde pysyy geneerisenä (ei yksityisiä polkuja). Tyhjä
-/// allowlist (oletus) hylkää **kaikki** polut — fail-closed.
+/// The configuration is **configurable** — the skill does not hardcode any
+/// path, so the published source stays generic (no private paths). An empty
+/// allowlist (default) rejects **all** paths — fail-closed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileWriteConfig {
-    /// Sallitut juurihakemistot. Kirjoitus sallitaan vain jos kanoninen kohde
-    /// pysyy jonkin näistä (kanonisoidun) juuren alla.
+    /// Allowed root directories. A write is allowed only if the canonical
+    /// target stays under one of these (canonicalized) roots.
     allow_roots: Vec<PathBuf>,
 }
 
 impl FileWriteConfig {
-    /// Luo tyhjän kokoonpanon, joka hylkää kaikki polut (fail-closed).
+    /// Creates an empty configuration that rejects all paths (fail-closed).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Lisää sallitun juuren (rakentaja-ketjutus).
+    /// Adds an allowed root (builder chaining).
     ///
-    /// Juurta ei kanonisoida tässä — kanonisointi tehdään vasta kirjoitushetkellä,
-    /// jotta kokoonpanon voi rakentaa myös ennen kuin hakemisto on olemassa.
+    /// The root is not canonicalized here — canonicalization happens only at
+    /// write time, so the configuration can be built before the directory
+    /// even exists.
     #[must_use]
     pub fn allow_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.allow_roots.push(root.into());
         self
     }
 
-    /// Kanonisoi sallitut juuret. Olemassaolemattomat tai kanonisoitumattomat
-    /// juuret ohitetaan hiljaa (niiden alle ei voi koskaan osua).
-    /// Kanonisoi sallitut juuret (myös [`super::file_patch_apply`]).
+    /// Canonicalizes the allowed roots. Nonexistent or uncanonicalizable
+    /// roots are silently skipped (nothing can ever land under them).
+    /// Canonicalizes the allowed roots (also used by [`super::file_patch_apply`]).
     pub(crate) fn canonical_allow_roots(&self) -> Vec<PathBuf> {
         self.allow_roots
             .iter()
@@ -137,51 +139,50 @@ impl FileWriteConfig {
     }
 }
 
-/// Lippulaiva-taito allowlistatulle tiedoston kirjoitukselle (aito levykirjoitus).
+/// Flagship skill for allowlisted file writing (genuine disk write).
 ///
-/// Riskiluokka on [`ActionRisk::WriteLocal`] ja käytäntö
-/// [`ApprovalPolicy::RequireApproval`]: allowlistatun juuren alle osuva
-/// kirjoitus ajaa automaattisesti; allowlistin ulkopuolinen kohde hylätään.
+/// The risk class is [`ActionRisk::WriteLocal`] and the policy is
+/// [`ApprovalPolicy::RequireApproval`]: a write landing under an allowlisted
+/// root runs automatically; a target outside the allowlist is rejected.
 #[derive(Debug, Clone, Default)]
 pub struct FileWriteAllowlisted {
-    /// Allowlist-kokoonpano (sallitut juuret).
+    /// Allowlist configuration (allowed roots).
     config: FileWriteConfig,
 }
 
 impl FileWriteAllowlisted {
-    /// Luo taidon tyhjällä allowlistilla (hylkää kaikki polut, fail-closed).
+    /// Creates the skill with an empty allowlist (rejects all paths, fail-closed).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Luo taidon annetulla allowlist-kokoonpanolla.
+    /// Creates the skill with the given allowlist configuration.
     #[must_use]
     pub fn with_config(config: FileWriteConfig) -> Self {
         Self { config }
     }
 
-    /// Taidon kiinteä tunniste.
+    /// The skill's fixed identifier.
     #[must_use]
     pub fn skill_id() -> SkillId {
         SkillId::from_uuid(SKILL_UUID)
     }
 
-    /// Ratkaisee allowlistatun, kanonisoidun kohdepolun syötteen polusta.
+    /// Resolves the allowlisted, canonicalized target path from the input path.
     ///
-    /// Koska kohdetiedostoa ei ehkä vielä ole (eikä sitä siis voi suoraan
-    /// kanonisoida), taito:
-    /// 1. torjuu kohdepolut jotka päättyvät `..`-segmenttiin (ei tiedostonimeä),
-    /// 2. kanonisoi lähimmän **olemassa olevan** esivanhemman (purkaa `..` ja
-    ///    seuraa symlinkit), ja liimaa sen perään jäljellä olevat "normaalit"
-    ///    komponentit,
-    /// 3. varmistaa että lopullinen kanoninen kohde pysyy jonkin sallitun juuren
-    ///    alla. Symlink-pakeneminen paljastuu askeleessa 2 (esivanhemman
-    ///    kanonisointi seuraa linkit todelliseen kohteeseen).
+    /// Since the target file may not exist yet (and thus cannot be directly
+    /// canonicalized), the skill:
+    /// 1. rejects target paths ending in a `..` segment (no file name),
+    /// 2. canonicalizes the nearest **existing** ancestor (resolves `..` and
+    ///    follows symlinks), and appends the remaining "normal" components,
+    /// 3. verifies the final canonical target stays under some allowed root.
+    ///    A symlink escape is revealed in step 2 (canonicalizing the ancestor
+    ///    follows links to their real target).
     ///
     /// # Errors
-    /// - [`ActionError::PolicyDenied`] jos allowlist on tyhjä, jos polkua ei voi
-    ///   ratkaista tai jos kanoninen kohde ei ole minkään sallitun juuren alla.
+    /// - [`ActionError::PolicyDenied`] if the allowlist is empty, the path
+    ///   cannot be resolved, or the canonical target is not under any allowed root.
     fn resolve_allowed(&self, requested: &str) -> Result<PathBuf> {
         let roots = self.config.canonical_allow_roots();
         if roots.is_empty() {
@@ -201,16 +202,16 @@ impl FileWriteAllowlisted {
         }
     }
 
-    /// Kirjoittaa sisällön kanonisoituun kohteeseen ja koostaa todistepaketin
-    /// ytimen (tiiviste + tavumäärä + tila) — EI kirjoitettua sisältöä.
+    /// Writes the content to the canonicalized target and assembles the proof
+    /// bundle's core (hash + byte count + mode) — NOT the written content.
     ///
-    /// Luo tarvittaessa puuttuvat vanhempihakemistot (jotka kanonisoinnin
-    /// perusteella pysyvät allowlistin sisällä). `overwrite` korvaa koko
-    /// tiedoston, `append` lisää loppuun.
+    /// Creates any missing parent directories as needed (which, based on the
+    /// canonicalization, stay inside the allowlist). `overwrite` replaces the
+    /// whole file, `append` adds to the end.
     ///
     /// # Errors
-    /// Palauttaa [`ActionError::ExecutionFailed`] jos hakemiston luonti tai
-    /// tiedoston kirjoitus epäonnistuu.
+    /// Returns [`ActionError::ExecutionFailed`] if directory creation or file
+    /// writing fails.
     async fn write_proof(
         &self,
         canonical: &Path,
@@ -258,23 +259,23 @@ impl FileWriteAllowlisted {
     }
 }
 
-/// Ratkaisee (mahdollisesti vielä olemattoman) kohdepolun kanonisen muodon.
+/// Resolves the canonical form of a (possibly not yet existing) target path.
 ///
-/// Kanonisoi lähimmän olemassa olevan esivanhemman ja liittää siihen jäljellä
-/// olevat normaalikomponentit. Torjuu `..`-segmentit jäljellä olevassa osassa
-/// (ne voisivat paeta allowlistia symlinkin läpi kulkematta kanonisoinnin
-/// kautta).
+/// Canonicalizes the nearest existing ancestor and appends the remaining
+/// normal components to it. Rejects `..` segments in the remaining part
+/// (they could escape the allowlist via a symlink without passing through
+/// canonicalization).
 ///
 /// # Errors
-/// [`ActionError::PolicyDenied`] jos polku on tyhjä, päättyy `..`:iin, tai jos
-/// yksikään esivanhempi ei kanonisoidu.
+/// [`ActionError::PolicyDenied`] if the path is empty, ends in `..`, or if no
+/// ancestor can be canonicalized.
 fn canonicalize_target(requested: &Path) -> Result<PathBuf> {
-    // Jos kohde on jo olemassa, kanonisoi suoraan (seuraa symlinkit).
+    // If the target already exists, canonicalize it directly (follows symlinks).
     if let Ok(canonical) = std::fs::canonicalize(requested) {
         return Ok(canonical);
     }
 
-    // Muuten kiivetään ylös lähimpään olemassa olevaan esivanhempaan.
+    // Otherwise climb up to the nearest existing ancestor.
     let mut existing = requested;
     let mut tail: Vec<Component<'_>> = Vec::new();
     loop {
@@ -283,8 +284,8 @@ fn canonicalize_target(requested: &Path) -> Result<PathBuf> {
                 let file = existing.components().next_back().ok_or_else(|| {
                     ActionError::PolicyDenied("kohdepolku on tyhjä (hylätty)".to_string())
                 })?;
-                // `..` jäljellä olevassa hännässä voisi paeta juuresta
-                // ilman että kanonisointi näkee sitä → torjutaan.
+                // A `..` in the remaining tail could escape the root without
+                // canonicalization seeing it → rejected.
                 if matches!(file, Component::ParentDir) {
                     return Err(ActionError::PolicyDenied(
                         "'..' kohdepolun lopussa ei sallittu (hylätty)".to_string(),
@@ -313,19 +314,19 @@ fn canonicalize_target(requested: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Onko `path` jonkin annetun juuren alla (tai itse juuri).
+/// Is `path` under any of the given roots (or the root itself)?
 ///
-/// Vertailu tehdään komponentti-tasolla [`Path::starts_with`]-semantiikalla,
-/// joten esim. `/allow/dir2` ei osu juureen `/allow/dir` (etuliite ei riitä —
-/// koko komponentin on täsmättävä).
+/// The comparison is done at the component level via [`Path::starts_with`]
+/// semantics, so e.g. `/allow/dir2` does not match the root `/allow/dir` (a
+/// prefix match is not enough — the whole component must match).
 fn path_is_under_any(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 
-/// Laskee kanonisen polun SHA-256-tiivisteen heksamerkkijonona.
+/// Computes the SHA-256 hash of the canonical path as a hex string.
 ///
-/// Polku tiivistetään tavuesityksestään; tiiviste tallennetaan todisteeseen
-/// raakapolun sijasta, jottei (mahdollisesti yksityinen) polku vuoda.
+/// The path is hashed from its byte representation; the hash is stored in
+/// the proof instead of the raw path, so a (potentially private) path does not leak.
 fn hash_path(path: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(path.to_string_lossy().as_bytes());
@@ -345,8 +346,8 @@ impl ActionExecutor for FileWriteAllowlisted {
             }
         };
 
-        // Ratkaise + validoi allowlist. Hylätty kohde → epäonnistunut tulos
-        // (ei paniikkia, ei virhettä joka kaataisi putken).
+        // Resolve + validate against the allowlist. A rejected target →
+        // failed result (no panic, no error that would crash the pipeline).
         let canonical = match self.resolve_allowed(&input.path) {
             Ok(path) => path,
             Err(e) => {
@@ -373,7 +374,7 @@ impl ActionExecutor for FileWriteAllowlisted {
             "mode": out.mode,
         });
 
-        // Kirjoituksen tulos pysyy oletuksena epäluotettavana (ei .trusted()).
+        // The write's result stays untrusted by default (no .trusted()).
         Ok(ActionResult::success(
             format!(
                 "wrote {} byte(s) to allowlisted path ({})",
@@ -435,8 +436,8 @@ mod tests {
         from_unix_secs(secs).expect("valid unix seconds")
     }
 
-    /// Luo eristetyn väliaikaishakemiston tälle testille (kanonisoituna, jotta
-    /// macOS `/var`→`/private/var`-symlinkit eivät sotke `starts_with`-vertailua).
+    /// Creates an isolated temp directory for this test (canonicalized, so
+    /// macOS `/var`→`/private/var` symlinks don't confuse the `starts_with` comparison).
     fn temp_dir(tag: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!(
@@ -467,9 +468,9 @@ mod tests {
         assert_eq!(m.permissions, vec![SkillPermission::WriteLocalFiles]);
         assert_eq!(m.input_schema["properties"]["path"]["type"], "string");
         assert_eq!(m.input_schema["properties"]["content"]["type"], "string");
-        // Geneerinen: ei perhenimiä eikä yksityisiä polkuja manifestissa.
-        // Kielletyt nimet rakennetaan fragmenteista, jottei lähdetiedostossa ole
-        // yhtäkään kokonaista perhenimi-literaalia (audit-layer-b.sh napsahtaisi).
+        // Generic: no family names or private paths in the manifest.
+        // The forbidden names are built from fragments so the source file
+        // does not contain a single whole family-name literal (audit-layer-b.sh would flag it).
         let rendered = serde_json::to_string(&m).expect("serialize manifest");
         let forbidden_fragments: [(&str, &str); 6] = [
             ("Lum", "en"),
@@ -513,7 +514,7 @@ mod tests {
         assert_eq!(res.raw_output_redacted["bytes_written"], json!(10));
         assert_eq!(res.raw_output_redacted["mode"], json!("overwrite"));
 
-        // Luetaan takaisin levyltä ja varmistetaan sisältö.
+        // Read back from disk and verify the content.
         let read_back = std::fs::read_to_string(&target).expect("read back");
         assert_eq!(read_back, "hello disk");
     }
@@ -523,7 +524,7 @@ mod tests {
         let dir = temp_dir("nested");
         let skill = FileWriteAllowlisted::with_config(FileWriteConfig::new().allow_root(&dir));
 
-        // Vanhempihakemistoja ("a/b/") ei ole vielä olemassa.
+        // The parent directories ("a/b/") do not exist yet.
         let target = dir.join("a").join("b").join("deep.txt");
         let payload = serde_json::to_value(FileWriteInput {
             path: target.to_string_lossy().to_string(),
@@ -551,7 +552,7 @@ mod tests {
         let other = temp_dir("other");
         let skill = FileWriteAllowlisted::with_config(FileWriteConfig::new().allow_root(&allowed));
 
-        // Kohde on toisen (ei-allowlistatun) juuren alla.
+        // The target is under a different (non-allowlisted) root.
         let target = other.join("secret.txt");
         let payload = serde_json::to_value(FileWriteInput {
             path: target.to_string_lossy().to_string(),
@@ -568,20 +569,20 @@ mod tests {
             "path outside allowlist must be rejected"
         );
         assert!(res.output_summary.contains("rejected"));
-        // Todiste sivuvaikutuksen puuttumisesta: tiedostoa ei luotu.
+        // Proof of the absence of a side effect: the file was not created.
         assert!(!target.exists(), "rejected write must not touch disk");
     }
 
     #[tokio::test]
     async fn rejects_dot_dot_traversal() {
-        // Allowlist = alihakemisto; yritetään `..`-pakeneminen ulos.
+        // Allowlist = a subdirectory; attempt a `..` escape outward.
         let base = temp_dir("traversal");
         let allowed = base.join("inside");
         std::fs::create_dir_all(&allowed).expect("create inside");
         let skill = FileWriteAllowlisted::with_config(FileWriteConfig::new().allow_root(&allowed));
 
-        // `<allowed>/../outside.txt` → kanonisoituu `<base>/outside.txt`:ksi,
-        // joka EI ole allowlistin alla → hylätään.
+        // `<allowed>/../outside.txt` → canonicalizes to `<base>/outside.txt`,
+        // which is NOT under the allowlist → rejected.
         let traversal = allowed.join("..").join("outside.txt");
         let payload = serde_json::to_value(FileWriteInput {
             path: traversal.to_string_lossy().to_string(),
@@ -606,8 +607,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_symlink_escape() {
-        // Symlink allowlistin SISÄLLÄ joka osoittaa allowlistin ULKOPUOLELLE.
-        // Kanonisointi seuraa linkin → todellinen kohde paljastuu ulkopuoliseksi.
+        // A symlink INSIDE the allowlist that points OUTSIDE the allowlist.
+        // Canonicalization follows the link → the real target is revealed as external.
         let allowed = temp_dir("symlink_allowed");
         let outside = temp_dir("symlink_outside");
 
@@ -615,7 +616,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &link_dir).expect("create symlink");
         let skill = FileWriteAllowlisted::with_config(FileWriteConfig::new().allow_root(&allowed));
 
-        // Kirjoitus <allowed>/link_dir/leak.txt → kanonisoituu <outside>/leak.txt.
+        // A write to <allowed>/link_dir/leak.txt → canonicalizes to <outside>/leak.txt.
         let target = link_dir.join("leak.txt");
         let payload = serde_json::to_value(FileWriteInput {
             path: target.to_string_lossy().to_string(),
@@ -643,7 +644,7 @@ mod tests {
         let skill = FileWriteAllowlisted::with_config(FileWriteConfig::new().allow_root(&dir));
         let target = dir.join("log.txt");
 
-        // Ensin kirjoitetaan pohja overwrite-tilassa.
+        // First write the base content in overwrite mode.
         let first = serde_json::to_value(FileWriteInput {
             path: target.to_string_lossy().to_string(),
             content: "line1\n".to_string(),
@@ -656,7 +657,7 @@ mod tests {
             .expect("execute");
         assert!(res1.status.is_success());
 
-        // Sitten lisätään append-tilassa.
+        // Then append in append mode.
         let second = serde_json::to_value(FileWriteInput {
             path: target.to_string_lossy().to_string(),
             content: "line2\n".to_string(),
@@ -670,7 +671,7 @@ mod tests {
         assert!(res2.status.is_success());
         assert_eq!(res2.raw_output_redacted["mode"], json!("append"));
 
-        // Sisältö = molemmat rivit peräkkäin (append EI korvannut).
+        // Content = both lines in sequence (append did NOT replace).
         let read_back = std::fs::read_to_string(&target).expect("read back");
         assert_eq!(read_back, "line1\nline2\n");
     }
@@ -678,7 +679,7 @@ mod tests {
     #[tokio::test]
     async fn empty_allowlist_rejects_everything() {
         let dir = temp_dir("empty_allow");
-        // Tyhjä allowlist → fail-closed.
+        // Empty allowlist → fail-closed.
         let skill = FileWriteAllowlisted::new();
         let target = dir.join("doc.txt");
         let payload = serde_json::to_value(FileWriteInput {
@@ -716,7 +717,7 @@ mod tests {
             .expect("execute");
         assert!(res.status.is_success());
 
-        // Tiiviste (64 heksamerkkiä) ja tavumäärä ovat läsnä.
+        // The hash (64 hex chars) and byte count are present.
         let hash = res.raw_output_redacted["path_hash"]
             .as_str()
             .expect("path_hash present");
@@ -729,7 +730,7 @@ mod tests {
             content.len() as u64
         );
 
-        // Kirjoitettu sisältö EI saa esiintyä todisteessa.
+        // The written content must NOT appear in the proof.
         let rendered = serde_json::to_string(&res.raw_output_redacted).expect("serialize output");
         assert!(
             !rendered.contains("must never appear"),
@@ -741,7 +742,7 @@ mod tests {
     async fn invalid_payload_fails_gracefully() {
         let dir = temp_dir("bad_payload");
         let skill = FileWriteAllowlisted::with_config(FileWriteConfig::new().allow_root(&dir));
-        // Puuttuva `content`-kenttä → parse-virhe → epäonnistunut tulos (ei paniikkia).
+        // Missing `content` field → parse error → failed result (no panic).
         let payload = json!({ "path": "x.txt" });
         let res = skill
             .execute(make_request(FileWriteAllowlisted::skill_id(), payload))

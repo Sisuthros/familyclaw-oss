@@ -1,116 +1,119 @@
-//! `dispatch_redteam` — musta laatikko exactly-once-lähetyksen todistamiseen.
+//! `dispatch_redteam` — black box for proving exactly-once dispatch.
 //!
-//! Tämä binääri ajetaan lapsiprosessina (kuten `continuity_daemon`), jotta
-//! "SIGKILL kesken lähetyksen" voidaan todistaa **aidon prosessirajan yli**. Se
-//! kohdistuu täsmälleen siihen bugiin jonka GPT-5.5 paljasti: ikkuna jossa
-//! [`ActionRuntime`]:n sivuvaikutus (`submit_task`) on jo tapahtunut mutta
-//! agenttikerroksen durable-journalointi EI vielä — kaatuminen siinä saa replayn
-//! ajamaan sivuvaikutuksen uudelleen (kaksoislaukaisu).
+//! This binary is run as a child process (like `continuity_daemon`) so that
+//! "SIGKILL mid-dispatch" can be proven **across a real process boundary**. It
+//! targets exactly the bug that GPT-5.5 revealed: the window in which the
+//! [`ActionRuntime`]'s side effect (`submit_task`) has already happened but the
+//! agent layer's durable journaling has NOT — a crash in that window causes
+//! replay to run the side effect again (double-firing).
 //!
-//! ## Sivuvaikutuksen laskuri (todiste)
-//! Rekisteröity taito ([`CountingExecutor`]) **kasvattaa levyllä olevaa laskuria
-//! joka kerta kun sen `execute` ajetaan oikeasti**. Testi lukee laskurin raakana
-//! ja vaatii että se on tasan 1 — kaksoislaukaisu nostaisi sen 2:een.
+//! ## Side-effect counter (proof)
+//! The registered skill ([`CountingExecutor`]) **increments an on-disk counter
+//! every time its `execute` is actually run**. The test reads the counter raw
+//! and requires it to be exactly 1 — a double-fire would push it to 2.
 //!
-//! ## Moodit (`--mode`)
-//! - `old` — käyttää [`ActionRuntime::submit_task_as`]:ia (bugiton ennen korjausta:
-//!   EI outbox-suojaa) → todistaa että bugi ON olemassa (laskuri = 2).
-//! - `new` — käyttää [`ActionRuntime::submit_task_idempotent`]:ia kaatumiskestävän
-//!   outboxin kanssa → todistaa korjauksen (laskuri = 1, lopputulos identtinen).
+//! ## Modes (`--mode`)
+//! - `old` — uses [`ActionRuntime::submit_task_as`] (the pre-fix, buggy path:
+//!   NO outbox protection) → proves the bug DOES exist (counter = 2).
+//! - `new` — uses [`ActionRuntime::submit_task_idempotent`] with the crash-safe
+//!   outbox → proves the fix (counter = 1, outcome identical).
 //!
-//! ## Vaiheet (`--phase`)
-//! ### `submit_task`-polku (avaimet `turn-*`)
-//! - `crash` — aja lähetys (sivuvaikutus tapahtuu), kirjaa lopputulos
-//!   `--outcome-out`-tiedostoon, ja **poistu 137 ENNEN kuin agentti ehtisi
-//!   journaloida dispatch-rivin**. Tämä on COMMITTED-ikkuna: outbox on jo
-//!   täysin kirjoitettu (intent + committed), vain agenttikerroksen journal-rivi
-//!   puuttuu. Hyvänlaatuinen replay-kohta (exactly-once arvo-identtinen).
-//! - `crash_intent` — kaadu **INTENT-ONLY-ikkunassa**: `record_intent` on jo
-//!   levyllä JA sivuvaikutus on jo lauennut (laskuri = 1), mutta `record_committed`
-//!   EI ole vielä ajettu. Tämä on se aidosti vaarallinen ikkuna joka todistaa
-//!   **at-most-once fail-closed** -takuun (vrt. moduulin [`CrashAfterIntentOutbox`]).
-//! - `resume` — toistaa täsmälleen sen mitä agentin tuore-ajo-haara tekee kun
-//!   journal-riviä EI ole (koska kaatuminen esti sen): ajaa SAMAN lähetyksen
-//!   samalla idempotenssi-avaimella uudelleen. COMMITTED-ikkunan jälkeen
-//!   (`new`-moodi) outbox palauttaa committed-lopputuloksen ajamatta
-//!   sivuvaikutusta; `old`-moodissa se ajetaan uudelleen (double-fire).
-//! - `resume_intent` — toistaa intent-only-kaatumisen jälkeen: outbox-lookup
-//!   palauttaa `InProgress` → `submit_task_idempotent` palauttaa
+//! ## Phases (`--phase`)
+//! ### `submit_task` path (keys `turn-*`)
+//! - `crash` — run the dispatch (side effect happens), record the outcome to
+//!   the `--outcome-out` file, and **exit 137 BEFORE the agent gets a chance to
+//!   journal the dispatch row**. This is the COMMITTED window: the outbox has
+//!   already been fully written (intent + committed), only the agent layer's
+//!   journal row is missing. A benign replay point (exactly-once value-identical).
+//! - `crash_intent` — crash in the **INTENT-ONLY window**: `record_intent` is
+//!   already on disk AND the side effect has already fired (counter = 1), but
+//!   `record_committed` has NOT run yet. This is the genuinely dangerous window
+//!   that proves the **at-most-once fail-closed** guarantee (cf. the module's
+//!   [`CrashAfterIntentOutbox`]).
+//! - `resume` — replays exactly what the agent's fresh-run branch does when the
+//!   journal row is MISSING (because the crash prevented it): re-runs the SAME
+//!   dispatch with the same idempotency key. After the COMMITTED window
+//!   (`new` mode) the outbox returns the committed outcome without re-running
+//!   the side effect; in `old` mode it is re-run (double-fire).
+//! - `resume_intent` — replays after an intent-only crash: the outbox lookup
+//!   returns `InProgress` → `submit_task_idempotent` returns
 //!   [`PolicyDenied`](familyclaw_actions::ActionError::PolicyDenied) fail-closed,
-//!   eikä sivuvaikutus aja uudelleen (laskuri pysyy 1:ssä).
+//!   and the side effect does NOT re-run (counter stays at 1).
 //!
-//! ### Hyväksynnän jälkeisen jatkon polku (avaimet `resume-{id}-dispatch-{k}`)
-//! Tämä todistaa SAMAN at-most-once-takuun **jatkon lähetysavaimelle**, jonka
-//! agentin tool-loop tuottaa hyväksynnän myöntämisen JÄLKEEN. Kun keskeytetty
-//! vuoro hyväksytään ja malli pyytää jatkossa **toisen** työkalun, sen lähetys
-//! reititetään `submit_task_idempotent`:n läpi avaimella
-//! `resume-{approval_id}-dispatch-{k}` (johdettu suoraan jatkon hyväksynnän
-//! tunnisteesta + juoksevasta lähetysindeksistä). Tämä avain-muoto on tasan se,
-//! jonka tuotantopolku rakentaa (`drive_tool_loop` muodostaa `{prefix}-dispatch-{k}`
-//! prefiksistä `resume-{approval_id}`). Aiemmin tämä jatkon at-most-once oli
-//! todistettu vain saman prosessin sisäisellä yksikkötestillä — nämä vaiheet
-//! todistavat sen **aidon prosessirajan yli** (SIGKILL exit 137).
-//! - `resume_continuation_crash` — aja jatkon lähetys `resume-*-dispatch-*`-avaimella
-//!   aseistetulla intent-koukulla: `record_intent` fsyncataan JA sivuvaikutus
-//!   laukeaa (laskuri = 1), prosessi abortoi `record_committed`:n alussa →
-//!   **poistuu 137 INTENT-ONLY-ikkunassa**. Vaatii `--mode new` +
-//!   `FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1`.
-//! - `resume_continuation_resume` — tuore prosessi ajaa SAMAN jatkon lähetyksen
-//!   SAMALLA `resume-*-dispatch-*`-avaimella → outbox-lookup näkee `InProgress` →
-//!   `submit_task_idempotent` palauttaa
+//! ### Post-approval continuation dispatch path (keys `resume-{id}-dispatch-{k}`)
+//! This proves the SAME at-most-once guarantee for the **continuation dispatch
+//! key** that the agent's tool loop produces AFTER an approval is granted. When
+//! a suspended turn is approved and the model requests **another** tool in
+//! continuation, its dispatch is routed through `submit_task_idempotent` with
+//! the key `resume-{approval_id}-dispatch-{k}` (derived directly from the
+//! continuation approval's identifier + a running dispatch index). This key
+//! shape is exactly what the production path builds (`drive_tool_loop`
+//! constructs `{prefix}-dispatch-{k}` from the prefix `resume-{approval_id}`).
+//! Previously this continuation's at-most-once was only proven by a same-process
+//! unit test — these phases prove it **across a real process boundary**
+//! (SIGKILL exit 137).
+//! - `resume_continuation_crash` — run the continuation dispatch with the
+//!   `resume-*-dispatch-*` key with the intent hook armed: `record_intent` is
+//!   fsynced AND the side effect fires (counter = 1), the process aborts at the
+//!   start of `record_committed` → **exits 137 in the INTENT-ONLY window**.
+//!   Requires `--mode new` + `FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1`.
+//! - `resume_continuation_resume` — a fresh process runs the SAME continuation
+//!   dispatch with the SAME `resume-*-dispatch-*` key → the outbox lookup sees
+//!   `InProgress` →
+//!   `submit_task_idempotent` returns
 //!   [`PolicyDenied`](familyclaw_actions::ActionError::PolicyDenied) fail-closed,
-//!   eikä sivuvaikutus aja uudelleen (laskuri pysyy 1:ssä).
+//!   and the side effect does NOT re-run (counter stays at 1).
 //!
-//! ### Hyväksyntäpolku (avaimet `approval-*`)
-//! Tämä todistaa SAMAN at-most-once-takuun [`ActionRuntime::approve`]:n
-//! sivuvaikutus-ikkunalle — outbox-avain on `approval-{id}`, EI `turn-*`. Polku
-//! tarvitsee kaatumiskestävän **pending**-pinnan (Wire-vaihe), jotta tuore
-//! prosessi voi ladata odottavan hyväksynnän levyltä ja **uudelleenhyväksyä
-//! saman `ApprovalId`:n**.
-//! - `approve_crash_intent` — lähetä hyväksyntää vaativa tehtävä, sitten
-//!   `approve()` aseistetulla intent-koukulla: `run_after_approval` ajaa
-//!   sivuvaikutuksen (laskuri = 1), `record_intent` on fsyncattu, mutta prosessi
-//!   abortoi `record_committed`:n alussa → **poistuu 137 INTENT-ONLY-ikkunassa**
-//!   (intent levyllä, committed + `pending.remove` tekemättä).
-//! - `approve_crash_committed` — kuten yllä mutta kaatumiskoukku abortoi
-//!   `record_committed`:n **jälkeen** (committed fsyncattu) mutta ENNEN
-//!   `pending.remove`:a → COMMITTED-ikkuna hyväksyntäpolulla.
-//! - `approve_resume` — tuore prosessi lataa odottavan hyväksynnän durable-
-//!   pinnalta (Wire), poimii **saman** `ApprovalId`:n ja uudelleenhyväksyy sen:
-//!   intent-only-kaatumisen jälkeen outbox näkee `InProgress` →
+//! ### Approval path (keys `approval-*`)
+//! This proves the SAME at-most-once guarantee for [`ActionRuntime::approve`]'s
+//! side-effect window — the outbox key is `approval-{id}`, NOT `turn-*`. This
+//! path needs a crash-safe **pending** surface (Wire stage) so that a fresh
+//! process can load the pending approval from disk and **re-approve the same
+//! `ApprovalId`**.
+//! - `approve_crash_intent` — dispatch a task requiring approval, then call
+//!   `approve()` with the intent hook armed: `run_after_approval` runs the
+//!   side effect (counter = 1), `record_intent` is fsynced, but the process
+//!   aborts at the start of `record_committed` → **exits 137 in the
+//!   INTENT-ONLY window** (intent on disk, committed + `pending.remove` not done).
+//! - `approve_crash_committed` — as above but the crash hook aborts
+//!   **after** `record_committed` (committed fsynced) but BEFORE
+//!   `pending.remove` → COMMITTED window on the approval path.
+//! - `approve_resume` — a fresh process loads the pending approval from the
+//!   durable surface (Wire), picks up the **same** `ApprovalId` and re-approves
+//!   it: after an intent-only crash the outbox sees `InProgress` →
 //!   [`PolicyDenied`](familyclaw_actions::ActionError::PolicyDenied) fail-closed
-//!   (laskuri pysyy 1:ssä); committed-kaatumisen jälkeen outbox näkee `Committed`
-//!   → arvo-identtinen lopputulos (laskuri pysyy 1:ssä).
+//!   (counter stays at 1); after a committed crash the outbox sees `Committed`
+//!   → value-identical outcome (counter stays at 1).
 //!
-//! ## Kaatumiskoukku — tuotannossa SAAVUTTAMATON (turvallisuusperustelu)
-//! Intent-only- ja committed-kaatumiset toteutetaan [`CrashAfterIntentOutbox`]-
-//! kääreellä joka delegoi oikealle [`JournalDispatchOutbox`]:lle, mutta sen
-//! `record_committed` **abortoi prosessin** kun se on aseistettu jommallakummalla
-//! ympäristömuuttujalla:
-//! - [`CRASH_AFTER_INTENT_ENV`] → abort **ENNEN** delegointia (intent levyllä,
-//!   committed kirjoittamatta = INTENT-ONLY-ikkuna).
-//! - [`CRASH_AFTER_COMMITTED_ENV`] → abort **JÄLKEEN** delegoinnin (committed
-//!   fsyncattu, mutta `pending.remove` ajamatta = COMMITTED-ikkuna
-//!   hyväksyntäpolulla).
+//! ## Crash hook — UNREACHABLE in production (security justification)
+//! Intent-only and committed crashes are implemented via the
+//! [`CrashAfterIntentOutbox`] wrapper, which delegates to the real
+//! [`JournalDispatchOutbox`], except that its `record_committed` **aborts the
+//! process** when armed via either environment variable:
+//! - [`CRASH_AFTER_INTENT_ENV`] → abort **BEFORE** delegating (intent on disk,
+//!   committed not written = INTENT-ONLY window).
+//! - [`CRASH_AFTER_COMMITTED_ENV`] → abort **AFTER** delegating (committed
+//!   fsynced, but `pending.remove` not run = COMMITTED window on the
+//!   approval path).
 //!
-//! Koska sekä `submit_task_idempotent` että `approve` kutsuvat `record_intent` →
-//! sivuvaikutus → `record_committed` tässä järjestyksessä, abort
-//! `record_committed`:n ympärillä jättää tilan tasan haluttuun ikkunaan.
+//! Since both `submit_task_idempotent` and `approve` call `record_intent` →
+//! side effect → `record_committed` in this order, aborting around
+//! `record_committed` leaves the state in exactly the desired window.
 //!
-//! Koukku on **kaksinkertaisesti portitettu eikä voi laueta tuotannossa**:
-//! 1. **Käännösraja:** [`CrashAfterIntentOutbox`] on määritelty VAIN tässä
-//!    red-team-binäärissä (`src/bin/`), EI kirjastossa. Tuotantokoodi rakentaa
-//!    outboxinsa aina [`JournalDispatchOutbox`]:sta tai
-//!    [`InMemoryDispatchOutbox`](familyclaw_actions::dispatch_outbox::InMemoryDispatchOutbox):sta
-//!    — tätä kääre-tyyppiä ei ole olemassa kirjasto-API:ssa, joten sitä on
-//!    rakenteellisesti mahdotonta instantioida tuotannossa.
-//! 2. **Ajonaikainen portti:** vaikka tyyppi jotenkin päätyisi käyttöön, abort
-//!    laukeaa vain kun [`CRASH_AFTER_INTENT_ENV`] **tai**
-//!    [`CRASH_AFTER_COMMITTED_ENV`] = `"1"`. Mikään tuotantopolku ei aseta
-//!    kumpaakaan muuttujaa.
+//! The hook is **doubly gated and cannot fire in production**:
+//! 1. **Compilation boundary:** [`CrashAfterIntentOutbox`] is defined ONLY in
+//!    this red-team binary (`src/bin/`), NOT in the library. Production code
+//!    always builds its outbox from [`JournalDispatchOutbox`] or
+//!    [`InMemoryDispatchOutbox`](familyclaw_actions::dispatch_outbox::InMemoryDispatchOutbox)
+//!    — this wrapper type does not exist in the library API, so it is
+//!    structurally impossible to instantiate in production.
+//! 2. **Runtime gate:** even if the type somehow ended up in use, the abort
+//!    only fires when [`CRASH_AFTER_INTENT_ENV`] **or**
+//!    [`CRASH_AFTER_COMMITTED_ENV`] = `"1"`. No production path sets either
+//!    variable.
 //!
-//! ## Determinismi
-//! Kello injektoidaan `--clock`:lla — järjestelmäkelloa ei lueta koskaan.
+//! ## Determinism
+//! The clock is injected via `--clock` — the system clock is never read.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -131,26 +134,26 @@ use familyclaw_core::{time, Timestamp};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Laskurin kasvatuksen taito.
+/// Skill that increments a counter.
 ///
-/// Jokainen `execute` kasvattaa **levyllä** olevaa sivuvaikutuslaskuria —
-/// tämä on se mittari joka paljastaa kaksoislaukaisun yli prosessirajan.
+/// Every `execute` increments a side-effect counter that lives **on disk** —
+/// this is the gauge that reveals a double-fire across the process boundary.
 ///
-/// Taito on tarkoituksella **auto-run** ([`ActionRisk::ReadOnly`] +
-/// [`ApprovalPolicy::AutoIfReadOnly`]), jotta `submit_task` AJAA suorittajan
-/// (= sivuvaikutuksen) heti ensimmäisellä kutsulla — eikä jää odottamaan
-/// hyväksyntää. Näin "ulkoinen sivuvaikutus" tapahtuu mitattavasti jokaisella
-/// `submit_task`-suorituksella, ja kaksoislaukaisu näkyy laskurissa suoraan.
+/// The skill is intentionally **auto-run** ([`ActionRisk::ReadOnly`] +
+/// [`ApprovalPolicy::AutoIfReadOnly`]), so that `submit_task` RUNS the executor
+/// (= the side effect) immediately on the first call — instead of waiting for
+/// approval. This way the "external side effect" happens measurably on every
+/// `submit_task` run, and a double-fire shows up in the counter directly.
 #[derive(Debug)]
 struct CountingExecutor {
-    /// Polku jossa sivuvaikutuslaskuri elää (luetaan + kirjoitetaan joka ajolla).
+    /// Path where the side-effect counter lives (read + written on every run).
     counter_path: PathBuf,
-    /// Prosessin sisäinen laskuri (diagnostiikka; varsinainen todiste on levyllä).
+    /// In-process counter (diagnostics only; the actual proof is on disk).
     in_process: AtomicU64,
 }
 
 impl CountingExecutor {
-    /// Kiinteä tunniste, jotta `start` ja `resume` viittaavat samaan taitoon.
+    /// Fixed identifier so that `start` and `resume` refer to the same skill.
     const SKILL_UUID: Uuid = uuid::uuid!("11111111-2222-4333-8444-555566667777");
 
     fn skill_id() -> SkillId {
@@ -164,7 +167,7 @@ impl CountingExecutor {
         }
     }
 
-    /// Kasvattaa levyllä olevaa sivuvaikutuslaskuria atomisesti (luku → +1 → kirjoitus).
+    /// Increments the on-disk side-effect counter atomically (read → +1 → write).
     fn bump_disk_counter(&self) {
         let current = std::fs::read_to_string(&self.counter_path)
             .ok()
@@ -177,8 +180,8 @@ impl CountingExecutor {
 #[async_trait]
 impl ActionExecutor for CountingExecutor {
     async fn execute(&self, request: ActionRequest) -> familyclaw_actions::Result<ActionResult> {
-        // SIVUVAIKUTUS: kasvata laskuria. Tämä on "ulkoinen vaikutus" jonka on
-        // tapahduttava tasan kerran SIGKILL:n yli.
+        // SIDE EFFECT: increment the counter. This is the "external effect" that
+        // must happen exactly once across a SIGKILL.
         self.in_process.fetch_add(1, Ordering::SeqCst);
         self.bump_disk_counter();
         Ok(ActionResult::success(
@@ -208,28 +211,29 @@ impl Skill for CountingExecutor {
     }
 }
 
-/// Hyväksyntää vaativa laskuri-taito (hyväksyntäpolun sivuvaikutus).
+/// Counter skill that requires approval (approval path side effect).
 ///
-/// Identtinen [`CountingExecutor`]:n kanssa PAITSI että sen riskiluokka on
-/// [`ActionRisk::WriteExternal`] → `submit_task` jättää tehtävän odottamaan
-/// ihmisen hyväksyntää sen sijaan että ajaisi sen heti. Sivuvaikutus (laskurin
-/// kasvatus) tapahtuu siis vasta [`ActionRuntime::approve`]:n ajaessa
-/// [`run_after_approval`](familyclaw_actions)-haaran — täsmälleen se ikkuna jonka
-/// at-most-once-takuu kattaa `approval-{id}`-avaimella.
+/// Identical to [`CountingExecutor`] EXCEPT that its risk class is
+/// [`ActionRisk::WriteExternal`] → `submit_task` leaves the task waiting for
+/// human approval instead of running it immediately. The side effect (counter
+/// increment) therefore only happens when [`ActionRuntime::approve`] runs the
+/// [`run_after_approval`](familyclaw_actions) branch — exactly the window that
+/// the at-most-once guarantee covers via the `approval-{id}` key.
 ///
-/// Laskuri elää **levyllä** samalla mekanismilla kuin [`CountingExecutor`]:lla,
-/// joten kaksoislaukaisu hyväksynnän yli näkyy laskurissa suoraan (1 → 2).
+/// The counter lives **on disk** using the same mechanism as
+/// [`CountingExecutor`], so a double-fire across an approval shows up in the
+/// counter directly (1 → 2).
 #[derive(Debug)]
 struct ApprovalCountingExecutor {
-    /// Polku jossa sivuvaikutuslaskuri elää (jaettu muoto [`CountingExecutor`]:n kanssa).
+    /// Path where the side-effect counter lives (shared shape with [`CountingExecutor`]).
     counter_path: PathBuf,
-    /// Prosessin sisäinen laskuri (diagnostiikka; varsinainen todiste on levyllä).
+    /// In-process counter (diagnostics only; the actual proof is on disk).
     in_process: AtomicU64,
 }
 
 impl ApprovalCountingExecutor {
-    /// Kiinteä tunniste (eri kuin [`CountingExecutor`]:lla), jotta hyväksyntäpolun
-    /// taito on yksikäsitteinen rekisterissä.
+    /// Fixed identifier (different from [`CountingExecutor`]'s), so the
+    /// approval path's skill is unambiguous in the registry.
     const SKILL_UUID: Uuid = uuid::uuid!("99999999-8888-4777-8666-555544443333");
 
     fn skill_id() -> SkillId {
@@ -243,7 +247,7 @@ impl ApprovalCountingExecutor {
         }
     }
 
-    /// Kasvattaa levyllä olevaa sivuvaikutuslaskuria atomisesti (luku → +1 → kirjoitus).
+    /// Increments the on-disk side-effect counter atomically (read → +1 → write).
     fn bump_disk_counter(&self) {
         let current = std::fs::read_to_string(&self.counter_path)
             .ok()
@@ -256,9 +260,9 @@ impl ApprovalCountingExecutor {
 #[async_trait]
 impl ActionExecutor for ApprovalCountingExecutor {
     async fn execute(&self, request: ActionRequest) -> familyclaw_actions::Result<ActionResult> {
-        // SIVUVAIKUTUS: kasvata laskuria. Ajetaan hyväksyntäpolulla VASTA
-        // `approve()`:n `run_after_approval`-haarassa — tämä on se "ulkoinen
-        // vaikutus" jonka on tapahduttava korkeintaan kerran SIGKILL:n yli.
+        // SIDE EFFECT: increment the counter. On the approval path this only
+        // runs in `approve()`'s `run_after_approval` branch — this is the
+        // "external effect" that must happen at most once across a SIGKILL.
         self.in_process.fetch_add(1, Ordering::SeqCst);
         self.bump_disk_counter();
         Ok(ActionResult::success(
@@ -277,7 +281,7 @@ impl Skill for ApprovalCountingExecutor {
             version: "1.0.0".to_string(),
             description: "Kasvattaa sivuvaikutuslaskuria (vaatii hyväksynnän).".to_string(),
             permissions: vec![SkillPermission::WriteExternal],
-            // WriteExternal → vaatii ihmisen hyväksynnän (ei auto-run).
+            // WriteExternal → requires human approval (not auto-run).
             risk: ActionRisk::WriteExternal,
             approval_policy: ApprovalPolicy::RequireApproval,
             input_hint: None,
@@ -289,61 +293,61 @@ impl Skill for ApprovalCountingExecutor {
     }
 }
 
-/// Ympäristömuuttuja joka **aseistaa** intent-only-kaatumiskoukun.
+/// Environment variable that **arms** the intent-only crash hook.
 ///
-/// Vain kun tämä on `"1"`, [`CrashAfterIntentOutbox::record_committed`] abortoi
-/// prosessin ennen delegointia. Mikään tuotantopolku ei aseta tätä — ks. moduulin
-/// dokumentaatio (käännösraja + ajonaikainen portti).
+/// Only when this is `"1"` does [`CrashAfterIntentOutbox::record_committed`]
+/// abort the process before delegating. No production path sets this — see the
+/// module documentation (compilation boundary + runtime gate).
 const CRASH_AFTER_INTENT_ENV: &str = "FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT";
 
-/// Ympäristömuuttuja joka **aseistaa** committed-ikkunan kaatumiskoukun.
+/// Environment variable that **arms** the committed-window crash hook.
 ///
-/// Vain kun tämä on `"1"`, [`CrashAfterIntentOutbox::record_committed`] abortoi
-/// prosessin **delegoinnin JÄLKEEN** (committed on jo fsyncattu levylle) mutta
-/// ennen kuin kutsuja ehtii `pending.remove`:n. Tämä jäljittelee
-/// hyväksyntäpolun COMMITTED-ikkunaa. Mikään tuotantopolku ei aseta tätä — ks.
-/// moduulin dokumentaatio (käännösraja + ajonaikainen portti).
+/// Only when this is `"1"` does [`CrashAfterIntentOutbox::record_committed`]
+/// abort the process **AFTER delegating** (committed is already fsynced to
+/// disk) but before the caller gets to `pending.remove`. This mimics the
+/// COMMITTED window on the approval path. No production path sets this — see
+/// the module documentation (compilation boundary + runtime gate).
 const CRASH_AFTER_COMMITTED_ENV: &str = "FAMILYCLAW_REDTEAM_CRASH_AFTER_COMMITTED";
 
-/// Exit-koodi jolla intent-only-kaatuminen poistuu (SIGKILL-tyyli, kuten 137).
+/// Exit code with which an intent-only crash exits (SIGKILL-style, like 137).
 const CRASH_EXIT_CODE: i32 = 137;
 
-/// Kaatumiskoukku-kääre joka pakottaa joko **intent-only-** tai
-/// **committed-ikkunan** prosessirajan yli.
+/// Crash hook wrapper that forces either the **intent-only** or
+/// **committed window** across a process boundary.
 ///
-/// Delegoi kaiken oikealle [`JournalDispatchOutbox`]:lle PAITSI että
-/// [`record_committed`](CrashAfterIntentOutbox::record_committed) **abortoi
-/// prosessin** kun koukku on aseistettu:
-/// - [`CRASH_AFTER_INTENT_ENV`] = `"1"` → abort **ENNEN** delegointia: committed
-///   EI koskaan kirjoitu (intent levyllä, sivuvaikutus lauennut, committed
-///   kirjoittamatta) — INTENT-ONLY-ikkuna jonka GPT-5.5 nosti esiin.
-/// - [`CRASH_AFTER_COMMITTED_ENV`] = `"1"` → abort **JÄLKEEN** delegoinnin:
-///   committed on jo fsyncattu levylle mutta kutsuja ei ehdi `pending.remove`:a
-///   → COMMITTED-ikkuna (hyvänlaatuinen replay-kohta, arvo-identtinen).
+/// Delegates everything to the real [`JournalDispatchOutbox`] EXCEPT that
+/// [`record_committed`](CrashAfterIntentOutbox::record_committed) **aborts the
+/// process** when the hook is armed:
+/// - [`CRASH_AFTER_INTENT_ENV`] = `"1"` → abort **BEFORE** delegating: committed
+///   is NEVER written (intent on disk, side effect fired, committed not
+///   written) — the INTENT-ONLY window that GPT-5.5 raised.
+/// - [`CRASH_AFTER_COMMITTED_ENV`] = `"1"` → abort **AFTER** delegating:
+///   committed is already fsynced to disk but the caller doesn't get to
+///   `pending.remove` → COMMITTED window (benign replay point, value-identical).
 ///
-/// Koska sekä [`ActionRuntime::submit_task_idempotent`] että
-/// [`ActionRuntime::approve`] kutsuvat `record_intent` → sivuvaikutus →
-/// `record_committed` tässä järjestyksessä, abort `record_committed`:n ympärillä
-/// jättää tilan tasan haluttuun ikkunaan.
+/// Since both [`ActionRuntime::submit_task_idempotent`] and
+/// [`ActionRuntime::approve`] call `record_intent` → side effect →
+/// `record_committed` in this order, aborting around `record_committed` leaves
+/// the state in exactly the desired window.
 ///
-/// ## Tuotannossa saavuttamaton
-/// Tämä tyyppi elää VAIN red-team-binäärissä (`src/bin/`), ei kirjasto-API:ssa.
-/// Tuotanto rakentaa outboxinsa aina suoraan [`JournalDispatchOutbox`]:sta, joten
-/// tätä kääre-tyyppiä ei voi instantioida tuotannossa. Lisäksi abort on portitettu
-/// ajonaikaisella ympäristömuuttujalla. Kaksinkertainen suoja → ei voi laueta
-/// tuotannossa.
+/// ## Unreachable in production
+/// This type lives ONLY in the red-team binary (`src/bin/`), not in the
+/// library API. Production always builds its outbox directly from
+/// [`JournalDispatchOutbox`], so this wrapper type cannot be instantiated in
+/// production. In addition, the abort is gated by a runtime environment
+/// variable. Double protection → cannot fire in production.
 #[derive(Debug)]
 struct CrashAfterIntentOutbox {
-    /// Oikea kaatumiskestävä outbox johon kaikki ei-abortoivat kutsut delegoidaan.
+    /// The real crash-safe outbox to which all non-aborting calls are delegated.
     inner: JournalDispatchOutbox,
-    /// Aseistettu tila intent-only-ikkunaan (abort ENNEN delegointia).
+    /// Armed state for the intent-only window (abort BEFORE delegating).
     armed_before: bool,
-    /// Aseistettu tila committed-ikkunaan (abort JÄLKEEN delegoinnin).
+    /// Armed state for the committed window (abort AFTER delegating).
     armed_after: bool,
 }
 
 impl CrashAfterIntentOutbox {
-    /// Käärii oikean outboxin ja lukee aseistukset ympäristöstä KERRAN.
+    /// Wraps the real outbox and reads the arming state from the environment ONCE.
     fn new(inner: JournalDispatchOutbox) -> Self {
         let armed_before = std::env::var(CRASH_AFTER_INTENT_ENV).as_deref() == Ok("1");
         let armed_after = std::env::var(CRASH_AFTER_COMMITTED_ENV).as_deref() == Ok("1");
@@ -357,7 +361,7 @@ impl CrashAfterIntentOutbox {
 
 impl DispatchOutboxStore for CrashAfterIntentOutbox {
     fn kind(&self) -> &'static str {
-        // Kääre delegoi kaiken kaatumiskestävään outboxiin → sama lajitunniste.
+        // The wrapper delegates everything to the crash-safe outbox → same kind id.
         self.inner.kind()
     }
 
@@ -366,8 +370,8 @@ impl DispatchOutboxStore for CrashAfterIntentOutbox {
     }
 
     fn record_intent(&self, key: &str) -> familyclaw_actions::Result<()> {
-        // Aie delegoituu normaalisti (fsync) — tämä on se rivi joka jää levylle
-        // intent-only-kaatumisen jälkeen.
+        // The intent delegates normally (fsync) — this is the row that remains
+        // on disk after an intent-only crash.
         self.inner.record_intent(key)
     }
 
@@ -377,28 +381,30 @@ impl DispatchOutboxStore for CrashAfterIntentOutbox {
         outcome: &DispatchedOutcome,
     ) -> familyclaw_actions::Result<()> {
         if self.armed_before {
-            // INTENT-ONLY-IKKUNA: record_intent on jo levyllä JA sivuvaikutus on jo
-            // lauennut (kutsuja ajoi sen ennen tätä). Abortoidaan ENNEN delegointia
-            // → committed EI koskaan kirjoitu. Tämä on aidosti vaarallinen ikkuna.
+            // INTENT-ONLY WINDOW: record_intent is already on disk AND the side
+            // effect has already fired (the caller ran it before this). Abort
+            // BEFORE delegating → committed is NEVER written. This is the
+            // genuinely dangerous window.
             //
-            // `std::process::exit(137)` jäljittelee SIGKILL:iä — eikä kirjasto
-            // koskaan näe committed-riviä.
+            // `std::process::exit(137)` mimics SIGKILL — the library never sees
+            // the committed row.
             let _ = std::io::stderr().flush();
             eprintln!(
                 "crash injected: AFTER record_intent + side effect, \
                  BEFORE record_committed (intent-only window)"
             );
-            // Käytä eksplisiittistä exit-koodia jotta testi voi vaatia 137:n.
+            // Use an explicit exit code so the test can assert on 137.
             std::process::exit(CRASH_EXIT_CODE);
         }
-        // Committed delegoidaan oikealle outboxille (fsync). Tämän jälkeen
-        // committed-marker on levyllä — at-most-once-takuu pitää siitä eteenpäin.
+        // Committed is delegated to the real outbox (fsync). After this, the
+        // committed marker is on disk — the at-most-once guarantee holds from
+        // here on.
         self.inner.record_committed(key, outcome)?;
         if self.armed_after {
-            // COMMITTED-IKKUNA: committed on jo fsyncattu, mutta kutsuja (esim.
-            // `approve`) ei ole vielä ehtinyt `pending.remove`:a. Abortoidaan tähän
-            // → uudelleenhyväksyntä näkee Committed-rivin ja palauttaa
-            // arvo-identtisen lopputuloksen ajamatta sivuvaikutusta uudelleen.
+            // COMMITTED WINDOW: committed is already fsynced, but the caller
+            // (e.g. `approve`) hasn't yet gotten to `pending.remove`. Abort here
+            // → re-approval sees the Committed row and returns the
+            // value-identical outcome without re-running the side effect.
             let _ = std::io::stderr().flush();
             eprintln!(
                 "crash injected: AFTER record_committed (committed on disk), \
@@ -410,67 +416,70 @@ impl DispatchOutboxStore for CrashAfterIntentOutbox {
     }
 }
 
-/// Moodi: vanha (bugi) vai uusi (korjattu) lähetyspolku.
+/// Mode: old (buggy) or new (fixed) dispatch path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "snake_case")]
 enum Mode {
-    /// `submit_task_as` — EI outbox-idempotenssia (bugi ennen korjausta).
+    /// `submit_task_as` — NO outbox idempotency (the pre-fix bug).
     Old,
-    /// `submit_task_idempotent` — outbox-suojattu (korjaus).
+    /// `submit_task_idempotent` — outbox-protected (the fix).
     New,
 }
 
-/// Vaihe: kaadu kesken vai jatka.
+/// Phase: crash mid-flight or resume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "snake_case")]
 enum Phase {
-    /// COMMITTED-ikkuna: aja lähetys (intent + sivuvaikutus + committed), kirjaa
-    /// lopputulos, poistu 137 ENNEN agenttikerroksen journalointia.
+    /// COMMITTED window: run the dispatch (intent + side effect + committed),
+    /// record the outcome, exit 137 BEFORE the agent layer's journaling.
     Crash,
-    /// INTENT-ONLY-ikkuna: aja lähetys mutta abortoi `record_committed`:n alussa
-    /// → intent levyllä + sivuvaikutus lauennut, committed kirjoittamatta.
-    /// Vaatii `--mode new` (outbox-suojattu polku) + aseistetun koukun.
+    /// INTENT-ONLY window: run the dispatch but abort at the start of
+    /// `record_committed` → intent on disk + side effect fired, committed not
+    /// written. Requires `--mode new` (outbox-protected path) + the armed hook.
     CrashIntent,
-    /// COMMITTED-ikkunan jälkeen: aja SAMA lähetys uudelleen (agentin tuore-haara
-    /// ilman journal-riviä). Outbox palauttaa committed-lopputuloksen.
+    /// After the COMMITTED window: re-run the SAME dispatch (the agent's
+    /// fresh-run branch with no journal row). The outbox returns the committed
+    /// outcome.
     Resume,
-    /// INTENT-ONLY-ikkunan jälkeen: aja SAMA lähetys uudelleen → outbox-lookup
-    /// palauttaa `InProgress`, joten odotettu lopputulos on `PolicyDenied`
-    /// fail-closed (sivuvaikutus EI aja uudelleen).
+    /// After the INTENT-ONLY window: re-run the SAME dispatch → the outbox
+    /// lookup returns `InProgress`, so the expected outcome is `PolicyDenied`
+    /// fail-closed (the side effect does NOT re-run).
     ResumeIntent,
-    /// JATKON LÄHETYSPOLKU, INTENT-ONLY-ikkuna: aja hyväksynnän jälkeisen jatkon
-    /// lähetys avaimella `resume-{approval_id}-dispatch-{k}` (= tasan se avain,
-    /// jonka tuotannon `drive_tool_loop` muodostaa hyväksynnän myöntämisen
-    /// JÄLKEEN). Aseistettu intent-koukku → `record_intent` + sivuvaikutus
-    /// (laskuri = 1), abort `record_committed`:n alussa → poistuu 137. Vaatii
-    /// `--mode new` + `FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1`. Avain annetaan
-    /// `--key`:llä `resume-*-dispatch-*`-muodossa.
+    /// CONTINUATION DISPATCH PATH, INTENT-ONLY window: run the post-approval
+    /// continuation dispatch with the key `resume-{approval_id}-dispatch-{k}`
+    /// (= exactly the key that production's `drive_tool_loop` builds AFTER an
+    /// approval is granted). Intent hook armed → `record_intent` + side effect
+    /// (counter = 1), abort at the start of `record_committed` → exits 137.
+    /// Requires `--mode new` + `FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1`. The
+    /// key is supplied via `--key` in the `resume-*-dispatch-*` shape.
     ResumeContinuationCrash,
-    /// JATKON LÄHETYSPOLUN jälkeen: tuore prosessi ajaa SAMAN jatkon lähetyksen
-    /// SAMALLA `resume-*-dispatch-*`-avaimella → outbox-lookup palauttaa
-    /// `InProgress`, joten odotettu lopputulos on `PolicyDenied` fail-closed
-    /// (sivuvaikutus EI aja uudelleen, laskuri pysyy 1:ssä).
+    /// After the CONTINUATION DISPATCH PATH: a fresh process runs the SAME
+    /// continuation dispatch with the SAME `resume-*-dispatch-*` key → the
+    /// outbox lookup returns `InProgress`, so the expected outcome is
+    /// `PolicyDenied` fail-closed (the side effect does NOT re-run, counter
+    /// stays at 1).
     ResumeContinuationResume,
-    /// HYVÄKSYNTÄPOLKU, INTENT-ONLY-ikkuna: lähetä hyväksyntää vaativa tehtävä,
-    /// kirjaa `ApprovalId` levylle, sitten `approve()` aseistetulla intent-koukulla
-    /// → `run_after_approval` ajaa sivuvaikutuksen (laskuri = 1), `record_intent`
-    /// fsyncattu, prosessi abortoi `record_committed`:n alussa → poistuu 137.
-    /// Vaatii `--mode new`, durable pending (`--pending`) + task queue
-    /// (`--task-queue`) ja `FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1`.
+    /// APPROVAL PATH, INTENT-ONLY window: dispatch a task requiring approval,
+    /// record the `ApprovalId` to disk, then call `approve()` with the intent
+    /// hook armed → `run_after_approval` runs the side effect (counter = 1),
+    /// `record_intent` is fsynced, the process aborts at the start of
+    /// `record_committed` → exits 137. Requires `--mode new`, durable pending
+    /// (`--pending`) + task queue (`--task-queue`) and
+    /// `FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT=1`.
     ApproveCrashIntent,
-    /// HYVÄKSYNTÄPOLKU, COMMITTED-ikkuna: kuten yllä mutta koukku abortoi
-    /// `record_committed`:n **jälkeen** (committed levyllä) ennen `pending.remove`:a
-    /// → poistuu 137. Vaatii `FAMILYCLAW_REDTEAM_CRASH_AFTER_COMMITTED=1`.
+    /// APPROVAL PATH, COMMITTED window: as above but the hook aborts **after**
+    /// `record_committed` (committed on disk) before `pending.remove` → exits
+    /// 137. Requires `FAMILYCLAW_REDTEAM_CRASH_AFTER_COMMITTED=1`.
     ApproveCrashCommitted,
-    /// HYVÄKSYNTÄPOLUN jälkeen: tuore prosessi lataa odottavan hyväksynnän
-    /// durable-pinnalta (Wire), poimii SAMAN `ApprovalId`:n ja uudelleenhyväksyy
-    /// sen. Intent-only-kaatumisen jälkeen → `PolicyDenied` fail-closed (laskuri
-    /// pysyy 1:ssä); committed-kaatumisen jälkeen → arvo-identtinen `SubmitOutcome`
-    /// (laskuri pysyy 1:ssä). Koukkua EI aseisteta tässä vaiheessa.
+    /// After the APPROVAL PATH: a fresh process loads the pending approval
+    /// from the durable surface (Wire), picks up the SAME `ApprovalId` and
+    /// re-approves it. After an intent-only crash → `PolicyDenied` fail-closed
+    /// (counter stays at 1); after a committed crash → value-identical
+    /// `SubmitOutcome` (counter stays at 1). The hook is NOT armed in this phase.
     ApproveResume,
 }
 
-/// Komentorivirajapinta.
+/// Command-line interface.
 #[derive(Parser)]
 #[command(
     name = "dispatch_redteam",
@@ -481,51 +490,52 @@ struct Cli {
     command: Command,
 }
 
-/// Ainoa alikomento: `run` (vaiheet erotellaan `--phase`:lla).
+/// The only subcommand: `run` (phases are distinguished by `--phase`).
 #[derive(Subcommand)]
 enum Command {
-    /// Aja yksi vaihe annetussa moodissa.
+    /// Run a single phase in the given mode.
     Run(RunArgs),
 }
 
-/// `run`-argumentit.
+/// `run` arguments.
 #[derive(Parser)]
 struct RunArgs {
-    /// Vanha (bugi) vai uusi (korjattu) polku.
+    /// Old (buggy) or new (fixed) path.
     #[arg(long, value_enum)]
     mode: Mode,
-    /// Vaihe (`crash` / `resume`).
+    /// Phase (`crash` / `resume`).
     #[arg(long, value_enum)]
     phase: Phase,
-    /// Outbox-journalin polku (kaatumiskestävä idempotenssi).
+    /// Path to the outbox journal (crash-safe idempotency).
     #[arg(long)]
     outbox: PathBuf,
-    /// Sivuvaikutuslaskurin polku (todiste).
+    /// Path to the side-effect counter (proof).
     #[arg(long)]
     counter: PathBuf,
-    /// Tiedosto johon `crash`-vaihe kirjaa lopputuloksen (arvo-identtisyyden todiste).
+    /// File to which the `crash` phase records the outcome (proof of value identity).
     #[arg(long)]
     outcome_out: PathBuf,
-    /// Stabiili idempotenssi-avain. `submit_task`-vaiheilla muoto on agentin
-    /// `turn-{turn}-dispatch-{k}`; jatkon lähetyspolun vaiheilla
-    /// (`resume_continuation_*`) muoto on `resume-{approval_id}-dispatch-{k}`,
-    /// tasan se jonka tuotannon `drive_tool_loop` muodostaa hyväksynnän jälkeen.
+    /// Stable idempotency key. For `submit_task` phases the shape is the
+    /// agent's `turn-{turn}-dispatch-{k}`; for continuation dispatch path
+    /// phases (`resume_continuation_*`) the shape is
+    /// `resume-{approval_id}-dispatch-{k}`, exactly what production's
+    /// `drive_tool_loop` builds after approval.
     #[arg(long, default_value = "turn-0-dispatch-0")]
     key: String,
-    /// Injektoitu seinäkello (RFC 3339).
+    /// Injected wall clock (RFC 3339).
     #[arg(long)]
     clock: String,
-    /// Kaatumiskestävän **odottavien hyväksyntöjen** pinnan polku (Wire-vaihe).
-    /// Pakollinen hyväksyntäpolun vaiheille (`approve_*`).
+    /// Path to the crash-safe **pending approvals** surface (Wire stage).
+    /// Required for approval-path phases (`approve_*`).
     #[arg(long)]
     pending: Option<PathBuf>,
-    /// Kaatumiskestävän **tehtäväjonon** polku (durable queue). Pakollinen
-    /// hyväksyntäpolun vaiheille (`approve_*`).
+    /// Path to the crash-safe **task queue** (durable queue). Required for
+    /// approval-path phases (`approve_*`).
     #[arg(long)]
     task_queue: Option<PathBuf>,
 }
 
-/// Lopputuloksen levymuoto arvo-identtisyyden vertailuun.
+/// On-disk shape of the outcome, for value-identity comparison.
 #[derive(Debug, Serialize, Deserialize)]
 struct OutcomeRecord {
     task_id: String,
@@ -543,7 +553,7 @@ impl OutcomeRecord {
     }
 }
 
-/// Daemonin virhetyyppi.
+/// Daemon error type.
 #[derive(Debug, thiserror::Error)]
 enum HarnessError {
     #[error("core error: {0}")]
@@ -576,21 +586,21 @@ async fn run(cli: Cli) -> HarnessResult<()> {
     }
 }
 
-/// Rakentaa ajoympäristön: laskuri-taito rekisteröitynä + (uusi-moodissa)
-/// kaatumiskestävä outbox annetusta polusta.
+/// Builds the runtime: counter skill registered + (in new mode) the crash-safe
+/// outbox from the given path.
 ///
-/// `crash_intent`- ja `resume_continuation_crash`-vaiheissa kaatumiskestävä
-/// outbox kääritään [`CrashAfterIntentOutbox`]:iin, joka abortoi prosessin
-/// `record_committed`:n alussa (intent-only-ikkuna). Kaikissa muissa vaiheissa
-/// käytetään suoraa [`JournalDispatchOutbox`]:a.
+/// In the `crash_intent` and `resume_continuation_crash` phases the crash-safe
+/// outbox is wrapped in [`CrashAfterIntentOutbox`], which aborts the process at
+/// the start of `record_committed` (intent-only window). All other phases use
+/// the plain [`JournalDispatchOutbox`].
 fn build_runtime(args: &RunArgs) -> HarnessResult<ActionRuntime> {
     let mut runtime = ActionRuntime::new();
     runtime.register_skill(CountingExecutor::new(args.counter.clone()))?;
     if args.mode == Mode::New {
         let outbox = JournalDispatchOutbox::open(&args.outbox)?;
-        // Intent-only-kaatumisikkunan vaiheet (sekä `turn-*`- että
-        // `resume-*-dispatch-*`-avaimilla) tarvitsevat kaatumiskoukulla kääritun
-        // outboxin: `record_committed` abortoi ennen delegointia kun aseistettu.
+        // The intent-only crash window phases (with both `turn-*` and
+        // `resume-*-dispatch-*` keys) need the outbox wrapped in the crash
+        // hook: `record_committed` aborts before delegating when armed.
         if matches!(
             args.phase,
             Phase::CrashIntent | Phase::ResumeContinuationCrash
@@ -603,7 +613,7 @@ fn build_runtime(args: &RunArgs) -> HarnessResult<ActionRuntime> {
     Ok(runtime)
 }
 
-/// Pakottaa pakollisen polun argumentin (hyväksyntäpolun vaiheille).
+/// Enforces a required path argument (for approval-path phases).
 fn require_path<'a>(value: Option<&'a PathBuf>, flag: &str) -> HarnessResult<&'a PathBuf> {
     value.ok_or_else(|| {
         HarnessError::Io(std::io::Error::other(format!(
@@ -612,31 +622,31 @@ fn require_path<'a>(value: Option<&'a PathBuf>, flag: &str) -> HarnessResult<&'a
     })
 }
 
-/// Rakentaa **kaatumiskestävän** ajoympäristön hyväksyntäpolulle: durable pending
-/// (Wire) + durable task queue + kaatumiskestävä dispatch-outbox.
+/// Builds the **crash-safe** runtime for the approval path: durable pending
+/// (Wire) + durable task queue + crash-safe dispatch outbox.
 ///
-/// Tämä on se kokoonpano jonka ansiosta tuore prosessi voi ladata odottavan
-/// hyväksynnän levyltä ([`ActionRuntime::with_durable_stores`]) ja
-/// uudelleenhyväksyä SAMAN `ApprovalId`:n at-most-once-suojan alla
-/// (`approval-{id}`-avain). Crash-vaiheissa outbox kääritään
-/// [`CrashAfterIntentOutbox`]:iin (intent- tai committed-ikkuna ympäristömuuttujan
-/// mukaan); resume-vaiheessa käytetään suoraa [`JournalDispatchOutbox`]:a.
+/// This is the configuration that lets a fresh process load the pending
+/// approval from disk ([`ActionRuntime::with_durable_stores`]) and re-approve
+/// the SAME `ApprovalId` under at-most-once protection (the `approval-{id}`
+/// key). In crash phases the outbox is wrapped in [`CrashAfterIntentOutbox`]
+/// (intent or committed window depending on the environment variable); in the
+/// resume phase the plain [`JournalDispatchOutbox`] is used.
 async fn build_approval_runtime(args: &RunArgs) -> HarnessResult<ActionRuntime> {
     let pending = require_path(args.pending.as_ref(), "--pending")?;
     let task_queue = require_path(args.task_queue.as_ref(), "--task-queue")?;
 
-    // `with_durable_stores` avaa nyt itse kaatumiskestävän journal-outboxin
-    // annetusta polusta (`args.outbox`), joten resume-vaihe saa kaatumiskestävän
-    // outboxin SUORAAN ilman erillistä avausta tai ketjutusta.
+    // `with_durable_stores` now itself opens the crash-safe journal outbox from
+    // the given path (`args.outbox`), so the resume phase gets the crash-safe
+    // outbox DIRECTLY without a separate open or chaining.
     let mut runtime = ActionRuntime::with_durable_stores(pending, task_queue, &args.outbox).await?;
 
-    // Crash-vaiheet tarvitsevat kaatumiskoukulla KÄÄRITYN outboxin (abortoi
-    // record_committed:n ympärillä). Konstruktorin oletus-outbox ei voi tehdä
-    // tätä, joten korvaa se nimenomaisesti `with_dispatch_outbox`:lla — tämä on
-    // juuri se erikoistapaus jota varten override-koukku on olemassa. Outbox
-    // avataan toisen kerran SAMASTA polusta, mutta journal on idempotentti
-    // append-only-loki (ei truncate), joten kaksoisavaus on harmiton; tämä on
-    // testibinääri eikä tuotantopolku (build_family/gateway eivät kaksoisavaa).
+    // Crash phases need the outbox WRAPPED with the crash hook (aborts around
+    // record_committed). The constructor's default outbox can't do this, so
+    // replace it explicitly with `with_dispatch_outbox` — this is exactly the
+    // special case the override hook exists for. The outbox is opened a second
+    // time from the SAME path, but the journal is an idempotent append-only
+    // log (no truncate), so the double-open is harmless; this is a test binary,
+    // not a production path (build_family/gateway do not double-open).
     if matches!(
         args.phase,
         Phase::ApproveCrashIntent | Phase::ApproveCrashCommitted
@@ -650,7 +660,7 @@ async fn build_approval_runtime(args: &RunArgs) -> HarnessResult<ActionRuntime> 
     Ok(runtime)
 }
 
-/// Ajaa lähetyksen valitulla polulla (vanha vs uusi).
+/// Runs the dispatch on the selected path (old vs new).
 async fn dispatch(
     runtime: &mut ActionRuntime,
     args: &RunArgs,
@@ -658,16 +668,16 @@ async fn dispatch(
 ) -> familyclaw_actions::Result<SubmitOutcome> {
     let payload = serde_json::json!({ "n": 1 });
     match args.mode {
-        // VANHA polku: suora `submit_task_as` ilman idempotenssi-avainta. Tämä on
-        // koodi joka oli ennen korjausta — sillä EI ole outbox-suojaa, joten
-        // re-drive kaatumisen jälkeen ajaa sivuvaikutuksen uudelleen.
+        // OLD path: direct `submit_task_as` without an idempotency key. This is
+        // the code that existed before the fix — it has NO outbox protection,
+        // so a re-drive after a crash re-runs the side effect.
         Mode::Old => {
             runtime
                 .submit_task_as("agent_a", CountingExecutor::skill_id(), payload, now)
                 .await
         }
-        // UUSI polku: idempotentti lähetys vakaalla avaimella. Outbox palauttaa
-        // committed-lopputuloksen ajamatta sivuvaikutusta uudelleen.
+        // NEW path: idempotent dispatch with a stable key. The outbox returns
+        // the committed outcome without re-running the side effect.
         Mode::New => {
             runtime
                 .submit_task_idempotent(
@@ -685,8 +695,8 @@ async fn dispatch(
 async fn run_phase(args: RunArgs) -> HarnessResult<()> {
     let now = time::parse_rfc3339(&args.clock)?;
 
-    // Hyväksyntäpolun vaiheet käyttävät eri (kaatumiskestävää) kokoonpanoa ja
-    // erillistä taitoa → eroteta ne ENNEN submit-polun ajoympäristön rakennusta.
+    // Approval-path phases use a different (crash-safe) configuration and a
+    // separate skill → branch them off BEFORE building the submit-path runtime.
     if matches!(
         args.phase,
         Phase::ApproveCrashIntent | Phase::ApproveCrashCommitted | Phase::ApproveResume
@@ -698,27 +708,29 @@ async fn run_phase(args: RunArgs) -> HarnessResult<()> {
 
     match args.phase {
         Phase::ApproveCrashIntent | Phase::ApproveCrashCommitted | Phase::ApproveResume => {
-            // Nämä haarautuivat jo `run_approval_phase`:een yllä; tänne ei pitäisi
-            // koskaan päästä. Epäonnistu äänekkäästi panikoimatta.
+            // These already branched off to `run_approval_phase` above; this
+            // point should never be reached. Fail loudly rather than panicking.
             Err(HarnessError::Io(std::io::Error::other(
                 "approval phase reached submit-path match — internal routing error",
             )))
         }
         Phase::Crash => {
-            // COMMITTED-ikkuna. Lähetys ajetaan kokonaan (intent + sivuvaikutus +
-            // committed). Kirjaa lopputulos arvo-identtisyyden vertailuun ja poistu
-            // 137 ENNEN kuin agentti ehtisi journaloida dispatch-rivin.
+            // COMMITTED window. The dispatch runs to completion (intent + side
+            // effect + committed). Record the outcome for value-identity
+            // comparison and exit 137 BEFORE the agent gets a chance to journal
+            // the dispatch row.
             let outcome = dispatch(&mut runtime, &args, now).await?;
             write_outcome(&args.outcome_out, &outcome)?;
             eprintln!("crash injected: after committed, before dispatch journal append");
             std::process::exit(CRASH_EXIT_CODE);
         }
         Phase::CrashIntent => {
-            // INTENT-ONLY-ikkuna. `dispatch` ei koskaan palaa: kaatumiskoukku
-            // abortoi prosessin `record_committed`:n alussa — record_intent on jo
-            // levyllä ja sivuvaikutus on jo lauennut. Jos koukku EI ole aseistettu
-            // (ympäristömuuttuja puuttuu), tämä on ohjelmointivirhe — älä jätä
-            // hiljaa "onnistumaan" vaan epäonnistu äänekkäästi.
+            // INTENT-ONLY window. `dispatch` never returns: the crash hook
+            // aborts the process at the start of `record_committed` —
+            // record_intent is already on disk and the side effect has already
+            // fired. If the hook is NOT armed (the environment variable is
+            // missing), this is a programming error — don't silently "succeed",
+            // fail loudly.
             let _ = dispatch(&mut runtime, &args, now).await?;
             Err(HarnessError::Io(std::io::Error::other(
                 "crash_intent phase returned without aborting — \
@@ -726,9 +738,9 @@ async fn run_phase(args: RunArgs) -> HarnessResult<()> {
             )))
         }
         Phase::Resume => {
-            // COMMITTED-ikkunan jälkeen: agentin tuore-haaran uudelleenajo
-            // (journal-riviä ei ole, koska kaatuminen esti sen). `new`-moodissa
-            // outbox neutraloi sen; `old`-moodissa sivuvaikutus tapahtuu toistamiseen.
+            // After the COMMITTED window: re-run of the agent's fresh-run branch
+            // (no journal row, since the crash prevented it). In `new` mode the
+            // outbox neutralizes it; in `old` mode the side effect happens again.
             let outcome = dispatch(&mut runtime, &args, now).await?;
             let before = read_outcome(&args.outcome_out);
             let now_record = OutcomeRecord::from_submit(&outcome);
@@ -746,17 +758,18 @@ async fn run_phase(args: RunArgs) -> HarnessResult<()> {
             Ok(())
         }
         Phase::ResumeIntent => {
-            // INTENT-ONLY-ikkunan jälkeen: aja SAMA lähetys samalla avaimella.
-            // Outbox-lookup näkee intentin ilman committedia → InProgress →
-            // submit_task_idempotent palauttaa PolicyDenied fail-closed. ÄLÄ aja
-            // sivuvaikutusta uudelleen. Tämä on at-most-once-takuun ydin.
+            // After the INTENT-ONLY window: run the SAME dispatch with the same
+            // key. The outbox lookup sees the intent without a committed →
+            // InProgress → submit_task_idempotent returns PolicyDenied
+            // fail-closed. Do NOT re-run the side effect. This is the core of
+            // the at-most-once guarantee.
             let dispatch_result = dispatch(&mut runtime, &args, now).await;
             let policy_denied = matches!(dispatch_result, Err(ActionError::PolicyDenied(_)));
             let denied_message = match &dispatch_result {
                 Err(ActionError::PolicyDenied(msg)) => Some(msg.clone()),
                 _ => None,
             };
-            // Tulosta yhden rivin RESULT-JSON harnessille (laskuri MUST pysyä 1:ssä).
+            // Print a single-line RESULT JSON for the harness (counter MUST stay at 1).
             let result = serde_json::json!({
                 "side_effect_count": read_counter(&args.counter),
                 "policy_denied": policy_denied,
@@ -768,15 +781,16 @@ async fn run_phase(args: RunArgs) -> HarnessResult<()> {
             Ok(())
         }
         Phase::ResumeContinuationCrash => {
-            // JATKON LÄHETYS, INTENT-ONLY-ikkuna. Identtinen `CrashIntent`:n kanssa
-            // PAITSI että idempotenssi-avain on `resume-{approval_id}-dispatch-{k}`
-            // (annetaan `--key`:llä), eikä `turn-*`. Tämä on tasan se avain jonka
-            // tuotannon `drive_tool_loop` rakentaa hyväksynnän myöntämisen JÄLKEEN
-            // (prefiksistä `resume-{approval_id}` + juokseva lähetysindeksi).
-            // `dispatch` ei koskaan palaa: kaatumiskoukku abortoi prosessin
-            // `record_committed`:n alussa — `record_intent` on jo levyllä ja
-            // sivuvaikutus on jo lauennut. Jos koukku EI ole aseistettu, se on
-            // ohjelmointivirhe → epäonnistu äänekkäästi.
+            // CONTINUATION DISPATCH, INTENT-ONLY window. Identical to
+            // `CrashIntent` EXCEPT that the idempotency key is
+            // `resume-{approval_id}-dispatch-{k}` (supplied via `--key`),
+            // instead of `turn-*`. This is exactly the key that production's
+            // `drive_tool_loop` builds AFTER an approval is granted (from the
+            // prefix `resume-{approval_id}` + a running dispatch index).
+            // `dispatch` never returns: the crash hook aborts the process at
+            // the start of `record_committed` — `record_intent` is already on
+            // disk and the side effect has already fired. If the hook is NOT
+            // armed, that's a programming error → fail loudly.
             assert_resume_key_shape(&args.key)?;
             let _ = dispatch(&mut runtime, &args, now).await?;
             Err(HarnessError::Io(std::io::Error::other(
@@ -785,11 +799,12 @@ async fn run_phase(args: RunArgs) -> HarnessResult<()> {
             )))
         }
         Phase::ResumeContinuationResume => {
-            // JATKON LÄHETYS, INTENT-ONLY-ikkunan jälkeen: tuore prosessi ajaa
-            // SAMAN jatkon lähetyksen SAMALLA `resume-*-dispatch-*`-avaimella.
-            // Outbox-lookup näkee intentin ilman committedia → InProgress →
-            // submit_task_idempotent palauttaa PolicyDenied fail-closed. Sivuvaikutus
-            // EI aja uudelleen → at-most-once jatkon lähetysavaimelle.
+            // CONTINUATION DISPATCH, after the INTENT-ONLY window: a fresh
+            // process runs the SAME continuation dispatch with the SAME
+            // `resume-*-dispatch-*` key. The outbox lookup sees the intent
+            // without a committed → InProgress → submit_task_idempotent
+            // returns PolicyDenied fail-closed. The side effect does NOT
+            // re-run → at-most-once for the continuation dispatch key.
             assert_resume_key_shape(&args.key)?;
             let dispatch_result = dispatch(&mut runtime, &args, now).await;
             let policy_denied = matches!(dispatch_result, Err(ActionError::PolicyDenied(_)));
@@ -811,13 +826,14 @@ async fn run_phase(args: RunArgs) -> HarnessResult<()> {
     }
 }
 
-/// Varmistaa että jatkon lähetysavain on muotoa `resume-{id}-dispatch-{k}`.
+/// Ensures that the continuation dispatch key has the shape
+/// `resume-{id}-dispatch-{k}`.
 ///
-/// Tämä on sama avain-muoto jonka tuotannon `drive_tool_loop` muodostaa
-/// hyväksynnän myöntämisen JÄLKEEN (prefiksistä `resume-{approval_id}` +
-/// `-dispatch-{k}`). Vartija pitää red-team-vaiheet rehellisinä: jos avain ei
-/// noudata muotoa, todiste ei koskisi jatkon lähetysavainta — epäonnistu
-/// äänekkäästi panikoimatta.
+/// This is the same key shape that production's `drive_tool_loop` builds
+/// AFTER an approval is granted (from the prefix `resume-{approval_id}` +
+/// `-dispatch-{k}`). This guard keeps the red-team phases honest: if the key
+/// doesn't follow the shape, the proof wouldn't actually apply to the
+/// continuation dispatch key — fail loudly rather than silently.
 fn assert_resume_key_shape(key: &str) -> HarnessResult<()> {
     if key.starts_with("resume-") && key.contains("-dispatch-") {
         return Ok(());
@@ -829,26 +845,27 @@ fn assert_resume_key_shape(key: &str) -> HarnessResult<()> {
     ))))
 }
 
-/// Ajaa **hyväksyntäpolun** vaiheet aidon prosessirajan yli.
+/// Runs the **approval path** phases across a real process boundary.
 ///
-/// Kaikki kolme vaihetta jakavat saman kaatumiskestävän kokoonpanon
+/// All three phases share the same crash-safe configuration
 /// ([`build_approval_runtime`]): durable pending (Wire) + durable task queue +
-/// kaatumiskestävä dispatch-outbox. Idempotenssi-avain on `approval-{id}` (EI
+/// crash-safe dispatch outbox. The idempotency key is `approval-{id}` (NOT
 /// `turn-*`).
 ///
-/// - `approve_crash_intent` / `approve_crash_committed`: lähetä hyväksyntää
-///   vaativa tehtävä, kirjaa `ApprovalId` + lopputulos levylle, sitten `approve()`
-///   aseistetulla koukulla → prosessi abortoi `record_committed`:n ympärillä
-///   (intent- tai committed-ikkuna) ja poistuu 137.
-/// - `approve_resume`: lataa odottava hyväksyntä durable-pinnalta, poimi SAMA
-///   `ApprovalId` ja uudelleenhyväksy se. Tulosta yhden rivin RESULT-JSON.
+/// - `approve_crash_intent` / `approve_crash_committed`: dispatch a task
+///   requiring approval, record the `ApprovalId` + outcome to disk, then call
+///   `approve()` with the hook armed → the process aborts around
+///   `record_committed` (intent or committed window) and exits 137.
+/// - `approve_resume`: load the pending approval from the durable surface,
+///   pick up the SAME `ApprovalId` and re-approve it. Print a single-line
+///   RESULT JSON.
 async fn run_approval_phase(args: RunArgs, now: Timestamp) -> HarnessResult<()> {
     let mut runtime = build_approval_runtime(&args).await?;
 
     match args.phase {
         Phase::ApproveCrashIntent | Phase::ApproveCrashCommitted => {
-            // 1) Lähetä hyväksyntää vaativa tehtävä (WriteExternal → NeedsApproval).
-            //    Sivuvaikutus EI vielä laukea — se odottaa hyväksyntää.
+            // 1) Dispatch a task requiring approval (WriteExternal → NeedsApproval).
+            //    The side effect does NOT fire yet — it waits for approval.
             let submitted = runtime
                 .submit_task_as(
                     "agent_a",
@@ -863,23 +880,25 @@ async fn run_approval_phase(args: RunArgs, now: Timestamp) -> HarnessResult<()> 
                      (odotettiin NeedsApproval)",
                 ))
             })?;
-            // Kirjaa lopputulos + ApprovalId levylle: resume-vaihe vertaa tähän
-            // (arvo-identtisyys) ja varmistaa että SAMA hyväksyntä ladattiin.
+            // Record the outcome + ApprovalId to disk: the resume phase compares
+            // against this (value identity) and verifies that the SAME approval
+            // was loaded.
             write_outcome(&args.outcome_out, &submitted)?;
 
-            // 2) Hyväksy → run_after_approval ajaa sivuvaikutuksen (laskuri = 1),
-            //    record_intent fsyncataan, sitten kaatumiskoukku abortoi
-            //    record_committed:n ympärillä. `approve` ei palaa normaalisti.
+            // 2) Approve → run_after_approval runs the side effect (counter = 1),
+            //    record_intent is fsynced, then the crash hook aborts around
+            //    record_committed. `approve` doesn't return normally.
             let _ = runtime.approve(approval_id, now).await?;
-            // Jos koukku EI ollut aseistettu, tänne päästään → ohjelmointivirhe.
+            // If the hook was NOT armed, execution reaches here → programming error.
             Err(HarnessError::Io(std::io::Error::other(
                 "approve crash phase returned without aborting — is \
                  FAMILYCLAW_REDTEAM_CRASH_AFTER_INTENT / _AFTER_COMMITTED=1 set?",
             )))
         }
         Phase::ApproveResume => {
-            // Lataa odottava hyväksyntä durable-pinnalta (Wire-vaihe): tämä on se
-            // kohta jossa SAMA ApprovalId rekonstruoidaan levyltä uudessa prosessissa.
+            // Load the pending approval from the durable surface (Wire stage):
+            // this is the point where the SAME ApprovalId is reconstructed from
+            // disk in the new process.
             let pending = runtime.try_pending_approvals()?;
             let approval_id = pending.first().map(|p| p.approval_id).ok_or_else(|| {
                 HarnessError::Io(std::io::Error::other(
@@ -888,9 +907,9 @@ async fn run_approval_phase(args: RunArgs, now: Timestamp) -> HarnessResult<()> 
                 ))
             })?;
 
-            // Uudelleenhyväksy SAMA ApprovalId → outbox-avain approval-{id}.
-            // Intent-only-kaatumisen jälkeen: InProgress → PolicyDenied.
-            // Committed-kaatumisen jälkeen: Committed → arvo-identtinen lopputulos.
+            // Re-approve the SAME ApprovalId → outbox key approval-{id}.
+            // After an intent-only crash: InProgress → PolicyDenied.
+            // After a committed crash: Committed → value-identical outcome.
             let approve_result = runtime.approve(approval_id, now).await;
             let policy_denied = matches!(approve_result, Err(ActionError::PolicyDenied(_)));
             let denied_message = match &approve_result {
@@ -898,7 +917,8 @@ async fn run_approval_phase(args: RunArgs, now: Timestamp) -> HarnessResult<()> 
                 _ => None,
             };
 
-            // Arvo-identtisyys committed-ikkunalle: vertaa kaatuneeseen lopputulokseen.
+            // Value identity for the committed window: compare against the
+            // outcome recorded before the crash.
             let before = read_outcome(&args.outcome_out);
             let resumed = approve_result.as_ref().ok().map(OutcomeRecord::from_submit);
             let value_identical = match (&before, &resumed) {
@@ -919,8 +939,8 @@ async fn run_approval_phase(args: RunArgs, now: Timestamp) -> HarnessResult<()> 
             std::io::stdout().flush()?;
             Ok(())
         }
-        // Submit- ja jatkopolun vaiheet eivät koskaan päädy tänne (haaroitettu
-        // run_phase:ssa).
+        // Submit and continuation path phases never end up here (already
+        // branched off in run_phase).
         Phase::Crash
         | Phase::CrashIntent
         | Phase::Resume
@@ -932,20 +952,20 @@ async fn run_approval_phase(args: RunArgs, now: Timestamp) -> HarnessResult<()> 
     }
 }
 
-/// Kirjoittaa lopputuloksen levylle (arvo-identtisyyden todiste).
+/// Writes the outcome to disk (proof of value identity).
 fn write_outcome(path: &Path, outcome: &SubmitOutcome) -> HarnessResult<()> {
     let record = OutcomeRecord::from_submit(outcome);
     std::fs::write(path, serde_json::to_string(&record)?)?;
     Ok(())
 }
 
-/// Lukee aiemmin kirjatun lopputuloksen (jos on).
+/// Reads a previously recorded outcome (if any).
 fn read_outcome(path: &Path) -> Option<OutcomeRecord> {
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
-/// Lukee sivuvaikutuslaskurin raakana (0 jos tiedostoa ei ole).
+/// Reads the side-effect counter raw (0 if the file doesn't exist).
 fn read_counter(path: &Path) -> u64 {
     std::fs::read_to_string(path)
         .ok()

@@ -29,7 +29,7 @@ Requires Python 3.13 (tested on 3.13.5). No API key, no LLM, no network at run t
 the graph is a fixed deterministic script, so every run is byte-reproducible.
 
 ```bash
-git clone https://github.com/<your-org>/familyclaw.git
+git clone https://github.com/Sisuthros/familyclaw.git
 cd familyclaw/bench-competitors/langgraph
 
 # 1. Create a throwaway venv and install the two pinned packages.

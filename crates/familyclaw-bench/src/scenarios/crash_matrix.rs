@@ -1,29 +1,29 @@
-//! S1 Crash Matrix — durable-replay-jatkuvuuden adversariaalinen todiste.
+//! S1 Crash Matrix — an adversarial proof of durable-replay continuity.
 //!
-//! Tämä skenaario (design §3 S1) ajaa kiinteän monivaiheisen tehtävän
-//! [`Subject`]:lla, **tappaa sen** jokaisessa kaatumispisteessä erikseen,
-//! käynnistää uudelleen, ja todistaa kolme asiaa:
+//! This scenario (design §3 S1) runs a fixed multi-step task on a
+//! [`Subject`], **kills it** at each crash point in turn, restarts, and
+//! proves three things:
 //!
-//! 1. **resume-oikeellisuus** — työkuorma jatkuu täsmälleen seuraavasta
-//!    askelesta (ei alusta, ei keskeltä väärin).
-//! 2. **sivuvaikutus täsmälleen kerran** — replay ei aja sivuvaikutuksia
-//!    uudelleen (tämä on durable-substraatin ydinlupaus).
-//! 3. **lopputulos == kaatumaton perustaso** — kaatuneen ajon lopputila on
-//!    identtinen kaatumattoman baseline-ajon kanssa.
+//! 1. **resume correctness** — the workload continues from exactly the next
+//!    step (not from scratch, not incorrectly from the middle).
+//! 2. **side effect exactly once** — replay does not re-run side effects
+//!    (this is the durable substrate's core promise).
+//! 3. **result == crash-free baseline** — the crashed run's end state is
+//!    identical to a crash-free baseline run.
 //!
-//! Kilpailijat menettävät käynnissä olevan työn juuri näissä pisteissä —
-//! tämä skenaario tekee siitä mitattavan ja reprodusoitavan.
+//! Competitors lose in-flight work at exactly these points — this scenario
+//! makes that measurable and reproducible.
 //!
-//! ## Kaatumispisteet (design §3 S1)
-//! - [`CrashPoint::BeforeWrite`] — askel ei ehtinyt journaliin.
-//! - [`CrashPoint::MidWrite`] — viimeinen rivi katkeaa (torn line).
-//! - [`CrashPoint::MidReplay`] — kaatuminen kesken replayn (jatketaan jatkamista).
-//! - [`CrashPoint::CorruptedJournal`] — ei-viimeinen rivi korruptoitui.
+//! ## Crash points (design §3 S1)
+//! - [`CrashPoint::BeforeWrite`] — the step never reached the journal.
+//! - [`CrashPoint::MidWrite`] — the last line is torn (torn line).
+//! - [`CrashPoint::MidReplay`] — crash mid-replay (resuming the resume).
+//! - [`CrashPoint::CorruptedJournal`] — a non-final line got corrupted.
 //!
-//! ## Reprodusoitavuus
-//! Kello [`Timestamp`] on injektoitu — järjestelmäkelloa ei lueta. Tehtävän
-//! askeleet ovat kiinteä deterministinen skripti, joten sama subject + sama
-//! kello → identtinen tulos joka ajolla (design §2.2).
+//! ## Reproducibility
+//! The clock [`Timestamp`] is injected — the system clock is never read. The
+//! task's steps are a fixed deterministic script, so the same subject + same
+//! clock → identical result on every run (design §2.2).
 
 use async_trait::async_trait;
 
@@ -34,10 +34,10 @@ use crate::metrics;
 use crate::scenario::{Scenario, ScenarioResult};
 use crate::subject::{CrashPoint, RestartReport, Subject, Task};
 
-/// Kiinteät kaatumispisteet jotka skenaario käy läpi järjestyksessä.
+/// The fixed crash points the scenario walks through in order.
 ///
-/// [`CrashPoint::Clean`] EI ole tässä listassa — se ajetaan erikseen
-/// kaatumattomana perustasona (baseline), ei adversariaalisena pisteenä.
+/// [`CrashPoint::Clean`] is NOT in this list — it is run separately as the
+/// crash-free baseline, not as an adversarial point.
 const CRASH_POINTS: [CrashPoint; 4] = [
     CrashPoint::BeforeWrite,
     CrashPoint::MidWrite,
@@ -45,29 +45,29 @@ const CRASH_POINTS: [CrashPoint; 4] = [
     CrashPoint::CorruptedJournal,
 ];
 
-/// Skenaariossa ajettavan kiinteän tehtävän askelten määrä.
+/// Number of steps in the fixed task run by the scenario.
 ///
-/// Pidetään pienenä mutta > 1, jotta "jatka seuraavasta askelesta" on
-/// mielekäs väite (yhden askelen tehtävä ei voi osoittaa keskeltä jatkamista).
+/// Kept small but > 1, so that "continue from the next step" is a meaningful
+/// claim (a single-step task cannot demonstrate resuming from the middle).
 const TASK_STEPS: usize = 5;
 
-/// S1 Crash Matrix -skenaario.
+/// S1 Crash Matrix scenario.
 ///
-/// Ajaa saman monivaiheisen tehtävän jokaisessa kaatumispisteessä ja
-/// vertaa lopputulosta kaatumattomaan perustasoon.
+/// Runs the same multi-step task at each crash point and compares the result
+/// to a crash-free baseline.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CrashMatrix;
 
 impl CrashMatrix {
-    /// Rakentaa uuden Crash Matrix -skenaarion.
+    /// Builds a new Crash Matrix scenario.
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 
-    /// Rakentaa skenaarion käyttämän kiinteän monivaiheisen tehtävän.
+    /// Builds the fixed multi-step task used by the scenario.
     ///
-    /// Deterministinen: sama `id` ja samat askeleet joka ajolla.
+    /// Deterministic: same `id` and same steps on every run.
     fn task() -> Task {
         let steps: Vec<String> = (0..TASK_STEPS).map(|i| format!("step-{i}")).collect();
         Task::new(
@@ -77,28 +77,29 @@ impl CrashMatrix {
         )
     }
 
-    /// Ajaa kaatumattoman perustason: käynnistä tehtävä, käynnistä uudelleen
-    /// ilman kaatumista, ja palauta restart-raportti vertailua varten.
+    /// Runs the crash-free baseline: start the task, restart without
+    /// crashing, and return the restart report for comparison.
     async fn baseline_run(
         subject: &mut dyn Subject,
         task: &Task,
         clock: Timestamp,
     ) -> Result<RestartReport> {
         let _handle = subject.start_task(task, clock).await?;
-        // Ei kill-kutsua — puhdas pysäytys ([`CrashPoint::Clean`] semantiikka).
-        // Subject käynnistyy uudelleen ja raportoi kaatumattoman lopputilan.
+        // No kill call — a clean stop ([`CrashPoint::Clean`] semantics).
+        // The subject restarts and reports the crash-free end state.
         let report = subject.restart(clock).await?;
         Ok(report)
     }
 
-    /// Ajaa yhden kaatumispisteen: käynnistä tehtävä, tapa pisteessä,
-    /// käynnistä uudelleen, palauta restart-tulos.
+    /// Runs a single crash point: start the task, kill it at the point,
+    /// restart, and return the restart outcome.
     ///
-    /// Korruptoidulla journalilla `restart` **kieltäytyy äänekkäästi** (durable-
-    /// substraatti palauttaa virheen sen sijaan että jatkaisi väärään tilaan).
-    /// Tämä on oikea jatkuvuustakuu (design §3 S1: "loud, never silently
-    /// wrong"), joten virhe käännetään hallituksi [`CrashRunOutcome::LoudRefusal`]
-    /// -tulokseksi nimenomaan korruptiopisteessä — ei harness-fataaliksi.
+    /// With a corrupted journal, `restart` **refuses loudly** (the durable
+    /// substrate returns an error instead of continuing into the wrong
+    /// state). This is the correct continuity guarantee (design §3 S1: "loud,
+    /// never silently wrong"), so the error is converted into a controlled
+    /// [`CrashRunOutcome::LoudRefusal`] result specifically at the corruption
+    /// point — not into a harness fatal.
     async fn crash_run(
         subject: &mut dyn Subject,
         task: &Task,
@@ -109,9 +110,10 @@ impl CrashMatrix {
         subject.kill(&handle, point).await?;
         match subject.restart(clock).await {
             Ok(report) => Ok(CrashRunOutcome::Resumed(report)),
-            // Korruptiopisteessä äänekäs kieltäytyminen ON oikea lopputulos:
-            // mikään sivuvaikutus ei ajautunut uudelleen eikä tilaa korruptoitu
-            // hiljaa. Muissa pisteissä virhe on aito vika → propagoi.
+            // At the corruption point, a loud refusal IS the correct outcome:
+            // no side effect got re-executed and no state was silently
+            // corrupted. At other points, an error is a genuine bug →
+            // propagate it.
             Err(err) if point == CrashPoint::CorruptedJournal => {
                 Ok(CrashRunOutcome::LoudRefusal(err.to_string()))
             }
@@ -120,38 +122,40 @@ impl CrashMatrix {
     }
 }
 
-/// Yhden kaatumispisteen `restart`-tulos: joko subjekti jatkoi (raportti) tai
-/// kieltäytyi äänekkäästi (korruptiopisteen oikea lopputulos).
+/// A single crash point's `restart` outcome: either the subject resumed (with
+/// a report) or refused loudly (the correct outcome at the corruption point).
 enum CrashRunOutcome {
-    /// Subjekti jatkoi ja raportoi lopputilan.
+    /// The subject resumed and reported the end state.
     Resumed(RestartReport),
-    /// Subjekti kieltäytyi äänekkäästi (durable-virhe) — korruptiopisteen win.
+    /// The subject refused loudly (durable error) — a win at the corruption point.
     LoudRefusal(String),
 }
 
-/// Yhden kaatumispisteen arvioinnin tulos sisäiseen aggregointiin.
+/// A single crash point's assessment result, for internal aggregation.
 struct PointAssessment {
-    /// Jatkuiko työkuorma oikein tästä pisteestä (sivuvaikutukset huomioiden).
+    /// Whether the workload resumed correctly from this point (accounting
+    /// for side effects).
     resumed_correctly: bool,
-    /// Kuinka monta ylimääräistä sivuvaikutusta replay ajoi (tavoite 0).
+    /// How many extra side effects replay ran (target 0).
     side_effect_overcount: usize,
-    /// Vastasiko lopputila kaatumatonta perustasoa.
+    /// Whether the end state matched the crash-free baseline.
     matches_baseline: bool,
 }
 
-/// Arvioi yksittäisen kaatumispisteen raportin perustasoa vasten.
+/// Assesses a single crash point's report against the baseline.
 ///
-/// `expected_steps` on tehtävän askelten määrä; `correctly_resumed` lasketaan
-/// raportista. Resume on oikein kun replay-tilasta palauduttiin puhtaaseen
-/// lopputilaan ilman ylimääräisiä sivuvaikutuksia.
+/// `expected_steps` is the number of steps in the task; `correctly_resumed`
+/// is computed from the report. Resume is correct when it recovered from the
+/// replay state to a clean end state with no extra side effects.
 fn assess_point(report: &RestartReport, baseline: &RestartReport) -> PointAssessment {
     let side_effect_overcount = report.side_effects_reexecuted;
-    // Resume on oikein vain jos: päästiin puhtaaseen lopputilaan JA yksikään
-    // sivuvaikutus ei ajautunut uudelleen.
+    // Resume is correct only if: it reached a clean end state AND no side
+    // effect was re-executed.
     let resumed_correctly = report.resumed_clean && side_effect_overcount == 0;
-    // Lopputulos vastaa baselinea kun molemmat saavuttivat puhtaan lopputilan.
-    // (RestartReport sisältää lopputilan eheyden `resumed_clean`-lipun kautta;
-    // baseline on aina puhdas, joten vertailu on baseline.resumed_clean-ankkuroitu.)
+    // The result matches the baseline when both reached a clean end state.
+    // (RestartReport captures end-state integrity via the `resumed_clean`
+    // flag; the baseline is always clean, so the comparison is anchored on
+    // baseline.resumed_clean.)
     let matches_baseline = report.resumed_clean == baseline.resumed_clean && baseline.resumed_clean;
     PointAssessment {
         resumed_correctly,
@@ -162,8 +166,8 @@ fn assess_point(report: &RestartReport, baseline: &RestartReport) -> PointAssess
 
 #[async_trait]
 impl Scenario for CrashMatrix {
-    // Trait-allekirjoitus vaatii `&str`; literaali on aina `'static`, joten
-    // clippyn `&'static str`-ehdotus ei sovi tähän toteutukseen.
+    // Trait signature requires `&str`; the literal is always `'static`, so
+    // clippy's `&'static str` suggestion doesn't fit this implementation.
     #[allow(clippy::unnecessary_literal_bound)]
     fn id(&self) -> &str {
         "s1_crash_matrix"
@@ -178,7 +182,7 @@ impl Scenario for CrashMatrix {
             ));
         }
 
-        // 1) Kaatumaton perustaso vertailua varten.
+        // 1) Crash-free baseline for comparison.
         let baseline = Self::baseline_run(subject, &task, clock).await?;
 
         let mut result = ScenarioResult::new(self.id(), false).with_note(format!(
@@ -186,7 +190,7 @@ impl Scenario for CrashMatrix {
             baseline.steps_replayed, baseline.resumed_clean
         ));
 
-        // 2) Käy jokainen kaatumispiste läpi ja kerää arviot.
+        // 2) Walk through every crash point and collect assessments.
         let mut correctly_resumed_points: usize = 0;
         let mut total_overcount: usize = 0;
         let mut all_match_baseline = true;
@@ -210,11 +214,11 @@ impl Scenario for CrashMatrix {
                     (assessment, note)
                 }
                 CrashRunOutcome::LoudRefusal(err) => {
-                    // Äänekäs kieltäytyminen korruptiopisteessä = oikea lopputulos:
-                    // ei uudelleen ajettuja sivuvaikutuksia, ei hiljaista
-                    // korruptiota. Tämä lasketaan oikein-jatkuneeksi pisteeksi ja
-                    // baseline-yhteensopivaksi (lopputila ei poikennut väärään
-                    // suuntaan — se kieltäytyi kuten kuuluu).
+                    // A loud refusal at the corruption point = the correct
+                    // outcome: no side effects re-executed, no silent
+                    // corruption. This counts as a correctly resumed point
+                    // and as baseline-matching (the end state did not diverge
+                    // in the wrong direction — it refused as it should).
                     let assessment = PointAssessment {
                         resumed_correctly: true,
                         side_effect_overcount: 0,
@@ -234,27 +238,28 @@ impl Scenario for CrashMatrix {
             result = result.with_note(note);
         }
 
-        // 3) Mittarit (design §3 S1).
+        // 3) Metrics (design §3 S1).
         //
-        // resume_correctness: 1.0 vain jos KAIKKI pisteet jatkuivat oikein.
-        // Mallinnetaan metrics::resume_correctness-funktiolla jossa "askeleet"
-        // ovat kaatumispisteet: expected = CRASH_POINTS.len(), correctly_resumed
-        // = oikein jatkuneiden pisteiden määrä, side_effects = kokonaisylityö.
-        // (Mikä tahansa uudelleen ajettu sivuvaikutus pakottaa tuloksen nollaan.)
+        // resume_correctness: 1.0 only if ALL points resumed correctly.
+        // Modeled with the metrics::resume_correctness function where
+        // "steps" are the crash points: expected = CRASH_POINTS.len(),
+        // correctly_resumed = number of correctly resumed points,
+        // side_effects = total overcount. (Any re-executed side effect
+        // forces the result to zero.)
         let resume_score = metrics::resume_correctness(
             CRASH_POINTS.len(),
             correctly_resumed_points,
             total_overcount,
         )?;
 
-        // side_effect_overcount: sivuvaikutusten kokonaisylitys (tavoite 0).
+        // side_effect_overcount: total side-effect overcount (target 0).
         let overcount_metric = f64::from(u32::try_from(total_overcount).unwrap_or(u32::MAX));
 
-        // result_matches_baseline: 1.0 jos jokaisen kaatuneen ajon lopputila
-        // vastaa kaatumatonta perustasoa.
+        // result_matches_baseline: 1.0 if every crashed run's end state
+        // matches the crash-free baseline.
         let matches_metric = if all_match_baseline { 1.0 } else { 0.0 };
 
-        // passed = kaikki kolme täydellisiä.
+        // passed = all three are perfect.
         let passed =
             (resume_score - 1.0).abs() < f64::EPSILON && total_overcount == 0 && all_match_baseline;
 
@@ -268,19 +273,19 @@ impl Scenario for CrashMatrix {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)] // Vakiot 0.0/1.0 ovat tarkkoja float-arvoja testeissä.
-#[allow(clippy::unnecessary_literal_bound)] // Trait-stubin `name(&self) -> &str` vaatii `&str`.
+#[allow(clippy::float_cmp)] // Constants 0.0/1.0 are exact float values in these tests.
+#[allow(clippy::unnecessary_literal_bound)] // The stub trait's `name(&self) -> &str` requires `&str`.
 mod tests {
     use super::*;
     use crate::subject::{DreamSummary, RecallHit, RunHandle};
 
-    /// Ohjelmoitava stub-subject jonka restart-raportin voi konfiguroida
-    /// kaatumispisteittäin — antaa testin simuloida sekä terveen että
-    /// rikkinäisen subjektin.
+    /// A programmable stub subject whose restart report can be configured
+    /// per crash point — lets the test simulate both a healthy and a broken
+    /// subject.
     struct ProgrammableSubject {
-        /// Sivuvaikutusten ylitys jonka restart raportoi (vakio kaikille pisteille).
+        /// Side-effect overcount reported by restart (constant across all points).
         side_effects_reexecuted: usize,
-        /// Saavuttiko restart puhtaan lopputilan.
+        /// Whether restart reached a clean end state.
         resumed_clean: bool,
     }
 
@@ -356,7 +361,7 @@ mod tests {
             .await
             .expect("scenario runs");
         assert!(!result.passed, "any re-executed side effect must fail S1");
-        // 4 kaatumispistettä × 1 ylimääräinen sivuvaikutus = 4.
+        // 4 crash points × 1 extra side effect = 4.
         assert_eq!(result.metrics["side_effect_overcount"], 4.0);
         assert_eq!(result.metrics["resume_correctness"], 0.0);
     }
@@ -372,7 +377,7 @@ mod tests {
             .await
             .expect("scenario runs");
         assert!(!result.passed, "unclean resume must fail S1");
-        // Baseline ei myöskään saavuta puhdasta tilaa → matches_baseline = 0.
+        // The baseline also fails to reach a clean state → matches_baseline = 0.
         assert_eq!(result.metrics["result_matches_baseline"], 0.0);
     }
 

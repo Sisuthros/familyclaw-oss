@@ -1,15 +1,15 @@
-//! [`Channel`]-rajapinta ja saapuvien viestien virta ([`MessageStream`]).
+//! The [`Channel`] interface and the inbound message stream ([`MessageStream`]).
 //!
-//! `Channel` on alustan abstraktio yhdelle kaksisuuntaiselle kanavalle:
-//! - [`Channel::send`] lähettää [`OutboundMessage`]-viestin ulos,
-//! - [`Channel::receive`] palauttaa [`MessageStream`]-virran saapuvista
-//!   [`InboundEnvelope`]-kirjekuorista,
-//! - [`Channel::channel_id`] ja [`Channel::kind`] tunnistavat kanavainstanssin.
+//! `Channel` is the platform's abstraction for a single bidirectional channel:
+//! - [`Channel::send`] sends an [`OutboundMessage`] out,
+//! - [`Channel::receive`] returns a [`MessageStream`] of inbound
+//!   [`InboundEnvelope`] envelopes,
+//! - [`Channel::channel_id`] and [`Channel::kind`] identify the channel instance.
 //!
-//! Rajapinta on **dyn-yhteensopiva** (`Box<dyn Channel>`), jotta eri kanavia
-//! voi pitää yhdessä kokoelmassa. Tämän vuoksi `send` palauttaa eksplisiittisen
-//! boxatun futuren ([`SendFuture`]) — näin vältetään raskas ulkoinen
-//! `async-trait`-riippuvuus ja säilytetään silti trait-objektit.
+//! The interface is **dyn-compatible** (`Box<dyn Channel>`), so different
+//! channels can be kept together in one collection. This is why `send`
+//! returns an explicit boxed future ([`SendFuture`]) — this avoids a heavy
+//! external `async-trait` dependency while still supporting trait objects.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -17,86 +17,87 @@ use std::pin::Pin;
 use crate::error::ChannelResult;
 use crate::message::{ChannelKind, InboundEnvelope, OutboundMessage};
 
-/// Boxattu, lähetettävä future kanavan [`Channel::send`]-operaatiolle.
+/// A boxed, sendable future for a channel's [`Channel::send`] operation.
 ///
-/// Eksplisiittinen tyyppi tekee [`Channel`]-traitista dyn-yhteensopivan ilman
-/// `async-trait`-makroa.
+/// The explicit type makes the [`Channel`] trait dyn-compatible without an
+/// `async-trait` macro.
 pub type SendFuture<'a> = Pin<Box<dyn Future<Output = ChannelResult<()>> + Send + 'a>>;
 
-/// Saapuvien [`InboundEnvelope`]-kirjekuorten virta yhdeltä kanavalta.
+/// A stream of inbound [`InboundEnvelope`] envelopes from one channel.
 ///
-/// Virtaa kulutetaan [`MessageStream::recv`]-metodilla. `None` tarkoittaa, että
-/// kanava on suljettu eikä lisää viestejä tule. Tyyppi kääri sisäisen
-/// kanava-vastaanottimen, jotta toteutus ei vuoda kutsujalle.
+/// The stream is drained via the [`MessageStream::recv`] method. `None`
+/// means the channel is closed and no more messages will arrive. The type
+/// wraps the internal channel receiver so the implementation does not leak
+/// to the caller.
 #[derive(Debug)]
 pub struct MessageStream {
     rx: tokio::sync::mpsc::UnboundedReceiver<InboundEnvelope>,
 }
 
 impl MessageStream {
-    /// Rakentaa virran annetusta vastaanottimesta.
+    /// Builds a stream from the given receiver.
     ///
-    /// Kanava-toteutukset luovat parin
-    /// [`tokio::sync::mpsc::unbounded_channel`]-kutsulla ja antavat
-    /// vastaanottimen tähän.
+    /// Channel implementations create the pair via
+    /// [`tokio::sync::mpsc::unbounded_channel`] and pass the receiver here.
     #[must_use]
     pub fn new(rx: tokio::sync::mpsc::UnboundedReceiver<InboundEnvelope>) -> Self {
         Self { rx }
     }
 
-    /// Odottaa ja palauttaa seuraavan saapuvan viestin, tai `None` kun kanava
-    /// on lopullisesti suljettu.
+    /// Waits for and returns the next inbound message, or `None` once the
+    /// channel is permanently closed.
     pub async fn recv(&mut self) -> Option<InboundEnvelope> {
         self.rx.recv().await
     }
 
-    /// Yrittää ottaa seuraavan viestin estymättä.
+    /// Attempts to take the next message without blocking.
     ///
     /// # Errors
-    /// [`crate::ChannelError::Receive`] jos jonossa ei juuri nyt ole viestiä
-    /// (tyhjä) tai jos virta on suljettu.
+    /// [`crate::ChannelError::Receive`] if there is currently no message in
+    /// the queue (empty) or if the stream is closed.
     pub fn try_recv(&mut self) -> ChannelResult<InboundEnvelope> {
         self.rx
             .try_recv()
             .map_err(|e| crate::ChannelError::receive("stream", e.to_string()))
     }
 
-    /// Sulkee virran: ei oteta enää uusia viestejä vastaan. Jo jonossa olevat
-    /// viestit voi yhä kuluttaa [`recv`](MessageStream::recv)-kutsulla.
+    /// Closes the stream: no new messages will be accepted. Messages already
+    /// in the queue can still be drained via [`recv`](MessageStream::recv).
     pub fn close(&mut self) {
         self.rx.close();
     }
 }
 
-/// Yksi kaksisuuntainen kanava (Discord, Telegram, Mock, …).
+/// A single bidirectional channel (Discord, Telegram, Mock, …).
 ///
-/// Toteutusten on oltava `Send + Sync`, jotta kanavia voi jakaa actoreiden ja
-/// tehtävien välillä Resonance Busissa.
+/// Implementations must be `Send + Sync` so channels can be shared between
+/// actors and tasks on the Resonance Bus.
 pub trait Channel: Send + Sync {
-    /// Tämän kanavainstanssin vakaa tunniste (esim. `"discord-main"`).
-    /// Sama arvo päätyy [`InboundEnvelope::channel_id`]-kenttään.
+    /// The stable identifier for this channel instance (e.g. `"discord-main"`).
+    /// The same value ends up in the [`InboundEnvelope::channel_id`] field.
     fn channel_id(&self) -> &str;
 
-    /// Kanavan teknologiatyyppi.
+    /// The channel's technology type.
     fn kind(&self) -> ChannelKind;
 
-    /// Lähettää viestin ulos tältä kanavalta.
+    /// Sends a message out from this channel.
     ///
-    /// Palauttaa boxatun futuren ([`SendFuture`]). Virhe ([`ChannelResult`])
-    /// kuvaa kuljetus- tai elinkaarivian; semanttiset validointivirheet
-    /// (tyhjä sisältö) on jo torjuttu [`OutboundMessage::new`]-konstruktorissa.
+    /// Returns a boxed future ([`SendFuture`]). An error ([`ChannelResult`])
+    /// describes a transport or lifecycle failure; semantic validation
+    /// errors (empty content) have already been rejected in the
+    /// [`OutboundMessage::new`] constructor.
     fn send(&self, message: OutboundMessage) -> SendFuture<'_>;
 
-    /// Avaa saapuvien viestien virran ([`MessageStream`]).
+    /// Opens the inbound message stream ([`MessageStream`]).
     ///
-    /// Kukin saapuva kanavaviesti on jo kanonisoitu [`InboundEnvelope`]:ksi
-    /// (sis. [`ChannelKind`] + `channel_id`), valmiina muunnettavaksi busin
-    /// hyötykuormaksi.
+    /// Each inbound channel message is already canonicalized into an
+    /// [`InboundEnvelope`] (including [`ChannelKind`] + `channel_id`), ready
+    /// to be converted into the bus payload.
     ///
     /// # Errors
-    /// [`crate::ChannelError::Receive`] tai
-    /// [`crate::ChannelError::Closed`] jos virtaa ei voi avata (esim. se on jo
-    /// otettu tai kanava on suljettu).
+    /// [`crate::ChannelError::Receive`] or [`crate::ChannelError::Closed`] if
+    /// the stream cannot be opened (e.g. it has already been taken or the
+    /// channel is closed).
     fn receive(&self) -> ChannelResult<MessageStream>;
 }
 
@@ -137,7 +138,7 @@ mod tests {
         let bus = InboundMessage::new("u", "r", "late")
             .expect("valid")
             .into_envelope(ChannelKind::Mock, "m");
-        // Lähetys suljettuun virtaan epäonnistuu.
+        // Sending into a closed stream fails.
         assert!(tx.send(bus).is_err());
         assert!(stream.recv().await.is_none());
     }

@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+keywords = ["metrics", "observability", "rbac", "agent", "prometheus"]
+categories = ["development-tools::debugging"]
 
 [lints]
 workspace = true

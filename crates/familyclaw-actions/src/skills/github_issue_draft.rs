@@ -1,30 +1,32 @@
-//! Aito taito: GitHub-issue-luonnoksen tuottaminen ja (valinnainen) tallennus
-//! allowlistattuun **luonnos-artefaktiin** levylle (KERROS A).
+//! Genuine skill: producing a GitHub issue draft and (optionally) persisting
+//! it as an allowlisted **draft artifact** to disk (Layer A).
 //!
-//! [`GithubIssueDraftMock`] muuntaa vapaamuotoisen bugiraportin
-//! ([`GithubIssueDraftInput::bug_report`]) jäsennellyksi issue-luonnokseksi
-//! (otsikko + runko). Tämä on `github_issue_draft`-provider-taidon **aito
-//! toteutus**, joka **ei tee verkkokutsua eikä tarvitse tunnuksia**:
+//! [`GithubIssueDraftMock`] converts a free-form bug report
+//! ([`GithubIssueDraftInput::bug_report`]) into a structured issue draft
+//! (title + body). This is the **genuine implementation** of the
+//! `github_issue_draft` provider skill, which **makes no network call and
+//! requires no credentials**:
 //!
-//! - **Ilman `out_path`:ia** taito tuottaa deterministisen luonnoksen (proposal
-//!   only) — sama sopimus kuin ennen, taaksepäin-yhteensopiva.
-//! - **`out_path`:in kanssa** taito **kirjoittaa oikeasti** luonnos-artefaktin
-//!   (Markdown) levylle, mutta vain **allowlistatun juuren alle**, peilaten
-//!   [`super::file_write::FileWriteAllowlisted`]-taidon kanonisointi- ja
-//!   allowlist-mallia. Näin syntyy aito, redaktoitava sivuvaikutus **ilman**
-//!   ulkoista API:a tai avainta (KERROS A — geneerinen placeholder-repo).
+//! - **Without `out_path`** the skill produces a deterministic draft (proposal
+//!   only) — the same contract as before, backward-compatible.
+//! - **With `out_path`** the skill **actually writes** the draft artifact
+//!   (Markdown) to disk, but only **under an allowlisted root**, mirroring
+//!   the canonicalization and allowlist pattern of
+//!   [`super::file_write::FileWriteAllowlisted`]. This produces a genuine,
+//!   redactable side effect **without** an external API or credential
+//!   (Layer A — generic placeholder repo).
 //!
-//! ## Riskiluokka ja hyväksyntä
-//! Riski on [`ActionRisk::WriteExternal`] ja käytäntö
-//! [`ApprovalPolicy::RequireApproval`], joten luonnoksen tuotto/tallennus
-//! pysähtyy **aina** ihmisen hyväksyntään ennen suoritusta — putki johtaa
-//! vaatimuksen manifestista, ei payloadista.
+//! ## Risk class and approval
+//! The risk is [`ActionRisk::WriteExternal`] and the policy is
+//! [`ApprovalPolicy::RequireApproval`], so producing/persisting the draft
+//! **always** pauses for human approval before execution — the pipeline
+//! derives the requirement from the manifest, not the payload.
 //!
-//! ## Todistepaketti ei sisällä sisältöä
-//! Kun artefakti kirjoitetaan, tulos sisältää vain kanonisen polun
-//! **tiivisteen** (SHA-256) ja kirjoitettujen tavujen **määrän** — EI luonnoksen
-//! runkoa. Tyhjä allowlist (oletus) hylkää **kaikki** kirjoituspolut
-//! (fail-closed); luonnoksen tuotto ilman `out_path`:ia toimii silti.
+//! ## The proof bundle contains no content
+//! When the artifact is written, the result contains only the **hash**
+//! (SHA-256) of the canonical path and the **count** of bytes written — NOT
+//! the draft's body. An empty allowlist (default) rejects **all** write paths
+//! (fail-closed); producing the draft without `out_path` still works.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -42,69 +44,69 @@ use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 use super::file_write::FileWriteConfig;
 use super::Skill;
 
-/// Geneerinen kohderepo (KERROS A — ei oikea repo).
+/// Generic target repo (Layer A — not a real repo).
 pub const EXAMPLE_REPO: &str = "example-org/example-repo";
 
-/// Taidon kiinteä tunniste, jotta rekisteröinti ja haku ovat toistettavia.
+/// Fixed identifier for the skill, so registration and lookup are reproducible.
 const SKILL_UUID: uuid::Uuid = uuid::uuid!("11111111-1111-4111-8111-111111111111");
 
-/// Taidon syöte: vapaamuotoinen bugiraportti ja valinnainen tallennuspolku.
+/// Skill input: free-form bug report and optional output path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubIssueDraftInput {
-    /// Käyttäjän kirjoittama vapaamuotoinen bugiraportti.
+    /// The user-written free-form bug report.
     pub bug_report: String,
-    /// Valinnainen allowlistattu polku johon luonnos-artefakti kirjoitetaan.
-    /// Jos `None`, taito tuottaa vain luonnoksen (ei sivuvaikutusta).
+    /// Optional allowlisted path to which the draft artifact is written.
+    /// If `None`, the skill only produces the draft (no side effect).
     #[serde(default)]
     pub out_path: Option<String>,
 }
 
-/// Taidon tulos: issue-luonnos (ei julkaistu mihinkään ulkoiseen järjestelmään).
+/// Skill result: the issue draft (not published to any external system).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubIssueDraftOutput {
-    /// Ehdotettu issuen otsikko.
+    /// Proposed issue title.
     pub title: String,
-    /// Ehdotettu issuen runko (Markdown).
+    /// Proposed issue body (Markdown).
     pub body: String,
-    /// Kohderepo johon issue ehdotetaan (geneerinen).
+    /// Target repo the issue is proposed for (generic).
     pub repo: String,
 }
 
-/// Aito taito: GitHub-issue-luonnos + valinnainen allowlistattu levytallennus.
+/// Genuine skill: GitHub issue draft + optional allowlisted disk persistence.
 ///
-/// Riskiluokka on [`ActionRisk::WriteExternal`] ja käytäntö
-/// [`ApprovalPolicy::RequireApproval`], joten suoritus vaatii aina hyväksynnän.
+/// The risk class is [`ActionRisk::WriteExternal`] and the policy is
+/// [`ApprovalPolicy::RequireApproval`], so execution always requires approval.
 #[derive(Debug, Clone, Default)]
 pub struct GithubIssueDraftMock {
-    /// Allowlist-kokoonpano artefaktin kirjoitukselle (tyhjä = fail-closed).
+    /// Allowlist configuration for writing the artifact (empty = fail-closed).
     config: FileWriteConfig,
 }
 
 impl GithubIssueDraftMock {
-    /// Luo taidon tyhjällä allowlistilla (artefaktin kirjoitus fail-closed;
-    /// luonnoksen tuotto ilman `out_path`:ia toimii silti).
+    /// Creates the skill with an empty allowlist (artifact write is
+    /// fail-closed; producing the draft without `out_path` still works).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Luo taidon annetulla allowlist-kokoonpanolla (sallitut juuret).
+    /// Creates the skill with the given allowlist configuration (allowed roots).
     #[must_use]
     pub fn with_config(config: FileWriteConfig) -> Self {
         Self { config }
     }
 
-    /// Taidon kiinteä tunniste.
+    /// The skill's fixed identifier.
     #[must_use]
     pub fn skill_id() -> SkillId {
         SkillId::from_uuid(SKILL_UUID)
     }
 
-    /// Muodostaa issue-luonnoksen bugiraportista (puhdas logiikka).
+    /// Builds an issue draft from a bug report (pure logic).
     ///
-    /// Otsikko johdetaan raportin ensimmäisestä ei-tyhjästä rivistä
-    /// (typistettynä), ja runko sisältää alkuperäisen raportin sekä geneerisen
-    /// toistorakenteen.
+    /// The title is derived from the report's first non-empty line
+    /// (truncated), and the body contains the original report plus a
+    /// generic repro-steps template.
     #[must_use]
     pub fn draft(input: &GithubIssueDraftInput) -> GithubIssueDraftOutput {
         let first_line = input
@@ -127,7 +129,7 @@ impl GithubIssueDraftMock {
         }
     }
 
-    /// Renderöi luonnoksen tallennettavaksi Markdown-artefaktiksi.
+    /// Renders the draft as a persistable Markdown artifact.
     #[must_use]
     fn render_artifact(draft: &GithubIssueDraftOutput) -> String {
         format!(
@@ -136,11 +138,11 @@ impl GithubIssueDraftMock {
         )
     }
 
-    /// Ratkaisee allowlistatun, kanonisoidun kohdepolun syötteen polusta.
+    /// Resolves the allowlisted, canonicalized target path from the input path.
     ///
     /// # Errors
-    /// [`ActionError::PolicyDenied`] jos allowlist on tyhjä, polkua ei voi
-    /// ratkaista, tai kanoninen kohde ei ole minkään sallitun juuren alla.
+    /// [`ActionError::PolicyDenied`] if the allowlist is empty, the path
+    /// cannot be resolved, or the canonical target is not under any allowed root.
     fn resolve_allowed(&self, requested: &str) -> Result<PathBuf> {
         let roots = self.config.canonical_allow_roots();
         if roots.is_empty() {
@@ -159,20 +161,20 @@ impl GithubIssueDraftMock {
     }
 }
 
-/// Onko `path` jonkin annetun juuren alla (tai itse juuri).
+/// Is `path` under any of the given roots (or the root itself)?
 fn path_is_under_any(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 
-/// Ratkaisee (mahdollisesti vielä olemattoman) kohdepolun kanonisen muodon.
+/// Resolves the canonical form of a (possibly not yet existing) target path.
 ///
-/// Kanonisoi lähimmän olemassa olevan esivanhemman (purkaa `..`, seuraa
-/// symlinkit) ja liittää jäljellä olevat normaalikomponentit. Torjuu
-/// `..`-segmentit hännässä.
+/// Canonicalizes the nearest existing ancestor (resolves `..`, follows
+/// symlinks) and appends the remaining normal components. Rejects trailing
+/// `..` segments.
 ///
 /// # Errors
-/// [`ActionError::PolicyDenied`] jos polku on tyhjä, päättyy `..`:iin, tai jos
-/// yksikään esivanhempi ei kanonisoidu.
+/// [`ActionError::PolicyDenied`] if the path is empty, ends in `..`, or if no
+/// ancestor can be canonicalized.
 fn canonicalize_target(requested: &Path) -> Result<PathBuf> {
     if let Ok(canonical) = std::fs::canonicalize(requested) {
         return Ok(canonical);
@@ -214,8 +216,8 @@ fn canonicalize_target(requested: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Laskee kanonisen polun SHA-256-tiivisteen heksamerkkijonona (raakapolun
-/// sijasta, jottei mahdollisesti yksityinen polku vuoda todisteeseen).
+/// Computes the SHA-256 hash of the canonical path as a hex string (instead
+/// of the raw path, so a potentially private path does not leak into the proof).
 fn hash_path(path: &Path) -> String {
     format!("{:x}", Sha256::digest(path.to_string_lossy().as_bytes()))
 }
@@ -223,7 +225,7 @@ fn hash_path(path: &Path) -> String {
 #[async_trait]
 impl ActionExecutor for GithubIssueDraftMock {
     async fn execute(&self, request: ActionRequest) -> Result<ActionResult> {
-        // Jäsennä syöte; epäkelpo syöte tuottaa Failed-tuloksen (ei virhettä).
+        // Parse the input; an invalid input produces a Failed result (not an error).
         let input: GithubIssueDraftInput = match serde_json::from_value(request.payload.clone()) {
             Ok(input) => input,
             Err(e) => {
@@ -236,7 +238,7 @@ impl ActionExecutor for GithubIssueDraftMock {
 
         let draft = Self::draft(&input);
 
-        // Ei tallennuspolkua → pelkkä luonnos (taaksepäin-yhteensopiva).
+        // No output path → draft only (backward-compatible).
         let Some(out_path) = input.out_path.as_deref() else {
             let output: Value = json!({
                 "draft": { "title": draft.title, "body": draft.body, "repo": draft.repo },
@@ -250,7 +252,7 @@ impl ActionExecutor for GithubIssueDraftMock {
             ));
         };
 
-        // Tallennuspolku annettu → aito allowlistattu levykirjoitus.
+        // Output path given → a genuine allowlisted disk write.
         let canonical = match self.resolve_allowed(out_path) {
             Ok(p) => p,
             Err(e) => {
@@ -277,7 +279,7 @@ impl ActionExecutor for GithubIssueDraftMock {
             ));
         }
 
-        // Todiste: vain polkutiiviste + tavumäärä — EI luonnoksen runkoa.
+        // Proof: only the path hash + byte count — NOT the draft body.
         let output: Value = json!({
             "draft": { "title": draft.title, "repo": draft.repo },
             "published": false,
@@ -459,7 +461,7 @@ mod tests {
     async fn empty_allowlist_rejects_artifact_write() {
         let dir = temp_dir("empty");
         let target = dir.join("issue.md");
-        // Tyhjä allowlist → fail-closed artefaktin kirjoitukselle.
+        // Empty allowlist → fail-closed for artifact write.
         let skill = GithubIssueDraftMock::new();
         let res = skill
             .execute(make_request(json!({
@@ -501,8 +503,9 @@ mod tests {
         let dir = temp_dir("proof");
         let target = dir.join("issue.md");
         let skill = GithubIssueDraftMock::with_config(FileWriteConfig::new().allow_root(&dir));
-        // Otsikko johdetaan ENSIMMÄISESTÄ rivistä (se saa esiintyä); herkkä
-        // runkosisältö on eri rivillä eikä saa vuotaa todisteeseen.
+        // The title is derived from the FIRST line (it is allowed to appear);
+        // the sensitive body content is on a different line and must not
+        // leak into the proof.
         let res = skill
             .execute(make_request(json!({
                 "bug_report": "Short title line\nmust-never-appear-in-proof-body",
@@ -519,7 +522,7 @@ mod tests {
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(res.raw_output_redacted["bytes_written"].as_u64().is_some());
 
-        // Kun artefakti kirjoitetaan, todiste-tuloste ei sisällä runkoa.
+        // When the artifact is written, the proof output does not contain the body.
         let out = &res.raw_output_redacted;
         assert!(
             out["draft"].get("body").is_none(),

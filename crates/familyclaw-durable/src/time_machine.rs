@@ -1,52 +1,52 @@
-//! Time Machine — journalin tarkastelu (inspect), haarautus (fork) ja
-//! aikajanojen vertailu (diff).
+//! Time Machine — journal inspection (inspect), branching (fork), and
+//! timeline comparison (diff).
 //!
-//! Durable-journal on append-only ja replay deterministinen — siksi historia
-//! on paitsi *toistettavissa*, myös *haarautettavissa*: mikä tahansa mennyt
-//! päätöspiste voidaan avata, leikata ja ajaa uudelleen muutetulla
-//! jatkologiikalla ilman että alkuperäinen aikajana muuttuu tai yksikään
-//! oikea sivuvaikutus toistuu.
+//! A durable journal is append-only and replay is deterministic — which
+//! means history is not only *replayable* but also *forkable*: any past
+//! decision point can be opened, cut, and re-run with modified continuation
+//! logic without the original timeline changing or a single real side effect
+//! recurring.
 //!
-//! Kolme kerrosta:
+//! Three layers:
 //!
-//! 1. **Inspect** — [`Timeline`] purkaa journalin ihmisluettavaksi
-//!    askel-listaksi: mitä tapahtui, missä järjestyksessä, mikä onnistui ja
-//!    mikä epäonnistui ("mustan laatikon" luku).
-//! 2. **Fork** — [`TimeMachine::fork`] kopioi aikajanan alun uuteen
-//!    journaliin ja katkaisee sen valitusta askeleesta. Haarassa historia
-//!    toistuu deterministisesti leikkauspisteeseen asti, ja siitä eteenpäin
-//!    suoritus on *tuoretta* — kutsuja voi ajaa vaihtoehtoisen jatkon
-//!    ("mitä jos?"). Haaraan kirjataan aina [`FORK_MARKER`]-auditrivi,
-//!    joten haarautuneen aikajanan alkuperä on todennettavissa.
-//! 3. **Diff** — [`TimelineDiff`] vertaa kahta aikajanaa askel askeleelta ja
-//!    tuottaa deterministisen, sarjallistuvan raportin: mikä pysyi samana,
-//!    minkä tulos muuttui, missä aikajanat erkanivat.
+//! 1. **Inspect** — [`Timeline`] unpacks the journal into a human-readable
+//!    list of steps: what happened, in what order, what succeeded and what
+//!    failed (a "black box" read).
+//! 2. **Fork** — [`TimeMachine::fork`] copies the start of a timeline into a
+//!    new journal and truncates it at the chosen step. In the fork, history
+//!    replays deterministically up to the cut point, and from there on
+//!    execution is *fresh* — the caller can run an alternative continuation
+//!    ("what if?"). A [`FORK_MARKER`] audit row is always recorded at the
+//!    start of the fork, so the origin of a forked timeline is verifiable.
+//! 3. **Diff** — [`TimelineDiff`] compares two timelines step by step and
+//!    produces a deterministic, serializable report: what stayed the same,
+//!    what result changed, where the timelines diverged.
 //!
-//! Counterfactual-ajoja varten [`DryRunRecorder`] kaappaa *aiotut* ulkoiset
-//! sivuvaikutukset intenteiksi. Tyypillä **ei ole rakenteellisesti mitään
-//! dispatch-polkua** — kaapattu intent ei voi koskaan saavuttaa ulkoista
-//! järjestelmää tämän tyypin kautta. Tämä on sama fail-closed-periaate kuin
-//! muuallakin alustassa: turvallisuus on rakenteen, ei politiikan, ominaisuus.
+//! For counterfactual runs, [`DryRunRecorder`] captures *intended* external
+//! side effects as intents. The type **has structurally no dispatch path
+//! whatsoever** — a captured intent can never reach an external system
+//! through this type. This is the same fail-closed principle used
+//! throughout the platform: safety is a property of structure, not policy.
 //!
-//! ## Esimerkki: kelaa, haaraudu, vertaa
+//! ## Example: rewind, fork, diff
 //! ```
 //! use familyclaw_durable::{DurableContext, InMemoryJournal, TimeMachine};
 //!
 //! # fn main() -> familyclaw_durable::Result<()> {
-//! // Alkuperäinen ajo: kaksi askelta.
+//! // Original run: two steps.
 //! let mut ctx = DurableContext::new(InMemoryJournal::new())?;
 //! let a: i64 = ctx.step("load", || Ok(10))?;
 //! let _b: i64 = ctx.step("apply", || Ok(a * 2))?;
 //! let original = ctx.finish();
 //!
-//! // Haaraudu: pidä vain "load", aja "apply" uudella logiikalla.
+//! // Fork: keep only "load", run "apply" with new logic.
 //! let fork = TimeMachine::fork(&original, 1)?;
 //! let mut alt = DurableContext::new(fork)?;
-//! let a: i64 = alt.step("load", || Ok(0))?; // replay: palautuu lokista (10)
-//! let _b: i64 = alt.step("apply", || Ok(a * 3))?; // tuore: uusi logiikka
+//! let a: i64 = alt.step("load", || Ok(0))?; // replay: restored from the log (10)
+//! let _b: i64 = alt.step("apply", || Ok(a * 3))?; // fresh: new logic
 //! let forked = alt.finish();
 //!
-//! // Vertaa aikajanat: "load" ennallaan, "apply" muuttui 20 → 30.
+//! // Compare timelines: "load" unchanged, "apply" changed 20 → 30.
 //! let diff = TimeMachine::diff(&original, &forked)?;
 //! assert!(!diff.is_identical());
 //! assert_eq!(diff.changed_count(), 1);
@@ -66,76 +66,75 @@ use crate::error::{DurableError, Result};
 use crate::journal::Journal;
 use crate::memory::InMemoryJournal;
 
-/// Auditmarkerin nimi, joka kirjataan jokaisen haarautetun aikajanan alkuun
-/// (tarkemmin: kopioidun prefiksin perään).
+/// Name of the audit marker recorded at the start of every forked timeline
+/// (more precisely: right after the copied prefix).
 ///
-/// Payload kertoo montako askelta prefiksissä säilytettiin ja montako
-/// lähdeaikajanassa oli yhteensä — haarautuneen aikajanan alkuperä on siis
-/// aina todennettavissa lokista itsestään.
+/// The payload records how many steps were kept in the prefix and how many
+/// the source timeline had in total — so the origin of a forked timeline is
+/// always verifiable from the log itself.
 pub const FORK_MARKER: &str = "timeline_forked";
 
-/// Yhden workflow-askeleen lopputulos tarkastelu- ja diff-näkymissä.
+/// Outcome of a single workflow step in the inspect and diff views.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum StepOutcome {
-    /// Askel valmistui; `output` on journaliin tallennettu tulos.
+    /// The step completed; `output` is the result stored in the journal.
     Completed {
-        /// Askeleen palauttama tulos JSON-arvona.
+        /// The step's returned result as a JSON value.
         output: serde_json::Value,
     },
-    /// Askel epäonnistui; `error` on tallennettu virheviesti.
+    /// The step failed; `error` is the stored error message.
     Failed {
-        /// Tallennettu virheviesti.
+        /// The stored error message.
         error: String,
     },
 }
 
 impl StepOutcome {
-    /// Onko lopputulos onnistunut.
+    /// Whether the outcome is a success.
     #[must_use]
     pub const fn is_completed(&self) -> bool {
         matches!(self, StepOutcome::Completed { .. })
     }
 }
 
-/// Yksi workflow-askel aikajanan tarkastelunäkymässä.
+/// A single workflow step in the timeline inspection view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimelineStep {
-    /// Askeleen 0-pohjainen paikka aikajanan **askelten** joukossa
-    /// (markerit ja snapshotit eivät kuluta paikkoja — sama kursori kuin
-    /// [`crate::DurableContext`]-replayssa).
+    /// The step's 0-based position among the timeline's **steps**
+    /// (markers and snapshots do not consume positions — the same cursor
+    /// convention as [`crate::DurableContext`] replay).
     pub position: usize,
-    /// Askeleen sekvenssipaikka journalissa.
+    /// The step's sequence position in the journal.
     pub step_id: StepId,
-    /// Askeleen looginen nimi.
+    /// The step's logical name.
     pub name: String,
-    /// Askeleen lopputulos.
+    /// The step's outcome.
     pub outcome: StepOutcome,
-    /// Rivin kirjoitushetki (vain diagnostiikkaa varten — ei vaikuta
-    /// determinismiin).
+    /// The moment the row was written (diagnostics only — does not affect
+    /// determinism).
     pub timestamp: Timestamp,
 }
 
-/// Journalin luettu, muuttumaton tarkastelunäkymä ("musta laatikko").
+/// A read-only, immutable inspection view of a journal (a "black box").
 ///
-/// Rakennetaan [`Timeline::from_journal`]-kutsulla. Sisältää vain
-/// workflow-askeleet järjestyksessä; markerien ja snapshotien määrät
-/// raportoidaan erikseen.
+/// Built via [`Timeline::from_journal`]. Contains only the workflow steps in
+/// order; marker and snapshot counts are reported separately.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Timeline {
-    /// Workflow-askeleet lisäysjärjestyksessä.
+    /// The workflow steps in append order.
     pub steps: Vec<TimelineStep>,
-    /// Marker-rivien lukumäärä lokissa (ml. sessiotila).
+    /// Number of marker rows in the log (including session state).
     pub marker_count: usize,
-    /// Snapshot-rivien lukumäärä lokissa.
+    /// Number of snapshot rows in the log.
     pub snapshot_count: usize,
 }
 
 impl Timeline {
-    /// Lukee journalin ja rakentaa tarkastelunäkymän.
+    /// Reads the journal and builds an inspection view.
     ///
     /// # Errors
-    /// Vie journalin lukuvirheen läpi ([`DurableError::Io`],
+    /// Propagates the journal's read error ([`DurableError::Io`],
     /// [`DurableError::CorruptEntry`], ...).
     pub fn from_journal<J: Journal>(journal: &J) -> Result<Self> {
         let mut steps = Vec::new();
@@ -178,31 +177,31 @@ impl Timeline {
         })
     }
 
-    /// Askelten lukumäärä aikajanalla.
+    /// Number of steps in the timeline.
     #[must_use]
     pub fn len(&self) -> usize {
         self.steps.len()
     }
 
-    /// Onko aikajana tyhjä (ei yhtään workflow-askelta).
+    /// Whether the timeline is empty (no workflow steps at all).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.steps.is_empty()
     }
 
-    /// Palauttaa askeleen annetulta paikalta, jos sellainen on.
+    /// Returns the step at the given position, if one exists.
     #[must_use]
     pub fn step(&self, position: usize) -> Option<&TimelineStep> {
         self.steps.get(position)
     }
 
-    /// Etsii ensimmäisen askeleen annetulla nimellä.
+    /// Finds the first step with the given name.
     #[must_use]
     pub fn find(&self, name: &str) -> Option<&TimelineStep> {
         self.steps.iter().find(|s| s.name == name)
     }
 
-    /// Ihmisluettava markdown-raportti aikajanasta (CLI-/raporttikäyttöön).
+    /// Human-readable markdown report of the timeline (for CLI/reporting use).
     #[must_use]
     pub fn render_markdown(&self) -> String {
         let mut out = String::new();
@@ -226,65 +225,68 @@ impl Timeline {
     }
 }
 
-/// Yhden askelparin vertailutulos kahden aikajanan välillä.
+/// Comparison result for a single step pair between two timelines.
 ///
-/// `before` on vertailun vasen (alkuperäinen) ja `after` oikea (esim.
-/// haarautettu) aikajana.
+/// `before` is the left-hand (original) side of the comparison and `after`
+/// is the right-hand (e.g. forked) timeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StepDiff {
-    /// Sama askel, sama lopputulos molemmilla aikajanoilla.
+    /// Same step, same outcome on both timelines.
     Unchanged {
-        /// Askeleen paikka molemmilla aikajanoilla.
+        /// The step's position on both timelines.
         position: usize,
-        /// Askeleen nimi.
+        /// The step's name.
         name: String,
     },
-    /// Sama askelnimi, mutta lopputulos muuttui (tulos tai onnistuminen).
+    /// Same step name, but the outcome changed (result or success/failure).
     Changed {
-        /// Askeleen paikka molemmilla aikajanoilla.
+        /// The step's position on both timelines.
         position: usize,
-        /// Askeleen nimi.
+        /// The step's name.
         name: String,
-        /// Lopputulos alkuperäisellä aikajanalla.
+        /// The outcome on the original timeline.
         before: StepOutcome,
-        /// Lopputulos vertailtavalla aikajanalla.
+        /// The outcome on the compared timeline.
         after: StepOutcome,
     },
-    /// Aikajanat erkanivat: samalla paikalla on eri askel (eri nimi).
+    /// The timelines diverged: a different step (different name) occupies
+    /// the same position.
     Diverged {
-        /// Paikka jossa erkaantuminen havaittiin.
+        /// The position where divergence was detected.
         position: usize,
-        /// Askeleen nimi alkuperäisellä aikajanalla.
+        /// The step name on the original timeline.
         before_name: String,
-        /// Askeleen nimi vertailtavalla aikajanalla.
+        /// The step name on the compared timeline.
         after_name: String,
     },
-    /// Askel on vain alkuperäisellä aikajanalla (vertailtava on lyhyempi).
+    /// The step exists only on the original timeline (the compared one is
+    /// shorter).
     OnlyInBefore {
-        /// Askeleen paikka alkuperäisellä aikajanalla.
+        /// The step's position on the original timeline.
         position: usize,
-        /// Askeleen nimi.
+        /// The step's name.
         name: String,
     },
-    /// Askel on vain vertailtavalla aikajanalla (alkuperäinen on lyhyempi).
+    /// The step exists only on the compared timeline (the original one is
+    /// shorter).
     OnlyInAfter {
-        /// Askeleen paikka vertailtavalla aikajanalla.
+        /// The step's position on the compared timeline.
         position: usize,
-        /// Askeleen nimi.
+        /// The step's name.
         name: String,
     },
 }
 
-/// Kahden aikajanan deterministinen, sarjallistuva vertailuraportti.
+/// A deterministic, serializable comparison report between two timelines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TimelineDiff {
-    /// Askelkohtaiset vertailutulokset paikkajärjestyksessä.
+    /// Per-step comparison results in positional order.
     pub steps: Vec<StepDiff>,
 }
 
 impl TimelineDiff {
-    /// Vertaa kahta valmiiksi luettua aikajanaa askel askeleelta.
+    /// Compares two already-read timelines step by step.
     #[must_use]
     pub fn from_timelines(before: &Timeline, after: &Timeline) -> Self {
         let mut steps = Vec::new();
@@ -330,7 +332,8 @@ impl TimelineDiff {
         Self { steps }
     }
 
-    /// Ovatko aikajanat identtiset (jokainen askel [`StepDiff::Unchanged`]).
+    /// Whether the timelines are identical (every step is
+    /// [`StepDiff::Unchanged`]).
     #[must_use]
     pub fn is_identical(&self) -> bool {
         self.steps
@@ -338,7 +341,7 @@ impl TimelineDiff {
             .all(|d| matches!(d, StepDiff::Unchanged { .. }))
     }
 
-    /// Montako askelta muuttui ([`StepDiff::Changed`]).
+    /// How many steps changed ([`StepDiff::Changed`]).
     #[must_use]
     pub fn changed_count(&self) -> usize {
         self.steps
@@ -347,7 +350,7 @@ impl TimelineDiff {
             .count()
     }
 
-    /// Montako askelta on vain toisella aikajanalla
+    /// How many steps exist on only one of the timelines
     /// ([`StepDiff::OnlyInBefore`] + [`StepDiff::OnlyInAfter`]).
     #[must_use]
     pub fn tail_count(&self) -> usize {
@@ -362,7 +365,7 @@ impl TimelineDiff {
             .count()
     }
 
-    /// Ensimmäinen paikka jossa aikajanat erkanivat nimeltään, jos sellainen on.
+    /// The first position where the timelines diverged by name, if any.
     #[must_use]
     pub fn first_divergence(&self) -> Option<usize> {
         self.steps.iter().find_map(|d| match d {
@@ -371,7 +374,7 @@ impl TimelineDiff {
         })
     }
 
-    /// Ihmisluettava markdown-raportti vertailusta.
+    /// Human-readable markdown report of the comparison.
     #[must_use]
     pub fn render_markdown(&self) -> String {
         let mut out = String::new();
@@ -416,7 +419,7 @@ impl TimelineDiff {
     }
 }
 
-/// Lyhyt tekstiesitys lopputuloksesta diff-raporttiin.
+/// Short text representation of an outcome for the diff report.
 fn render_outcome(outcome: &StepOutcome) -> String {
     match outcome {
         StepOutcome::Completed { output } => format!("ok `{output}`"),
@@ -424,36 +427,37 @@ fn render_outcome(outcome: &StepOutcome) -> String {
     }
 }
 
-/// Counterfactual-ajon kaappaama aiottu ulkoinen sivuvaikutus (intent).
+/// An intended external side effect captured by a counterfactual run (an
+/// intent).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecordedIntent {
-    /// Askeleen looginen nimi, jonka sisällä intent syntyi.
+    /// The logical name of the step within which the intent arose.
     pub step: String,
-    /// Intentin hyötykuorma (esim. mitä *olisi* lähetetty).
+    /// The intent's payload (e.g. what *would have* been sent).
     pub payload: serde_json::Value,
 }
 
-/// Dry-run-intenttien kaappari counterfactual-ajoihin.
+/// Dry-run intent recorder for counterfactual runs.
 ///
-/// Haarautetulla aikajanalla ajettava jatko kutsuu [`record`](Self::record)
-/// -metodia siellä missä oikea suoritus dispatchaisi ulkoisen sivuvaikutuksen.
-/// **Tällä tyypillä ei ole dispatch-metodia eikä mitään polkua ulkoiseen
-/// järjestelmään** — kaapattu intent voidaan vain lukea ja raportoida. Näin
-/// "mitä agentti olisi tehnyt" on rakenteellisesti erotettu siitä, että se
-/// koskaan tapahtuisi.
+/// A continuation run on a forked timeline calls the [`record`](Self::record)
+/// method at the point where real execution would dispatch an external side
+/// effect. **This type has no dispatch method and no path whatsoever to an
+/// external system** — a captured intent can only be read and reported. This
+/// structurally separates "what the agent would have done" from it ever
+/// actually happening.
 #[derive(Debug, Default)]
 pub struct DryRunRecorder {
     intents: Mutex<Vec<RecordedIntent>>,
 }
 
 impl DryRunRecorder {
-    /// Luo tyhjän kaapparin.
+    /// Creates an empty recorder.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Kaappaa yhden aiotun sivuvaikutuksen.
+    /// Captures a single intended side effect.
     pub fn record(&self, step: impl Into<String>, payload: serde_json::Value) {
         self.intents
             .lock()
@@ -464,7 +468,7 @@ impl DryRunRecorder {
             });
     }
 
-    /// Palauttaa kopion kaikista kaapatuista intenteistä kaappausjärjestyksessä.
+    /// Returns a copy of all captured intents in capture order.
     #[must_use]
     pub fn intents(&self) -> Vec<RecordedIntent> {
         self.intents
@@ -473,7 +477,7 @@ impl DryRunRecorder {
             .clone()
     }
 
-    /// Kaapattujen intenttien lukumäärä.
+    /// The number of captured intents.
     #[must_use]
     pub fn len(&self) -> usize {
         self.intents
@@ -482,55 +486,59 @@ impl DryRunRecorder {
             .len()
     }
 
-    /// Onko kaappari tyhjä.
+    /// Whether the recorder is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
 
-/// Time Machine -fasadi: inspect, fork ja diff yhden nimen alla.
+/// Time Machine facade: inspect, fork, and diff under one name.
 ///
-/// Kaikki operaatiot ovat **lukevia lähdejournalin suhteen** — mikään ei
-/// koskaan muuta olemassa olevaa aikajanaa (append-only-invariantti säilyy).
+/// All operations are **read-only with respect to the source journal** —
+/// nothing ever mutates an existing timeline (the append-only invariant is
+/// preserved).
 #[derive(Debug, Clone, Copy)]
 pub struct TimeMachine;
 
 impl TimeMachine {
-    /// Lukee journalin tarkastelunäkymäksi. Katso [`Timeline::from_journal`].
+    /// Reads the journal into an inspection view. See
+    /// [`Timeline::from_journal`].
     ///
     /// # Errors
-    /// Vie journalin lukuvirheen läpi.
+    /// Propagates the journal's read error.
     pub fn inspect<J: Journal>(journal: &J) -> Result<Timeline> {
         Timeline::from_journal(journal)
     }
 
-    /// Haarauttaa aikajanan: kopioi lähdejournalista `keep_steps` ensimmäistä
-    /// **workflow-askelta** (sekä niitä edeltävät markerit/snapshotit) uuteen
-    /// muistijournaliin ja kirjaa perään [`FORK_MARKER`]-auditrivin.
+    /// Forks a timeline: copies the first `keep_steps` **workflow steps**
+    /// (along with the markers/snapshots preceding them) from the source
+    /// journal into a new in-memory journal, then records a [`FORK_MARKER`]
+    /// audit row after them.
     ///
-    /// Haaran päälle rakennettu [`crate::DurableContext`] toistaa säilytetyn
-    /// prefiksin deterministisesti (sivuvaikutuksia ajamatta) ja jatkaa siitä
-    /// tuoreena — leikkauspisteestä eteenpäin voi ajaa vaihtoehtoisen jatkon.
-    /// Lähdejournal ei muutu.
+    /// A [`crate::DurableContext`] built on top of the fork replays the
+    /// retained prefix deterministically (without running side effects) and
+    /// continues fresh from there — an alternative continuation can be run
+    /// from the cut point onward. The source journal is not modified.
     ///
     /// # Errors
-    /// [`DurableError::InvalidFork`] jos `keep_steps` ylittää lähdeaikajanan
-    /// askelmäärän. Muuten vie journalin luku-/kirjoitusvirheen läpi.
+    /// [`DurableError::InvalidFork`] if `keep_steps` exceeds the source
+    /// timeline's step count. Otherwise propagates the journal's
+    /// read/write error.
     pub fn fork<J: Journal>(source: &J, keep_steps: usize) -> Result<InMemoryJournal> {
         let target = InMemoryJournal::new();
         Self::fork_into(source, keep_steps, &target)?;
         Ok(target)
     }
 
-    /// Kuten [`fork`](Self::fork), mutta kirjoittaa haaran annettuun
-    /// **tyhjään** kohdejournaliin (esim. [`crate::FileJournal`] pysyvyyttä
-    /// varten). Palauttaa säilytettyjen askelten määrän.
+    /// Like [`fork`](Self::fork), but writes the fork into the given
+    /// **empty** target journal (e.g. a [`crate::FileJournal`] for
+    /// persistence). Returns the number of steps kept.
     ///
     /// # Errors
-    /// [`DurableError::InvalidFork`] jos kohde ei ole tyhjä tai `keep_steps`
-    /// ylittää lähdeaikajanan askelmäärän. Muuten vie journalin
-    /// luku-/kirjoitusvirheen läpi.
+    /// [`DurableError::InvalidFork`] if the target is not empty or
+    /// `keep_steps` exceeds the source timeline's step count. Otherwise
+    /// propagates the journal's read/write error.
     pub fn fork_into<J: Journal, T: Journal>(
         source: &J,
         keep_steps: usize,
@@ -561,7 +569,7 @@ impl TimeMachine {
             target.append(entry)?;
         }
 
-        // Auditrivi: haaran alkuperä on todennettavissa lokista itsestään.
+        // Audit row: the fork's origin is verifiable from the log itself.
         target.append(JournalEntry::marker(
             StepId::new(kept as u64),
             FORK_MARKER,
@@ -574,11 +582,11 @@ impl TimeMachine {
         Ok(kept)
     }
 
-    /// Vertaa kahta aikajanaa askel askeleelta. Katso
+    /// Compares two timelines step by step. See
     /// [`TimelineDiff::from_timelines`].
     ///
     /// # Errors
-    /// Vie kummankin journalin lukuvirheen läpi.
+    /// Propagates either journal's read error.
     pub fn diff<A: Journal, B: Journal>(before: &A, after: &B) -> Result<TimelineDiff> {
         let b = Timeline::from_journal(before)?;
         let a = Timeline::from_journal(after)?;
@@ -593,8 +601,8 @@ mod tests {
     use serde_json::json;
     use std::cell::Cell;
 
-    /// Apuri: kolmen askeleen ajo (load → decide → act) jossa "act" kaappaa
-    /// sivuvaikutuksen laskuriin. Palauttaa valmiin journalin.
+    /// Helper: a three-step run (load → decide → act) where "act" captures
+    /// a side effect into a counter. Returns the finished journal.
     fn three_step_run(effects: &Cell<u32>) -> InMemoryJournal {
         let mut ctx = DurableContext::new(InMemoryJournal::new()).expect("ctx");
         let amount: i64 = ctx.step("load", || Ok(100)).expect("load");
@@ -622,13 +630,13 @@ mod tests {
         let names: Vec<&str> = timeline.steps.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["load", "decide", "act"]);
 
-        // Paikat ovat 0-pohjaisia ja järjestyksessä.
+        // Positions are 0-based and in order.
         for (i, step) in timeline.steps.iter().enumerate() {
             assert_eq!(step.position, i);
             assert!(step.outcome.is_completed());
         }
 
-        // Tulokset luettavissa.
+        // Results are readable.
         match &timeline.step(1).expect("decide").outcome {
             StepOutcome::Completed { output } => assert_eq!(output, &json!(200)),
             other @ StepOutcome::Failed { .. } => panic!("expected completed, got {other:?}"),
@@ -677,13 +685,13 @@ mod tests {
         let fork = TimeMachine::fork(&journal, 2).expect("fork");
         let timeline = TimeMachine::inspect(&fork).expect("inspect fork");
 
-        // Prefiksi säilyi, häntä leikkautui.
+        // The prefix was kept, the tail was truncated.
         assert_eq!(timeline.len(), 2);
         assert_eq!(timeline.steps[0].name, "load");
         assert_eq!(timeline.steps[1].name, "decide");
         assert!(timeline.find("act").is_none(), "tail must be truncated");
 
-        // Auditmarker on lokissa.
+        // The audit marker is in the log.
         let entries = fork.entries();
         let marker = entries.last().expect("marker entry");
         match &marker.kind {
@@ -695,7 +703,7 @@ mod tests {
             other => panic!("expected fork marker, got {other:?}"),
         }
 
-        // Alkuperäinen aikajana ei muuttunut.
+        // The original timeline did not change.
         assert_eq!(
             TimeMachine::inspect(&journal)
                 .expect("inspect original")
@@ -734,21 +742,17 @@ mod tests {
         assert_eq!(timeline.marker_count, 1, "audit marker present");
     }
 
-    /// Ydintesti: haarautunut jatko ajaa counterfactualin — prefiksi toistuu
-    /// lokista sivuvaikutuksitta, uusi jatko ajetaan tasan kerran, eikä
-    /// alkuperäinen aikajana muutu.
+    /// Core test: a forked continuation runs a counterfactual — the prefix
+    /// replays from the log without side effects, the new continuation runs
+    /// exactly once, and the original timeline does not change.
     #[test]
     fn forked_continuation_is_counterfactual_and_leaves_original_untouched() {
         let original_effects = Cell::new(0u32);
         let journal = three_step_run(&original_effects);
-        assert_eq!(
-            original_effects.get(),
-            1,
-            "alkuperäinen act ajettiin kerran"
-        );
+        assert_eq!(original_effects.get(), 1, "the original act ran once");
         let original_len = journal.len().expect("len");
 
-        // Haaraudu ennen "decide"-askelta ja aja korjattu politiikka.
+        // Fork before the "decide" step and run a corrected policy.
         let fork = TimeMachine::fork(&journal, 1).expect("fork");
         let mut alt = DurableContext::new(fork).expect("alt ctx");
 
@@ -759,10 +763,10 @@ mod tests {
                 Ok(0)
             })
             .expect("load replay");
-        assert_eq!(amount, 100, "prefiksi palautuu lokista");
-        assert_eq!(replay_effects.get(), 0, "replay ei aja suljinta");
+        assert_eq!(amount, 100, "the prefix is restored from the log");
+        assert_eq!(replay_effects.get(), 0, "replay does not run the closure");
 
-        // Counterfactual: uusi decide-politiikka + dry-run act.
+        // Counterfactual: new decide policy + dry-run act.
         let recorder = DryRunRecorder::new();
         let approved: i64 = alt.step("decide", || Ok(amount / 2)).expect("decide alt");
         assert_eq!(approved, 50);
@@ -773,17 +777,13 @@ mod tests {
             })
             .expect("act alt");
 
-        // Intent kaapattiin — mitään ei dispatchattu (tyypillä ei ole polkua).
+        // The intent was captured — nothing was dispatched (the type has no path).
         assert_eq!(recorder.len(), 1);
         assert_eq!(recorder.intents()[0].payload, json!({"would_send": 50}));
 
-        // Alkuperäinen aikajana on täsmälleen ennallaan.
+        // The original timeline is exactly unchanged.
         assert_eq!(journal.len().expect("len"), original_len);
-        assert_eq!(
-            original_effects.get(),
-            1,
-            "ei uusia oikeita sivuvaikutuksia"
-        );
+        assert_eq!(original_effects.get(), 1, "no new real side effects");
     }
 
     #[test]
@@ -803,18 +803,22 @@ mod tests {
         let effects = Cell::new(0u32);
         let journal = three_step_run(&effects);
 
-        // Haarauta pysyvään FileJournaliin.
+        // Fork into a persistent FileJournal.
         let target = FileJournal::open(&path).expect("open target");
         let kept = TimeMachine::fork_into(&journal, 2, &target).expect("fork_into");
         assert_eq!(kept, 2);
         drop(target);
 
-        // "Restart": avaa haara uudella kahvalla ja jatka siitä.
+        // "Restart": open the fork with a new handle and continue from there.
         let reopened = FileJournal::open(&path).expect("reopen");
         let mut ctx = DurableContext::new(reopened).expect("ctx");
         let a: i64 = ctx.step("load", || Ok(0)).expect("load");
         let b: i64 = ctx.step("decide", || Ok(0)).expect("decide");
-        assert_eq!((a, b), (100, 200), "prefiksi palautuu lokista levyltäkin");
+        assert_eq!(
+            (a, b),
+            (100, 200),
+            "the prefix is restored from the log even from disk"
+        );
         assert!(!ctx.is_replaying());
 
         let _ = std::fs::remove_file(&path);
@@ -839,7 +843,7 @@ mod tests {
         let effects = Cell::new(0u32);
         let original = three_step_run(&effects);
 
-        // Haara: sama load, eri decide/act, plus ylimääräinen askel.
+        // Fork: same load, different decide/act, plus an extra step.
         let fork = TimeMachine::fork(&original, 1).expect("fork");
         let mut alt = DurableContext::new(fork).expect("alt");
         let amount: i64 = alt.step("load", || Ok(0)).expect("load");
@@ -852,9 +856,9 @@ mod tests {
 
         let diff = TimeMachine::diff(&original, &forked).expect("diff");
         assert!(!diff.is_identical());
-        assert_eq!(diff.changed_count(), 2, "decide ja act muuttuivat");
-        assert_eq!(diff.tail_count(), 1, "audit vain haarassa");
-        assert_eq!(diff.first_divergence(), None, "nimet eivät erkaantuneet");
+        assert_eq!(diff.changed_count(), 2, "decide and act changed");
+        assert_eq!(diff.tail_count(), 1, "audit only in the fork");
+        assert_eq!(diff.first_divergence(), None, "names did not diverge");
 
         assert!(matches!(
             &diff.steps[0],

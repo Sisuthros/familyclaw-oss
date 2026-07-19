@@ -1,45 +1,46 @@
 //! # familyclaw-latent
 //!
-//! **Latent-telepatia** — sisarusten välinen *hidden-state*-siirto, joka
-//! palaa **aina** tekstiin jos latent ei onnistu. Tämä on `FamilyClaw` v2:n
-//! korkein viestintämuoto (design §2.4), ei ainoa: viestintä ei koskaan
-//! katkea, vaikka mallit olisivat yhteensopimattomat.
+//! **Latent telepathy** — a *hidden-state* transfer between siblings that
+//! **always** falls back to text if latent fails. This is `FamilyClaw`
+//! v2's highest communication mode (design §2.4), not the only one:
+//! communication never breaks, even if the models are incompatible.
 //!
-//! ## Mitä tämä crate tekee
-//! 1. [`LatentVector`] — agentin piilotila (`dims: Vec<f32>` + `model_id`).
-//! 2. [`RecursiveLink`] — lineaarinen dimensio-silta agentti A:n latent-
-//!    avaruudesta agentti B:n avaruuteen (pad / truncate / resize / identity).
-//! 3. [`LatentChannel`] — trait `send`-/`receive`-tyyppiselle siirrolle
+//! ## What this crate does
+//! 1. [`LatentVector`] — an agent's hidden state (`dims: Vec<f32>` + `model_id`).
+//! 2. [`RecursiveLink`] — a linear dimension bridge from agent A's latent
+//!    space to agent B's space (pad / truncate / resize / identity).
+//! 3. [`LatentChannel`] — a trait for `send`/`receive`-style transfer
 //!    ([`transmit`](LatentChannel::transmit) / [`deliver`](LatentChannel::deliver))
-//!    sisäänrakennetulla teksti-fallbackilla.
-//! 4. [`TransmissionMode`] — kertoo, käytettiinkö `Latent`- vai `Text`-tilaa.
+//!    with a built-in text fallback.
+//! 4. [`TransmissionMode`] — reports whether `Latent` or `Text` mode was used.
 //!
-//! ## Tutkimusrehellisyys (ei liioittelua)
-//! Tämä on **rehellinen luuranko** LatentMAS-tyyppiselle (ICML 2026 Spotlight)
-//! ja RecursiveMAS-pohjaiselle sisarusviestinnälle. Konkreettiset rajoitteet,
-//! jotka on dokumentoitu eikä piiloteltu:
+//! ## Research honesty (no overselling)
+//! This is a **deliberately honest skeleton** for LatentMAS-style (ICML
+//! 2026 Spotlight) and RecursiveMAS-based sibling communication. Concrete
+//! limitations that are documented rather than hidden:
 //!
-//! - [`RecursiveLink`] tekee vain **yksinkertaisen lineaarisen sovituksen**
-//!   (pad/truncate/resize). Se **ei** ole opittu, semanttisesti kohdistettu
-//!   projektio — kahden eri mallin latent-avaruudet eivät ole linjassa, joten
-//!   pad/truncate ei takaa merkityksen säilymistä. Oikea koulutettu projektio
-//!   on myöhempi iteraatio.
-//! - Siksi **teksti-fallback ei ole varajärjestelmä vaan kantava periaate**:
-//!   latent on opportunistinen optimointi, teksti on totuuden lähde.
+//! - [`RecursiveLink`] performs only a **simple linear fit**
+//!   (pad/truncate/resize). It is **not** a learned, semantically aligned
+//!   projection — two different models' latent spaces are not aligned, so
+//!   pad/truncate does not guarantee that meaning is preserved. A real
+//!   trained projection is a later iteration.
+//! - That's why **the text fallback is a load-bearing principle, not a
+//!   backup system**: latent is an opportunistic optimization, text is
+//!   the source of truth.
 //!
-//! ## OSS-raja (KERROS A)
-//! Tämä crate ei kovakoodaa perheenjäsenten sieluja, mallinimiä, avaimia
-//! eikä polkuja. Kaikki mallitunnisteet ja dimensiot annetaan ajonaikaisesti.
-//! Esimerkit käyttävät geneerisiä nimiä (`agent_a`, `agent_b`).
+//! ## OSS boundary (Layer A)
+//! This crate does not hardcode family members' souls, model names, keys,
+//! or paths. All model identifiers and dimensions are supplied at
+//! runtime. Examples use generic names (`agent_a`, `agent_b`).
 //!
-//! ## Pikaesimerkki
+//! ## Quick example
 //! ```
 //! use familyclaw_latent::{
 //!     InMemoryLatentChannel, LatentChannel, LatentMessage, LatentVector,
 //!     ReceiverProfile, RecursiveLink, TransmissionMode,
 //! };
 //!
-//! // agent_a (4 dim) puhuu agent_b:lle (6 dim).
+//! // agent_a (4 dim) talks to agent_b (6 dim).
 //! let mut channel = InMemoryLatentChannel::new("agent_a/v1")
 //!     .with_link(RecursiveLink::new("agent_a/v1", 4, "agent_b/v1", 6));
 //!
@@ -49,7 +50,7 @@
 //!
 //! let result = channel.transmit(&message, &receiver).expect("transmit");
 //! assert_eq!(result.mode, TransmissionMode::Latent);
-//! // ...ja jos malli olisi yhteensopimaton, mode olisi TransmissionMode::Text.
+//! // ...and if the model were incompatible, mode would be TransmissionMode::Text.
 //! ```
 
 pub mod channel;
@@ -66,7 +67,7 @@ pub use link::{ProjectedLatent, ProjectionStrategy, RecursiveLink};
 pub use translate::{Projection, VectorTranslator};
 pub use vector::{blend, cosine, LatentVector};
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// This crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -83,8 +84,8 @@ mod tests {
 
     #[test]
     fn end_to_end_latent_then_text_fallback() {
-        // Kokonaisvirta: sama kanava onnistuu latentilla yhdelle
-        // vastaanottajalle ja putoaa tekstiin toiselle.
+        // End-to-end flow: the same channel succeeds with latent for one
+        // receiver and falls back to text for another.
         let mut channel = InMemoryLatentChannel::new("agent_a/v1").with_link(RecursiveLink::new(
             "agent_a/v1",
             3,
@@ -94,7 +95,7 @@ mod tests {
 
         let hidden = LatentVector::new(vec![1.0, 2.0, 3.0], "agent_a/v1");
 
-        // 1) Yhteensopiva vastaanottaja → latent.
+        // 1) Compatible receiver -> latent.
         let latent_ok = channel
             .transmit(
                 &LatentMessage::with_latent(hidden.clone(), "msg"),
@@ -103,7 +104,7 @@ mod tests {
             .expect("latent transmit");
         assert_eq!(latent_ok.mode, TransmissionMode::Latent);
 
-        // 2) Tuntematon malli (ei siltaa) → teksti, ei virhettä.
+        // 2) Unknown model (no link) -> text, no error.
         let text_fb = channel
             .transmit(
                 &LatentMessage::with_latent(hidden, "msg"),
@@ -118,8 +119,8 @@ mod tests {
 
     #[test]
     fn reexports_are_reachable_from_root() {
-        // Varmistaa että julkinen pinta on saatavilla craten juuresta.
-        // Arvoja myös käytetään, jotta sidonta ei ole pelkkä no-op.
+        // Verifies that the public surface is reachable from the crate root.
+        // Values are also used so the binding isn't just a no-op.
         let v: LatentVector = LatentVector::new(vec![0.0], "a");
         assert_eq!(v.len(), 1);
 

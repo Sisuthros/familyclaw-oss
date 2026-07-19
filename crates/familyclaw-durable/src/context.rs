@@ -1,18 +1,19 @@
-//! [`DurableContext`] — deterministisen replayn `step`-API.
+//! [`DurableContext`] — the deterministic replay `step` API.
 //!
-//! Tämä on perheen #1 kipupisteen (muistin epäjatkuvuus) rakenteellinen
-//! ratkaisu (design §2.1). Workflow kääritään askeliin
-//! ([`step`](DurableContext::step)). Kun konteksti rakennetaan olemassa olevan
-//! journalin päälle, jo suoritetut askeleet **palautetaan lokista ajamatta
-//! niiden sulkimia uudelleen** — eli sivuvaikutukset eivät toistu, mutta tulos
-//! on sama. Kaatumisen jälkeen workflow jatkuu täsmälleen siitä mihin se jäi.
+//! This is the structural solution to the family's pain point #1 (memory
+//! discontinuity) (design §2.1). The workflow is wrapped into steps
+//! ([`step`](DurableContext::step)). When a context is built on top of an
+//! existing journal, steps that already ran are **restored from the log
+//! without re-running their closures** — meaning side effects do not recur,
+//! but the result is the same. After a crash, the workflow resumes exactly
+//! where it left off.
 //!
-//! ## Determinismin invariantti
-//! Koodin täytyy tuottaa samat askeleet (sama nimi, sama järjestys) joka
-//! ajolla. Jos replay-koodi pyytää askeleen jonka nimi ei vastaa journalissa
-//! samalla paikalla olevaa, [`step`](DurableContext::step) palauttaa
-//! [`DurableError::NondeterministicReplay`]:n sen sijaan että jatkaisi
-//! hiljaa väärin.
+//! ## The determinism invariant
+//! The code must produce the same steps (same name, same order) on every
+//! run. If replaying code requests a step whose name does not match the one
+//! recorded in the journal at that position, [`step`](DurableContext::step)
+//! returns [`DurableError::NondeterministicReplay`] instead of silently
+//! continuing incorrectly.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -21,37 +22,37 @@ use crate::entry::{EntryKind, JournalEntry, StepId};
 use crate::error::{DurableError, Result};
 use crate::journal::Journal;
 
-/// Deterministisen replayn suorituskonteksti yhden journalin yli.
+/// Execution context for deterministic replay over a single journal.
 ///
-/// Geneerinen journal-toteutuksen `J` yli, joten sama logiikka toimii
-/// [`crate::InMemoryJournal`]- ja [`crate::FileJournal`]-taustalla.
+/// Generic over the journal implementation `J`, so the same logic works with
+/// both [`crate::InMemoryJournal`] and [`crate::FileJournal`] as the backend.
 #[derive(Debug)]
 pub struct DurableContext<J: Journal> {
     journal: J,
-    /// Aiemmin tallennetut rivit, joiden yli replay etenee. Vain ne rivit
-    /// jotka liittyvät askeleeseen (StepCompleted/StepFailed) — snapshotit JA
-    /// markerit suodatetaan pois, koska ne eivät ole `step`-kutsuja.
+    /// Previously recorded rows over which replay advances. Only rows tied
+    /// to a step (StepCompleted/StepFailed) — snapshots AND markers are
+    /// filtered out, since they are not `step` calls.
     replay: Vec<JournalEntry>,
-    /// Kuinka monta `step`-kutsua on jo tehty tällä kontekstilla. Toimii sekä
-    /// replay-kursorina että seuraavan askeleen sekvenssipaikkana.
+    /// How many `step` calls have already been made on this context. Serves
+    /// both as the replay cursor and as the next step's sequence position.
     cursor: usize,
 }
 
 impl<J: Journal> DurableContext<J> {
-    /// Rakentaa kontekstin journalin päälle, lataten aiemmat askeleet
-    /// replay-pohjaksi.
+    /// Builds a context on top of a journal, loading prior steps as the
+    /// replay basis.
     ///
     /// # Errors
-    /// Vie virheen läpi jos journalin luku epäonnistuu
-    /// (esim. [`DurableError::CorruptEntry`]).
+    /// Propagates the error if reading the journal fails
+    /// (e.g. [`DurableError::CorruptEntry`]).
     pub fn new(journal: J) -> Result<Self> {
         let all = journal.replay_all()?;
-        // Säilytä vain askel-rivit (StepCompleted/StepFailed) replay-kursoria
-        // varten. Snapshotit (optimointi) ja markerit (esim. dreaming-vaiheen
-        // ristiriitamerkinnät) EIVÄT ole `step`-kutsuja, joten ne eivät kuluta
-        // kursoria — näin sama jaettu loki voi kantaa molempia ilman että
-        // marker-rivi näyttäytyy workflow-askeleena ja laukaisee
-        // NondeterministicReplay-virheen.
+        // Keep only step rows (StepCompleted/StepFailed) for the replay
+        // cursor. Snapshots (an optimization) and markers (e.g. dreaming-phase
+        // contradiction annotations) are NOT `step` calls, so they do not
+        // consume the cursor — this way the same shared log can carry both
+        // without a marker row appearing as a workflow step and triggering a
+        // NondeterministicReplay error.
         let replay: Vec<JournalEntry> = all.into_iter().filter(|e| e.kind.is_step()).collect();
         Ok(Self {
             journal,
@@ -60,67 +61,69 @@ impl<J: Journal> DurableContext<J> {
         })
     }
 
-    /// Onko konteksti tällä hetkellä toistamassa aiemmin tallennettuja askelia.
+    /// Whether the context is currently replaying previously recorded steps.
     ///
-    /// `true` niin kauan kuin kursori ei ole ohittanut tallennettuja rivejä.
+    /// `true` for as long as the cursor has not passed the recorded rows.
     #[must_use]
     pub fn is_replaying(&self) -> bool {
         self.cursor < self.replay.len()
     }
 
-    /// Kuinka monta askelta on jo suoritettu tai toistettu.
+    /// How many steps have already run or been replayed.
     #[must_use]
     pub fn steps_taken(&self) -> usize {
         self.cursor
     }
 
-    /// **Ohita koko replay** — siirrä kursori tallennettujen rivien loppuun
-    /// **ajamatta** niitä uudelleen, niin että [`is_replaying`](Self::is_replaying)
-    /// palauttaa `false` ja seuraava [`step`](Self::step) menee tuore-ajo-haaraan.
+    /// **Skips the entire replay** — moves the cursor to the end of the
+    /// recorded rows **without** re-running them, so that
+    /// [`is_replaying`](Self::is_replaying) returns `false` and the next
+    /// [`step`](Self::step) takes the fresh-run branch.
     ///
-    /// Tämä on **elävän jatkamisen** (live-resume) primitiivi: kun konteksti
-    /// rakennetaan olemassa olevan journalin päälle MUTTA kutsuja ei aio syöttää
-    /// historiaa uudelleen (esim. gateway-restart, joka palvelee VAIN uusia
-    /// viestejä), aiempaa replay-historiaa ei pidä toistaa askel askeleelta.
-    /// Ilman tätä ensimmäinen elävä askel (uusi nimi, esim. `turn-{N}`) osuisi
-    /// vielä avoinna olevaan replay-haaraan ja kaatuisi
-    /// [`DurableError::NondeterministicReplay`]:hin, koska tallennettu nimi
-    /// (`turn-0`) ei täsmää.
+    /// This is the **live-resume** primitive: when a context is built on top
+    /// of an existing journal BUT the caller does not intend to feed the
+    /// history back in (e.g. a gateway restart that serves ONLY new
+    /// messages), the prior replay history should not be replayed step by
+    /// step. Without this, the first live step (a new name, e.g. `turn-{N}`)
+    /// would land in the still-open replay branch and fail with
+    /// [`DurableError::NondeterministicReplay`], because the recorded name
+    /// (`turn-0`) would not match.
     ///
-    /// Seuraava tuore askel saa sekvenssipaikan `replay.len()` (jatkaa lokin
-    /// perään), eikä yksikään tallennettu sivuvaikutus aja uudelleen.
+    /// The next fresh step is assigned the sequence position `replay.len()`
+    /// (continuing after the log), and no recorded side effect is re-run.
     ///
-    /// Vastinpari: in-order-uudelleensyöttö (continuity-daemon, replay-testit)
-    /// EI kutsu tätä — se haluaa nimenomaan toistaa historian askel askeleelta.
+    /// Counterpart: in-order re-feeding (the continuity daemon, replay tests)
+    /// does NOT call this — it specifically wants to replay history step by
+    /// step.
     pub fn fast_forward_replay(&mut self) {
         self.cursor = self.replay.len();
     }
 
-    /// Seuraavan askeleen sekvenssipaikka.
+    /// The sequence position of the next step.
     #[must_use]
     pub fn next_step_id(&self) -> StepId {
         StepId::new(self.cursor as u64)
     }
 
-    /// Suorittaa nimetyn askeleen kerran-ja-vain-kerran-semantiikalla.
+    /// Executes the named step with run-once-and-only-once semantics.
     ///
-    /// - **Tuore ajo:** suljin `f` ajetaan, tulos sarjallistuu ja kirjoitetaan
-    ///   journaliin ennen paluuta.
-    /// - **Replay:** jos tällä paikalla on jo tallennettu rivi, suljinta `f`
-    ///   **ei ajeta** — tallennettu tulos jäsennetään ja palautetaan (tai
-    ///   tallennettu virhe palautetaan).
+    /// - **Fresh run:** the closure `f` runs, its result is serialized and
+    ///   written to the journal before returning.
+    /// - **Replay:** if a row is already recorded at this position, the
+    ///   closure `f` is **not run** — the recorded result is parsed and
+    ///   returned (or the recorded error is returned).
     ///
-    /// Tämä takaa että askeleen sivuvaikutukset (verkkokutsu, tiedostokirjoitus)
-    /// tapahtuvat tasan kerran koko workflow'n elinkaaren yli, vaikka prosessi
-    /// kaatuisi ja käynnistyisi uudelleen kesken.
+    /// This guarantees that a step's side effects (a network call, a file
+    /// write) happen exactly once over the workflow's entire lifecycle, even
+    /// if the process crashes and restarts mid-way.
     ///
     /// # Errors
-    /// - [`DurableError::NondeterministicReplay`] jos `name` ei vastaa
-    ///   journalissa tällä paikalla olevaa askelta.
-    /// - [`DurableError::StepFailed`] jos suljin palautti virheen (tuore ajo)
-    ///   tai jos tallennettu rivi oli epäonnistuminen (replay).
-    /// - [`DurableError::Serde`] jos tuloksen sarjallistus/jäsennys epäonnistuu.
-    /// - [`DurableError::Io`] jos journalin kirjoitus epäonnistuu.
+    /// - [`DurableError::NondeterministicReplay`] if `name` does not match
+    ///   the step recorded in the journal at this position.
+    /// - [`DurableError::StepFailed`] if the closure returned an error (fresh
+    ///   run) or the recorded row was a failure (replay).
+    /// - [`DurableError::Serde`] if serializing/parsing the result fails.
+    /// - [`DurableError::Io`] if writing to the journal fails.
     pub fn step<T, F>(&mut self, name: &str, f: F) -> Result<T>
     where
         T: Serialize + DeserializeOwned,
@@ -128,7 +131,7 @@ impl<J: Journal> DurableContext<J> {
     {
         let index = self.cursor as u64;
 
-        // Replay-haara: tällä paikalla on jo tallennettu rivi.
+        // Replay branch: a row is already recorded at this position.
         if let Some(entry) = self.replay.get(self.cursor) {
             let recorded_name = entry.step_name().unwrap_or_default();
             if recorded_name != name {
@@ -146,10 +149,10 @@ impl<J: Journal> DurableContext<J> {
                 EntryKind::StepFailed { error, .. } => {
                     Err(DurableError::step_failed(name, error.clone()))
                 }
-                // Replay-vektori sisältää vain askel-rivejä (`is_step`),
-                // joten snapshotit/markerit (ja mahdolliset tulevat ei-askel-
-                // lajit) on jo suodatettu pois `new`:ssä. Tätä haaraa ei pitäisi
-                // koskaan saavuttaa — mutta käsitellään silti ilman paniikkia.
+                // The replay vector contains only step rows (`is_step`), so
+                // snapshots/markers (and any future non-step kinds) have
+                // already been filtered out in `new`. This branch should
+                // never be reached — but it's still handled without panicking.
                 other => Err(DurableError::NondeterministicReplay {
                     index,
                     expected: name.to_string(),
@@ -160,7 +163,7 @@ impl<J: Journal> DurableContext<J> {
             return result;
         }
 
-        // Tuore-ajo-haara: suljin ajetaan kerran.
+        // Fresh-run branch: the closure runs once.
         let step_id = StepId::new(index);
         match f() {
             Ok(value) => {
@@ -171,8 +174,8 @@ impl<J: Journal> DurableContext<J> {
                 Ok(value)
             }
             Err(message) => {
-                // Kirjaa epäonnistuminen jotta replay palauttaa saman virheen
-                // ajamatta sivuvaikutuksia uudelleen.
+                // Record the failure so replay returns the same error without
+                // re-running side effects.
                 self.journal
                     .append(JournalEntry::failed(step_id, name, message.clone()))?;
                 self.cursor += 1;
@@ -181,51 +184,54 @@ impl<J: Journal> DurableContext<J> {
         }
     }
 
-    /// Kirjoittaa snapshotin nykytilasta nykyiselle sekvenssipaikalle.
+    /// Writes a snapshot of the current state at the current sequence position.
     ///
-    /// Snapshot ei kuluta `step`-kursoria eikä keskeytä replayta — se on
-    /// lisämerkintä lokiin auditointia/optimointia varten.
+    /// A snapshot does not consume the `step` cursor and does not interrupt
+    /// replay — it is an additional entry in the log for auditing/optimization.
     ///
     /// # Errors
-    /// [`DurableError::Io`]/[`DurableError::Serde`] jos kirjoitus epäonnistuu.
+    /// [`DurableError::Io`]/[`DurableError::Serde`] if the write fails.
     pub fn snapshot<S: Serialize>(&mut self, state: &S) -> Result<()> {
         let value = serde_json::to_value(state)?;
         self.journal.snapshot(self.next_step_id(), value)
     }
 
-    /// Kuluttaa kontekstin ja palauttaa taustalla olevan journalin.
+    /// Consumes the context and returns the underlying journal.
     ///
-    /// Tätä käytetään kun workflow on ajettu loppuun (tai "kaatumisen"
-    /// simuloimiseksi testeissä): journal voidaan ottaa talteen ja rakentaa
-    /// uusi konteksti sen päälle replayta varten.
+    /// Used when the workflow has finished running (or to simulate a
+    /// "crash" in tests): the journal can be taken and a new context built
+    /// on top of it for replay.
     #[must_use]
     pub fn finish(self) -> J {
         self.journal
     }
 
-    /// Palauttaa viittauksen taustalla olevaan journaliin (esim. rivien
-    /// tarkasteluun testeissä).
+    /// Returns a reference to the underlying journal (e.g. to inspect rows
+    /// in tests).
     #[must_use]
     pub fn journal(&self) -> &J {
         &self.journal
     }
 
-    /// Montako **ylätason vuoroa** (`turn-{n}`) replay-vektorissa on.
+    /// How many **top-level turns** (`turn-{n}`) are in the replay vector.
     ///
-    /// Agentin vuoronkäsittely kirjaa per vuoro KAKSI askelta: ylätason
-    /// `turn-{n}` ja sen ali-askeleen `turn-{n}-think`. Kun agentti rakennetaan
-    /// olemassa olevan journalin päälle (esim. gateway-restart), sen
-    /// `turn_counter` on alustettava tällä luvulla — muuten seuraava ELÄVÄ vuoro
-    /// alkaisi paikasta `turn-0`, osuisi replay-haaraan ja palauttaisi vanhan
-    /// lopputuloksen ajamatta uutta viestiä (restart-mykkyys + muistihäviö).
+    /// The agent's turn handling records TWO steps per turn: the top-level
+    /// `turn-{n}` and its sub-step `turn-{n}-think`. When the agent is built
+    /// on top of an existing journal (e.g. a gateway restart), its
+    /// `turn_counter` must be initialized with this number — otherwise the
+    /// next LIVE turn would start at `turn-0`, land in the replay branch, and
+    /// return the old result without processing the new message (restart
+    /// muteness + memory loss).
     ///
-    /// Laskee **ali-askeleet pois** (`-think`): vain `turn-{n}` muotoiset nimet,
-    /// joissa `{n}` on pelkkä luku, lasketaan. Palauttaa suurimman vuoronumeron
-    /// **+ 1** (eli seuraavan vapaan vuoropaikan), tai `0` jos vuoroja ei ole.
-    /// `max+1` (eikä pelkkä laskuri) on kestävä myös aukoille lokissa.
+    /// **Sub-steps are excluded** (`-think`): only names of the exact form
+    /// `turn-{n}`, where `{n}` is a plain number, are counted. Returns the
+    /// highest turn number **+ 1** (i.e. the next free turn slot), or `0` if
+    /// there are no turns. `max+1` (rather than a plain counter) is resilient
+    /// to gaps in the log.
     ///
-    /// **Tämä EI muuta replay-kursoria** — se vain lukee replay-vektorin.
-    /// In-memory (ei-persistentti) polku, jossa replay on tyhjä, palauttaa `0`.
+    /// **This does NOT mutate the replay cursor** — it only reads the replay
+    /// vector. The in-memory (non-persistent) path, where replay is empty,
+    /// returns `0`.
     #[must_use]
     pub fn replayed_turn_count(&self) -> u64 {
         self.replay
@@ -236,12 +242,12 @@ impl<J: Journal> DurableContext<J> {
             .map_or(0, |max| max + 1)
     }
 
-    /// Tarkistaa onko annettu askel jo suoritettu.
+    /// Checks whether a given step has already run.
     ///
     /// # Errors
-    /// Palauttaa virheen jos journalin luku epäonnistuu.
+    /// Returns an error if reading the journal fails.
     pub fn has_run_step(&self, name: &str) -> Result<bool> {
-        // Replay-vektori sisältää vain askel-rivit (StepCompleted/StepFailed)
+        // The replay vector contains only step rows (StepCompleted/StepFailed).
         for entry in &self.replay {
             if let Some(step_name) = entry.step_name() {
                 if step_name == name {
@@ -253,20 +259,21 @@ impl<J: Journal> DurableContext<J> {
     }
 }
 
-/// Jäsentää **ylätason vuoron** numeron askelnimestä, jos nimi on tasan
-/// `turn-{n}` (ei `turn-{n}-think` -ali-askel eikä muu askel).
+/// Parses the **top-level turn** number from a step name, if the name is
+/// exactly `turn-{n}` (not a `turn-{n}-think` sub-step nor any other step).
 ///
-/// Palauttaa `Some(n)` vain kun `{n}` on kelvollinen `u64` ilman lisäliitteitä;
-/// muuten `None`. Näin `replayed_turn_count` laskee per-vuoro vain kerran,
-/// vaikka jokainen vuoro kirjaa myös `-think`-ali-askeleen.
+/// Returns `Some(n)` only when `{n}` is a valid `u64` with no extra suffix;
+/// otherwise `None`. This way `replayed_turn_count` counts each turn only
+/// once, even though every turn also records a `-think` sub-step.
 fn parse_top_level_turn(step_name: &str) -> Option<u64> {
     step_name.strip_prefix("turn-")?.parse::<u64>().ok()
 }
 
-/// Lyhyt diagnostiikkaleima ei-askel-rivilajille (snapshot/marker/tuleva laji).
+/// A short diagnostic label for non-step row kinds (snapshot/marker/future kind).
 ///
-/// Käytetään vain "ei pitäisi tapahtua" -virhepolulla: replay-vektori on jo
-/// suodatettu pelkkiin askeliin, joten tätä kutsutaan käytännössä ei koskaan.
+/// Used only on the "should never happen" error path: the replay vector is
+/// already filtered down to steps only, so this is in practice essentially
+/// never called.
 fn non_step_label(kind: &EntryKind) -> &'static str {
     if kind.is_snapshot() {
         "snapshot"
@@ -283,12 +290,12 @@ mod tests {
     use crate::memory::InMemoryJournal;
     use std::cell::Cell;
 
-    /// Apuri: tuore konteksti tyhjän muistijournalin päälle.
+    /// Helper: a fresh context on top of an empty in-memory journal.
     fn fresh() -> DurableContext<InMemoryJournal> {
         DurableContext::new(InMemoryJournal::new()).expect("new context")
     }
 
-    /// Pieni RAII-temp-tiedosto ilman ulkoisia crateja.
+    /// A small RAII temp file without external crates.
     struct TempPath(std::path::PathBuf);
 
     impl TempPath {
@@ -315,8 +322,8 @@ mod tests {
         }
     }
 
-    /// Kolmiaskelinen testityö: 10 → +5 → ×2 = 30. Laskuri kirjaa montako
-    /// kertaa sulkimet OIKEASTI ajetaan (replay ei kasvata sitä).
+    /// A three-step test workflow: 10 → +5 → ×2 = 30. The counter records how
+    /// many times the closures are ACTUALLY run (replay does not increment it).
     fn three_step_workflow<J: Journal>(
         ctx: &mut DurableContext<J>,
         effects: &Cell<u32>,
@@ -371,18 +378,18 @@ mod tests {
             }
             other => panic!("expected StepFailed, got {other:?}"),
         }
-        // Epäonnistuminen on lokissa.
+        // The failure is in the log.
         let entries = ctx.journal().entries();
         assert_eq!(entries.len(), 1);
         assert!(matches!(entries[0].kind, EntryKind::StepFailed { .. }));
     }
 
-    /// Ydintesti: aja workflow puoliksi sivuvaikutuksilla, "kaada", rakenna
-    /// uusi konteksti samasta journalista, replay → side-effectit EIVÄT toistu,
-    /// tulos sama.
+    /// Core test: run a workflow halfway with side effects, "crash", build a
+    /// new context from the same journal, replay → the side effects do NOT
+    /// recur, the result is the same.
     #[test]
     fn replay_does_not_repeat_side_effects() {
-        // Sivuvaikutuslaskuri: jokainen sulkimen oikea suoritus kasvattaa tätä.
+        // Side-effect counter: each real execution of the closure increments this.
         let effects = Cell::new(0u32);
 
         let run_workflow = |ctx: &mut DurableContext<InMemoryJournal>| -> Result<i32> {
@@ -401,36 +408,36 @@ mod tests {
             Ok(c)
         };
 
-        // --- Ensimmäinen (täysi) ajo ---
+        // --- First (full) run ---
         let journal = InMemoryJournal::new();
         let mut ctx = DurableContext::new(journal).expect("ctx 1");
         let first = run_workflow(&mut ctx).expect("first run");
         assert_eq!(first, 30);
-        assert_eq!(effects.get(), 3, "kolme sivuvaikutusta tuoreessa ajossa");
+        assert_eq!(effects.get(), 3, "three side effects in the fresh run");
 
-        // Ota journal talteen kuin se olisi levyllä kaatumisen yli.
+        // Take the journal as if it survived a crash on disk.
         let journal = ctx.finish();
         assert_eq!(journal.len().expect("len"), 3);
 
-        // --- Replay: uusi konteksti samasta journalista ---
+        // --- Replay: new context from the same journal ---
         let mut ctx2 = DurableContext::new(journal).expect("ctx 2");
         let replayed = run_workflow(&mut ctx2).expect("replay run");
 
-        // Tulos identtinen JA yhtään uutta sivuvaikutusta ei syntynyt.
+        // The result is identical AND no new side effects occurred.
         assert_eq!(replayed, first);
         assert_eq!(
             effects.get(),
             3,
-            "replay ei saa ajaa sulkimia uudelleen — ei uusia sivuvaikutuksia"
+            "replay must not re-run closures — no new side effects"
         );
     }
 
-    /// Kaadu kesken: vain osa askeleista on lokissa, replay täyttää loput.
+    /// Crash mid-workflow: only some steps are in the log, replay fills in the rest.
     #[test]
     fn partial_journal_resumes_from_where_it_left_off() {
         let effects = Cell::new(0u32);
 
-        // Vaihe 1: aja vain kaksi ensimmäistä askelta, sitten "kaada".
+        // Step 1: run only the first two steps, then "crash".
         let journal = InMemoryJournal::new();
         let mut ctx = DurableContext::new(journal).expect("ctx");
         let _ = ctx
@@ -449,8 +456,8 @@ mod tests {
         assert_eq!(effects.get(), 2);
         assert_eq!(journal.len().expect("len"), 2);
 
-        // Vaihe 2: jatka — a ja b toistetaan lokista (ei sivuvaikutusta),
-        // c ajetaan tuoreena (yksi uusi sivuvaikutus).
+        // Step 2: continue — a and b replay from the log (no side effect),
+        // c runs fresh (one new side effect).
         let mut ctx2 = DurableContext::new(journal).expect("ctx 2");
         assert!(ctx2.is_replaying());
         let a: i32 = ctx2
@@ -465,7 +472,7 @@ mod tests {
                 Ok(2)
             })
             .expect("b replay");
-        assert!(!ctx2.is_replaying(), "kursori ohitti tallennetut rivit");
+        assert!(!ctx2.is_replaying(), "the cursor passed the recorded rows");
         let c: i32 = ctx2
             .step("c", || {
                 effects.set(effects.get() + 1);
@@ -473,13 +480,13 @@ mod tests {
             })
             .expect("c fresh");
         assert_eq!(c, 3);
-        // a+b toistettiin (0 uutta), c tuore (+1) → yhteensä 3.
+        // a+b replayed (0 new), c fresh (+1) → total 3.
         assert_eq!(effects.get(), 3);
     }
 
     #[test]
     fn nondeterministic_step_name_is_detected() {
-        // Lokissa askel "a"; replay-koodi pyytää "b" samalla paikalla.
+        // The log has step "a"; the replaying code requests "b" at the same position.
         let mut ctx = fresh();
         let _ = ctx.step("a", || Ok::<_, String>(1)).expect("a");
         let journal = ctx.finish();
@@ -505,22 +512,19 @@ mod tests {
     #[test]
     fn recorded_failure_replays_as_failure_without_rerun() {
         let ran = Cell::new(false);
-        // Tuore ajo: askel epäonnistuu, kirjautuu virheenä.
+        // Fresh run: the step fails, is recorded as an error.
         let journal = InMemoryJournal::new();
         let mut ctx = DurableContext::new(journal).expect("ctx");
         let _ = ctx.step::<i32, _>("risky", || Err("nope".to_string()));
         let journal = ctx.finish();
 
-        // Replay: sama askel palauttaa saman virheen ajamatta suljinta.
+        // Replay: the same step returns the same error without running the closure.
         let mut ctx2 = DurableContext::new(journal).expect("ctx2");
         let res: Result<i32> = ctx2.step("risky", || {
             ran.set(true);
             Ok(99)
         });
-        assert!(
-            !ran.get(),
-            "epäonnistunutta askelta ei aja uudelleen replayssa"
-        );
+        assert!(!ran.get(), "a failed step must not be re-run during replay");
         match res {
             Err(DurableError::StepFailed { message, .. }) => assert_eq!(message, "nope"),
             other => panic!("expected StepFailed, got {other:?}"),
@@ -529,8 +533,8 @@ mod tests {
 
     #[test]
     fn finish_consumes_context_and_returns_journal() {
-        // finish() siirtää omistuksen journaliin, joten kontekstia ei voi enää
-        // käyttää (käännösaikainen takuu, ei ajonaikainen lippu).
+        // finish() transfers ownership to the journal, so the context can no
+        // longer be used (a compile-time guarantee, not a runtime flag).
         let mut ctx = fresh();
         let _ = ctx.step("a", || Ok::<_, String>(1)).expect("a");
         let journal = ctx.finish();
@@ -545,7 +549,7 @@ mod tests {
             .expect("snapshot");
         let _ = ctx.step("b", || Ok::<_, String>(2)).expect("b");
 
-        // Lokissa: a (step0), snapshot, b (step1). Snapshot ei kuluta kursoria.
+        // In the log: a (step0), snapshot, b (step1). Snapshot does not consume the cursor.
         let entries = ctx.journal().entries();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].step_name(), Some("a"));
@@ -557,14 +561,14 @@ mod tests {
 
     #[test]
     fn snapshot_is_ignored_during_replay_cursor() {
-        // Lokissa snapshot askelten välissä ei saa rikkoa replayn nimimatchia.
+        // A snapshot between steps in the log must not break replay's name matching.
         let mut ctx = fresh();
         let _ = ctx.step("a", || Ok::<_, String>(1)).expect("a");
         ctx.snapshot(&serde_json::json!({"x": 1})).expect("snap");
         let _ = ctx.step("b", || Ok::<_, String>(2)).expect("b");
         let journal = ctx.finish();
 
-        // Replay: a ja b toistuvat oikein vaikka snapshot on välissä lokissa.
+        // Replay: a and b replay correctly even with a snapshot in between in the log.
         let mut ctx2 = DurableContext::new(journal).expect("ctx2");
         let a: i32 = ctx2.step("a", || Ok(0)).expect("a replay");
         let b: i32 = ctx2.step("b", || Ok(0)).expect("b replay");
@@ -574,8 +578,8 @@ mod tests {
 
     #[test]
     fn marker_in_log_does_not_consume_step_cursor_or_break_replay() {
-        // Loki jossa askel "a", marker (ei-askel), askel "b". Markerin EI saa
-        // näkyä replay-kursorissa eikä aiheuttaa NondeterministicReplay:ta.
+        // A log with step "a", a marker (non-step), step "b". The marker must
+        // NOT show up in the replay cursor nor cause NondeterministicReplay.
         let mut ctx = fresh();
         let _ = ctx.step("a", || Ok::<_, String>(1)).expect("a");
         ctx.journal
@@ -588,12 +592,12 @@ mod tests {
         let _ = ctx.step("b", || Ok::<_, String>(2)).expect("b");
         let journal = ctx.finish();
 
-        // Lokissa kolme riviä mutta vain kaksi askelta.
+        // The log has three rows but only two steps.
         assert_eq!(journal.len().expect("len"), 3);
 
-        // Replay: a ja b toistuvat oikein vaikka marker on välissä lokissa.
+        // Replay: a and b replay correctly even with a marker in between in the log.
         let mut ctx2 = DurableContext::new(journal).expect("ctx2");
-        // Replay-kursori näkee vain kaksi askelta (marker suodatettu pois).
+        // The replay cursor sees only two steps (the marker is filtered out).
         assert!(ctx2.is_replaying());
         let a: i32 = ctx2.step("a", || Ok(0)).expect("a replay");
         let b: i32 = ctx2.step("b", || Ok(0)).expect("b replay");
@@ -605,7 +609,7 @@ mod tests {
 
     #[test]
     fn replayed_turn_count_counts_top_level_turns_only() {
-        // Simuloi agentin vuoroloki: per vuoro `turn-{n}` + `turn-{n}-think`.
+        // Simulate an agent's turn log: per turn, `turn-{n}` + `turn-{n}-think`.
         let mut ctx = fresh();
         let _ = ctx.step("turn-0", || Ok::<_, String>(0)).expect("t0");
         let _ = ctx
@@ -617,19 +621,19 @@ mod tests {
             .expect("t1-think");
         let journal = ctx.finish();
 
-        // Rakenna uudelleen → replay-vektorissa neljä askelta, mutta vain KAKSI
-        // ylätason vuoroa. Seuraava vapaa vuoropaikka = 2.
+        // Rebuild → the replay vector has four steps, but only TWO top-level
+        // turns. The next free turn slot = 2.
         let ctx2 = DurableContext::new(journal).expect("ctx2");
         assert_eq!(
             ctx2.replayed_turn_count(),
             2,
-            "kaksi ylätason vuoroa (turn-0, turn-1); -think-ali-askeleita ei lasketa"
+            "two top-level turns (turn-0, turn-1); -think sub-steps are not counted"
         );
     }
 
     #[test]
     fn fast_forward_replay_skips_to_live_without_rerunning() {
-        // Aja kaksi askelta, "kaadu", rakenna uudelleen → replay-tila.
+        // Run two steps, "crash", rebuild → replay state.
         let effects = Cell::new(0u32);
         let journal = {
             let mut ctx = fresh();
@@ -650,39 +654,43 @@ mod tests {
         assert_eq!(effects.get(), 2);
 
         let mut ctx2 = DurableContext::new(journal).expect("ctx2");
-        assert!(ctx2.is_replaying(), "kaksi askelta lokissa");
+        assert!(ctx2.is_replaying(), "two steps in the log");
 
-        // Elävä jatkaminen: ohita replay ajamatta sitä uudelleen.
+        // Live continuation: skip replay without re-running it.
         ctx2.fast_forward_replay();
-        assert!(!ctx2.is_replaying(), "kursori siirtyi replayn loppuun");
+        assert!(
+            !ctx2.is_replaying(),
+            "the cursor moved to the end of replay"
+        );
         assert_eq!(ctx2.steps_taken(), 2);
 
-        // Seuraava askel on TUORE (uusi nimi) eikä kaadu NondeterministicReplay:
-        // hin — se kirjautuu lokin perään sekvenssipaikalle 2.
+        // The next step is FRESH (a new name) and does not fail with
+        // NondeterministicReplay — it is recorded after the log at sequence
+        // position 2.
         let fresh_effect = Cell::new(0u32);
         let out: i32 = ctx2
             .step("turn-1", || {
                 fresh_effect.set(fresh_effect.get() + 1);
                 Ok(42)
             })
-            .expect("uusi elävä askel ei kaadu");
+            .expect("a new live step must not fail");
         assert_eq!(out, 42);
-        assert_eq!(fresh_effect.get(), 1, "uusi askel ajettiin tasan kerran");
+        assert_eq!(fresh_effect.get(), 1, "the new step ran exactly once");
         assert_eq!(ctx2.next_step_id(), StepId::new(3));
-        // Replatut askeleet eivät ajaneet uudelleen.
+        // Replayed steps did not run again.
         assert_eq!(effects.get(), 2);
     }
 
     #[test]
     fn replayed_turn_count_is_zero_for_empty_journal() {
-        // Tuore (ei-persistentti) polku: replay tyhjä → seuraava vuoro = 0.
+        // Fresh (non-persistent) path: replay is empty → next turn = 0.
         let ctx = fresh();
         assert_eq!(ctx.replayed_turn_count(), 0);
     }
 
     #[test]
     fn replayed_turn_count_ignores_non_turn_steps() {
-        // Vieras askel ("warmup") ei saa vaikuttaa vuorolaskuriin.
+        // A foreign step ("warmup") must not affect the turn counter.
         let mut ctx = fresh();
         let _ = ctx.step("warmup", || Ok::<_, String>(1)).expect("warmup");
         let _ = ctx.step("turn-0", || Ok::<_, String>(0)).expect("t0");
@@ -692,7 +700,7 @@ mod tests {
         assert_eq!(
             ctx2.replayed_turn_count(),
             1,
-            "vain turn-0 lasketaan vuoroksi"
+            "only turn-0 is counted as a turn"
         );
     }
 
@@ -704,11 +712,11 @@ mod tests {
         assert_eq!(ctx.next_step_id(), StepId::new(1));
     }
 
-    /// Ydin-integraatio (review issue #8): kaatumiskestävyys päästä päähän
-    /// `DurableContext`:n + `FileJournal`:in **yhdistelmänä**, kun viimeinen
-    /// rivi typistyi kaatumisessa. Resumeen jälkeen säilyneet askeleet eivät
-    /// toista sivuvaikutuksia, typistynyt askel ajetaan tuoreena tasan kerran,
-    /// ja lopputulos vastaa kaatumatonta ajoa (= 30).
+    /// Core integration test (review issue #8): end-to-end crash resistance
+    /// as a **combination** of `DurableContext` + `FileJournal`, when the
+    /// last row was truncated by a crash. After resuming, the preserved
+    /// steps do not repeat side effects, the truncated step runs fresh
+    /// exactly once, and the final result matches a crash-free run (= 30).
     #[test]
     fn file_journal_torn_last_line_resumes_on_correct_step() {
         use crate::file::FileJournal;
@@ -716,21 +724,21 @@ mod tests {
 
         let tmp = TempPath::new("torn");
 
-        // --- Vaihe 1: aja kaikki kolme askelta FileJournaliin, sitten "kaada". ---
+        // --- Step 1: run all three steps into a FileJournal, then "crash". ---
         let effects = Cell::new(0u32);
         {
             let mut ctx =
                 DurableContext::new(FileJournal::open(tmp.path()).expect("open 1")).expect("ctx 1");
             assert_eq!(three_step_workflow(&mut ctx, &effects).expect("first"), 30);
-            assert_eq!(effects.get(), 3, "kolme tuoretta sivuvaikutusta");
+            assert_eq!(effects.get(), 3, "three fresh side effects");
         }
 
-        // --- Kaatuminen: revi viimeinen rivi (step_c): jätä kaksi ehjää riviä +
-        //     vajaa (rivinvaihdoton) tynkä = klassinen torn last line. ---
+        // --- Crash: tear the last row (step_c): leave two intact rows +
+        //     an incomplete (newline-less) fragment = the classic torn last line. ---
         {
             let contents = std::fs::read_to_string(tmp.path()).expect("read");
             let mut lines: Vec<&str> = contents.lines().collect();
-            assert_eq!(lines.len(), 3, "kolme riviä ennen revintää");
+            assert_eq!(lines.len(), 3, "three rows before tearing");
             lines.pop();
             let mut f = std::fs::File::create(tmp.path()).expect("recreate");
             for l in &lines {
@@ -740,19 +748,19 @@ mod tests {
             f.flush().expect("flush");
         }
 
-        // --- Vaihe 2: resume. step_a + step_b toistuvat lokista (ei uutta
-        //     sivuvaikutusta), step_c ajetaan tuoreena TASAN kerran. ---
+        // --- Step 2: resume. step_a + step_b replay from the log (no new
+        //     side effect), step_c runs fresh EXACTLY once. ---
         let resumed_effects = Cell::new(0u32);
         let mut ctx2 =
             DurableContext::new(FileJournal::open(tmp.path()).expect("open 2")).expect("ctx 2");
-        assert!(ctx2.is_replaying(), "kaksi ehjää askelta lokissa");
+        assert!(ctx2.is_replaying(), "two intact steps in the log");
         let resumed = three_step_workflow(&mut ctx2, &resumed_effects).expect("resume");
 
-        assert_eq!(resumed, 30, "lopputulos vastaa kaatumatonta ajoa");
+        assert_eq!(resumed, 30, "the final result matches a crash-free run");
         assert_eq!(
             resumed_effects.get(),
             1,
-            "vain typistynyt step_c ajettiin uudelleen; step_a/step_b tulivat lokista"
+            "only the truncated step_c ran again; step_a/step_b came from the log"
         );
     }
 
@@ -778,7 +786,7 @@ mod tests {
         assert_eq!(out, made);
         let journal = ctx.finish();
 
-        // Replay palauttaa identtisen rakenteen jäsennettynä lokista.
+        // Replay returns an identical structure parsed from the log.
         let mut ctx2 = DurableContext::new(journal).expect("ctx2");
         let replayed: Payload = ctx2
             .step("build", || {

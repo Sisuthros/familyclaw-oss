@@ -1,33 +1,35 @@
-//! [`FamilyClawSubject`] — ajaa `continuity_daemon`-binääriä mustana laatikkona.
+//! [`FamilyClawSubject`] — runs the `continuity_daemon` binary as a black box.
 //!
-//! Tämä on ensimmäinen [`Subject`]-toteutus (design §2.1). Se EI kutsu
-//! FamilyClaw-crateja suoraan vaan ajaa `continuity_daemon`-binääriä erillisinä
-//! lapsiprosesseina — todistaen jatkuvuuden **aidon prosessirajan yli**
-//! (sama malli kuin `familyclaw-agent/src/bin/crash_replay.rs`). Näin benchmark
-//! mittaa mitä skeptikko itse voi ajaa, ei in-process-kirjastokutsua.
+//! This is the first [`Subject`] implementation (design §2.1). It does NOT
+//! call FamilyClaw crates directly but runs the `continuity_daemon` binary
+//! as separate child processes — proving continuity **across a real process
+//! boundary** (the same pattern as `familyclaw-agent/src/bin/crash_replay.rs`).
+//! This way the benchmark measures what a skeptic can run themselves, not an
+//! in-process library call.
 //!
-//! ## Elinkaari
-//! 1. [`start_task`](FamilyClawSubject::start_task) — varaa väliaikaisen
-//!    journal- + store-polun ja tallentaa tehtävän (ei vielä aja daemonia).
-//! 2. [`kill`](FamilyClawSubject::kill) — ajaa `continuity_daemon start
-//!    --crash-at <point>` joka kirjoittaa tilan ja poistuu kaatumispisteessä
-//!    (`Clean` ajaa loppuun).
-//! 3. [`restart`](FamilyClawSubject::restart) — ajaa `resume`:n joka rakentaa
-//!    kontekstin journalista, toistaa valmistuneet askeleet ja viimeistelee.
-//! 4. [`recall`](FamilyClawSubject::recall) — ajaa `recall`:n persistoitua
-//!    tallennusta vasten.
-//! 5. [`sleep_cycle`](FamilyClawSubject::sleep_cycle) — ajaa `sleep`:n
-//!    (yksi [`DreamCycle`](familyclaw_dream::DreamCycle)).
+//! ## Lifecycle
+//! 1. [`start_task`](FamilyClawSubject::start_task) — reserves a temporary
+//!    journal + store path and stores the task (does not yet run the daemon).
+//! 2. [`kill`](FamilyClawSubject::kill) — runs `continuity_daemon start
+//!    --crash-at <point>`, which writes state and exits at the crash point
+//!    (`Clean` runs to completion).
+//! 3. [`restart`](FamilyClawSubject::restart) — runs `resume`, which rebuilds
+//!    context from the journal, replays completed steps, and finalizes.
+//! 4. [`recall`](FamilyClawSubject::recall) — runs `recall` against the
+//!    persisted store.
+//! 5. [`sleep_cycle`](FamilyClawSubject::sleep_cycle) — runs `sleep` (one
+//!    [`DreamCycle`](familyclaw_dream::DreamCycle)).
 //!
-//! ## Reprodusoitavuus
-//! Kello injektoidaan jokaiseen daemon-kutsuun `--clock <rfc3339>`-argumenttina
-//! ([`Timestamp`]) — daemon ei lue järjestelmäkelloa. Sama syöte → sama tulos.
+//! ## Reproducibility
+//! The clock is injected into every daemon call as a `--clock <rfc3339>`
+//! argument ([`Timestamp`]) — the daemon never reads the system clock. Same
+//! input → same result.
 //!
-//! ## Binäärin paikannus
-//! Testeissä käytetään `CARGO_BIN_EXE_continuity_daemon`-ympäristömuuttujaa
-//! (Cargo asettaa sen). Muuten polun voi antaa eksplisiittisesti tai antaa
-//! ympäristömuuttujan `CONTINUITY_DAEMON_BIN` kautta; viimeisenä fallbackina
-//! oletetaan että `continuity_daemon` on `PATH`:ssa.
+//! ## Binary resolution
+//! Tests use the `CARGO_BIN_EXE_continuity_daemon` environment variable
+//! (set by Cargo). Otherwise the path can be given explicitly, or via the
+//! `CONTINUITY_DAEMON_BIN` environment variable; as a last-resort fallback,
+//! `continuity_daemon` is assumed to be on `PATH`.
 
 use std::path::PathBuf;
 use std::process::Output;
@@ -41,34 +43,36 @@ use crate::subject::{
     CrashPoint, DreamSummary, RecallHit, RestartReport, RunHandle, Subject, Task,
 };
 
-/// Ympäristömuuttuja jolla daemon-binäärin polun voi yliajaa.
+/// Environment variable used to override the daemon binary's path.
 const DAEMON_BIN_ENV: &str = "CONTINUITY_DAEMON_BIN";
 
-/// Cargon testiaikana asettama ympäristömuuttuja binäärin polulle.
+/// Environment variable Cargo sets for the binary's path during tests.
 const CARGO_BIN_ENV: &str = "CARGO_BIN_EXE_continuity_daemon";
 
-/// FamilyClaw-subjekti joka ajaa `continuity_daemon`-binääriä lapsiprosessina.
+/// The FamilyClaw subject, which runs the `continuity_daemon` binary as a
+/// child process.
 ///
-/// Pitää väliaikaiset journal- + store-polut ja tehtävän tilan kahden
-/// daemon-kutsun välillä. Polut elävät [`tempdir`](FamilyClawSubject::tempdir):n
-/// alla ja siivotaan kun subjekti pudotetaan.
+/// Holds the temporary journal + store paths and the task state between two
+/// daemon calls. Paths live under
+/// [`tempdir`](FamilyClawSubject::tempdir) and are cleaned up when the
+/// subject is dropped.
 #[derive(Debug)]
 pub struct FamilyClawSubject {
-    /// Daemon-binäärin polku.
+    /// The daemon binary's path.
     daemon: PathBuf,
-    /// Väliaikaishakemisto johon journal + store kirjoitetaan.
+    /// The temporary directory the journal + store are written to.
     tempdir: PathBuf,
-    /// Journal-tiedoston polku.
+    /// The journal file's path.
     journal: PathBuf,
-    /// Muistitallennuksen polku.
+    /// The memory store's path.
     store: PathBuf,
-    /// Aktiivinen tehtävä (asetettu [`start_task`](FamilyClawSubject::start_task)issa).
+    /// The active task (set in [`start_task`](FamilyClawSubject::start_task)).
     task: Option<Task>,
-    /// Subjektin vakaa nimi scorecardia varten.
+    /// The subject's stable name for the scorecard.
     name: String,
 }
 
-/// Daemonin `resume`-tuloste (jäsennetään stdoutin RESULT-riviltä).
+/// The daemon's `resume` output (parsed from the stdout RESULT line).
 #[derive(Debug, Deserialize)]
 struct ResumeOutput {
     steps_replayed: usize,
@@ -77,20 +81,20 @@ struct ResumeOutput {
     resumed_clean: bool,
 }
 
-/// Daemonin yksittäinen recall-osuma.
+/// A single recall hit from the daemon.
 #[derive(Debug, Deserialize)]
 struct RecallHitOutput {
     content: String,
     relevance: f32,
 }
 
-/// Daemonin `recall`-tuloste.
+/// The daemon's `recall` output.
 #[derive(Debug, Deserialize)]
 struct RecallOutput {
     hits: Vec<RecallHitOutput>,
 }
 
-/// Daemonin `sleep`-tuloste.
+/// The daemon's `sleep` output.
 #[derive(Debug, Deserialize)]
 struct SleepOutput {
     scanned: usize,
@@ -103,11 +107,11 @@ struct SleepOutput {
 }
 
 impl FamilyClawSubject {
-    /// Rakentaa subjektin annetulla daemon-binäärin polulla ja
-    /// väliaikaishakemistolla.
+    /// Builds a subject with the given daemon binary path and temporary
+    /// directory.
     ///
-    /// Useimmiten kannattaa käyttää [`from_env`](FamilyClawSubject::from_env)
-    /// joka paikantaa binäärin ympäristöstä automaattisesti.
+    /// In most cases prefer [`from_env`](FamilyClawSubject::from_env), which
+    /// locates the binary from the environment automatically.
     #[must_use]
     pub fn new(daemon: impl Into<PathBuf>, tempdir: impl Into<PathBuf>) -> Self {
         let tempdir = tempdir.into();
@@ -123,29 +127,29 @@ impl FamilyClawSubject {
         }
     }
 
-    /// Rakentaa subjektin paikantaen daemon-binäärin ympäristöstä ja luoden
-    /// uniikin väliaikaishakemiston.
+    /// Builds a subject by locating the daemon binary from the environment
+    /// and creating a unique temporary directory.
     ///
-    /// Binäärin paikannusjärjestys:
-    /// 1. `CONTINUITY_DAEMON_BIN` (eksplisiittinen yliajo),
-    /// 2. `CARGO_BIN_EXE_continuity_daemon` (Cargo-testit),
-    /// 3. `continuity_daemon` (`PATH`-fallback).
+    /// Binary resolution order:
+    /// 1. `CONTINUITY_DAEMON_BIN` (explicit override),
+    /// 2. `CARGO_BIN_EXE_continuity_daemon` (Cargo tests),
+    /// 3. `continuity_daemon` (`PATH` fallback).
     ///
     /// # Errors
-    /// [`BenchError::Io`] jos väliaikaishakemistoa ei voi luoda.
+    /// [`BenchError::Io`] if the temporary directory cannot be created.
     pub fn from_env() -> Result<Self> {
         let daemon = resolve_daemon_bin();
         let tempdir = make_tempdir()?;
         Ok(Self::new(daemon, tempdir))
     }
 
-    /// Palauttaa käytetyn väliaikaishakemiston polun.
+    /// Returns the temporary directory in use.
     #[must_use]
     pub fn tempdir(&self) -> &std::path::Path {
         &self.tempdir
     }
 
-    /// Poistaa mahdolliset aiemmat journal- + store-tiedostot (tuore lähtötila).
+    /// Removes any prior journal + store files (a fresh starting state).
     fn reset_state(&self) -> Result<()> {
         for p in [&self.journal, &self.store] {
             if p.exists() {
@@ -155,12 +159,13 @@ impl FamilyClawSubject {
         Ok(())
     }
 
-    /// Ajaa daemon-alikomennon ja palauttaa sen [`Output`]:n.
+    /// Runs a daemon subcommand and returns its [`Output`].
     async fn run_daemon(&self, args: &[String]) -> Result<Output> {
         let daemon = self.daemon.clone();
         let owned: Vec<String> = args.to_vec();
-        // Synkroninen `std::process::Command` blocking-säikeessä, jotta async-
-        // konteksti ei jumitu (sama malli kuin crash_replay full-ajossa).
+        // A synchronous `std::process::Command` on a blocking thread, so the
+        // async context doesn't stall (same pattern as the crash_replay
+        // full run).
         let output = tokio::task::spawn_blocking(move || {
             std::process::Command::new(&daemon).args(&owned).output()
         })
@@ -169,7 +174,8 @@ impl FamilyClawSubject {
         Ok(output)
     }
 
-    /// Jäsentää daemonin stdoutista `RESULT <json>` -rivin annetuksi tyypiksi.
+    /// Parses the `RESULT <json>` line from the daemon's stdout into the
+    /// given type.
     fn parse_result<T: for<'de> Deserialize<'de>>(output: &Output) -> Result<T> {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let line = stdout
@@ -186,14 +192,15 @@ impl FamilyClawSubject {
         Ok(parsed)
     }
 
-    /// Tehtävä tai virhe jos [`start_task`](FamilyClawSubject::start_task) puuttuu.
+    /// The active task, or an error if
+    /// [`start_task`](FamilyClawSubject::start_task) hasn't been called.
     fn require_task(&self) -> Result<&Task> {
         self.task
             .as_ref()
             .ok_or_else(|| BenchError::subject("no active task — call start_task first"))
     }
 
-    /// Ajaa `start`-komennon annetulla kaatumispisteellä (`None` = clean).
+    /// Runs the `start` command with the given crash point (`None` = clean).
     async fn spawn_start(&self, point: Option<CrashPoint>, clock: Timestamp) -> Result<Output> {
         let task = self.require_task()?;
         let steps = task.steps.len().max(1);
@@ -221,10 +228,10 @@ impl FamilyClawSubject {
 #[async_trait]
 impl Subject for FamilyClawSubject {
     async fn start_task(&mut self, task: &Task, _clock: Timestamp) -> Result<RunHandle> {
-        // Tuore lähtötila joka tehtävälle (deterministisyys).
+        // A fresh starting state for every task (determinism).
         self.reset_state()?;
         self.task = Some(task.clone());
-        // Token = journal-polku (subjekti-spesifinen läpinäkyvä viite).
+        // Token = journal path (a subject-specific opaque reference).
         Ok(RunHandle::new(task.id.clone(), path_arg(&self.journal)))
     }
 
@@ -232,7 +239,7 @@ impl Subject for FamilyClawSubject {
         let clock = time::now();
         match point {
             CrashPoint::Clean => {
-                // Ei kaatumista: aja tehtävä loppuun puhtaasti.
+                // No crash: run the task to completion cleanly.
                 let out = self.spawn_start(None, clock).await?;
                 if !out.status.success() {
                     return Err(BenchError::subject(format!(
@@ -242,23 +249,24 @@ impl Subject for FamilyClawSubject {
                 }
             }
             CrashPoint::MidReplay => {
-                // MidReplay vaatii valmiin journalin: aja ensin puhdas start,
-                // sitten kaada kesken replayn re-enteröimällä.
+                // MidReplay requires a completed journal: first run a clean
+                // start, then crash mid-replay by re-entering it.
                 let clean = self.spawn_start(None, clock).await?;
                 if !clean.status.success() {
                     return Err(BenchError::subject(
                         "mid_replay setup (clean start) failed".to_string(),
                     ));
                 }
-                // Tämä poistuu nollasta poikkeavalla koodilla — odotettu.
+                // This exits with a non-zero code — expected.
                 let _ = self.spawn_start(Some(CrashPoint::MidReplay), clock).await?;
             }
-            // BeforeWrite / MidWrite / CorruptedJournal: daemon poistuu pisteessä.
+            // BeforeWrite / MidWrite / CorruptedJournal: the daemon exits at the point.
             other => {
                 let _ = self.spawn_start(Some(other), clock).await?;
                 if other == CrashPoint::CorruptedJournal {
-                    // CorruptedJournal: daemon ei tue erikseen — simuloidaan
-                    // vioittamalla EI-viimeinen rivi journalissa, jos rivejä on.
+                    // CorruptedJournal: the daemon has no dedicated support —
+                    // simulate it by corrupting a non-final line in the
+                    // journal, if there are enough lines.
                     corrupt_middle_line(&self.journal)?;
                 }
             }
@@ -293,9 +301,9 @@ impl Subject for FamilyClawSubject {
         Ok(RestartReport {
             steps_replayed: parsed.steps_replayed,
             was_replaying: parsed.was_replaying,
-            // Tuoreet askeleet ovat normaali resumea — EIVÄT toistuneita
-            // sivuvaikutuksia. side_effects_reexecuted on aina 0 niin kauan kuin
-            // resume on puhdas; epäpuhdas resume nostaa tämän.
+            // Fresh steps are a normal part of resume — NOT repeated side
+            // effects. side_effects_reexecuted is always 0 as long as
+            // resume is clean; an unclean resume raises it.
             side_effects_reexecuted: if parsed.resumed_clean {
                 0
             } else {
@@ -331,12 +339,12 @@ impl Subject for FamilyClawSubject {
     }
 
     async fn sleep_cycle(&mut self, clock: Timestamp) -> Result<DreamSummary> {
-        // Liveness-koe (design §3 S3): aja unijakso TUOREEN, ehjän tilan yli.
-        // Harness ajaa skenaariot peräkkäin samalla subjektilla, joten aiempi
-        // skenaario (esim. S1 CorruptedJournal) on voinut jättää korruptoidun
-        // journalin. Resetoidaan ja kylvetään puhdas valmis ajo, jotta `sleep`
-        // lukee aina kelvollisen journalin + tallennuksen — ei aiemman
-        // skenaarion korruptiojäämää.
+        // Liveness check (design §3 S3): run the sleep cycle over a FRESH,
+        // intact state. The harness runs scenarios sequentially against the
+        // same subject, so a prior scenario (e.g. S1 CorruptedJournal) may
+        // have left a corrupted journal. Reset and seed a clean completed
+        // run, so `sleep` always reads a valid journal + store — not a
+        // leftover corruption from a prior scenario.
         if let Some(task) = self.task.clone() {
             self.reset_state()?;
             let clean = self.spawn_start(None, clock).await?;
@@ -346,10 +354,10 @@ impl Subject for FamilyClawSubject {
                     String::from_utf8_lossy(&clean.stderr).trim()
                 )));
             }
-            // Pidä `task` aktiivisena (reset ei pyyhi sitä, mutta varmistetaan).
+            // Keep `task` active (reset doesn't clear it, but make sure).
             self.task = Some(task);
         }
-        // Varmista että journal on olemassa (sleep lukee ristiriidat siitä).
+        // Make sure the journal exists (sleep reads conflicts from it).
         if !self.journal.exists() {
             std::fs::write(&self.journal, b"")?;
         }
@@ -388,12 +396,12 @@ impl Subject for FamilyClawSubject {
 
 impl Drop for FamilyClawSubject {
     fn drop(&mut self) {
-        // Siivoa väliaikaishakemisto. Virheet ohitetaan (parhaansa-mukaan).
+        // Clean up the temporary directory. Errors are ignored (best-effort).
         let _ = std::fs::remove_dir_all(&self.tempdir);
     }
 }
 
-/// Paikantaa daemon-binäärin ympäristöstä (env-yliajo → Cargo → PATH-fallback).
+/// Locates the daemon binary from the environment (env override → Cargo → PATH fallback).
 fn resolve_daemon_bin() -> PathBuf {
     if let Ok(explicit) = std::env::var(DAEMON_BIN_ENV) {
         return PathBuf::from(explicit);
@@ -404,7 +412,7 @@ fn resolve_daemon_bin() -> PathBuf {
     PathBuf::from("continuity_daemon")
 }
 
-/// Luo uniikin väliaikaishakemiston bench-ajoa varten.
+/// Creates a unique temporary directory for a bench run.
 fn make_tempdir() -> Result<PathBuf> {
     let mut dir = std::env::temp_dir();
     dir.push(format!(
@@ -416,8 +424,9 @@ fn make_tempdir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Tuottaa karkean uniikin loppuliitteen hakemistonimeen (ei kelloriippuvuutta
-/// determinismin kannalta — vain hakemiston eristämiseen rinnakkaisissa ajoissa).
+/// Produces a coarse unique suffix for the directory name (no clock
+/// dependency for determinism — only used to isolate directories across
+/// concurrent runs).
 fn uniq_suffix() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -425,29 +434,29 @@ fn uniq_suffix() -> String {
     format!("{n:08x}")
 }
 
-/// Muuntaa polun komentoriviargumentiksi (UTF-8; ei-UTF-8 polut lossy).
+/// Converts a path into a command-line argument (UTF-8; non-UTF-8 paths are lossy).
 fn path_arg(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// [`CrashPoint`] daemonin `--crash-at`-arvoksi (snake_case).
+/// [`CrashPoint`] as the daemon's `--crash-at` value (snake_case).
 fn crash_point_arg(point: CrashPoint) -> &'static str {
     match point {
         CrashPoint::BeforeWrite => "before_write",
         CrashPoint::MidWrite => "mid_write",
         CrashPoint::MidReplay => "mid_replay",
-        // CorruptedJournal/Clean eivät kuljeta daemonille suoraan — käsitellään
-        // kutsupuolella. Palautetaan turvallinen oletus.
+        // CorruptedJournal/Clean aren't passed to the daemon directly —
+        // handled on the caller side. Return a safe default.
         CrashPoint::CorruptedJournal | CrashPoint::Clean => "clean",
     }
 }
 
-/// Vioittaa journalin EI-viimeisen rivin (CorruptedJournal-hyökkäys, design §5).
+/// Corrupts a NON-final line of the journal (the CorruptedJournal attack, design §5).
 ///
-/// Tämä on aito korruptio (toisin kuin revitty viimeinen rivi): jos rivejä on
-/// vähintään kaksi, ensimmäinen rivi korvataan roskalla. `replay_from` palauttaa
-/// tästä [`CorruptEntry`](familyclaw_durable::DurableError::CorruptEntry):n —
-/// jota resume käsittelee virheenä (ei hiljaista vääristymää).
+/// This is genuine corruption (as opposed to a torn last line): if there are
+/// at least two lines, the first line is replaced with garbage. `replay_from`
+/// returns a [`CorruptEntry`](familyclaw_durable::DurableError::CorruptEntry)
+/// for this — which resume treats as an error (no silent data loss).
 fn corrupt_middle_line(journal: &std::path::Path) -> Result<()> {
     if !journal.exists() {
         return Ok(());

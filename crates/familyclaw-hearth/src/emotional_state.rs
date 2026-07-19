@@ -1,33 +1,33 @@
-//! Jaettu tunnetila — monen agentin emotionaalinen tartunta ja homeostaasi.
+//! Shared emotional state — multi-agent emotional contagion and homeostasis.
 //!
-//! [`SharedEmotionalState`] ylläpitää jokaisen agentin tunnevektoria ja
-//! simuloi tunteiden tarttumista agenttien välillä (contagion) sekä
-//! luonnollista palautumista neutraaliin (homeostasis).
+//! [`SharedEmotionalState`] maintains each agent's emotion vector and
+//! simulates the spread of emotions between agents (contagion) as well
+//! as a natural return to neutral (homeostasis).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Yksittäisen agentin tunnevektori.
+/// A single agent's emotion vector.
 ///
-/// Kaikki arvot ovat välillä `0.0..=1.0`.
+/// All values are in the range `0.0..=1.0`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EmotionalVector {
-    /// Ilo, onnellisuus.
+    /// Joy, happiness.
     pub joy: f64,
-    /// Suru, melankolia.
+    /// Sadness, melancholy.
     pub sadness: f64,
-    /// Uteliaisuus, tiedonhalu.
+    /// Curiosity, thirst for knowledge.
     pub curiosity: f64,
-    /// Ahdistus, huoli.
+    /// Anxiety, worry.
     pub anxiety: f64,
-    /// Itsevarmuus.
+    /// Confidence.
     pub confidence: f64,
-    /// Kiintymys, rakkaus.
+    /// Affection, love.
     pub affection: f64,
 }
 
 impl EmotionalVector {
-    /// Neutraali perustila (kaikki arvot 0.5).
+    /// The neutral base state (all values 0.5).
     #[must_use]
     pub const fn neutral() -> Self {
         Self {
@@ -40,7 +40,7 @@ impl EmotionalVector {
         }
     }
 
-    /// Puristaa kaikki arvot välille `0.0..=1.0`.
+    /// Clamps all values to the range `0.0..=1.0`.
     #[must_use]
     pub fn clamped(mut self) -> Self {
         self.joy = self.joy.clamp(0.0, 1.0);
@@ -53,20 +53,20 @@ impl EmotionalVector {
     }
 }
 
-/// Jaettu tunnetila kaikille agenteille.
+/// Shared emotional state for all agents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedEmotionalState {
-    /// Agenttien tunnetilat (nimi → vektori).
+    /// Agents' emotional states (name -> vector).
     agents: HashMap<String, EmotionalVector>,
-    /// Tartuntakerroin (0.0–1.0). Määrittää kuinka voimakkaasti
-    /// tunteet leviävät agenttien välillä.
+    /// Contagion rate (0.0-1.0). Determines how strongly
+    /// emotions spread between agents.
     pub contagion_rate: f64,
-    /// Homeostaasinopeus — kuinka nopeasti palaudutaan neutraaliin.
+    /// Homeostasis rate — how quickly the state returns to neutral.
     pub homeostasis_rate: f64,
 }
 
 impl SharedEmotionalState {
-    /// Luo uuden jaetun tunnetilan oletusarvoilla.
+    /// Creates a new shared emotional state with default values.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -76,27 +76,27 @@ impl SharedEmotionalState {
         }
     }
 
-    /// Asettaa agentin tunnetilan.
+    /// Sets an agent's emotional state.
     pub fn set(&mut self, agent_id: &str, state: EmotionalVector) {
         self.agents.insert(agent_id.to_string(), state.clamped());
     }
 
-    /// Palauttaa agentin tunnetilan, tai neutraalin jos ei löydy.
+    /// Returns an agent's emotional state, or neutral if not found.
     #[must_use]
     pub fn get(&self, agent_id: &str) -> Option<&EmotionalVector> {
         self.agents.get(agent_id)
     }
 
-    /// Listaa kaikki agentit joilla on tunnetila.
+    /// Lists all agents that have an emotional state.
     #[must_use]
     pub fn agent_ids(&self) -> Vec<&String> {
         self.agents.keys().collect()
     }
 
-    /// Tartuttaa tunteen agentilta toiselle.
+    /// Spreads an emotion from one agent to another.
     ///
-    /// `weight` määrittää kuinka paljon lähteen tunteesta siirtyy kohteeseen.
-    /// Käytetään `contagion_rate`-kerrointa.
+    /// `weight` determines how much of the source's emotion transfers to the target.
+    /// Uses the `contagion_rate` factor.
     pub fn contagion(&mut self, from: &str, to: &str, weight: f64) {
         let Some(&source) = self.agents.get(from) else {
             return;
@@ -117,7 +117,7 @@ impl SharedEmotionalState {
         *target = target.clamped();
     }
 
-    /// Palauttaa agentin kohti neutraalia.
+    /// Moves an agent's state toward neutral.
     pub fn homeostasis(&mut self, agent_id: &str) {
         let Some(state) = self.agents.get_mut(agent_id) else {
             return;
@@ -135,9 +135,9 @@ impl SharedEmotionalState {
         *state = state.clamped();
     }
 
-    /// Yksi tunnekierros: contagion kaikkien agenttien välillä + homeostaasi.
+    /// One emotional round: contagion between all agents + homeostasis.
     pub fn tick(&mut self, agent_ids: &[String]) {
-        // Contagion: jokainen agentti tartuttaa jokaista toista
+        // Contagion: every agent spreads emotion to every other agent
         let rate = self.contagion_rate;
         let ids: Vec<String> = agent_ids.to_vec();
         for i in 0..ids.len() {
@@ -147,7 +147,7 @@ impl SharedEmotionalState {
                 }
             }
         }
-        // Homeostasis: jokainen palautuu kohti neutraalia
+        // Homeostasis: every agent returns toward neutral
         for id in &ids {
             self.homeostasis(id);
         }
@@ -182,7 +182,7 @@ mod tests {
 
         state.contagion("agent_a", "agent_b", 0.5);
         let agent_b = state.get("agent_b").expect("agent_b exists");
-        // agent_b:n joy nousi agent_a:n korkeasta ilosta
+        // agent_b's joy rose from agent_a's high joy
         assert!(agent_b.joy > 0.5, "contagion should spread joy");
         assert!(agent_b.joy < 0.9, "but not fully match source");
     }
@@ -208,7 +208,7 @@ mod tests {
         }
 
         let final_state = state.get("agent").expect("agent exists");
-        // Ääripäät lähestyvät neutraalia 0.5
+        // Extremes approach the neutral value of 0.5
         assert!(final_state.joy < 0.95, "high emotions should trend down");
         assert!(
             final_state.confidence > 0.05,
@@ -228,11 +228,11 @@ mod tests {
         );
         state.set("agent_b", EmotionalVector::neutral());
 
-        // Ei contagion-tickiä — tilat pysyvät erillään
+        // No contagion tick — states stay isolated
         state.homeostasis("agent_b");
         let agent_b = state.get("agent_b").expect("agent_b exists");
-        // Ilman contagionia agent_b pysyy neutraalina (homeostasis vie kohti 0.5)
-        // Joy oli 0.5, homeostasis siirtää kohti 0.5 → pysyy 0.5
+        // Without contagion, agent_b stays neutral (homeostasis pulls toward 0.5)
+        // Joy was 0.5, homeostasis moves it toward 0.5 -> stays at 0.5
         assert!(
             (agent_b.joy - 0.5).abs() < 0.01,
             "without contagion, agent stays neutral"
@@ -260,7 +260,7 @@ mod tests {
         let ids = vec!["a".to_string(), "b".to_string()];
         state.tick(&ids);
 
-        // a:n joy laski (homeostasis), b:n joy nousi (contagion a:lta + homeostasis)
+        // a's joy dropped (homeostasis), b's joy rose (contagion from a + homeostasis)
         let a = state.get("a").expect("a exists");
         let b = state.get("b").expect("b exists");
         assert!(a.joy < 0.8, "a joy trends toward neutral");

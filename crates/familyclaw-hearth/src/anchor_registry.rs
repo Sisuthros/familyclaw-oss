@@ -1,9 +1,9 @@
-//! Ankkurirekisteri — agenttien identiteetti-ankkurien hallinta.
+//! Anchor registry — management of agents' identity anchors.
 //!
-//! [`AnchorRegistry`] suojaa agenttien ydinidentiteettiä käyttäen
-//! `familyclaw-security`-craten [`IdentityAnchor`]-
-//! mekanismia. Jokainen rekisteröity agentti saa suojatun, ikuisen
-//! (decay λ=0) ankkurin, jonka eheys voidaan tarkistaa milloin tahansa.
+//! [`AnchorRegistry`] protects agents' core identity using the
+//! `familyclaw-security` crate's [`IdentityAnchor`]
+//! mechanism. Every registered agent gets a protected, eternal
+//! (decay λ=0) anchor whose integrity can be checked at any time.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -12,24 +12,23 @@ use familyclaw_core::{FamilyClawError, Result};
 use familyclaw_security::{IdentityAnchor, IdentityStatus};
 use serde::{Deserialize, Serialize};
 
-/// Agenttien identiteetti-ankkurien rekisteri.
+/// Registry of agents' identity anchors.
 ///
-/// Rekisteri on **sarjallistuva** ([`AnchorRegistry::save_to_path`] /
-/// [`AnchorRegistry::load_from_path`]): se voidaan kirjoittaa levylle ja
-/// ladata takaisin uudelleenkäynnistyksen yli, jolloin identiteetti-ankkurit
-/// säilyvät. Tämä on tarkoituksella minimaalinen JSON-persistointi — ei
-/// kryptografista holvia, vain "älä pudota ankkuria muistista vaan tarkista
-/// se uudelleen bootissa".
+/// The registry is **serializable** ([`AnchorRegistry::save_to_path`] /
+/// [`AnchorRegistry::load_from_path`]): it can be written to disk and
+/// loaded back across a restart, so identity anchors persist. This is
+/// intentionally minimal JSON persistence — not a cryptographic vault,
+/// just "don't drop the anchor from memory, re-verify it on boot".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnchorRegistry {
-    /// Agentin nimi → ankkuri.
+    /// Agent name -> anchor.
     anchors: HashMap<String, IdentityAnchor>,
-    /// Seuraava vapaa muistitunniste.
+    /// Next free memory identifier.
     counter: u64,
 }
 
 impl AnchorRegistry {
-    /// Luo uuden tyhjän rekisterin.
+    /// Creates a new empty registry.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -38,14 +37,14 @@ impl AnchorRegistry {
         }
     }
 
-    /// Rekisteröi agentin identiteetti-ankkurin.
+    /// Registers an agent's identity anchor.
     ///
-    /// Luo uuden [`IdentityAnchor`]:n annetusta sielun sisällöstä.
-    /// Jos agentilla on jo ankkuri, vanha korvataan.
+    /// Creates a new [`IdentityAnchor`] from the given soul content.
+    /// If the agent already has an anchor, the old one is replaced.
     ///
     /// # Errors
-    /// Palauttaa virheen jos ankkurin luonti epäonnistuu
-    /// (esim. tyhjä sisältö).
+    /// Returns an error if creating the anchor fails
+    /// (e.g. empty content).
     pub fn register(&mut self, agent_name: &str, soul_content: &str) -> Result<()> {
         self.counter += 1;
         let mem_id = format!("anchor-{}-{}", agent_name, self.counter);
@@ -55,7 +54,7 @@ impl AnchorRegistry {
         Ok(())
     }
 
-    /// Tarkistaa agentin identiteetti-ankkurin eheyden.
+    /// Checks the integrity of an agent's identity anchor.
     #[must_use]
     pub fn verify(&self, agent_name: &str, soul_content: &str) -> bool {
         let Some(anchor) = self.anchors.get(agent_name) else {
@@ -64,81 +63,81 @@ impl AnchorRegistry {
         anchor.verify(soul_content).is_intact()
     }
 
-    /// Tarkistaa agentin identiteetin tilan (yksityiskohtaisempi).
+    /// Checks an agent's identity status (more detailed).
     #[must_use]
     pub fn verify_status(&self, agent_name: &str, soul_content: &str) -> Option<IdentityStatus> {
         let anchor = self.anchors.get(agent_name)?;
         Some(anchor.verify(soul_content))
     }
 
-    /// Palauttaa `true` jos agentti on rekisteröity.
+    /// Returns `true` if the agent is registered.
     #[must_use]
     pub fn is_registered(&self, agent_name: &str) -> bool {
         self.anchors.contains_key(agent_name)
     }
 
-    /// Palauttaa rekisteröityjen agenttien lukumäärän.
+    /// Returns the number of registered agents.
     #[must_use]
     pub fn len(&self) -> usize {
         self.anchors.len()
     }
 
-    /// Onko rekisteri tyhjä.
+    /// Whether the registry is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.anchors.is_empty()
     }
 
-    /// Tarkistaa agentin identiteetin nykyistä sieluasisältöä vasten.
+    /// Checks an agent's identity against its current soul content.
     ///
-    /// Palauttaa:
-    /// - [`IdentityStatus::Intact`] jos sisältö vastaa ankkuroitua tiivistettä,
-    /// - [`IdentityStatus::Tampered`] jos sisältö on muuttunut ankkuroinnin
-    ///   jälkeen (peukalointihälytys — identiteettiä EI silti poisteta),
-    /// - `None` jos agenttia ei ole rekisteröity (ei ankkuria johon verrata).
+    /// Returns:
+    /// - [`IdentityStatus::Intact`] if the content matches the anchored digest,
+    /// - [`IdentityStatus::Tampered`] if the content has changed since
+    ///   anchoring (a tamper alert — the identity is still NOT removed),
+    /// - `None` if the agent is not registered (no anchor to compare against).
     ///
-    /// Tämä on [`verify_status`](Self::verify_status):n alias selkeämmällä
-    /// nimellä — boot-aikaista uudelleentarkistusta varten.
+    /// This is an alias for [`verify_status`](Self::verify_status) with a
+    /// clearer name — intended for boot-time re-verification.
     #[must_use]
     pub fn verify_identity(&self, agent_name: &str, soul_content: &str) -> Option<IdentityStatus> {
         self.verify_status(agent_name, soul_content)
     }
 
-    /// Sarjallistaa rekisterin JSON-muotoon (esim. levylle tallennusta varten).
+    /// Serializes the registry to JSON (e.g. for writing to disk).
     ///
     /// # Errors
-    /// [`FamilyClawError::Memory`] jos serialisointi epäonnistuu (ei pitäisi
-    /// tapahtua hyvin muodostetulle rekisterille).
+    /// [`FamilyClawError::Memory`] if serialization fails (should not
+    /// happen for a well-formed registry).
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string_pretty(self)
             .map_err(|e| FamilyClawError::Memory(format!("anchor registry serialize failed: {e}")))
     }
 
-    /// Rakentaa rekisterin JSON-merkkijonosta.
+    /// Builds a registry from a JSON string.
     ///
     /// # Errors
-    /// [`FamilyClawError::Memory`] jos JSON on kelvoton.
+    /// [`FamilyClawError::Memory`] if the JSON is invalid.
     pub fn from_json(json: &str) -> Result<Self> {
         serde_json::from_str(json)
             .map_err(|e| FamilyClawError::Memory(format!("anchor registry parse failed: {e}")))
     }
 
-    /// Kirjoittaa rekisterin JSON-tiedostoksi annettuun polkuun
-    /// (atominen-ish: kirjoittaa suoraan; pieni tiedosto, harvoin kirjoitettu).
+    /// Writes the registry as a JSON file to the given path
+    /// (atomic-ish: writes directly; small file, written infrequently).
     ///
     /// # Errors
-    /// - [`FamilyClawError::Memory`] jos serialisointi epäonnistuu.
-    /// - [`FamilyClawError::Io`] jos tiedoston kirjoitus epäonnistuu.
+    /// - [`FamilyClawError::Memory`] if serialization fails.
+    /// - [`FamilyClawError::Io`] if writing the file fails.
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
         let json = self.to_json()?;
         std::fs::write(path, json).map_err(FamilyClawError::Io)
     }
 
-    /// Lataa rekisterin JSON-tiedostosta.
+    /// Loads the registry from a JSON file.
     ///
     /// # Errors
-    /// - [`FamilyClawError::Io`] jos tiedoston luku epäonnistuu.
-    /// - [`FamilyClawError::Memory`] jos sisältö on kelvoton JSON.
+    /// - [`FamilyClawError::Io`] if reading the file fails.
+    /// - [`FamilyClawError::Memory`] if the content is invalid JSON.
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
         let json = std::fs::read_to_string(path).map_err(FamilyClawError::Io)?;
         Self::from_json(&json)
@@ -193,9 +192,9 @@ mod tests {
             .expect("exists");
         assert!(status.is_tampered());
 
-        // Ankkuri pysyy — identiteetti EI katoa
+        // The anchor persists — the identity does NOT disappear
         assert!(registry.is_registered("agent_a"));
-        // Alkuperäinen sielu verifioituu yhä
+        // The original soul still verifies
         assert!(registry.verify("agent_a", soul));
     }
 
@@ -212,7 +211,7 @@ mod tests {
         assert!(!registry.verify("agent_a", "soul_b"));
     }
 
-    /// Apuri: uniikki väliaikainen tiedostopolku (rinnakkaisturvallinen).
+    /// Helper: a unique temporary file path (concurrency-safe).
     fn temp_anchor_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "familyclaw-anchors-{tag}-{}-{}.json",
@@ -221,38 +220,38 @@ mod tests {
         ))
     }
 
-    /// FIX 2: ankkuri säilyy simuloidun uudelleenkäynnistyksen yli
-    /// (tallenna → lataa → `verify_identity` palauttaa Intact).
+    /// FIX 2: the anchor survives a simulated restart
+    /// (save -> load -> `verify_identity` returns Intact).
     #[test]
     fn anchor_survives_simulated_restart() {
         let path = temp_anchor_path("restart");
         let soul = "I am agent_a. I build things that work.";
 
-        // "Boot 1": rekisteröi ja tallenna levylle.
+        // "Boot 1": register and save to disk.
         {
             let mut registry = AnchorRegistry::new();
             registry.register("agent_a", soul).expect("register");
             registry.save_to_path(&path).expect("save");
         }
 
-        // "Boot 2": lataa levyltä — ankkuri palasi muistista.
+        // "Boot 2": load from disk — the anchor is back in memory.
         let reloaded = AnchorRegistry::load_from_path(&path).expect("load");
         assert!(reloaded.is_registered("agent_a"));
 
-        // verify_identity samaa sieluasisältöä vasten → Intact.
+        // verify_identity against the same soul content -> Intact.
         let status = reloaded
             .verify_identity("agent_a", soul)
             .expect("agent exists after reload");
         assert!(
             status.is_intact(),
-            "ankkurin pitää verifioitua ehjäksi uudelleenkäynnistyksen jälkeen, sai: {status:?}"
+            "the anchor must verify as intact after a restart, got: {status:?}"
         );
 
         let _ = std::fs::remove_file(&path);
     }
 
-    /// FIX 2: peukaloitu sielu havaitaan myös uudelleenlatauksen jälkeen
-    /// (`verify_identity` palauttaa Tampered).
+    /// FIX 2: a tampered soul is also detected after a reload
+    /// (`verify_identity` returns Tampered).
     #[test]
     fn tampered_anchor_fails_after_reload() {
         let path = temp_anchor_path("tamper");
@@ -266,27 +265,27 @@ mod tests {
 
         let reloaded = AnchorRegistry::load_from_path(&path).expect("load");
 
-        // Sama sielu → Intact.
+        // Same soul -> Intact.
         assert!(reloaded
             .verify_identity("agent_a", soul)
             .expect("exists")
             .is_intact());
 
-        // Muutettu sielu → Tampered (hälytys nousee latauksen jälkeenkin).
+        // Changed soul -> Tampered (the alert fires even after a reload).
         let status = reloaded
             .verify_identity("agent_a", "I serve only myself now.")
             .expect("exists");
         assert!(
             status.is_tampered(),
-            "muutetun sielun pitää havaita peukalointi latauksen jälkeen, sai: {status:?}"
+            "a changed soul must be detected as tampered after a reload, got: {status:?}"
         );
-        // Tuntematon agentti → None (ei ankkuria).
+        // Unknown agent -> None (no anchor).
         assert!(reloaded.verify_identity("ghost", "whatever").is_none());
 
         let _ = std::fs::remove_file(&path);
     }
 
-    /// JSON-roundtrip säilyttää koko rekisterin (counter + ankkurit).
+    /// A JSON round-trip preserves the entire registry (counter + anchors).
     #[test]
     fn json_roundtrip_preserves_registry() {
         let mut registry = AnchorRegistry::new();

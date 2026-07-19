@@ -1,16 +1,16 @@
-//! RED-TEAM [concurrent-writers] — kahden samanaikaisen kirjoittajan hyökkäys
-//! `FileJournal`-journalia ja `LocalJsonStore`-tallennusta vastaan.
+//! RED-TEAM [concurrent-writers] — an attack by two concurrent writers
+//! against the `FileJournal` journal and `LocalJsonStore` storage.
 //!
-//! Väite jota vastaan hyökätään: *"remembers everything, side-effects exactly
-//! once"*. Jos kaksi prosessia/kahvaa kirjoittaa samaan journaliin tai samaan
-//! storeen lähes yhtä aikaa, häviääkö dataa, lomittuvatko rivit (korruptio),
-//! vai katoaako päivityksiä (lost update)?
+//! Claim under attack: *"remembers everything, side-effects exactly once"*.
+//! If two processes/handles write to the same journal or the same store
+//! nearly simultaneously, does data get lost, do lines interleave
+//! (corruption), or do updates disappear (lost update)?
 //!
-//! Nämä testit AJAVAT hyökkäyksen oikeaa koodia vastaan — ne eivät arvaa.
-//! Mitään ei korjata: tämä on pelkkä hyökkäys + todiste.
+//! These tests RUN the attack against real code — they do not guess. Nothing
+//! is fixed here: this is pure attack + proof.
 //!
-//! Kaikki kellonajat injektoidaan (`Timestamp`), ei lueta järjestelmäkelloa
-//! testilogiikassa (paitsi yksilöivissä temp-poluissa, mikä on sallittua).
+//! All clock times are injected (`Timestamp`); the system clock is never read
+//! in test logic (except in unique temp paths, which is allowed).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,17 +24,17 @@ use familyclaw_durable::{FileJournal, Journal, JournalEntry, StepId};
 use familyclaw_memory::{ImportanceFactors, LocalJsonStore, Memory, MemoryStore};
 use serde_json::json;
 
-/// Prosessin-laajuinen sarjallistuslukko TÄMÄN binäärin testeille.
+/// A process-wide serialization lock for THIS binary's tests.
 ///
-/// `HYÖKKÄYS 1` ajaa kaksi säiettä jotka appendaavat samaan tiedostoon
-/// maksimaalisen lomitusriskin alla. Itse väitteet (ei korruptiota, ei
-/// kadonneita kirjoituksia) ovat oikeellisuusinvariantteja, joita EI saa
-/// löysentää. Vika ei ole väitteissä vaan siinä, että kun KOKO työtila ajetaan
-/// rinnakkain, käyttöjärjestelmän ajastin + levyn fsync-jono ruuhkautuvat niin
-/// pahasti, että testin omat kaksi säiettä lomittuvat `write_all`-syscallien
-/// välissä Windowsilla (~1/3 ajoista). Sarjallistamalla tämän binäärin testit
-/// keskenään poistetaan ulkoinen ruuhka — testi pysyy yhtä tiukkana mutta tulee
-/// deterministiseksi. Ei lisää crate-riippuvuutta (vrt. `#[serial]`).
+/// `ATTACK 1` runs two threads that append to the same file under maximal
+/// interleaving risk. The claims themselves (no corruption, no lost writes)
+/// are correctness invariants that must NOT be loosened. The problem is not
+/// with the claims but with the fact that, when the ENTIRE workspace is run
+/// in parallel, the OS scheduler + disk fsync queue get so congested that the
+/// test's own two threads interleave between `write_all` syscalls on Windows
+/// (~1/3 of runs). Serializing this binary's tests against each other removes
+/// the external congestion — the test stays just as strict but becomes
+/// deterministic. Adds no crate dependency (cf. `#[serial]`).
 fn serial_guard() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -42,7 +42,7 @@ fn serial_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Yksilöivä temp-polku ilman ulkoisia crateja.
+/// A unique temp path without external crates.
 fn temp_path(tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     let unique = format!(
@@ -57,12 +57,12 @@ fn temp_path(tag: &str) -> PathBuf {
     p
 }
 
-/// RAII-siivous.
+/// RAII cleanup.
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
-        // store-toteutuksen tmp-tiedosto.
+        // The store implementation's tmp file.
         let mut tmp = self.0.as_os_str().to_os_string();
         tmp.push(".tmp");
         let _ = std::fs::remove_file(PathBuf::from(tmp));
@@ -70,19 +70,21 @@ impl Drop for Cleanup {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HYÖKKÄYS 1: FileJournal — kaksi kahvaa, kaksi säiettä, sama tiedosto.
+// ATTACK 1: FileJournal — two handles, two threads, the same file.
 //
-// Kumpikin säie avaa OMAN FileJournal-kahvansa samaan polkuun (kaksi erillistä
-// File-deskriptoria append-tilassa, kuten kaksi prosessia tekisi) ja appendaa
-// N riviä. Append tekee write_all + flush + sync_all. Kysymys: säilyykö rivien
-// rakenne (ei lomitusta), ja säilyykö rivien LUKUMÄÄRÄ (ei kadonneita)?
+// Each thread opens its OWN FileJournal handle to the same path (two separate
+// File descriptors in append mode, as two processes would) and appends N
+// lines. Append does write_all + flush + sync_all. Question: does the line
+// structure survive (no interleaving), and does the line COUNT survive (no
+// lost writes)?
 // ─────────────────────────────────────────────────────────────────────────────
 #[test]
 fn filejournal_two_handles_concurrent_append_integrity() {
     const N: u64 = 400;
 
-    // Sarjallista tämän binäärin testit keskenään: poistaa ulkoisen
-    // ajastin-/fsync-ruuhkan joka muuten lomittaa testin omat kaksi säiettä.
+    // Serialize this binary's tests against each other: removes the external
+    // scheduler/fsync congestion that would otherwise interleave the test's
+    // own two threads.
     let _guard = serial_guard();
 
     let path = temp_path("journal");
@@ -96,19 +98,19 @@ fn filejournal_two_handles_concurrent_append_integrity() {
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
             let j = FileJournal::open(&path).expect("open journal handle");
-            // Synkronoi molemmat säikeet alkamaan yhtä aikaa → maksimaalinen
-            // lomitusriski.
+            // Synchronize both threads to start at the same time → maximal
+            // interleaving risk.
             barrier.wait();
             for i in 0..N {
-                // step_id koodaa kirjoittajan + indeksin jotta voimme laskea
-                // tarkalleen kuinka monta kummankin riviä selvisi.
+                // step_id encodes the writer + index so we can count exactly
+                // how many of each writer's lines survived.
                 let step = StepId::new(writer_id * 1_000_000 + i);
                 let entry = JournalEntry::completed(
                     step,
                     format!("w{writer_id}"),
-                    // Tukeva hyötykuorma jotta serialisoitu rivi on iso (useita
-                    // sataa tavua) → write_all joutuu mahdollisesti useaan
-                    // syscalliin → lomitusriski kasvaa.
+                    // A substantial payload so the serialized line is large
+                    // (several hundred bytes) → write_all may need multiple
+                    // syscalls → interleaving risk increases.
                     json!({
                         "writer": writer_id,
                         "index": i,
@@ -123,15 +125,15 @@ fn filejournal_two_handles_concurrent_append_integrity() {
         h.join().expect("writer thread panicked");
     }
 
-    // ── Verifiointi: lue raakatiedosto ja erottele ehjät rivit. ─────────────
+    // ── Verification: read the raw file and separate out the intact lines. ─────────────
     let raw = std::fs::read_to_string(&path).expect("read journal");
     let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
 
     let total_written = 2 * usize::try_from(N).expect("N fits usize");
 
-    // (a) Rivimäärä: jokaisen \n-päätteisen rivin pitäisi olla yksi append.
-    //     Jos rivejä on vähemmän kuin 2N → kadonneita kirjoituksia (lost write).
-    //     Jos parse epäonnistuu jollain rivillä → lomittunut korruptio.
+    // (a) Line count: every \n-terminated line should be one append.
+    //     If there are fewer lines than 2N → lost writes (lost write).
+    //     If parsing fails on some line → interleaved corruption.
     let mut parsed_ok = 0usize;
     let mut parse_failures: Vec<(usize, String)> = Vec::new();
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -163,19 +165,19 @@ fn filejournal_two_handles_concurrent_append_integrity() {
         eprintln!("[journal] FIRST CORRUPT LINE idx={idx}: {msg}");
     }
 
-    // (b) replay_all kautta — sama polku jota tuotanto käyttää. Sisäkorruptio
-    //     (lomittunut rivi joka EI ole viimeinen) palauttaa CorruptEntry-virheen.
+    // (b) Via replay_all — the same path production uses. Interior corruption
+    //     (an interleaved line that is NOT the last one) returns a CorruptEntry error.
     let replay = FileJournal::open(&path).expect("reopen").replay_all();
     match &replay {
         Ok(entries) => eprintln!("[journal] replay_all OK, {} entries", entries.len()),
         Err(e) => eprintln!("[journal] replay_all ERROR: {e}"),
     }
 
-    // ── Väitteet (todiste, ei arvaus). ──────────────────────────────────────
-    // Väite "remembers everything" rikkoutuu jos:
-    //   - rivejä katosi (parsed_ok + parse_failures < 2N), TAI
-    //   - jokin rivi on korruptoitunut (parse_failures > 0), TAI
-    //   - replay_all kaatuu korruptioon.
+    // ── Assertions (proof, not a guess). ──────────────────────────────────────
+    // The claim "remembers everything" breaks if:
+    //   - lines were lost (parsed_ok + parse_failures < 2N), OR
+    //   - some line is corrupted (parse_failures > 0), OR
+    //   - replay_all fails with corruption.
     assert!(
         parse_failures.is_empty(),
         "INTEGRITY BREAK: {} interleaved/corrupt lines in journal (first: {:?})",
@@ -197,15 +199,15 @@ fn filejournal_two_handles_concurrent_append_integrity() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HYÖKKÄYS 2: LocalJsonStore — kaksi kahvaa SAMAAN polkuun, lost update.
+// ATTACK 2: LocalJsonStore — two handles to the SAME path, lost update.
 //
-// Tämä on klassinen read-modify-write-kilpa: kahdella LocalJsonStore-oliolla on
-// ERILLISET RwLock + HashMap. Kumpikin lataa tiedoston (tyhjä), lisää oman
-// muistonsa, ja persistoi (tmp + rename). Viimeinen rename voittaa → toinen
-// muisto katoaa levyltä, vaikka add() palautti Ok.
+// This is a classic read-modify-write race: two LocalJsonStore instances have
+// SEPARATE RwLock + HashMap. Each loads the file (empty), adds its own
+// memory, and persists (tmp + rename). The last rename wins → the other
+// memory disappears from disk even though add() returned Ok.
 //
-// Väite "side-effects exactly once / remembers everything" testataan: jos
-// molemmat add() onnistuvat mutta levyllä on vain yksi → DATA LOSS.
+// The claim "side-effects exactly once / remembers everything" is tested: if
+// both add() calls succeed but only one memory is on disk → DATA LOSS.
 // ─────────────────────────────────────────────────────────────────────────────
 #[test]
 fn localjsonstore_two_handles_same_path_lost_update() {
@@ -220,8 +222,8 @@ fn localjsonstore_two_handles_same_path_lost_update() {
         .expect("runtime");
 
     let added_ids: Vec<familyclaw_core::MessageId> = rt.block_on(async {
-        // Kaksi erillistä kahvaa samaan tiedostoon — kuten kaksi prosessia tai
-        // kaksi rinnakkaista taskia jotka kumpikin avasivat storen.
+        // Two separate handles to the same file — as two processes or two
+        // parallel tasks that each opened the store would.
         let store_a = Arc::new(LocalJsonStore::open(&path).await.expect("open a"));
         let store_b = Arc::new(LocalJsonStore::open(&path).await.expect("open b"));
 
@@ -236,7 +238,7 @@ fn localjsonstore_two_handles_same_path_lost_update() {
         let id_a = mem_a.id;
         let id_b = mem_b.id;
 
-        // Aja molemmat add()-kutsut samanaikaisesti.
+        // Run both add() calls concurrently.
         let ta = {
             let store_a = Arc::clone(&store_a);
             tokio::spawn(async move { store_a.add(mem_a).await })
@@ -253,8 +255,8 @@ fn localjsonstore_two_handles_same_path_lost_update() {
         vec![id_a, id_b]
     });
 
-    // ── Verifiointi: avaa storen levyltä UUDESTAAN (puhdas kahva). ──────────
-    // Molempien add() palautti Ok ⇒ "muistettu". Mutta mitä levyllä oikeasti on?
+    // ── Verification: reopen the store from disk AGAIN (a clean handle). ──────────
+    // Both add() calls returned Ok ⇒ "remembered". But what's actually on disk?
     let on_disk = rt.block_on(async {
         let reopened = LocalJsonStore::open(&path).await.expect("reopen");
         reopened.all().await.expect("all")
@@ -267,8 +269,8 @@ fn localjsonstore_two_handles_same_path_lost_update() {
         on_disk.iter().map(|m| m.source.clone()).collect::<Vec<_>>()
     );
 
-    // Väite: jos kumpikaan id ei kadonnut, store on turvallinen samanaikaisille
-    // kahvoille. Jos toinen katosi → LOST UPDATE (side-effect "muista X" hävisi).
+    // Claim: if neither id was lost, the store is safe for concurrent
+    // handles. If one disappeared → LOST UPDATE (the "remember X" side effect vanished).
     let lost: Vec<_> = added_ids
         .iter()
         .filter(|id| !surviving_ids.contains(id))
@@ -287,11 +289,11 @@ fn localjsonstore_two_handles_same_path_lost_update() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HYÖKKÄYS 2b: deterministinen lost-update ILMAN kilpa-ajoitusta.
+// ATTACK 2b: deterministic lost-update WITHOUT racing timing.
 //
-// Poistaa ajoitusepävarmuuden: sekvensoi read-modify-write käsin niin että
-// lost update on PAKKO tapahtua jos toteutus ei koordinoi kahvoja. Tämä on
-// "smoking gun" — ei flaky, todistaa rakenteellisen aukon.
+// Removes timing uncertainty: sequences the read-modify-write by hand so a
+// lost update is FORCED to occur if the implementation doesn't coordinate
+// handles. This is the "smoking gun" — not flaky, it proves the structural gap.
 // ─────────────────────────────────────────────────────────────────────────────
 #[test]
 fn localjsonstore_deterministic_lost_update() {
@@ -305,8 +307,8 @@ fn localjsonstore_deterministic_lost_update() {
         .expect("runtime");
 
     let (id_a, id_b, on_disk_len, a_present, b_present) = rt.block_on(async {
-        // Molemmat kahvat avataan kun tiedosto on vielä tyhjä → kummankin
-        // sisäinen HashMap on tyhjä (sama lähtötila kuin todellisessa kilvassa).
+        // Both handles are opened while the file is still empty → each one's
+        // internal HashMap is empty (the same starting state as a real race).
         let store_a = LocalJsonStore::open(&path).await.expect("open a");
         let store_b = LocalJsonStore::open(&path).await.expect("open b");
 
@@ -321,8 +323,8 @@ fn localjsonstore_deterministic_lost_update() {
         let id_a = mem_a.id;
         let id_b = mem_b.id;
 
-        // A kirjoittaa ensin (tiedostossa nyt {A}), sitten B kirjoittaa oman
-        // tyhjän snapshotinsa päälle (tiedostossa nyt {B}). A katoaa levyltä.
+        // A writes first (the file now has {A}), then B writes its own empty
+        // snapshot on top (the file now has {B}). A disappears from disk.
         store_a.add(mem_a).await.expect("add a Ok");
         store_b.add(mem_b).await.expect("add b Ok");
 
@@ -338,8 +340,8 @@ fn localjsonstore_deterministic_lost_update() {
          id_a={id_a} id_b={id_b}"
     );
 
-    // Molemmat add() palauttivat Ok ⇒ kumpikin "muistettiin". Levyllä pitäisi
-    // olla 2. Jos on 1 → todistettu rakenteellinen lost update.
+    // Both add() calls returned Ok ⇒ each one was "remembered". Disk should
+    // have 2. If it has 1 → a structural lost update is proven.
     assert_eq!(
         on_disk_len, 2,
         "DETERMINISTIC LOST UPDATE: both add() returned Ok but disk has {on_disk_len} \

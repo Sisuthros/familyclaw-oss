@@ -1,27 +1,28 @@
-//! `VectorTranslator` — cross-model latent-vektorin *kääntäjä* lähettäjän
-//! mallin avaruudesta vastaanottajan mallin avaruuteen.
+//! `VectorTranslator` — a cross-model latent-vector *translator* from the
+//! sender model's space into the receiver model's space.
 //!
-//! ## Mihin tämä eroaa [`crate::link::RecursiveLink`]:istä?
-//! `RecursiveLink` tekee pelkän **dimensio-sovituksen** (pad/truncate/resize):
-//! se ei kosketa arvoihin. `VectorTranslator` lisää sen päälle **konfiguroitavan
-//! lineaarisen projektion** — joko komponenttikohtainen `scale`/`offset` tai
-//! täysi `matrix` — joka approksimoi avaruuksien välistä karttaa.
+//! ## How does this differ from [`crate::link::RecursiveLink`]?
+//! `RecursiveLink` performs only **dimension fitting** (pad/truncate/resize):
+//! it never touches the values. `VectorTranslator` adds a **configurable
+//! linear projection** on top of that — either a per-component `scale`/`offset`
+//! or a full `matrix` — that approximates the map between the two spaces.
 //!
-//! ## Tärkeä rehellisyysraja (ei liioittelua)
-//! Tämä on MVP: **konfiguroitava lineaarinen projektio, EI koulutettu enkooderi.**
-//! Direct Semantic Communication -paperi (2025) käyttää opetettua dual-encoder-
-//! kääntäjää (~0.538 kosini) ja 30 % sekoitusta. Tässä matriisi/skaalaus annetaan
-//! ulkoa — se mahdollistaa *rakenteen* ja testattavuuden, muttei väitä oppineensa
-//! semanttista kohdistusta. Identiteettiprojektio (oletus) säilyttää vektorin
-//! sellaisenaan, jolloin sama-malli-käännös on häviötön.
+//! ## Important honesty boundary (no overselling)
+//! This is an MVP: **a configurable linear projection, NOT a trained encoder.**
+//! The Direct Semantic Communication paper (2025) uses a trained dual-encoder
+//! translator (~0.538 cosine) and a 30% blend. Here the matrix/scale is
+//! supplied externally — it provides *structure* and testability, but does
+//! not claim to have learned semantic alignment. The identity projection
+//! (the default) leaves the vector unchanged, so same-model translation is
+//! lossless.
 //!
-//! Dimensioiden eroavuus käsitellään **deterministisesti** (truncate/pad ennen
-//! lineaarista karttaa) ja häviöllisyydestä kirjataan
-//! [`FallbackReason::ProjectionFailed`] tuloksen mukaan.
+//! Dimension mismatches are handled **deterministically** (truncate/pad before
+//! the linear map), and lossiness is recorded via
+//! [`FallbackReason::ProjectionFailed`] in the result.
 //!
-//! ## OSS-raja (KERROS A)
-//! Ei kovakoodattuja mallinimiä — kaikki mallitunnisteet ja kertoimet annetaan
-//! ajonaikaisesti. Esimerkit käyttävät geneerisiä nimiä (`agent_a`, `agent_b`).
+//! ## OSS boundary (Layer A)
+//! No hardcoded model names — all model identifiers and coefficients are
+//! supplied at runtime. Examples use generic names (`agent_a`, `agent_b`).
 
 use serde::{Deserialize, Serialize};
 
@@ -29,39 +30,42 @@ use crate::channel::{FallbackReason, ReceiverProfile};
 use crate::link::{ProjectedLatent, ProjectionStrategy};
 use crate::vector::LatentVector;
 
-/// Konfiguroitava lineaarinen kartta lähettäjän avaruudesta vastaanottajan
-/// avaruuteen. MVP — annettu ulkoa, ei opittu.
+/// A configurable linear map from the sender's space to the receiver's
+/// space. MVP — supplied externally, not learned.
 ///
-/// Kaikki muunnokset toimivat **vastaanottajan dimensioluvussa**: lähde
-/// sovitetaan ensin kohdekokoon (deterministinen pad/truncate) ja sitten
-/// lineaarinen kartta sovelletaan.
+/// All transforms operate in the **receiver's dimensionality**: the source
+/// is first fitted to the target size (deterministic pad/truncate) and then
+/// the linear map is applied.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Projection {
-    /// Identiteetti: arvoja ei muuteta (vain dimensio sovitetaan).
+    /// Identity: values are unchanged (only the dimension is fitted).
     Identity,
-    /// Komponenttikohtainen affiininen kartta: `y[i] = scale[i] * x[i] + offset[i]`.
-    /// `scale`- ja `offset`-vektorien pituus määrittää kohdedimension.
+    /// Per-component affine map: `y[i] = scale[i] * x[i] + offset[i]`.
+    /// The length of the `scale` and `offset` vectors determines the target
+    /// dimension.
     ScaleOffset {
-        /// Komponenttikohtaiset kertoimet.
+        /// Per-component scale factors.
         scale: Vec<f32>,
-        /// Komponenttikohtaiset siirtymät.
+        /// Per-component offsets.
         offset: Vec<f32>,
     },
-    /// Täysi matriisikartta `y = M x`, riveittäin (`rows` × `cols`).
-    /// `cols` on lähdedimensio (koh-sovituksen jälkeen), `rows` kohdedimensio.
+    /// Full matrix map `y = M x`, given row by row (`rows` x `cols`).
+    /// `cols` is the source dimension (after fitting), `rows` is the target
+    /// dimension.
     Matrix {
-        /// Rivit; jokaisen rivin pituus on `cols`.
+        /// Rows; each row has length `cols`.
         rows: Vec<Vec<f32>>,
-        /// Sarakkeiden määrä (= odotettu lähdedimensio kartan sisäänmenossa).
+        /// Number of columns (= the source dimension expected at the map's
+        /// input).
         cols: usize,
     },
 }
 
 impl Projection {
-    /// Lähdedimensio, jonka tämä projektio odottaa sisääntulossa.
+    /// The source dimension this projection expects at its input.
     ///
-    /// `None` = mikä tahansa (identiteetti / komponenttikohtainen kartta
-    /// vaatii vain että sisääntulo on jo kohdekokoinen).
+    /// `None` = any size (identity / per-component map only requires the
+    /// input to already be the target size).
     #[must_use]
     fn input_dims(&self) -> Option<usize> {
         match self {
@@ -72,20 +76,22 @@ impl Projection {
     }
 }
 
-/// Lähettäjän mallin avaruudesta vastaanottajan avaruuteen kääntävä yksikkö.
+/// A unit that translates from the sender model's space into the receiver's
+/// space.
 ///
-/// Kapseloi lähettäjän mallitunnisteen ja sen lähtödimension sekä
-/// [`Projection`]-konfiguraation. [`translate`](VectorTranslator::translate)
-/// tuottaa aina [`ProjectedLatent`]:n — viestintä ei katkea, vaikka
-/// dimensiot eivät täsmäisi (silloin tehdään deterministinen häviöllinen
-/// sovitus ja merkitään se).
+/// Encapsulates the sender's model identifier and its output dimension,
+/// along with a [`Projection`] configuration.
+/// [`translate`](VectorTranslator::translate) always produces a
+/// [`ProjectedLatent`] — communication never breaks even if the dimensions
+/// don't match (in that case a deterministic, lossy fit is performed and
+/// flagged).
 ///
-/// # Esimerkki
+/// # Example
 /// ```
 /// use familyclaw_latent::translate::{Projection, VectorTranslator};
 /// use familyclaw_latent::{LatentVector, ReceiverProfile};
 ///
-/// // Sama-malli-käännös identiteetillä säilyttää vektorin.
+/// // Same-model translation with identity preserves the vector.
 /// let tr = VectorTranslator::identity("agent_a/v1", 3);
 /// let v = LatentVector::new(vec![1.0, 2.0, 3.0], "agent_a/v1");
 /// let rx = ReceiverProfile::latent("agent_a/v1", 3);
@@ -95,16 +101,17 @@ impl Projection {
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorTranslator {
-    /// Lähettäjän mallitunniste (`"provider/model"`).
+    /// The sender's model identifier (`"provider/model"`).
     sender_model: String,
-    /// Lähettäjän lähtödimensio (vektorin odotettu koko ennen käännöstä).
+    /// The sender's output dimension (the vector's expected size before
+    /// translation).
     sender_dims: usize,
-    /// Lineaarinen kartta lähettäjän → vastaanottajan avaruuteen.
+    /// The linear map from the sender's space to the receiver's space.
     projection: Projection,
 }
 
 impl VectorTranslator {
-    /// Rakentaa kääntäjän eksplisiittisellä projektiolla.
+    /// Builds a translator with an explicit projection.
     #[must_use]
     pub fn new(
         sender_model: impl Into<String>,
@@ -118,14 +125,15 @@ impl VectorTranslator {
         }
     }
 
-    /// Identiteettikääntäjä: arvoja ei muuteta, vain dimensio sovitetaan
-    /// vastaanottajan kokoon. Sama-malli-käännös on tällöin häviötön.
+    /// Identity translator: values are unchanged, only the dimension is
+    /// fitted to the receiver's size. Same-model translation is then
+    /// lossless.
     #[must_use]
     pub fn identity(sender_model: impl Into<String>, sender_dims: usize) -> Self {
         Self::new(sender_model, sender_dims, Projection::Identity)
     }
 
-    /// Komponenttikohtainen affiininen kääntäjä
+    /// Per-component affine translator
     /// (`y[i] = scale[i] * x[i] + offset[i]`).
     #[must_use]
     pub fn scale_offset(
@@ -141,7 +149,7 @@ impl VectorTranslator {
         )
     }
 
-    /// Matriisikääntäjä `y = M x` (`rows` riviä, `cols` lähdesaraketta).
+    /// Matrix translator `y = M x` (`rows` rows, `cols` source columns).
     #[must_use]
     pub fn matrix(
         sender_model: impl Into<String>,
@@ -152,19 +160,19 @@ impl VectorTranslator {
         Self::new(sender_model, sender_dims, Projection::Matrix { rows, cols })
     }
 
-    /// Lähettäjän mallitunniste.
+    /// The sender's model identifier.
     #[must_use]
     pub fn sender_model(&self) -> &str {
         &self.sender_model
     }
 
-    /// Lähettäjän lähtödimensio.
+    /// The sender's output dimension.
     #[must_use]
     pub fn sender_dims(&self) -> usize {
         self.sender_dims
     }
 
-    /// Onko tämä identiteettikartta sama-malli-käännökselle.
+    /// Whether this is an identity map for a same-model translation.
     #[must_use]
     pub fn is_identity_to(&self, to: &ReceiverProfile) -> bool {
         matches!(self.projection, Projection::Identity)
@@ -172,28 +180,31 @@ impl VectorTranslator {
             && self.sender_dims == to.dims
     }
 
-    /// Kääntää vektorin lähettäjän avaruudesta vastaanottajan avaruuteen.
+    /// Translates a vector from the sender's space into the receiver's
+    /// space.
     ///
-    /// Vaiheet:
-    /// 1. Sovita lähde **lineaarisen kartan sisäänmenokokoon** deterministisesti
-    ///    (pad nollilla / truncate). Truncate on häviöllinen.
-    /// 2. Sovella lineaarinen kartta (identiteetti / scale-offset / matriisi).
-    /// 3. Sovita tulos vastaanottajan odottamaan kokoon (`to.dims`)
-    ///    deterministisesti (pad/truncate). Truncate on häviöllinen.
+    /// Steps:
+    /// 1. Deterministically fit the source to the **linear map's input
+    ///    size** (zero-pad / truncate). Truncation is lossy.
+    /// 2. Apply the linear map (identity / scale-offset / matrix).
+    /// 3. Deterministically fit the result to the receiver's expected size
+    ///    (`to.dims`) (pad/truncate). Truncation is lossy.
     ///
-    /// Palauttaa **aina** [`ProjectedLatent`]:n — ei koskaan virhettä — jotta
-    /// se yhtyy craten "viestintä ei katkea" -periaatteeseen. Häviöllisyys
-    /// (`lossless == false`) on signaali kutsujalle harkita teksti-fallbackia;
-    /// syy on luettavissa [`Self::fallback_reason`]-apurilla.
+    /// **Always** returns a [`ProjectedLatent`] — never an error — so it
+    /// aligns with the crate's "communication never breaks" principle.
+    /// Lossiness (`lossless == false`) is a signal for the caller to
+    /// consider a text fallback; the reason can be read via
+    /// [`Self::fallback_reason`].
     ///
-    /// Ei-äärellinen syöte (`NaN`/`inf`) käsitellään häviöllisenä ja arvot
-    /// puhdistetaan nolliksi, jottei myrkky leviä vastaanottajan avaruuteen.
+    /// Non-finite input (`NaN`/`inf`) is treated as lossy and the values are
+    /// sanitized to zero, so the poison doesn't spread into the receiver's
+    /// space.
     #[must_use]
     pub fn translate(&self, v: &LatentVector, to: &ReceiverProfile) -> ProjectedLatent {
         let source_dims = v.dims.len();
         let target_dims = to.dims;
 
-        // Puhdista ei-äärelliset arvot; merkitse häviölliseksi jos jouduttiin.
+        // Sanitize non-finite values; mark as lossy if we had to.
         let mut lossy = false;
         let cleaned: Vec<f32> = v
             .dims
@@ -208,7 +219,7 @@ impl VectorTranslator {
             })
             .collect();
 
-        // Vaihe 1: sovita kartan sisäänmenokokoon (jos kartta vaatii kiinteän).
+        // Step 1: fit to the map's input size (if the map requires a fixed one).
         let map_input = self.projection.input_dims();
         let (fitted, fit_lossy) = match map_input {
             Some(n) => fit_to(&cleaned, n),
@@ -216,10 +227,10 @@ impl VectorTranslator {
         };
         lossy |= fit_lossy;
 
-        // Vaihe 2: sovella lineaarinen kartta.
+        // Step 2: apply the linear map.
         let mapped = self.apply_map(&fitted);
 
-        // Vaihe 3: sovita vastaanottajan odottamaan kokoon.
+        // Step 3: fit to the receiver's expected size.
         let (final_dims, final_lossy) = fit_to(&mapped, target_dims);
         lossy |= final_lossy;
 
@@ -234,11 +245,11 @@ impl VectorTranslator {
         }
     }
 
-    /// Diagnostinen syy, jos [`translate`](Self::translate) joutui tekemään
-    /// häviöllisen käännöksen. `None` jos tulos on häviötön.
+    /// A diagnostic reason if [`translate`](Self::translate) had to perform
+    /// a lossy translation. `None` if the result is lossless.
     ///
-    /// Tarkoitettu kutsujalle, joka haluaa kirjata
-    /// [`FallbackReason::ProjectionFailed`]:n latent-mittausta varten.
+    /// Intended for a caller that wants to record
+    /// [`FallbackReason::ProjectionFailed`] for latent-transfer metrics.
     #[must_use]
     pub fn fallback_reason(projected: &ProjectedLatent) -> Option<FallbackReason> {
         if projected.lossless {
@@ -248,7 +259,8 @@ impl VectorTranslator {
         }
     }
 
-    /// Soveltaa konfiguroidun lineaarisen kartan jo oikeankokoiseen syötteeseen.
+    /// Applies the configured linear map to input that is already the
+    /// correct size.
     fn apply_map(&self, x: &[f32]) -> Vec<f32> {
         match &self.projection {
             Projection::Identity => x.to_vec(),
@@ -273,14 +285,14 @@ impl VectorTranslator {
         }
     }
 
-    /// Päättää raportoitavan [`ProjectionStrategy`]:n läpinäkyvyyttä varten.
+    /// Decides the [`ProjectionStrategy`] to report, for transparency.
     fn strategy_for(
         &self,
         source_dims: usize,
         target_dims: usize,
         to: &ReceiverProfile,
     ) -> ProjectionStrategy {
-        // Eksplisiittinen kartta = aina Resize-tasoinen muunnos (arvoja muutettu).
+        // An explicit map is always a Resize-level transform (values were changed).
         if !matches!(self.projection, Projection::Identity) {
             return ProjectionStrategy::Resize;
         }
@@ -298,13 +310,13 @@ impl VectorTranslator {
     }
 }
 
-/// Sovittaa komponenttijonon kohdepituuteen deterministisesti.
+/// Deterministically fits a component sequence to the target length.
 ///
-/// - Yhtä suuri → muuttumaton, häviötön.
-/// - Lyhyempi kohde → truncate (häviöllinen).
-/// - Pidempi kohde → pad nollilla (häviötön).
+/// - Equal length -> unchanged, lossless.
+/// - Shorter target -> truncate (lossy).
+/// - Longer target -> zero-pad (lossless).
 ///
-/// Palauttaa `(dims, lossy)`.
+/// Returns `(dims, lossy)`.
 fn fit_to(src: &[f32], target: usize) -> (Vec<f32>, bool) {
     match target.cmp(&src.len()) {
         std::cmp::Ordering::Equal => (src.to_vec(), false),
@@ -351,7 +363,7 @@ mod tests {
 
     #[test]
     fn dim_mismatch_pad_is_handled_without_panic() {
-        // Lähde 2-ulotteinen, vastaanottaja 4-ulotteinen → pad, häviötön.
+        // Source is 2-dimensional, receiver is 4-dimensional -> pad, lossless.
         let tr = VectorTranslator::identity("agent_a/v1", 2);
         let v = vec_a(vec![7.0, 8.0]);
         let rx = ReceiverProfile::latent("agent_b/v1", 4);
@@ -365,7 +377,7 @@ mod tests {
 
     #[test]
     fn dim_mismatch_truncate_marks_lossy() {
-        // Lähde 4-ulotteinen, vastaanottaja 2-ulotteinen → truncate, häviöllinen.
+        // Source is 4-dimensional, receiver is 2-dimensional -> truncate, lossy.
         let tr = VectorTranslator::identity("agent_a/v1", 4);
         let v = vec_a(vec![1.0, 2.0, 3.0, 4.0]);
         let rx = ReceiverProfile::latent("agent_b/v1", 2);
@@ -398,7 +410,7 @@ mod tests {
 
     #[test]
     fn matrix_projection_maps_to_new_space() {
-        // 3 → 2 matriisi: rivi0 = summa kahdesta ekasta, rivi1 = kolmas.
+        // 3 -> 2 matrix: row0 = sum of the first two, row1 = the third.
         let tr = VectorTranslator::matrix(
             "agent_a/v1",
             3,
@@ -414,15 +426,15 @@ mod tests {
 
     #[test]
     fn matrix_input_padding_when_source_smaller() {
-        // Matriisi odottaa 3 saraketta, lähde on 2 → pad nollalla (häviötön),
-        // sitten kartta. Rivi summaa kaikki kolme.
+        // Matrix expects 3 columns, source is 2 -> zero-pad (lossless),
+        // then the map. The row sums all three.
         let tr = VectorTranslator::matrix("agent_a/v1", 2, vec![vec![1.0, 1.0, 1.0]], 3);
         let v = vec_a(vec![4.0, 5.0]);
         let rx = ReceiverProfile::latent("agent_b/v1", 1);
         let p = tr.translate(&v, &rx);
         // (4 + 5 + 0) = 9
         assert_eq!(p.vector.dims, vec![9.0]);
-        // Sisäänmenon pad on häviötön ja lopputulos on oikean kokoinen.
+        // The input pad is lossless and the final result is the right size.
         assert!(p.lossless);
     }
 

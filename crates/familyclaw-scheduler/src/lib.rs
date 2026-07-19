@@ -1,46 +1,47 @@
 //! # familyclaw-scheduler
 //!
-//! FamilyClaw-alustan **minimaalinen intervalliperustainen ajastin** (KERROS A,
-//! OSS). Crate antaa rekisteröidä toistuvia työkalutehtäviä jotka laukeavat
-//! kiinteällä aikavälillä ([`chrono::Duration`]) ja reitittää jokaisen
-//! laukaisun olemassa olevan **idempotentin lähetyspolun**
-//! ([`familyclaw_actions::ActionRuntime::submit_task_idempotent`]) läpi.
+//! The `FamilyClaw` platform's **minimal interval-based scheduler** (Layer A,
+//! OSS). This crate lets you register recurring tool tasks that fire at a
+//! fixed interval ([`chrono::Duration`]) and routes every firing through
+//! the existing **idempotent dispatch path**
+//! ([`familyclaw_actions::ActionRuntime::submit_task_idempotent`]).
 //!
 //! ```text
-//! rekisteröi(interval) → tick → onko erääntynyt? → idempotentti lähetys → kirjaa
+//! register(interval) → tick → is it due? → idempotent dispatch → record
 //! ```
 //!
-//! ## Tarkoituksella minimaalinen (roadmap D5)
-//! Tämä crate **ei**:
-//! - jäsentää cron-lausekkeita ([`croner`]) valinnaisesti tehtäväkohtaisesti,
-//! - tee LLM-kutsuja,
-//! - sisällä mitään autonomiaa, suostumuslogiikkaa eikä "toimii itse" -käytöstä
-//!   (perheen hallintakytkimet ovat eri vaihe, eivät tässä cratessa),
-//! - suorita työkaluja itse — se **vain reitittää** lähetyksen
-//!   [`familyclaw_actions`]-pinon idempotentin lähetyksen kautta.
+//! ## Deliberately minimal (roadmap D5)
+//! This crate does **not**:
+//! - parse cron expressions ([`croner`]) optionally per task,
+//! - make LLM calls,
+//! - contain any autonomy, consent logic, or "acts on its own" behavior
+//!   (a family's governance switches are a different phase, not in this crate),
+//! - execute tools itself — it **only routes** dispatch through the
+//!   [`familyclaw_actions`] stack's idempotent dispatch.
 //!
-//! ## Determinismi
-//! Päätöslogiikka (mitkä tehtävät erääntyvät ja millä avaimella) on **puhdas**:
-//! nykyhetki annetaan injektoituna ([`familyclaw_core::time::Timestamp`]),
-//! kelloa ei lueta logiikan sisällä. Vain [`runner`] koskettaa oikeaa aikaa
-//! ([`tokio::time`]). Tämä tekee koko erääntymis- ja avainlogiikan
-//! yksikkötestattavaksi ilman oikeaa aikaa.
+//! ## Determinism
+//! The decision logic (which tasks are due, and with what key) is
+//! **pure**: the current instant is supplied as an injected value
+//! ([`familyclaw_core::time::Timestamp`]), the clock is never read inside
+//! the logic. Only [`runner`] touches real time ([`tokio::time`]). This
+//! makes the entire due/key logic unit-testable without real time.
 //!
-//! ## Idempotenssiavaimen vakaus (kaatumiskestävyys)
-//! Jokainen laukaisu saa **deterministisen** avaimen muotoa
-//! `schedule-{task_id}-{epoch_bucket}`, jossa `epoch_bucket` on
-//! `floor(now_unix / interval_secs)` (ks. [`decision::firing_key`]). Sama
-//! looginen laukaisuikkuna tuottaa **aina saman avaimen**, joten jos ajastin
-//! kaatuu ja käynnistyy uudelleen saman ikkunan sisällä, lähetys osuu
-//! lähetys-outboxissa jo sitoutuneeseen avaimeen eikä sivuvaikutus laukea
-//! kahdesti (at-most-once). Avain on riippumaton prosessin muistista — se
-//! johdetaan pelkästä `task_id`:stä, intervallista ja nykyhetkestä.
+//! ## Idempotency key stability (crash safety)
+//! Every firing gets a **deterministic** key of the form
+//! `schedule-{task_id}-{epoch_bucket}`, where `epoch_bucket` is
+//! `floor(now_unix / interval_secs)` (see [`decision::firing_key`]). The
+//! same logical firing window **always produces the same key**, so if the
+//! scheduler crashes and restarts within the same window, the dispatch
+//! hits the key already committed in the dispatch outbox and the side
+//! effect does not fire twice (at-most-once). The key is independent of
+//! process memory — it is derived purely from the `task_id`, the
+//! interval, and the current instant.
 //!
-//! ## OSS-raja (KERROS A)
-//! Tämä crate on julkaistava. Se sisältää vain **geneerisiä tyyppejä** — ei
-//! oikeita providereita, sieluja, API-avaimia, tokeneita eikä henkilökohtaisia
-//! polkuja. Tehtävät tunnistetaan geneerisillä [`familyclaw_actions::SkillId`]-
-//! ja [`ScheduledTaskId`]-tunnisteilla.
+//! ## OSS boundary (Layer A)
+//! This crate is publishable. It contains only **generic types** — no
+//! real providers, souls, API keys, tokens, or personal paths. Tasks are
+//! identified with generic [`familyclaw_actions::SkillId`] and
+//! [`ScheduledTaskId`] identifiers.
 
 pub mod decision;
 pub mod dispatch;

@@ -1,33 +1,32 @@
-//! Suhteellisten päiväysten absolutisointi.
+//! Absolutization of relative dates.
 //!
-//! `absolutize_dates`-vaihe (design §2.3, Anthropic Dreaming) ratkaisee
-//! konkreettisen perheen kipupisteen: muisto "`agent_a` lähti **eilen**" muuttuu
-//! merkityksettömäksi heti seuraavana päivänä, ellei "eilen" sidota
-//! kalenteripäivään. Tämä moduuli korvaa suhteelliset päiväsanat
-//! absoluuttisilla ISO-päivämäärillä (`YYYY-MM-DD`) suhteessa unijakson
-//! viitehetkeen.
+//! The `absolutize_dates` phase (design §2.3, Anthropic Dreaming) solves a
+//! concrete family pain point: the memory "`agent_a` left **yesterday**"
+//! becomes meaningless the very next day unless "yesterday" is anchored to
+//! a calendar date. This module replaces relative date words with absolute
+//! ISO dates (`YYYY-MM-DD`) relative to the dream cycle's reference instant.
 //!
-//! Vertailu on tarkoituksella **konservatiivinen**: vain selkeät,
-//! yksiselitteiset päiväsanat korvataan, ja korvaus tehdään vain kokonaisille
-//! sanoille (ei sanan osille). Tuntematon ⇒ teksti jätetään ennalleen
-//! (CLAUDE.md ydinarvo: älä arvaa).
+//! The matching is intentionally **conservative**: only clear,
+//! unambiguous date words are replaced, and the replacement only applies to
+//! whole words (not parts of words). Unknown ⇒ the text is left as-is
+//! (CLAUDE.md core value: don't guess).
 
 use chrono::{Datelike, Duration};
 use familyclaw_core::Timestamp;
 
-/// Yksi tunnettu suhteellinen päiväsana ja sen siirtymä viitepäivästä.
+/// One known relative date word and its offset from the reference date.
 struct RelativeWord {
-    /// Sana sellaisena kuin se esiintyy tekstissä (pieniksi kirjaimiksi).
+    /// The word as it appears in text (lowercased).
     word: &'static str,
-    /// Päivien siirtymä viitepäivästä (`-1` = eilen, `+1` = huomenna).
+    /// Offset in days from the reference date (`-1` = yesterday, `+1` = tomorrow).
     offset_days: i64,
 }
 
-/// Tunnetut suhteelliset päiväsanat (suomi + englanti).
+/// Known relative date words (Finnish + English).
 ///
-/// Lista on tarkoituksella suppea ja yksiselitteinen — "today/tänään" ei
-/// muuta merkitystä kalenteripäiväksi sidottuna, joten se sisältyy
-/// täydellisyyden vuoksi (offset 0).
+/// The list is intentionally narrow and unambiguous — "today/tänään"
+/// doesn't change meaning when anchored to a calendar date, so it's
+/// included for completeness (offset 0).
 const RELATIVE_WORDS: &[RelativeWord] = &[
     RelativeWord {
         word: "eilen",
@@ -63,11 +62,11 @@ const RELATIVE_WORDS: &[RelativeWord] = &[
     },
 ];
 
-/// Muotoilee päiväyksen ISO-muotoon (`YYYY-MM-DD`) viitehetkestä siirrettynä.
+/// Formats a date in ISO form (`YYYY-MM-DD`), shifted from the reference instant.
 ///
-/// Siirto tehdään päivätasolla viitehetken kalenteripäivästä. Jos siirto
-/// vuotaisi chronon edustaman päiväalueen yli, viitepäivä palautetaan
-/// sellaisenaan (paniikiton fallback).
+/// The shift is applied at day granularity from the reference instant's
+/// calendar date. If the shift would overflow the date range chrono can
+/// represent, the reference date is returned unchanged (panic-free fallback).
 fn shifted_iso(reference: Timestamp, offset_days: i64) -> String {
     let base = reference.date_naive();
     let shifted = base
@@ -81,37 +80,38 @@ fn shifted_iso(reference: Timestamp, offset_days: i64) -> String {
     )
 }
 
-/// Lopputulos yhden tekstin absolutisoinnista.
+/// The result of absolutizing a single piece of text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbsolutizeResult {
-    /// Mahdollisesti uudelleenkirjoitettu teksti.
+    /// The possibly rewritten text.
     pub text: String,
-    /// Kuinka monta päiväsanaa korvattiin.
+    /// How many date words were replaced.
     pub replacements: usize,
 }
 
 impl AbsolutizeResult {
-    /// Muuttuiko teksti.
+    /// Whether the text changed.
     #[must_use]
     pub fn changed(&self) -> bool {
         self.replacements > 0
     }
 }
 
-/// Onko merkki sananraja (ei aakkosnumeerinen).
+/// Whether a character is a word boundary (not alphanumeric).
 ///
-/// Käytetään kokonaisten sanojen tunnistukseen, jottei esim. "todays" tai
-/// "yesterdays" osu osittain. Unicode-tietoinen, jotta ä/ö toimivat.
+/// Used to detect whole words, so that e.g. "todays" or "yesterdays" don't
+/// match partially. Unicode-aware, so ä/ö work correctly.
 fn is_word_boundary(c: char) -> bool {
     !c.is_alphanumeric()
 }
 
-/// Pieniksi kirjaimiksi muunnettu yhden merkin kopio, kun muunnos on 1:1.
+/// A lowercased copy of a single character, when the conversion is 1:1.
 ///
-/// Lähes kaikki tunnistettavat kirjaimet (ASCII a–z + suomalaiset ä/ö/å)
-/// muuntuvat yhdeksi merkiksi. Harvinaisissa tapauksissa joissa muunnos
-/// laajenisi (esim. eräät erikoismerkit), palautetaan alkuperäinen merkki —
-/// tällöin se vain ei osu pieneen päiväsanaan, mikä on turvallinen tulos.
+/// Nearly all recognized letters (ASCII a-z + Finnish ä/ö/å) convert to a
+/// single character. In rare cases where the conversion would expand
+/// (e.g. certain special characters), the original character is returned —
+/// in that case it simply won't match a lowercase date word, which is a
+/// safe outcome.
 fn lower_char(c: char) -> char {
     let mut it = c.to_lowercase();
     match (it.next(), it.next()) {
@@ -120,19 +120,19 @@ fn lower_char(c: char) -> char {
     }
 }
 
-/// Korvaa kokonaiset esiintymät `needle`-sanasta (case-insensitive)
-/// `replacement`-merkkijonolla. Palauttaa (teksti, korvausmäärä).
+/// Replaces whole occurrences of the word `needle` (case-insensitive) with
+/// the string `replacement`. Returns (text, replacement count).
 ///
-/// Korvaa vain sananrajojen ympäröimät esiintymät, jotta osittaiset osumat
-/// (esim. "todays" sanasta "today") jäävät koskematta. Vertailu tehdään
-/// merkki kerrallaan pieniksi kirjaimiksi muunnettuna, mutta **säilytetyt
-/// merkit otetaan alkuperäisestä tekstistä** — joten alkuperäinen kirjainkoko
-/// ja muu teksti (esim. paikkamerkit) säilyvät ennallaan.
+/// Only replaces occurrences surrounded by word boundaries, so partial
+/// matches (e.g. "todays" for "today") are left untouched. The comparison
+/// is done character-by-character in lowercase, but **the preserved
+/// characters are taken from the original text** — so the original letter
+/// case and other text (e.g. placeholders) remain unchanged.
 fn replace_whole_word(haystack: &str, needle: &str, replacement: &str) -> (String, usize) {
     if needle.is_empty() {
         return (haystack.to_string(), 0);
     }
-    // Alkuperäiset merkit (säilytettävät) + niiden pienaakkosversiot (vertailu).
+    // Original characters (preserved) + their lowercase versions (for comparison).
     let orig: Vec<char> = haystack.chars().collect();
     let lower: Vec<char> = orig.iter().map(|&c| lower_char(c)).collect();
     let needle_chars: Vec<char> = needle.chars().map(lower_char).collect();
@@ -159,15 +159,16 @@ fn replace_whole_word(haystack: &str, needle: &str, replacement: &str) -> (Strin
     (out, count)
 }
 
-/// Korvaa kaikki tunnetut suhteelliset päiväsanat absoluuttisilla
-/// ISO-päivämäärillä suhteessa viitehetkeen `reference`.
+/// Replaces all known relative date words with absolute ISO dates relative
+/// to the `reference` instant.
 ///
-/// Korvausmuoto on `<sana> (YYYY-MM-DD)`, jotta alkuperäinen ilmaisu säilyy
-/// luettavuuden vuoksi mutta absoluuttinen päivä on kiinnitetty. Esim.
-/// `"lähti eilen"` → `"lähti eilen (2026-06-03)"`.
+/// The replacement form is `<word> (YYYY-MM-DD)`, so the original phrasing
+/// is preserved for readability while the absolute date is pinned down.
+/// E.g. `"lähti eilen"` → `"lähti eilen (2026-06-03)"`.
 ///
-/// Jo absolutisoitu sana (jota seuraa heti `(YYYY-MM-DD)`) ohitetaan, joten
-/// toistuva unijakso on idempotentti — sama muisto ei kerrytä päivämääriä.
+/// A word that's already absolutized (immediately followed by
+/// `(YYYY-MM-DD)`) is skipped, so a repeated dream cycle is idempotent —
+/// the same memory doesn't accumulate dates.
 #[must_use]
 pub fn absolutize(text: &str, reference: Timestamp) -> AbsolutizeResult {
     let mut current = text.to_string();
@@ -176,9 +177,10 @@ pub fn absolutize(text: &str, reference: Timestamp) -> AbsolutizeResult {
     for rw in RELATIVE_WORDS {
         let iso = shifted_iso(reference, rw.offset_days);
         let replacement = format!("{} ({iso})", rw.word);
-        // Idempotenssi: jos sana on jo seurattu täsmälleen tällä annotaatiolla,
-        // älä korvaa uudestaan. Tehdään tämä korvaamalla ensin valmis muoto
-        // paikkamerkiksi, korvaamalla loput, ja palauttamalla paikkamerkki.
+        // Idempotence: if the word is already followed by exactly this
+        // annotation, don't replace it again. Achieved by first replacing
+        // the finished form with a placeholder, replacing the rest, and
+        // then restoring the placeholder.
         let sentinel = "\u{0}DREAM_DATE\u{0}";
         let already = format!("{} ({iso})", rw.word);
         let guarded = current.replace(already.as_str(), sentinel);
@@ -198,7 +200,7 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
 
-    /// Kiinteä viitehetki testeille: 2026-06-04 (UTC).
+    /// Fixed reference instant for tests: 2026-06-04 (UTC).
     fn reference() -> Timestamp {
         Utc.with_ymd_and_hms(2026, 6, 4, 12, 0, 0)
             .single()
@@ -262,14 +264,14 @@ mod tests {
         let r = reference();
         let res = absolutize("Yesterday it rained", r);
         assert_eq!(res.replacements, 1);
-        // Sana normalisoituu pieniksi kirjaimiksi korvauksessa.
+        // The word is normalized to lowercase in the replacement.
         assert!(res.text.contains("yesterday (2026-06-03)"));
     }
 
     #[test]
     fn absolutize_does_not_touch_partial_words() {
         let r = reference();
-        // "yesterdays" ei ole kokonainen "yesterday" → ei kosketa.
+        // "yesterdays" is not a whole "yesterday" → left untouched.
         let res = absolutize("yesterdays news", r);
         assert_eq!(res.replacements, 0);
         assert_eq!(res.text, "yesterdays news");
@@ -289,7 +291,7 @@ mod tests {
         let once = absolutize("left eilen", r);
         assert_eq!(once.replacements, 1);
         let twice = absolutize(&once.text, r);
-        // Toinen ajo ei lisää uutta päivämäärää.
+        // A second run does not add a new date.
         assert_eq!(twice.replacements, 0);
         assert_eq!(twice.text, once.text);
     }

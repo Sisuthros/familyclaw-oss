@@ -1,70 +1,71 @@
 # familyclaw-durable
 
-**Durable substrate — deterministinen replay (crash-proof).**
+**Durable substrate — deterministic replay (crash-proof).**
 
-FamilyClaw-alustan KERROS 1 (design §2.1) ja perheen **#1 kipupisteen —
-muistin epäjatkuvuuden — rakenteellinen ratkaisu**. Durable execution tekee
-työn jatkuvuudesta *rakenteen*: jos prosessi kaatuu, workflow jatkuu täsmälleen
-siitä mihin se jäi, sivuvaikutuksia toistamatta.
+Layer 1 of the FamilyClaw platform (design §2.1) and the **structural
+solution to a family's pain point #1 — memory discontinuity**. Durable
+execution turns continuity of work into *structure*: if the process
+crashes, the workflow resumes exactly where it left off, without replaying
+side effects.
 
-## Malli
+## Model
 
-Journal-pohjainen deterministinen replay (Temporal-/Flawless-malli puhtaana
-Rustina; ei wasmtimea tässä vaiheessa):
+Journal-based deterministic replay (the Temporal/Flawless model in pure
+Rust; no wasmtime at this stage):
 
-1. Workflow kääritään askeliin `DurableContext::step`.
-2. Jokainen valmistunut askel kirjataan `JournalEntry`:nä append-only
-   `Journal`:iin.
-3. Uudelleenkäynnistyksessä `DurableContext` rakennetaan samasta journalista, ja
-   jo suoritetut askeleet **palautetaan lokista ajamatta niiden sulkimia
-   uudelleen** → sivuvaikutukset eivät toistu, tulos on sama.
+1. The workflow is wrapped into steps via `DurableContext::step`.
+2. Every completed step is written as a `JournalEntry` to an append-only
+   `Journal`.
+3. On restart, `DurableContext` is rebuilt from the same journal, and
+   steps that already ran **are restored from the log without re-running
+   their closures** → side effects are not repeated, the result is the same.
 
-## Julkinen API
+## Public API
 
-| Tyyppi | Vastuu |
+| Type | Responsibility |
 |--------|--------|
-| `DurableContext<J>` | `step(name, closure)` -API; replay-kursori, snapshot, finish |
-| `Journal` (trait) | append-only loki: `append`, `replay_from`, `snapshot`, `len` |
-| `InMemoryJournal` | kestämätön toteutus testaukseen/kehitykseen |
-| `FileJournal` | kaatumiskestävä append-only JSONL (`flush` + `fsync`) |
-| `JournalEntry`, `EntryKind`, `StepId` | journal-rivit |
-| `DurableError`, `Result` | virhetyypit (muuntuvat `FamilyClawError`:ksi) |
+| `DurableContext<J>` | `step(name, closure)` API; replay cursor, snapshot, finish |
+| `Journal` (trait) | append-only log: `append`, `replay_from`, `snapshot`, `len` |
+| `InMemoryJournal` | non-durable implementation for testing/development |
+| `FileJournal` | crash-safe append-only JSONL (`flush` + `fsync`) |
+| `JournalEntry`, `EntryKind`, `StepId` | journal rows |
+| `DurableError`, `Result` | error types (convert into `FamilyClawError`) |
 
-## Esimerkki
+## Example
 
 ```rust
 use familyclaw_durable::{DurableContext, InMemoryJournal};
 
-// Tuore ajo: suljin ajetaan ja tulos kirjataan lokiin.
+// Fresh run: the closure runs and the result is written to the log.
 let mut ctx = DurableContext::new(InMemoryJournal::new())?;
 let greeting: String = ctx.step("greet", || Ok("hello".to_string()))?;
 
-// "Kaatuminen": journal talteen, konteksti uudelleen.
+// "Crash": save the journal, rebuild the context.
 let journal = ctx.finish();
 let mut resumed = DurableContext::new(journal)?;
 
-// Replay: askel palautuu lokista — suljinta EI ajeta uudelleen.
+// Replay: the step is restored from the log — the closure is NOT re-run.
 let again: String = resumed.step("greet", || Ok("DIFFERENT".to_string()))?;
-assert_eq!(again, "hello"); // tallennettu arvo, ei sulkimen uusi arvo
+assert_eq!(again, "hello"); // the stored value, not a new value from the closure
 ```
 
-## Kaatumiskestävyys
+## Crash safety
 
-- `FileJournal::append` flushaa ja fsyncaa (`File::sync_all`) ennen paluuta →
-  valmistunut askel on levyllä myös äkillisen kaatumisen jälkeen.
-- Replay sietää tasan yhden tapauksen: vajaan **viimeisen** rivin (ei
-  rivinvaihtoa) joka jäi kesken kirjoituksen kaatuessa. Mikä tahansa *aiempi*
-  vioittunut rivi palautuu `DurableError::CorruptEntry`:nä.
+- `FileJournal::append` flushes and fsyncs (`File::sync_all`) before
+  returning → a completed step is on disk even after a sudden crash.
+- Replay tolerates exactly one case: an incomplete **last** line (missing
+  newline) left mid-write when a crash occurred. Any *earlier* corrupted
+  line comes back as `DurableError::CorruptEntry`.
 
-## Determinismin invariantti
+## Determinism invariant
 
-Koodin täytyy tuottaa samat askeleet (sama nimi, sama järjestys) joka ajolla.
-Jos replay-koodi pyytää askeleen jonka nimi ei vastaa journalissa samalla
-paikalla olevaa, `step` palauttaa `DurableError::NondeterministicReplay`:n sen
-sijaan että jatkaisi hiljaa väärin.
+The code must produce the same steps (same name, same order) on every run.
+If replaying code requests a step whose name doesn't match the one at the
+same position in the journal, `step` returns
+`DurableError::NondeterministicReplay` instead of silently continuing
+incorrectly.
 
-## OSS-raja (KERROS A)
+## OSS boundary (Layer A)
 
-Geneeristä alustakoodia: ei kovakoodattuja sieluja, avaimia, tokeneita,
-IP-osoitteita eikä henkilökohtaisia polkuja. Journalin polku annetaan
-ajonaikaisesti.
+Generic platform code: no hardcoded souls, keys, tokens, IP addresses, or
+personal paths. The journal path is supplied at runtime.

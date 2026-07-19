@@ -1,22 +1,24 @@
-//! Discord-viestien pilkkominen Discordin merkkirajoituksen mukaan.
+//! Splitting Discord messages according to Discord's character limit.
 //!
-//! [`split_message`] pilkkoo tekstin paloihin, joiden Unicode-merkkimäärä
-//! (`chars().count()`) ei ylitä annettua rajaa. Katkaisu suosii rivinvaihtoa,
-//! sitten sanaväliä, ja viimeisenä kovaa merkkirajaa.
+//! [`split_message`] splits text into chunks whose Unicode character count
+//! (`chars().count()`) does not exceed the given limit. The split point
+//! prefers a newline, then a word boundary, and as a last resort a hard
+//! character cut.
 
-/// Pilkkoo viestin enintään `max_len` merkin (`chars().count()`) paloihin.
+/// Splits a message into chunks of at most `max_len` characters
+/// (`chars().count()`).
 ///
-/// Tyhjä tai pelkkää whitespacea oleva syöte palauttaa tyhjän vektorin.
-/// `max_len == 0` käsitellään kuin `1`.
+/// An empty or whitespace-only input returns an empty vector. `max_len == 0`
+/// is treated as `1`.
 ///
-/// Katkaisujärjestys ensimmäisen `max_len` merkin ikkunassa:
-/// 1. viimeinen rivinvaihto (`\n`),
-/// 2. viimeinen sanaväli (` `),
-/// 3. kova katkaisu tasan `max_len` merkin kohdalta.
+/// Split-point priority within the first `max_len`-character window:
+/// 1. the last newline (`\n`),
+/// 2. the last space (` `),
+/// 3. a hard cut at exactly `max_len` characters.
 ///
-/// Yksikään pala ei ole tyhjä eikä ylitä `max_len` merkkiä.
+/// No chunk is empty or exceeds `max_len` characters.
 ///
-/// # Esimerkkejä
+/// # Examples
 ///
 /// ```
 /// use familyclaw_channels::discord::split::split_message;
@@ -53,15 +55,15 @@ pub fn split_message(body: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
-/// Palauttaa vähintään yhden merkin pituuden ensimmäiselle palalle.
+/// Returns a length of at least one character for the first chunk.
 fn min_non_empty_split(s: &str) -> usize {
     s.char_indices()
         .nth(1)
         .map_or(s.len(), |(byte_idx, _)| byte_idx)
 }
 
-/// Etsii tavupisteen, josta `s` katkaistaan ensimmäiseen enintään `max_len`
-/// merkin palaan (exclusive end of chunk).
+/// Finds the byte offset at which `s` is cut for the first chunk of at most
+/// `max_len` characters (exclusive end of chunk).
 fn find_split_byte(s: &str, max_len: usize) -> usize {
     debug_assert!(s.chars().count() > max_len);
 

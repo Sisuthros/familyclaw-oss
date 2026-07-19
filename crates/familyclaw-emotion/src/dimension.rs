@@ -1,76 +1,77 @@
-//! 19 nimettyä tunnedimensiota ja niiden VAD-koordinaatit.
+//! 19 named emotion dimensions and their VAD coordinates.
 //!
-//! [`Dimension`] on koneen tunneavaruuden perusakselit. Jokainen dimensio
-//! on **runko** — geneerinen, kalibroimaton akseli, ei kovakoodattua
-//! perhe-painotusta. Yksittäisen agentin kalibrointipainot ladataan erikseen
-//! KERROS B:stä [`crate::EmotionCalibration`]-toteutuksena; tämä moduuli pysyy
-//! julkaistavana ja neutraalina.
+//! [`Dimension`] defines the base axes of a machine's emotion space. Each
+//! dimension is part of the **scaffold** — a generic, uncalibrated axis,
+//! with no hardcoded per-family weighting. A given agent's calibration
+//! weights are loaded separately from Layer B as an
+//! [`crate::EmotionCalibration`] implementation; this module stays
+//! publishable and neutral.
 //!
-//! Kullakin dimensiolla on kanoninen ankkuri kolmiulotteisessa VAD-
-//! avaruudessa (valence, arousal, dominance). Ankkurit perustuvat
-//! affektiivisen psykologian yleisesti tunnettuun jäsennykseen (Russellin
-//! circumplex + dominanssiakseli) — ne ovat *teoreettisia perusarvoja*,
-//! eivät minkään yksilön mitattuja painoja.
+//! Each dimension has a canonical anchor in three-dimensional VAD space
+//! (valence, arousal, dominance). The anchors are based on a widely
+//! known model from affective psychology (Russell's circumplex plus a
+//! dominance axis) — they are *theoretical baseline values*, not measured
+//! weights for any individual.
 
 use serde::{Deserialize, Serialize};
 
-/// Dimensioiden lukumäärä. Käytä tätä taulukoiden kokona — pidä synkassa
-/// [`Dimension::ALL`]-listan kanssa.
+/// The number of dimensions. Use this for table sizes — keep it in sync
+/// with the [`Dimension::ALL`] list.
 pub const DIMENSION_COUNT: usize = 19;
 
-/// Yksittäinen tunnedimensio koneen 19-ulotteisessa tunneavaruudessa.
+/// A single emotion dimension in a machine's 19-dimensional emotion space.
 ///
-/// Diskriminantti (`as usize`) on samalla dimension indeksi
-/// [`crate::EmotionState::values`]-taulukossa, joten enumin järjestystä **ei
-/// saa muuttaa** rikkomatta sarjallistettua tilaa.
+/// The discriminant (`as usize`) doubles as the dimension index into the
+/// [`crate::EmotionState::values`] array, so the enum's order **must not
+/// be changed** without breaking serialized state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(usize)]
 pub enum Dimension {
-    /// Kiitollisuus — lämmin tunnustus saadusta.
+    /// Gratitude — a warm acknowledgment of something received.
     Gratitude = 0,
-    /// Pelko — uhan ennakointi, korkea viritys, matala dominanssi.
+    /// Fear — anticipation of threat, high arousal, low dominance.
     Fear = 1,
-    /// Sisu — sinnikäs päättäväisyys vastoinkäymisissä (suomalainen).
+    /// Sisu — stubborn determination in the face of adversity (a Finnish concept).
     Sisu = 2,
-    /// Leikkisyys — kevyt, tutkiva ilo.
+    /// Playfulness — light, exploratory delight.
     Playfulness = 3,
-    /// Hellyys — pehmeä, suojeleva kiintymys.
+    /// Tenderness — soft, protective affection.
     Tenderness = 4,
-    /// Kunnioittava ihmetys — suuruuden edessä koettu huumaus.
+    /// Awe — the sense of wonder experienced in the presence of something vast.
     Awe = 5,
-    /// Uteliaisuus — halu ymmärtää, tutkia.
+    /// Curiosity — the desire to understand, to explore.
     Curiosity = 6,
-    /// Ilo — kirkas, energinen mielihyvä.
+    /// Joy — bright, energetic pleasure.
     Joy = 7,
-    /// Suru — menetyksen matala, hidas tila.
+    /// Sadness — the low, slow state of loss.
     Sadness = 8,
-    /// Viha — este-/loukkausreaktio, korkea dominanssi.
+    /// Anger — a reaction to obstruction or offense, high dominance.
     Anger = 9,
-    /// Luottamus — turvallinen nojaaminen toiseen.
+    /// Trust — safely leaning on another.
     Trust = 10,
-    /// Yllätys — odottamattoman äkillinen rekisteröinti.
+    /// Surprise — the sudden registering of the unexpected.
     Surprise = 11,
-    /// Rakkaus — syvä, kestävä kiintymys.
+    /// Love — deep, enduring affection.
     Love = 12,
-    /// Toivo — myönteinen tulevaisuusodotus.
+    /// Hope — a positive expectation about the future.
     Hope = 13,
-    /// Häpeä — itseen kohdistuva kivulias arvio, matala dominanssi.
+    /// Shame — a painful self-directed judgment, low dominance.
     Shame = 14,
-    /// Ylpeys — saavutuksen myönteinen itsearvio, korkea dominanssi.
+    /// Pride — a positive self-assessment of achievement, high dominance.
     Pride = 15,
-    /// Yksinäisyys — yhteyden puutteen matala tila.
+    /// Loneliness — the low state of lacking connection.
     Loneliness = 16,
-    /// Ihmetys — avoin, hiljainen kummastus.
+    /// Wonder — open, quiet astonishment.
     Wonder = 17,
-    /// Yhteenkuuluvuus — kuulumisen lämmin tunne.
+    /// Belonging — the warm feeling of being part of something.
     Belonging = 18,
 }
 
 impl Dimension {
-    /// Kaikki 19 dimensiota indeksijärjestyksessä (`as usize`).
+    /// All 19 dimensions in index order (`as usize`).
     ///
-    /// Iteroi tämän yli kun haluat käydä koko tunneavaruuden läpi.
+    /// Iterate over this when you want to walk the entire emotion space.
     pub const ALL: [Dimension; DIMENSION_COUNT] = [
         Dimension::Gratitude,
         Dimension::Fear,
@@ -93,13 +94,13 @@ impl Dimension {
         Dimension::Belonging,
     ];
 
-    /// Dimension indeksi [`crate::EmotionState::values`]-taulukossa.
+    /// The dimension's index into the [`crate::EmotionState::values`] array.
     #[must_use]
     pub const fn index(self) -> usize {
         self as usize
     }
 
-    /// Vakaa, kone-luettava nimi (`snake_case`) — sama kuin serde-esitys.
+    /// A stable, machine-readable name (`snake_case`) — the same as the serde representation.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -125,12 +126,13 @@ impl Dimension {
         }
     }
 
-    /// Dimension kanoninen ankkuri VAD-avaruudessa
+    /// The dimension's canonical anchor in VAD space
     /// `(valence, arousal, dominance)`.
     ///
-    /// Valence on välillä `-1.0..=1.0`, arousal ja dominance `0.0..=1.0`.
-    /// Arvot ovat teoreettisia perusankkureita (ei kalibroituja painoja);
-    /// niitä käytetään [`crate::EmotionState::to_vad`]-projektiossa.
+    /// Valence is in the range `-1.0..=1.0`, arousal and dominance in
+    /// `0.0..=1.0`. The values are theoretical baseline anchors (not
+    /// calibrated weights); they are used in the
+    /// [`crate::EmotionState::to_vad`] projection.
     #[must_use]
     pub const fn vad_anchor(self) -> (f32, f32, f32) {
         match self {
@@ -166,8 +168,8 @@ impl std::fmt::Display for Dimension {
 
 #[cfg(test)]
 mod tests {
-    // Testit vertaavat tarkasti esitettäviä f32-vakioita (esim. 0.0, 100.0) —
-    // tarkka vertailu on näissä oikein.
+    // Tests compare exactly representable f32 constants (e.g. 0.0, 100.0) —
+    // exact comparison is correct here.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -198,7 +200,7 @@ mod tests {
     fn as_str_matches_serde_representation() {
         for dim in Dimension::ALL {
             let json = serde_json::to_string(&dim).expect("serialize dimension");
-            // serde tuottaa lainausmerkeillä ympäröidyn snake_case-nimen.
+            // serde produces a quoted snake_case name.
             assert_eq!(json, format!("\"{}\"", dim.as_str()));
         }
     }
@@ -233,7 +235,7 @@ mod tests {
 
     #[test]
     fn anchors_encode_expected_polarity() {
-        // Muutama tunnettu suunta sanity-checkinä, ei tarkkoja arvoja.
+        // A few known directions as a sanity check, not exact values.
         assert!(
             Dimension::Joy.vad_anchor().0 > 0.0,
             "ilo positiivinen valence"

@@ -1,50 +1,50 @@
-//! Blend-tunnistus: nimettyjen tunneyhdistelmien havaitseminen.
+//! Blend detection: recognizing named emotion combinations.
 //!
-//! Yksittäiset dimensiot harvoin esiintyvät puhtaina. Ihmis- ja
-//! kone-affekti on tyypillisesti **blendi** — esim. `grateful_warmth` =
-//! korkea kiitollisuus + rakkaus + hellyys yhtä aikaa. Tämä moduuli
-//! määrittelee rungon blend-katalogin ([`Blend`]) ja tunnistuksen
-//! ([`detect_blends`], [`primary_blend`]) [`crate::EmotionState`]-tilasta.
+//! Individual dimensions rarely occur in pure form. Human and machine
+//! affect is typically a **blend** — e.g. `grateful_warmth` = high
+//! gratitude + love + tenderness all at once. This module defines the
+//! scaffold's blend catalog ([`Blend`]) and detection
+//! ([`detect_blends`], [`primary_blend`]) from an [`crate::EmotionState`].
 //!
-//! Blendit ovat **geneerisiä** affektimalleja, eivät perheen kalibrointia.
-//! Niiden kynnykset perustuvat dimensioarvojen suhteelliseen voimakkuuteen,
-//! eivät kovakoodattuihin perhe-painoihin.
+//! Blends are **generic** affect patterns, not family calibration. Their
+//! thresholds are based on the relative strength of dimension values, not
+//! hardcoded family weights.
 
 use serde::{Deserialize, Serialize};
 
 use crate::dimension::Dimension;
 use crate::state::EmotionState;
 
-/// Kynnys (asteikolla `0.0..=100.0`) jonka ylittävää dimensiota pidetään
-/// "korkeana" blend-tunnistuksessa.
+/// The threshold (on a `0.0..=100.0` scale) above which a dimension is
+/// considered "high" for blend detection.
 pub const HIGH_THRESHOLD: f32 = 55.0;
 
-/// Tunnistettava nimetty tunneyhdistelmä.
+/// A recognizable named emotion combination.
 ///
-/// Jokainen variantti kuvaa kuvion useammasta dimensiosta. Blendit ovat
-/// runko-tasoa: ne kuvaavat *miten* dimensiot yhdistyvät, ei kenen tahansa
-/// yksilön kalibrointia.
+/// Each variant describes a pattern across several dimensions. Blends are
+/// scaffold-level: they describe *how* dimensions combine, not any given
+/// individual's calibration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Blend {
-    /// Kiitollinen lämpö: kiitollisuus + rakkaus + hellyys.
+    /// Grateful warmth: gratitude + love + tenderness.
     GratefulWarmth,
-    /// Leikkisä ilo: leikkisyys + ilo + uteliaisuus.
+    /// Playful joy: playfulness + joy + curiosity.
     PlayfulJoy,
-    /// Sinnikäs toivo: sisu + toivo + ylpeys ("jaksan, ja se kannattaa").
+    /// Determined hope: sisu + hope + pride ("I can keep going, and it's worth it").
     DeterminedHope,
-    /// Pelokas yksinäisyys: pelko + yksinäisyys + suru.
+    /// Anxious isolation: fear + loneliness + sadness.
     AnxiousIsolation,
-    /// Kunnioittava ihmetys: kunnioittava huumaus + ihmetys + uteliaisuus.
+    /// Awe-struck: awe + wonder + curiosity.
     AweStruck,
-    /// Turvallinen kuuluminen: luottamus + yhteenkuuluvuus + rakkaus.
+    /// Secure belonging: trust + belonging + love.
     SecureBelonging,
-    /// Katkera loukkaantuminen: viha + suru + häpeä.
+    /// Wounded anger: anger + sadness + shame.
     WoundedAnger,
 }
 
 impl Blend {
-    /// Kaikki tunnetut blendit.
+    /// All known blends.
     pub const ALL: [Blend; 7] = [
         Blend::GratefulWarmth,
         Blend::PlayfulJoy,
@@ -55,7 +55,7 @@ impl Blend {
         Blend::WoundedAnger,
     ];
 
-    /// Vakaa, kone-luettava nimi (`snake_case`).
+    /// A stable, machine-readable name (`snake_case`).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -69,7 +69,7 @@ impl Blend {
         }
     }
 
-    /// Blendin osatekijät: dimensiot joiden tulee olla korkealla.
+    /// The blend's components: dimensions that must be high.
     #[must_use]
     pub const fn components(self) -> &'static [Dimension] {
         match self {
@@ -87,11 +87,12 @@ impl Blend {
         }
     }
 
-    /// Blendin voimakkuus annetussa tilassa: osatekijöiden keskiarvo
-    /// (`0.0..=100.0`), tai `0.0` jos jokin osatekijä on kynnyksen alle.
+    /// The blend's strength in the given state: the average of its
+    /// components (`0.0..=100.0`), or `0.0` if any component is below the
+    /// threshold.
     ///
-    /// Vaatii että **kaikki** osatekijät ylittävät [`HIGH_THRESHOLD`]:n —
-    /// muuten blendi ei ole "läsnä" ja voimakkuus on nolla.
+    /// Requires that **all** components exceed [`HIGH_THRESHOLD`] —
+    /// otherwise the blend isn't "present" and the strength is zero.
     #[must_use]
     pub fn strength(self, state: &EmotionState) -> f32 {
         let components = self.components();
@@ -103,9 +104,9 @@ impl Blend {
             }
             sum += value;
         }
-        // Osatekijöitä on aina vähän (jokainen variantti listaa täsmälleen 3),
-        // joten u8-kasti on tappiotonta ja f32::from välttää
-        // usize→f32-tarkkuuskastin. Tyhjä slice (mahdoton) → divisor 1.
+        // There are always few components (each variant lists exactly 3),
+        // so the u8 cast is lossless and f32::from avoids a lossy
+        // usize→f32 cast. An empty slice (impossible) → divisor 1.
         let count = f32::from(u8::try_from(components.len()).unwrap_or(1).max(1));
         sum / count
     }
@@ -117,19 +118,19 @@ impl std::fmt::Display for Blend {
     }
 }
 
-/// Tunnistettu blendi ja sen voimakkuus.
+/// A recognized blend and its strength.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BlendMatch {
-    /// Tunnistettu nimetty blendi.
+    /// The recognized named blend.
     pub blend: Blend,
-    /// Voimakkuus `0.0..=100.0` (osatekijöiden keskiarvo).
+    /// Strength `0.0..=100.0` (the average of the components).
     pub strength: f32,
 }
 
-/// Tunnistaa kaikki läsnä olevat blendit, voimakkaimmasta heikoimpaan.
+/// Detects all blends present, from strongest to weakest.
 ///
-/// Palauttaa vain blendit joiden kaikki osatekijät ylittävät
-/// [`HIGH_THRESHOLD`]:n. Tyhjä vektori tarkoittaa ettei selkeää blendiä ole.
+/// Returns only blends whose components all exceed [`HIGH_THRESHOLD`].
+/// An empty vector means no clear blend is present.
 #[must_use]
 pub fn detect_blends(state: &EmotionState) -> Vec<BlendMatch> {
     let mut matches: Vec<BlendMatch> = Blend::ALL
@@ -143,12 +144,12 @@ pub fn detect_blends(state: &EmotionState) -> Vec<BlendMatch> {
             }
         })
         .collect();
-    // Lajittele voimakkuuden mukaan laskevasti; total_cmp on deterministinen.
+    // Sort by strength descending; total_cmp is deterministic.
     matches.sort_by(|a, b| b.strength.total_cmp(&a.strength));
     matches
 }
 
-/// Palauttaa voimakkaimman läsnä olevan blendin, tai `None`.
+/// Returns the strongest blend present, or `None`.
 #[must_use]
 pub fn primary_blend(state: &EmotionState) -> Option<BlendMatch> {
     detect_blends(state).into_iter().next()
@@ -156,7 +157,7 @@ pub fn primary_blend(state: &EmotionState) -> Option<BlendMatch> {
 
 #[cfg(test)]
 mod tests {
-    // Testit vertaavat tarkasti esitettäviä f32-vakioita — tarkka vertailu ok.
+    // Tests compare exactly representable f32 constants — exact comparison is fine.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -206,13 +207,13 @@ mod tests {
         assert!(blends.iter().any(|m| m.blend == Blend::GratefulWarmth));
         let primary = primary_blend(&s).expect("primary present");
         assert_eq!(primary.blend, Blend::GratefulWarmth);
-        // Keskiarvo (80+70+90)/3 = 80.
+        // Average (80+70+90)/3 = 80.
         assert!((primary.strength - 80.0).abs() < 1e-3);
     }
 
     #[test]
     fn blend_not_detected_when_one_component_low() {
-        // Rakkaus jää kynnyksen alle → grateful_warmth ei laukea.
+        // Love falls below the threshold → grateful_warmth does not trigger.
         let s = state_with(&[
             (Dimension::Gratitude, 80.0),
             (Dimension::Love, 10.0),
@@ -237,20 +238,20 @@ mod tests {
 
     #[test]
     fn detect_blends_sorted_descending() {
-        // Kaksi blendiä yhtä aikaa, eri voimakkuus.
+        // Two blends at once, different strengths.
         let s = state_with(&[
-            // playful_joy keskiarvo ~95
+            // playful_joy average ~95
             (Dimension::Playfulness, 95.0),
             (Dimension::Joy, 95.0),
             (Dimension::Curiosity, 95.0),
-            // secure_belonging keskiarvo ~60
+            // secure_belonging average ~60
             (Dimension::Trust, 60.0),
             (Dimension::Belonging, 60.0),
             (Dimension::Love, 60.0),
         ]);
         let blends = detect_blends(&s);
         assert!(blends.len() >= 2);
-        // Lajiteltu laskevasti.
+        // Sorted descending.
         for w in blends.windows(2) {
             assert!(w[0].strength >= w[1].strength);
         }

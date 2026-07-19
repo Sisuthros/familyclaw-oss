@@ -34,7 +34,7 @@ use tracing_subscriber::EnvFilter;
     about = "FamilyClaw minimal demo — 1 agent + bus"
 )]
 struct Cli {
-    /// Kuinka kauan demo ajetaan sekunteina (0 = Ctrl-C:hen asti)
+    /// How long the demo runs, in seconds (0 = until Ctrl-C)
     #[arg(short, long, default_value = "10")]
     duration: u64,
 }
@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
         channel_a,
         "mock-a".to_string(), // reply_target
         &resolver,
-        None, // ei havainnoitavuussiltaa (esimerkki ei tarjoile /metrics)
+        None, // no observability bridge (the example does not serve /metrics)
     )
     .await?;
 

@@ -1,5 +1,8 @@
 # Phase 1 Release Readiness Checklist
 
+> **ARCHIVED (2026-07-18):** historical sprint/booth document; items verified
+> complete or superseded by [STATUS.md](../../STATUS.md).
+
 > Hardening / test / CI / PR-readiness sprint on `feat/familyclaw-v1-tool-loop`.
 > No new product features. No scope widening. Close the listed P0/P1 gaps only.
 

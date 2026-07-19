@@ -1,14 +1,14 @@
-//! Esimerkkimalli (reference pattern): sähköpostien luokittelu (triage) (KERROS A).
+//! Reference pattern: email triage (classification) (Layer A).
 //!
-//! [`EmailTriageMock`] lukee listan sähköposteja ([`EmailItem`]) ja luokittelee
-//! kunkin kategoriaan sekä ehdottaa toimenpidettä. Taito on **vain luku**
-//! ([`crate::policy::ActionRisk::ReadOnly`]) — se ei lähetä, poista eikä muokkaa
-//! mitään. Tämä on **referenssimalli joka näyttää taidon sopimuksen**
-//! (manifesti + read-only-riskiluokka + syöte/tuloste-skeema): suorituslogiikka
-//! on deterministinen ja muistinvarainen, ja lähettäjäosoite on geneerinen
-//! placeholder `user@example.com` (KERROS A). Kytke oma Gmail-tarjoajasi tähän
-//! suoritusrunkoon, kun haluat elävän integraation — manifesti ja putki pysyvät
-//! ennallaan.
+//! [`EmailTriageMock`] reads a list of emails ([`EmailItem`]) and classifies
+//! each one into a category while suggesting an action. The skill is
+//! **read-only** ([`crate::policy::ActionRisk::ReadOnly`]) — it neither sends,
+//! deletes, nor modifies anything. This is a **reference pattern that
+//! demonstrates the skill contract** (manifest + read-only risk class +
+//! input/output schema): the execution logic is deterministic and in-memory,
+//! and the sender address is a generic placeholder `user@example.com` (Layer
+//! A). Wire up your own Gmail provider into this execution scaffold when you
+//! want a live integration — the manifest and pipeline remain unchanged.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -22,72 +22,72 @@ use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 
 use super::Skill;
 
-/// Taidon kiinteä tunniste, jotta rekisteröinti ja haku ovat toistettavia.
+/// Fixed identifier for the skill, so registration and lookup are reproducible.
 const SKILL_UUID: uuid::Uuid = uuid::uuid!("22222222-2222-4222-8222-222222222222");
 
-/// Yksittäinen sähköposti luokiteltavaksi.
+/// A single email to be classified.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailItem {
-    /// Lähettäjän osoite (geneerinen, esim. `user@example.com`).
+    /// The sender's address (generic, e.g. `user@example.com`).
     pub from: String,
-    /// Viestin aihe.
+    /// The message subject.
     pub subject: String,
-    /// Viestin runko.
+    /// The message body.
     pub body: String,
 }
 
-/// Taidon syöte: lista luokiteltavia sähköposteja.
+/// Skill input: a list of emails to classify.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailTriageInput {
-    /// Luokiteltavat sähköpostit.
+    /// The emails to classify.
     pub emails: Vec<EmailItem>,
 }
 
-/// Yhden sähköpostin luokittelutulos.
+/// The classification result for a single email.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TriagedEmail {
-    /// Indeksi syötelistassa (0-pohjainen).
+    /// Index in the input list (0-based).
     pub id: usize,
-    /// Päätelty kategoria (esim. `urgent`, `spam`, `normal`).
+    /// The inferred category (e.g. `urgent`, `spam`, `normal`).
     pub category: String,
-    /// Ehdotettu toimenpide (esim. `reply`, `archive`, `read`).
+    /// The suggested action (e.g. `reply`, `archive`, `read`).
     pub action: String,
 }
 
-/// Taidon tulos: luokitellut sähköpostit.
+/// Skill output: the classified emails.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailTriageOutput {
-    /// Luokittelutulokset syötteen järjestyksessä.
+    /// Classification results in the order of the input.
     pub categorized: Vec<TriagedEmail>,
 }
 
-/// Mock-taito sähköpostien luokittelulle (vain luku).
+/// Mock skill for email classification (read-only).
 ///
-/// Riskiluokka on [`ActionRisk::ReadOnly`] ja käytäntö
-/// [`ApprovalPolicy::AutoIfReadOnly`], joten suoritus ajaa automaattisesti
-/// ilman hyväksyntää.
+/// The risk class is [`ActionRisk::ReadOnly`] and the policy is
+/// [`ApprovalPolicy::AutoIfReadOnly`], so execution runs automatically
+/// without approval.
 #[derive(Debug, Clone, Default)]
 pub struct EmailTriageMock;
 
 impl EmailTriageMock {
-    /// Luo uuden taidon.
+    /// Creates a new skill instance.
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 
-    /// Taidon kiinteä tunniste.
+    /// The skill's fixed identifier.
     #[must_use]
     pub fn skill_id() -> SkillId {
         SkillId::from_uuid(SKILL_UUID)
     }
 
-    /// Luokittelee sähköpostit deterministisillä avainsanoilla (puhdas logiikka).
+    /// Classifies the emails using deterministic keywords (pure logic).
     ///
-    /// Heuristiikka:
-    /// - aihe/runko sisältää sanan `urgent`/`asap` → `urgent` + `reply`,
-    /// - aihe/runko sisältää sanan `unsubscribe`/`offer` → `spam` + `archive`,
-    /// - muutoin → `normal` + `read`.
+    /// Heuristic:
+    /// - subject/body contains `urgent`/`asap` → `urgent` + `reply`,
+    /// - subject/body contains `unsubscribe`/`offer` → `spam` + `archive`,
+    /// - otherwise → `normal` + `read`.
     #[must_use]
     pub fn triage(input: &EmailTriageInput) -> EmailTriageOutput {
         let categorized = input
@@ -146,9 +146,8 @@ impl Skill for EmailTriageMock {
             id: Self::skill_id(),
             name: "email_triage_mock".to_string(),
             version: "1.0.0".to_string(),
-            description:
-                "Luokittelee sähköpostit kategorioihin ja ehdottaa toimenpiteet (vain luku)."
-                    .to_string(),
+            description: "Classifies emails into categories and suggests actions (read-only)."
+                .to_string(),
             permissions: vec![SkillPermission::NetworkRead],
             risk: ActionRisk::ReadOnly,
             approval_policy: ApprovalPolicy::AutoIfReadOnly,
@@ -159,21 +158,21 @@ impl Skill for EmailTriageMock {
                 "properties": {
                     "emails": {
                         "type": "array",
-                        "description": "Luokiteltavat sähköpostit.",
+                        "description": "The emails to classify.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "from": {
                                     "type": "string",
-                                    "description": "Lähettäjän osoite."
+                                    "description": "The sender's address."
                                 },
                                 "subject": {
                                     "type": "string",
-                                    "description": "Viestin aihe."
+                                    "description": "The message subject."
                                 },
                                 "body": {
                                     "type": "string",
-                                    "description": "Viestin runko."
+                                    "description": "The message body."
                                 }
                             },
                             "required": ["from", "subject", "body"],

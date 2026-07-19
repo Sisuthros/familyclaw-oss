@@ -1,33 +1,33 @@
-# Arkkitehtuuri: Channels (Kanava-abstraktio)
+# Architecture: Channels (Channel Abstraction)
 
-FamilyClaw käyttää yhtenäistä kanava-abstraktiota yhdistääkseen ydinjärjestelmän eri viestintäalustoihin, kuten Discordiin. Tämän ansiosta järjestelmän sisäinen toiminta on riippumatonta ulkoisista viestintäpalveluista.
+FamilyClaw uses a unified channel abstraction to connect the core system to various communication platforms, such as Discord. This keeps the system's internal behavior independent of external communication services.
 
-## `Channel`-trait ja rajapinta
+## `Channel` trait and interface
 
-Kaikki adapterit toteuttavat yhteisen abstraktion, joka määrittelee neljä perusoperaatiota (sopimus):
-- `start().await`: Yhdistää alustan palvelimiin (esim. WebSocket-gateway) ja palauttaa valmiustilan tai virheen (`ready`/`virhe`).
-- `stop().await`: Sulkee yhteyden siististi.
-- `send(OutboundMessage).await`: Lähettää viestin ulkoiselle alustalle.
-- `receive()`: Palauttaa `MessageStream`-olion saapuvien viestien kuuntelemiseksi (kutsuttavissa vain kerran).
+All adapters implement a common abstraction that defines four basic operations (the contract):
+- `start().await`: Connects to the platform's servers (e.g. a WebSocket gateway) and returns a ready state or an error (`ready`/`error`).
+- `stop().await`: Closes the connection cleanly.
+- `send(OutboundMessage).await`: Sends a message to the external platform.
+- `receive()`: Returns a `MessageStream` for listening to incoming messages (callable only once).
 
-## Discord-adapterin rakenne
+## Discord adapter structure
 
-Discord-adapteri on toteutettu `serenity`-kirjaston (versio 0.12) avulla.
-- **Gateway-task:** Taustalla pyörivä epäsynkroninen task, joka ylläpitää Discord Gateway -yhteyttä.
-- **Vastaanotto (MPSC):** Gateway-task lukee tapahtumat ja välittää saapuvat viestit eteenpäin ytimelle `mpsc` (multi-producer, single-consumer) -kanavan kautta, joka palautetaan `MessageStream`-oliona `receive()`-kutsussa.
-- **Lähetys:** `Arc<Http>`-instanssia käytetään epäsynkronisiin API-kutsuihin, jolloin viestien lähetys onnistuu rinnakkain ilman Gateway-taskin estämistä.
+The Discord adapter is implemented using the `serenity` library (version 0.12).
+- **Gateway task:** A background async task that maintains the Discord Gateway connection.
+- **Receiving (MPSC):** The gateway task reads events and forwards incoming messages to the core via an `mpsc` (multi-producer, single-consumer) channel, which is returned as a `MessageStream` from `receive()`.
+- **Sending:** An `Arc<Http>` instance is used for async API calls, allowing messages to be sent concurrently without blocking the gateway task.
 
-## KERROS A -periaate
+## LAYER A principle
 
-Channels-abstraktio ja adapterit on suunniteltu noudattamaan ehdotonta **Kerros A** -periaatetta:
-Kaikki konfiguraatio (kuten botin tokenit ja kanava-ID:t) annetaan ajonaikaisesti. Koodissa ei saa olla mitään kovakoodattuja arvoja, salaisuuksia tai projektikohtaisia tunnisteita. Tällä varmistetaan, että repoon ei päädy mitään salattavaa.
+The channels abstraction and its adapters are designed to strictly follow the **Layer A** principle:
+All configuration (such as bot tokens and channel IDs) is supplied at runtime. The code must not contain any hardcoded values, secrets, or project-specific identifiers. This ensures nothing sensitive ends up in the repo.
 
-## Feature-gating (`discord`-lippu)
+## Feature gating (the `discord` flag)
 
-Discord-adapteri ja sen riippuvuudet on eristetty `discord`-featuren taakse.
-**Miksi?** Tämä eristys vähentää käännösaikaa ja binäärin kokoa niille käyttäjille, jotka eivät tarvitse Discord-tukea, sekä mahdollistaa muiden adapterien rinnakkaisen kehittämisen ja kääntämisen itsenäisesti.
+The Discord adapter and its dependencies are isolated behind the `discord` feature.
+**Why?** This isolation reduces build time and binary size for users who don't need Discord support, and allows other adapters to be developed and compiled independently in parallel.
 
-## Viestin kulku (Sekvenssikaavio)
+## Message flow (sequence diagram)
 
 ```mermaid
 sequenceDiagram
@@ -36,29 +36,29 @@ sequenceDiagram
     participant GW as Gateway Task
     participant API as Discord API / Gateway
 
-    %% Yhdistäminen
+    %% Connecting
     FC->>CH: new(token, target_channel_id)
     FC->>CH: start()
-    CH->>API: Yhdistä WebSocket-gatewayhin
+    CH->>API: Connect to the WebSocket gateway
     API-->>CH: Ready
     CH-->>FC: Ok(())
 
     FC->>CH: receive()
     CH-->>FC: MessageStream
 
-    %% Vastaanotto
+    %% Receiving
     API->>GW: MessageCreate Event
-    GW->>GW: Suodata (oikea kanava)
-    GW->>FC: mpsc:n kautta (MessageStream -> InboundMessage)
+    GW->>GW: Filter (correct channel)
+    GW->>FC: via mpsc (MessageStream -> InboundMessage)
 
-    %% Lähetys
+    %% Sending
     FC->>CH: send(OutboundMessage)
     CH->>API: HTTP POST /channels/{id}/messages (Arc<Http>)
     API-->>CH: 200 OK
     CH-->>FC: Ok(())
 
-    %% Pysäytys
+    %% Stopping
     FC->>CH: stop()
-    CH->>API: Sulje Gateway-yhteys
+    CH->>API: Close the Gateway connection
     CH-->>FC: Ok(())
 ```

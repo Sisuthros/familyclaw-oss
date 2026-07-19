@@ -1,43 +1,45 @@
 //! # familyclaw-dream
 //!
-//! **Dreaming — yöllinen muistikonsolidaatio (hippocampal model).**
+//! **Dreaming — nightly memory consolidation (hippocampal model).**
 //!
-//! Tämä crate on FamilyClaw-alustan (KERROS A, OSS) "uni"-vaihe (design §2.3,
-//! Anthropic Dreaming 6.5.2026). Se peilaa perheen Amplifier-proteesin —
-//! joka konsolidoi `MEMORY.md`:n — **natiiviksi** muistin huolloksi: yöllinen
-//! [`DreamCycle`] lukee muistit [`familyclaw_memory`]-tallennuksesta ja
-//! ristiriitatiedon durable-[`familyclaw_durable`]-journalista, ja siivoaa
-//! muistin viidessä vaiheessa.
+//! This crate is the "sleep" phase of the `FamilyClaw` platform (Layer A,
+//! OSS; design §2.3, Anthropic Dreaming 2026-05-06). It mirrors a family's
+//! Amplifier prosthesis — which consolidates `MEMORY.md` — as **native**
+//! memory maintenance: a nightly [`DreamCycle`] reads memories from
+//! [`familyclaw_memory`] storage and conflict data from the durable
+//! [`familyclaw_durable`] journal, and cleans up memory in five phases.
 //!
-//! ## Viisi vaihetta
-//! 1. **`merge_duplicates`** — lähes-identtiset muistot yhdistetään yhdeksi
-//!    vahvistetuksi edustajaksi (tunneet + tägit unioidaan, muut haudataan).
-//!    Samankaltaisuus on riippuvuusvapaa Jaccard-sananjoukko ([`similarity`]).
-//! 2. **`drop_contradicted`** — durable-journalin ristiriitaisiksi merkitsemät
-//!    muistot haudataan ([`contradiction`]). Journal on totuuden lähde —
-//!    unijakso ei arvaa.
-//! 3. **`absolutize_dates`** — suhteelliset päiväsanat ("eilen", "tomorrow")
-//!    muutetaan absoluuttisiksi ISO-päivämääriksi ([`dates`]). Tämä ratkaisee
-//!    konkreettisesti perheen muistin "eilen vanhenee" -ongelman.
-//! 4. **`consolidate`** — korkean tärkeyden muistot vahvistuvat, matalan
-//!    retention (R < kynnys) muistot arkistoituvat.
-//! 5. tuottaa [`DreamReport`]:n johon jokainen vaihe kirjaa [`Reflection`]:nsa.
+//! ## Five phases
+//! 1. **`merge_duplicates`** — near-identical memories are merged into a
+//!    single reinforced representative (emotions + tags are unioned, the
+//!    rest are tombstoned). Similarity is a dependency-free Jaccard word
+//!    set ([`similarity`]).
+//! 2. **`drop_contradicted`** — memories the durable journal has flagged
+//!    as contradicted are tombstoned ([`contradiction`]). The journal is
+//!    the source of truth — the dream cycle doesn't guess.
+//! 3. **`absolutize_dates`** — relative date words ("yesterday",
+//!    "tomorrow") are converted to absolute ISO dates ([`dates`]). This
+//!    concretely solves a family memory's "yesterday expires" problem.
+//! 4. **`consolidate`** — high-importance memories are reinforced,
+//!    low-retention (R < threshold) memories are archived.
+//! 5. produces a [`DreamReport`] in which every phase records its
+//!    [`Reflection`].
 //!
-//! Vaiheet ajetaan kiinteässä järjestyksessä, joten sama syöte tuottaa saman
-//! raportin (deterministinen, toistettava).
+//! Phases run in a fixed order, so the same input produces the same report
+//! (deterministic, repeatable).
 //!
-//! ## Identiteetti-ankkurit ovat pyhiä
-//! Mikään vaihe ei koskaan hauta tai arkistoi
-//! [`familyclaw_memory::DecayPolicy::ProtectedCore`]-muistoa — identiteetti
-//! ei vaimene unessa (design §2: anchor λ = 0.0).
+//! ## Identity anchors are sacred
+//! No phase ever tombstones or archives a
+//! [`familyclaw_memory::DecayPolicy::ProtectedCore`] memory — identity does
+//! not decay during sleep (design §2: anchor λ = 0.0).
 //!
-//! ## OSS-raja (KERROS A)
-//! Tämä crate on geneeristä alustakoodia. Se ei kovakoodaa perheenjäsenten
-//! sieluja, kalibrointeja, avaimia, tokeneita, IP-osoitteita tai
-//! henkilökohtaisia polkuja. Kaikki perhe-spesifit muistot ja kynnykset
-//! annetaan ajonaikaisesti.
+//! ## OSS boundary (Layer A)
+//! This crate is generic platform code. It does not hardcode family
+//! members' souls, calibrations, keys, tokens, IP addresses, or personal
+//! paths. All family-specific memories and thresholds are supplied at
+//! runtime.
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```rust
 //! use familyclaw_dream::{DreamCycle, DreamConfig};
 //! use familyclaw_memory::{ImportanceFactors, LocalJsonStore, Memory, MemoryStore};
@@ -46,7 +48,7 @@
 //! # async fn demo() -> familyclaw_core::Result<()> {
 //! let store = LocalJsonStore::in_memory();
 //! store.add(Memory::builder("we shipped the release").build()).await?;
-//! store.add(Memory::builder("we shipped the release").build()).await?; // duplikaatti
+//! store.add(Memory::builder("we shipped the release").build()).await?; // duplicate
 //!
 //! let journal = InMemoryJournal::new();
 //! let cycle = DreamCycle::with_config(&store, DreamConfig::default());
@@ -80,7 +82,7 @@ pub use report::{DreamReport, Reflection, ReflectionKind};
 pub use similarity::{is_near_duplicate, jaccard};
 pub use weekly::{weekly_review, weekly_review_top_n, MemoryDigest, WeeklyReport};
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

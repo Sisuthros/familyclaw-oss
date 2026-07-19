@@ -1,12 +1,15 @@
 [package]
 name = "familyclaw-bus"
-description = "Resonance Bus — Ractor actor model + affective nervous system"
+description = "Actor-based message bus for multi-agent systems, built on Ractor, with shared emotional-state propagation between agents"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["actor", "agent", "message-bus", "async", "runtime"]
+categories = ["asynchronous", "concurrency"]
 
 [lints]
 workspace = true

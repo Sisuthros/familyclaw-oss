@@ -1,22 +1,23 @@
-//! [`EventRecorder`] — tilaa siltakerroksen tapahtumaväylän ja muuntaa
-//! tapahtumat mittaripäivityksiksi.
+//! [`EventRecorder`] — subscribes to the bridge layer's event bus and
+//! converts events into metric updates.
 //!
-//! Tallennin on **vain lukeva**: se tilaa [`EventBus`]in
-//! ([`FamilyBridge::subscribe`]) ja kuluttaa tapahtumia, mutta ei koskaan
-//! julkaise väylälle. Tapahtumalaji ([`EventKind`]) kuvataan
-//! [`MetricsRegistry`]-päivitykseksi. Tuntemattomat ja tulevat lajit (mukaan
-//! lukien [`EventKind::Custom`] joita ei erikseen tunnisteta) **ohitetaan**
-//! `_ => {}`-haarassa — näin uudet tapahtumatyypit eivät koskaan riko
-//! tallenninta (eteenpäin-yhteensopivuus).
+//! The recorder is **read-only**: it subscribes to the [`EventBus`]
+//! ([`FamilyBridge::subscribe`]) and consumes events, but never publishes to
+//! the bus. Each event kind ([`EventKind`]) is mapped to a
+//! [`MetricsRegistry`] update. Unknown and future kinds (including
+//! [`EventKind::Custom`] labels that are not individually recognized) are
+//! **ignored** by the `_ => {}` branch — this way new event types never
+//! break the recorder (forward compatibility).
 //!
-//! ## Tapahtuma → mittari -kartta (mitkä sarjat ovat eläviä)
-//! Tallennin kasvattaa **vain** alla luetellut sarjat. Muut laivueen
-//! oletussarjat pysyvät nollassa kunnes niille tuotetaan vastaava tapahtuma.
+//! ## Event → metric map (which series are live)
+//! The recorder only increments the series listed below. Other default
+//! fleet series stay at zero until a corresponding event is produced for
+//! them.
 //!
-//! | [`EventKind`] | Mittari |
+//! | [`EventKind`] | Metric |
 //! |---|---|
-//! | `TaskCreated` | `tasks_created` (laskuri +1) |
-//! | `TaskHandedOff` | `task_handoffs` (laskuri +1) |
+//! | `TaskCreated` | `tasks_created` (counter +1) |
+//! | `TaskHandedOff` | `task_handoffs` (counter +1) |
 //! | `AgentRegistered` | `agents_online` (gauge +1) |
 //! | `AgentDeregistered` | `agents_online` (gauge -1) |
 //! | `Custom("task.completed" \| "orchestration.task_completed")` | `tasks_completed` (+1) |
@@ -30,16 +31,16 @@
 //! | `Custom("workflow.step_completed" \| "orchestration.workflow_step_completed")` | `workflow_steps_completed` (+1) |
 //! | `Custom("tool.call" \| "orchestration.tool_call")` | `tool_calls` (+1) |
 //!
-//! `TaskStatusChanged` ja `AgentHeartbeat` eivät kartoitu omaan mittariin.
+//! `TaskStatusChanged` and `AgentHeartbeat` do not map to their own metric.
 //!
-//! ## Custom-tapahtumat
-//! Orkestrointi- ja sopimuskerros lähettää koordinaation
-//! [`EventKind::Custom`]-tapahtumina vakaalla etuliitteellä
-//! (`contract.*`, `orchestration.*`, `workflow.*`). Tallennin tunnistaa
-//! tunnetut etiketit ja kasvattaa vastaavia laskureita; tuntemattomat
-//! etiketit ohitetaan turvallisesti.
+//! ## Custom events
+//! The orchestration and contract layers publish coordination events as
+//! [`EventKind::Custom`] with a stable prefix (`contract.*`,
+//! `orchestration.*`, `workflow.*`). The recorder recognizes the known
+//! labels and increments the matching counters; unrecognized labels are
+//! safely ignored.
 //!
-//! ## Käyttö
+//! ## Usage
 //! ```
 //! use familyclaw_bridge::FamilyBridge;
 //! use familyclaw_observability::{EventRecorder, MetricsRegistry};
@@ -49,9 +50,9 @@
 //! let metrics = MetricsRegistry::with_fleet_defaults();
 //! let mut recorder = EventRecorder::new(&bridge, metrics.clone());
 //!
-//! // Tuota tapahtuma...
+//! // Produce an event...
 //! bridge.create_task("seed", None).await?;
-//! // ...ja valuta se mittareihin.
+//! // ...and drain it into the metrics.
 //! recorder.drain_once().await;
 //! # Ok(())
 //! # }
@@ -68,11 +69,13 @@ use crate::metrics::{
     COUNTER_WORKFLOW_STEPS_COMPLETED, GAUGE_AGENTS_ONLINE,
 };
 
-/// Tilaa tapahtumaväylän ja päivittää mittareita tapahtumien perusteella.
+/// Subscribes to the event bus and updates metrics based on the events
+/// received.
 ///
-/// Pidä yksi tallennin elossa koko gatewayn eliniän. Tilaaja näkee vain
-/// *tilauksen jälkeen* julkaistut tapahtumat (ks. [`EventBus`]-semantiikka),
-/// joten luo tallennin ennen kuin liikennettä alkaa syntyä.
+/// Keep a single recorder alive for the lifetime of the gateway. A
+/// subscriber only sees events published *after* it subscribes (see
+/// [`EventBus`] semantics), so create the recorder before traffic starts
+/// flowing.
 ///
 /// [`EventBus`]: familyclaw_bridge::EventBus
 #[derive(Debug)]
@@ -82,8 +85,8 @@ pub struct EventRecorder {
 }
 
 impl EventRecorder {
-    /// Luo tallentimen joka tilaa annetun sillan väylän ja kirjaa annettuun
-    /// rekisteriin.
+    /// Creates a recorder that subscribes to the given bridge's event bus
+    /// and records into the given registry.
     #[must_use]
     pub fn new(bridge: &FamilyBridge, metrics: MetricsRegistry) -> Self {
         Self {
@@ -92,30 +95,32 @@ impl EventRecorder {
         }
     }
 
-    /// Pääsy tallentimen mittarirekisteriin.
+    /// Access to the recorder's metrics registry.
     #[must_use]
     pub fn metrics(&self) -> &MetricsRegistry {
         &self.metrics
     }
 
-    /// Valuttaa kaikki *tällä hetkellä jonossa* olevat tapahtumat estämättä
-    /// ja palauttaa montako tapahtumaa käsiteltiin.
+    /// Drains all events *currently queued* without blocking, and returns
+    /// how many events were processed.
     ///
-    /// Tämä ei odota uusia tapahtumia — se vain tyhjentää sen mitä on heti
-    /// saatavilla. Jos tilaaja jäi jälkeen ja tapahtumia pudotettiin, pudotus
-    /// ohitetaan (mittarit eivät voi paniikata tästä) ja valutus jatkuu.
+    /// This does not wait for new events — it only empties what is
+    /// immediately available. If the subscriber lagged and events were
+    /// dropped, the drop is ignored (metrics cannot panic over this) and
+    /// draining continues.
     ///
-    /// `async` on osa vakaata rajapintaa ([`run`]:n rinnalla) eikä siksi
-    /// poistettavissa, vaikka nykytoteutus ei `await`-tä — tämä sallii
-    /// myöhemmin lisättävän odottavan vastapainevariantin ilman API-muutosta.
+    /// `async` is part of the stable interface (alongside [`run`]) and is
+    /// therefore not removable, even though the current implementation
+    /// never `await`s — this allows a future blocking/backpressure variant
+    /// to be added later without an API change.
     ///
     /// [`run`]: EventRecorder::run
     #[allow(clippy::unused_async)]
     pub async fn drain_once(&mut self) -> usize {
         let mut processed = 0usize;
-        // `try_recv` palauttaa `Ok(Some)` niin kauan kuin jonossa on tapahtumia.
-        // `Ok(None)` (tyhjä) ja `Err(_)` (lagged/closed) lopettavat silmukan
-        // siististi — pudotettuja tapahtumia ei lasketa eikä paniikkia synny.
+        // `try_recv` returns `Ok(Some)` as long as there are events queued.
+        // `Ok(None)` (empty) and `Err(_)` (lagged/closed) end the loop
+        // cleanly — dropped events are not counted and no panic occurs.
         while let Ok(Some(event)) = self.subscriber.try_recv() {
             self.record(&event.kind);
             processed += 1;
@@ -123,57 +128,58 @@ impl EventRecorder {
         processed
     }
 
-    /// Estävä silmukka: odottaa ja käsittelee tapahtumia kunnes väylä sulkeutuu.
+    /// Blocking loop: waits for and processes events until the bus closes.
     ///
-    /// Soveltuu omistettuun taustatehtävään (`tokio::spawn`). Palaa kun väylä
-    /// on suljettu (kaikki lähettäjät pudotettu). Lagged-tilanteet ohitetaan
-    /// ja kuuntelu jatkuu.
+    /// Suited for a dedicated background task (`tokio::spawn`). Returns when
+    /// the bus is closed (all senders dropped). Lagged conditions are
+    /// ignored and listening continues.
     pub async fn run(mut self) {
         loop {
             match self.subscriber.recv().await {
                 Ok(event) => self.record(&event.kind),
-                // Suljettu → lopeta; lagged → jatka.
+                // Closed → stop; lagged → continue.
                 Err(err) => {
                     let msg = err.to_string();
                     if msg.contains("closed") {
                         break;
                     }
-                    // lagged: jatka kuuntelua.
+                    // lagged: keep listening.
                 }
             }
         }
     }
 
-    /// Muuntaa yhden tapahtumalajin mittaripäivitykseksi.
+    /// Converts a single event kind into a metric update.
     ///
-    /// Tunnettujen ydinlajien lisäksi tunnistetaan vakaat
-    /// [`EventKind::Custom`]-etiketit. Tuntemattomat lajit ohitetaan
-    /// (`_ => {}`) — tämä on tahallinen eteenpäin-yhteensopivuusvara.
+    /// In addition to the known core kinds, stable [`EventKind::Custom`]
+    /// labels are recognized. Unknown kinds are ignored (`_ => {}`) — this
+    /// is a deliberate forward-compatibility allowance.
     fn record(&self, kind: &EventKind) {
         match kind {
             EventKind::TaskCreated => self.metrics.counter(COUNTER_TASKS_CREATED).inc(),
             EventKind::TaskHandedOff => self.metrics.counter(COUNTER_TASK_HANDOFFS).inc(),
-            // Agentin rekisteröinti/poisto liikuttaa `agents_online`-gaugea:
-            // rekisteröinti +1, poisto -1. Tämä on hetkellinen arvo (gauge), ei
-            // kumulatiivinen laskuri — se voi nousta ja laskea agenttien tullessa
-            // ja poistuessa. Runtime julkaisee rekisteröinnin agentin spawnatessa
-            // (havainnoitavuussilta), joten gauge heijastaa elävää agenttimäärää.
+            // Agent registration/deregistration moves the `agents_online`
+            // gauge: registration +1, deregistration -1. This is an
+            // instantaneous value (gauge), not a cumulative counter — it can
+            // go up and down as agents come and go. The runtime publishes
+            // registration when an agent spawns (observability bridge), so
+            // the gauge reflects the live agent count.
             EventKind::AgentRegistered => self.metrics.gauge(GAUGE_AGENTS_ONLINE).add(1),
             EventKind::AgentDeregistered => self.metrics.gauge(GAUGE_AGENTS_ONLINE).sub(1),
             EventKind::Custom(label) => self.record_custom(label),
-            // Eteenpäin-yhteensopivuus: turvallisesti ohitettavat lajit.
+            // Forward compatibility: kinds that are safe to ignore.
             //
-            // - `TaskStatusChanged`: emme tarkastele hyötykuormaa tässä, joten
-            //   emme tiedä kohdetilaa; tehtävän valmistuminen kirjataan
-            //   erilliseltä Custom-etiketiltä (workflow/orkestrointi).
-            // - `AgentHeartbeat`: ei oma mittarinsa (liveness lasketaan
-            //   rekisteröinnin perusteella).
-            // - Mahdolliset tulevat variantit (`_`).
+            // - `TaskStatusChanged`: we don't inspect the payload here, so we
+            //   don't know the target state; task completion is recorded
+            //   from a separate Custom label (workflow/orchestration).
+            // - `AgentHeartbeat`: has no metric of its own (liveness is
+            //   derived from registration).
+            // - Any future variants (`_`).
             _ => {}
         }
     }
 
-    /// Kuvaa vakaan Custom-etiketin mittaripäivitykseksi.
+    /// Maps a stable Custom label to a metric update.
     fn record_custom(&self, label: &str) {
         match label {
             "task.completed" | "orchestration.task_completed" => {
@@ -194,7 +200,7 @@ impl EventRecorder {
             "tool.call" | "orchestration.tool_call" => {
                 self.metrics.counter(COUNTER_TOOL_CALLS).inc();
             }
-            // Tuntematon Custom-etiketti → ohita (eteenpäin-yhteensopivuus).
+            // Unknown Custom label → ignore (forward compatibility).
             _ => {}
         }
     }
@@ -239,7 +245,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_custom_variant_is_ignored() {
-        // Käytä raakaa väylää julkaistaksesi mielivaltaisen Custom-tapahtuman.
+        // Use the raw bus to publish an arbitrary Custom event.
         let bus = EventBus::new();
         let bridge = FamilyBridge::from_parts(
             familyclaw_bridge::AgentRegistry::new(),
@@ -249,16 +255,16 @@ mod tests {
         let metrics = MetricsRegistry::with_fleet_defaults();
         let mut recorder = EventRecorder::new(&bridge, metrics.clone());
 
-        // Täysin tuntematon Custom-etiketti.
+        // A completely unknown Custom label.
         bus.publish(Event::new(
             EventKind::Custom("some.future.event".into()),
             None,
         ));
         let n = recorder.drain_once().await;
-        // Tapahtuma KÄSITELTIIN (ei kaatunut), mutta mikään laskuri ei muuttunut.
+        // The event WAS processed (no panic), but no counter changed.
         assert_eq!(n, 1);
         let out = metrics.prometheus_export();
-        // Kaikki laskurit yhä nollassa.
+        // All counters still at zero.
         assert!(out.contains("tasks_created 0"));
         assert!(out.contains("contract_proposed 0"));
     }
@@ -317,14 +323,15 @@ mod tests {
         bridge.heartbeat_now(id).await.expect("heartbeat");
 
         let n = recorder.drain_once().await;
-        // Molemmat tapahtumat käsiteltiin (register + heartbeat).
+        // Both events were processed (register + heartbeat).
         assert_eq!(n, 2);
-        // Rekisteröinti nosti agents_online-gaugea +1; heartbeatilla ei ole omaa
-        // mittaria. Tehtävälaskuri ei muuttunut (eri tapahtumaperhe).
+        // Registration bumped the agents_online gauge by +1; the heartbeat
+        // has no metric of its own. The task counter did not change
+        // (different event family).
         assert_eq!(metrics.gauge(GAUGE_AGENTS_ONLINE).get(), 1);
         assert_eq!(metrics.counter(COUNTER_TASKS_CREATED).get(), 0);
 
-        // Poisto laskee gaugen takaisin nollaan.
+        // Deregistration brings the gauge back down to zero.
         assert!(
             bridge.deregister_agent(id).await.is_some(),
             "agentti poistui"

@@ -1,29 +1,30 @@
-//! Oikea wasmtime-pohjainen sandbox-toteutus.
+//! Real wasmtime-based sandbox implementation.
 //!
-//! **Käännetään vain `wasmtime`-featuren kanssa.** Tämä moduuli kytkee
-//! [`CodeSandbox`]-rajapinnan wasmtimen ajoaikaan: polttoaine (fuel) pakottaa
-//! suorituskaton ja kyvykkyysmalli rajaa pääsyn. wasmtime on iso riippuvuus
-//! (Cranelift + JIT), joten se on optional ettei se hidasta workspacen buildia
-//! kun sandboxia ei tarvita.
+//! **Compiled only with the `wasmtime` feature.** This module wires the
+//! [`CodeSandbox`] interface to the wasmtime runtime: fuel enforces the
+//! execution ceiling, and the capability model restricts access. wasmtime is
+//! a large dependency (Cranelift + JIT), so it is optional so it does not
+//! slow down the workspace build when the sandbox is not needed.
 //!
-//! ## Suorituskonventio
-//! Ajettavan WASM-moduulin tulee viedä (export) parametriton funktio nimeltä
-//! [`WasmtimeSandbox::ENTRY_POINT`] joka palauttaa `i32`-tilakoodin. Moduuli
-//! ajetaan ilman host-importteja: koska kyvykkyydet (verkko, FS) eivät ole
-//! oletuksena käytössä, importteja vaativa moduuli hylätään selkeällä
-//! [`SandboxError::Setup`]-virheellä. Tämä on tietoinen turvalinja —
-//! laajennetut WASI-kyvykkyydet lisätään myöhemmin kyvykkyysmallin ohjaamana.
+//! ## Execution convention
+//! The WASM module to be executed must export a parameterless function
+//! named [`WasmtimeSandbox::ENTRY_POINT`] that returns an `i32` status code.
+//! The module is run without host imports: since capabilities (network, FS)
+//! are not enabled by default, a module that requires imports is rejected
+//! with a clear [`SandboxError::Setup`] error. This is a deliberate security
+//! boundary — extended WASI capabilities will be added later, governed by
+//! the capability model.
 
 use wasmtime::{Config, Engine, Instance, Module, Store, Trap};
 
 use crate::error::SandboxError;
 use crate::sandbox::{CodeSandbox, SandboxOutput, SandboxRequest, SandboxResult};
 
-/// wasmtime-pohjainen [`CodeSandbox`]-toteutus.
+/// wasmtime-based [`CodeSandbox`] implementation.
 ///
-/// Yksi instanssi kapseloi jaetun [`Engine`]:n (joka pitää sisällään
-/// käännetyn koodin välimuistin) ja on `Send + Sync`, joten se voidaan jakaa
-/// busin actorien välillä.
+/// A single instance encapsulates a shared [`Engine`] (which holds the
+/// compiled-code cache) and is `Send + Sync`, so it can be shared across
+/// bus actors.
 #[derive(Clone)]
 pub struct WasmtimeSandbox {
     engine: Engine,
@@ -31,39 +32,39 @@ pub struct WasmtimeSandbox {
 
 impl std::fmt::Debug for WasmtimeSandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `wasmtime::Engine` ei toteuta Debugia, joten näytetään vain tyyppi.
+        // `wasmtime::Engine` does not implement Debug, so only the type is shown.
         f.debug_struct("WasmtimeSandbox").finish_non_exhaustive()
     }
 }
 
 impl WasmtimeSandbox {
-    /// Pakollisen vietävän funktion nimi (parametriton, palauttaa `i32`).
+    /// The name of the required exported function (no parameters, returns `i32`).
     pub const ENTRY_POINT: &'static str = "run";
 
-    /// Luo uuden wasmtime-sandboxin polttoainemittaus käytössä.
+    /// Creates a new wasmtime sandbox with fuel metering enabled.
     ///
     /// # Errors
-    /// [`SandboxError::Setup`] jos wasmtime-engineä ei voida alustaa annetulla
-    /// konfiguraatiolla.
+    /// [`SandboxError::Setup`] if the wasmtime engine cannot be initialized
+    /// with the given configuration.
     pub fn new() -> crate::Result<Self> {
         let mut config = Config::new();
-        // Polttoainemittaus pakottaa suorituskaton — ydinturvaominaisuus.
+        // Fuel metering enforces the execution ceiling — a core security feature.
         config.consume_fuel(true);
-        // Natiivi unwind-info: tarvitaan jotta trap-unwinding (mm.
-        // polttoaineen loppuminen) toimii oikein eikä laukaise
-        // __fastfail-aborttausta Windowsilla.
+        // Native unwind info: needed so that trap unwinding (e.g. fuel
+        // exhaustion) works correctly instead of triggering a
+        // __fastfail abort on Windows.
         config.native_unwind_info(true);
-        // Ei guest-backtraceja: sandbox ei paljasta epäluotetun koodin
-        // pinokuvaa ja keventää kustannusta. `wasm_backtrace(false)` on
-        // deprekoitu uudemmassa wasmtimessa — `None` poistaa backtrace-
-        // kontekstin kokonaan, mikä vastaa täsmälleen vanhaa käytöstä.
+        // No guest backtraces: the sandbox does not expose a stack trace of
+        // untrusted code, and this reduces overhead. `wasm_backtrace(false)`
+        // is deprecated in newer wasmtime — `None` removes the backtrace
+        // context entirely, which matches the old behavior exactly.
         config.wasm_backtrace_max_frames(None);
         let engine =
             Engine::new(&config).map_err(|e| SandboxError::setup(format!("engine init: {e}")))?;
         Ok(Self { engine })
     }
 
-    /// Sisäänpääsy jaettuun [`Engine`]:iin (esim. moduulien esikääntämiseen).
+    /// Access to the shared [`Engine`] (e.g. for precompiling modules).
     #[must_use]
     pub fn engine(&self) -> &Engine {
         &self.engine
@@ -72,18 +73,18 @@ impl WasmtimeSandbox {
 
 impl CodeSandbox for WasmtimeSandbox {
     fn execute(&self, request: &SandboxRequest) -> SandboxResult {
-        // 1) Validoi pyyntö (koodi ei tyhjä, kyvykkyydet hyvinmuodostetut).
+        // 1) Validate the request (code not empty, capabilities well-formed).
         request.validate()?;
 
-        // 2) Käännä moduuli annetusta WASM-tavukoodista. `Module::new` on
-        //    turvallinen (toisin kuin `deserialize`), joten unsafe-kieltoa ei
-        //    rikota.
+        // 2) Compile the module from the given WASM bytecode. `Module::new`
+        //    is safe (unlike `deserialize`), so the unsafe-code prohibition
+        //    is not violated.
         let module = Module::new(&self.engine, &request.code)
             .map_err(|e| SandboxError::setup(format!("module compile: {e}")))?;
 
-        // 3) Turvalinja: importteja vaativaa moduulia ei ajeta. Ilman
-        //    myönnettyjä kyvykkyyksiä host ei tarjoa mitään, joten import
-        //    jäisi linkittämättä. Hylätään selkeällä viestillä.
+        // 3) Security boundary: a module requiring imports is not run.
+        //    Without granted capabilities, the host provides nothing, so the
+        //    import would be left unlinked. Reject with a clear message.
         if module.imports().len() > 0 {
             return Err(SandboxError::setup(
                 "module requires host imports, which are not granted by the current \
@@ -91,20 +92,20 @@ impl CodeSandbox for WasmtimeSandbox {
             ));
         }
 
-        // 4) Luo store ja aseta polttoainebudjetti. "Rajaton" tarkoittaa
-        //    käytännössä u64::MAX (consume_fuel on enginen vaatimuksesta silti
-        //    päällä, mutta katto on käytännössä ääretön).
+        // 4) Create the store and set the fuel budget. "Unlimited" means
+        //    u64::MAX in practice (consume_fuel is still enabled per the
+        //    engine's requirement, but the ceiling is effectively infinite).
         let mut store = Store::new(&self.engine, ());
         let budget = request.fuel_limit.budget().unwrap_or(u64::MAX);
         store
             .set_fuel(budget)
             .map_err(|e| SandboxError::setup(format!("set fuel: {e}")))?;
 
-        // 5) Instantioi moduuli ilman importteja.
+        // 5) Instantiate the module without imports.
         let instance = Instance::new(&mut store, &module, &[])
             .map_err(|e| SandboxError::setup(format!("instantiate: {e}")))?;
 
-        // 6) Hae sovittu entry-point ja aja se.
+        // 6) Look up the agreed entry point and call it.
         let entry = instance
             .get_typed_func::<(), i32>(&mut store, Self::ENTRY_POINT)
             .map_err(|e| {
@@ -118,11 +119,11 @@ impl CodeSandbox for WasmtimeSandbox {
         let status = match entry.call(&mut store, ()) {
             Ok(status) => status,
             Err(err) => {
-                // Erottele polttoaineen loppuminen muista trapeista.
+                // Distinguish fuel exhaustion from other traps.
                 if err.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
-                    // `required` on vähintään budget+1 (saturating: ei panikoi
-                    // vaikka budget olisi u64::MAX rajattomassa tapauksessa,
-                    // jota ei käytännössä tapahdu polttoaineen loppuessa).
+                    // `required` is at least budget+1 (saturating: does not
+                    // panic even if budget were u64::MAX in the unlimited
+                    // case, which in practice never happens when fuel runs out).
                     return Err(SandboxError::fuel_exhausted(
                         budget,
                         budget.saturating_add(1),
@@ -132,14 +133,15 @@ impl CodeSandbox for WasmtimeSandbox {
             }
         };
 
-        // 7) Laske kulutettu polttoaine.
+        // 7) Compute the fuel consumed.
         let fuel_after = store
             .get_fuel()
             .map_err(|e| SandboxError::execution(format!("read fuel: {e}")))?;
         let fuel_consumed = fuel_before.saturating_sub(fuel_after);
 
-        // 8) Pakkaa tilakoodi pikku-endian tavuiksi tulokseen. Laajempi
-        //    muistipohjainen output-konventio lisätään kyvykkyysmallin myötä.
+        // 8) Pack the status code into little-endian bytes for the result. A
+        //    broader memory-based output convention will be added along with
+        //    the capability model.
         Ok(SandboxOutput::new(
             status.to_le_bytes().to_vec(),
             fuel_consumed,
@@ -160,7 +162,7 @@ mod tests {
     use super::*;
     use crate::fuel::FuelLimit;
 
-    /// Pieni WAT-moduuli joka vie `run`-funktion ja palauttaa annetun arvon.
+    /// A small WAT module that exports the `run` function and returns the given value.
     fn wat_returning(value: i32) -> Vec<u8> {
         let wat = format!(r#"(module (func (export "run") (result i32) (i32.const {value})))"#);
         wat::parse_str(&wat).expect("valid wat compiles to wasm")
@@ -179,7 +181,7 @@ mod tests {
         let req = SandboxRequest::new(wat_returning(7));
         let out = sandbox.execute(&req).expect("simple module runs");
         assert_eq!(out.output, 7_i32.to_le_bytes().to_vec());
-        // Jotain polttoainetta kuluu.
+        // Some fuel is consumed.
         assert!(out.fuel_consumed > 0);
     }
 
@@ -224,7 +226,7 @@ mod tests {
     #[test]
     fn infinite_loop_runs_out_of_fuel() {
         let sandbox = WasmtimeSandbox::new().expect("engine init");
-        // Ikuinen silmukka — pitää keskeytyä polttoaineen loppumiseen.
+        // Infinite loop — must be interrupted by fuel exhaustion.
         let wat = r#"(module (func (export "run") (result i32)
             (loop (br 0)) (i32.const 0)))"#;
         let wasm = wat::parse_str(wat).expect("valid wat");
@@ -236,7 +238,7 @@ mod tests {
     #[test]
     fn fuel_consumed_scales_with_work() {
         let sandbox = WasmtimeSandbox::new().expect("engine init");
-        // Vähän työtä vs. enemmän työtä → enemmän polttoainetta.
+        // Little work vs. more work -> more fuel consumed.
         let light = r#"(module (func (export "run") (result i32) (i32.const 0)))"#;
         let heavy = r#"(module (func (export "run") (result i32)
             (local $i i32)
@@ -261,7 +263,7 @@ mod tests {
             .execute(&SandboxRequest::new(code.clone()))
             .expect("run a");
         let b = sandbox.execute(&SandboxRequest::new(code)).expect("run b");
-        // Determinismi: sama syöte → sama kulutus + sama tulos (durable-replay).
+        // Determinism: same input -> same consumption + same result (durable replay).
         assert_eq!(a.fuel_consumed, b.fuel_consumed);
         assert_eq!(a.output, b.output);
     }

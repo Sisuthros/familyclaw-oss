@@ -1,37 +1,38 @@
-//! Jatkettavan vuoron tila ([`ResumableTurn`]) + sen kaatumiskestävä
-//! tallennuspinta ([`ResumableTurnStore`]) — suspend/resume-sillan (roadmap §6)
-//! pysyvä puoli.
+//! Resumable turn state ([`ResumableTurn`]) + its crash-resistant store
+//! ([`ResumableTurnStore`]) — the durable half of the suspend/resume
+//! bridge (roadmap §6).
 //!
-//! ## Mihin tätä tarvitaan
-//! Kun [`Agent::think`](crate::Agent::think) ajaa tool-loopin ja työkalu vaatii
-//! ihmisen hyväksynnän, vuoro **keskeytyy** ([`ThinkOutcome::Suspended`](crate::ThinkOutcome::Suspended)).
-//! Hyväksyntä voi tulla minuutteja tai tunteja myöhemmin — mahdollisesti vasta
-//! prosessin uudelleenkäynnistyksen jälkeen. Jotta vuoron voi **jatkaa siitä
-//! mihin se jäi**, tool-loopin siihenastinen tila on tallennettava pysyvästi:
-//! viestipino (LLM-konteksti), keskeyttäneen työkalukutsun tunniste ja
-//! myönnetyn hyväksynnän tunniste. Tämä moduuli tallentaa juuri sen — eikä
-//! mitään muuta.
+//! ## Why this module exists
+//! When [`Agent::think`](crate::Agent::think) runs the tool loop and a
+//! tool requires human approval, the turn **suspends**
+//! ([`ThinkOutcome::Suspended`](crate::ThinkOutcome::Suspended)).
+//! Approval may arrive minutes or hours later — possibly only after a
+//! process restart. To be able to **resume the turn from where it left
+//! off**, the tool loop's state so far must be persisted: the message
+//! stack (LLM context), the suspending tool call's identifier, and the
+//! granted approval's identifier. This module persists exactly that —
+//! nothing more.
 //!
-//! ## Salaisuusinvariantti (ehdoton)
-//! Jatkettavaa vuoroa **ei koskaan** tallenneta raakojen salaisuuksien eikä
-//! KERROS B -datan kanssa. [`ResumableTurn`] kantaa argumenteista vain
-//! **SHA-256-tiivisteen** ([`ResumableTurn::arguments_hash`]) ja **redaktoidun
-//! tiivistelmän** ([`ResumableTurn::redacted_arguments`]) — ei koskaan raakoja
-//! työkaluargumentteja. Viestipino ([`ResumableTurn::messages`]) sisältää
-//! tool-loopin LLM-kontekstin, joka on jo rakennettu redaktoiduista
-//! todisteista (`familyclaw-actions` redaktoi todistepaketit ennen kuin niiden
-//! teksti syötetään malliin) — kutsujan **vastuulla** on olla työntämättä
-//! salaisuuksia viestipinoon, samoin kuin
-//! [`PendingRecord::redacted_summary`](familyclaw_actions::PendingRecord)
-//! :n kohdalla.
+//! ## Secrecy invariant (absolute)
+//! A resumable turn is **never** persisted with raw secrets or Layer B
+//! data. [`ResumableTurn`] carries only a **SHA-256 hash**
+//! ([`ResumableTurn::arguments_hash`]) and a **redacted summary**
+//! ([`ResumableTurn::redacted_arguments`]) of the arguments — never raw
+//! tool arguments. The message stack ([`ResumableTurn::messages`])
+//! contains the tool loop's LLM context, which is already built from
+//! **redacted evidence** (`familyclaw-actions` redacts evidence bundles
+//! before their text is fed to the model) — it is the caller's
+//! **responsibility** not to push secrets into the message stack, the
+//! same as for
+//! [`PendingRecord::redacted_summary`](familyclaw_actions::PendingRecord).
 //!
-//! Kenttä kentältä, miksi mikään kenttä ei vuoda salaisuutta — ks.
-//! [`ResumableTurn`]:n dokumentaatio.
+//! Field by field, why no field leaks a secret — see [`ResumableTurn`]'s
+//! documentation.
 //!
-//! ## Determinismi
-//! Kaikki aikaa lukeva logiikka ottaa aikaleiman injektoituna
-//! ([`familyclaw_core::time::Timestamp`]) — kelloa ei lueta tämän moduulin
-//! sisällä. Vanhentuminen käyttää samaa fail-closed-rajaa kuin
+//! ## Determinism
+//! All time-reading logic takes the timestamp injected
+//! ([`familyclaw_core::time::Timestamp`]) — the clock is never read
+//! inside this module. Expiry uses the same fail-closed boundary as
 //! [`familyclaw_actions::approval::Approval::is_expired`] (`now > expires_at`).
 
 use std::collections::HashMap;
@@ -48,23 +49,23 @@ use familyclaw_durable::{EntryKind, FileJournal, Journal, JournalEntry, StepId};
 
 use crate::llm::LlmMessage;
 
-/// Tämän moduulin oma virhetyyppi (tallennuspinnan I/O + sarjallistus).
+/// This module's own error type (store I/O + serialization).
 ///
-/// Pidetään erillään [`familyclaw_core::FamilyClawError`]:sta, jotta
-/// tallennuspinta pysyy ohuena ja itsenäisenä; [`crate::Agent`] kääräisee tämän
-/// tarvittaessa ydintyyppiin.
+/// Kept separate from [`familyclaw_core::FamilyClawError`] so the store
+/// stays thin and self-contained; [`crate::Agent`] wraps this into the
+/// core type when needed.
 #[derive(Debug)]
 pub enum ResumableError {
-    /// Journalin avaus, luku tai kirjoitus epäonnistui.
+    /// Opening, reading, or writing the journal failed.
     Journal(String),
-    /// [`ResumableTurn`]:n sarjallistus tai jäsennys epäonnistui.
+    /// Serializing or parsing a [`ResumableTurn`] failed.
     Serde(String),
-    /// Pyydettyä jatkettavaa vuoroa ei löytynyt (tuntematon tunniste tai jo
-    /// kulutettu/häädetty). **Fail-closed:** tuntematonta tunnistetta ei voi
-    /// jatkaa.
+    /// The requested resumable turn was not found (unknown identifier, or
+    /// already consumed/evicted). **Fail-closed:** an unknown identifier
+    /// cannot be resumed.
     NotFound(ApprovalId),
-    /// Jatkettava vuoro löytyi, mutta on **vanhentunut** (`now > expires_at`).
-    /// Fail-closed: vanhentunutta vuoroa ei jatketa.
+    /// The resumable turn was found, but is **expired** (`now > expires_at`).
+    /// Fail-closed: an expired turn is not resumed.
     Expired(ApprovalId),
 }
 
@@ -85,92 +86,102 @@ impl std::fmt::Display for ResumableError {
 
 impl std::error::Error for ResumableError {}
 
-/// Tämän moduulin tulostyyppi.
+/// This module's result type.
 pub type Result<T> = std::result::Result<T, ResumableError>;
 
-/// **Jatkettavan vuoron** salaisuudeton, pysyvä tila (roadmap §6 resumable-turn-state).
+/// The **resumable turn**'s secret-free, persistent state (roadmap §6
+/// resumable-turn-state).
 ///
-/// Tämä on tasan se tieto, jonka [`Agent::resume_approved`](crate::Agent::resume_approved)
-/// tarvitsee jatkaakseen keskeytyneen tool-loopin siitä mihin se jäi — ei
-/// enempää. Avaimena tallennuspinnalla toimii [`ResumableTurn::approval_id`].
+/// This is exactly the information [`Agent::resume_approved`](crate::Agent::resume_approved)
+/// needs to resume a suspended tool loop from where it left off — no
+/// more. [`ResumableTurn::approval_id`] serves as the store's key.
 ///
-/// ## Salaisuusinvariantti (kenttä kentältä)
-/// Mikään kenttä ei kanna raakaa salaisuutta eikä KERROS B -dataa:
-/// - [`approval_id`](Self::approval_id) — myönnetyn hyväksynnän tunniste (UUID,
-///   ei salaisuus). Tallennuspinnan avain ja side `familyclaw-actions`:n
-///   odottavaan hyväksyntään.
-/// - [`being_id`](Self::being_id) — olennon bus-tunniste merkkijonona (UUID).
-/// - [`conversation_origin`](Self::conversation_origin) — vastauksen kohde
-///   (kanava/keskustelu/lähettäjä). Reititysmetatietoa, ei salaisuus.
-/// - [`messages`](Self::messages) — tool-loopin LLM-viestipino. Sisältää
-///   system-promptin, käyttäjän viestin ja siihenastiset työkalutulokset.
-///   Työkalutulokset on johdettu **redaktoiduista todisteista**
-///   (`familyclaw-actions` redaktoi ennen kuin teksti syötetään malliin), joten
-///   ne eivät sisällä raakoja salaisuuksia. Kutsujan vastuulla on olla
-///   työntämättä salaisuuksia tähän.
-/// - [`tool_call_id`](Self::tool_call_id) — LLM:n antama työkalukutsun tunniste
-///   (sitoo tulevan `tool_result`-viestin oikeaan kutsuun). Läpinäkyvä merkki.
-/// - [`tool_name`](Self::tool_name) — keskeyttäneen työkalun nimi (manifestin
-///   nimi, ei salaisuus).
-/// - [`arguments_hash`](Self::arguments_hash) — työkaluargumenttien
-///   SHA-256-**tiiviste** (ei raakoja argumentteja). Sitoo jatkettavan vuoron
-///   tarkasti niihin argumentteihin, joille hyväksyntä myönnettiin.
-/// - [`redacted_arguments`](Self::redacted_arguments) — ihmisluettava,
-///   redaktoitu tiivistelmä siitä mitä työkalu tekisi. **Ei raakoja
-///   argumentteja, ei salaisuuksia.**
+/// ## Secrecy invariant (field by field)
+/// No field carries a raw secret or Layer B data:
+/// - [`approval_id`](Self::approval_id) — the granted approval's
+///   identifier (UUID, not a secret). The store's key, and the link to
+///   `familyclaw-actions`'s pending approval.
+/// - [`being_id`](Self::being_id) — the being's bus identifier as a
+///   string (UUID).
+/// - [`conversation_origin`](Self::conversation_origin) — the reply
+///   target (channel/conversation/sender). Routing metadata, not a secret.
+/// - [`messages`](Self::messages) — the tool loop's LLM message stack.
+///   Contains the system prompt, the user message, and the tool results
+///   so far. Tool results are derived from **redacted evidence**
+///   (`familyclaw-actions` redacts before the text is fed to the model),
+///   so they contain no raw secrets. It's the caller's responsibility not
+///   to push secrets in here.
+/// - [`tool_call_id`](Self::tool_call_id) — the tool call identifier
+///   given by the LLM (binds the upcoming `tool_result` message to the
+///   right call). An opaque token.
+/// - [`tool_name`](Self::tool_name) — the name of the suspending tool
+///   (the manifest name, not a secret).
+/// - [`arguments_hash`](Self::arguments_hash) — the tool arguments'
+///   SHA-256 **hash** (not raw arguments). Binds the resumable turn
+///   precisely to the arguments the approval was granted for.
+/// - [`redacted_arguments`](Self::redacted_arguments) — a human-readable,
+///   redacted summary of what the tool would do. **No raw arguments, no
+///   secrets.**
 /// - [`created_at`](Self::created_at) / [`expires_at`](Self::expires_at) —
-///   aikaleimat (auditointi + TTL).
-/// - [`policy_snapshot`](Self::policy_snapshot) — käytäntö-tilannekuva
-///   keskeytyshetkellä (esim. vaadittu oikeus). Neutraalia metatietoa.
-/// - [`audit_ids`](Self::audit_ids) — viittaukset jo kirjattuihin
-///   audit-tapahtumiin (UUID:t), jotta resume voi linkittää itsensä
-///   keskeytyksen audit-jälkeen.
+///   timestamps (audit + TTL).
+/// - [`policy_snapshot`](Self::policy_snapshot) — a policy snapshot at
+///   the moment of suspension (e.g. the required permission). Neutral
+///   metadata.
+/// - [`audit_ids`](Self::audit_ids) — references to already-recorded
+///   audit events (UUIDs), so resume can link itself to the suspension's
+///   audit trail.
 /// - [`turn_id`](Self::turn_id) / [`durable_cursor`](Self::durable_cursor) —
-///   vuoron järjestysnumero + durable-lokin kursoripaikka keskeytyshetkellä.
-///   Diagnostiikkaa ja resumea varten.
+///   the turn's sequence number + the durable log's cursor position at
+///   the moment of suspension. For diagnostics and resume.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResumableTurn {
-    /// Myönnetyn hyväksynnän tunniste (tallennuspinnan avain).
+    /// The granted approval's identifier (the store's key).
     pub approval_id: ApprovalId,
-    /// Vuoron suorittaneen olennon bus-tunniste merkkijonona.
+    /// The bus identifier of the being that ran the turn, as a string.
     pub being_id: String,
-    /// Vastauksen kohde (kanava/keskustelu/lähettäjä) jatkamista varten;
-    /// `None` jos vuorolla ei ollut per-viesti-alkuperää (staattinen kohde).
+    /// The reply target (channel/conversation/sender) for resuming;
+    /// `None` if the turn had no per-message origin (a static target).
     pub conversation_origin: Option<MessageOrigin>,
-    /// Tool-loopin LLM-viestipino keskeytyshetkellä (system + user +
-    /// siihenastiset assistant/tool-viestit). Tästä loop jatkaa.
+    /// The tool loop's LLM message stack at the moment of suspension
+    /// (system + user + the assistant/tool messages so far). The loop
+    /// resumes from this.
     pub messages: Vec<LlmMessage>,
-    /// Keskeyttäneen työkalukutsun LLM-tunniste (`tool_result` sitoutuu tähän).
+    /// The suspending tool call's LLM identifier (`tool_result` binds to
+    /// this).
     pub tool_call_id: String,
-    /// Keskeyttäneen työkalun nimi (manifestin nimi).
+    /// The name of the suspending tool (the manifest name).
     pub tool_name: String,
-    /// Työkaluargumenttien SHA-256-tiiviste (EI raakoja argumentteja).
+    /// The tool arguments' SHA-256 hash (NOT raw arguments).
     pub arguments_hash: String,
-    /// Redaktoitu, ihmisluettava tiivistelmä työkalun argumenteista/toimesta.
+    /// A redacted, human-readable summary of the tool's arguments/action.
     pub redacted_arguments: String,
-    /// Keskeytyksen luontihetki (auditointi).
+    /// The moment the suspension was created (audit).
     pub created_at: Timestamp,
-    /// Hetki jonka jälkeen jatkettava vuoro on vanhentunut (= hyväksynnän TTL).
+    /// The moment after which the resumable turn is expired (= the
+    /// approval's TTL).
     pub expires_at: Timestamp,
-    /// Käytäntö-tilannekuva keskeytyshetkellä (neutraali metatieto).
+    /// A policy snapshot at the moment of suspension (neutral metadata).
     pub policy_snapshot: String,
-    /// Viittaukset keskeytyksen audit-tapahtumiin (UUID-merkkijonoja).
+    /// References to the suspension's audit events (UUID strings).
     pub audit_ids: Vec<String>,
-    /// Vuoron järjestysnumero olennon elinkaaressa keskeytyshetkellä.
+    /// The turn's sequence number in the being's lifecycle at the moment
+    /// of suspension.
     pub turn_id: u64,
-    /// Durable-lokin kursoripaikka keskeytyshetkellä (diagnostiikka).
+    /// The durable log's cursor position at the moment of suspension
+    /// (diagnostics).
     pub durable_cursor: u64,
 }
 
 impl ResumableTurn {
-    /// Rakentaa jatkettavan vuoron tilan **tiivistäen argumentit**: raakoja
-    /// argumentteja ei oteta vastaan, vaan kutsuja antaa jo tiivisteen ja
-    /// redaktoidun tiivistelmän. Näin tyyppiä on käytännössä mahdotonta
-    /// rakentaa salaisuuden kanssa.
+    /// Builds the resumable turn state **hashing the arguments**: raw
+    /// arguments are not accepted; instead the caller already supplies
+    /// the hash and the redacted summary. This makes it practically
+    /// impossible to construct the type with a secret.
     ///
-    /// `tool_arguments` on raaka JSON, josta lasketaan **vain** SHA-256-tiiviste
-    /// — itse arvoa ei tallenneta. Tämä on payload-sidonnan vastine: kun resume
-    /// myöhemmin jatkaa, hyväksyntä kulutetaan samaa tiivistettä vasten.
+    /// `tool_arguments` is raw JSON from which **only** a SHA-256 hash is
+    /// computed — the value itself is not stored. This is the payload
+    /// binding's counterpart: when resume later continues, the approval
+    /// is consumed against this same hash.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -185,9 +196,10 @@ impl ResumableTurn {
         created_at: Timestamp,
         expires_at: Timestamp,
     ) -> Self {
-        // Argumenteista TALLENNETAAN VAIN TIIVISTE. Sarjallistus epäonnistuu
-        // käytännössä koskaan (Value→Vec<u8>); jos se epäonnistuu, tiiviste
-        // lasketaan tyhjästä — se vain estää resumen (mismatch), ei vuoda mitään.
+        // ONLY THE HASH OF THE ARGUMENTS IS STORED. Serialization practically
+        // never fails (Value→Vec<u8>); if it does, the hash is computed
+        // from empty bytes — that only blocks resume (mismatch), it leaks
+        // nothing.
         let raw = serde_json::to_vec(tool_arguments).unwrap_or_default();
         let arguments_hash = sha256_hex(&raw);
         Self {
@@ -208,21 +220,23 @@ impl ResumableTurn {
         }
     }
 
-    /// Liittää käytäntö-tilannekuvan (ketjutus). Neutraali metatieto, ei salaisuus.
+    /// Attaches the policy snapshot (chainable). Neutral metadata, not a
+    /// secret.
     #[must_use]
     pub fn with_policy_snapshot(mut self, snapshot: impl Into<String>) -> Self {
         self.policy_snapshot = snapshot.into();
         self
     }
 
-    /// Liittää audit-tapahtumien tunnisteet (ketjutus).
+    /// Attaches the audit event identifiers (chainable).
     #[must_use]
     pub fn with_audit_ids(mut self, ids: Vec<String>) -> Self {
         self.audit_ids = ids;
         self
     }
 
-    /// Liittää durable-paikan: vuoron numero + kursoripaikka (ketjutus).
+    /// Attaches the durable position: turn number + cursor position
+    /// (chainable).
     #[must_use]
     pub const fn with_durable_position(mut self, turn_id: u64, durable_cursor: u64) -> Self {
         self.turn_id = turn_id;
@@ -230,97 +244,105 @@ impl ResumableTurn {
         self
     }
 
-    /// Onko jatkettava vuoro vanhentunut hetkeen `now` nähden (`now > expires_at`).
+    /// Whether the resumable turn is expired relative to `now`
+    /// (`now > expires_at`).
     ///
-    /// Sama fail-closed-raja kuin [`familyclaw_actions::approval::Approval::is_expired`]:
-    /// tasan `expires_at` kelpaa vielä, aidosti myöhempi ei.
+    /// Same fail-closed boundary as
+    /// [`familyclaw_actions::approval::Approval::is_expired`]: exactly
+    /// `expires_at` still counts as valid, genuinely later does not.
     #[must_use]
     pub fn is_expired(&self, now: Timestamp) -> bool {
         now > self.expires_at
     }
 }
 
-/// **Jatkettavien vuorojen tallennuspinta.**
+/// **Store for resumable turns.**
 ///
-/// Abstrahoi sen, missä jatkettavat vuorot elävät — muistissa vai
-/// kaatumiskestävällä levyllä. Sama sopimus kuin
-/// [`familyclaw_actions::PendingApprovalStore`]:lla: kaikki metodit ovat
-/// `&self` (sisäinen mutaatio lukon takana), jotta trait on `dyn`-yhteensopiva.
+/// Abstracts over where resumable turns live — in memory or on
+/// crash-resistant disk. Same contract as
+/// [`familyclaw_actions::PendingApprovalStore`]: all methods take
+/// `&self` (internal mutation behind a lock), so the trait is
+/// `dyn`-compatible.
 ///
-/// ## Sopimus
-/// - [`put`](Self::put) tallentaa jatkettavan vuoron avaimella
-///   `turn.approval_id`. Saman avaimen uudelleenkirjoitus korvaa aiemman.
-/// - [`get`](Self::get) palauttaa tallennetun vuoron, `None` jos ei löydy.
-/// - [`remove`](Self::remove) kuluttaa (poistaa) vuoron kertakäyttöisesti.
-/// - [`evict_expired`](Self::evict_expired) häätää vanhentuneet fail-closed-rajalla.
+/// ## Contract
+/// - [`put`](Self::put) stores a resumable turn keyed by
+///   `turn.approval_id`. Rewriting the same key replaces the previous one.
+/// - [`get`](Self::get) returns the stored turn, `None` if not found.
+/// - [`remove`](Self::remove) consumes (removes) the turn, one-time use.
+/// - [`evict_expired`](Self::evict_expired) evicts expired turns using
+///   the fail-closed boundary.
 ///
-/// ## Salaisuudet
-/// Levylle tallentava toteutus saa kirjoittaa vain [`ResumableTurn`]:n
-/// salaisuudettomat kentät (tiiviste + tunnisteet + redaktoidut tiivistelmät +
-/// redaktoiduista todisteista johdettu viestipino) — ei koskaan raakoja
-/// argumentteja eikä salaisuuksia.
+/// ## Secrets
+/// An implementation that persists to disk may only write
+/// [`ResumableTurn`]'s secret-free fields (hash + identifiers + redacted
+/// summaries + the message stack derived from redacted evidence) — never
+/// raw arguments or secrets.
 pub trait ResumableTurnStore: Send + Sync {
-    /// Tallentaa (tai korvaa) jatkettavan vuoron avaimella `turn.approval_id`.
+    /// Stores (or replaces) a resumable turn keyed by `turn.approval_id`.
     ///
     /// # Errors
-    /// [`ResumableError::Journal`]/[`ResumableError::Serde`] jos levytoteutuksen
-    /// kirjoitus tai sarjallistus epäonnistuu.
+    /// [`ResumableError::Journal`]/[`ResumableError::Serde`] if the disk
+    /// implementation's write or serialization fails.
     fn put(&self, turn: ResumableTurn) -> Result<()>;
 
-    /// Hakee jatkettavan vuoron hyväksynnän tunnisteella; `None` jos ei löydy.
+    /// Looks up a resumable turn by approval identifier; `None` if not found.
     ///
     /// # Errors
-    /// [`ResumableError::Journal`]/[`ResumableError::Serde`] levytoteutuksilla.
+    /// [`ResumableError::Journal`]/[`ResumableError::Serde`] for disk
+    /// implementations.
     fn get(&self, approval_id: ApprovalId) -> Result<Option<ResumableTurn>>;
 
-    /// Poistaa (kuluttaa) jatkettavan vuoron ja palauttaa sen, jos se oli
-    /// olemassa; `None` jos ei. Kertakäyttöinen: poiston jälkeen ei enää löydy.
+    /// Removes (consumes) a resumable turn and returns it, if it existed;
+    /// `None` otherwise. One-time use: not found again after removal.
     ///
     /// # Errors
-    /// [`ResumableError::Journal`]/[`ResumableError::Serde`] levytoteutuksilla.
+    /// [`ResumableError::Journal`]/[`ResumableError::Serde`] for disk
+    /// implementations.
     fn remove(&self, approval_id: ApprovalId) -> Result<Option<ResumableTurn>>;
 
-    /// Jatkettavien vuorojen lukumäärä.
+    /// The number of resumable turns.
     ///
     /// # Errors
-    /// [`ResumableError::Journal`]/[`ResumableError::Serde`] levytoteutuksilla.
+    /// [`ResumableError::Journal`]/[`ResumableError::Serde`] for disk
+    /// implementations.
     fn len(&self) -> Result<usize>;
 
-    /// Onko pinta tyhjä.
+    /// Whether the store is empty.
     ///
     /// # Errors
-    /// Sama kuin [`len`](Self::len).
+    /// Same as [`len`](Self::len).
     fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
     }
 
-    /// Poistaa kaikki hetkeen `now` mennessä vanhentuneet vuorot ja palauttaa
-    /// häädettyjen lukumäärän. Sama fail-closed-raja kuin
-    /// [`ResumableTurn::is_expired`].
+    /// Removes all turns expired as of `now` and returns the number
+    /// evicted. Same fail-closed boundary as [`ResumableTurn::is_expired`].
     ///
     /// # Errors
-    /// [`ResumableError::Journal`]/[`ResumableError::Serde`] levytoteutuksilla.
+    /// [`ResumableError::Journal`]/[`ResumableError::Serde`] for disk
+    /// implementations.
     fn evict_expired(&self, now: Timestamp) -> Result<usize>;
 }
 
-/// Muistinvarainen tallennuspinta ([`HashMap`] traitin takana).
+/// An in-memory store ([`HashMap`] behind the trait).
 ///
-/// Oletus ja testikäyttö: nopea, **mutta ei selviä kaatumisesta**. Tuotannossa,
-/// jossa resume-kaatumiskestävyys on vaatimus, käytä [`JournalResumableStore`]:a.
+/// Default and used in tests: fast, **but does not survive a crash**. In
+/// production, where resume crash-resistance is a requirement, use
+/// [`JournalResumableStore`].
 #[derive(Debug, Default)]
 pub struct InMemoryResumableStore {
-    /// Hyväksynnän tunniste → jatkettava vuoro.
+    /// Approval identifier → resumable turn.
     inner: Mutex<HashMap<ApprovalId, ResumableTurn>>,
 }
 
 impl InMemoryResumableStore {
-    /// Luo tyhjän muistipinnan.
+    /// Creates an empty in-memory store.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Lukitsee kartan, toipuen myrkytetystä lukosta paniikkaamatta.
+    /// Locks the map, recovering from a poisoned lock without panicking.
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ApprovalId, ResumableTurn>> {
         self.inner
             .lock()
@@ -354,62 +376,66 @@ impl ResumableTurnStore for InMemoryResumableStore {
     }
 }
 
-/// Journal-rivin looginen nimi jatkettavan vuoron tallennukselle.
+/// The journal line's logical name for storing a resumable turn.
 const RESUMABLE_PUT: &str = "resumable_turn_put";
-/// Journal-rivin looginen nimi jatkettavan vuoron poistolle (tombstone).
+/// The journal line's logical name for removing a resumable turn (tombstone).
 const RESUMABLE_DELETE: &str = "resumable_turn_delete";
 
-/// Tiivistyksen oletuskerroin: loki tiivistetään automaattisesti kun fyysisten
-/// rivien määrä ylittää `AUTO_COMPACT_FACTOR * elävien_vuorojen_määrä`.
+/// Default compaction factor: the log is compacted automatically once
+/// the number of physical rows exceeds
+/// `AUTO_COMPACT_FACTOR * number_of_live_turns`.
 ///
-/// Kerroin 2 = "tiivistä kun vähintään puolet riveistä on kuolleita". Rajaa
-/// kuolleiden rivien kertymisen vakiokertoimeen elävää kohti, joten lokin koko
-/// ja replayn O(n)-kustannus pysyvät elävän tilan kokoluokassa.
+/// A factor of 2 = "compact once at least half the rows are dead". Bounds
+/// the accumulation of dead rows to a constant multiple of live rows, so
+/// the log size and replay's O(n) cost stay proportional to the size of
+/// the live state.
 const AUTO_COMPACT_FACTOR: usize = 2;
 
-/// Pienin fyysinen rivimäärä jolla auto-tiivistys ylipäänsä harkitaan (estää
-/// turhan tiivistyksen pienillä lokeilla).
+/// Minimum number of physical rows for auto-compaction to even be
+/// considered (avoids pointless compaction on small logs).
 const AUTO_COMPACT_MIN_ROWS: usize = 64;
 
-/// Kaatumiskestävä tallennuspinta [`FileJournal`]:n päällä.
+/// A crash-resistant store built on [`FileJournal`].
 ///
-/// Append-only-loki: jokainen tallennus kirjoitetaan `resumable_turn_put`-
-/// markerina (koko salaisuudeton [`ResumableTurn`]) ja jokainen poisto
-/// `resumable_turn_delete`-markerina (vain hyväksynnän tunniste, tombstone).
-/// Tila rekonstruoidaan toistamalla loki: myöhempi rivi voittaa, joten poisto
-/// kumoaa lisäyksen.
+/// An append-only log: every store is written as a `resumable_turn_put`
+/// marker (the whole secret-free [`ResumableTurn`]) and every removal as
+/// a `resumable_turn_delete` marker (just the approval identifier, a
+/// tombstone). State is reconstructed by replaying the log: a later row
+/// wins, so a removal cancels out an addition.
 ///
-/// Koska [`FileJournal::append`] flushaa ja fsyncaa ennen paluuta, valmistunut
-/// tallennus on levyllä myös äkillisen kaatumisen jälkeen — **jatkettava vuoro
-/// selviää keskeytyksen ja resumen välisestä kaatumisesta**, joten hyväksynnän
-/// myöntämisen jälkeen vuoron voi jatkaa loppuun vaikka prosessi olisi
-/// käynnistynyt välissä uudelleen.
+/// Because [`FileJournal::append`] flushes and fsyncs before returning,
+/// a completed store is on disk even after a sudden crash — **a
+/// resumable turn survives a crash between suspension and resume**, so
+/// after approval is granted, the turn can be resumed to completion even
+/// if the process restarted in between.
 ///
-/// ## Tiivistys (compaction) — rajaton kasvu kuriin
-/// Koska loki on append-only, jokainen poisto ([`remove`](ResumableTurnStore::remove)
-/// / [`evict_expired`](ResumableTurnStore::evict_expired)) ja saman tunnisteen
-/// korvaus jättää **kuolleita rivejä** lokiin: tila on oikea (myöhempi rivi
-/// voittaa), mutta tiedosto kasvaa rajatta ja replay muuttuu O(n):ksi
-/// rivimäärässä. [`compact`](JournalResumableStore::compact) kirjoittaa lokin
-/// uudelleen sisältämään **vain elävät vuorot** atomisesti
-/// [`FileJournal::rewrite`]:n kautta (temp + fsync + rename) — elävä tila säilyy
-/// bitilleen eikä keskeytyminen menetä eläviä vuoroja. Tiivistys laukeaa joko
-/// operaattorin kutsumana tai **automaattisesti** tallennuksen ja häädön
-/// yhteydessä kun kuolleiden rivien osuus ylittää kynnyksen (ks.
-/// `AUTO_COMPACT_FACTOR` ja [`with_auto_compact_factor`](JournalResumableStore::with_auto_compact_factor)).
+/// ## Compaction — keeping unbounded growth in check
+/// Because the log is append-only, every removal
+/// ([`remove`](ResumableTurnStore::remove) /
+/// [`evict_expired`](ResumableTurnStore::evict_expired)) and every
+/// replacement of the same identifier leaves **dead rows** in the log:
+/// the state is correct (the later row wins), but the file grows
+/// unbounded and replay becomes O(n) in row count.
+/// [`compact`](JournalResumableStore::compact) rewrites the log to
+/// contain **only live turns**, atomically, via [`FileJournal::rewrite`]
+/// (temp + fsync + rename) — the live state is preserved bit-for-bit and
+/// an interruption never loses live turns. Compaction is triggered either
+/// by the operator or **automatically** alongside store/eviction once
+/// the dead-row ratio exceeds the threshold (see `AUTO_COMPACT_FACTOR`
+/// and [`with_auto_compact_factor`](JournalResumableStore::with_auto_compact_factor)).
 ///
-/// ## Salaisuusinvariantti
-/// Levylle kirjoitetaan vain [`ResumableTurn`]:n salaisuudettomat kentät (ks.
-/// [`ResumableTurn`]) — ei koskaan raakoja työkaluargumentteja eikä salaisuuksia.
-/// Tiivistys säilyttää tämän: uudelleenkirjoitettu loki sisältää samat
-/// salaisuudettomat `resumable_turn_put`-rivit.
+/// ## Secrecy invariant
+/// Only [`ResumableTurn`]'s secret-free fields are written to disk (see
+/// [`ResumableTurn`]) — never raw tool arguments or secrets. Compaction
+/// preserves this: the rewritten log contains the same secret-free
+/// `resumable_turn_put` rows.
 pub struct JournalResumableStore {
-    /// Append-only-loki johon tallennukset ja poistot kirjataan.
+    /// The append-only log that stores and removals are recorded to.
     journal: FileJournal,
-    /// Seuraavan rivin sekvenssipaikka (monotoninen).
+    /// The next row's sequence position (monotonic).
     next_step: Mutex<StepId>,
-    /// Auto-tiivistyksen kerroin: tiivistä kun `rivit > factor * elävät`.
-    /// `0` poistaa auto-tiivistyksen käytöstä (vain manuaalinen `compact`).
+    /// The auto-compaction factor: compact when `rows > factor * live`.
+    /// `0` disables auto-compaction (manual `compact` only).
     auto_compact_factor: usize,
 }
 
@@ -422,14 +448,14 @@ impl std::fmt::Debug for JournalResumableStore {
 }
 
 impl JournalResumableStore {
-    /// Avaa (tai luo) kaatumiskestävän pinnan annetusta tiedostopolusta.
+    /// Opens (or creates) a crash-resistant store from the given file path.
     ///
-    /// Olemassa olevasta lokista jatkettavat vuorot rekonstruoidaan heti, joten
-    /// uudelleenkäynnistyksen jälkeen ne ovat yhä [`get`](ResumableTurnStore::get)-
-    /// haettavissa ja jatkettavissa.
+    /// Resumable turns are reconstructed immediately from an existing
+    /// log, so after a restart they are still retrievable via
+    /// [`get`](ResumableTurnStore::get) and resumable.
     ///
     /// # Errors
-    /// [`ResumableError::Journal`] jos journalia ei voi avata tai lukea.
+    /// [`ResumableError::Journal`] if the journal cannot be opened or read.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let journal = FileJournal::open(path)
             .map_err(|e| ResumableError::Journal(format!("open resumable journal failed: {e}")))?;
@@ -444,26 +470,27 @@ impl JournalResumableStore {
         })
     }
 
-    /// Asettaa auto-tiivistyksen kertoimen (ketjutus).
+    /// Sets the auto-compaction factor (chainable).
     ///
-    /// Loki tiivistetään automaattisesti kun fyysisten rivien määrä ylittää
-    /// `factor * elävien_vuorojen_määrä` (ja rivejä on vähintään
-    /// `AUTO_COMPACT_MIN_ROWS`). Oletus on `AUTO_COMPACT_FACTOR` (2). Arvo `0`
-    /// **poistaa** auto-tiivistyksen käytöstä — loki tiivistetään vain
-    /// [`compact`](Self::compact)-kutsulla.
+    /// The log is compacted automatically once the number of physical
+    /// rows exceeds `factor * number_of_live_turns` (and there are at
+    /// least `AUTO_COMPACT_MIN_ROWS` rows). The default is
+    /// `AUTO_COMPACT_FACTOR` (2). A value of `0` **disables**
+    /// auto-compaction — the log is compacted only via an explicit
+    /// [`compact`](Self::compact) call.
     #[must_use]
     pub const fn with_auto_compact_factor(mut self, factor: usize) -> Self {
         self.auto_compact_factor = factor;
         self
     }
 
-    /// Palauttaa lokin tiedostopolun.
+    /// Returns the log's file path.
     #[must_use]
     pub fn path(&self) -> &Path {
         self.journal.path()
     }
 
-    /// Varaa ja palauttaa seuraavan sekvenssipaikan (monotoninen).
+    /// Reserves and returns the next sequence position (monotonic).
     fn next_step_id(&self) -> StepId {
         let mut guard = self
             .next_step
@@ -474,7 +501,7 @@ impl JournalResumableStore {
         current
     }
 
-    /// Liittää markerin lokiin annetulla nimellä ja hyötykuormalla.
+    /// Appends a marker to the log with the given name and payload.
     fn append_marker(&self, name: &str, payload: serde_json::Value) -> Result<()> {
         let entry = JournalEntry::marker(self.next_step_id(), name, payload);
         self.journal
@@ -482,7 +509,8 @@ impl JournalResumableStore {
             .map_err(|e| ResumableError::Journal(format!("append resumable marker failed: {e}")))
     }
 
-    /// Rekonstruoi nykytilan toistamalla lokin (myöhempi rivi voittaa).
+    /// Reconstructs the current state by replaying the log (a later row
+    /// wins).
     fn replay_state(&self) -> Result<HashMap<ApprovalId, ResumableTurn>> {
         let entries = self.journal.replay_all().map_err(|e| {
             ResumableError::Journal(format!("replay resumable journal failed: {e}"))
@@ -490,14 +518,17 @@ impl JournalResumableStore {
         Self::reconstruct_state(entries)
     }
 
-    /// Rakentaa nykytilan annetuista journal-riveistä (puhdas funktio, ei I/O).
+    /// Builds the current state from the given journal rows (a pure
+    /// function, no I/O).
     ///
-    /// Toisto käy rivit järjestyksessä: `resumable_turn_put` lisää/korvaa vuoron,
-    /// `resumable_turn_delete` poistaa sen (tombstone). Myöhempi rivi voittaa.
-    /// Eriytetty [`replay_state`](Self::replay_state):stä jotta sekä levyltä lukeva
-    /// replay että [`compact`](Self::compact):n [`FileJournal::compact_with`]-suljin
-    /// rakentavat tilan **samalla logiikalla** — jälkimmäinen saa rivit valmiiksi
-    /// luettuina lukon alta, eikä saa lukea journalia uudelleen (deadlock).
+    /// The replay walks rows in order: `resumable_turn_put` adds/replaces
+    /// a turn, `resumable_turn_delete` removes it (tombstone). A later
+    /// row wins. Kept separate from [`replay_state`](Self::replay_state)
+    /// so that both the disk-reading replay and
+    /// [`compact`](Self::compact)'s [`FileJournal::compact_with`] closure
+    /// build state using **the same logic** — the latter receives the
+    /// rows already read under the lock, and must not read the journal
+    /// again (deadlock).
     fn reconstruct_state(entries: Vec<JournalEntry>) -> Result<HashMap<ApprovalId, ResumableTurn>> {
         let mut state: HashMap<ApprovalId, ResumableTurn> = HashMap::new();
         for entry in entries {
@@ -523,59 +554,64 @@ impl JournalResumableStore {
         Ok(state)
     }
 
-    /// Fyysisten journal-rivien määrä (eläviä + kuolleita). Dead-row-suhteen
-    /// mittauspohja; eroaa [`len`](ResumableTurnStore::len):stä joka palauttaa
-    /// vain elävien vuorojen määrän.
+    /// The number of physical journal rows (live + dead). The
+    /// measurement basis for the dead-row ratio; differs from
+    /// [`len`](ResumableTurnStore::len), which returns only the number of
+    /// live turns.
     fn physical_row_count(&self) -> Result<usize> {
         self.journal
             .len()
             .map_err(|e| ResumableError::Journal(format!("read resumable journal len failed: {e}")))
     }
 
-    /// Kirjoittaa lokin uudelleen sisältämään **vain elävät vuorot** (tiivistys),
-    /// pudottaen kaikki kuolleet rivit (tombstonet ja korvatut `put`-rivit).
-    /// Palauttaa pudotettujen kuolleiden rivien määrän.
+    /// Rewrites the log to contain **only live turns** (compaction),
+    /// dropping all dead rows (tombstones and superseded `put` rows).
+    /// Returns the number of dead rows dropped.
     ///
-    /// Elävä tila säilyy bitilleen: tiivistyksen jälkeen täsmälleen samat vuorot
-    /// ovat [`get`](ResumableTurnStore::get)-haettavissa, ja uudelleenlatauksesta
-    /// (restart) rekonstruoituu identtinen tila. Tiivistys on **atominen**
-    /// ([`FileJournal::rewrite`]: temp + fsync + rename) — jos prosessi kaatuu
-    /// kesken, elävä tiedosto on yhä ehjässä vanhassa tilassaan eikä yhtään
-    /// elävää vuoroa katoa.
+    /// The live state is preserved bit-for-bit: after compaction exactly
+    /// the same turns are retrievable via [`get`](ResumableTurnStore::get),
+    /// and reloading (restart) reconstructs an identical state.
+    /// Compaction is **atomic** ([`FileJournal::rewrite`]: temp + fsync +
+    /// rename) — if the process crashes mid-way, the live file is still
+    /// in its old, intact state and no live turn is lost.
     ///
-    /// Rivit uudelleennumeroidaan tiiviiksi `0..N`-sekvenssiksi ja sisäinen
-    /// sekvenssikursori asetetaan vastaamaan, jotta tulevat tallennukset jatkavat
-    /// oikealta paikalta.
+    /// Rows are renumbered into a compact `0..N` sequence and the
+    /// internal sequence cursor is set to match, so future stores
+    /// continue from the correct position.
     ///
     /// # Errors
-    /// [`ResumableError::Serde`] jos jonkin vuoron sarjallistus epäonnistuu;
-    /// [`ResumableError::Journal`] jos lokin luku tai atominen uudelleenkirjoitus
-    /// epäonnistuu. Virhetilanteessa elävä loki jätetään entiselleen.
+    /// [`ResumableError::Serde`] if serializing some turn fails;
+    /// [`ResumableError::Journal`] if reading the log or the atomic
+    /// rewrite fails. On error, the live log is left unchanged.
     pub fn compact(&self) -> Result<usize> {
-        // Atominen tiivistys appendeja vastaan: [`FileJournal::compact_with`]
-        // pitää saman file-lukon koko luku→suodatus→swap-operaation ajan, joten
-        // rinnakkainen tallennus/poisto ei voi laskeutua aukkoon ja kadota
-        // (TOCTOU-korjaus). `build`-suljin saa luetut rivit, rekonstruoi elävän
-        // tilan ja palauttaa uudelleennumeroidut elävät RESUMABLE_PUT-rivit.
+        // Atomic compaction against appends: [`FileJournal::compact_with`]
+        // holds the same file lock for the whole
+        // read→filter→swap operation, so a concurrent store/removal
+        // cannot land in the gap and get lost (a TOCTOU fix). The
+        // `build` closure receives the rows already read, reconstructs
+        // the live state, and returns the renumbered live
+        // RESUMABLE_PUT rows.
         //
-        // Elävien rivien määrä smugletaan sulkimesta `Cell`:llä, jotta
-        // sekvenssikursori voidaan asettaa swapin jälkeen (suljin EI saa lukita
-        // journalia uudelleen → ei voi lukea kursoria omalta polultaan).
+        // The number of live rows is smuggled out of the closure via a
+        // `Cell`, so the sequence cursor can be set after the swap (the
+        // closure must NOT lock the journal again → it cannot read the
+        // cursor via its own path).
         let live_count = std::cell::Cell::new(0usize);
         let dropped = self
             .journal
             .compact_with(|entries| {
-                // Rekonstruoi elävä tila valmiiksi luetuista riveistä (sama
-                // logiikka kuin replayssa, mutta EI uudelleenlukua — uudelleenluku
-                // lukitsisi journalin ja deadlockkaisi). ResumableError kääritään
-                // DurableError-tekstiksi jotta tyyppi sopii compact_with-sopimukseen.
+                // Reconstruct the live state from the already-read rows
+                // (same logic as replay, but WITHOUT re-reading — that
+                // would lock the journal again and deadlock).
+                // ResumableError is wrapped as DurableError text so the
+                // type fits the compact_with contract.
                 let state = Self::reconstruct_state(entries).map_err(|e| {
                     familyclaw_durable::DurableError::step_failed(
                         "compact_reconstruct",
                         e.to_string(),
                     )
                 })?;
-                // Yksi RESUMABLE_PUT-rivi per elävä vuoro, uudelleennumeroituna 0..N.
+                // One RESUMABLE_PUT row per live turn, renumbered 0..N.
                 let mut kept = Vec::with_capacity(state.len());
                 let mut step = StepId::ZERO;
                 for turn in state.values() {
@@ -590,8 +626,8 @@ impl JournalResumableStore {
                 ResumableError::Journal(format!("compact resumable journal failed: {e}"))
             })?;
 
-        // Sekvenssikursori osoittamaan tiivistetyn lokin perään (= elävien määrä,
-        // koska rivit uudelleennumeroitiin tiiviisti 0..N).
+        // Point the sequence cursor past the compacted log (= the number
+        // of live turns, since rows were renumbered compactly as 0..N).
         {
             let mut guard = self
                 .next_step
@@ -603,14 +639,15 @@ impl JournalResumableStore {
         Ok(dropped)
     }
 
-    /// Tiivistää lokin **jos** kuolleiden rivien osuus ylittää kynnyksen.
+    /// Compacts the log **if** the dead-row ratio exceeds the threshold.
     ///
-    /// Laukaisuehto: `auto_compact_factor > 0` JA fyysisiä rivejä on vähintään
-    /// [`AUTO_COMPACT_MIN_ROWS`] JA `rivit > factor * elävät`. Kutsutaan
-    /// tallennuksen ja häädön jälkeen. Auto-tiivistyksen epäonnistuminen **ei**
-    /// kaada kutsujaa: data on jo turvallisesti lokissa, joten tiivistys on pelkkä
-    /// optimointi — virhe niellään (loki vain pysyy tiivistämättömänä tällä
-    /// kertaa).
+    /// Trigger condition: `auto_compact_factor > 0` AND there are at
+    /// least [`AUTO_COMPACT_MIN_ROWS`] physical rows AND
+    /// `rows > factor * live`. Called after store and eviction.
+    /// Auto-compaction failing does **not** fail the caller: the data is
+    /// already safely in the log, so compaction is purely an
+    /// optimization — the error is swallowed (the log just stays
+    /// uncompacted this time).
     fn maybe_auto_compact(&self) {
         if self.auto_compact_factor == 0 {
             return;
@@ -635,7 +672,7 @@ impl ResumableTurnStore for JournalResumableStore {
         let payload = serde_json::to_value(&turn)
             .map_err(|e| ResumableError::Serde(format!("encode resumable turn failed: {e}")))?;
         self.append_marker(RESUMABLE_PUT, payload)?;
-        // Korvaus jätti kuolleen rivin (vanha put) → harkitse auto-tiivistystä.
+        // A replacement left a dead row (the old put) → consider auto-compaction.
         self.maybe_auto_compact();
         Ok(())
     }
@@ -647,12 +684,12 @@ impl ResumableTurnStore for JournalResumableStore {
     fn remove(&self, approval_id: ApprovalId) -> Result<Option<ResumableTurn>> {
         let existing = self.replay_state()?.remove(&approval_id);
         if existing.is_some() {
-            // Tombstone vain jos vuoro oli olemassa — turha rivi vältetään.
+            // Only tombstone if the turn existed — avoids a needless row.
             let payload = serde_json::to_value(approval_id).map_err(|e| {
                 ResumableError::Serde(format!("encode resumable delete id failed: {e}"))
             })?;
             self.append_marker(RESUMABLE_DELETE, payload)?;
-            // Tombstone on kuollut rivi → harkitse auto-tiivistystä.
+            // A tombstone is a dead row → consider auto-compaction.
             self.maybe_auto_compact();
         }
         Ok(existing)
@@ -676,7 +713,7 @@ impl ResumableTurnStore for JournalResumableStore {
             self.append_marker(RESUMABLE_DELETE, payload)?;
         }
         if !expired.is_empty() {
-            // Häätö tuotti tombstoneja (kuolleita rivejä) → harkitse tiivistystä.
+            // Eviction produced tombstones (dead rows) → consider compaction.
             self.maybe_auto_compact();
         }
         Ok(expired.len())
@@ -694,7 +731,7 @@ mod tests {
         from_unix_secs(secs).expect("valid unix seconds")
     }
 
-    /// Apuri: jatkettava vuoro annetulla TTL:llä ja argumenteilla.
+    /// Helper: a resumable turn with the given TTL and arguments.
     fn turn_at(now: Timestamp, ttl: Duration, args: &serde_json::Value) -> ResumableTurn {
         ResumableTurn::new(
             ApprovalId::new(),
@@ -713,13 +750,13 @@ mod tests {
         )
     }
 
-    /// Geneerinen being-id-merkkijono testeihin (ei salaisuus).
+    /// Generic being-id string for tests (not a secret).
     #[allow(non_snake_case)]
     fn BeingIdStr() -> String {
         "00000000-0000-4000-8000-000000000001".to_string()
     }
 
-    /// RAII-temp-tiedosto ilman ulkoisia crateja.
+    /// An RAII temp file without external crates.
     struct TempPath(PathBuf);
 
     impl TempPath {
@@ -761,7 +798,7 @@ mod tests {
         let got = store.get(id).expect("get").expect("present");
         assert_eq!(got.approval_id, id);
         assert_eq!(got.tool_name, "github_issue_draft");
-        // Payload-sidonta: tiiviste vastaa samaa argument-arvoa.
+        // Payload binding: the hash matches the same argument value.
         assert_eq!(
             got.arguments_hash,
             sha256_hex(&serde_json::to_vec(&args).unwrap())
@@ -775,18 +812,18 @@ mod tests {
 
     #[test]
     fn arguments_are_hashed_not_stored_raw() {
-        // Argumentti sisältää salaisuuden — vain tiiviste tallennetaan.
+        // The argument contains a secret — only the hash is stored.
         let now = at(1_700_000_000);
         let secret = format!("sk-{}", "live".repeat(4));
         let args = serde_json::json!({ "api_key": secret });
         let turn = turn_at(now, Duration::minutes(60), &args);
-        // Sarjallistettu muoto ei sisällä raakaa salaisuutta.
+        // The serialized form contains no raw secret.
         let json = serde_json::to_string(&turn).expect("serialize");
         assert!(
             !json.contains(&secret),
             "raw secret must never be in the turn"
         );
-        // Mutta tiiviste on läsnä.
+        // But the hash is present.
         assert!(json.contains(&sha256_hex(&serde_json::to_vec(&args).unwrap())));
     }
 
@@ -817,7 +854,7 @@ mod tests {
         let id = turn.approval_id;
         store.put(turn).expect("put");
 
-        // Tasan expires_at EI vanhentunut (sama fail-closed-raja).
+        // Exactly at expires_at is NOT expired yet (same fail-closed boundary).
         assert_eq!(store.evict_expired(at(1_700_000_060)).expect("evict"), 0);
         assert!(store.get(id).expect("get").is_some());
         assert_eq!(store.evict_expired(at(1_700_000_061)).expect("evict"), 1);
@@ -833,14 +870,14 @@ mod tests {
         let id = turn.approval_id;
         let hash = turn.arguments_hash.clone();
 
-        // Vaihe 1: tallenna ja PUDOTA (simuloi kaatuminen).
+        // Step 1: store and DROP (simulates a crash).
         {
             let store = JournalResumableStore::open(tmp.path()).expect("open 1");
             store.put(turn).expect("put");
             assert_eq!(store.len().expect("len"), 1);
         }
 
-        // Vaihe 2: rakenna pinta UUDELLEEN samasta tiedostosta — vuoro säilyi.
+        // Step 2: rebuild the store AGAIN from the same file — the turn survived.
         let resumed = JournalResumableStore::open(tmp.path()).expect("open 2");
         assert_eq!(resumed.len().expect("len"), 1, "resumable survived restart");
         let got = resumed.get(id).expect("get").expect("still present");
@@ -848,7 +885,7 @@ mod tests {
         assert_eq!(got.arguments_hash, hash);
         assert_eq!(got.messages.len(), 2, "message stack survived");
 
-        // Kulutus säilyy tombstonena yli vielä yhden restartin.
+        // Consumption survives as a tombstone across yet another restart.
         resumed.remove(id).expect("remove").expect("present");
         let after = JournalResumableStore::open(tmp.path()).expect("open 3");
         assert!(after.get(id).expect("get").is_none());
@@ -871,7 +908,7 @@ mod tests {
             !on_disk.contains(&secret),
             "persisted resumable turn must never contain the raw secret"
         );
-        // Tiiviste ON läsnä (sidonta säilyy).
+        // The hash IS present (the binding is preserved).
         assert!(on_disk.contains(&sha256_hex(&serde_json::to_vec(&args).unwrap())));
     }
 
@@ -883,13 +920,13 @@ mod tests {
 
     // ---- Compaction ----
 
-    /// Laskee fyysiset (eläviä + kuolleita) journal-rivit lukemalla tiedoston.
+    /// Counts physical (live + dead) journal rows by reading the file.
     fn physical_rows(path: &Path) -> usize {
         std::fs::read_to_string(path)
             .map_or(0, |s| s.lines().filter(|l| !l.trim().is_empty()).count())
     }
 
-    /// Apuri: tallenna `n` vuoroa, palauta niiden tunnisteet.
+    /// Helper: store `n` turns, return their identifiers.
     fn put_n(store: &JournalResumableStore, now: Timestamp, n: usize) -> Vec<ApprovalId> {
         let args = serde_json::json!({ "x": 1 });
         let mut ids = Vec::with_capacity(n);
@@ -946,7 +983,7 @@ mod tests {
             ids
         };
 
-        // Restart pelkästä tiivistetystä tiedostosta → identtinen tila.
+        // Restart from just the compacted file → identical state.
         let resumed = JournalResumableStore::open(tmp.path()).expect("open 2");
         assert_eq!(resumed.len().expect("len"), 3);
         for id in ids.iter().take(3) {
@@ -976,7 +1013,7 @@ mod tests {
         let live = put_n(&store, now, 1);
         store.compact().expect("compact");
 
-        // Jokainen levyllä oleva rivi jäsentyy ehjäksi (ei puolikasta renamesta).
+        // Every row on disk parses intact (no half-written row from the rename).
         let on_disk = std::fs::read_to_string(tmp.path()).expect("read");
         for line in on_disk.lines().filter(|l| !l.trim().is_empty()) {
             serde_json::from_str::<JournalEntry>(line).expect("intact json line");
@@ -984,7 +1021,7 @@ mod tests {
         assert_eq!(store.len().expect("len"), 1);
         assert!(store.get(live[0]).expect("get").is_some());
 
-        // Ei orpoa temp-tiedostoa tämän lokin nimellä.
+        // No orphaned temp file under this log's name.
         let dir = tmp.path().parent().expect("parent");
         let own = tmp
             .path()
@@ -1037,12 +1074,12 @@ mod tests {
         let store = JournalResumableStore::open(tmp.path()).expect("open"); // default factor
         let args = serde_json::json!({ "x": 1 });
 
-        // Yksi pysyvä elävä.
+        // One permanent live turn.
         let keeper = turn_at(now, Duration::minutes(60), &args);
         let keeper_id = keeper.approval_id;
         store.put(keeper).expect("put keeper");
 
-        // 100 put+remove paria → ilman tiivistystä 201 riviä.
+        // 100 put+remove pairs → 201 rows without compaction.
         for _ in 0..100 {
             let t = turn_at(now, Duration::minutes(60), &args);
             let id = t.approval_id;
@@ -1068,14 +1105,15 @@ mod tests {
         assert_eq!(physical_rows(tmp.path()), 0);
     }
 
-    /// TOCTOU-aukon sulkemisen regressio: tiivistys lukee tilan ja kirjoittaa
-    /// lokin uudelleen **saman file-lukon alla** ([`FileJournal::compact_with`]),
-    /// joten rinnakkainen tallennus ei voi laskeutua aukkoon ja kadota. Tässä ei
-    /// aja oikeaa rinnakkaisuutta (race on epädeterministinen) — todistetaan
-    /// rakenteesta seuraava havaittava invariantti: tiivistyksen PALUUN JÄLKEEN
-    /// tehty tallennus laskeutuu tiivistettyjen elävien vuorojen PERÄÄN, ja
-    /// uudelleenlataus tuottaa täsmälleen oikean tilan. Concurrent-append-
-    /// turvallisuus seuraa nyt yhden-lukon-pidosta.
+    /// Regression test for closing the TOCTOU gap: compaction reads the
+    /// state and rewrites the log **under the same file lock**
+    /// ([`FileJournal::compact_with`]), so a concurrent store cannot land
+    /// in the gap and get lost. This does not run genuine concurrency
+    /// (the race is non-deterministic) — instead it proves the
+    /// observable invariant that follows from the structure: a store
+    /// made AFTER compaction returns lands AFTER the compacted live
+    /// turns, and reloading produces exactly the correct state.
+    /// Concurrent-append safety now follows from holding a single lock.
     #[test]
     fn compact_then_put_does_not_lose_post_compact_turn() {
         let tmp = TempPath::new("compact-toctou");
@@ -1097,7 +1135,7 @@ mod tests {
         );
         assert_eq!(physical_rows(tmp.path()), 3, "only live rows after compact");
 
-        // Tiivistyksen JÄLKEEN tallennettu vuoro laskeutuu elävien PERÄÄN.
+        // A turn stored AFTER compaction lands AFTER the live turns.
         let args = serde_json::json!({ "x": 2 });
         let post = turn_at(now, Duration::minutes(60), &args);
         let post_id = post.approval_id;
@@ -1105,7 +1143,7 @@ mod tests {
         assert_eq!(store.len().expect("len"), 4, "3 live + 1 post-compact");
         assert!(store.get(post_id).expect("get").is_some());
 
-        // Uudelleenlataus tuottaa täsmälleen oikean tilan.
+        // Reloading produces exactly the correct state.
         let resumed = JournalResumableStore::open(tmp.path()).expect("reopen");
         assert_eq!(resumed.len().expect("len"), 4);
         for id in ids.iter().take(3) {

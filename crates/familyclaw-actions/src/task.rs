@@ -1,20 +1,21 @@
-//! Toimintotehtävä (action-task): toimintopinon ajettavan yksikön tila ja
-//! elinkaari sekä jonot jotka säilyttävät tehtäviä (KERROS A, geneerinen).
+//! Action task: the state and lifecycle of a runnable unit of the action stack,
+//! plus the queues that hold tasks (Layer A, generic).
 //!
-//! Tämä moduuli kattaa:
-//! - [`TaskStatus`] — tehtävän tilakone ([`TaskStatus::can_transition_to`]
-//!   koodaa lailliset siirtymät, [`TaskStatus::is_terminal`] päätelmät),
-//! - [`ActionTask`] — yksittäinen toimintotehtävä rakennusvaiheittain
-//!   ([`ActionTask::new`] + `with_*`-rakentajat, [`ActionTask::validate`]),
-//! - [`TaskEvent`] — audit-tapahtumat tehtävän elinkaaresta,
-//! - [`TaskQueue`] — in-memory-jono (tokio [`tokio::sync::Mutex`]),
-//! - [`DurableTaskQueue`] — JSONL-tukeutuva jono joka liittää tilatilannekuvat
-//!   (snapshot) tiedostoon ja osaa rekonstruoida tilan ([`DurableTaskQueue::reload`]).
+//! This module covers:
+//! - [`TaskStatus`] — the task's state machine ([`TaskStatus::can_transition_to`]
+//!   encodes the legal transitions, [`TaskStatus::is_terminal`] the terminal check),
+//! - [`ActionTask`] — a single action task built step by step
+//!   ([`ActionTask::new`] + `with_*` builders, [`ActionTask::validate`]),
+//! - [`TaskEvent`] — audit events from the task's lifecycle,
+//! - [`TaskQueue`] — an in-memory queue (tokio [`tokio::sync::Mutex`]),
+//! - [`DurableTaskQueue`] — a JSONL-backed queue that appends state snapshots
+//!   to a file and can reconstruct state ([`DurableTaskQueue::reload`]).
 //!
-//! ## Determinismi
-//! Puhdas tilakonelogiikka **ei lue kelloa**. Jonojen tilamuutosmetodit ottavat
-//! aikaleiman injektoituna ([`familyclaw_core::time::Timestamp`]), jotta testit
-//! ja durable-replay pysyvät deterministisinä.
+//! ## Determinism
+//! The pure state-machine logic **never reads the clock**. The queues' state-
+//! transition methods take the timestamp injected
+//! ([`familyclaw_core::time::Timestamp`]), so tests and durable replay stay
+//! deterministic.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,77 +29,77 @@ use familyclaw_core::time::Timestamp;
 use crate::error::{ActionError, Result};
 use crate::ids::{ActionTaskId, ProofBundleId, SkillId};
 
-/// Moduulin valmiusaste — säilytetään, jotta [`crate::all_modules_scaffolded`]
-/// kääntyy edelleen muiden moduulien rinnalla.
+/// Module readiness flag — kept so that [`crate::all_modules_scaffolded`]
+/// still compiles alongside the other modules.
 pub(crate) const SCAFFOLDED: bool = true;
 
-/// Toimintotehtävän tila tilakoneessa.
+/// The action task's state in the state machine.
 ///
-/// Lailliset siirtymät koodataan [`TaskStatus::can_transition_to`]-metodissa.
-/// Päätetilat ([`TaskStatus::Done`], [`TaskStatus::Failed`],
-/// [`TaskStatus::Cancelled`]) eivät salli enää siirtymää eteenpäin.
+/// Legal transitions are encoded in the [`TaskStatus::can_transition_to`]
+/// method. Terminal states ([`TaskStatus::Done`], [`TaskStatus::Failed`],
+/// [`TaskStatus::Cancelled`]) no longer allow any further transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
-    /// Suunniteltu: tehtävä on luotu mutta ei vielä valmis ajettavaksi.
+    /// Planned: the task has been created but is not yet ready to run.
     Planned,
-    /// Valmis: tehtävä voidaan ottaa ajoon (riippuvuudet täyttyneet).
+    /// Ready: the task can be picked up for execution (dependencies satisfied).
     Ready,
-    /// Käynnissä: tehtävää suoritetaan parhaillaan.
+    /// Running: the task is currently being executed.
     Running,
-    /// Odottaa hyväksyntää: ihmisen hyväksyntä vaaditaan ennen jatkamista.
+    /// Needs approval: human approval is required before continuing.
     NeedsApproval,
-    /// Estetty: ulkoinen este (esim. riippuvuus) pysäyttää tehtävän.
+    /// Blocked: an external obstacle (e.g. a dependency) is stopping the task.
     Blocked,
-    /// Keskeytetty vastapaineen vuoksi: resurssibudjetti (esim. samanaikaisuus-
-    /// tai nopeusraja) ei ollut saatavilla, joten tehtävä pysäytettiin ja
-    /// persistoitiin levylle. Jatkuu tilaan [`TaskStatus::Ready`] kun budjetti
-    /// vapautuu. Ero [`TaskStatus::Blocked`]:iin: `Blocked` = ulkoinen este,
-    /// `Suspended` = sisäinen resurssirajoite (vastapaine).
+    /// Suspended due to backpressure: a resource budget (e.g. a concurrency
+    /// or rate limit) was not available, so the task was paused and
+    /// persisted to disk. Resumes to [`TaskStatus::Ready`] once the budget
+    /// frees up. Difference from [`TaskStatus::Blocked`]: `Blocked` = external
+    /// obstacle, `Suspended` = internal resource constraint (backpressure).
     Suspended,
-    /// Valmistunut onnistuneesti (päätetila).
+    /// Completed successfully (terminal state).
     Done,
-    /// Epäonnistui (päätetila).
+    /// Failed (terminal state).
     Failed,
-    /// Peruutettu (päätetila).
+    /// Cancelled (terminal state).
     Cancelled,
 }
 
 impl TaskStatus {
-    /// Onko tämä päätetila (ei enää siirtymiä eteenpäin).
+    /// Whether this is a terminal state (no further transitions).
     ///
-    /// Päätetiloja ovat [`TaskStatus::Done`], [`TaskStatus::Failed`] ja
-    /// [`TaskStatus::Cancelled`].
+    /// The terminal states are [`TaskStatus::Done`], [`TaskStatus::Failed`]
+    /// and [`TaskStatus::Cancelled`].
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
 
-    /// Onko siirtymä tilasta `self` tilaan `next` laillinen.
+    /// Whether the transition from state `self` to state `next` is legal.
     ///
-    /// Sallitut reunat:
+    /// Allowed edges:
     /// - `Planned → Ready`
     /// - `Ready → Running`
     /// - `Running → {Done | Failed | NeedsApproval | Blocked | Suspended}`
     /// - `NeedsApproval → Running`
-    /// - `Blocked → Ready` (este poistui)
-    /// - `Suspended → Ready` (resurssibudjetti vapautui — vastapaine purkautui)
-    /// - mikä tahansa **ei-päätetila** → `Cancelled`
+    /// - `Blocked → Ready` (obstacle cleared)
+    /// - `Suspended → Ready` (resource budget freed up — backpressure resolved)
+    /// - any **non-terminal state** → `Cancelled`
     ///
-    /// Päätetilat eivät salli mitään siirtymää. Siirtymä samaan tilaan ei ole
-    /// sallittu (ei no-op-itsesiirtymiä).
+    /// Terminal states allow no transition at all. A transition to the same
+    /// state is not allowed (no no-op self-transitions).
     #[must_use]
     pub const fn can_transition_to(self, next: Self) -> bool {
         use TaskStatus::{
             Blocked, Cancelled, Done, Failed, NeedsApproval, Planned, Ready, Running, Suspended,
         };
 
-        // Päätetilasta ei voi siirtyä mihinkään.
+        // A terminal state cannot transition anywhere.
         if self.is_terminal() {
             return false;
         }
 
-        // Mikä tahansa ei-päätetila voidaan peruuttaa.
+        // Any non-terminal state can be cancelled.
         if matches!(next, Cancelled) {
             return true;
         }
@@ -112,50 +113,50 @@ impl TaskStatus {
     }
 }
 
-/// Yksittäinen toimintotehtävä: ajettavan yksikön koko tila.
+/// A single action task: the full state of a runnable unit.
 ///
-/// Tehtävä viittaa suoritettavaan taitoon ([`SkillId`]) ja kantaa payloadin
-/// ([`serde_json::Value`]), uudelleenyrityslaskurin, ajastuksen sekä mahdollisen
-/// todistepaketin tunnisteen. Aikaleimat ([`Timestamp`]) injektoidaan — niitä
-/// ei lueta kellosta tämän tyypin sisällä.
+/// The task references the skill to execute ([`SkillId`]) and carries the
+/// payload ([`serde_json::Value`]), a retry counter, scheduling, and an
+/// optional proof bundle identifier. Timestamps ([`Timestamp`]) are injected —
+/// none are read from the clock inside this type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionTask {
-    /// Tehtävän yksilöivä tunniste.
+    /// The task's unique identifier.
     pub id: ActionTaskId,
-    /// Suoritettavan taidon tunniste.
+    /// The identifier of the skill to execute.
     pub skill_id: SkillId,
-    /// Tehtävän tila tilakoneessa.
+    /// The task's state in the state machine.
     pub status: TaskStatus,
-    /// Taidolle välitettävä syöte (geneerinen JSON).
+    /// The input passed to the skill (generic JSON).
     pub payload: serde_json::Value,
-    /// Toteutuneiden uudelleenyritysten määrä.
+    /// The number of retries that have occurred.
     pub retry_count: u32,
-    /// Aikaisin ajankohta jolloin tehtävän saa ottaa ajoon (`None` = heti).
+    /// The earliest time at which the task may be picked up for execution (`None` = immediately).
     pub scheduled_at: Option<Timestamp>,
-    /// Takaraja jonka jälkeen tehtävä on myöhässä (`None` = ei takarajaa).
+    /// The deadline after which the task is late (`None` = no deadline).
     pub deadline: Option<Timestamp>,
-    /// Suorituksesta syntyneen todistepaketin tunniste (`None` ennen suoritusta).
+    /// The identifier of the proof bundle produced by execution (`None` before execution).
     pub proof_bundle_id: Option<ProofBundleId>,
-    /// Vastapaine-keskeytyksen syy ihmisluettavana (`None` kun ei keskeytetty).
+    /// The human-readable reason for a backpressure suspension (`None` when not suspended).
     ///
-    /// Asetetaan kun tehtävä siirtyy tilaan [`TaskStatus::Suspended`] ja
-    /// nollataan kun se jatkuu tilaan [`TaskStatus::Ready`]. Tämä kenttä
-    /// persistoituu [`DurableTaskQueue`]-snapshotissa, jotta uudelleenkäynnistys
-    /// tietää miksi tehtävä on keskeytetty. **Ei saa koskaan sisältää
-    /// salaisuuksia** — vain geneerinen resurssisyy (esim. budjetin nimi).
+    /// Set when the task transitions to [`TaskStatus::Suspended`] and cleared
+    /// when it resumes to [`TaskStatus::Ready`]. This field persists in the
+    /// [`DurableTaskQueue`] snapshot, so that on restart it is known why the
+    /// task is suspended. **Must never contain secrets** — only a generic
+    /// resource reason (e.g. a budget name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suspension_reason: Option<String>,
-    /// Luontihetki (injektoitu).
+    /// Creation time (injected).
     pub created_at: Timestamp,
-    /// Viimeisin päivityshetki (injektoitu).
+    /// Most recent update time (injected).
     pub updated_at: Timestamp,
 }
 
 impl ActionTask {
-    /// Luo uuden tehtävän tilassa [`TaskStatus::Planned`].
+    /// Creates a new task in state [`TaskStatus::Planned`].
     ///
-    /// Tunniste generoidaan satunnaisesti. Aikaleimat injektoidaan (`now`),
-    /// ja sekä `created_at` että `updated_at` asetetaan samaksi.
+    /// The identifier is generated randomly. Timestamps are injected (`now`),
+    /// and both `created_at` and `updated_at` are set to the same value.
     #[must_use]
     pub fn new(skill_id: SkillId, payload: serde_json::Value, now: Timestamp) -> Self {
         Self {
@@ -173,41 +174,41 @@ impl ActionTask {
         }
     }
 
-    /// Rakentaja: asettaa eksplisiittisen tunnisteen.
+    /// Builder: sets an explicit identifier.
     #[must_use]
     pub const fn with_id(mut self, id: ActionTaskId) -> Self {
         self.id = id;
         self
     }
 
-    /// Rakentaja: asettaa aikaisimman ajoajan (`scheduled_at`).
+    /// Builder: sets the earliest scheduled time (`scheduled_at`).
     #[must_use]
     pub const fn with_scheduled_at(mut self, at: Timestamp) -> Self {
         self.scheduled_at = Some(at);
         self
     }
 
-    /// Rakentaja: asettaa takarajan (`deadline`).
+    /// Builder: sets the deadline (`deadline`).
     #[must_use]
     pub const fn with_deadline(mut self, at: Timestamp) -> Self {
         self.deadline = Some(at);
         self
     }
 
-    /// Rakentaja: liittää todistepaketin tunnisteen.
+    /// Builder: attaches the proof bundle identifier.
     #[must_use]
     pub const fn with_proof_bundle_id(mut self, id: ProofBundleId) -> Self {
         self.proof_bundle_id = Some(id);
         self
     }
 
-    /// Validoi tehtävän sisäisen eheyden.
+    /// Validates the task's internal integrity.
     ///
     /// # Errors
-    /// Palauttaa [`ActionError::ManifestValidation`] jos:
-    /// - tehtävän tai taidon tunniste on `nil`,
-    /// - `updated_at` on ennen `created_at`-hetkeä,
-    /// - takaraja (`deadline`) on ennen aikaisinta ajoaikaa (`scheduled_at`).
+    /// Returns [`ActionError::ManifestValidation`] if:
+    /// - the task or skill identifier is `nil`,
+    /// - `updated_at` is before `created_at`,
+    /// - the deadline is before the earliest scheduled time (`scheduled_at`).
     pub fn validate(&self) -> Result<()> {
         if self.id.is_nil() {
             return Err(ActionError::ManifestValidation(
@@ -234,56 +235,56 @@ impl ActionTask {
         Ok(())
     }
 
-    /// Onko tehtävä valmis ajoon annetulla hetkellä `now`.
+    /// Whether the task is ready to run at the given time `now`.
     ///
-    /// Tehtävä on valmis kun tila on [`TaskStatus::Ready`] ja `scheduled_at`
-    /// joko puuttuu tai on jo saavutettu (`scheduled_at <= now`).
+    /// The task is ready when its state is [`TaskStatus::Ready`] and
+    /// `scheduled_at` is either absent or already reached (`scheduled_at <= now`).
     #[must_use]
     pub fn is_ready_at(&self, now: Timestamp) -> bool {
         self.status == TaskStatus::Ready && self.scheduled_at.is_none_or(|at| at <= now)
     }
 }
 
-/// Audit-tapahtuma tehtävän elinkaaresta.
+/// An audit event from a task's lifecycle.
 ///
-/// Tapahtumat ovat tarkoitettu kirjattaviksi (audit-loki / durable-jono) ja ne
-/// sarjallistuvat JSON-muotoon `kind`-erottelijalla.
+/// Events are intended to be recorded (audit log / durable queue) and they
+/// serialize to JSON with a `kind` discriminator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskEvent {
-    /// Tehtävä luotiin.
+    /// The task was created.
     Created {
-        /// Tehtävän tunniste.
+        /// The task's identifier.
         task_id: ActionTaskId,
-        /// Tila johon tehtävä luotiin (yleensä [`TaskStatus::Planned`]).
+        /// The state the task was created in (usually [`TaskStatus::Planned`]).
         status: TaskStatus,
-        /// Tapahtuman hetki.
+        /// The event's time.
         at: Timestamp,
     },
-    /// Tila vaihtui.
+    /// The state changed.
     StatusChanged {
-        /// Tehtävän tunniste.
+        /// The task's identifier.
         task_id: ActionTaskId,
-        /// Lähtötila.
+        /// The source state.
         from: TaskStatus,
-        /// Kohdetila.
+        /// The target state.
         to: TaskStatus,
-        /// Tapahtuman hetki.
+        /// The event's time.
         at: Timestamp,
     },
-    /// Uudelleenyrityslaskuria kasvatettiin.
+    /// The retry counter was incremented.
     RetryIncremented {
-        /// Tehtävän tunniste.
+        /// The task's identifier.
         task_id: ActionTaskId,
-        /// Uusi laskurin arvo kasvatuksen jälkeen.
+        /// The counter's new value after incrementing.
         count: u32,
-        /// Tapahtuman hetki.
+        /// The event's time.
         at: Timestamp,
     },
 }
 
 impl TaskEvent {
-    /// Palauttaa tapahtumaan liittyvän tehtävän tunnisteen.
+    /// Returns the task identifier associated with the event.
     #[must_use]
     pub const fn task_id(&self) -> ActionTaskId {
         match *self {
@@ -294,32 +295,33 @@ impl TaskEvent {
     }
 }
 
-/// In-memory-jono toimintotehtäthe operator.
+/// An in-memory queue for action tasks.
 ///
-/// Säilyttää tehtävät tunnisteen mukaan ja suojaa tilan tokio
-/// [`tokio::sync::Mutex`]-lukolla, jotta jonoa voi jakaa async-tehtävien välillä.
-/// Jono **ei lue kelloa** — kaikki tilamuutokset ottavat aikaleiman injektoituna.
+/// Holds tasks keyed by identifier and guards the state with a tokio
+/// [`tokio::sync::Mutex`] lock, so the queue can be shared across async tasks.
+/// The queue **never reads the clock** — all state transitions take the
+/// timestamp injected.
 #[derive(Debug, Default)]
 pub struct TaskQueue {
-    /// Tunniste → tehtävä -kartta lukon takana.
+    /// Identifier → task map behind the lock.
     inner: Mutex<HashMap<ActionTaskId, ActionTask>>,
 }
 
 impl TaskQueue {
-    /// Luo uuden tyhjän jonon.
+    /// Creates a new empty queue.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Rakentaa jonon **valmiiksi täytettynä** annetusta tunniste→tehtävä
-    /// -kartasta (esim. [`DurableTaskQueue::reload`]:n tuloksesta).
+    /// Builds the queue **already populated** from the given identifier→task
+    /// map (e.g. the result of [`DurableTaskQueue::reload`]).
     ///
-    /// Tämä on kaatumiskestävyyden palautuspolku: uudelleenkäynnistyksessä jono
-    /// rekonstruoidaan levyltä luetusta tilasta, jotta hyväksyntää odottavat
-    /// tehtävät ([`TaskStatus::NeedsApproval`]) ovat yhä ajettavissa
-    /// (`run_after_approval`). Tehtäviä ei validoida uudelleen tässä — ne
-    /// validoitiin jo kirjoitusvaiheessa ([`DurableTaskQueue::append`]).
+    /// This is the crash-resilience recovery path: on restart the queue is
+    /// reconstructed from state read off disk, so that tasks awaiting
+    /// approval ([`TaskStatus::NeedsApproval`]) are still runnable
+    /// (`run_after_approval`). Tasks are not re-validated here — they were
+    /// already validated at write time ([`DurableTaskQueue::append`]).
     #[must_use]
     pub fn from_map(tasks: HashMap<ActionTaskId, ActionTask>) -> Self {
         Self {
@@ -327,14 +329,14 @@ impl TaskQueue {
         }
     }
 
-    /// Lisää tehtävän jonoon.
+    /// Adds a task to the queue.
     ///
-    /// Tehtävä validoidaan ([`ActionTask::validate`]) ennen tallennusta, ja
-    /// saman tunnisteen kaksinkertainen lisäys hylätään.
+    /// The task is validated ([`ActionTask::validate`]) before storing, and
+    /// a duplicate insert of the same identifier is rejected.
     ///
     /// # Errors
-    /// - Tehtävän validoinnin virhe.
-    /// - [`ActionError::ManifestValidation`] jos sama tunniste on jo jonossa.
+    /// - A task validation error.
+    /// - [`ActionError::ManifestValidation`] if the same identifier is already in the queue.
     pub async fn submit(&self, task: ActionTask) -> Result<()> {
         task.validate()?;
         let mut guard = self.inner.lock().await;
@@ -348,17 +350,17 @@ impl TaskQueue {
         Ok(())
     }
 
-    /// Hakee tehtävän tunnisteella (kopio); `None` jos ei löydy.
+    /// Looks up a task by identifier (a copy); `None` if not found.
     pub async fn get(&self, id: ActionTaskId) -> Option<ActionTask> {
         self.inner.lock().await.get(&id).cloned()
     }
 
-    /// Luettelee kaikki tehtävät (kopiot, järjestys määrittelemätön).
+    /// Lists all tasks (copies, order unspecified).
     pub async fn list(&self) -> Vec<ActionTask> {
         self.inner.lock().await.values().cloned().collect()
     }
 
-    /// Luettelee tehtävät joiden tila vastaa annettua (kopiot).
+    /// Lists tasks whose state matches the given one (copies).
     pub async fn list_by_status(&self, status: TaskStatus) -> Vec<ActionTask> {
         self.inner
             .lock()
@@ -369,16 +371,16 @@ impl TaskQueue {
             .collect()
     }
 
-    /// Siirtää tehtävän uuteen tilaan jos siirtymä on laillinen.
+    /// Transitions the task to a new state if the transition is legal.
     ///
-    /// Päivittää myös `updated_at`-leiman injektoidulla hetkellä `now` ja
-    /// palauttaa syntyneen [`TaskEvent::StatusChanged`]-tapahtuman.
+    /// Also updates the `updated_at` timestamp with the injected time `now`
+    /// and returns the resulting [`TaskEvent::StatusChanged`] event.
     ///
     /// # Errors
-    /// - [`ActionError::NotFound`] jos tehtävää ei ole jonossa.
-    /// - [`ActionError::IllegalTransition`] jos siirtymä ei ole laillinen
-    ///   (mukaan lukien yritys ajaa peruutettu tehtävä —
-    ///   `Cancelled → Running` ei ole sallittu).
+    /// - [`ActionError::NotFound`] if the task is not in the queue.
+    /// - [`ActionError::IllegalTransition`] if the transition is not legal
+    ///   (including an attempt to run a cancelled task —
+    ///   `Cancelled → Running` is not allowed).
     pub async fn transition(
         &self,
         id: ActionTaskId,
@@ -405,16 +407,16 @@ impl TaskQueue {
         })
     }
 
-    /// Keskeyttää tehtävän vastapaineen vuoksi: siirtää sen tilaan
-    /// [`TaskStatus::Suspended`] ja tallentaa geneerisen `reason`-syyn.
+    /// Suspends a task due to backpressure: transitions it to
+    /// [`TaskStatus::Suspended`] and stores the generic `reason`.
     ///
-    /// Siirtymä tarkistetaan [`TaskStatus::can_transition_to`]-koneella (vain
-    /// `Running → Suspended` on laillinen). `reason` ei saa sisältää
-    /// salaisuuksia — vain resurssisyy (esim. budjetin nimi).
+    /// The transition is checked by the [`TaskStatus::can_transition_to`]
+    /// machine (only `Running → Suspended` is legal). `reason` must not
+    /// contain secrets — only a resource reason (e.g. a budget name).
     ///
     /// # Errors
-    /// - [`ActionError::NotFound`] jos tehtävää ei ole jonossa.
-    /// - [`ActionError::IllegalTransition`] jos nykytilasta ei voi keskeyttää.
+    /// - [`ActionError::NotFound`] if the task is not in the queue.
+    /// - [`ActionError::IllegalTransition`] if the current state cannot be suspended.
     pub async fn suspend(
         &self,
         id: ActionTaskId,
@@ -442,13 +444,13 @@ impl TaskQueue {
         })
     }
 
-    /// Jatkaa keskeytettyä tehtävää: siirtää sen tilasta
-    /// [`TaskStatus::Suspended`] takaisin tilaan [`TaskStatus::Ready`] ja
-    /// nollaa keskeytyssyyn. Käytetään kun resurssibudjetti vapautuu.
+    /// Resumes a suspended task: transitions it from
+    /// [`TaskStatus::Suspended`] back to [`TaskStatus::Ready`] and clears the
+    /// suspension reason. Used when a resource budget frees up.
     ///
     /// # Errors
-    /// - [`ActionError::NotFound`] jos tehtävää ei ole jonossa.
-    /// - [`ActionError::IllegalTransition`] jos tehtävä ei ole keskeytettynä.
+    /// - [`ActionError::NotFound`] if the task is not in the queue.
+    /// - [`ActionError::IllegalTransition`] if the task is not suspended.
     pub async fn resume(&self, id: ActionTaskId, now: Timestamp) -> Result<TaskEvent> {
         let mut guard = self.inner.lock().await;
         let task = guard
@@ -471,14 +473,14 @@ impl TaskQueue {
         })
     }
 
-    /// Kasvattaa tehtävän uudelleenyrityslaskuria yhdellä.
+    /// Increments the task's retry counter by one.
     ///
-    /// Päivittää `updated_at`-leiman ja palauttaa
-    /// [`TaskEvent::RetryIncremented`]-tapahtuman.
+    /// Updates the `updated_at` timestamp and returns the
+    /// [`TaskEvent::RetryIncremented`] event.
     ///
     /// # Errors
-    /// - [`ActionError::NotFound`] jos tehtävää ei ole jonossa.
-    /// - [`ActionError::ExecutionFailed`] jos laskuri ylivuotaisi (`u32::MAX`).
+    /// - [`ActionError::NotFound`] if the task is not in the queue.
+    /// - [`ActionError::ExecutionFailed`] if the counter would overflow (`u32::MAX`).
     pub async fn increment_retry(&self, id: ActionTaskId, now: Timestamp) -> Result<TaskEvent> {
         let mut guard = self.inner.lock().await;
         let task = guard
@@ -496,11 +498,12 @@ impl TaskQueue {
         })
     }
 
-    /// Palauttaa ajettavissa olevan tehtävän annetulla hetkellä `now`.
+    /// Returns a runnable task at the given time `now`.
     ///
-    /// Valitsee tilan [`TaskStatus::Ready`] tehtävistä sen, jonka `scheduled_at`
-    /// on jo saavutettu (tai puuttuu). Useasta ehdokkaasta valitaan deterministisesti
-    /// pienimmän tunnisteen mukaan, jotta tulos on toistettava.
+    /// Among tasks in state [`TaskStatus::Ready`], picks the one whose
+    /// `scheduled_at` has already been reached (or is absent). When there are
+    /// multiple candidates, the choice is deterministic by the smallest
+    /// identifier, so the result is reproducible.
     pub async fn next_ready(&self, now: Timestamp) -> Option<ActionTask> {
         let guard = self.inner.lock().await;
         guard
@@ -511,43 +514,43 @@ impl TaskQueue {
     }
 }
 
-/// JSONL-tukeutuva durable-jono toimintotehtäthe operator.
+/// A JSONL-backed durable queue for action tasks.
 ///
-/// Jokainen tilamuutos kirjoitetaan yhtenä JSON-rivinä (`append`) tiedostoon:
-/// rivi on tehtävän koko tilatilannekuva (snapshot). [`DurableTaskQueue::reload`]
-/// lukee tiedoston ja rekonstruoi **viimeisimmän** tilan per tehtävätunniste
-/// (myöhempi rivi voittaa). Toteutus on deterministinen: aikaleimat injektoidaan.
+/// Every state change is written as one JSON line (`append`) to the file:
+/// the line is the task's full state snapshot. [`DurableTaskQueue::reload`]
+/// reads the file and reconstructs the **latest** state per task identifier
+/// (a later line wins). The implementation is deterministic: timestamps are injected.
 #[derive(Debug, Clone)]
 pub struct DurableTaskQueue {
-    /// JSONL-tiedoston polku johon tilannekuvat liitetään.
+    /// The path of the JSONL file that snapshots are appended to.
     path: PathBuf,
 }
 
 impl DurableTaskQueue {
-    /// Luo durable-jonon annetulle tiedostopolulle.
+    /// Creates a durable queue for the given file path.
     ///
-    /// Tiedostoa ei luoda tässä; se syntyy ensimmäisellä [`DurableTaskQueue::append`]-
-    /// kutsulla. Olemassa olevasta tiedostosta voi heti lukea
-    /// [`DurableTaskQueue::reload`]-kutsulla.
+    /// The file is not created here; it comes into existence on the first
+    /// [`DurableTaskQueue::append`] call. An existing file can be read
+    /// immediately via [`DurableTaskQueue::reload`].
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
-    /// Palauttaa tiedostopolun jota tämä jono käyttää.
+    /// Returns the file path this queue uses.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Liittää tehtävän tilannekuvan (snapshot) JSONL-tiedostoon.
+    /// Appends the task's state snapshot to the JSONL file.
     ///
-    /// Tehtävä validoidaan ennen kirjoitusta. Rivi on tehtävän koko tila
-    /// JSON-muodossa, ja loppuun lisätään rivinvaihto.
+    /// The task is validated before writing. The line is the task's full
+    /// state in JSON form, with a newline appended.
     ///
     /// # Errors
-    /// - Tehtävän validoinnin virhe.
-    /// - [`ActionError::Proof`] jos sarjallistus tai tiedostokirjoitus epäonnistuu.
+    /// - A task validation error.
+    /// - [`ActionError::Proof`] if serialization or the file write fails.
     pub async fn append(&self, task: &ActionTask) -> Result<()> {
         task.validate()?;
         let mut line = serde_json::to_string(task)
@@ -569,15 +572,15 @@ impl DurableTaskQueue {
         Ok(())
     }
 
-    /// Rekonstruoi viimeisimmän tilan per tehtävätunniste JSONL-tiedostosta.
+    /// Reconstructs the latest state per task identifier from the JSONL file.
     ///
-    /// Tyhjät rivit ohitetaan. Jokainen rivi on yksi tilannekuva; saman
-    /// tunnisteen myöhempi rivi korvaa aiemman. Jos tiedostoa ei ole vielä
-    /// olemassa, palautetaan tyhjä kartta (ei virhe).
+    /// Empty lines are skipped. Each line is one snapshot; a later line for
+    /// the same identifier replaces the earlier one. If the file does not
+    /// yet exist, an empty map is returned (not an error).
     ///
     /// # Errors
-    /// - [`ActionError::Proof`] jos tiedoston luku epäonnistuu (muu kuin
-    ///   "ei löydy") tai jokin rivi ei ole kelvollinen tehtävä-JSON.
+    /// - [`ActionError::Proof`] if reading the file fails (other than
+    ///   "not found") or some line is not valid task JSON.
     pub async fn reload(&self) -> Result<HashMap<ActionTaskId, ActionTask>> {
         let bytes = match tokio::fs::read(&self.path).await {
             Ok(bytes) => bytes,
@@ -605,12 +608,12 @@ impl DurableTaskQueue {
         Ok(latest)
     }
 
-    /// Lataa durable-tiedostosta in-memory-jonon ([`TaskQueue`]).
+    /// Loads an in-memory queue ([`TaskQueue`]) from the durable file.
     ///
-    /// Kätevä apuri jolla durable-tilan saa takaisin ajettavaksi jonoksi.
+    /// A convenient helper to turn durable state back into a runnable queue.
     ///
     /// # Errors
-    /// Sama kuin [`DurableTaskQueue::reload`].
+    /// Same as [`DurableTaskQueue::reload`].
     pub async fn load_into_queue(&self) -> Result<TaskQueue> {
         let map = self.reload().await?;
         Ok(TaskQueue {
@@ -624,12 +627,12 @@ mod tests {
     use super::*;
     use familyclaw_core::time::from_unix_secs;
 
-    /// Apuri: kiinteä aikaleima determinististä testausta varten.
+    /// Helper: a fixed timestamp for deterministic testing.
     fn at(secs: i64) -> Timestamp {
         from_unix_secs(secs).expect("valid unix seconds in test")
     }
 
-    /// Apuri: kelvollinen mock-tehtävä annetulla luontihetkellä.
+    /// Helper: a valid mock task at the given creation time.
     fn task_at(now: Timestamp) -> ActionTask {
         ActionTask::new(SkillId::new(), serde_json::json!({ "to": "general" }), now)
     }
@@ -690,7 +693,7 @@ mod tests {
         assert!(!TaskStatus::Planned.can_transition_to(TaskStatus::Running));
         assert!(!TaskStatus::Ready.can_transition_to(TaskStatus::Done));
         assert!(!TaskStatus::Running.can_transition_to(TaskStatus::Ready));
-        // Itsesiirtymät eivät ole sallittuja.
+        // Self-transitions are not allowed.
         assert!(!TaskStatus::Running.can_transition_to(TaskStatus::Running));
     }
 
@@ -867,7 +870,7 @@ mod tests {
         let q = TaskQueue::new();
         let base = at(1_700_000_000);
 
-        // Tehtävä jolla on tuleva scheduled_at — ei vielä ajettavissa.
+        // A task with a future scheduled_at — not yet runnable.
         let future = task_at(base).with_scheduled_at(at(1_700_001_000));
         let future_id = future.id;
         q.submit(future).await.expect("submit future");
@@ -875,10 +878,10 @@ mod tests {
             .await
             .expect("ready");
 
-        // Hetkellä ennen scheduled_at: ei ajettavaa.
+        // At a time before scheduled_at: nothing runnable.
         assert!(q.next_ready(at(1_700_000_500)).await.is_none());
 
-        // Tehtävä ilman scheduled_at — ajettavissa heti kun Ready.
+        // A task without scheduled_at — runnable as soon as it's Ready.
         let nowable = task_at(base);
         let nowable_id = nowable.id;
         q.submit(nowable).await.expect("submit nowable");
@@ -889,7 +892,7 @@ mod tests {
         let picked = q.next_ready(at(1_700_000_500)).await.expect("one ready");
         assert_eq!(picked.id, nowable_id);
 
-        // Hetkellä scheduled_at jälkeen molemmat ovat ajettavissa.
+        // At a time after scheduled_at, both are runnable.
         let later = q.next_ready(at(1_700_002_000)).await;
         assert!(later.is_some());
     }
@@ -909,7 +912,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let unique = ActionTaskId::new();
         let path = dir.join(format!("familyclaw-actions-durable-{unique}.jsonl"));
-        // Varmista puhdas lähtö.
+        // Ensure a clean starting state.
         let _ = tokio::fs::remove_file(&path).await;
 
         let durable = DurableTaskQueue::new(&path);
@@ -918,7 +921,7 @@ mod tests {
         let mut task = task_at(now).with_id(ActionTaskId::new());
         let id = task.id;
 
-        // Kirjoita useita tilannekuvia: viimeisin (Running) jää voimaan.
+        // Write several snapshots: the latest one (Running) remains in effect.
         durable.append(&task).await.expect("append planned");
 
         task.status = TaskStatus::Ready;
@@ -930,12 +933,12 @@ mod tests {
         task.updated_at = at(1_700_000_002);
         durable.append(&task).await.expect("append running");
 
-        // Toinen tehtävä samaan tiedostoon.
+        // A second task in the same file.
         let other = task_at(now).with_id(ActionTaskId::new());
         let other_id = other.id;
         durable.append(&other).await.expect("append other");
 
-        // Uusi instanssi samaan polkuun: ei jaettua muistia.
+        // A new instance for the same path: no shared memory.
         let reloaded = DurableTaskQueue::new(&path).reload().await.expect("reload");
 
         assert_eq!(reloaded.len(), 2);
@@ -945,7 +948,7 @@ mod tests {
         assert_eq!(restored.updated_at, at(1_700_000_002));
         assert!(reloaded.contains_key(&other_id));
 
-        // load_into_queue palauttaa ajettavan jonon samasta tilasta.
+        // load_into_queue returns a runnable queue from the same state.
         let queue = DurableTaskQueue::new(&path)
             .load_into_queue()
             .await
@@ -955,7 +958,7 @@ mod tests {
             TaskStatus::Running
         );
 
-        // Siivous.
+        // Cleanup.
         let _ = tokio::fs::remove_file(&path).await;
     }
 
@@ -981,19 +984,19 @@ mod tests {
         assert_eq!(ev.task_id(), id);
     }
 
-    // ---- Track 2: Suspended-tila + vastapaine (suspend/resume) ----
+    // ---- Track 2: Suspended state + backpressure (suspend/resume) ----
 
     #[test]
     fn suspend_transitions_are_legal_only_from_running() {
-        // Running -> Suspended on laillinen vastapaine-keskeytys.
+        // Running -> Suspended is a legal backpressure suspension.
         assert!(TaskStatus::Running.can_transition_to(TaskStatus::Suspended));
-        // Suspended -> Ready on laillinen jatkaminen.
+        // Suspended -> Ready is a legal resumption.
         assert!(TaskStatus::Suspended.can_transition_to(TaskStatus::Ready));
-        // Suspended -> Cancelled (ei-päätetila voidaan aina peruuttaa).
+        // Suspended -> Cancelled (a non-terminal state can always be cancelled).
         assert!(TaskStatus::Suspended.can_transition_to(TaskStatus::Cancelled));
-        // Suspended EI saa hypätä suoraan Runningiin (täytyy kulkea Readyn kautta).
+        // Suspended must NOT jump directly to Running (must go through Ready).
         assert!(!TaskStatus::Suspended.can_transition_to(TaskStatus::Running));
-        // Ei voi keskeyttää ei-Running-tilasta.
+        // Cannot suspend from a non-Running state.
         assert!(!TaskStatus::Ready.can_transition_to(TaskStatus::Suspended));
         assert!(!TaskStatus::Planned.can_transition_to(TaskStatus::Suspended));
     }
@@ -1014,7 +1017,7 @@ mod tests {
             .await
             .expect("running");
 
-        // Vastapaine: keskeytä budjettisyyllä.
+        // Backpressure: suspend with a budget reason.
         queue
             .suspend(
                 id,
@@ -1030,7 +1033,7 @@ mod tests {
             Some("per_skill_concurrency budget exhausted")
         );
 
-        // Budjetti vapautui: jatka.
+        // Budget freed up: resume.
         queue.resume(id, at(1_700_000_004)).await.expect("resume");
         let resumed = queue.get(id).await.expect("present");
         assert_eq!(resumed.status, TaskStatus::Ready);
@@ -1047,7 +1050,7 @@ mod tests {
         let task = task_at(now).with_id(ActionTaskId::new());
         let id = task.id;
         queue.submit(task).await.expect("submit");
-        // Planned-tilasta ei voi keskeyttää.
+        // Cannot suspend from the Planned state.
         let err = queue.suspend(id, "nope", at(1_700_000_001)).await;
         assert!(matches!(err, Err(ActionError::IllegalTransition(_))));
     }
@@ -1059,7 +1062,7 @@ mod tests {
         let task = task_at(now).with_id(ActionTaskId::new());
         let id = task.id;
         queue.submit(task).await.expect("submit");
-        // Ei voi jatkaa tehtävää joka ei ole keskeytetty.
+        // Cannot resume a task that is not suspended.
         let err = queue.resume(id, at(1_700_000_001)).await;
         assert!(matches!(err, Err(ActionError::IllegalTransition(_))));
     }
@@ -1082,7 +1085,7 @@ mod tests {
         task.updated_at = at(1_700_000_010);
         durable.append(&task).await.expect("append suspended");
 
-        // Uudelleenkäynnistys: keskeytyssyy säilyy snapshotissa.
+        // Restart: the suspension reason survives in the snapshot.
         let reloaded = DurableTaskQueue::new(&path).reload().await.expect("reload");
         let restored = reloaded.get(&id).expect("restored");
         assert_eq!(restored.status, TaskStatus::Suspended);
@@ -1096,9 +1099,9 @@ mod tests {
 
     #[tokio::test]
     async fn suspension_reason_carries_no_secret() {
-        // Operaattorin vastuulla on antaa salaisuudeton syy; tämä testi
-        // dokumentoi invariantin ja varmistaa ettei suspend/resume itse vuoda
-        // payloadia syyhyn.
+        // It is the operator's responsibility to supply a secret-free reason;
+        // this test documents the invariant and verifies that suspend/resume
+        // itself does not leak the payload into the reason.
         let queue = TaskQueue::new();
         let now = at(1_700_000_000);
         let task = ActionTask::new(

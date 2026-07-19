@@ -1,12 +1,14 @@
 [package]
 name = "familyclaw-actions"
-description = "Skill-, hyväksyntä-, suoritus- ja todistepino agenttien toiminnoille (KERROS A, OSS)"
+description = "Action pipeline for agents: skill execution, human approval gating, and a durable proof trail from observe to report"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+keywords = ["agent", "approval", "audit", "workflow", "runtime"]
+categories = ["asynchronous", "development-tools"]
 
 [lints]
 workspace = true

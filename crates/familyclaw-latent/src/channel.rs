@@ -1,71 +1,72 @@
-//! Latent-kanava — sisarusten välinen piilotilan siirto, **aina** teksti-
-//! fallbackilla.
+//! Latent channel — transfer of hidden state between siblings, **always**
+//! with a text fallback.
 //!
-//! [`LatentChannel`] on abstraktio yhdensuuntaiselle viestinnälle, jossa
-//! ensisijaisesti yritetään siirtää [`LatentVector`] (latent-telepatia) ja
-//! **jos se ei onnistu** — yhteensopimattomat mallit, projektio epäonnistuu,
-//! vektori epäterve, tai vastaanottaja ei tue latenttia — siirrytään
-//! **automaattisesti teksti-fallbackiin** ([`TransmissionMode::Text`]).
+//! [`LatentChannel`] is an abstraction for one-way communication that
+//! primarily attempts to transfer a [`LatentVector`] (latent telepathy) and,
+//! **if that fails** — incompatible models, projection failure, an unsound
+//! vector, or a receiver that doesn't support latent — **automatically
+//! falls back to text** ([`TransmissionMode::Text`]).
 //!
-//! ## Suunnittelun ydinperiaate (design §2.4)
-//! > "Aina **fallback tekstiin** jos mallit yhteensopimattomat — ei koskaan
-//! > riko viestintää. Korkein viestintämuoto, ei ainoa."
+//! ## Core design principle (design §2.4)
+//! > "Always **fall back to text** if models are incompatible — never break
+//! > communication. The highest communication mode, not the only one."
 //!
-//! Tästä syystä [`LatentChannel::transmit`] **ei koskaan palauta virhettä
-//! pelkän yhteensopimattomuuden takia**: se palauttaa onnistuneen
-//! [`Transmission`]-tuloksen jonka `mode` kertoo, käytettiinkö latenttia vai
-//! tekstiä. Kanava saa palauttaa virheen vain todellisesta kuljetusviasta
-//! (esim. yhteys katkesi), ei semanttisesta yhteensopimattomuudesta.
+//! For this reason, [`LatentChannel::transmit`] **never returns an error
+//! purely for incompatibility**: it returns a successful [`Transmission`]
+//! result whose `mode` reports whether latent or text was used. A channel
+//! may return an error only for a genuine transport failure (e.g. the
+//! connection dropped), never for semantic incompatibility.
 
 use serde::{Deserialize, Serialize};
 
 use crate::link::{ProjectedLatent, RecursiveLink};
 use crate::vector::LatentVector;
 
-/// Viestin siirtomuoto: korkein onnistunut taso.
+/// The message's transmission mode: the highest tier that succeeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransmissionMode {
-    /// Piilotila siirrettiin onnistuneesti latent-vektorina.
+    /// The hidden state was successfully transferred as a latent vector.
     Latent,
-    /// Latent ei ollut mahdollista → palattiin teksti-edustukseen.
+    /// Latent was not possible -> fell back to text representation.
     Text,
 }
 
 impl TransmissionMode {
-    /// Onko siirto tehty latent-muodossa.
+    /// Whether the transfer was done in latent form.
     #[must_use]
     pub fn is_latent(self) -> bool {
         matches!(self, Self::Latent)
     }
 
-    /// Onko siirto tehty teksti-fallbackina.
+    /// Whether the transfer was done as a text fallback.
     #[must_use]
     pub fn is_text(self) -> bool {
         matches!(self, Self::Text)
     }
 }
 
-/// Syy, jonka takia latent-siirrosta jouduttiin palaamaan tekstiin.
+/// The reason a latent transfer had to fall back to text.
 ///
-/// Tallennetaan [`Transmission::fallback_reason`]-kenttään diagnostiikkaa ja
-/// tutkimusmittausta varten (kuinka usein latent toimii vs. fallback).
+/// Stored in the [`Transmission::fallback_reason`] field for diagnostics and
+/// research metrics (how often latent works vs. falls back).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FallbackReason {
-    /// Vastaanottaja ei tue latent-vastaanottoa lainkaan.
+    /// The receiver doesn't support latent reception at all.
     ReceiverTextOnly,
-    /// Lähettäjälle ei ole [`RecursiveLink`]-siltaa vastaanottajan malliin.
+    /// There is no [`RecursiveLink`] bridge from the sender to the
+    /// receiver's model.
     NoLink,
-    /// Dimensio-projektio epäonnistui (malli- tai dimensioristiriita,
-    /// epäterve vektori).
+    /// The dimension projection failed (model or dimension mismatch,
+    /// unsound vector).
     ProjectionFailed,
-    /// Latent-edustusta ei ollut saatavilla (vain teksti annettiin).
+    /// No latent representation was available (only text was supplied).
     NoLatentAvailable,
 }
 
 impl FallbackReason {
-    /// Lyhyt, ihmisluettava kuvaus syystä (lokitusta varten).
+    /// A short, human-readable description of the reason (for logging).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -77,21 +78,22 @@ impl FallbackReason {
     }
 }
 
-/// Lähettävä sisarus haluaa siirtää joko piilotilan, tekstin, tai molemmat.
+/// The sending sibling wants to transfer either the hidden state, text, or
+/// both.
 ///
-/// `latent` on valinnainen: jos sitä ei ole, siirto menee suoraan tekstinä.
-/// `text` on **pakollinen** — se on aina turvaverkko, joka takaa ettei
-/// viestintä koskaan katkea, vaikka latent epäonnistuisi.
+/// `latent` is optional: if absent, the transfer goes straight through as
+/// text. `text` is **mandatory** — it is always the safety net that
+/// guarantees communication never breaks even if latent fails.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LatentMessage {
-    /// Valinnainen piilotila (latent-telepatia). `None` = vain teksti.
+    /// Optional hidden state (latent telepathy). `None` = text only.
     pub latent: Option<LatentVector>,
-    /// Tekstiedustus — aina mukana fallbackia varten.
+    /// The text representation — always included for the fallback.
     pub text: String,
 }
 
 impl LatentMessage {
-    /// Rakentaa viestin sekä piilotilasta että tekstistä.
+    /// Builds a message from both a hidden state and text.
     #[must_use]
     pub fn with_latent(latent: LatentVector, text: impl Into<String>) -> Self {
         Self {
@@ -100,7 +102,7 @@ impl LatentMessage {
         }
     }
 
-    /// Rakentaa pelkän tekstiviestin (ei piilotilaa).
+    /// Builds a text-only message (no hidden state).
     #[must_use]
     pub fn text_only(text: impl Into<String>) -> Self {
         Self {
@@ -110,27 +112,28 @@ impl LatentMessage {
     }
 }
 
-/// Yhden siirron lopputulos: mitä vastaanottaja tosiasiassa sai ja missä
-/// muodossa.
+/// The outcome of a single transfer: what the receiver actually got, and in
+/// which form.
 ///
-/// `mode` kertoo korkeimman onnistuneen tason. Jos `mode` on
-/// [`TransmissionMode::Latent`], `projected` sisältää kohde-avaruuteen
-/// sovitetun vektorin. Jos `mode` on [`TransmissionMode::Text`],
-/// `fallback_reason` kertoo miksi.
+/// `mode` reports the highest tier that succeeded. If `mode` is
+/// [`TransmissionMode::Latent`], `projected` holds the vector fitted to the
+/// target space. If `mode` is [`TransmissionMode::Text`], `fallback_reason`
+/// reports why.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Transmission {
-    /// Korkein onnistunut siirtomuoto.
+    /// The highest transmission mode that succeeded.
     pub mode: TransmissionMode,
-    /// Vastaanottajan saama tekstiedustus (aina läsnä — turvaverkko).
+    /// The text representation the receiver got (always present — the
+    /// safety net).
     pub text: String,
-    /// Kohde-malliin sovitettu piilotila, jos `mode == Latent`.
+    /// The hidden state fitted to the target model, if `mode == Latent`.
     pub projected: Option<ProjectedLatent>,
-    /// Syy fallbackiin, jos `mode == Text`.
+    /// The reason for the fallback, if `mode == Text`.
     pub fallback_reason: Option<FallbackReason>,
 }
 
 impl Transmission {
-    /// Rakentaa onnistuneen latent-siirron tuloksen.
+    /// Builds a successful latent-transfer result.
     #[must_use]
     fn latent(projected: ProjectedLatent, text: String) -> Self {
         Self {
@@ -141,7 +144,7 @@ impl Transmission {
         }
     }
 
-    /// Rakentaa teksti-fallback-tuloksen annetulla syyllä.
+    /// Builds a text-fallback result with the given reason.
     #[must_use]
     fn text(reason: FallbackReason, text: String) -> Self {
         Self {
@@ -153,22 +156,23 @@ impl Transmission {
     }
 }
 
-/// Vastaanottavan sisaruksen kyvyt latent-vastaanottoon.
+/// The receiving sibling's capabilities for latent reception.
 ///
-/// Kuvaa, mitä mallia vastaanottaja käyttää ja minkä kokoista piilotilaa se
-/// odottaa. Jos `accepts_latent` on `false`, kaikki siirrot menevät tekstinä.
+/// Describes which model the receiver uses and what size hidden state it
+/// expects. If `accepts_latent` is `false`, all transfers go through as
+/// text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiverProfile {
-    /// Vastaanottajan mallitunniste (`"provider/model"`).
+    /// The receiver's model identifier (`"provider/model"`).
     pub model_id: String,
-    /// Vastaanottajan odottama latent-dimensioluku.
+    /// The latent dimensionality the receiver expects.
     pub dims: usize,
-    /// Hyväksyykö vastaanottaja latent-siirron lainkaan.
+    /// Whether the receiver accepts latent transfer at all.
     pub accepts_latent: bool,
 }
 
 impl ReceiverProfile {
-    /// Vastaanottaja, joka hyväksyy latentin annetulla mallilla ja koolla.
+    /// A receiver that accepts latent with the given model and size.
     #[must_use]
     pub fn latent(model_id: impl Into<String>, dims: usize) -> Self {
         Self {
@@ -178,7 +182,7 @@ impl ReceiverProfile {
         }
     }
 
-    /// Vastaanottaja, joka hyväksyy vain tekstiä.
+    /// A receiver that accepts only text.
     #[must_use]
     pub fn text_only(model_id: impl Into<String>) -> Self {
         Self {
@@ -189,54 +193,56 @@ impl ReceiverProfile {
     }
 }
 
-/// Latent-kanava sisarusten välillä.
+/// A latent channel between siblings.
 ///
-/// Toteutus vastaa konkreettisesta kuljetuksesta (in-process, bus, verkko).
-/// Trait-tason oletustoteutus [`LatentChannel::transmit`] hoitaa
-/// **yhteisen fallback-logiikan** niin, että jokainen kanava käyttäytyy
-/// samalla tavalla: latent ensin, teksti aina varalla.
+/// The implementation is responsible for the concrete transport (in-process,
+/// bus, network). The trait-level default implementation
+/// [`LatentChannel::transmit`] handles the **shared fallback logic** so that
+/// every channel behaves the same way: latent first, text always as a
+/// backup.
 pub trait LatentChannel {
-    /// Lähettäjän malli, jolla `LatentVector`-piilotilat tuotetaan.
+    /// The sender's model, which produces the `LatentVector` hidden states.
     fn sender_model(&self) -> &str;
 
-    /// Hakee [`RecursiveLink`]-sillan lähettäjän mallista annettuun
-    /// kohde-malliin, jos sellainen on määritelty.
+    /// Looks up a [`RecursiveLink`] bridge from the sender's model to the
+    /// given target model, if one is defined.
     ///
-    /// `None` tarkoittaa ettei siltaa ole → siirto putoaa tekstiin
+    /// `None` means no bridge exists -> the transfer falls back to text
     /// ([`FallbackReason::NoLink`]).
     fn link_to(&self, target_model: &str) -> Option<RecursiveLink>;
 
-    /// Toimittaa valmiin [`Transmission`]-tuloksen vastaanottajalle.
+    /// Delivers a finished [`Transmission`] result to the receiver.
     ///
-    /// Tämä on ainoa metodi joka koskettaa todellista kuljetusta. Se saa
-    /// palauttaa virheen **vain** kuljetusviasta (yhteys katkesi), ei
-    /// semanttisesta yhteensopimattomuudesta — fallback hoidetaan jo
-    /// [`transmit`](LatentChannel::transmit)-tasolla.
+    /// This is the only method that touches the actual transport. It may
+    /// return an error **only** for a transport failure (connection
+    /// dropped), never for semantic incompatibility — the fallback is
+    /// already handled at the [`transmit`](LatentChannel::transmit) level.
     ///
     /// # Errors
-    /// Palauttaa virheen vain todellisesta kuljetusviasta.
+    /// Returns an error only for a genuine transport failure.
     fn deliver(&mut self, transmission: &Transmission) -> crate::Result<()>;
 
-    /// Lähettää viestin vastaanottajalle valiten korkeimman mahdollisen
-    /// siirtomuodon ja palaten tarvittaessa tekstiin.
+    /// Sends a message to the receiver, choosing the highest possible
+    /// transmission mode and falling back to text when needed.
     ///
-    /// Algoritmi:
-    /// 1. Jos vastaanottaja ei hyväksy latentia → teksti
+    /// Algorithm:
+    /// 1. If the receiver doesn't accept latent -> text
     ///    ([`FallbackReason::ReceiverTextOnly`]).
-    /// 2. Jos viestissä ei ole piilotilaa → teksti
+    /// 2. If the message has no hidden state -> text
     ///    ([`FallbackReason::NoLatentAvailable`]).
-    /// 3. Jos lähettäjältä ei ole siltaa kohde-malliin → teksti
+    /// 3. If the sender has no bridge to the target model -> text
     ///    ([`FallbackReason::NoLink`]).
-    /// 4. Jos projektio epäonnistuu (malli-/dimensio-/NaN-virhe) → teksti
+    /// 4. If the projection fails (model/dimension/NaN error) -> text
     ///    ([`FallbackReason::ProjectionFailed`]).
-    /// 5. Muutoin latent: projisoi ja toimita.
+    /// 5. Otherwise latent: project and deliver.
     ///
-    /// Lopuksi tulos toimitetaan [`deliver`](LatentChannel::deliver)-metodilla.
+    /// The result is finally delivered via the
+    /// [`deliver`](LatentChannel::deliver) method.
     ///
     /// # Errors
-    /// Palauttaa virheen vain jos [`deliver`](LatentChannel::deliver)
-    /// epäonnistuu kuljetustasolla. Yhteensopimattomuus **ei** ole virhe —
-    /// se johtaa teksti-fallbackiin.
+    /// Returns an error only if [`deliver`](LatentChannel::deliver) fails at
+    /// the transport level. Incompatibility is **not** an error — it leads
+    /// to a text fallback.
     fn transmit(
         &mut self,
         message: &LatentMessage,
@@ -247,38 +253,39 @@ pub trait LatentChannel {
         Ok(result)
     }
 
-    /// Päättää siirtomuodon **suorittamatta** kuljetusta.
+    /// Decides the transmission mode **without** performing the transport.
     ///
-    /// Eriytetty [`transmit`](LatentChannel::transmit)-metodista jotta
-    /// fallback-logiikkaa voi testata ja tarkastella ilman sivuvaikutuksia.
-    /// Oletustoteutusta ei yleensä tarvitse korvata.
+    /// Separated from the [`transmit`](LatentChannel::transmit) method so
+    /// the fallback logic can be tested and inspected without side effects.
+    /// The default implementation usually doesn't need to be overridden.
     fn plan(&self, message: &LatentMessage, receiver: &ReceiverProfile) -> Transmission {
         let text = message.text.clone();
 
-        // 1. Vastaanottaja ei tue latenttia.
+        // 1. Receiver doesn't support latent.
         if !receiver.accepts_latent {
             return Transmission::text(FallbackReason::ReceiverTextOnly, text);
         }
 
-        // 2. Viestissä ei ole piilotilaa.
+        // 2. Message has no hidden state.
         let Some(latent) = &message.latent else {
             return Transmission::text(FallbackReason::NoLatentAvailable, text);
         };
 
-        // 3. Ei siltaa kohde-malliin.
+        // 3. No bridge to the target model.
         let Some(link) = self.link_to(&receiver.model_id) else {
             return Transmission::text(FallbackReason::NoLink, text);
         };
 
-        // Varmistetaan että silta osuu vastaanottajan odottamaan kokoon.
-        // Jos linkin kohde-dimensio ei vastaa vastaanottajaa, projektio
-        // antaisi väärän kokoisen vektorin → kohdellaan kuin ei siltaa.
+        // Make sure the bridge lands on the size the receiver expects.
+        // If the link's target dimension doesn't match the receiver, the
+        // projection would produce a wrongly sized vector -> treat as if
+        // there were no bridge.
         if link.target_dims() != receiver.dims {
             return Transmission::text(FallbackReason::NoLink, text);
         }
 
-        // 4. Projektio. Mikä tahansa virhe → teksti-fallback (ei koskaan
-        // propagoi virhettä ylös).
+        // 4. Projection. Any error -> text fallback (never propagate the
+        // error upward).
         match link.project(latent) {
             Ok(projected) => Transmission::latent(projected, text),
             Err(_) => Transmission::text(FallbackReason::ProjectionFailed, text),
@@ -286,24 +293,25 @@ pub trait LatentChannel {
     }
 }
 
-/// In-memory-testikanava: kerää toimitetut siirrot muistiin ja sallii
-/// siltojen rekisteröinnin kohde-malleille.
+/// An in-memory test channel: collects delivered transfers in memory and
+/// allows registering bridges for target models.
 ///
-/// Tämä on tarkoitettu testaukseen ja paikalliseen kehitykseen — se ei tee
-/// oikeaa verkkokuljetusta. Tuotantokanavat (bus, verkko) toteuttavat
-/// [`LatentChannel`]-traitin omalla [`deliver`](LatentChannel::deliver)-
-/// logiikallaan mutta perivät saman fallback-käyttäytymisen.
+/// This is intended for testing and local development — it does not perform
+/// real network transport. Production channels (bus, network) implement the
+/// [`LatentChannel`] trait with their own [`deliver`](LatentChannel::deliver)
+/// logic but inherit the same fallback behavior.
 #[derive(Debug, Default)]
 pub struct InMemoryLatentChannel {
     sender_model: String,
     links: Vec<RecursiveLink>,
     delivered: Vec<Transmission>,
-    /// Jos `true`, [`deliver`](LatentChannel::deliver) simuloi kuljetusvian.
+    /// If `true`, [`deliver`](LatentChannel::deliver) simulates a transport
+    /// failure.
     fail_delivery: bool,
 }
 
 impl InMemoryLatentChannel {
-    /// Luo kanavan annetulla lähettäjä-mallilla.
+    /// Creates a channel with the given sender model.
     #[must_use]
     pub fn new(sender_model: impl Into<String>) -> Self {
         Self {
@@ -314,21 +322,22 @@ impl InMemoryLatentChannel {
         }
     }
 
-    /// Rekisteröi sillan kohde-malliin. Palauttaa `self`in ketjutusta varten.
+    /// Registers a bridge to a target model. Returns `self` for chaining.
     #[must_use]
     pub fn with_link(mut self, link: RecursiveLink) -> Self {
         self.links.push(link);
         self
     }
 
-    /// Asettaa kanavan simuloimaan kuljetusvikaa toimituksessa (testit).
+    /// Configures the channel to simulate a transport failure on delivery
+    /// (for tests).
     #[must_use]
     pub fn failing_delivery(mut self) -> Self {
         self.fail_delivery = true;
         self
     }
 
-    /// Tähän mennessä toimitetut siirrot (testitarkistuksia varten).
+    /// The transfers delivered so far (for test assertions).
     #[must_use]
     pub fn delivered(&self) -> &[Transmission] {
         &self.delivered
@@ -386,14 +395,14 @@ mod tests {
         let projected = t.projected.expect("latent carries projection");
         assert_eq!(projected.vector.model_id, "agent_b/v1");
         assert_eq!(projected.vector.dims, vec![1.0, 2.0, 3.0]);
-        // Teksti on aina mukana turvaverkkona myös latent-tilassa.
+        // Text is always included as a safety net, even in latent mode.
         assert_eq!(t.text, "hello");
         assert_eq!(ch.delivered().len(), 1);
     }
 
     #[test]
     fn latent_bridges_differing_dimensions() {
-        // Dimensio-silta-testi: 2-ulotteinen lähde → 4-ulotteinen kohde.
+        // Dimension-bridge test: 2-dimensional source -> 4-dimensional target.
         let mut ch = channel_with_link("agent_b/v1", 2, 4);
         let msg = LatentMessage::with_latent(latent_vec(vec![9.0, 8.0]), "bridge");
         let rx = ReceiverProfile::latent("agent_b/v1", 4);
@@ -433,7 +442,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_text_when_no_link_to_target() {
-        // Kanavalla on silta agent_b:hen, mutta vastaanottaja on agent_c.
+        // The channel has a bridge to agent_b, but the receiver is agent_c.
         let mut ch = channel_with_link("agent_b/v1", 3, 3);
         let msg = LatentMessage::with_latent(latent_vec(vec![1.0, 2.0, 3.0]), "x");
         let rx = ReceiverProfile::latent("agent_c/v1", 3);
@@ -445,7 +454,7 @@ mod tests {
 
     #[test]
     fn falls_back_when_link_target_dims_mismatch_receiver() {
-        // Silta tuottaa 4-ulotteisen, mutta vastaanottaja odottaa 3:a.
+        // The bridge produces a 4-dimensional vector, but the receiver expects 3.
         let mut ch = channel_with_link("agent_b/v1", 2, 4);
         let msg = LatentMessage::with_latent(latent_vec(vec![1.0, 2.0]), "x");
         let rx = ReceiverProfile::latent("agent_b/v1", 3);
@@ -457,7 +466,7 @@ mod tests {
 
     #[test]
     fn falls_back_when_projection_fails_on_nan() {
-        // Silta on olemassa ja dimensiot täsmäävät, mutta vektori on epäterve.
+        // The bridge exists and dimensions match, but the vector is unsound.
         let mut ch = channel_with_link("agent_b/v1", 2, 2);
         let bad = LatentVector::new(vec![1.0, f32::NAN], "agent_a/v1");
         let msg = LatentMessage::with_latent(bad, "fallback me");
@@ -471,7 +480,7 @@ mod tests {
 
     #[test]
     fn falls_back_when_vector_model_does_not_match_link_source() {
-        // Sillan lähde on agent_a, mutta vektori väittää olevansa agent_z.
+        // The bridge's source is agent_a, but the vector claims to be agent_z.
         let mut ch = channel_with_link("agent_b/v1", 2, 2);
         let mismatched = LatentVector::new(vec![1.0, 2.0], "agent_z/v1");
         let msg = LatentMessage::with_latent(mismatched, "txt");
@@ -490,7 +499,7 @@ mod tests {
 
         let err = ch.transmit(&msg, &rx).expect_err("transport must fail");
         assert!(matches!(err, crate::FamilyClawError::Bus(_)));
-        // Mitään ei toimitettu.
+        // Nothing was delivered.
         assert_eq!(ch.delivered().len(), 0);
     }
 
@@ -502,7 +511,7 @@ mod tests {
 
         let planned = ch.plan(&msg, &rx);
         assert_eq!(planned.mode, TransmissionMode::Latent);
-        // plan() ei toimita mitään.
+        // plan() delivers nothing.
         assert_eq!(ch.delivered().len(), 0);
     }
 

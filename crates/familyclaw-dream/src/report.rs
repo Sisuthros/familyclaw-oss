@@ -1,34 +1,34 @@
-//! Unijakson tulosraportti: [`DreamReport`] ja [`Reflection`].
+//! The dream cycle's result report: [`DreamReport`] and [`Reflection`].
 //!
-//! Unijakso ([`crate::DreamCycle`]) tuottaa raportin joka kertoo *mitä yön
-//! aikana tapahtui*: kuinka monta muistoa yhdistettiin, pudotettiin tai
-//! arkistoitiin, ja minkä reflektiot konsolidaatio synnytti. Raportti on
-//! puhdasta dataa — se sarjallistuu lokeihin ja peilaa Amplifier-proteesin
-//! "freshness audit" -palautteen natiiviksi (design §2.3).
+//! A dream cycle ([`crate::DreamCycle`]) produces a report describing
+//! *what happened overnight*: how many memories were merged, dropped, or
+//! archived, and which reflections consolidation produced. The report is
+//! pure data — it serializes to logs and mirrors the Amplifier prosthesis's
+//! "freshness audit" feedback as a native feature (design §2.3).
 
 use serde::{Deserialize, Serialize};
 
 use familyclaw_core::{MessageId, Timestamp};
 
-/// Yksittäinen unireflektio — koneluettava merkintä siitä mitä jokin
-/// konsolidaatiovaihe teki yhdelle muistolle.
+/// A single dream reflection — a machine-readable record of what a
+/// consolidation phase did to one memory.
 ///
-/// Reflektiot eivät ole vapaata proosaa vaan jäsenneltyjä tapahtumia, jotta
-/// ne voidaan auditoida ja toistaa deterministisesti. `note`-kenttä on
-/// ihmisluettava tiivistys, mutta `kind` + `memory` ovat kone-luettava
-/// totuus.
+/// Reflections are not free-form prose but structured events, so they can
+/// be audited and replayed deterministically. The `note` field is a
+/// human-readable summary, but `kind` + `memory` are the machine-readable
+/// truth.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reflection {
-    /// Mihin konsolidaatiovaiheeseen reflektio liittyy.
+    /// Which consolidation phase this reflection relates to.
     pub kind: ReflectionKind,
-    /// Muisto jota reflektio koskee (kohde tai säilytetty edustaja).
+    /// The memory this reflection concerns (the target or the kept representative).
     pub memory: MessageId,
-    /// Ihmisluettava tiivistys (esim. `"merged 3 near-duplicates"`).
+    /// Human-readable summary (e.g. `"merged 3 near-duplicates"`).
     pub note: String,
 }
 
 impl Reflection {
-    /// Rakentaa reflektion annetulle vaiheelle, muistolle ja tiivistykselle.
+    /// Builds a reflection for the given phase, memory, and summary.
     #[must_use]
     pub fn new(kind: ReflectionKind, memory: MessageId, note: impl Into<String>) -> Self {
         Self {
@@ -39,28 +39,28 @@ impl Reflection {
     }
 }
 
-/// Mikä konsolidaatiovaihe reflektion synnytti.
+/// Which consolidation phase produced the reflection.
 ///
-/// `#[non_exhaustive]` jotta uusia vaiheita (esim. tulevan latent-pohjaisen
-/// klusteroinnin) voi lisätä rikkomatta lukijoita.
+/// `#[non_exhaustive]` so new phases (e.g. a future latent-based
+/// clustering phase) can be added without breaking readers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ReflectionKind {
-    /// Lähes-identtisiä muistoja yhdistettiin yhdeksi edustajaksi.
+    /// Near-identical memories were merged into one representative.
     Merged,
-    /// Vanhentunut/ristiriitainen muisto pudotettiin (tombstoned).
+    /// An outdated/contradicted memory was dropped (tombstoned).
     Dropped,
-    /// Suhteellinen päiväys ("eilen") muutettiin absoluuttiseksi.
+    /// A relative date ("yesterday") was converted to an absolute date.
     DateAbsolutized,
-    /// Tärkeä muisto vahvistettiin (säilyvyyttä kasvatettiin).
+    /// An important memory was strengthened (its persistence was increased).
     Strengthened,
-    /// Matala-retention muisto arkistoitiin.
+    /// A low-retention memory was archived.
     Archived,
 }
 
 impl ReflectionKind {
-    /// Vakaa, kone-luettava nimi (`snake_case`) — sama kuin serde-esitys.
+    /// Stable, machine-readable name (`snake_case`) — matches the serde representation.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -79,37 +79,37 @@ impl std::fmt::Display for ReflectionKind {
     }
 }
 
-/// Yhden unijakson koottu tulos.
+/// The rolled-up result of a single dream cycle.
 ///
-/// Laskurit kertovat *kuinka monta* muistoa kukin vaihe käsitteli;
-/// [`reflections`](DreamReport::reflections) sisältää tapahtumakohtaiset
-/// merkinnät. Raportti rakennetaan vaiheittain [`DreamReport::default`]:sta
-/// tai [`DreamReport::new`]:llä ja kerätään yhteen unijakson lopuksi.
+/// The counters report *how many* memories each phase processed;
+/// [`reflections`](DreamReport::reflections) holds the per-event records.
+/// The report is built phase-by-phase from [`DreamReport::default`] or
+/// [`DreamReport::new`] and assembled at the end of the dream cycle.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DreamReport {
-    /// Hetki jolloin unijakso ajettiin (UTC). `None` kunnes asetettu.
+    /// The instant the dream cycle ran (UTC). `None` until set.
     #[serde(default)]
     pub ran_at: Option<Timestamp>,
-    /// Yhdistettyjen (poistettujen) duplikaattien määrä — EI mukaan luettuna
-    /// säilytettyjä edustajia.
+    /// Number of merged (removed) duplicates — NOT including the retained
+    /// representatives.
     pub merged: usize,
-    /// Pudotettujen (tombstoned) vanhentuneiden/ristiriitaisten määrä.
+    /// Number of dropped (tombstoned) outdated/contradicted memories.
     pub dropped: usize,
-    /// Arkistoitujen matala-retention muistojen määrä.
+    /// Number of archived low-retention memories.
     pub archived: usize,
-    /// Vahvistettujen tärkeiden muistojen määrä.
+    /// Number of strengthened important memories.
     pub strengthened: usize,
-    /// Absolutisoitujen päiväysten määrä.
+    /// Number of absolutized dates.
     pub dates_absolutized: usize,
-    /// Läpikäytyjen muistojen kokonaismäärä unijakson alussa.
+    /// Total number of memories scanned at the start of the dream cycle.
     pub scanned: usize,
-    /// Tapahtumakohtaiset reflektiot, syntyjärjestyksessä.
+    /// Per-event reflections, in the order they occurred.
     #[serde(default)]
     pub reflections: Vec<Reflection>,
 }
 
 impl DreamReport {
-    /// Luo tyhjän raportin annetulla ajohetkellä.
+    /// Creates an empty report with the given run instant.
     #[must_use]
     pub fn new(ran_at: Timestamp) -> Self {
         Self {
@@ -118,10 +118,10 @@ impl DreamReport {
         }
     }
 
-    /// Lisää reflektion ja kasvattaa vastaavan laskurin.
+    /// Records a reflection and increments the matching counter.
     ///
-    /// Tämä on raportin ainoa mutaatioreitti, joten laskurit ja reflektiot
-    /// pysyvät aina synkassa (yksi reflektio ⇒ yksi laskurin nousu).
+    /// This is the report's only mutation path, so the counters and
+    /// reflections always stay in sync (one reflection ⇒ one counter increment).
     pub fn record(&mut self, reflection: Reflection) {
         match reflection.kind {
             ReflectionKind::Merged => self.merged += 1,
@@ -133,7 +133,7 @@ impl DreamReport {
         self.reflections.push(reflection);
     }
 
-    /// Tekikö unijakso mitään muutoksia.
+    /// Whether the dream cycle made any changes.
     #[must_use]
     pub fn made_changes(&self) -> bool {
         self.merged > 0
@@ -143,7 +143,7 @@ impl DreamReport {
             || self.dates_absolutized > 0
     }
 
-    /// Reflektioiden kokonaismäärä (sama kuin laskureiden summa).
+    /// Total number of reflections (same as the sum of the counters).
     #[must_use]
     pub fn total_actions(&self) -> usize {
         self.merged + self.dropped + self.archived + self.strengthened + self.dates_absolutized

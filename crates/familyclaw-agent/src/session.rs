@@ -1,83 +1,98 @@
-//! Sessio-isolaatio (F4) — per-viesti alkuperä ([`MessageOrigin`]) ja siitä
-//! johdettu [`MessageOrigin::session_key`].
+//! Session isolation (F4) — per-message origin ([`MessageOrigin`]) and the
+//! [`MessageOrigin::session_key`] derived from it.
 //!
-//! ## Miksi tämä moduuli on olemassa
-//! FamilyClaw-MVP ajaa **yhtä** agenttia, **yhtä** muistia ja **staattista**
-//! reply-kohdetta ([`Agent::with_reply_target`](crate::Agent::with_reply_target)).
-//! Tämä on oikein tasan silloin kun on yksi kanava ja yksi keskustelu. Heti kun
-//! kanavia tai keskusteluja on enemmän kuin yksi, kaikki keskustelut vuotavat
-//! samaan kontekstiin ja muistiin: agentti sekoittaa A:n ja B:n. Sessio-isolaatio
-//! erottaa keskustelut **session-avaimella**.
+//! ## Why this module exists
+//! `FamilyClaw` MVP runs **one** agent, **one** memory, and a **static**
+//! reply target ([`Agent::with_reply_target`](crate::Agent::with_reply_target)).
+//! This is correct exactly when there is one channel and one
+//! conversation. As soon as there is more than one channel or
+//! conversation, all conversations leak into the same context and
+//! memory: the agent mixes up A and B. Session isolation separates
+//! conversations by **session key**.
 //!
-//! ## Mikä on `session_key`
-//! `session_key = "<channel_id>:<conversation>"`. Tämä on luonteva avain:
-//! sama kanava + sama keskustelu = sama sessio; eri keskustelu = eri sessio.
-//! Lähettäjä ([`MessageOrigin::sender`]) kulkee mukana auditointia varten, mutta
-//! **ei** ole osa session-avainta (sama keskustelu voi olla monenkeskinen).
+//! ## What `session_key` is
+//! `session_key = "<channel_id>:<conversation>"`. This is a natural key:
+//! same channel + same conversation = same session; different
+//! conversation = different session. The sender
+//! ([`MessageOrigin::sender`]) travels along for auditing, but is **not**
+//! part of the session key (the same conversation can be multi-party).
 //!
-//! ## Suhde F2-origin-sopimukseen (RIIPPUVUUS)
-//! [`MessageOrigin`] on F4:n **rajapinta**, joka odottaa F2-origin-sopimusta
-//! (origin-kenttä bus-kirjekuoressa [`ResonanceMessage`](familyclaw_bus::ResonanceMessage)).
-//! Kanavakerros tuottaa jo täsmälleen tarvittavat kentät
-//! ([`InboundEnvelope`](familyclaw_channels::InboundEnvelope): `channel_id`,
-//! `conversation`, `sender`); [`MessageOrigin::from_inbound_envelope`] kuvaa ne
-//! suoraan. Kun F2 vie originin bus-kirjekuoreen ja
-//! [`Agent::handle_turn`](crate::Agent::handle_turn) saa sen per-viesti, tämä
-//! tyyppi on valmis kytkettäväksi ilman uutta suunnittelua.
+//! ## Relationship to the F2 origin contract (DEPENDENCY)
+//! [`MessageOrigin`] is F4's **interface**, which expects the F2 origin
+//! contract (the origin field on the bus envelope
+//! [`ResonanceMessage`](familyclaw_bus::ResonanceMessage)). The channel
+//! layer already produces exactly the fields needed
+//! ([`InboundEnvelope`](familyclaw_channels::InboundEnvelope):
+//! `channel_id`, `conversation`, `sender`);
+//! [`MessageOrigin::from_inbound_envelope`] maps them directly. Once F2
+//! carries the origin into the bus envelope and
+//! [`Agent::handle_turn`](crate::Agent::handle_turn) receives it
+//! per-message, this type is ready to be wired up without further design.
 //!
-//! ## Mitä F4 tekee kun origin on kytketty (dokumentoitu toteutusreitti)
-//! Yksi agentti, yksi muisti — **ei** per-sessio Agent-instansseja (ylirakennus).
-//! Isolaatio tehdään muisti-scopella session-avaimella:
-//! 1. **Kirjoitus:** [`Agent::handle_turn`](crate::Agent::handle_turn) liittää
-//!    muistoon tagin `session:<key>` (origin-Some-haara), [`session_tag`](MessageOrigin::session_tag).
-//! 2. **Luku:** [`Agent::think`](crate::Agent::think) suodattaa recallin samalla
-//!    `session:<key>`-tagilla → A:n muistot eivät vuoda B:n kontekstiin.
-//! 3. **Reply-kohde:** vastaus johdetaan originin keskustelusta, ei staattisesta
-//!    reply-kohteesta — origin ENSIN, fallback staattiseen
-//!    ([`MessageOrigin::reply_target`]).
+//! ## What F4 does once origin is wired up (documented implementation path)
+//! One agent, one memory — **not** per-session Agent instances
+//! (over-engineering). Isolation is done via a memory scope keyed by
+//! session:
+//! 1. **Write:** [`Agent::handle_turn`](crate::Agent::handle_turn)
+//!    attaches the tag `session:<key>` to the memory (the origin-Some
+//!    branch), [`session_tag`](MessageOrigin::session_tag).
+//! 2. **Read:** [`Agent::think`](crate::Agent::think) filters recall by
+//!    the same `session:<key>` tag → A's memories don't leak into B's
+//!    context.
+//! 3. **Reply target:** the reply is derived from the origin's
+//!    conversation, not the static reply target — origin FIRST, fallback
+//!    to static ([`MessageOrigin::reply_target`]).
 //!
-//! Vaihe 2 (recall-suodatus) odottaa muistikerroksen tag-filtteriä; siihen asti
-//! `session:<key>`-tag kirjoitetaan jo nyt (vaihe 1 + 3 ovat valmiita), ja luku
-//! suodattaa kun rajapinta on saatavilla. Ks. [`session_tag`](MessageOrigin::session_tag).
+//! Step 2 (recall filtering) awaits a tag filter in the memory layer;
+//! until then the `session:<key>` tag is already written now (steps 1 +
+//! 3 are done), and reads will filter once the interface is available.
+//! See [`session_tag`](MessageOrigin::session_tag).
 //!
-//! ## OSS-raja (KERROS A)
-//! Geneeristä alustakoodia: ei kovakoodattuja kanavanimiä, keskusteluja,
-//! avaimia eikä polkuja. Kaikki alkuperätieto tulee ajonaikaisesti viestistä.
+//! ## OSS boundary (Layer A)
+//! Generic platform code: no hard-coded channel names, conversations,
+//! keys, or paths. All origin information comes from the message at
+//! runtime.
 
 use serde::{Deserialize, Serialize};
 
-/// Tag-etuliite session-scopatuille muistoille. Muisto tagataan
-/// `"<SESSION_TAG_PREFIX><session_key>"`:llä kirjoitettaessa, ja recall
-/// suodatetaan samalla tagilla luettaessa — näin eri sessioiden muistot eivät
-/// vuoda toistensa kontekstiin.
+/// Tag prefix for session-scoped memories. A memory is tagged with
+/// `"<SESSION_TAG_PREFIX><session_key>"` on write, and recall is filtered
+/// by the same tag on read — this way, different sessions' memories
+/// don't leak into each other's context.
 pub const SESSION_TAG_PREFIX: &str = "session:";
 
-/// Yhden saapuvan viestin **alkuperä** (F2-origin-sopimuksen muoto): mistä
-/// kanavasta, mistä keskustelusta ja keneltä viesti tuli.
+/// A single incoming message's **origin** (the shape of the F2 origin
+/// contract): which channel, which conversation, and from whom the
+/// message came.
 ///
-/// Kaikki kentät ovat [`String`], joten tyyppi on suoraan serde-sarjallistuva
-/// (durable-replay + bus-kirjekuoren `origin`-kenttä, kun F2 vie sen sinne).
+/// All fields are [`String`], so the type is directly serde-serializable
+/// (durable replay + the bus envelope's `origin` field, once F2 carries
+/// it there).
 ///
-/// ## Kentät
-/// - `channel_id` — kanavainstanssin tunniste (esim. `"discord-main"`),
-///   vastaa [`InboundEnvelope::channel_id`](familyclaw_channels::InboundEnvelope).
-/// - `conversation` — keskustelun/ryhmän tunniste (vastausosoite),
-///   vastaa [`InboundEnvelope::conversation`](familyclaw_channels::InboundEnvelope).
-/// - `sender` — kanavakohtainen lähettäjän tunniste (auditointiin; **ei** osa
-///   session-avainta), vastaa
+/// ## Fields
+/// - `channel_id` — the channel instance's identifier (e.g.
+///   `"discord-main"`), corresponds to
+///   [`InboundEnvelope::channel_id`](familyclaw_channels::InboundEnvelope).
+/// - `conversation` — the conversation/group identifier (the reply
+///   address), corresponds to
+///   [`InboundEnvelope::conversation`](familyclaw_channels::InboundEnvelope).
+/// - `sender` — the channel-specific sender identifier (for auditing;
+///   **not** part of the session key), corresponds to
 ///   [`InboundEnvelope::sender`](familyclaw_channels::InboundEnvelope).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageOrigin {
-    /// Kanavainstanssin tunniste (session-avaimen ensimmäinen osa).
+    /// The channel instance's identifier (the first part of the session key).
     pub channel_id: String,
-    /// Keskustelun/ryhmän tunniste (session-avaimen toinen osa + reply-kohde).
+    /// The conversation/group identifier (the second part of the session
+    /// key + the reply target).
     pub conversation: String,
-    /// Kanavakohtainen lähettäjän tunniste (auditointi; ei session-avaimessa).
+    /// The channel-specific sender identifier (auditing; not in the
+    /// session key).
     pub sender: String,
 }
 
 impl MessageOrigin {
-    /// Rakentaa alkuperän paljaista osista.
+    /// Builds an origin from its bare parts.
     #[must_use]
     pub fn new(
         channel_id: impl Into<String>,
@@ -91,42 +106,48 @@ impl MessageOrigin {
         }
     }
 
-    /// Johtaa **session-avaimen** alkuperästä: `"<channel_id>:<conversation>"`.
+    /// Derives the **session key** from the origin: `"<channel_id>:<conversation>"`.
     ///
-    /// Tämä on F4:n ydin: kaksi viestiä kuuluvat samaan sessioon **joss** ne
-    /// tulivat samasta kanavasta ja samasta keskustelusta. Lähettäjä ei vaikuta
-    /// avaimeen (monenkeskinen keskustelu jakaa session).
+    /// This is F4's core: two messages belong to the same session **iff**
+    /// they came from the same channel and the same conversation. The
+    /// sender doesn't affect the key (a multi-party conversation shares
+    /// the session).
     #[must_use]
     pub fn session_key(&self) -> String {
         format!("{}:{}", self.channel_id, self.conversation)
     }
 
-    /// Johtaa **muisti-tagin** session-avaimesta: `"session:<channel_id>:<conversation>"`.
+    /// Derives the **memory tag** from the session key:
+    /// `"session:<channel_id>:<conversation>"`.
     ///
-    /// [`Agent::handle_turn`](crate::Agent::handle_turn) liittää tämän muistoon
-    /// kirjoitettaessa, ja [`Agent::think`](crate::Agent::think) suodattaa
-    /// recallin samalla tagilla — näin eri sessioiden muistot pysyvät erillään
-    /// vaikka agentti ja muisti ovat jaettuja (ei per-sessio-instansseja).
+    /// [`Agent::handle_turn`](crate::Agent::handle_turn) attaches this to
+    /// the memory on write, and [`Agent::think`](crate::Agent::think)
+    /// filters recall by the same tag — this way, different sessions'
+    /// memories stay separate even though the agent and memory are
+    /// shared (no per-session instances).
     #[must_use]
     pub fn session_tag(&self) -> String {
         format!("{SESSION_TAG_PREFIX}{}", self.session_key())
     }
 
-    /// Reply-kohde tälle alkuperälle: keskustelu, josta viesti tuli.
+    /// The reply target for this origin: the conversation the message
+    /// came from.
     ///
-    /// F4-reititys käyttää tätä per-viesti **ennen** staattista reply-kohdetta:
-    /// vastaus ohjautuu takaisin samaan keskusteluun, ei johonkin kiinteään
-    /// kohteeseen. Vastaa kanavakerroksen
+    /// F4 routing uses this per-message **before** the static reply
+    /// target: the reply routes back to the same conversation, not to
+    /// some fixed target. Corresponds to the channel layer's
     /// [`InboundEnvelope::reply`](familyclaw_channels::InboundEnvelope::reply)
-    /// -kohdetta (`conversation`).
+    /// target (`conversation`).
     #[must_use]
     pub fn reply_target(&self) -> &str {
         &self.conversation
     }
 
-    /// Kuvaa kanavakerroksen [`InboundEnvelope`](familyclaw_channels::InboundEnvelope):n
-    /// alkuperäksi. Tämä on **F2-kytkentäkohta**: kanava tuottaa jo täsmälleen
-    /// nämä kentät, joten origin saadaan per-viesti ilman uutta tietoa.
+    /// Maps the channel layer's
+    /// [`InboundEnvelope`](familyclaw_channels::InboundEnvelope) into an
+    /// origin. This is the **F2 wiring point**: the channel already
+    /// produces exactly these fields, so the origin is obtained
+    /// per-message without any new information.
     #[must_use]
     pub fn from_inbound_envelope(envelope: &familyclaw_channels::InboundEnvelope) -> Self {
         Self {
@@ -150,7 +171,7 @@ mod tests {
 
     #[test]
     fn sender_does_not_affect_session_key() {
-        // Sama kanava + keskustelu, eri lähettäjä → SAMA sessio (monenkeskinen).
+        // Same channel + conversation, different sender → SAME session (multi-party).
         let a = MessageOrigin::new("tg-1", "room-7", "alice");
         let b = MessageOrigin::new("tg-1", "room-7", "bob");
         assert_eq!(a.session_key(), b.session_key());
@@ -158,7 +179,7 @@ mod tests {
 
     #[test]
     fn different_conversation_is_different_session() {
-        // F4:n ydinväite: eri keskustelu = eri sessio (ei kontekstivuotoa).
+        // F4's core claim: different conversation = different session (no context leak).
         let a = MessageOrigin::new("discord-main", "channel-a", "u");
         let b = MessageOrigin::new("discord-main", "channel-b", "u");
         assert_ne!(a.session_key(), b.session_key());
@@ -176,7 +197,7 @@ mod tests {
         let origin = MessageOrigin::new("discord-main", "general", "u");
         assert_eq!(origin.session_tag(), "session:discord-main:general");
         assert!(origin.session_tag().starts_with(SESSION_TAG_PREFIX));
-        // Tag sisältää koko session-avaimen.
+        // The tag contains the whole session key.
         assert!(origin.session_tag().ends_with(&origin.session_key()));
     }
 
@@ -188,7 +209,7 @@ mod tests {
 
     #[test]
     fn from_inbound_envelope_maps_origin_fields() {
-        // F2-kytkentäkohta: kanavakirjekuori → MessageOrigin (per-viesti).
+        // F2 wiring point: channel envelope → MessageOrigin (per-message).
         let envelope = InboundMessage::new("user-42", "general", "hei")
             .expect("valid inbound")
             .into_envelope(ChannelKind::Discord, "discord-main");
@@ -196,16 +217,16 @@ mod tests {
         assert_eq!(origin.channel_id, "discord-main");
         assert_eq!(origin.conversation, "general");
         assert_eq!(origin.sender, "user-42");
-        // Session-avain johdettu suoraan kirjekuoresta.
+        // Session key derived directly from the envelope.
         assert_eq!(origin.session_key(), "discord-main:general");
-        // Reply-kohde = sama keskustelu kuin kirjekuoren reply().
+        // Reply target = same conversation as the envelope's reply().
         assert_eq!(origin.reply_target(), envelope.conversation);
     }
 
     #[test]
     fn message_origin_serde_roundtrip() {
-        // Serde-sarjallistuva: valmis bus-kirjekuoren origin-kenttään (F2) ja
-        // durable-replayhin.
+        // Serde-serializable: ready for the bus envelope's origin field
+        // (F2) and for durable replay.
         let origin = MessageOrigin::new("discord-main", "general", "user-42");
         let json = serde_json::to_string(&origin).expect("serialize");
         let back: MessageOrigin = serde_json::from_str(&json).expect("deserialize");

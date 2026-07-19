@@ -1,55 +1,57 @@
-//! Kasvusilmukan **ehdotuspino** (Phase 4.5, roadmap §6.5) — KERROS A, OSS.
+//! The growth loop's **proposal stack** (Phase 4.5, roadmap §6.5) — Layer A, OSS.
 //!
-//! Kasvusilmukan putki on `proof bundle → safe memory → pattern proposal →
-//! eval proposal → approval-gated skill/policy update`. Tämä crate toteuttaa
-//! sen **turvallisen ytimen**: [`Proposal`]-tietorakenteen ja
-//! [`ProposalStore`]:n joka **kirjaa** ehdotuksia ja merkitsee niiden tilan
-//! (hyväksytty/evätty) — **muttei KOSKAAN sovella niitä**.
+//! The growth loop's pipeline is `proof bundle → safe memory → pattern
+//! proposal → eval proposal → approval-gated skill/policy update`. This
+//! crate implements its **safe core**: the [`Proposal`] data structure and
+//! [`ProposalStore`], which **records** proposals and marks their status
+//! (approved/denied) — **but NEVER applies them**.
 //!
-//! ## Kovat invariantit (roadmap §6.5, ei-neuvoteltavat)
-//! - ❌ **Ei hiljaista itse-muokkausta.** Tämä crate ei sisällä `apply`-metodia
-//!   eikä mitään polkua joka muuttaisi taitoa, käytäntöä tai oikeutta. Ehdotus
-//!   on **inertti data**: se voi olla `Pending`/`Approved`/`Denied`, mutta sen
-//!   *soveltaminen* (jos ja kun se rakennetaan) on erillinen, ihmisen
-//!   hyväksyntäportin takana oleva askel toisessa PR:ssä — eikä se voi koskaan
-//!   nostaa oikeuksia hiljaa.
-//! - ❌ **Ei hiljaista oikeuksien laajennusta.** [`ProposalKind`] on
-//!   tarkoituksella **kuvaileva** (ihmisluettava ehdotus + eval-kriteeri), ei
-//!   suoritettava muutos. Mitä ehdotus *saa* lopulta muuttaa, on oma
-//!   suunnittelupäätöksensä (ihminen päättää) ja toteutetaan vasta hyväksyntä-
-//!   portin kanssa.
-//! - ✅ Jokainen ehdotus kantaa **todiste-lähteensä** ([`Proposal::proof_sources`])
-//!   ja **eval-kriteerinsä** ([`Proposal::eval`]) — ei muutosta ilman testiä
-//!   joka todistaa hyödyn (peilaa Phase-3 recall-benchmark-kuria).
-//! - ✅ **Hyväksyntä sitoutuu sisältöön, ei vain tunnisteeseen.** Päätös
-//!   ([`ProposalStore::approve`] / [`ProposalStore::deny`]) vaatii ehdotuksen
-//!   [sisältöhajautteen](Proposal::content_hash): jos pinossa oleva ehdotus on
-//!   ehtinyt muuttua sen jälkeen kun ihminen katselmoi sen (TOCTOU-drift),
-//!   päätös **epäonnistuu** ([`GrowthError::HashMismatch`]) — deny-by-default.
-//! - ✅ **Pysyvä päätösjälki.** Jokainen päätös tuottaa [`ApprovalRecord`]:n
-//!   joka jää pinoon kyseltäväksi ([`ProposalStore::approval_history`]) —
-//!   auditointiketju ei katoa status-lipun alle.
+//! ## Hard invariants (roadmap §6.5, non-negotiable)
+//! - ❌ **No silent self-modification.** This crate contains no `apply` method
+//!   and no path that would change a skill, policy, or permission. A
+//!   proposal is **inert data**: it can be `Pending`/`Approved`/`Denied`,
+//!   but its *application* (if and when that is built) is a separate step
+//!   behind a human approval gate in another PR — and it can never elevate
+//!   permissions silently.
+//! - ❌ **No silent permission expansion.** [`ProposalKind`] is deliberately
+//!   **descriptive** (a human-readable proposal + eval criterion), not an
+//!   executable change. What a proposal is *allowed* to eventually change
+//!   is its own design decision (a human decides) and is implemented only
+//!   alongside the approval gate.
+//! - ✅ Every proposal carries its **proof sources** ([`Proposal::proof_sources`])
+//!   and its **eval criterion** ([`Proposal::eval`]) — no change without a
+//!   test that proves the benefit (mirrors the Phase 3 recall-benchmark
+//!   discipline).
+//! - ✅ **Approval binds to content, not just an identifier.** A decision
+//!   ([`ProposalStore::approve`] / [`ProposalStore::deny`]) requires the
+//!   proposal's [content hash](Proposal::content_hash): if the proposal on
+//!   the stack has changed since a human reviewed it (TOCTOU drift), the
+//!   decision **fails** ([`GrowthError::HashMismatch`]) — deny-by-default.
+//! - ✅ **A permanent decision trail.** Every decision produces an
+//!   [`ApprovalRecord`] that stays on the stack, queryable
+//!   ([`ProposalStore::approval_history`]) — the audit trail doesn't
+//!   disappear under a status flag.
 //!
-//! ## Apply-polun esivaatimukset (tilannekuva)
+//! ## Prerequisites for an apply path (current snapshot)
 //!
-//! `apply()`-metodia **EI ole olemassa eikä saa vielä rakentaa**. Ennen kuin
-//! sellaista edes harkitaan (erillinen PR, ihmisen hyväksyntäportti), näiden
-//! esivaatimusten on oltava paikallaan:
+//! An `apply()` method **does not exist and must not yet be built**.
+//! Before that is even considered (a separate PR, a human approval gate),
+//! these prerequisites must be in place:
 //!
-//! - [x] **Sisältöhajautteeseen sidottu hyväksyntä** — TEHTY tässä cratessa:
-//!   päätös sitoutuu ehdotuksen tarkkaan sisältöön, ei vain tunnisteeseen.
-//! - [ ] TODO: **Polkujen kanonisointi + kieltolista** — mihin kohteisiin
-//!   sovellus saisi ylipäätään koskea, normalisoituna ja kiellot edellä.
-//! - [ ] TODO: **Pakollinen dry-run-diffi** — sovelluksen vaikutus on
-//!   näytettävä ihmiselle diffina ennen suoritusta, ei jälkikäteen.
-//! - [ ] TODO: **Palautussuunnitelma (revert plan)** — jokaisella
-//!   sovelluksella on oltava todistettu tie takaisin ennen ensimmäistäkään
-//!   suoritusta.
+//! - [x] **Approval bound to a content hash** — DONE in this crate: a
+//!   decision binds to the proposal's exact content, not just an identifier.
+//! - [ ] TODO: **Path canonicalization + denylist** — which targets an
+//!   application would even be allowed to touch, normalized, with denials
+//!   taking precedence.
+//! - [ ] TODO: **Mandatory dry-run diff** — an application's effect must
+//!   be shown to a human as a diff before execution, not after the fact.
+//! - [ ] TODO: **A revert plan** — every application must have a proven
+//!   path back before even its first execution.
 //!
-//! Tämän craten **turvallisuus on rakenteellista**: koska `apply`-polkua ei ole
-//! olemassa, hyväksymätön (tai hyväksyttykään) ehdotus ei voi muuttaa mitään
-//! tämän craten kautta. Yksikkötesti `store_has_no_apply_path_only_records...`
-//! dokumentoi tämän takuun.
+//! This crate's **safety is structural**: because no `apply` path exists,
+//! an unapproved (or even an approved) proposal cannot change anything
+//! through this crate. The unit test `store_has_no_apply_path_only_records...`
+//! documents this guarantee.
 
 use std::collections::HashMap;
 
@@ -64,24 +66,24 @@ pub use evidence::{
     evaluate_for_approval, EvidenceLedger, EvidenceVerdict, ImprovementMetric, ReplayEvidence,
 };
 
-/// Ehdotuksen yksilöivä tunniste.
+/// A proposal's unique identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ProposalId(Uuid);
 
 impl ProposalId {
-    /// Luo uuden satunnaisen tunnisteen.
+    /// Creates a new random identifier.
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
-    /// Rakentaa tunnisteen annetusta UUID:sta (vakaa, testeille).
+    /// Builds an identifier from a given UUID (stable, for tests).
     #[must_use]
     pub const fn from_uuid(uuid: Uuid) -> Self {
         Self(uuid)
     }
 
-    /// Taustalla oleva UUID.
+    /// The underlying UUID.
     #[must_use]
     pub const fn as_uuid(&self) -> Uuid {
         self.0
@@ -100,23 +102,23 @@ impl std::fmt::Display for ProposalId {
     }
 }
 
-/// Päättäjän identiteetti — **geneerinen rooli-id** (KERROS A, OSS).
+/// A decision-maker's identity — a **generic role id** (Layer A, OSS).
 ///
-/// Tämä on tarkoituksella pelkkä läpinäkyvä newtype: se kantaa roolin
-/// (esim. `"operator"`, `"reviewer-2"`), **ei koskaan** todellista
-/// henkilöllisyyttä. Todellisten identiteettien sidonta (jos sellaista
-/// tarvitaan) kuuluu yksityiseen kerrokseen, ei tähän OSS-crateen.
+/// This is deliberately just a transparent newtype: it carries a role
+/// (e.g. `"operator"`, `"reviewer-2"`), **never** a real identity. Binding
+/// to real identities (if that's ever needed) belongs to the private
+/// layer, not to this OSS crate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ApproverId(String);
 
 impl ApproverId {
-    /// Rakentaa päättäjä-tunnisteen geneerisestä rooli-id:stä.
+    /// Builds a decision-maker identifier from a generic role id.
     #[must_use]
     pub fn new(role: impl Into<String>) -> Self {
         Self(role.into())
     }
 
-    /// Rooli-id merkkijonona.
+    /// The role id as a string.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -129,138 +131,138 @@ impl std::fmt::Display for ApproverId {
     }
 }
 
-/// Ihmisen päätös ehdotuksesta. **Päätös ei sovella mitään** — se on
-/// kirjattu tahdonilmaus, jonka mahdollinen toimeenpano on erillinen,
-/// portin takana oleva askel (jota tämä crate ei tee).
+/// A human decision on a proposal. **The decision applies nothing** — it is
+/// a recorded declaration of intent, whose possible enactment is a separate
+/// step behind a gate (which this crate does not perform).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Decision {
-    /// Ehdotus hyväksyttiin (EI vielä sovellettu).
+    /// The proposal was approved (NOT yet applied).
     Approved,
-    /// Ehdotus evättiin.
+    /// The proposal was denied.
     Denied {
-        /// Ihmisluettava perustelu epäykselle (auditointijälkeä varten).
+        /// Human-readable justification for the denial (for the audit trail).
         reason: String,
     },
 }
 
-/// Pysyvä päätöskirjaus: kuka päätti, mistä tarkasta sisällöstä ja milloin.
+/// A permanent decision record: who decided, on exactly what content, and when.
 ///
-/// `content_hash` sitoo päätöksen ehdotuksen **tarkkaan sisältöön**
-/// päätöshetkellä ([`Proposal::content_hash`]) — jos ehdotus myöhemmin
-/// muuttuisi, kirjaus todistaa mihin versioon päätös kohdistui.
+/// `content_hash` binds the decision to the proposal's **exact content** at
+/// decision time ([`Proposal::content_hash`]) — if the proposal later
+/// changes, the record proves which version the decision applied to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRecord {
-    /// Päätöksen kohteena ollut ehdotus.
+    /// The proposal the decision was about.
     pub proposal_id: ProposalId,
-    /// Ehdotuksen sisältöhajaute päätöshetkellä (SHA-256).
+    /// The proposal's content hash at decision time (SHA-256).
     pub content_hash: [u8; 32],
-    /// Päättäjän geneerinen rooli-id.
+    /// The decision-maker's generic role id.
     pub approver: ApproverId,
-    /// Päätöshetki (injektoitu kello).
+    /// The decision time (injected clock).
     pub decided_at: Timestamp,
-    /// Tehty päätös.
+    /// The decision that was made.
     pub decision: Decision,
 }
 
-/// Kasvusilmukan virhetyypit. Epäonnistuminen on **äänekäs** (`Err`), ei
-/// hiljainen `false` — deny-by-default: epävarma päätös ei mene läpi.
+/// The growth loop's error types. Failure is **loud** (`Err`), not a
+/// silent `false` — deny-by-default: an uncertain decision does not go through.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GrowthError {
-    /// Ehdotuksen sisältö pinossa ei vastaa hajautetta jonka päättäjä
-    /// katselmoi → päätös evätään (TOCTOU-drift-suoja).
+    /// The proposal's content on the stack no longer matches the hash the
+    /// decision-maker reviewed → the decision is denied (TOCTOU drift protection).
     #[error(
         "content hash mismatch for proposal {id}: the stored proposal no longer matches what \
          was reviewed — decision refused (deny-by-default)"
     )]
     HashMismatch {
-        /// Ehdotus jonka sisältö ei täsmännyt.
+        /// The proposal whose content didn't match.
         id: ProposalId,
     },
-    /// Ehdotusta ei löytynyt pinosta.
+    /// The proposal was not found on the stack.
     #[error("proposal not found: {id}")]
     ProposalNotFound {
-        /// Tuntematon tunniste.
+        /// The unknown identifier.
         id: ProposalId,
     },
-    /// Ehdotus on jo päätetty — päätöstä ei voi tehdä (eikä ylikirjoittaa)
-    /// uudelleen tätä kautta.
+    /// The proposal has already been decided — a decision cannot be made
+    /// (or overwritten) again through this path.
     #[error("proposal {id} is already decided ({status:?}); decisions are not overwritable")]
     AlreadyDecided {
-        /// Jo päätetty ehdotus.
+        /// The already-decided proposal.
         id: ProposalId,
-        /// Ehdotuksen nykyinen (päätetty) tila.
+        /// The proposal's current (decided) status.
         status: ProposalStatus,
     },
 }
 
-/// Mitä ehdotus *koskee* — **kuvaileva**, ei suoritettava (kova invariantti:
-/// ei hiljaista muutosta). Jokainen variantti on ihmisluettava pyyntö, ei
-/// koneellinen mutaatio.
+/// What the proposal *is about* — **descriptive**, not executable (hard
+/// invariant: no silent change). Every variant is a human-readable request,
+/// not a machine mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProposalKind {
-    /// Havaittu toistuva kuvio joka ehdottaa uutta tai muokattua taitoa.
+    /// A recurring pattern observed that suggests a new or modified skill.
     SkillPattern {
-        /// Ihmisluettava kuvaus kuviosta (ei koodia, ei manifestidiffiä).
+        /// Human-readable description of the pattern (no code, no manifest diff).
         summary: String,
     },
-    /// Havaittu käytäntö joka esti turvallisen tapauksen toistuvasti.
+    /// An observed policy that repeatedly blocked a safe case.
     PolicyFriction {
-        /// Ihmisluettava kuvaus mitä estyi ja miksi se vaikuttaa väärältä.
+        /// Human-readable description of what was blocked and why it seems wrong.
         summary: String,
     },
 }
 
-/// Ehdotuksen elinkaaren tila. **Soveltaminen ei tapahdu tässä cratessa** —
-/// `Approved` tarkoittaa vain että ihminen on hyväksynyt; mahdollinen
-/// soveltaminen on erillinen, portin takana oleva askel.
+/// A proposal's lifecycle status. **Application does not happen in this
+/// crate** — `Approved` only means a human has approved it; any eventual
+/// application is a separate step behind a gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProposalStatus {
-    /// Odottaa ihmisen päätöstä (oletus uudelle ehdotukselle).
+    /// Awaiting a human decision (default for a new proposal).
     Pending,
-    /// Ihminen hyväksyi ehdotuksen (EI vielä sovellettu — soveltaminen on
-    /// erillinen askel jota tämä crate ei tee).
+    /// A human approved the proposal (NOT yet applied — application is a
+    /// separate step that this crate does not perform).
     Approved,
-    /// Ihminen hylkäsi ehdotuksen.
+    /// A human denied the proposal.
     Denied,
 }
 
-/// Eval-kriteeri: miten ehdotuksen hyöty *todistettaisiin* ennen soveltamista
-/// (peilaa Phase-3 recall-benchmark-kuria: ei muutosta ilman testiä).
-/// Kuvaileva — varsinaista evalia ei aja tämä crate.
+/// Eval criterion: how the proposal's benefit *would be proven* before
+/// application (mirrors the Phase 3 recall-benchmark discipline: no change
+/// without a test). Descriptive — this crate does not run the actual eval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvalCriteria {
-    /// Ihmisluettava kuvaus miten hyöty mitattaisiin (esim. "recall@5 paranee
-    /// fixturella X ilman regressiota Y:ssä").
+    /// Human-readable description of how the benefit would be measured (e.g.
+    /// "recall@5 improves on fixture X without regressing Y").
     pub description: String,
 }
 
-/// Yksittäinen kasvuehdotus — **inertti data**, ei suoritettava muutos.
+/// A single growth proposal — **inert data**, not an executable change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proposal {
-    /// Yksilöivä tunniste.
+    /// Unique identifier.
     pub id: ProposalId,
-    /// Mitä ehdotus koskee (kuvaileva).
+    /// What the proposal is about (descriptive).
     pub kind: ProposalKind,
-    /// Eval-kriteeri: miten hyöty todistettaisiin ennen soveltamista.
+    /// Eval criterion: how the benefit would be proven before application.
     pub eval: EvalCriteria,
-    /// Todiste-lähteet (proof-bundle-tunnisteet merkkijonoina) jotka
-    /// motivoivat ehdotuksen — ketju auditoitavaksi.
+    /// Proof sources (proof-bundle identifiers as strings) that motivate the
+    /// proposal — a chain for auditing.
     pub proof_sources: Vec<String>,
-    /// Elinkaaren tila.
+    /// Lifecycle status.
     pub status: ProposalStatus,
-    /// Luontihetki (injektoitu kello).
+    /// Creation time (injected clock).
     pub created_at: Timestamp,
 }
 
-/// Domain-separaatio + versiotagi sisältöhajautteelle. Versio nostetaan jos
-/// kanoninen muoto joskus muuttuu — vanhat hajautteet eivät silloin täsmää
-/// vahingossa (deny-by-default).
+/// Domain separation + version tag for the content hash. The version is
+/// bumped if the canonical form ever changes — old hashes then won't match
+/// by accident (deny-by-default).
 const CONTENT_HASH_DOMAIN: &[u8] = b"familyclaw-growth/proposal-content/v1\n";
 
-/// Kanoninen **sisältönäkymä** ehdotuksesta hajautusta varten: sama kuin
-/// [`Proposal`] mutta **ilman muuttuvaa `status`-kenttää**. Kenttäjärjestys on
-/// kiinteä (deklaraatiojärjestys), joten `serde_json`-sarjallistus on
-/// deterministinen samalle arvolle.
+/// The canonical **content view** of a proposal for hashing: the same as
+/// [`Proposal`] but **without the mutable `status` field**. Field order is
+/// fixed (declaration order), so `serde_json` serialization is
+/// deterministic for the same value.
 #[derive(Serialize)]
 struct ProposalContentView<'a> {
     id: &'a ProposalId,
@@ -271,7 +273,7 @@ struct ProposalContentView<'a> {
 }
 
 impl Proposal {
-    /// Rakentaa uuden `Pending`-ehdotuksen.
+    /// Builds a new `Pending` proposal.
     #[must_use]
     pub fn new(
         kind: ProposalKind,
@@ -289,14 +291,14 @@ impl Proposal {
         }
     }
 
-    /// Ehdotuksen **sisältöhajaute** (SHA-256): kanoninen sarjallistus
-    /// kaikista kentistä **paitsi muuttuvasta `status`-kentästä**.
+    /// The proposal's **content hash** (SHA-256): a canonical serialization
+    /// of all fields **except the mutable `status` field**.
     ///
-    /// Hyväksyntä sidotaan tähän hajautteeseen tunnisteen sijaan, jotta
-    /// `record → (ihminen katselmoi) → approve` -polussa ehdotuksen sisältö
-    /// ei voi vaihtua huomaamatta katselmoinnin ja päätöksen välissä
-    /// (TOCTOU). Status-kentän muuttaminen EI muuta hajautetta — päätös
-    /// koskee sisältöä, ei elinkaaritilaa.
+    /// Approval is bound to this hash rather than to the identifier, so
+    /// that in the `record → (human reviews) → approve` path, the
+    /// proposal's content cannot change unnoticed between review and
+    /// decision (TOCTOU). Changing the status field does NOT change the
+    /// hash — the decision concerns the content, not the lifecycle status.
     #[must_use]
     pub fn content_hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
@@ -311,13 +313,13 @@ impl Proposal {
         if let Ok(bytes) = serde_json::to_vec(&view) {
             hasher.update(&bytes);
         } else {
-            // Käytännössä saavuttamaton: näkymä on pelkkää dataa
-            // (merkkijonot, UUID, UTC-aikaleima) jonka JSON-sarjallistus
-            // ei epäonnistu. Jos näin silti kävisi, EI paniikkia eikä
-            // hiljaista nollahajautetta — syötetään merkkiliite jota
-            // onnistunut sarjallistus (alkaa aina `{`:lla) ei voi
-            // tuottaa, sidottuna tunnisteeseen. Tuloksena hajaute joka
-            // ei täsmää mihinkään katselmoituun sisältöön →
+            // Practically unreachable: the view is plain data (strings,
+            // UUID, UTC timestamp) whose JSON serialization does not fail.
+            // If it somehow did, do NOT panic and do NOT produce a silent
+            // zero hash — instead feed in a marker suffix that a
+            // successful serialization (which always starts with `{`)
+            // cannot produce, bound to the identifier. The result is a
+            // hash that does not match any reviewed content →
             // deny-by-default.
             hasher.update(b"!content-serialization-failure:");
             hasher.update(self.id.as_uuid().as_bytes());
@@ -326,18 +328,18 @@ impl Proposal {
     }
 }
 
-/// Kasvusilmukan ehdotuspino: **kirjaa** ehdotuksia, merkitsee niiden tilan ja
-/// säilyttää pysyvän päätösjäljen ([`ApprovalRecord`]).
+/// The growth loop's proposal stack: **records** proposals, marks their
+/// status, and keeps a permanent decision trail ([`ApprovalRecord`]).
 ///
-/// **Tarkoituksellinen rajaus (kova invariantti):** tällä tyypillä EI ole
-/// `apply`-metodia eikä mitään tapaa muuttaa taitoa/käytäntöä/oikeutta. Se on
-/// puhtaasti kirjaava + tila-merkkaava. Ehdotuksen soveltaminen (jos ja kun se
-/// rakennetaan) on erillinen, ihmisen hyväksyntäportin takana oleva askel.
+/// **Deliberate scope limit (hard invariant):** this type has NO `apply`
+/// method and no way to change a skill/policy/permission. It is purely
+/// record-keeping + status-marking. Applying a proposal (if and when that
+/// is built) is a separate step behind a human approval gate.
 ///
-/// Päätökset ([`approve`](Self::approve) / [`deny`](Self::deny)) vaativat
-/// katselmoidun sisällön hajautteen ja epäonnistuvat äänekkäästi
-/// ([`GrowthError`]) jos sisältö on driftannut, ehdotusta ei ole tai se on
-/// jo päätetty.
+/// Decisions ([`approve`](Self::approve) / [`deny`](Self::deny)) require
+/// the reviewed content's hash and fail loudly ([`GrowthError`]) if the
+/// content has drifted, the proposal doesn't exist, or it has already
+/// been decided.
 #[derive(Debug, Default)]
 pub struct ProposalStore {
     proposals: HashMap<ProposalId, Proposal>,
@@ -345,20 +347,21 @@ pub struct ProposalStore {
 }
 
 impl ProposalStore {
-    /// Luo tyhjän pinon.
+    /// Creates an empty stack.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Kirjaa ehdotuksen (tila aina `Pending` riippumatta annetusta). Palauttaa
-    /// tunnisteen. EI sovella mitään.
+    /// Records a proposal (status is always forced to `Pending` regardless
+    /// of what was given). Returns the identifier. Applies nothing.
     ///
-    /// Huom: jos samalla tunnisteella kirjataan uudelleen, aiempi sisältö
-    /// korvautuu ja tila palaa `Pending`iksi — mutta mikään aiemman sisällön
-    /// pohjalta katselmoitu hajaute ei enää täsmää uuteen sisältöön, joten
-    /// vanhentunut hyväksyntä-yritys kaatuu [`GrowthError::HashMismatch`]iin
-    /// (deny-by-default). Jo tehdyt [`ApprovalRecord`]-kirjaukset säilyvät.
+    /// Note: if a proposal is re-recorded under the same identifier, the
+    /// prior content is replaced and the status returns to `Pending` — but
+    /// any hash reviewed against the prior content will no longer match the
+    /// new content, so a stale approval attempt fails with
+    /// [`GrowthError::HashMismatch`] (deny-by-default). Previously recorded
+    /// [`ApprovalRecord`] entries are preserved.
     pub fn record(&mut self, mut proposal: Proposal) -> ProposalId {
         proposal.status = ProposalStatus::Pending;
         let id = proposal.id;
@@ -366,19 +369,19 @@ impl ProposalStore {
         id
     }
 
-    /// Hakee ehdotuksen tunnisteella.
+    /// Looks up a proposal by identifier.
     #[must_use]
     pub fn get(&self, id: ProposalId) -> Option<&Proposal> {
         self.proposals.get(&id)
     }
 
-    /// Kaikki ehdotukset (introspektio operaattoripinnalle).
+    /// All proposals (introspection for an operator surface).
     #[must_use]
     pub fn all(&self) -> Vec<&Proposal> {
         self.proposals.values().collect()
     }
 
-    /// Vain odottavat ehdotukset (ihmisen päätettäväksi).
+    /// Only the pending proposals (awaiting a human decision).
     #[must_use]
     pub fn pending(&self) -> Vec<&Proposal> {
         self.proposals
@@ -387,17 +390,18 @@ impl ProposalStore {
             .collect()
     }
 
-    /// Merkitsee ehdotuksen ihmisen hyväksymäksi ja kirjaa pysyvän
-    /// [`ApprovalRecord`]:n.
+    /// Marks a proposal as approved by a human and records a permanent
+    /// [`ApprovalRecord`].
     ///
-    /// `expected_hash` on hajaute jonka päättäjä laski **katselmoimastaan**
-    /// sisällöstä ([`Proposal::content_hash`]). Jos pinossa olevan ehdotuksen
-    /// nykyinen sisältöhajaute ei täsmää, päätös **epäonnistuu**
-    /// ([`GrowthError::HashMismatch`]) — hyväksyntä sitoutuu tarkkaan
-    /// sisältöön, ei tunnisteeseen (TOCTOU-suoja, deny-by-default).
+    /// `expected_hash` is the hash the decision-maker computed over the
+    /// content they **reviewed** ([`Proposal::content_hash`]). If the
+    /// proposal's current content hash on the stack doesn't match, the
+    /// decision **fails** ([`GrowthError::HashMismatch`]) — approval binds
+    /// to the exact content, not the identifier (TOCTOU protection,
+    /// deny-by-default).
     ///
-    /// **Tämä EI sovella ehdotusta** — se vain kirjaa ihmisen päätöksen. Mikään
-    /// taito/käytäntö/oikeus ei muutu tämän kutsun seurauksena.
+    /// **This does NOT apply the proposal** — it only records the human's
+    /// decision. No skill/policy/permission changes as a result of this call.
     pub fn approve(
         &mut self,
         id: ProposalId,
@@ -408,12 +412,12 @@ impl ProposalStore {
         self.decide(id, expected_hash, approver, now, Decision::Approved)
     }
 
-    /// Merkitsee ehdotuksen ihmisen hylkäämäksi ja kirjaa pysyvän
-    /// [`ApprovalRecord`]:n perusteluineen.
+    /// Marks a proposal as denied by a human and records a permanent
+    /// [`ApprovalRecord`] with its justification.
     ///
-    /// Sama sisältöhajaute-portti kuin [`approve`](Self::approve): myös epäys
-    /// sitoutuu tarkkaan katselmoituun sisältöön, jotta auditointijälki
-    /// todistaa mistä versiosta päätös tehtiin.
+    /// Same content-hash gate as [`approve`](Self::approve): a denial also
+    /// binds to the exact reviewed content, so the audit trail proves which
+    /// version the decision was made against.
     pub fn deny(
         &mut self,
         id: ProposalId,
@@ -433,7 +437,7 @@ impl ProposalStore {
         )
     }
 
-    /// Päätöshistoria annetulle ehdotukselle (kirjausjärjestyksessä).
+    /// Decision history for a given proposal (in recording order).
     #[must_use]
     pub fn approval_history(&self, id: ProposalId) -> Vec<&ApprovalRecord> {
         self.approvals
@@ -442,15 +446,15 @@ impl ProposalStore {
             .collect()
     }
 
-    /// Koko päätösjälki (kirjausjärjestyksessä, kaikki ehdotukset).
+    /// The entire decision trail (in recording order, all proposals).
     #[must_use]
     pub fn approvals(&self) -> &[ApprovalRecord] {
         &self.approvals
     }
 
-    /// Yhteinen päätöspolku: löytyminen → ei jo päätetty → sisältöhajaute
-    /// täsmää → status-merkintä + pysyvä kirjaus. Epäonnistuminen missä
-    /// tahansa portissa on `Err` eikä muuta mitään.
+    /// The shared decision path: found → not already decided → content hash
+    /// matches → status marked + permanent record. Failure at any gate is
+    /// an `Err` and changes nothing.
     fn decide(
         &mut self,
         id: ProposalId,
@@ -488,13 +492,13 @@ impl ProposalStore {
         Ok(record)
     }
 
-    /// Ehdotusten lukumäärä.
+    /// The number of proposals.
     #[must_use]
     pub fn len(&self) -> usize {
         self.proposals.len()
     }
 
-    /// Onko pino tyhjä.
+    /// Whether the stack is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.proposals.is_empty()
@@ -536,7 +540,7 @@ mod tests {
     fn record_forces_pending_and_returns_id() {
         let mut store = ProposalStore::new();
         let mut p = sample();
-        p.status = ProposalStatus::Approved; // yritä huijata sisään hyväksyttynä
+        p.status = ProposalStatus::Approved; // try to sneak it in as already approved
         let id = store.record(p);
         assert_eq!(
             store.get(id).expect("present").status,
@@ -620,7 +624,7 @@ mod tests {
             .expect_err("drifted content must not be approvable");
         assert_eq!(err, GrowthError::HashMismatch { id });
 
-        // Deny-by-default: mikään ei muuttunut, mitään ei kirjattu.
+        // Deny-by-default: nothing changed, nothing was recorded.
         assert_eq!(
             store.get(id).expect("present").status,
             ProposalStatus::Pending
@@ -689,9 +693,9 @@ mod tests {
         );
     }
 
-    /// TOCTOU-skenaario: ehdotus katselmoidaan, sen jälkeen sama tunniste
-    /// ylikirjoitetaan eri sisällöllä — vanhentuneen katselmoinnin hajaute
-    /// EI saa hyväksyä uutta sisältöä.
+    /// TOCTOU scenario: a proposal is reviewed, then the same identifier is
+    /// re-recorded with different content — the stale reviewed hash must
+    /// NOT be able to approve the new content.
     #[test]
     fn rerecord_with_same_id_invalidates_stale_reviewed_hash() {
         let mut store = ProposalStore::new();
@@ -699,7 +703,7 @@ mod tests {
         let id = store.record(original.clone());
         let reviewed_hash = store.get(id).expect("present").content_hash();
 
-        // Sisältö vaihtuu katselmoinnin ja päätöksen välissä (sama id).
+        // Content changes between review and decision (same id).
         let mut swapped = sample();
         swapped.id = id;
         swapped.kind = ProposalKind::PolicyFriction {
@@ -731,25 +735,25 @@ mod tests {
         assert_eq!(store.all().len(), 2);
     }
 
-    /// KOVA INVARIANTTI: pinolla EI OLE apply-polkua. Tämä testi dokumentoi
-    /// rakenteellisen takuun — proposalin elinkaari on data-only, ja ainoat
-    /// mutaatiot ovat status-merkinnät + pysyvät päätöskirjaukset. Mikään
-    /// julkinen metodi ei muuta taitoa, käytäntöä tai oikeutta. (Jos joku
-    /// lisää `apply`-metodin, tämä kommentti + PR-katselmointi on portti.)
+    /// HARD INVARIANT: the stack has NO apply path. This test documents the
+    /// structural guarantee — a proposal's lifecycle is data-only, and the
+    /// only mutations are status marks + permanent decision records. No
+    /// public method changes a skill, policy, or permission. (If someone
+    /// adds an `apply` method, this comment + PR review is the gate.)
     #[test]
     fn store_has_no_apply_path_only_records_and_marks_status() {
         let mut store = ProposalStore::new();
         let id = store.record(sample());
         let hash = store.get(id).expect("present").content_hash();
-        // Ainoat tila-mutaatiot: approve/deny. Hyväksyntä EI sovella → status
-        // on Approved mutta mitään ulkoista ei muutu (tämä crate ei kosketa
-        // mitään taito-/käytäntö-/oikeuspintaa).
+        // The only status mutations: approve/deny. Approval does NOT apply
+        // → status becomes Approved but nothing external changes (this
+        // crate touches no skill/policy/permission surface).
         store
             .approve(id, hash, operator(), at(2000))
             .expect("approve succeeds");
         let p = store.get(id).expect("present");
         assert_eq!(p.status, ProposalStatus::Approved);
-        // proof_sources + eval säilyvät muuttumattomina (auditoitavuus).
+        // proof_sources + eval remain unchanged (auditability).
         assert_eq!(p.proof_sources, vec!["proof-1", "proof-2"]);
         assert!(!p.eval.description.is_empty());
     }

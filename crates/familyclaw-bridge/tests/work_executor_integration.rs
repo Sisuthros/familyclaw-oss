@@ -1,17 +1,18 @@
-//! Integraatiotesti: [`WorkExecutor`]-sauma komponoituu [`TaskBoard`]in kanssa.
+//! Integration test: the [`WorkExecutor`] seam composes with [`TaskBoard`].
 //!
-//! Todistaa Homepage Factoryn KERROS A -sauman: tehtävän suoritus on irrotettu
-//! taulusta. Driver ajaa tehtävän suorittajan läpi ja omistaa tilasiirtymät;
-//! suorittaja ei mutatoi taulua. Kun live-suorittaja (KERROS B) myöhemmin
-//! pudotetaan `DefaultSimulatingExecutor`:n tilalle, tämä virtaus pysyy samana.
+//! Proves the Homepage Factory's Layer A seam: task execution is decoupled
+//! from the board. The driver runs the task through the executor and owns
+//! the state transitions; the executor does not mutate the board. When the
+//! live executor (Layer B) is later dropped in place of
+//! `DefaultSimulatingExecutor`, this flow stays the same.
 
 use familyclaw_bridge::{
     DefaultSimulatingExecutor, Task, TaskBoard, TaskStatus, WorkExecutor, WorkOutcome,
 };
 
-/// Testin sisäinen suorittaja, joka aina epäonnistuu — todistaa driverin
-/// uudelleenyritys-haaran (`succeeded = false` jättää tehtävän Active-tilaan).
-/// KERROS A ei toimita tällaista; tämä elää vain testin invariantin osoittamiseksi.
+/// A test-internal executor that always fails — proves the driver's
+/// retry branch (`succeeded = false` leaves the task in the Active state).
+/// Layer A does not ship anything like this; it exists only to demonstrate the test's invariant.
 struct AlwaysFailingExecutor;
 
 #[async_trait::async_trait]
@@ -21,14 +22,14 @@ impl WorkExecutor for AlwaysFailingExecutor {
     }
 }
 
-/// Pieni driver: ajaa Active-tehtävän suorittajan läpi ja siirtää tilan
-/// lopputuloksen mukaan. Sauman kutsujapuoli — *suorittaja ei tee tätä*.
+/// A small driver: runs an Active task through the executor and transitions
+/// its status based on the outcome. This is the seam's caller side — *the executor does not do this*.
 async fn run_one(board: &TaskBoard, exec: &dyn WorkExecutor, task: &Task) -> WorkOutcome {
     let outcome = exec.execute(task).await.expect("execute task");
     let next = if outcome.succeeded {
         TaskStatus::Done
     } else {
-        // Epäonnistuminen jättää tehtävän Active-tilaan uudelleenyritystä varten.
+        // A failure leaves the task in the Active state for a retry.
         TaskStatus::Active
     };
     if next != task.status {
@@ -45,7 +46,7 @@ async fn simulating_executor_drives_task_to_done() {
     let board = TaskBoard::new();
     let exec = DefaultSimulatingExecutor::new();
 
-    // 1. Luo tehtävä ja ota työn alle.
+    // 1. Create the task and pick it up.
     let task = board.create("build homepage", None).await.expect("create");
     assert_eq!(task.status, TaskStatus::Pending);
     let active = board
@@ -54,10 +55,10 @@ async fn simulating_executor_drives_task_to_done() {
         .expect("activate");
     assert_eq!(active.status, TaskStatus::Active);
 
-    // 2-3. Suorita sauman läpi; driver siirtää onnistuessa Done:ksi.
+    // 2-3. Execute through the seam; on success, the driver transitions to Done.
     let outcome = run_one(&board, &exec, &active).await;
 
-    // 4. Lopputulos kaikuttaa tehtävän, ja taulu päätyy Done-tilaan.
+    // 4. The outcome echoes the task, and the board ends up in the Done state.
     assert!(outcome.succeeded);
     assert_eq!(outcome.task_id, active.id);
     assert_eq!(outcome.output, "simulated: build homepage");
@@ -69,7 +70,7 @@ async fn simulating_executor_drives_task_to_done() {
 #[tokio::test]
 async fn executor_does_not_mutate_the_board_itself() {
     // Sauman invariantti: suorittaja ei kosketa taulua. Ajetaan execute ilman
-    // driveriä — taulun tilan on pysyttävä Active:na.
+    // driver — the board's status must remain Active.
     let board = TaskBoard::new();
     let exec = DefaultSimulatingExecutor::new();
 
@@ -92,9 +93,9 @@ async fn executor_does_not_mutate_the_board_itself() {
 #[tokio::test]
 async fn failing_executor_keeps_task_active_for_retry() {
     // Driverin uudelleenyritys-haara: kun suorittaja palauttaa
-    // `succeeded = false`, driver EI siirrä tehtävää Done:ksi vaan jättää sen
-    // Active-tilaan. Todistaa että lopputulos — ei suorittajan sivuvaikutus —
-    // ohjaa tilasiirtymän.
+    // `succeeded = false`, the driver does NOT transition the task to Done
+    // but leaves it in the Active state. Proves that the outcome — not a
+    // side effect from the executor — drives the state transition.
     let board = TaskBoard::new();
     let exec = AlwaysFailingExecutor;
 
@@ -118,8 +119,8 @@ async fn failing_executor_keeps_task_active_for_retry() {
 
 #[tokio::test]
 async fn seam_accepts_swapped_executor_via_trait_object() {
-    // Kerros B:n pudotettavuus: driver toimii minkä tahansa `dyn WorkExecutor`:n
-    // kanssa. Tässä käytämme oletustuplaa, mutta tyyppi on `Box<dyn …>`.
+    // Layer B's drop-in replaceability: the driver works with any
+    // `dyn WorkExecutor`. Here we use the default double, but the type is `Box<dyn ...>`.
     let board = TaskBoard::new();
     let exec: Box<dyn WorkExecutor> = Box::new(DefaultSimulatingExecutor::new());
 

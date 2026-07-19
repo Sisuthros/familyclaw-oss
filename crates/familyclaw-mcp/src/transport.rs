@@ -1,4 +1,4 @@
-//! JSON-RPC-kuljetukset: stdio ja HTTP (KERROS A).
+//! JSON-RPC transports: stdio and HTTP (Layer A).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,30 +12,31 @@ use crate::env::McpTransportConfig;
 use crate::error::{McpError, Result};
 use crate::redact::redact_command_line;
 
-/// Jaettu JSON-RPC-id-laskuri.
+/// Shared JSON-RPC id counter.
 type RpcId = Arc<AtomicU64>;
 
 fn next_id(counter: &RpcId) -> u64 {
     counter.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-/// Aktiivinen kuljetus stdio- tai HTTP-yhteydelle.
+/// An active transport for a stdio or HTTP connection.
 pub enum Transport {
-    /// Prosessin stdin/stdout JSON-RPC -rivit.
+    /// JSON-RPC lines over a child process's stdin/stdout.
     ///
-    /// Boksattu: `StdioTransport` on huomattavasti suurempi kuin
-    /// `HttpTransport` (lapsiprosessi + mutexit), joten indirektio pitää
-    /// enumin varianttikoot tasapainossa.
+    /// Boxed: `StdioTransport` is considerably larger than `HttpTransport`
+    /// (child process + mutexes), so the indirection keeps the enum's
+    /// variant sizes balanced.
     Stdio(Box<StdioTransport>),
-    /// HTTP POST `/mcp`-päätepisteeseen.
+    /// HTTP POST to the `/mcp` endpoint.
     Http(HttpTransport),
 }
 
 impl Transport {
-    /// Avaa kuljetus konfiguraatiosta.
+    /// Opens a transport from configuration.
     ///
     /// # Errors
-    /// Prosessin käynnistys, HTTP-clientin luonti tai MCP-kättely epäonnistuu.
+    /// Returns an error if spawning the process, creating the HTTP client,
+    /// or the MCP handshake fails.
     pub fn connect(config: &McpTransportConfig, server_name: &str) -> Result<Self> {
         match config {
             McpTransportConfig::Stdio { command, args } => {
@@ -49,7 +50,7 @@ impl Transport {
         }
     }
 
-    /// Suorittaa JSON-RPC-pyynnön ja palauttaa `result`-kentän.
+    /// Performs a JSON-RPC request and returns the `result` field.
     pub async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         match self {
             Self::Stdio(t) => t.request(method, params).await,
@@ -57,7 +58,7 @@ impl Transport {
         }
     }
 
-    /// MCP `initialize` + `notifications/initialized` -kättely.
+    /// MCP `initialize` + `notifications/initialized` handshake.
     pub async fn handshake(&mut self) -> Result<()> {
         let params = json!({
             "protocolVersion": "2024-11-05",
@@ -79,7 +80,7 @@ impl Transport {
     }
 }
 
-/// Stdio JSON-RPC -kuljetus (lapsiprosessi).
+/// Stdio JSON-RPC transport (child process).
 pub struct StdioTransport {
     _child: Child,
     stdin: Mutex<ChildStdin>,
@@ -185,7 +186,7 @@ impl StdioTransport {
                 .map_err(|e| McpError::TransportRecv(format!("invalid json: {e}")))?;
 
             if response.get("method").is_some() && response.get("id").is_none() {
-                // Palvelimen notifikaatio — ohita ja odota vastausta.
+                // Server notification — ignore it and keep waiting for the response.
                 continue;
             }
 
@@ -209,7 +210,7 @@ impl StdioTransport {
     }
 }
 
-/// HTTP JSON-RPC -kuljetus (POST `/mcp`).
+/// HTTP JSON-RPC transport (POST `/mcp`).
 pub struct HttpTransport {
     client: reqwest::Client,
     url: String,

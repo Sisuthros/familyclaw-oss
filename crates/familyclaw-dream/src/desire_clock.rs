@@ -1,15 +1,15 @@
-//! Desire Clock — yöllinen uniajastin (Anthropic §2.3.1).
+//! Desire Clock — nightly dream scheduler (Anthropic §2.3.1).
 //!
-//! Tämä moduuli tarjoaa [`DesireClock`]in, joka määrittää kellonajat jolloin
-//! [`crate::DreamCycle`] tulisi ajaa. Se noudattaa Anthropicin
-//! Dreaming-mallin (design §2.3.1) mukaista käytäntöä:
+//! This module provides [`DesireClock`], which determines the times at
+//! which [`crate::DreamCycle`] should run. It follows the policy from
+//! Anthropic's Dreaming model (design §2.3.1):
 //!
-//! - **3AM-local reflection** — unijakso käynnistyy aina klo 03:00 paikka-aikavyöhykkeellä
-//! - **Nightly cadence** — yksi unijakso yössä, ei päivällä
-//! - **Missed runs** — jos unijakso jää väliin (esim. kone ei päällä), se
-//!   ajetaan seuraavana mahdollisena hetkenä
+//! - **3AM-local reflection** — the dream cycle always starts at 03:00 local time
+//! - **Nightly cadence** — one dream cycle per night, never during the day
+//! - **Missed runs** — if a dream cycle is missed (e.g. the machine was
+//!   off), it runs at the next possible opportunity
 //!
-//! # Esimerkki
+//! # Example
 //! ```rust
 //! use familyclaw_dream::desire_clock::{DesireClock, NextDream};
 //! use chrono::{DateTime, Utc, TimeZone};
@@ -18,40 +18,40 @@
 //! let now = Utc.with_ymd_and_hms(2026, 6, 4, 16, 30, 0).unwrap();
 //! let next = clock.next_dream_time(now);
 //! match next {
-//!     NextDream::Tonight { at } => println!("Seuraava uni: {}", at),
-//!     NextDream::Tomorrow { at } => println!("Uni huomenna: {}", at),
-//!     NextDream::Missed { should_have_run_at } => println!("Unijakso jäänyt väliin: {}", should_have_run_at),
+//!     NextDream::Tonight { at } => println!("Next dream: {}", at),
+//!     NextDream::Tomorrow { at } => println!("Dream tomorrow: {}", at),
+//!     NextDream::Missed { should_have_run_at } => println!("Dream cycle missed: {}", should_have_run_at),
 //! }
 //! ```
 
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use familyclaw_core::Timestamp;
 
-/// Desire Clock — Anthropicin yöllisen unimallin ajastin.
+/// Desire Clock — Anthropic's nightly dream model scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DesireClock {
-    /// Uniajan kellonaika paikallisella aikavyöhykkeellä (esim. 03:00).
+    /// Reflection time-of-day in local time zone (e.g. 03:00).
     reflection_hour: u32,
-    /// Minuutti jolloin unijakso käynnistyy (esim. 00).
+    /// Minute at which the dream cycle starts (e.g. 00).
     reflection_minute: u32,
 }
 
-/// Seuraavan unijakson ajankohta.
+/// The time of the next dream cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NextDream {
-    /// Unijakso käynnistyy tänään yöllä.
+    /// The dream cycle starts tonight.
     Tonight {
-        /// Ajankohta jolloin tämänyöinen unijakso käynnistyy.
+        /// The instant at which tonight's dream cycle starts.
         at: Timestamp,
     },
-    /// Unijakso käynnistyy huomenna yöllä.
+    /// The dream cycle starts tomorrow night.
     Tomorrow {
-        /// Ajankohta jolloin huomisyöinen unijakso käynnistyy.
+        /// The instant at which tomorrow night's dream cycle starts.
         at: Timestamp,
     },
-    /// Edellinen unijakso jäi ajamatta (kone ei päällä).
+    /// The previous dream cycle was missed (machine was off).
     Missed {
-        /// Ajankohta jolloin unijakson olisi pitänyt käynnistyä.
+        /// The instant at which the dream cycle should have started.
         should_have_run_at: Timestamp,
     },
 }
@@ -60,13 +60,13 @@ impl Default for DesireClock {
     fn default() -> Self {
         Self {
             reflection_hour: 3,   // 03:00
-            reflection_minute: 0, // 00 minuuttia
+            reflection_minute: 0, // 00 minutes
         }
     }
 }
 
 impl DesireClock {
-    /// Luo Desire Clockin annetulla kellonajalla.
+    /// Creates a Desire Clock with the given time-of-day.
     #[must_use]
     pub fn new(reflection_hour: u32, reflection_minute: u32) -> Self {
         Self {
@@ -75,11 +75,11 @@ impl DesireClock {
         }
     }
 
-    /// Laske seuraavan unijakson ajankohta nyt hetkeen nähden.
+    /// Computes the time of the next dream cycle relative to `now`.
     ///
-    /// Palauttaa:
-    /// - [`NextDream::Tonight`] jos tämä yö ei ole vielä mennyt
-    /// - [`NextDream::Tomorrow`] jos tämä yö on jo mennyt
+    /// Returns:
+    /// - [`NextDream::Tonight`] if tonight's reflection time has not yet passed
+    /// - [`NextDream::Tomorrow`] if tonight's reflection time has already passed
     #[must_use]
     pub fn next_dream_time(&self, now: Timestamp) -> NextDream {
         let utc: DateTime<Utc> = now;
@@ -95,12 +95,12 @@ impl DesireClock {
             .unwrap();
 
         if utc < today_reflection {
-            // Tänään yö ei ole vielä mennyt → unijakso tänä yönä
+            // Tonight's reflection time has not yet passed → dream cycle tonight
             NextDream::Tonight {
                 at: today_reflection,
             }
         } else {
-            // Tämä yö on mennyt → unijakso huomenna
+            // Tonight's reflection time has passed → dream cycle tomorrow
             let tomorrow_reflection = today_reflection + chrono::Duration::days(1);
             NextDream::Tomorrow {
                 at: tomorrow_reflection,
@@ -108,11 +108,11 @@ impl DesireClock {
         }
     }
 
-    /// Laske viimeisin unijakson ajankohta nyt hetkeen nähden.
+    /// Computes the most recent dream cycle time relative to `now`.
     ///
-    /// Palauttaa:
-    /// - [`NextDream::Missed`] jos tämä yö ei ole vielä mennyt (kone ei päällä eilen)
-    /// - [`NextDream::Tonight`] jos tämä yö on mennyt (kone oli päällä tänään)
+    /// Returns:
+    /// - [`NextDream::Missed`] if tonight's reflection time has not yet passed (machine was off last night)
+    /// - [`NextDream::Tonight`] if tonight's reflection time has passed (machine was on today)
     #[must_use]
     pub fn last_dream_time(&self, now: Timestamp) -> NextDream {
         let utc: DateTime<Utc> = now;
@@ -128,13 +128,13 @@ impl DesireClock {
             .unwrap();
 
         if utc < today_reflection {
-            // Tänään yö ei ole vielä mennyt → viimeisin unijakso oli eilen
+            // Tonight's reflection time has not yet passed → the most recent dream cycle was last night
             let yesterday_reflection = today_reflection - chrono::Duration::days(1);
             NextDream::Missed {
                 should_have_run_at: yesterday_reflection,
             }
         } else {
-            // Tämä yö on mennyt → viimeisin unijakso oli tänään
+            // Tonight's reflection time has passed → the most recent dream cycle was tonight
             NextDream::Tonight {
                 at: today_reflection,
             }

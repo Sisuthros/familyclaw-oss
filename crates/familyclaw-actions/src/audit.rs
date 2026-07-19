@@ -1,20 +1,19 @@
-//! Audit-loki: tamper-evident tapahtumaketju toimintopinon vaiheista
-//! (havainto, suunnitelma, hyväksyntä, suoritus, todiste) (KERROS A).
+//! Audit trail: a tamper-evident event chain for the action pipeline's
+//! stages (observe, plan, approve, execute, proof) (Layer A).
 //!
-//! Tämä moduuli määrittelee:
-//! - [`AuditAction`] — mitä tapahtui (hyväksyntä myönnettiin/kulutettiin/…),
-//! - [`ActionAuditEvent`] — yksittäinen lokitapahtuma (tunniste, hetki, syy),
-//! - [`AuditLog`] — in-memory append-only -loki tapahtumille.
+//! This module defines:
+//! - [`AuditAction`] — what happened (approval granted/consumed/…),
+//! - [`ActionAuditEvent`] — a single log event (identifier, moment, reason),
+//! - [`AuditLog`] — an in-memory append-only log of events.
 //!
-//! ## Determinismi
-//! Tapahtumat ottavat aikaleiman injektoituna
-//! ([`familyclaw_core::time::Timestamp`]) — kelloa ei lueta tämän moduulin
-//! logiikan sisällä, jotta testit ja replay pysyvät deterministisinä.
+//! ## Determinism
+//! Events take their timestamp injected
+//! ([`familyclaw_core::time::Timestamp`]) — the clock is never read inside
+//! this module's logic, so tests and replay stay deterministic.
 //!
-//! ## OSS-raja
-//! Tapahtumat eivät sisällä salaisuuksia: vapaamuotoinen `reason`-kenttä on
-//! tarkoitettu lyhyelle ihmisluettavalle selitteelle, ei payloadille tai
-//! avaimille.
+//! ## OSS boundary
+//! Events contain no secrets: the free-form `reason` field is meant for a
+//! short human-readable explanation, not a payload or keys.
 
 use std::sync::Mutex;
 
@@ -24,57 +23,57 @@ use familyclaw_core::time::Timestamp;
 
 use crate::ids::{ActionId, ApprovalId, AuditEventId};
 
-/// Moduulin valmiusaste — säilytetään, jotta [`crate::all_modules_scaffolded`]
-/// kääntyy edelleen muiden vielä luurankovaiheessa olevien moduulien rinnalla.
+/// Module readiness level — kept so [`crate::all_modules_scaffolded`]
+/// still compiles alongside other modules still in scaffold stage.
 pub(crate) const SCAFFOLDED: bool = true;
 
-/// Audit-tapahtuman tyyppi: mitä toimintopinossa tapahtui.
+/// Type of an audit event: what happened in the action pipeline.
 ///
-/// Sarjallistuu `snake_case`-muotoon, jotta lokia voi suodattaa ja lukea
-/// koneellisesti.
+/// Serializes to `snake_case`, so the log can be filtered and read
+/// by machines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditAction {
-    /// Hyväksyntä myönnettiin (human-in-the-loop hyväksyi toiminnon).
+    /// Approval was granted (human-in-the-loop approved the action).
     ApprovalGranted,
-    /// Hyväksyntä kulutettiin onnistuneesti (kertakäyttö käytetty).
+    /// Approval was consumed successfully (the one-shot use was consumed).
     ApprovalConsumed,
-    /// Hyväksyntä evättiin (ihminen kieltäytyi).
+    /// Approval was denied (the human refused).
     ApprovalDenied,
-    /// Hyväksyntä todettiin vanhentuneeksi kulutusyrityksen yhteydessä.
+    /// Approval was found expired during a consumption attempt.
     ApprovalExpired,
-    /// Hyväksynnän kulutus epäonnistui (esim. payload-tiiviste ei täsmännyt
-    /// tai hyväksyntää oli jo käytetty).
+    /// Consuming the approval failed (e.g. the payload hash did not match,
+    /// or the approval had already been used).
     ApprovalRejected,
 }
 
-/// Yksittäinen audit-lokin tapahtuma toimintopinon hyväksyntävaiheesta.
+/// A single audit-log event from the action pipeline's approval stage.
 ///
-/// Jokainen tapahtuma kantaa oman tunnisteensa, kohteena olevan toiminnon
-/// ([`ActionId`]) ja mahdollisen hyväksynnän ([`ApprovalId`]) tunnisteen, sekä
-/// aikaleiman ja lyhyen ihmisluettavan syyn.
+/// Each event carries its own identifier, the identifier of the target
+/// action ([`ActionId`]) and of the possible approval ([`ApprovalId`]), as
+/// well as a timestamp and a short human-readable reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionAuditEvent {
-    /// Tapahtuman yksilöivä tunniste.
+    /// The event's unique identifier.
     pub id: AuditEventId,
-    /// Tapahtuman tyyppi (mitä tapahtui).
+    /// The event's type (what happened).
     pub action: AuditAction,
-    /// Toiminto johon tapahtuma liittyy.
+    /// The action the event relates to.
     pub action_id: ActionId,
-    /// Hyväksynnän tunniste jos tapahtuma koskee tiettyä hyväksyntää
-    /// (`None` esim. eväyksessä ennen kuin hyväksyntää on olemassa).
+    /// The approval's identifier if the event concerns a specific approval
+    /// (`None` e.g. for a denial before an approval exists).
     pub approval_id: Option<ApprovalId>,
-    /// Tapahtuman hetki (injektoitu — ei luettu kellosta).
+    /// The event's moment (injected — not read from the clock).
     pub at: Timestamp,
-    /// Lyhyt ihmisluettava selite (EI salaisuuksia eikä payloadia).
+    /// Short human-readable explanation (NO secrets or payload).
     pub reason: String,
 }
 
 impl ActionAuditEvent {
-    /// Rakentaa uuden audit-tapahtuman tuoreella tunnisteella.
+    /// Builds a new audit event with a fresh identifier.
     ///
-    /// Aikaleima ja syy annetaan kutsujalta; tunniste generoidaan satunnaisesti
-    /// ([`AuditEventId::new`]).
+    /// The timestamp and reason are given by the caller; the identifier is
+    /// generated randomly ([`AuditEventId::new`]).
     #[must_use]
     pub fn new(
         action: AuditAction,
@@ -94,51 +93,52 @@ impl ActionAuditEvent {
     }
 }
 
-/// In-memory append-only -audit-loki.
+/// In-memory append-only audit log.
 ///
-/// Loki on tarkoituksella vain lisäävä (`append`): tapahtumia ei poisteta eikä
-/// muokata, mikä tukee tamper-evident-ominaisuutta. Tämä KERROS A -toteutus
-/// säilyttää tapahtumat muistissa; pysyvä tallennus on substraattikerroksen
-/// vastuulla.
+/// The log is intentionally append-only (`append`): events are never
+/// deleted or modified, which supports the tamper-evident property. This
+/// Layer A implementation keeps events in memory; durable storage is the
+/// substrate layer's responsibility.
 #[derive(Debug, Clone, Default)]
 pub struct AuditLog {
-    /// Tapahtumat kronologisessa lisäysjärjestyksessä.
+    /// Events in chronological insertion order.
     events: Vec<ActionAuditEvent>,
 }
 
 impl AuditLog {
-    /// Luo uuden tyhjän audit-lokin.
+    /// Creates a new empty audit log.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Lisää tapahtuman lokin loppuun ja palauttaa lisätyn tapahtuman tunnisteen.
+    /// Appends the event to the end of the log and returns the appended
+    /// event's identifier.
     pub fn append(&mut self, event: ActionAuditEvent) -> AuditEventId {
         let id = event.id;
         self.events.push(event);
         id
     }
 
-    /// Lokissa olevien tapahtumien lukumäärä.
+    /// Number of events in the log.
     #[must_use]
     pub fn len(&self) -> usize {
         self.events.len()
     }
 
-    /// Onko loki tyhjä.
+    /// Whether the log is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
 
-    /// Kaikki tapahtumat lisäysjärjestyksessä.
+    /// All events in insertion order.
     #[must_use]
     pub fn events(&self) -> &[ActionAuditEvent] {
         &self.events
     }
 
-    /// Tietyn toiminnon ([`ActionId`]) kaikki tapahtumat lisäysjärjestyksessä.
+    /// All events for a given action ([`ActionId`]) in insertion order.
     #[must_use]
     pub fn events_for(&self, action_id: ActionId) -> Vec<&ActionAuditEvent> {
         self.events
@@ -147,92 +147,92 @@ impl AuditLog {
             .collect()
     }
 
-    /// Sisältääkö loki vähintään yhden annetun tyypin tapahtuman.
+    /// Whether the log contains at least one event of the given type.
     #[must_use]
     pub fn contains_action(&self, action: AuditAction) -> bool {
         self.events.iter().any(|e| e.action == action)
     }
 }
 
-/// Suorituspinon (executor → verify → proof) audit-tapahtuman tyyppi.
+/// Type of an execution-pipeline (executor → verify → proof) audit event.
 ///
-/// Laajempi kuin [`AuditAction`], joka kattaa vain hyväksyntävaiheen.
-/// `AuditKind` kuvaa koko toimintopinon kannalta kiinnostavat tapahtumat:
-/// hyväksyntä, suoritus, redaktointi, taint-merkintä ja käytäntöeväys.
-/// Sarjallistuu `snake_case`-muotoon koneellista suodatusta varten.
+/// Broader than [`AuditAction`], which covers only the approval stage.
+/// `AuditKind` describes the events of interest for the whole action
+/// pipeline: approval, execution, redaction, taint marking, and policy
+/// denial. Serializes to `snake_case` for machine filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditKind {
-    /// Hyväksyntä myönnettiin.
+    /// Approval was granted.
     ApprovalGranted,
-    /// Hyväksyntä kulutettiin (kertakäyttö käytetty).
+    /// Approval was consumed (the one-shot use was consumed).
     ApprovalConsumed,
-    /// Hyväksyntä evättiin.
+    /// Approval was denied.
     ApprovalDenied,
-    /// Hyväksyntä todettiin vanhentuneeksi.
+    /// Approval was found expired.
     ApprovalExpired,
-    /// Toiminnon suoritus alkoi.
+    /// Action execution started.
     ActionStarted,
-    /// Toiminnon suoritus onnistui.
+    /// Action execution succeeded.
     ActionSucceeded,
-    /// Toiminnon suoritus epäonnistui.
+    /// Action execution failed.
     ActionFailed,
-    /// Salaisuudelta näyttäviä arvoja redaktoitiin todisteesta.
+    /// Secret-looking values were redacted from the proof.
     RedactionApplied,
-    /// Tuloste merkittiin epäluotettavaksi (taint).
+    /// The output was marked untrusted (taint).
     TaintMarked,
-    /// Käytäntö (policy) esti toiminnon.
+    /// Policy blocked the action.
     PolicyDenied,
-    /// **Agentin vuoro (turn) alkoi** — tool-loopin ensimmäinen kierros
-    /// käynnistyi. (TURN-AUDIT, roadmap §6 D6.)
-    TurnStarted,
-    /// **Työkalukutsu lähetettiin** tool-loopin sisällä (taidon nimi +
-    /// redaktoitu tulos `detail`-kentässä, ei koskaan raakaa payloadia).
+    /// **The agent's turn started** — the tool loop's first round began.
     /// (TURN-AUDIT, roadmap §6 D6.)
+    TurnStarted,
+    /// **A tool call was dispatched** inside the tool loop (the skill's
+    /// name + a redacted result in the `detail` field, never the raw
+    /// payload). (TURN-AUDIT, roadmap §6 D6.)
     ToolDispatched,
-    /// **Vuoro keskeytyi** odottamaan ihmisen hyväksyntää (suspend):
-    /// `detail` kantaa hyväksynnän tunnisteen + redaktoidun tiivistelmän.
+    /// **The turn was suspended** waiting for human approval (suspend):
+    /// `detail` carries the approval's identifier + a redacted summary.
     /// (TURN-AUDIT, roadmap §6 D6.)
     TurnSuspended,
-    /// **Keskeytetty vuoro jatkettiin** (resume) hyväksynnän myöntämisen
-    /// jälkeen. (TURN-AUDIT, roadmap §6 D6.)
+    /// **A suspended turn was resumed** after approval was granted.
+    /// (TURN-AUDIT, roadmap §6 D6.)
     TurnResumed,
-    /// **Vuoro päättyi lopulliseen vastaukseen** (`stop_reason` = answered).
+    /// **The turn ended with a final answer** (`stop_reason` = answered).
     /// (TURN-AUDIT, roadmap §6 D6.)
     TurnAnswered,
-    /// **Vuoro saavutti kierrosrajan** ilman vastausta
+    /// **The turn hit the iteration limit** without an answer
     /// (`stop_reason` = max-iter). (TURN-AUDIT, roadmap §6 D6.)
     TurnMaxIterations,
 }
 
-/// Suorituspinon yksittäinen audit-tapahtuma.
+/// A single execution-pipeline audit event.
 ///
-/// Toisin kuin [`ActionAuditEvent`] (hyväksyntäkohtainen), tämä kuvaa minkä
-/// tahansa [`AuditKind`]-tapahtuman vapaamuotoisella `detail`-selitteellä.
+/// Unlike [`ActionAuditEvent`] (approval-specific), this describes any
+/// [`AuditKind`] event with a free-form `detail` explanation.
 ///
-/// ## OSS-raja
-/// `detail` on tarkoitettu lyhyelle ihmisluettavalle selitteelle — **ei koskaan
-/// raakaa salaisuutta, tokenia eikä payloadia**. Salaiset arvot redaktoidaan
-/// todistepaketissa ([`crate::proof`]), eivät päädy tähän kenttään.
+/// ## OSS boundary
+/// `detail` is meant for a short human-readable explanation — **never a raw
+/// secret, token, or payload**. Secret values are redacted in the proof
+/// bundle ([`crate::proof`]) and never end up in this field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecAuditEvent {
-    /// Tapahtuman yksilöivä tunniste.
+    /// The event's unique identifier.
     pub id: AuditEventId,
-    /// Tapahtuman tyyppi.
+    /// The event's type.
     pub kind: AuditKind,
-    /// Tapahtuman hetki (injektoitu — ei luettu kellosta).
+    /// The event's moment (injected — not read from the clock).
     pub at: Timestamp,
-    /// Toiminto johon tapahtuma liittyy.
+    /// The action the event relates to.
     pub action_id: ActionId,
-    /// Lyhyt ihmisluettava selite (EI raakoja salaisuuksia).
+    /// Short human-readable explanation (NO raw secrets).
     pub detail: String,
 }
 
 impl ExecAuditEvent {
-    /// Rakentaa uuden suorituspinon audit-tapahtuman tuoreella tunnisteella.
+    /// Builds a new execution-pipeline audit event with a fresh identifier.
     ///
-    /// Aikaleima ja selite annetaan kutsujalta; tunniste generoidaan
-    /// satunnaisesti ([`AuditEventId::new`]).
+    /// The timestamp and explanation are given by the caller; the
+    /// identifier is generated randomly ([`AuditEventId::new`]).
     #[must_use]
     pub fn new(
         kind: AuditKind,
@@ -250,30 +250,30 @@ impl ExecAuditEvent {
     }
 }
 
-/// Säikeenturvallinen in-memory-keräin suorituspinon audit-tapahtumille.
+/// A thread-safe in-memory collector for execution-pipeline audit events.
 ///
-/// Tapahtumat säilytetään [`std::sync::Mutex`]-lukon takana, jotta keräintä voi
-/// jakaa rinnakkaisten suoritusten kesken. Keräin on vain lisäävä: tapahtumia
-/// ei poisteta eikä muokata (tamper-evident). Pysyvä tallennus on
-/// substraattikerroksen vastuulla.
+/// Events are held behind a [`std::sync::Mutex`] lock, so the collector can
+/// be shared across concurrent executions. The collector is append-only:
+/// events are never deleted or modified (tamper-evident). Durable storage
+/// is the substrate layer's responsibility.
 #[derive(Debug, Default)]
 pub struct AuditCollector {
-    /// Tapahtumat lisäysjärjestyksessä, lukon takana.
+    /// Events in insertion order, behind the lock.
     events: Mutex<Vec<ExecAuditEvent>>,
 }
 
 impl AuditCollector {
-    /// Luo uuden tyhjän keräimen.
+    /// Creates a new empty collector.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Kirjaa tapahtuman ja palauttaa sen tunnisteen.
+    /// Records the event and returns its identifier.
     ///
-    /// Lukon myrkyttyessä (paniikki toisessa säikeessä) lukko palautetaan
-    /// kunnolla ([`std::sync::PoisonError::into_inner`]) tiedonhukan
-    /// välttämiseksi — kirjaus ei koskaan paniikkaa.
+    /// If the lock is poisoned (a panic in another thread), the lock is
+    /// recovered properly ([`std::sync::PoisonError::into_inner`]) to avoid
+    /// data loss — recording never panics.
     pub fn record(&self, event: ExecAuditEvent) -> AuditEventId {
         let id = event.id;
         let mut guard = match self.events.lock() {
@@ -284,7 +284,7 @@ impl AuditCollector {
         id
     }
 
-    /// Palauttaa kaikki kirjatut tapahtumat lisäysjärjestyksessä (kopio).
+    /// Returns all recorded events in insertion order (a copy).
     #[must_use]
     pub fn list(&self) -> Vec<ExecAuditEvent> {
         match self.events.lock() {
@@ -293,14 +293,15 @@ impl AuditCollector {
         }
     }
 
-    /// Palauttaa tietyn [`ActionId`]:n kaikki tapahtumat lisäysjärjestyksessä
-    /// (kopio).
+    /// Returns all events for a given [`ActionId`] in insertion order
+    /// (a copy).
     ///
-    /// Käytetään mm. **turn-auditin** (roadmap §6 D6) operaattorihaussa: yksi
-    /// agentin vuoro tunnistetaan yhdellä [`ActionId`]:llä, joten yhden vuoron
-    /// koko audit-jälki (alku → työkalukutsut → suspend/resume → `stop_reason`)
-    /// saadaan suodattamalla tällä tunnisteella. Tuloste ei koskaan sisällä
-    /// raakoja salaisuuksia — `detail` redaktoidaan jo kirjaushetkellä.
+    /// Used, among other things, in the **turn-audit** (roadmap §6 D6)
+    /// operator lookup: a single agent turn is identified by one
+    /// [`ActionId`], so the full audit trail of one turn (start → tool
+    /// calls → suspend/resume → `stop_reason`) is obtained by filtering on
+    /// this identifier. The output never contains raw secrets — `detail` is
+    /// already redacted at recording time.
     #[must_use]
     pub fn events_for(&self, action_id: ActionId) -> Vec<ExecAuditEvent> {
         let guard = match self.events.lock() {
@@ -314,7 +315,7 @@ impl AuditCollector {
             .collect()
     }
 
-    /// Kirjattujen tapahtumien lukumäärä.
+    /// Number of recorded events.
     #[must_use]
     pub fn len(&self) -> usize {
         match self.events.lock() {
@@ -323,7 +324,7 @@ impl AuditCollector {
         }
     }
 
-    /// Onko keräin tyhjä.
+    /// Whether the collector is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -377,8 +378,8 @@ mod tests {
 
     #[test]
     fn turn_audit_kinds_serde_snake_case() {
-        // TURN-AUDIT-variantit sarjallistuvat snake_caseen koneellista
-        // suodatusta varten (operaattorin näkymä).
+        // TURN-AUDIT variants serialize to snake_case for machine
+        // filtering (the operator's view).
         for (kind, expected) in [
             (AuditKind::TurnStarted, "\"turn_started\""),
             (AuditKind::ToolDispatched, "\"tool_dispatched\""),
@@ -422,7 +423,7 @@ mod tests {
         assert_eq!(a_events.len(), 2, "vain turn a:n tapahtumat");
         assert!(a_events.iter().all(|e| e.action_id == turn_a));
         assert_eq!(collector.events_for(turn_b).len(), 1);
-        // Tuntematon tunniste → tyhjä.
+        // Unknown identifier → empty.
         assert!(collector.events_for(ActionId::new()).is_empty());
     }
 

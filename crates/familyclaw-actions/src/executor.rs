@@ -1,20 +1,20 @@
-//! Suorituskerros (executor): ajaa hyväksytyn toiminnon taidon kautta ja
-//! kerää tuloksen verifiointia ja todistetta varten (KERROS A).
-//! Vain mock-suoritus — ei oikeita verkkokutsuja.
+//! Execution layer (executor): runs an approved action via the skill and
+//! collects the result for verification and proof (Layer A).
+//! Mock execution only — no real network calls.
 //!
-//! Tämä moduuli määrittelee:
-//! - [`ActionStatus`] — toiminnon lopputila (onnistui / epäonnistui),
-//! - [`ActionRequest`] — suorituspyyntö (tunnisteet, payload, aikaleima),
-//! - [`ActionResult`] — suorituksen tulos (tila, yhteenveto, redaktoitu tuloste,
-//!   taint-leima),
-//! - [`ActionExecutor`] — async-trait, jonka toteutus ajaa toiminnon,
-//! - [`MockActionExecutor`] — testikäyttöinen toteutus (onnistuu/epäonnistuu).
+//! This module defines:
+//! - [`ActionStatus`] — the action's outcome (succeeded / failed),
+//! - [`ActionRequest`] — the execution request (ids, payload, timestamp),
+//! - [`ActionResult`] — the execution result (status, summary, redacted output,
+//!   taint marker),
+//! - [`ActionExecutor`] — an async trait whose implementation runs the action,
+//! - [`MockActionExecutor`] — a test-oriented implementation (succeeds/fails).
 //!
-//! ## Determinismi & OSS-raja
-//! Suorituspyyntö kantaa aikaleiman injektoituna ([`Timestamp`]). Mock-toteutus
-//! ei tee verkkokutsuja eikä lue kelloa logiikan sisällä. Tuloste merkitään
-//! oletuksena epäluotettavaksi (`untrusted`), kunnes lähde on eksplisiittisesti
-//! luotettu.
+//! ## Determinism & OSS boundary
+//! The execution request carries the timestamp injected ([`Timestamp`]). The
+//! mock implementation makes no network calls and never reads the clock
+//! inside the logic. The output is marked untrusted by default (`untrusted`),
+//! until the source is explicitly trusted.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -25,60 +25,60 @@ use familyclaw_core::time::Timestamp;
 use crate::ids::{ActionId, ActionTaskId, SkillId};
 use crate::Result;
 
-/// Moduulin valmiusaste — säilytetään, jotta [`crate::all_modules_scaffolded`]
-/// kääntyy edelleen muiden moduulien rinnalla.
+/// Module readiness flag — kept so that [`crate::all_modules_scaffolded`]
+/// still compiles alongside the other modules.
 pub(crate) const SCAFFOLDED: bool = true;
 
-/// Toiminnon lopputila.
+/// The action's outcome.
 ///
-/// Sarjallistuu `snake_case`-muotoon koneellista suodatusta varten.
+/// Serializes to `snake_case` form for machine filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionStatus {
-    /// Toiminto onnistui.
+    /// The action succeeded.
     Succeeded,
-    /// Toiminto epäonnistui.
+    /// The action failed.
     Failed,
 }
 
 impl ActionStatus {
-    /// Onnistuiko toiminto.
+    /// Whether the action succeeded.
     #[must_use]
     pub const fn is_success(self) -> bool {
         matches!(self, Self::Succeeded)
     }
 }
 
-/// Suorituspyyntö yhdelle toiminnolle.
+/// An execution request for a single action.
 ///
-/// Kantaa kaikki tunnisteet jotka todistepaketti tarvitsee jäljitettävyyttä
-/// varten, taidolle välitettävän payloadin sekä injektoidun aikaleiman.
+/// Carries all the identifiers the proof bundle needs for traceability, the
+/// payload passed to the skill, and the injected timestamp.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionRequest {
-    /// Suoritettavan toiminnon tunniste.
+    /// The identifier of the action to execute.
     pub action_id: ActionId,
-    /// Suoritettavan taidon tunniste.
+    /// The identifier of the skill to execute.
     pub skill_id: SkillId,
-    /// Tehtävä jonka osana toiminto suoritetaan.
+    /// The task this action is executed as part of.
     pub task_id: ActionTaskId,
-    /// Taidolle välitettävä syöte (geneerinen JSON).
+    /// The input passed to the skill (generic JSON).
     pub payload: Value,
-    /// Suorituksen alkuhetki (injektoitu — ei luettu kellosta).
+    /// The moment execution starts (injected — never read from the clock).
     pub now: Timestamp,
-    /// Onko syöte peräisin epäluotettavasta lähteestä (esim. MCP-työkalun
-    /// tuloste). Jos `true`, taint **propagoituu** tulokseen
-    /// ([`ActionResult::propagate_input_taint`]) eikä suorittaja voi pestä sitä
-    /// pois merkitsemällä oman tulosteensa luotetuksi. Oletuksena `false`.
+    /// Whether the input originates from an untrusted source (e.g. an MCP
+    /// tool's output). If `true`, the taint **propagates** into the result
+    /// ([`ActionResult::propagate_input_taint`]) and the executor cannot wash
+    /// it off by marking its own output as trusted. Defaults to `false`.
     pub input_untrusted: bool,
 }
 
 impl ActionRequest {
-    /// Rakentaa uuden suorituspyynnön luotetulla syötteellä
+    /// Builds a new execution request with trusted input
     /// (`input_untrusted = false`).
     ///
-    /// Jos syöte on peräisin epäluotettavasta lähteestä, merkitse se
-    /// [`ActionRequest::with_input_taint`]:lla, jolloin taint propagoituu
-    /// tulokseen ja todisteeseen.
+    /// If the input originates from an untrusted source, mark it via
+    /// [`ActionRequest::with_input_taint`], so the taint propagates into the
+    /// result and the proof.
     #[must_use]
     pub fn new(
         action_id: ActionId,
@@ -97,11 +97,11 @@ impl ActionRequest {
         }
     }
 
-    /// Asettaa syötteen taint-tilan (rakentaja).
+    /// Sets the input's taint state (builder).
     ///
-    /// `true` tarkoittaa että syöte on epäluotettavaa (esim. MCP-lähteistä)
-    /// dataa. Käytä tätä kun pyyntö rakennetaan epäluotettavasta tuloksesta,
-    /// jotta taint ei katoa suorituksen aikana.
+    /// `true` means the input is untrusted (e.g. MCP-sourced) data. Use this
+    /// when the request is built from an untrusted result, so the taint
+    /// doesn't disappear during execution.
     #[must_use]
     pub const fn with_input_taint(mut self, input_untrusted: bool) -> Self {
         self.input_untrusted = input_untrusted;
@@ -109,28 +109,29 @@ impl ActionRequest {
     }
 }
 
-/// Toiminnon suorituksen tulos.
+/// The result of executing an action.
 ///
-/// `raw_output_redacted` on suorituksen tuottama tuloste, joka redaktoidaan
-/// todistepaketin koonnissa ([`crate::proof::build_proof`]); kenttä ei saa
-/// koskaan päätyä todisteeseen ilman redaktointia. `untrusted` on oletuksena
-/// `true`, kunnes lähde on eksplisiittisesti luotettu.
+/// `raw_output_redacted` is the output produced by execution, which is
+/// redacted when the proof bundle is assembled
+/// ([`crate::proof::build_proof`]); this field must never reach the proof
+/// without redaction. `untrusted` defaults to `true` until the source is
+/// explicitly trusted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionResult {
-    /// Toiminnon lopputila.
+    /// The action's outcome.
     pub status: ActionStatus,
-    /// Lyhyt ihmisluettava yhteenveto (EI raakoja salaisuuksia).
+    /// A short human-readable summary (NO raw secrets).
     pub output_summary: String,
-    /// Onko tuloste peräisin epäluotettavasta lähteestä (taint).
+    /// Whether the output originates from an untrusted source (taint).
     pub untrusted: bool,
-    /// Suorituksen tuottama tuloste (redaktoidaan ennen todisteeseen liittämistä).
+    /// The output produced by execution (redacted before being attached to the proof).
     pub raw_output_redacted: Value,
-    /// Suorituksen päättymishetki (injektoitu).
+    /// The moment execution finished (injected).
     pub finished_at: Timestamp,
 }
 
 impl ActionResult {
-    /// Onnistunut tulos. Tuloste merkitään oletuksena epäluotettavaksi.
+    /// A successful result. The output is marked untrusted by default.
     #[must_use]
     pub fn success(
         output_summary: impl Into<String>,
@@ -146,7 +147,7 @@ impl ActionResult {
         }
     }
 
-    /// Epäonnistunut tulos.
+    /// A failed result.
     #[must_use]
     pub fn failure(output_summary: impl Into<String>, finished_at: Timestamp) -> Self {
         Self {
@@ -158,22 +159,22 @@ impl ActionResult {
         }
     }
 
-    /// Merkitsee tulosteen luotetuksi (poistaa taint-leiman).
+    /// Marks the output as trusted (removes the taint marker).
     ///
-    /// Käytetään vain kun lähde on eksplisiittisesti todettu luotettavaksi.
+    /// Use only when the source has been explicitly established as trusted.
     #[must_use]
     pub const fn trusted(mut self) -> Self {
         self.untrusted = false;
         self
     }
 
-    /// Propagoi syötteen taintin tulokseen **monotonisesti**.
+    /// Propagates the input's taint into the result **monotonically**.
     ///
-    /// Jos syöte oli epäluotettava (`input_untrusted = true`), tuloste
-    /// merkitään epäluotettavaksi riippumatta siitä, mitä suorittaja itse
-    /// asetti. Taint voi vain **lisääntyä**, ei koskaan poistua: luotettu
-    /// suorittaja ei voi pestä epäluotettavaa syötettä puhtaaksi. Jos syöte oli
-    /// luotettu, tämän kutsu ei muuta tulosteen omaa taint-tilaa.
+    /// If the input was untrusted (`input_untrusted = true`), the result is
+    /// marked untrusted regardless of what the executor itself set. Taint can
+    /// only **increase**, never disappear: a trusted executor cannot wash an
+    /// untrusted input clean. If the input was trusted, this call does not
+    /// change the result's own taint state.
     #[must_use]
     pub const fn propagate_input_taint(mut self, input_untrusted: bool) -> Self {
         if input_untrusted {
@@ -183,41 +184,41 @@ impl ActionResult {
     }
 }
 
-/// Toiminnon suorittaja.
+/// An action executor.
 ///
-/// Toteutus ajaa hyväksytyn toiminnon ja palauttaa [`ActionResult`]:n. KERROS A
-/// -toteutukset ovat **mockeja** — ei oikeita verkkokutsuja.
+/// The implementation runs an approved action and returns an
+/// [`ActionResult`]. Layer A implementations are **mocks** — no real network calls.
 #[async_trait]
 pub trait ActionExecutor: Send + Sync {
-    /// Suorittaa toiminnon ja palauttaa tuloksen.
+    /// Executes the action and returns the result.
     ///
     /// # Errors
-    /// Palauttaa [`crate::ActionError`] jos suoritus ei voi edes alkaa (esim.
-    /// kelpaamaton pyyntö). Itse toiminnon epäonnistuminen kuvataan
-    /// [`ActionStatus::Failed`]-tilana tuloksessa, ei virheenä.
+    /// Returns [`crate::ActionError`] if execution cannot even start (e.g. an
+    /// invalid request). A failure of the action itself is described as
+    /// [`ActionStatus::Failed`] status in the result, not as an error.
     async fn execute(&self, request: ActionRequest) -> Result<ActionResult>;
 }
 
-/// Testikäyttöinen mock-suorittaja.
+/// A test-oriented mock executor.
 ///
-/// Toistaa ennalta määrätyn lopputuloksen ilman verkkokutsuja: joko onnistuu
-/// palauttaen sille annetun tulosteen, tai epäonnistuu annetulla selitteellä.
+/// Replays a predetermined outcome without network calls: either succeeds,
+/// returning the output given to it, or fails with the given explanation.
 #[derive(Debug, Clone)]
 pub struct MockActionExecutor {
-    /// Palautettava lopputila.
+    /// The outcome to return.
     status: ActionStatus,
-    /// Onnistumisen yhteydessä palautettava tuloste.
+    /// The output to return on success.
     output: Value,
-    /// Yhteenvetoteksti.
+    /// The summary text.
     summary: String,
-    /// Merkitäänkö tuloste epäluotettavaksi (taint).
+    /// Whether to mark the output as untrusted (taint).
     untrusted: bool,
 }
 
 impl MockActionExecutor {
-    /// Onnistuva mock annetulla tulosteella.
+    /// A succeeding mock with the given output.
     ///
-    /// Tuloste merkitään oletuksena epäluotettavaksi (`untrusted = true`).
+    /// The output is marked untrusted by default (`untrusted = true`).
     #[must_use]
     pub fn succeeding(output: Value) -> Self {
         Self {
@@ -228,7 +229,7 @@ impl MockActionExecutor {
         }
     }
 
-    /// Epäonnistuva mock annetulla selitteellä.
+    /// A failing mock with the given explanation.
     #[must_use]
     pub fn failing(summary: impl Into<String>) -> Self {
         Self {
@@ -239,7 +240,7 @@ impl MockActionExecutor {
         }
     }
 
-    /// Merkitsee mockin tulosteen luotetuksi (poistaa taint-leiman).
+    /// Marks the mock's output as trusted (removes the taint marker).
     #[must_use]
     pub const fn trusted(mut self) -> Self {
         self.untrusted = false;

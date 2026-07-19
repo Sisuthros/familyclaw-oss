@@ -1,6 +1,10 @@
 # FamilyClaw
 
+<!-- TODO(launch): demo GIF — record scripts/demo-crash-replay.sh with asciinema -->
+
 **A Rust agent runtime where in-flight work survives a crash — at-most-once external side effects, durable memory, contract-checked coordination.**
+
+> *Checkpointing remembers the scene. FamilyClaw guards the trigger.*
 
 Most AI agents die between runs. FamilyClaw gives them continuity:
 durable replay, persistent memory, actor-based coordination, sleep-time consolidation,
@@ -9,6 +13,20 @@ and private runtime profiles that never enter the repository.
 > 📍 **[STATUS.md](STATUS.md)** — what works today, what is deferred, release (`v1.2.0`).
 > **[MASTERPLAN.md](MASTERPLAN.md)** — strategy, horizons, and priorities (one consolidated plan).
 > Start with STATUS for technical truth; MASTERPLAN for where we're going.
+
+## How FamilyClaw compares
+
+Honest, defensible positioning — not a scoreboard. ✅ = full guarantee today, ⚠️ = partial/config-dependent, ❌ = not a design goal / not provided.
+
+| Property | FamilyClaw | LangGraph | CrewAI | Temporal | OpenAI Agents SDK |
+|---|:--:|:--:|:--:|:--:|:--:|
+| Durable crash replay | ✅ | ⚠️ (checkpointing in `durability="sync"` mode; opt-in, not default) | ❌ | ✅ | ❌ |
+| At-most-once external side effects | ✅ | ⚠️ (checkpoint ≠ dispatch — a crash between effect and checkpoint can re-fire; see benchmark below) | ❌ | ⚠️ (durable execution, but activities are at-least-once by design — idempotency is the activity author's responsibility) | ❌ |
+| Persistent cross-session multi-agent memory | ✅ | ⚠️ (thread-scoped checkpoint state; no built-in decay/consolidation model) | ⚠️ (basic memory backends available) | ❌ (not an agent-memory product) | ⚠️ (session state only) |
+| Deny-by-default WASM skill sandbox | ✅ | ❌ | ❌ | ❌ | ❌ |
+| No `unsafe` Rust | ✅ | N/A (Python) | N/A (Python) | N/A (Go) | N/A (Python) |
+
+Full LangGraph crash-safety methodology, raw results, and honesty caveats: [`bench-competitors/langgraph/`](bench-competitors/langgraph/README.md).
 
 ## Should you use this?
 

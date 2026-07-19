@@ -1,34 +1,34 @@
-//! Ajan apufunktiot [`chrono`]-pohjalta.
+//! Time helper functions built on [`chrono`].
 //!
-//! Alusta käyttää johdonmukaisesti UTC-aikaa ([`Timestamp`]) sisäisessä
-//! tilassa ja sarjallistuksessa, jotta durable-replay ja muistin
-//! konsolidointi pysyvät deterministisinä aikavyöhykkeestä riippumatta.
-//! Paikallisaika lasketaan vain esitystä varten.
+//! The platform consistently uses UTC time ([`Timestamp`]) in internal
+//! state and serialization, so that durable replay and memory
+//! consolidation remain deterministic regardless of time zone.
+//! Local time is computed only for presentation purposes.
 
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 
-/// Alustan kanoninen aikaleima — aina UTC.
+/// The platform's canonical timestamp — always UTC.
 pub type Timestamp = DateTime<Utc>;
 
-/// Palauttaa nykyhetken UTC-aikaleimana.
+/// Returns the current instant as a UTC timestamp.
 #[must_use]
 pub fn now() -> Timestamp {
     Utc::now()
 }
 
-/// Muotoilee aikaleiman RFC 3339 -muotoon millisekuntien tarkkuudella.
+/// Formats a timestamp as RFC 3339 with millisecond precision.
 ///
-/// Vakiotarkkuus tekee lokeista ja sarjallistuksesta vertailukelpoisia.
+/// The fixed precision keeps logs and serialized output comparable.
 #[must_use]
 pub fn to_rfc3339(ts: Timestamp) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-/// Jäsentää RFC 3339 -aikaleiman UTC:ksi.
+/// Parses an RFC 3339 timestamp into UTC.
 ///
 /// # Errors
-/// Palauttaa [`crate::FamilyClawError::InvalidInput`] jos merkkijono ei ole
-/// kelvollinen RFC 3339 -aikaleima.
+/// Returns [`crate::FamilyClawError::InvalidInput`] if the string is not a
+/// valid RFC 3339 timestamp.
 pub fn parse_rfc3339(s: &str) -> crate::Result<Timestamp> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
@@ -37,11 +37,11 @@ pub fn parse_rfc3339(s: &str) -> crate::Result<Timestamp> {
         })
 }
 
-/// Rakentaa aikaleiman Unix-sekunneista (UTC).
+/// Builds a timestamp from Unix seconds (UTC).
 ///
 /// # Errors
-/// Palauttaa [`crate::FamilyClawError::InvalidInput`] jos sekuntiarvo on
-/// kelpaamaton (esim. ylivuoto).
+/// Returns [`crate::FamilyClawError::InvalidInput`] if the seconds value is
+/// invalid (e.g. overflow).
 pub fn from_unix_secs(secs: i64) -> crate::Result<Timestamp> {
     match Utc.timestamp_opt(secs, 0) {
         chrono::LocalResult::Single(ts) => Ok(ts),
@@ -51,15 +51,16 @@ pub fn from_unix_secs(secs: i64) -> crate::Result<Timestamp> {
     }
 }
 
-/// Palauttaa aikaleiman Unix-sekunteina (UTC).
+/// Returns the timestamp as Unix seconds (UTC).
 #[must_use]
 pub fn to_unix_secs(ts: Timestamp) -> i64 {
     ts.timestamp()
 }
 
-/// Onko `ts` annettua kestoa vanhempi suhteessa nykyhetkeen.
+/// Whether `ts` is older than the given duration relative to the current
+/// instant.
 ///
-/// Negatiivinen kesto käsitellään nollana (tulevaisuus ei ole "vanhentunut").
+/// A negative duration is treated as zero (the future is never "expired").
 #[must_use]
 pub fn is_older_than(ts: Timestamp, age: chrono::Duration) -> bool {
     now().signed_duration_since(ts) > age

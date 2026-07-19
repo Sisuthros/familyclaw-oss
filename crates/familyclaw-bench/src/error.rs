@@ -1,77 +1,77 @@
-//! Benchmark-harnessin virhetyypit.
+//! Error types for the benchmark harness.
 //!
-//! Kaikki harnessin epäonnistumiset kulkevat [`BenchError`]- ja [`Result`]-
-//! tyyppien kautta — tuotantopolulla EI käytetä `unwrap()`/`expect()`/
-//! `panic!()`. [`BenchError`] kääräisee alustan ydincraten
-//! [`familyclaw_core::FamilyClawError`]:n sekä durable-/dream-tason virheet,
-//! jotta skenaariot voivat propagoida `?`-operaattorilla.
+//! All harness failures flow through the [`BenchError`] and [`Result`]
+//! types — the production path never uses `unwrap()`/`expect()`/
+//! `panic!()`. [`BenchError`] wraps the platform's core crate error
+//! ([`familyclaw_core::FamilyClawError`]) as well as durable/dream-layer
+//! errors, so scenarios can propagate them with the `?` operator.
 
 use thiserror::Error;
 
-/// Benchmark-harnessin keskitetty virhetyyppi.
+/// The benchmark harness's central error type.
 ///
-/// `#[non_exhaustive]` jotta uusia variantteja voi lisätä myöhemmin rikkomatta
-/// downstream-skenaarioita.
+/// `#[non_exhaustive]` so new variants can be added later without breaking
+/// downstream scenarios.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum BenchError {
-    /// Subject (benchmarkattava järjestelmä) epäonnistui operaatiossa.
+    /// The subject (the system under benchmark) failed during an operation.
     #[error("subject error: {0}")]
     Subject(String),
 
-    /// Skenaarion suoritus epäonnistui.
+    /// A scenario run failed.
     #[error("scenario error: {0}")]
     Scenario(String),
 
-    /// Mittarin laskenta sai kelvottoman syötteen.
+    /// A metric calculation received invalid input.
     #[error("metric error: {0}")]
     Metric(String),
 
-    /// Scorecardin sarjallistus tai kirjoitus epäonnistui.
+    /// Scorecard serialization or write failed.
     #[error("scorecard error: {0}")]
     Scorecard(String),
 
-    /// Alustan ydinvirhe (config, IO, muisti, bus).
+    /// A platform core error (config, IO, memory, bus).
     #[error("core error: {0}")]
     Core(#[from] familyclaw_core::FamilyClawError),
 
-    /// Durable-substraatin virhe (journal, replay).
+    /// A durable-substrate error (journal, replay).
     #[error("durable error: {0}")]
     Durable(#[from] familyclaw_durable::DurableError),
 
-    /// JSON-sarjallistus tai -jäsennys epäonnistui.
+    /// JSON serialization or parsing failed.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
 
-    /// Tiedosto- tai prosessi-IO epäonnistui.
+    /// File or process IO failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
 
 impl BenchError {
-    /// Rakentaa [`BenchError::Subject`]-variantin.
+    /// Builds a [`BenchError::Subject`] variant.
     pub fn subject(msg: impl Into<String>) -> Self {
         Self::Subject(msg.into())
     }
 
-    /// Rakentaa [`BenchError::Scenario`]-variantin.
+    /// Builds a [`BenchError::Scenario`] variant.
     pub fn scenario(msg: impl Into<String>) -> Self {
         Self::Scenario(msg.into())
     }
 
-    /// Rakentaa [`BenchError::Metric`]-variantin.
+    /// Builds a [`BenchError::Metric`] variant.
     pub fn metric(msg: impl Into<String>) -> Self {
         Self::Metric(msg.into())
     }
 
-    /// Rakentaa [`BenchError::Scorecard`]-variantin.
+    /// Builds a [`BenchError::Scorecard`] variant.
     pub fn scorecard(msg: impl Into<String>) -> Self {
         Self::Scorecard(msg.into())
     }
 }
 
-/// Harnessin vakiotulostyyppi: [`std::result::Result`] jonka virhe on aina
-/// [`BenchError`].
+/// The harness's standard result type: [`std::result::Result`] whose error
+/// is always [`BenchError`].
 pub type Result<T> = std::result::Result<T, BenchError>;
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
 //!
 //! Feature-gated behind `surreal` flag.
 
-/// `SurrealDB`-pohjaiset Hearth-toteutukset (feature-gated `surreal`).
+/// `SurrealDB`-based Hearth implementations (feature-gated `surreal`).
 #[cfg(feature = "surreal")]
 #[allow(clippy::module_inception)]
 pub mod surreal {
@@ -20,12 +20,12 @@ pub mod surreal {
     #[derive(Clone)]
     pub struct SurrealHearthStore {
         db: Arc<Surreal<Any>>,
-        /// `MemoryStore`-supertraitin toteutus. `SurrealDB`-pohjainen
-        /// `MemoryStore`-backend ei ole vielä valmis (skeeman `memory_event`
-        /// -taulu on määritelty muttei kytketty), joten supertrait
-        /// delegoidaan kevyeen muistinvaraiseen [`LocalJsonStore`]:hen.
-        /// Tämä pitää `HearthStore: MemoryStore`-rajan tyydytettynä ilman
-        /// `todo!()`/`unimplemented!()`-paniikkeja.
+        /// Implementation of the `MemoryStore` supertrait. The `SurrealDB`-backed
+        /// `MemoryStore` backend isn't ready yet (the `memory_event` table is
+        /// defined in the schema but not wired up), so the supertrait is
+        /// delegated to the lightweight in-memory [`LocalJsonStore`].
+        /// This keeps the `HearthStore: MemoryStore` bound satisfied without
+        /// resorting to `todo!()`/`unimplemented!()` panics.
         memory: Arc<LocalJsonStore>,
     }
 
@@ -260,9 +260,9 @@ DEFINE FIELD decay_class ON anchor TYPE string;
                 }
 
                 let row = &rows[0];
-                // `narrative_thread` ei tallenna erillistä `updated_at`-kenttää
-                // (vrt. skeema), joten round-trippaa se `created_at`:sta kuten
-                // `NarrativeThread::new` (luonnissa `updated_at == created_at`).
+                // `narrative_thread` does not store a separate `updated_at` field
+                // (see schema), so round-trip it from `created_at`, matching
+                // `NarrativeThread::new` (at creation, `updated_at == created_at`).
                 let created_at = row
                     .get("created_at")
                     .and_then(|v| v.as_str())
@@ -303,17 +303,17 @@ DEFINE FIELD decay_class ON anchor TYPE string;
             let id = thread.id.to_string();
             let title = thread.title;
             let participants = thread.participants;
-            // RFC3339-merkkijono castataan natiiviksi datetimeksi (`type::datetime`)
-            // koska skeema määrittelee `created_at TYPE datetime` — pelkkä string
-            // aiheutti hiljaisen tyyppirikkomuksen (sama bugi kuin emotional_statessa).
+            // Cast the RFC3339 string to a native datetime (`type::datetime`)
+            // because the schema defines `created_at TYPE datetime` — a plain
+            // string caused a silent type mismatch (same bug as in emotional_state).
             let created_at = thread.created_at.to_rfc3339();
             Box::pin(async move {
-                // Osoita rivi `type::record`:lla jotta UPSERT päivittää saman rivin
-                // paikallaan — bare `UPSERT narrative_thread SET id=...` loi joka
-                // kutsulla uuden satunnais-id-rivin eikä persistoinut oikein.
-                // Tallenna UUID myös erilliseen `thread_uid`-string-kenttään, jotta
-                // `get_thread` voi hakea sen tavallisena kenttänä (record-id palautuu
-                // record-linkkinä, ei plain-stringinä — vrt. emotional_state.agent_id).
+                // Target the row with `type::record` so UPSERT updates the same row
+                // in place — a bare `UPSERT narrative_thread SET id=...` created a
+                // new random-id row on every call instead of persisting correctly.
+                // Also store the UUID in a separate `thread_uid` string field so
+                // `get_thread` can retrieve it as a plain field (the record id comes
+                // back as a record link, not a plain string — cf. emotional_state.agent_id).
                 let mut resp = db
                     .query(
                         "UPSERT type::record('narrative_thread', $id) SET thread_uid = $id, title = $title, participants = $participants, created_at = type::datetime($created_at)"
@@ -324,7 +324,7 @@ DEFINE FIELD decay_class ON anchor TYPE string;
                     .bind(("created_at", created_at))
                     .await
                     .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("SurrealDB upsert failed: {e}")))?;
-                // Statement-tason virheet eivät näy `.await`:ssa vaan `take_errors`:ssa.
+                // Statement-level errors don't surface in `.await` — they show up in `take_errors`.
                 let errors = resp.take_errors();
                 if !errors.is_empty() {
                     return Err(familyclaw_core::FamilyClawError::Memory(format!(
@@ -404,10 +404,10 @@ DEFINE FIELD decay_class ON anchor TYPE string;
             let agent_id = agent_id.to_string();
             let state = state.clamped();
             Box::pin(async move {
-                // Käytä eksplisiittistä record-id:tä (`emotional_state:<agent_id>`)
-                // `type::record`:lla, jotta UPSERT päivittää saman rivin paikallaan
-                // eikä luo uutta satunnais-id:tä joka kutsulla. `updated_at`
-                // asetetaan `time::now()`:lla (natiivi datetime, SCHEMAFULL-kenttä).
+                // Use an explicit record id (`emotional_state:<agent_id>`) via
+                // `type::record` so UPSERT updates the same row in place instead
+                // of creating a new random id on every call. `updated_at` is set
+                // via `time::now()` (a native datetime, SCHEMAFULL field).
                 let mut resp = db
                     .query(
                         "UPSERT type::record('emotional_state', $agent_id) SET agent_id = $agent_id, joy = $joy, sadness = $sadness, curiosity = $curiosity, anxiety = $anxiety, confidence = $confidence, affection = $affection, updated_at = time::now()"
@@ -421,8 +421,8 @@ DEFINE FIELD decay_class ON anchor TYPE string;
                     .bind(("affection", state.affection))
                     .await
                     .map_err(|e| familyclaw_core::FamilyClawError::Memory(format!("SurrealDB upsert failed: {e}")))?;
-                // Pinta lauseiden virheet (SCHEMAFULL-rikkomukset yms. eivät
-                // näy pelkässä `.await`:ssa vaan `take_errors`:ssa).
+                // Surface statement-level errors (SCHEMAFULL violations and the
+                // like don't show up in a plain `.await` — only in `take_errors`).
                 let errors = resp.take_errors();
                 if !errors.is_empty() {
                     return Err(familyclaw_core::FamilyClawError::Memory(format!(
@@ -443,10 +443,10 @@ DEFINE FIELD decay_class ON anchor TYPE string;
                     return Ok(());
                 }
 
-                // Rakenna YKSI query joka niputtaa kaikki agenttien UPSERTit
-                // yhteen transaktioon → yksi tietokantakierros N:n sijaan.
-                // Jokaiselle agentille indeksoidut bind-parametrit ($agent_0,
-                // $joy_0, ...) — ei string-interpolaatiota arvoihin (injektiosuoja).
+                // Build ONE query that bundles all per-agent UPSERTs into a
+                // single transaction → one database round trip instead of N.
+                // Each agent gets indexed bind parameters ($agent_0, $joy_0, ...)
+                // — no string interpolation of values (injection protection).
                 let mut sql = String::from("BEGIN TRANSACTION;\n");
                 for i in 0..states.len() {
                     use std::fmt::Write as _;
@@ -536,8 +536,8 @@ mod tests {
         assert!(store.is_ok(), "Should connect to mem://");
     }
 
-    /// Yksittäinen set/get round-trippaa oikein (todistaa että record-id +
-    /// `time::now()` -korjaus persistoi rivin — bare-UPSERT ei tehnyt).
+    /// A single set/get round-trips correctly (proves the record-id +
+    /// `time::now()` fix persists the row — a bare UPSERT did not).
     #[tokio::test]
     async fn surreal_emotional_state_single_roundtrip() {
         let store = SurrealHearthStore::connect("mem://")
@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(got, state, "single write must round-trip exactly");
     }
 
-    /// Toistuva set samalle agentille päivittää PAIKALLAAN — ei duplikaatteja.
+    /// A repeated set for the same agent updates IN PLACE — no duplicates.
     #[tokio::test]
     async fn surreal_repeated_set_updates_in_place() {
         let store = SurrealHearthStore::connect("mem://")
@@ -579,7 +579,7 @@ mod tests {
         }
         let got = store.get_emotional_state("agent_a").await.expect("get");
         assert!(approx(got.joy, 0.55), "last write wins");
-        // Tasan yksi agentti rekisterissä (ei satunnais-id-duplikaatteja).
+        // Exactly one agent in the registry (no random-id duplicates).
         let agents = store.list_agents_with_emotion().await.expect("list");
         assert_eq!(
             agents.iter().filter(|a| *a == "agent_a").count(),
@@ -588,7 +588,7 @@ mod tests {
         );
     }
 
-    /// Batch tuottaa saman lopputilan kuin per-agentti-kutsut samaan dataan.
+    /// A batch produces the same end state as per-agent calls on the same data.
     #[tokio::test]
     async fn surreal_batch_equals_per_agent() {
         let states = vec![
@@ -650,7 +650,7 @@ mod tests {
         assert_eq!(la, lb, "agent sets must match");
     }
 
-    /// Reunatapaus: 0 agenttia — no-op, ei virhettä, ei rivejä.
+    /// Edge case: 0 agents — no-op, no error, no rows.
     #[tokio::test]
     async fn surreal_batch_empty_is_noop() {
         let store = SurrealHearthStore::connect("mem://")
@@ -664,7 +664,7 @@ mod tests {
         assert!(agents.is_empty());
     }
 
-    /// Reunatapaus: 1 agentti batchissa.
+    /// Edge case: 1 agent in the batch.
     #[tokio::test]
     async fn surreal_batch_single_agent() {
         let store = SurrealHearthStore::connect("mem://")
@@ -682,7 +682,7 @@ mod tests {
         assert_eq!(got, state);
     }
 
-    /// Reunatapaus: batch olemassa olevan tilan päälle korvaa paikallaan.
+    /// Edge case: a batch over an existing state replaces it in place.
     #[tokio::test]
     async fn surreal_batch_overwrites_existing() {
         let store = SurrealHearthStore::connect("mem://")
@@ -733,7 +733,7 @@ mod tests {
         assert_eq!(agents.len(), 2);
     }
 
-    /// Batch clampaa arvot samoin kuin per-agentti-polku.
+    /// Batch clamps values the same way the per-agent path does.
     #[tokio::test]
     async fn surreal_batch_clamps() {
         let store = SurrealHearthStore::connect("mem://")
@@ -755,8 +755,8 @@ mod tests {
         assert!(approx(got.sadness, 0.0), "sadness clamped");
     }
 
-    /// Todistaa `set_thread`-korjauksen: thread persistoituu ja round-trippaa
-    /// oikein (aiempi bare-UPSERT + RFC3339-string-datetime esti persistoinnin).
+    /// Proves the `set_thread` fix: the thread persists and round-trips
+    /// correctly (the previous bare UPSERT + RFC3339 string datetime prevented persistence).
     #[tokio::test]
     async fn surreal_thread_roundtrip() {
         let store = SurrealHearthStore::connect("mem://")
@@ -779,8 +779,8 @@ mod tests {
         );
     }
 
-    /// Toistuva `set_thread` samalla id:llä päivittää saman rivin paikallaan,
-    /// ei luo duplikaatteja (bare-UPSERT loi joka kutsulla uuden satunnais-id-rivin).
+    /// A repeated `set_thread` with the same id updates the same row in place,
+    /// without creating duplicates (a bare UPSERT created a new random-id row on every call).
     #[tokio::test]
     async fn surreal_thread_set_updates_in_place() {
         let store = SurrealHearthStore::connect("mem://")

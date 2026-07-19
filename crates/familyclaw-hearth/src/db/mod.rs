@@ -1,9 +1,9 @@
-//! Tietokantakerros — [`HearthStore`]-trait ja [`InMemoryHearthStore`]-toteutus.
+//! Database layer — the [`HearthStore`] trait and the [`InMemoryHearthStore`] implementation.
 //!
-//! [`HearthStore`] laajentaa [`familyclaw_memory::MemoryStore`]-traittia
-//! narratiivisilla langoilla, jaetulla tunnetilalla ja ankkurituella.
-//! [`InMemoryHearthStore`] on kevyt oletustoteutus joka käärii
-//! minkä tahansa `MemoryStore`-toteutuksen.
+//! [`HearthStore`] extends the [`familyclaw_memory::MemoryStore`] trait
+//! with narrative threads, shared emotional state, and anchor support.
+//! [`InMemoryHearthStore`] is a lightweight default implementation that wraps
+//! any `MemoryStore` implementation.
 
 pub mod schema;
 #[cfg(feature = "surreal")]
@@ -18,24 +18,24 @@ use uuid::Uuid;
 use crate::emotional_state::EmotionalVector;
 use crate::narrative::{EventType, NarrativeThread, ThreadEvent};
 
-/// Delegoi `MemoryStore`-metodikutsun kääritylle `self.memory`-toteutukselle.
+/// Delegates a `MemoryStore` method call to the wrapped `self.memory` implementation.
 ///
-/// Poistaa toistuvan `self.memory.<method>(<args>)`-rungon
-/// [`InMemoryHearthStore`]:n `MemoryStore`-toteutuksesta.
+/// Removes the repetitive `self.memory.<method>(<args>)` boilerplate from
+/// [`InMemoryHearthStore`]'s `MemoryStore` implementation.
 macro_rules! delegate_memory_store {
     ($self:expr, $method:ident $(, $arg:expr)*) => {
         $self.memory.$method($($arg),*)
     };
 }
 
-/// Laajennettu tallennusabstraktio Hearthille.
+/// Extended storage abstraction for the Hearth.
 ///
-/// Laajentaa [`familyclaw_memory::MemoryStore`]:n narratiivisilla
-/// langoilla ja jaetulla tunnetilalla.
+/// Extends [`familyclaw_memory::MemoryStore`] with narrative threads
+/// and shared emotional state.
 pub trait HearthStore: familyclaw_memory::MemoryStore {
     // --- Narrative threads ---
 
-    /// Hakee narratiivisen langan.
+    /// Fetches a narrative thread.
     fn get_thread(
         &self,
         thread_id: Uuid,
@@ -43,19 +43,19 @@ pub trait HearthStore: familyclaw_memory::MemoryStore {
         Box<dyn std::future::Future<Output = Result<Option<NarrativeThread>>> + Send + '_>,
     >;
 
-    /// Tallentaa (luo tai korvaa) narratiivisen langan kokonaisuudessaan.
+    /// Stores (creates or replaces) a narrative thread in its entirety.
     ///
-    /// Tämä on alkeismetodi jonka päälle [`HearthStore::create_thread`] ja
-    /// [`HearthStore::add_thread_event`] rakentuvat (luku–muokkaus–kirjoitus).
+    /// This is the primitive method on top of which [`HearthStore::create_thread`]
+    /// and [`HearthStore::add_thread_event`] are built (read-modify-write).
     fn set_thread(
         &self,
         thread: NarrativeThread,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
-    /// Luo uuden narratiivisen langan.
+    /// Creates a new narrative thread.
     ///
-    /// Default-toteutus rakentuu [`HearthStore::set_thread`]:n päälle; toteuttaja
-    /// voi ohittaa sen tehokkaammalla versiolla.
+    /// The default implementation is built on top of [`HearthStore::set_thread`];
+    /// implementers may override it with a more efficient version.
     fn create_thread(
         &self,
         title: &str,
@@ -69,11 +69,11 @@ pub trait HearthStore: familyclaw_memory::MemoryStore {
         })
     }
 
-    /// Lisää tapahtuman lankaan.
+    /// Adds an event to the thread.
     ///
-    /// Default-toteutus tekee luku–muokkaus–kirjoitus-syklin
-    /// [`HearthStore::get_thread`]:n ja [`HearthStore::set_thread`]:n kautta;
-    /// toteuttaja voi ohittaa sen tehokkaammalla versiolla.
+    /// The default implementation performs a read-modify-write cycle via
+    /// [`HearthStore::get_thread`] and [`HearthStore::set_thread`];
+    /// implementers may override it with a more efficient version.
     fn add_thread_event(
         &self,
         thread_id: Uuid,
@@ -97,35 +97,36 @@ pub trait HearthStore: familyclaw_memory::MemoryStore {
 
     // --- Emotional state ---
 
-    /// Hakee agentin tunnetilan.
+    /// Fetches an agent's emotional state.
     fn get_emotional_state(
         &self,
         agent_id: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<EmotionalVector>> + Send + '_>>;
 
-    /// Asettaa agentin tunnetilan.
+    /// Sets an agent's emotional state.
     fn set_emotional_state(
         &self,
         agent_id: &str,
         state: EmotionalVector,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
-    /// Asettaa monen agentin tunnetilat kerralla (batch).
+    /// Sets emotional states for multiple agents at once (batch).
     ///
-    /// Tämä on semanttisesti identtinen sen kanssa että kutsuisi
-    /// [`HearthStore::set_emotional_state`]:ta jokaiselle `(agent_id, state)`
-    /// -parille — sama lopputila — mutta toteuttaja voi persistoida ne
-    /// **yhdellä tietokantakierroksella** (yksi transaktio / yksi query)
-    /// N erillisen sijaan.
+    /// This is semantically identical to calling
+    /// [`HearthStore::set_emotional_state`] for each `(agent_id, state)`
+    /// pair — same end state — but implementers may persist them in
+    /// **a single database round trip** (one transaction / one query)
+    /// instead of N separate ones.
     ///
-    /// Default-toteutus delegoi per-agentti-kutsuihin, jotta olemassa olevat
-    /// [`HearthStore`]-toteutukset toimivat muuttumatta; tehokas backend
-    /// (esim. `SurrealDB`) ohittaa tämän niputetulla versiolla.
+    /// The default implementation delegates to the per-agent calls so that
+    /// existing [`HearthStore`] implementations keep working unchanged; an
+    /// efficient backend (e.g. `SurrealDB`) overrides this with a bundled
+    /// version.
     ///
     /// # Errors
-    /// Palauttaa virheen jos jonkin tunnetilan tallennus epäonnistuu.
-    /// Virhetilanteessa osa tiloista on voitu jo kirjoittaa (kuten
-    /// per-agentti-silmukassakin).
+    /// Returns an error if storing any of the states fails.
+    /// On error, some states may already have been written (same as
+    /// in the per-agent loop).
     fn set_emotional_states_batch(
         &self,
         states: Vec<(String, EmotionalVector)>,
@@ -138,28 +139,28 @@ pub trait HearthStore: familyclaw_memory::MemoryStore {
         })
     }
 
-    /// Listaa kaikki agentit joilla on tunnetila.
+    /// Lists all agents that have an emotional state.
     fn list_agents_with_emotion(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send + '_>>;
 }
 
-/// Kevyt muistinvarainen toteutus — käärii minkä tahansa `MemoryStore`:n.
+/// Lightweight in-memory implementation — wraps any `MemoryStore`.
 ///
-/// Pitää narratiiviset langat ja tunnetilat muistissa `RwLock`-suojattuna.
-/// Soveltuu kehitykseen ja testaukseen; tuotantokäyttöön suositellaan
-/// SurrealDB-pohjaista toteutusta.
+/// Keeps narrative threads and emotional states in memory, guarded by an
+/// `RwLock`. Suitable for development and testing; a SurrealDB-backed
+/// implementation is recommended for production use.
 pub struct InMemoryHearthStore<M: familyclaw_memory::MemoryStore> {
-    /// Kääritty MemoryStore-toteutus.
+    /// The wrapped `MemoryStore` implementation.
     memory: M,
-    /// Narratiiviset langat (`thread_id` → thread).
+    /// Narrative threads (`thread_id` -> thread).
     threads: RwLock<HashMap<Uuid, NarrativeThread>>,
-    /// Agenttien tunnetilat (`agent_id` → state).
+    /// Agents' emotional states (`agent_id` -> state).
     emotional_states: RwLock<HashMap<String, EmotionalVector>>,
 }
 
 impl<M: familyclaw_memory::MemoryStore> InMemoryHearthStore<M> {
-    /// Luo uuden InMemoryHearthStore:n annetulla MemoryStore-toteutuksella.
+    /// Creates a new `InMemoryHearthStore` with the given `MemoryStore` implementation.
     #[must_use]
     pub fn new(memory: M) -> Self {
         Self {
@@ -352,7 +353,7 @@ impl<M: familyclaw_memory::MemoryStore + Send + Sync> HearthStore for InMemoryHe
         states: Vec<(String, EmotionalVector)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            // Yksi lukituksen otto koko batchille per-agentti-lukkojen sijaan.
+            // Take the lock once for the whole batch instead of per-agent locking.
             let mut guard = self.emotional_states.write().await;
             for (agent_id, state) in states {
                 guard.insert(agent_id, state.clamped());
@@ -419,7 +420,7 @@ mod tests {
         assert!(agents.contains(&"agent_a".to_string()));
     }
 
-    /// Batch-päivitys tuottaa saman lopputilan kuin per-agentti-kutsut.
+    /// A batch update produces the same end state as per-agent calls.
     #[tokio::test]
     async fn batch_equals_per_agent_updates() {
         let states = vec![
@@ -458,7 +459,7 @@ mod tests {
             ),
         ];
 
-        // Store 1: per-agentti (referenssi).
+        // Store 1: per-agent (reference).
         let per_agent = InMemoryHearthStore::new(LocalJsonStore::in_memory());
         for (agent, state) in &states {
             HearthStore::set_emotional_state(&per_agent, agent, *state)
@@ -467,12 +468,13 @@ mod tests {
         }
 
         // Store 2: batch.
+
         let batch = InMemoryHearthStore::new(LocalJsonStore::in_memory());
         HearthStore::set_emotional_states_batch(&batch, states.clone())
             .await
             .expect("set batch");
 
-        // Molemmilla oltava identtinen tila jokaiselle agentille.
+        // Both stores must have an identical state for every agent.
         for (agent, _) in &states {
             let a = HearthStore::get_emotional_state(&per_agent, agent)
                 .await
@@ -483,7 +485,7 @@ mod tests {
             assert_eq!(a, b, "state mismatch for {agent}");
         }
 
-        // Molemmilla sama agenttijoukko.
+        // Both stores must have the same set of agents.
         let mut agents_a = HearthStore::list_agents_with_emotion(&per_agent)
             .await
             .expect("list per-agent");
@@ -495,7 +497,7 @@ mod tests {
         assert_eq!(agents_a, agents_b);
     }
 
-    /// Reunatapaus: 0 agenttia — no-op, ei virhettä eikä rivejä.
+    /// Edge case: 0 agents — no-op, no error, no rows.
     #[tokio::test]
     async fn batch_empty_is_noop() {
         let store = InMemoryHearthStore::new(LocalJsonStore::in_memory());
@@ -508,7 +510,7 @@ mod tests {
         assert!(agents.is_empty());
     }
 
-    /// Reunatapaus: 1 agentti.
+    /// Edge case: 1 agent.
     #[tokio::test]
     async fn batch_single_agent() {
         let store = InMemoryHearthStore::new(LocalJsonStore::in_memory());
@@ -525,11 +527,11 @@ mod tests {
         assert!((got.joy - 0.9).abs() < f64::EPSILON);
     }
 
-    /// Reunatapaus: batch-päivitys olemassa olevan tilan päälle korvaa sen.
+    /// Edge case: a batch update over an existing state replaces it.
     #[tokio::test]
     async fn batch_overwrites_existing() {
         let store = InMemoryHearthStore::new(LocalJsonStore::in_memory());
-        // Alkuperäinen tila.
+        // Initial state.
         HearthStore::set_emotional_state(
             &store,
             "agent_a",
@@ -541,7 +543,7 @@ mod tests {
         .await
         .expect("initial set");
 
-        // Batch korvaa agent_a:n + lisää agent_b:n.
+        // Batch replaces agent_a + adds agent_b.
         HearthStore::set_emotional_states_batch(
             &store,
             vec![
@@ -573,7 +575,7 @@ mod tests {
         assert!((a.joy - 0.95).abs() < f64::EPSILON, "agent_a overwritten");
         assert!((b.joy - 0.3).abs() < f64::EPSILON, "agent_b inserted");
 
-        // Ei duplikaatteja: agent_a esiintyy tasan kerran.
+        // No duplicates: agent_a appears exactly once.
         let agents = HearthStore::list_agents_with_emotion(&store)
             .await
             .expect("list");
@@ -581,7 +583,7 @@ mod tests {
         assert_eq!(agents.len(), 2);
     }
 
-    /// Batch clampaa arvot samoin kuin per-agentti-kutsu.
+    /// Batch clamps values the same way a per-agent call does.
     #[tokio::test]
     async fn batch_clamps_like_per_agent() {
         let store = InMemoryHearthStore::new(LocalJsonStore::in_memory());

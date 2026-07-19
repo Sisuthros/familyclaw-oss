@@ -1,19 +1,19 @@
-//! Lippulaiva-taito: allowlistattu komentorivin suoritus (KERROS A).
+//! Flagship skill: allowlisted command-line execution (Layer A).
 //!
-//! [`ShellExec`] suorittaa yhden komentorivikomennon rajatulla työhakemistolla.
-//! Hermes-tyylinen **kovaa estoa** ei voi ohittaa millään tilalla (`manual` /
-//! `smart` / `off`). Kolme tilaa ([`ShellMode`]) määrätään ympäristöstä
+//! [`ShellExec`] executes a single command-line command with a restricted working
+//! directory. The Hermes-style **hard block** cannot be bypassed by any mode (`manual` /
+//! `smart` / `off`). Three modes ([`ShellMode`]) are determined by the environment
 //! (`FAMILYCLAW_SHELL_MODE`):
 //!
-//! - **manual** (oletus): [`ApprovalPolicy::AlwaysRequireApproval`] — kaikki
-//!   sallitut komennot vaativat hyväksynnän.
-//! - **smart**: turvalliset vain-luku-komennot (`ls`, `dir`, `echo`, `pwd`, …)
-//!   ajavat automaattisesti ([`ActionRisk::ReadOnly`] +
-//!   [`ApprovalPolicy::AutoIfReadOnly`]); muut hylätään tai vaativat hyväksynnän.
-//! - **off**: hylkää kaikki komennot (taito rekisteröityy mutta ei suorita).
+//! - **manual** (default): [`ApprovalPolicy::AlwaysRequireApproval`] — all
+//!   allowed commands require approval.
+//! - **smart**: safe read-only commands (`ls`, `dir`, `echo`, `pwd`, …)
+//!   run automatically ([`ActionRisk::ReadOnly`] +
+//!   [`ApprovalPolicy::AutoIfReadOnly`]); others are rejected or require approval.
+//! - **off**: rejects all commands (the skill is registered but does not execute).
 //!
-//! Työhakemisto rajataan [`ShellExecConfig::cwd_allowlist`]:lla
-//! (`FAMILYCLAW_SHELL_CWD_ALLOWLIST`, puolipiste-eroteltu). Tyhjä allowlist =
+//! The working directory is restricted via [`ShellExecConfig::cwd_allowlist`]
+//! (`FAMILYCLAW_SHELL_CWD_ALLOWLIST`, semicolon-separated). An empty allowlist =
 //! fail-closed.
 
 use std::path::{Path, PathBuf};
@@ -31,36 +31,36 @@ use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 
 use super::Skill;
 
-/// Taidon kiinteä tunniste.
+/// Fixed identifier of the skill.
 const SKILL_UUID: uuid::Uuid = uuid::uuid!("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
 
-/// Oletus-aikakatkaisu sekunteina.
+/// Default timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
-/// Tulosteen enimmäispituus todisteessa (tavuina per virta).
+/// Maximum output length in the evidence record (bytes per stream).
 const OUTPUT_MAX_BYTES: usize = 4_096;
 
-/// Ympäristömuuttuja: `manual` | `smart` | `off`.
+/// Environment variable: `manual` | `smart` | `off`.
 pub const ENV_SHELL_MODE: &str = "FAMILYCLAW_SHELL_MODE";
 
-/// Ympäristömuuttuja: puolipiste-eroteltu työhakemisto-allowlist.
+/// Environment variable: semicolon-separated working-directory allowlist.
 pub const ENV_CWD_ALLOWLIST: &str = "FAMILYCLAW_SHELL_CWD_ALLOWLIST";
 
-/// Suoritustila (`FAMILYCLAW_SHELL_MODE`).
+/// Execution mode (`FAMILYCLAW_SHELL_MODE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellMode {
-    /// Kaikki sallitut komennot vaativat hyväksynnän (oletus).
+    /// All allowed commands require approval (default).
     #[default]
     Manual,
-    /// Vain turvalliset read-only-komennot ajavat automaattisesti.
+    /// Only safe read-only commands run automatically.
     Smart,
-    /// Hylkää kaikki komennot.
+    /// Rejects all commands.
     Off,
 }
 
 impl ShellMode {
-    /// Jäsentää tilan merkkijonosta (case-insensitive).
+    /// Parses the mode from a string (case-insensitive).
     #[must_use]
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -71,7 +71,7 @@ impl ShellMode {
     }
 }
 
-/// Kokoonpano: tila, työhakemisto-allowlist ja aikakatkaisu.
+/// Configuration: mode, working-directory allowlist and timeout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellExecConfig {
     mode: ShellMode,
@@ -90,13 +90,13 @@ impl Default for ShellExecConfig {
 }
 
 impl ShellExecConfig {
-    /// Luo oletuskokoonpano (manual, tyhjä allowlist = fail-closed).
+    /// Creates the default configuration (manual, empty allowlist = fail-closed).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Lukee kokoonpanon ympäristöstä.
+    /// Reads the configuration from the environment.
     #[must_use]
     pub fn from_env() -> Self {
         let mode = std::env::var(ENV_SHELL_MODE)
@@ -119,64 +119,64 @@ impl ShellExecConfig {
         }
     }
 
-    /// Asettaa tilan (rakentaja).
+    /// Sets the mode (builder).
     #[must_use]
     pub fn mode(mut self, mode: ShellMode) -> Self {
         self.mode = mode;
         self
     }
 
-    /// Lisää sallitun työhakemiston juuren (rakentaja).
+    /// Adds an allowed working-directory root (builder).
     #[must_use]
     pub fn allow_cwd(mut self, root: impl Into<PathBuf>) -> Self {
         self.cwd_allowlist.push(root.into());
         self
     }
 
-    /// Asettaa aikakatkaisun sekunteina (rakentaja).
+    /// Sets the timeout in seconds (builder).
     #[must_use]
     pub fn timeout_secs(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
         self
     }
 
-    /// Nykyinen tila.
+    /// The current mode.
     #[must_use]
     pub const fn shell_mode(&self) -> ShellMode {
         self.mode
     }
 
-    /// Sallittujen työhakemistojuuren lukumäärä.
+    /// Number of allowed working-directory roots.
     #[must_use]
     pub fn cwd_root_count(&self) -> usize {
         self.cwd_allowlist.len()
     }
 }
 
-/// Syöte: suoritettava komento ja valinnainen työhakemisto.
+/// Input: the command to execute and an optional working directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellExecInput {
-    /// Komentorivikomento (yksi rivi).
+    /// Command-line command (single line).
     pub command: String,
-    /// Valinnainen työhakemisto (kanonisoidaan; on pysyttävä allowlistin alla).
+    /// Optional working directory (will be canonicalized; must remain under the allowlist).
     #[serde(default)]
     pub cwd: Option<String>,
 }
 
-/// Tulos: poistumiskoodi ja typistetyt virtaukset.
+/// Result: exit code and truncated streams.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellExecOutput {
-    /// Prosessin poistumiskoodi (`-1` aikakatkaisussa).
+    /// Process exit code (`-1` on timeout).
     pub exit_code: i32,
-    /// Typistetty stdout (enintään 4 KiB).
+    /// Truncated stdout (at most 4 KiB).
     pub stdout_summary: String,
-    /// Typistetty stderr (enintään 4 KiB).
+    /// Truncated stderr (at most 4 KiB).
     pub stderr_summary: String,
-    /// Totta jos komento ylitti aikakatkaisun.
+    /// True if the command exceeded the timeout.
     pub timed_out: bool,
 }
 
-/// Allowlistattu komentorivin suoritus Hermes-tyylisellä kovalla estolistalla.
+/// Allowlisted command-line execution with a Hermes-style hard blocklist.
 #[derive(Debug, Clone)]
 pub struct ShellExec {
     config: ShellExecConfig,
@@ -189,7 +189,7 @@ impl Default for ShellExec {
 }
 
 impl ShellExec {
-    /// Luo taidon oletuskokoonpanolla (manual, fail-closed allowlist).
+    /// Creates the skill with the default configuration (manual, fail-closed allowlist).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -197,21 +197,21 @@ impl ShellExec {
         }
     }
 
-    /// Luo taidon annetulla kokoonpanolla.
+    /// Creates the skill with the given configuration.
     #[must_use]
     pub fn with_config(config: ShellExecConfig) -> Self {
         Self { config }
     }
 
-    /// Taidon kiinteä tunniste.
+    /// Fixed identifier of the skill.
     #[must_use]
     pub fn skill_id() -> SkillId {
         SkillId::from_uuid(SKILL_UUID)
     }
 
-    /// Hermes-tyylinen kovaa esto — ei ohitettavissa millään tilalla.
+    /// Hermes-style hard block — not bypassable by any mode.
     ///
-    /// Palauttaa estosyyn jos komento on kielletty.
+    /// Returns the block reason if the command is forbidden.
     #[must_use]
     pub fn detect_hardline_block(command: &str) -> Option<&'static str> {
         let normalized = normalize_for_detection(command);
@@ -254,26 +254,29 @@ impl ShellExec {
         let roots = canonicalize_roots(&self.config.cwd_allowlist);
         if roots.is_empty() {
             return Err(ActionError::PolicyDenied(
-                "ei sallittuja työhakemistoja — kaikki komennot hylätään (fail-closed)".to_string(),
+                "no allowed working directories — all commands are rejected (fail-closed)"
+                    .to_string(),
             ));
         }
 
         let cwd = match requested {
             Some(path) => PathBuf::from(path),
             None => std::env::current_dir().map_err(|e| {
-                ActionError::PolicyDenied(format!("työhakemistoa ei voi ratkaista: {e}"))
+                ActionError::PolicyDenied(format!("cannot resolve working directory: {e}"))
             })?,
         };
 
         let canonical = std::fs::canonicalize(&cwd).map_err(|e| {
-            ActionError::PolicyDenied(format!("työhakemistoa ei voi kanonisoida (hylätty): {e}"))
+            ActionError::PolicyDenied(format!(
+                "cannot canonicalize working directory (rejected): {e}"
+            ))
         })?;
 
         if path_is_under_any(&canonical, &roots) {
             Ok(canonical)
         } else {
             Err(ActionError::PolicyDenied(
-                "työhakemisto on allowlistin ulkopuolella (hylätty)".to_string(),
+                "working directory is outside the allowlist (rejected)".to_string(),
             ))
         }
     }
@@ -281,27 +284,27 @@ impl ShellExec {
     fn gate_command(&self, command: &str) -> Result<()> {
         if self.config.mode == ShellMode::Off {
             return Err(ActionError::PolicyDenied(
-                "shell_exec on pois päältä (FAMILYCLAW_SHELL_MODE=off)".to_string(),
+                "shell_exec is turned off (FAMILYCLAW_SHELL_MODE=off)".to_string(),
             ));
         }
 
         if let Some(reason) = Self::detect_hardline_block(command) {
             return Err(ActionError::PolicyDenied(format!(
-                "hardline blocklist: {reason} (ei ohitettavissa)"
+                "hardline blocklist: {reason} (not bypassable)"
             )));
         }
 
         if self.config.mode == ShellMode::Smart {
-            // TURVAKORJAUS 2026-07-09 (audit-löytö [3], oli LIVE agenttituotannossa):
-            // is_safe_readonly validoi ENNEN vain komennon nimen, ei argumentteja —
-            // esim. `cat /etc/passwd` / `head ~/.ssh/id_rsa` ajettiin ilman hyväksyntää
-            // koska cat/head olivat sallittujen listalla, vaikka cwd-allowlist rajaa vain
-            // työhakemiston. Nyt tiedostoja lukevat komennot (cat/head/tail/type/ls/dir/gci)
-            // saavat tiedostoargumentteja VAIN allowlistin sisältä.
+            // SECURITY FIX 2026-07-09 (audit finding [3], was LIVE in agent production):
+            // is_safe_readonly previously validated only the command name, not the arguments —
+            // e.g. `cat /etc/passwd` / `head ~/.ssh/id_rsa` ran without approval
+            // because cat/head were on the allowed list, even though the cwd allowlist only
+            // restricts the working directory. Now commands that read files (cat/head/tail/type/ls/dir/gci)
+            // may only receive file arguments from inside the allowlist.
             let roots = canonicalize_roots(&self.config.cwd_allowlist);
             if !is_safe_readonly_command(command, &roots) {
                 return Err(ActionError::PolicyDenied(
-                    "smart-tilassa vain turvalliset read-only-komennot allowlistin sisällä sallitaan automaattisesti"
+                    "in smart mode only safe read-only commands inside the allowlist are auto-allowed"
                         .to_string(),
                 ));
             }
@@ -319,9 +322,9 @@ impl ShellExec {
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
 
-        let child = cmd.spawn().map_err(|e| {
-            ActionError::ExecutionFailed(format!("komentoa ei voitu käynnistää: {e}"))
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| ActionError::ExecutionFailed(format!("could not start command: {e}")))?;
 
         let wait_result = tokio::time::timeout(timeout, child.wait_with_output()).await;
 
@@ -333,7 +336,7 @@ impl ShellExec {
                 timed_out: true,
             }),
             Ok(Err(e)) => Err(ActionError::ExecutionFailed(format!(
-                "komennon suoritus epäonnistui: {e}"
+                "command execution failed: {e}"
             ))),
             Ok(Ok(output)) => {
                 let exit_code = output.status.code().unwrap_or(-1);
@@ -374,17 +377,17 @@ fn path_is_under_any(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 
-/// Normalisoi komennon tunnistusta varten (Hermes-tyylinen obfuskaation purku).
+/// Normalizes the command for detection purposes (Hermes-style de-obfuscation).
 fn normalize_for_detection(command: &str) -> String {
     let mut s = command.to_string();
-    // Unicode NFKC (yksinkertaistettu: vain ascii-lowercase + whitespace).
+    // Unicode NFKC (simplified: only ascii-lowercase + whitespace).
     s = s.to_ascii_lowercase();
-    // Poista backslash-pakenemiset: r\m -> rm
+    // Remove backslash escapes: r\m -> rm
     s = s.replace('\\', "");
-    // Tyhjät lainausmerkit: r''m -> rm
+    // Empty quotes: r''m -> rm
     s = s.replace("''", "");
     s = s.replace("\"\"", "");
-    // Moninkertainen whitespace yhdeksi.
+    // Collapse multiple whitespace into one.
     let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed
 }
@@ -471,7 +474,7 @@ fn is_catastrophic_rm_target(target: &str) -> bool {
 }
 
 /// Hard-block a NAMED user-home root and its immediate contents — the gap the
-/// literal `matches!` list missed (e.g. `rm -rf /home/operator`, `/Users/the operator`).
+/// literal `matches!` list missed (e.g. `rm -rf /home/operator`, `/Users/operator`).
 /// Wiping a whole user home is exactly the reported destructive-agent incident.
 /// We block the home root and its top-level sweep (`/home/operator`, `/home/operator/*`)
 /// but deliberately allow deeper, more specific paths (`/home/operator/project/build`)
@@ -622,9 +625,9 @@ fn command_basename(token: &str) -> &str {
     token.rsplit(['/', '\\']).next().unwrap_or(token)
 }
 
-/// Komennot jotka lukevat tiedoston argumentista → tiedostoargumentit on
-/// rajattava cwd-allowlistiin (muuten `cat /etc/passwd` vuotaisi mielivaltaisen
-/// tiedoston smart-tilassa ilman hyväksyntää).
+/// Commands that read a file from an argument → file arguments must be
+/// restricted to the cwd allowlist (otherwise `cat /etc/passwd` would leak an arbitrary
+/// file in smart mode without approval).
 fn reads_file_args(base: &str) -> bool {
     matches!(
         base,
@@ -632,16 +635,16 @@ fn reads_file_args(base: &str) -> bool {
     )
 }
 
-/// Turvalliset read-only-komennot smart-tilassa (koko ketju).
-/// `roots` = kanonisoidut cwd-allowlist-juuret; tiedostoargumentit on pysyttävä
-/// niiden alla tiedostoja lukeville komennoille.
+/// Safe read-only commands in smart mode (the whole chain).
+/// `roots` = canonicalized cwd-allowlist roots; file arguments must remain
+/// under them for commands that read files.
 fn is_safe_readonly_command(command: &str, roots: &[PathBuf]) -> bool {
     if command.contains('>') || command.contains('<') || command.contains('|') {
         return false;
     }
-    // Normalisoitu (lowercase, backslashit poistettu) komennon-nimen/blocklist-
-    // logiikkaan; ALKUPERÄINEN polkuvalidointiin (normalize rikkoo Windows-polut:
-    // C:\Users\... -> c:users...). Segmentoidaan molemmat ja pariutetaan indeksillä.
+    // Normalized (lowercase, backslashes removed) is used for the command-name/blocklist
+    // logic; the ORIGINAL is used for path validation (normalize breaks Windows paths:
+    // C:\Users\... -> c:users...). Both are segmented and paired by index.
     let norm_segments = split_command_segments(&normalize_for_detection(command));
     let raw_segments = split_command_segments(command);
     for (i, segment) in norm_segments.iter().enumerate() {
@@ -658,7 +661,7 @@ fn segment_is_safe_readonly(segment: &str, raw_segment: &str, roots: &[PathBuf])
     if tokens.is_empty() {
         return false;
     }
-    // Ohita wrapperit (ei sallita sudo/env smart-autossa).
+    // Skip wrappers (sudo/env are not allowed in smart-auto).
     if tokens.iter().any(|t| {
         matches!(
             command_basename(t),
@@ -691,22 +694,22 @@ fn segment_is_safe_readonly(segment: &str, raw_segment: &str, roots: &[PathBuf])
     if !base_ok {
         return false;
     }
-    // TURVAKORJAUS 2026-07-09: tiedostoja lukevat komennot saavat tiedosto-
-    // argumentteja VAIN allowlistin sisältä. Ei-tiedosto-tokenit (liput kuten -la,
-    // numeeriset kuten `tail -n 5`) sallitaan; tiedostopolut validoidaan roots-alle.
+    // SECURITY FIX 2026-07-09: commands that read files may receive file
+    // arguments ONLY from inside the allowlist. Non-file tokens (flags like -la,
+    // numeric ones like `tail -n 5`) are allowed; file paths are validated against roots.
     if reads_file_args(base) {
-        // Käytä ALKUPERÄISIÄ argumentteja (raw_segment) — normalisoitu segment on
-        // lowercasattu + backslashit poistettu, mikä rikkoo Windows-polut.
+        // Use the ORIGINAL arguments (raw_segment) — the normalized segment is
+        // lowercased + backslashes removed, which breaks Windows paths.
         let raw_tokens: Vec<&str> = raw_segment.split_whitespace().collect();
         for arg in raw_tokens.iter().skip(1) {
-            // Ohita liput ja pelkät numerot (esim. `head -n 20`, `tail -5`).
+            // Skip flags and plain numbers (e.g. `head -n 20`, `tail -5`).
             if arg.starts_with('-') || arg.chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
-            // Tiedostoargumentti: on kanonisoiduttava allowlistin alle.
+            // File argument: must canonicalize to under the allowlist.
             match std::fs::canonicalize(arg) {
                 Ok(p) if path_is_under_any(&p, roots) => {}
-                // Ei kanonisoidu (ei ole vielä olemassa) TAI ei allowlistissa → estä.
+                // Does not canonicalize (does not yet exist) OR is not in the allowlist → block.
                 _ => return false,
             }
         }
@@ -814,9 +817,10 @@ impl Skill for ShellExec {
             id: Self::skill_id(),
             name: "shell_exec".to_string(),
             version: "1.0.0".to_string(),
-            description: "Suorittaa yhden komentorivikomennon allowlistatulla työhakemistolla; \
-                 Hermes-tyylinen kovaa esto; tilat manual/smart/off (FAMILYCLAW_SHELL_MODE)."
-                .to_string(),
+            description:
+                "Executes a single command-line command with an allowlisted working directory; \
+                 Hermes-style hard block; modes manual/smart/off (FAMILYCLAW_SHELL_MODE)."
+                    .to_string(),
             permissions: vec![SkillPermission::ExecuteCode],
             risk,
             approval_policy,
@@ -829,11 +833,11 @@ impl Skill for ShellExec {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Suoritettava komentorivikomento (yksi rivi)."
+                        "description": "The command-line command to execute (single line)."
                     },
                     "cwd": {
                         "type": "string",
-                        "description": "Valinnainen työhakemisto (kanonisoidaan; allowlistin alla)."
+                        "description": "Optional working directory (will be canonicalized; under the allowlist)."
                     }
                 },
                 "required": ["command"],
@@ -915,7 +919,7 @@ mod tests {
         for cmd in [
             "rm -rf /home/operator",
             "rm -rf /home/operator/*",
-            "rm -rf /Users/the operator",
+            "rm -rf /Users/operator",
             "rm -rf /root/subuser",
         ] {
             assert!(
@@ -956,7 +960,7 @@ mod tests {
 
     #[test]
     fn safe_readonly_allows_ls_echo_pwd() {
-        // Ei-tiedosto-komennot ja pelkät liput ok ilman allowlistia.
+        // Non-file commands and plain flags are ok without an allowlist.
         let no_roots: &[PathBuf] = &[];
         assert!(is_safe_readonly_command("echo hello", no_roots));
         assert!(is_safe_readonly_command("pwd", no_roots));
@@ -972,13 +976,13 @@ mod tests {
 
     #[test]
     fn safe_readonly_blocks_file_read_outside_allowlist() {
-        // TURVAKORJAUS 2026-07-09 (audit [3]): cat/head/tail/ls tiedostoargumentit
-        // ON pysyttävä cwd-allowlistin sisällä. Ilman tätä `cat /etc/passwd` ajettiin
-        // smart-tilassa ilman hyväksyntää.
+        // SECURITY FIX 2026-07-09 (audit [3]): cat/head/tail/ls file arguments
+        // MUST remain inside the cwd allowlist. Without this, `cat /etc/passwd` ran
+        // in smart mode without approval.
         let dir = temp_dir("shellsafe");
         let roots = canonicalize_roots(std::slice::from_ref(&dir));
 
-        // Tiedosto allowlistin sisällä → sallittu.
+        // File inside the allowlist → allowed.
         let inside = dir.join("ok.txt");
         std::fs::write(&inside, b"hello").unwrap();
         let inside_cmd = format!("cat {}", inside.to_string_lossy());
@@ -987,7 +991,7 @@ mod tests {
             "allowlistin sisäinen tiedosto pitäisi sallia"
         );
 
-        // Tiedosto allowlistin ULKOPUOLELLA → estetty (aiemmin: LÄPI).
+        // File OUTSIDE the allowlist → blocked (previously: passed through).
         #[cfg(unix)]
         assert!(
             !is_safe_readonly_command("cat /etc/passwd", &roots),
@@ -997,7 +1001,7 @@ mod tests {
             !is_safe_readonly_command("head ../../secret.txt", &roots),
             "allowlistin ulkopuolinen head EI saa läpäistä"
         );
-        // Liput ja numerot ilman tiedostoa ok (head -n 5 ilman polkua).
+        // Flags and numbers without a file are ok (head -n 5 without a path).
         assert!(is_safe_readonly_command("date", &roots));
     }
 
@@ -1103,7 +1107,7 @@ mod tests {
 
     #[test]
     fn from_env_reads_mode() {
-        // Vain smoke: from_env ei kaadu ilman muuttujia.
+        // Smoke test only: from_env does not crash without environment variables.
         let cfg = ShellExecConfig::from_env();
         assert_eq!(cfg.shell_mode(), ShellMode::Manual);
     }

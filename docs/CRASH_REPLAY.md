@@ -1,7 +1,7 @@
-# Crash Replay Demo
+# Crash Replay
 **Proving Durable Execution Survives Process Death**
 
-This demo demonstrates FamilyClaw's killer feature: **deterministic replay** — kill the process mid-work, restart, and work resumes exactly where it stopped with side effects NOT re-run, and memory SURVIVES.
+This document describes FamilyClaw's killer feature: **deterministic replay** — kill the process mid-work, restart, and work resumes exactly where it stopped with side effects NOT re-run, and memory SURVIVES.
 
 ## What It Proves
 
@@ -35,28 +35,31 @@ The demo binary (`cargo run -p familyclaw-agent --bin familyclaw`) already prove
 
 **The full crash-replay proof requires `FileJournal` + persistent memory store**, which is Phase 1+ work. The living seed demo (Phase 0) uses in-memory for simplicity.
 
-## Future: True Crash Replay Script
+## Reproduce it: the real crash-replay binary
+
+The two-process proof described above is not hypothetical — it ships today as
+`crash_replay` (`crates/familyclaw-agent/src/bin/crash_replay.rs`) and the
+wrapper script `scripts/demo-crash-replay.sh`:
 
 ```bash
-# This would be the full crash-replay proof (Phase 1+)
-# ./scripts/crash-replay-proof.sh
-#
-# 1. Start agents with FileJournal + file-based memory
-# 2. agent_a sends "deploy key is blue-raven"
-# 3. agent_b receives and stores in memory
-# 4. KILL process (SIGKILL)
-# 5. Restart
-# 6. Query agent_b: "What did agent_a tell you?"
-# 7. agent_b answers: "blue-raven"
-# 8. Show journal log proving no double-execution
+cargo run -p familyclaw-agent --bin crash_replay -- reset
+cargo run -p familyclaw-agent --bin crash_replay -- write
+cargo run -p familyclaw-agent --bin crash_replay -- verify
+
+# Or use the script
+bash scripts/demo-crash-replay.sh
 ```
+
+See the [README Quick Start](../README.md#quick-start) and
+[QUICKSTART.md](QUICKSTART.md) for the full command sequence, and
+[SCORECARD.md](SCORECARD.md) for the deterministic crash-matrix results.
 
 ## Current Status
 
 - ✅ `familyclaw-durable` crate: Journal trait, InMemoryJournal, execution wrapper
 - ✅ `familyclaw-memory` crate: Eternal Thread, Ebbinghaus decay, identity anchors
 - ✅ `familyclaw-agent`: Composes both, demo proves memory + emotion + dream
-- 🔄 **Next**: FileJournal implementation + integration test for crash-replay
+- ✅ `FileJournal` implementation + `crash_replay` binary proving the full two-process crash-replay
 
 ---
 

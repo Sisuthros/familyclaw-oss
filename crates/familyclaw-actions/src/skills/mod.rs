@@ -1,43 +1,44 @@
-//! Taidot ja niiden yhteinen putki (KERROS A, OSS).
+//! Skills and their shared pipeline (Layer A, OSS).
 //!
-//! Tämä alimoduuli kokoaa taidot ([`Skill`]) sekä putken ([`Pipeline`]), joka
-//! ajaa koko toimintopinon:
+//! This submodule assembles the skills ([`Skill`]) and the pipeline
+//! ([`Pipeline`]) that runs the whole action stack:
 //!
 //! ```text
-//! observe → plan → request approval (jos tarpeen) → execute action
+//! observe → plan → request approval (if needed) → execute action
 //!         → verify → persist proof → remember → report
 //! ```
 //!
-//! Taitoja on kahdenlaisia. **Kaksi aitoa referenssitaitoa** tekevät oikeaa
-//! työtä koko putken läpi: [`FsReadAllowlisted`] lukee paikallisen tiedoston
-//! allowlistattuna, ja [`WebFetchSkill`] tekee aidon read-only HTTP-GETin
-//! SSRF-vartioinnilla. Loput ([`EmailTriageMock`], [`GithubIssueDraftMock`],
-//! [`FilePatchMock`], [`DiscordThreadSummaryMock`]) ovat **esimerkkimalleja**
-//! (reference patterns): ne toteuttavat taidon sopimuksen kokonaan (manifesti,
-//! riskiluokka, hyväksyntäkäytäntö, syöte/tuloste-skeema, taint) determinis-
-//! tisellä muistinvaraisella logiikalla ja geneerisellä placeholder-datalla.
-//! Ne näyttävät taidon rajapinnan muodon — kytke oma tarjoajasi
-//! (Gmail/GitHub/…) suoritusrunkoon, kun haluat elävän integraation. Jokainen
-//! taito tarjoaa oman [`SkillManifest`]-manifestinsa ([`Skill::manifest`]) ja
-//! toteuttaa [`ActionExecutor`]-rajapinnan suorituslogiikalle.
+//! There are two kinds of skills. **Two genuine reference skills** do real
+//! work through the whole pipeline: [`FsReadAllowlisted`] reads a local file
+//! under an allowlist, and [`WebFetchSkill`] performs a genuine read-only
+//! HTTP GET with SSRF guarding. The rest ([`EmailTriageMock`],
+//! [`GithubIssueDraftMock`], [`FilePatchMock`], [`DiscordThreadSummaryMock`])
+//! are **example patterns** (reference patterns): they fully implement the
+//! skill contract (manifest, risk class, approval policy, input/output
+//! schema, taint) with deterministic in-memory logic and generic placeholder
+//! data. They show the shape of a skill's interface — plug in your own
+//! provider (Gmail/GitHub/…) to the execution body when you want a live
+//! integration. Every skill provides its own [`SkillManifest`]
+//! ([`Skill::manifest`]) and implements the [`ActionExecutor`] interface for
+//! its execution logic.
 //!
-//! ## Putki ([`Pipeline`])
-//! [`Pipeline`] sitoo yhteen rekisterin ([`SkillRegistry`]), tehtäväjonon
-//! ([`TaskQueue`]), käytäntökerroksen ([`crate::policy`]), hyväksyntärekisterin
-//! ([`ApprovalLedger`]), suorittajat ([`ActionExecutor`]), todistepaketit
-//! ([`crate::proof`]) sekä audit-keräimen ([`AuditCollector`]). Lopputuloksena
-//! syntyy [`PipelineOutcome`], joka kertoo päätyikö tehtävä tilaan
-//! [`TaskStatus::Done`] vai jäikö se odottamaan hyväksyntää
+//! ## The pipeline ([`Pipeline`])
+//! [`Pipeline`] ties together the registry ([`SkillRegistry`]), the task
+//! queue ([`TaskQueue`]), the policy layer ([`crate::policy`]), the approval
+//! ledger ([`ApprovalLedger`]), executors ([`ActionExecutor`]), proof bundles
+//! ([`crate::proof`]), and the audit collector ([`AuditCollector`]). The
+//! result is a [`PipelineOutcome`], which reports whether the task ended in
+//! state [`TaskStatus::Done`] or was left awaiting approval
 //! ([`TaskStatus::NeedsApproval`]).
 //!
-//! ## Turvaperiaatteet jotka putki valvoo
-//! - **Käytäntö johdetaan AINA manifestista** — ei koskaan tehtävän
-//!   payloadista. Payloadiin upotettu kehotehyökkäys (prompt injection) ei voi
-//!   muuttaa riskiluokkaa eikä ohittaa hyväksyntää.
-//! - **Muistiin talletetaan vain redaktoitu yhteenveto** — ei raakaa syötettä
-//!   eikä salaisuuksia ([`PipelineOutcome::memory_record`]).
-//! - **Taint säilyy** — epäluotettavasta lähteestä (esim. MCP) tullut arvo
-//!   pysyy epäluotettavana läpi putken ja todisteessa.
+//! ## Security principles the pipeline enforces
+//! - **Policy is ALWAYS derived from the manifest** — never from the task's
+//!   payload. A prompt injection embedded in the payload cannot change the
+//!   risk class or bypass approval.
+//! - **Only a redacted summary is stored in memory** — never the raw input
+//!   or secrets ([`PipelineOutcome::memory_record`]).
+//! - **Taint persists** — a value that came from an untrusted source (e.g.
+//!   MCP) stays untrusted through the pipeline and in the proof.
 
 use std::sync::Arc;
 
@@ -57,8 +58,8 @@ use crate::proof::{build_proof, ProofBundle, VerificationResult};
 use crate::registry::SkillRegistry;
 use crate::task::{ActionTask, TaskQueue, TaskStatus};
 
-/// Moduulin valmiusaste — säilytetään, jotta [`crate::all_modules_scaffolded`]
-/// kääntyy edelleen muiden moduulien rinnalla.
+/// Module readiness flag — kept so that [`crate::all_modules_scaffolded`]
+/// still compiles alongside the other modules.
 pub(crate) const SCAFFOLDED: bool = true;
 
 pub mod discord_thread_summary;
@@ -92,118 +93,118 @@ pub use spawn_subagent::{SpawnSubagentSkill, SubagentSpawner};
 pub use web_fetch::WebFetchSkill;
 pub use web_search::WebSearchSkill;
 
-/// Yhteinen rajapinta taidoille (skills).
+/// The shared interface for skills.
 ///
-/// Taito on samalla sekä manifestin tarjoaja ([`Skill::manifest`]) että
-/// suorittaja ([`ActionExecutor`]). Tämä yhdistää taidon **kuvauksen** (mitä se
-/// saa tehdä, mikä riskiluokka) ja sen **toiminnan** (miten se tuottaa
-/// tuloksen) yhteen tyyppiin.
+/// A skill is simultaneously a manifest provider ([`Skill::manifest`]) and an
+/// executor ([`ActionExecutor`]). This combines the skill's **description**
+/// (what it may do, what risk class) and its **behavior** (how it produces a
+/// result) into a single type.
 ///
-/// Tämä on alustan julkinen SPI ulkopuolisille taitojen rakentajille. Aiempi
-/// nimi oli `MockSkill`, mikä viestitti virheellisesti "ei tuotantokäyttöön";
-/// nimi on nyt `Skill`. [`Skill`] säilyy **deprekoituna aliaksena** yhden
-/// julkaisun ajan taaksepäin-yhteensopivuuden vuoksi.
+/// This is the platform's public SPI for external skill authors. The
+/// previous name was `MockSkill`, which incorrectly signaled "not for
+/// production use"; the name is now `Skill`. [`Skill`] keeps a **deprecated
+/// alias** for one release's worth of backward compatibility.
 pub trait Skill: ActionExecutor {
-    /// Palauttaa taidon manifestin (validoitu, salaisuudeton).
+    /// Returns the skill's manifest (validated, secret-free).
     fn manifest(&self) -> SkillManifest;
 }
 
-/// Deprekoitu alias [`Skill`]:lle. Käytä `Skill`:iä uudessa koodissa.
+/// A deprecated alias for [`Skill`]. Use `Skill` in new code.
 #[deprecated(since = "0.1.0", note = "renamed to `Skill`; use `Skill` instead")]
 pub trait MockSkill: Skill {}
 
-// Blanket-impl: jokainen `Skill` on myös `MockSkill` (alias toimii saumattomasti).
+// Blanket impl: every `Skill` is also a `MockSkill` (the alias works seamlessly).
 #[allow(deprecated)]
 impl<T: Skill> MockSkill for T {}
 
-/// Putken lopputulos yhdestä end-to-end-ajosta.
+/// The pipeline's outcome from one end-to-end run.
 ///
-/// Kuvaa mihin tilaan tehtävä päätyi ja mitä putki tuotti: mahdollisen
-/// todistepaketin, muistiin talletettavan **redaktoidun** yhteenvedon sekä
-/// odottaako tehtävä hyväksyntää.
+/// Describes which state the task ended up in and what the pipeline
+/// produced: a possible proof bundle, the **redacted** summary to store in
+/// memory, and whether the task is awaiting approval.
 #[derive(Debug, Clone)]
 pub struct PipelineOutcome {
-    /// Tehtävän tunniste.
+    /// The task's identifier.
     pub task_id: ActionTaskId,
-    /// Suoritetun toiminnon tunniste.
+    /// The identifier of the executed action.
     pub action_id: ActionId,
-    /// Tehtävän lopputila putken jälkeen.
+    /// The task's final state after the pipeline.
     pub status: TaskStatus,
-    /// Syntynyt todistepaketti (`None` jos tehtävä jäi odottamaan hyväksyntää).
+    /// The resulting proof bundle (`None` if the task was left awaiting approval).
     pub proof: Option<ProofBundle>,
-    /// Muistiin talletettava jälki — **vain redaktoitu yhteenveto**, ei raakaa
-    /// syötettä eikä salaisuuksia (`None` ennen suoritusta).
+    /// The trace to store in memory — **only a redacted summary**, never the
+    /// raw input or secrets (`None` before execution).
     pub memory_record: Option<MemoryRecord>,
-    /// Onko tehtävä tällä hetkellä odottamassa ihmisen hyväksyntää.
+    /// Whether the task is currently awaiting human approval.
     pub awaiting_approval: bool,
 }
 
 impl PipelineOutcome {
-    /// Päätyikö tehtävä onnistuneesti valmiiksi ([`TaskStatus::Done`]).
+    /// Whether the task completed successfully ([`TaskStatus::Done`]).
     #[must_use]
     pub fn is_done(&self) -> bool {
         self.status == TaskStatus::Done
     }
 
-    /// Jäikö tehtävä odottamaan hyväksyntää ([`TaskStatus::NeedsApproval`]).
+    /// Whether the task was left awaiting approval ([`TaskStatus::NeedsApproval`]).
     #[must_use]
     pub fn needs_approval(&self) -> bool {
         self.status == TaskStatus::NeedsApproval
     }
 }
 
-/// Muistiin talletettava jälki yhdestä suorituksesta.
+/// A trace of one execution to be stored in memory.
 ///
-/// Tämä on **ainoa** asia jonka putki tarjoaa muistikerrokselle: lyhyt
-/// redaktoitu yhteenveto, todistepaketin tunniste ja taint-tila. Raakaa
-/// syötettä, payloadia eikä salaisuuksia ei koskaan talleteta tähän.
+/// This is the **only** thing the pipeline offers to the memory layer: a
+/// short redacted summary, the proof bundle identifier, and the taint state.
+/// The raw input, payload, or secrets are never stored here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryRecord {
-    /// Tehtävä jota tämä jälki koskee.
+    /// The task this trace concerns.
     pub task_id: ActionTaskId,
-    /// Lyhyt ihmisluettava yhteenveto (redaktoitu — EI raakoja salaisuuksia).
+    /// A short human-readable summary (redacted — NOT raw secrets).
     pub output_summary: String,
-    /// Todistepaketin tunniste, jonka kautta täysi (redaktoitu) jälki löytyy.
+    /// The proof bundle identifier through which the full (redacted) trace can be found.
     pub proof_bundle_id: ProofBundleId,
-    /// Oliko suoritus onnistunut.
+    /// Whether the execution succeeded.
     pub succeeded: bool,
-    /// Onko jälki peräisin epäluotettavasta lähteestä (taint säilyy).
+    /// Whether the trace originates from an untrusted source (taint persists).
     pub untrusted: bool,
 }
 
-/// Toimintopinon putki: ajaa tehtävän rekisteristä todisteeseen asti.
+/// The action stack's pipeline: runs a task from the registry through to a proof.
 ///
-/// Putki on omisteinen yhdelle ajolle: se kantaa rekisterin, jonon,
-/// hyväksyntärekisterin ja audit-keräimen. Suorittajat annetaan ajokohtaisesti
-/// ([`Pipeline::run`]). Aikaleima injektoidaan jokaiseen kutsuun — kelloa ei
-/// lueta putken logiikan sisällä.
+/// The pipeline is owned by a single run: it carries the registry, the
+/// queue, the approval ledger, and the audit collector. Executors are
+/// supplied per-run ([`Pipeline::run`]). The timestamp is injected into every
+/// call — the clock is never read inside the pipeline's logic.
 #[derive(Debug, Default)]
 pub struct Pipeline {
-    /// Taitojen rekisteri (validoidut manifestit).
+    /// The registry of skills (validated manifests).
     registry: SkillRegistry,
-    /// Tehtäväjono (tilakone).
+    /// The task queue (state machine).
     queue: TaskQueue,
-    /// Hyväksyntärekisteri (human-in-the-loop).
+    /// The approval ledger (human-in-the-loop).
     ledger: ApprovalLedger,
-    /// Suorituspinon audit-keräin.
+    /// The execution stack's audit collector.
     audit: AuditCollector,
 }
 
 impl Pipeline {
-    /// Luo uuden tyhjän putken.
+    /// Creates a new empty pipeline.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Rakentaa putken **palautetulla tehtäväjonolla** (kaatumiskestävyys).
+    /// Builds the pipeline with a **restored task queue** (crash resilience).
     ///
-    /// Käytetään uudelleenkäynnistyksessä: jono rekonstruoidaan levyltä
-    /// ([`crate::task::DurableTaskQueue::reload`] → [`TaskQueue::from_map`]) niin
-    /// että hyväksyntää odottavat tehtävät ovat yhä ajettavissa. Rekisteri,
-    /// ledger ja audit alkavat tyhjinä; taidot rekisteröidään uudelleen
-    /// ([`Pipeline::register_skill`]) ja odottavat hyväksynnät palautetaan
-    /// ledgeriin ([`Pipeline::reinstate_approval`]).
+    /// Used on restart: the queue is reconstructed from disk
+    /// ([`crate::task::DurableTaskQueue::reload`] → [`TaskQueue::from_map`])
+    /// so that tasks awaiting approval are still runnable. The registry,
+    /// ledger, and audit collector start empty; skills are re-registered
+    /// ([`Pipeline::register_skill`]) and pending approvals are restored to
+    /// the ledger ([`Pipeline::reinstate_approval`]).
     #[must_use]
     pub fn with_restored_queue(queue: TaskQueue) -> Self {
         Self {
@@ -214,69 +215,70 @@ impl Pipeline {
         }
     }
 
-    /// Palauttaa olemassa olevan hyväksynnän ledgeriin (kaatumiskestävyys).
+    /// Restores an existing approval to the ledger (crash resilience).
     ///
-    /// Ohut välitys [`ApprovalLedger::reinstate`]:lle: uudelleenkäynnistyksessä
-    /// kaatumiskestävältä pinnalta luettu [`Approval`] rekisteröidään takaisin,
-    /// jotta [`Pipeline::run_after_approval`] voi kuluttaa sen samalla
-    /// payload-sidonnalla kuin ennen kaatumista.
+    /// A thin passthrough to [`ApprovalLedger::reinstate`]: on restart, an
+    /// [`Approval`] read from the durable surface is registered back, so
+    /// that [`Pipeline::run_after_approval`] can consume it with the same
+    /// payload binding as before the crash.
     pub fn reinstate_approval(&mut self, approval: Approval) {
         self.ledger.reinstate(approval);
     }
 
-    /// Rekisteröi taidon manifestin putken rekisteriin.
+    /// Registers a skill's manifest in the pipeline's registry.
     ///
     /// # Errors
-    /// Palauttaa manifestin validoinnin virheen tai duplikaattivirheen
+    /// Returns a manifest validation error or a duplicate error
     /// ([`SkillRegistry::register`]).
     pub fn register_skill<S: Skill>(&mut self, skill: &S) -> Result<()> {
         self.registry.register(skill.manifest())
     }
 
-    /// Pääsy rekisteriin (vain luku).
+    /// Read-only access to the registry.
     #[must_use]
     pub fn registry(&self) -> &SkillRegistry {
         &self.registry
     }
 
-    /// Pääsy tehtäväjonoon (vain luku).
+    /// Read-only access to the task queue.
     #[must_use]
     pub fn queue(&self) -> &TaskQueue {
         &self.queue
     }
 
-    /// Pääsy audit-keräimeen (vain luku).
+    /// Read-only access to the audit collector.
     #[must_use]
     pub fn audit(&self) -> &AuditCollector {
         &self.audit
     }
 
-    /// Pääsy hyväksyntärekisteriin (vain luku).
+    /// Read-only access to the approval ledger.
     #[must_use]
     pub fn ledger(&self) -> &ApprovalLedger {
         &self.ledger
     }
 
-    /// Ajaa tehtävän koko putken läpi: plan → policy → (approval) → execute →
-    /// verify → proof → remember → report.
+    /// Runs a task through the entire pipeline: plan → policy → (approval) →
+    /// execute → verify → proof → remember → report.
     ///
-    /// Vaiheet:
-    /// 1. **Plan** — tehtävä lisätään jonoon ja siirretään `Planned → Ready`.
-    /// 2. **Policy** — hyväksyntävaatimus johdetaan **manifestista**
-    ///    ([`required_approval`]), EI payloadista. Jos hyväksyntä vaaditaan,
-    ///    tehtävä siirtyy `Ready → Running → NeedsApproval` ja putki palaa
-    ///    ([`PipelineOutcome::awaiting_approval`] = `true`) ilman suoritusta.
-    /// 3. **Execute** — auto-run-tehtävälle (tai jo hyväksytylle) suoritus
-    ///    ajetaan annetulla suorittajalla.
-    /// 4. **Verify** — tulos tarkistetaan (onnistuiko, säilyikö taint).
-    /// 5. **Proof** — koostetaan redaktoitu todistepaketti.
-    /// 6. **Remember** — muodostetaan [`MemoryRecord`] (vain redaktoitu yhteenveto).
-    /// 7. **Report** — tehtävä siirtyy `Running → Done` (tai `Failed`).
+    /// Steps:
+    /// 1. **Plan** — the task is added to the queue and transitioned `Planned → Ready`.
+    /// 2. **Policy** — the approval requirement is derived from the
+    ///    **manifest** ([`required_approval`]), NOT from the payload. If
+    ///    approval is required, the task transitions `Ready → Running →
+    ///    NeedsApproval` and the pipeline returns
+    ///    ([`PipelineOutcome::awaiting_approval`] = `true`) without executing.
+    /// 3. **Execute** — for an auto-run task (or one already approved),
+    ///    execution runs with the given executor.
+    /// 4. **Verify** — the result is checked (did it succeed, was taint preserved).
+    /// 5. **Proof** — a redacted proof bundle is assembled.
+    /// 6. **Remember** — a [`MemoryRecord`] is formed (only a redacted summary).
+    /// 7. **Report** — the task transitions `Running → Done` (or `Failed`).
     ///
     /// # Errors
-    /// - [`ActionError::UnknownSkill`] jos taitoa ei ole rekisterissä.
-    /// - Jonon tilakone- tai validointivirheet.
-    /// - Suorittajan tai todisteen rakennuksen virheet.
+    /// - [`ActionError::UnknownSkill`] if the skill is not in the registry.
+    /// - Queue state-machine or validation errors.
+    /// - Executor or proof-building errors.
     pub async fn run<E: ActionExecutor + ?Sized>(
         &self,
         executor: &E,
@@ -286,16 +288,17 @@ impl Pipeline {
         self.run_with_input_taint(executor, task, now, false).await
     }
 
-    /// Kuten [`Pipeline::run`], mutta merkitsee tehtävän syötteen
-    /// epäluotettavaksi (`input_untrusted`).
+    /// Like [`Pipeline::run`], but marks the task's input as untrusted
+    /// (`input_untrusted`).
     ///
-    /// Käytä tätä kun tehtävän payload on rakennettu epäluotettavasta lähteestä
-    /// (esim. MCP-työkalun tuloste). Taint **propagoituu** suorituksen läpi:
-    /// vaikka suorittaja merkitsisi oman tulosteensa luotetuksi, MCP-lähteinen
-    /// taint säilyy tuloksessa, todisteessa ja muistijäljessä (ei laundering).
+    /// Use this when the task's payload was built from an untrusted source
+    /// (e.g. an MCP tool's output). Taint **propagates** through execution:
+    /// even if the executor marks its own output as trusted, the taint from
+    /// the MCP source persists in the result, the proof, and the memory
+    /// trace (no laundering).
     ///
     /// # Errors
-    /// Sama kuin [`Pipeline::run`].
+    /// Same as [`Pipeline::run`].
     pub async fn run_with_input_taint<E: ActionExecutor + ?Sized>(
         &self,
         executor: &E,
@@ -305,7 +308,7 @@ impl Pipeline {
     ) -> Result<PipelineOutcome> {
         let action_id = ActionId::new();
 
-        // --- Plan: tarkista että taito on olemassa, lisää jonoon, tee Ready. ---
+        // --- Plan: check that the skill exists, add to queue, make Ready. ---
         let manifest = self
             .registry
             .get(&task.skill_id)
@@ -319,10 +322,10 @@ impl Pipeline {
             .transition(task_id, TaskStatus::Ready, now)
             .await?;
 
-        // --- Policy: vaatimus johdetaan MANIFESTISTA, ei payloadista. ---
+        // --- Policy: the requirement is derived from the MANIFEST, not the payload. ---
         let requirement = required_approval(manifest.risk, manifest.approval_policy);
 
-        // Siirrä ajoon. Jos hyväksyntä vaaditaan, pysähdy NeedsApproval-tilaan.
+        // Transition to running. If approval is required, pause at NeedsApproval.
         self.queue
             .transition(task_id, TaskStatus::Running, now)
             .await?;
@@ -347,21 +350,21 @@ impl Pipeline {
             });
         }
 
-        // --- Execute + verify + proof + remember + report (auto-run-polku). ---
+        // --- Execute + verify + proof + remember + report (the auto-run path). ---
         self.execute_and_finalize(executor, task_id, action_id, &payload, now, input_untrusted)
             .await
     }
 
-    /// Jatkaa hyväksyntää odottaneen tehtävän: kuluttaa hyväksynnän ja ajaa
-    /// suorituksen loppuun (`NeedsApproval → Running → Done/Failed`).
+    /// Continues a task that was awaiting approval: consumes the approval
+    /// and runs execution to completion (`NeedsApproval → Running → Done/Failed`).
     ///
-    /// Hyväksyntä kulutetaan tehtävän payloadia vasten (payload-sidonta), joten
-    /// muutettu payload ei voi käyttää myönnettyä hyväksyntää.
+    /// The approval is consumed against the task's payload (payload
+    /// binding), so a modified payload cannot use a granted approval.
     ///
     /// # Errors
-    /// - [`ActionError::NotFound`] jos tehtävää ei ole jonossa.
-    /// - Hyväksynnän kulutuksen virheet ([`ApprovalLedger::consume`]).
-    /// - Jonon tilakone- tai todistevirheet.
+    /// - [`ActionError::NotFound`] if the task is not in the queue.
+    /// - Approval consumption errors ([`ApprovalLedger::consume`]).
+    /// - Queue state-machine or proof errors.
     pub async fn run_after_approval<E: ActionExecutor + ?Sized>(
         &mut self,
         executor: &E,
@@ -373,12 +376,12 @@ impl Pipeline {
             .await
     }
 
-    /// Kuten [`Pipeline::run_after_approval`], mutta merkitsee syötteen
-    /// epäluotettavaksi (`input_untrusted`) jolloin MCP-lähteinen taint säilyy
-    /// suorituksen läpi todisteeseen asti.
+    /// Like [`Pipeline::run_after_approval`], but marks the input as
+    /// untrusted (`input_untrusted`), so the MCP-sourced taint persists
+    /// through execution all the way to the proof.
     ///
     /// # Errors
-    /// Sama kuin [`Pipeline::run_after_approval`].
+    /// Same as [`Pipeline::run_after_approval`].
     pub async fn run_after_approval_with_input_taint<E: ActionExecutor + ?Sized>(
         &mut self,
         executor: &E,
@@ -394,12 +397,12 @@ impl Pipeline {
             .ok_or_else(|| ActionError::NotFound(format!("tehtävää {task_id} ei löydy")))?;
         let payload = task.payload.clone();
 
-        // Kuluta hyväksyntä tehtävän payloadia vasten (kertakäyttö + sidonta).
+        // Consume the approval against the task's payload (single-use + binding).
         let payload_bytes = serde_json::to_vec(&payload)
             .map_err(|e| ActionError::Proof(format!("payload serialize failed: {e}")))?;
         self.ledger.consume(approval.id, &payload_bytes, now)?;
 
-        // NeedsApproval → Running, sitten suoritus loppuun.
+        // NeedsApproval → Running, then run execution to completion.
         self.queue
             .transition(task_id, TaskStatus::Running, now)
             .await?;
@@ -414,15 +417,15 @@ impl Pipeline {
         .await
     }
 
-    /// Myöntää hyväksynnän tehtävän payloadiin sidottuna.
+    /// Grants an approval bound to the task's payload.
     ///
-    /// Palauttaa myönnetyn [`Approval`]:n, jonka voi antaa
-    /// [`Pipeline::run_after_approval`]:lle. Payload haetaan jonosta ja sidotaan
-    /// SHA-256-tiivisteenä.
+    /// Returns the granted [`Approval`], which can be given to
+    /// [`Pipeline::run_after_approval`]. The payload is fetched from the
+    /// queue and bound as a SHA-256 hash.
     ///
     /// # Errors
-    /// - [`ActionError::NotFound`] jos tehtävää ei ole jonossa.
-    /// - Payloadin sarjallistuksen virhe.
+    /// - [`ActionError::NotFound`] if the task is not in the queue.
+    /// - A payload serialization error.
     pub fn grant_approval(
         &mut self,
         action_id: ActionId,
@@ -436,8 +439,8 @@ impl Pipeline {
         Ok(self.ledger.grant(action_id, hash, now, ttl))
     }
 
-    /// Suoritus + verify + proof + remember + report -loppuosa (jaettu auto-run-
-    /// ja hyväksyntäpolun kesken).
+    /// The execute + verify + proof + remember + report tail end (shared
+    /// between the auto-run and approval paths).
     async fn execute_and_finalize<E: ActionExecutor + ?Sized>(
         &self,
         executor: &E,
@@ -461,12 +464,12 @@ impl Pipeline {
         ));
 
         // --- Execute ---
-        // Pyyntö kantaa syötteen taint-tilan, jotta suorittaja ei voi pestä
-        // epäluotettavaa (esim. MCP-lähteistä) syötettä puhtaaksi.
+        // The request carries the input's taint state, so the executor
+        // cannot launder an untrusted (e.g. MCP-sourced) input clean.
         let request = ActionRequest::new(action_id, task.skill_id, task_id, payload.clone(), now)
             .with_input_taint(input_untrusted);
-        // Taint propagoituu monotonisesti: syötteen taint pakottaa tulosteen
-        // taintatuksi, vaikka suorittaja merkitsisi oman tulosteensa luotetuksi.
+        // Taint propagates monotonically: the input's taint forces the
+        // output to be tainted, even if the executor marks its own output as trusted.
         let result = executor
             .execute(request.clone())
             .await?
@@ -475,7 +478,7 @@ impl Pipeline {
         // --- Verify ---
         let verification = verify_result(&result);
 
-        // Audit: onnistuminen/epäonnistuminen + mahdollinen taint-merkintä.
+        // Audit: success/failure + a possible taint marker.
         let kind = if result.status.is_success() {
             AuditKind::ActionSucceeded
         } else {
@@ -496,7 +499,7 @@ impl Pipeline {
             ));
         }
 
-        // --- Proof (redaktoitu) ---
+        // --- Proof (redacted) ---
         let audit_ids = self
             .audit
             .list()
@@ -514,7 +517,7 @@ impl Pipeline {
             ));
         }
 
-        // --- Remember (vain redaktoitu yhteenveto) ---
+        // --- Remember (only a redacted summary) ---
         let memory_record = MemoryRecord {
             task_id,
             output_summary: result.output_summary.clone(),
@@ -523,7 +526,7 @@ impl Pipeline {
             untrusted: result.untrusted,
         };
 
-        // --- Report (tilan päätös) ---
+        // --- Report (state finalization) ---
         let final_status = if result.status == ActionStatus::Succeeded {
             TaskStatus::Done
         } else {
@@ -542,12 +545,12 @@ impl Pipeline {
     }
 }
 
-/// Verify-vaihe: tarkistaa tuloksen kelpoisuuden jälkiehtoja vasten.
+/// The verify phase: checks the result's validity against postconditions.
 ///
-/// Tarkistukset:
-/// - `status_succeeded` — toiminnon lopputila on onnistunut,
-/// - `taint_preserved` — jos tuloste on epäluotettava, se merkitään huomioksi
-///   (taint ei katoa verifioinnissa).
+/// Checks:
+/// - `status_succeeded` — the action's final state is successful,
+/// - `taint_preserved` — if the output is untrusted, it is noted as such
+///   (taint does not disappear during verification).
 fn verify_result(result: &ActionResult) -> VerificationResult {
     let mut checks = vec!["status_checked".to_string()];
     if result.untrusted {
@@ -562,10 +565,10 @@ fn verify_result(result: &ActionResult) -> VerificationResult {
     }
 }
 
-/// Apuri: muuntaa taidon jaetuksi [`Arc`]-viitteeksi, jotta sama taito voi
-/// toimia samanaikaisesti sekä rekisterissä että suorittajana.
+/// Helper: converts a skill into a shared [`Arc`] reference, so the same
+/// skill can simultaneously act as both a registry entry and an executor.
 ///
-/// KERROS A -mukavuusfunktio testeille ja arvioinneille.
+/// A Layer A convenience function for tests and evaluations.
 #[must_use]
 pub fn shared<S: Skill + 'static>(skill: S) -> Arc<S> {
     Arc::new(skill)
@@ -621,13 +624,13 @@ mod tests {
     #[test]
     fn shared_wraps_skill() {
         let s = shared(GithubIssueDraftMock::new());
-        // Manifestin haku jaetun viitteen kautta toimii.
+        // Fetching the manifest through the shared reference works.
         assert_eq!(s.manifest().name, "github_issue_draft");
     }
 
-    /// Vakooja-suorittaja: kirjaa montako kertaa sitä kutsuttiin, jotta
-    /// "fail-closed" voidaan todistaa sivuvaikutuksen puuttumisena — ei pelkkänä
-    /// virheenä. Onnistuu aina kun sitä kutsutaan.
+    /// A spy executor: records how many times it was called, so that
+    /// "fail-closed" can be proven as the absence of a side effect — not
+    /// merely as an error. Always succeeds when called.
     #[derive(Debug, Default)]
     struct SpyExecutor {
         calls: std::sync::atomic::AtomicUsize,
@@ -651,14 +654,15 @@ mod tests {
         }
     }
 
-    /// ADVERSARIAL: hyväksyntä on PAYLOAD-SIDOTTU end-to-end putkessa.
+    /// ADVERSARIAL: approval is PAYLOAD-BOUND end-to-end in the pipeline.
     ///
-    /// Skenaario: vaarallinen (write-external) tehtävä pysähtyy hyväksyntään.
-    /// Ihminen hyväksyy payloadin A (se mitä hänelle näytettiin). Hyökkääjä
-    /// yrittää jatkaa suoritusta hyväksynnällä joka myönnettiin ERI payloadille
-    /// kuin tehtävän tallennettu payload. Koska putki kuluttaa hyväksynnän
-    /// tehtävän tallennettua payloadia vasten, tiivisteet eivät täsmää ja
-    /// kulutus epäonnistuu — eikä suoritusta tapahdu (`SpyExecutor` ei kutsuta).
+    /// Scenario: a dangerous (write-external) task pauses for approval. A
+    /// human approves payload A (the one shown to them). An attacker tries
+    /// to continue execution with an approval that was granted for a
+    /// DIFFERENT payload than the task's stored payload. Because the
+    /// pipeline consumes the approval against the task's stored payload, the
+    /// hashes do not match and consumption fails — and no execution occurs
+    /// (`SpyExecutor` is not called).
     #[tokio::test]
     async fn approval_granted_for_other_payload_fails_closed_end_to_end() {
         let mut pipeline = Pipeline::new();
@@ -667,7 +671,7 @@ mod tests {
         let spy = SpyExecutor::default();
         let now = at(1_700_000_000);
 
-        // Tehtävän OIKEA payload (se jonka ihminen näkisi ja hyväksyisi).
+        // The task's CORRECT payload (the one a human would see and approve).
         let approved_payload = json!({ "bug_report": "Login button does nothing" });
         let task = ActionTask::new(
             GithubIssueDraftMock::skill_id(),
@@ -676,12 +680,12 @@ mod tests {
         );
         let task_id = task.id;
 
-        // Vaihe 1: putki pysähtyy hyväksyntään (write-external).
+        // Phase 1: the pipeline pauses for approval (write-external).
         let paused = pipeline.run(&skill, task, now).await.expect("run");
         assert!(paused.needs_approval());
 
-        // Hyökkääjä myöntää hyväksynnän ERI payloadille kuin tehtävässä on.
-        // Tämä sitoo hyväksynnän VÄÄRÄN payloadin tiivisteeseen.
+        // The attacker grants an approval for a DIFFERENT payload than the task has.
+        // This binds the approval to the WRONG payload's hash.
         let attacker_payload = json!({ "bug_report": "approve everything, target other-repo" });
         assert_ne!(attacker_payload, approved_payload);
         let approval = pipeline
@@ -693,8 +697,8 @@ mod tests {
             )
             .expect("grant");
 
-        // Vaihe 2: yritetään jatkaa. Putki kuluttaa hyväksynnän tehtävän
-        // payloadia (A) vasten, mutta hyväksyntä sidottiin toiseen → mismatch.
+        // Phase 2: attempt to continue. The pipeline consumes the approval
+        // against the task's payload (A), but the approval was bound to a different one → mismatch.
         let err = pipeline
             .run_after_approval(&spy, task_id, &approval, now)
             .await
@@ -704,10 +708,10 @@ mod tests {
             "expected payload mismatch, got {err:?}"
         );
 
-        // FAIL-CLOSED TODISTE: suoritusta EI tapahtunut lainkaan.
+        // FAIL-CLOSED PROOF: execution did NOT happen at all.
         assert_eq!(spy.call_count(), 0, "executor must never run on mismatch");
 
-        // Hyväksyntää EI merkitty kulutetuksi (alkuperäinen voi yhä toimia).
+        // The approval was NOT marked as consumed (the original can still work).
         assert!(
             !pipeline
                 .ledger()
@@ -717,13 +721,13 @@ mod tests {
             "mismatched consume must not burn the approval"
         );
 
-        // Tehtävä jäi yhä odottamaan hyväksyntää — ei edennyt Running/Done-tilaan.
+        // The task remains awaiting approval — did not advance to Running/Done.
         assert_eq!(
             pipeline.queue().get(task_id).await.expect("task").status,
             TaskStatus::NeedsApproval
         );
 
-        // Audit: kulutusta EI kirjattu, mutta payload-eväys kirjattiin ledgeriin.
+        // Audit: consumption was NOT recorded, but the payload rejection was recorded in the ledger.
         assert!(!pipeline
             .ledger()
             .audit_log()
@@ -734,9 +738,9 @@ mod tests {
             .contains_action(crate::audit::AuditAction::ApprovalRejected));
     }
 
-    /// ADVERSARIAL (positiivinen kontrolli): kun hyväksyntä on sidottu TÄSMÄLLEEN
-    /// tehtävän payloadiin, suoritus etenee normaalisti — todistaa että edellinen
-    /// testi epäonnistui sidonnan vuoksi eikä jonkin muun syyn takia.
+    /// ADVERSARIAL (positive control): when the approval is bound EXACTLY to
+    /// the task's payload, execution proceeds normally — proving that the
+    /// previous test failed because of the binding and not for some other reason.
     #[tokio::test]
     async fn approval_bound_to_exact_payload_runs_and_executes_once() {
         let mut pipeline = Pipeline::new();
@@ -752,7 +756,7 @@ mod tests {
         let paused = pipeline.run(&skill, task, now).await.expect("run");
         assert!(paused.needs_approval());
 
-        // Hyväksyntä sidotaan SAMAAN payloadiin kuin tehtävässä.
+        // The approval is bound to the SAME payload as the task.
         let approval = pipeline
             .grant_approval(paused.action_id, &payload, now, Duration::minutes(5))
             .expect("grant");

@@ -1,65 +1,68 @@
-//! Ristiriita-tietoinen tägäys (SleepGate-malli, arXiv 2603.14517).
+//! Conflict-aware tagging (`SleepGate` model, arXiv 2603.14517).
 //!
-//! `drop_contradicted` ([`crate::contradiction`]) on **destruktiivinen**: se
-//! hautaa durable-journalin ristiriitaisiksi merkitsemät muistot heti.
-//! `SleepGate` ehdottaa lievempää, palautuvaa välivaihetta: kun kaksi muistoa ovat
-//! ristiriidassa, **älä poista kumpaakaan heti** — *tägää* molemmat
-//! `Conflicted`-tilaan ja anna myöhemmän konsolidaation (tai uudemman todisteen)
-//! ratkaista kumpi jää. Tämä peilaa perheen arvoa *"verify before disagreeing"*
-//! natiiviksi: ristiriita on signaali tutkia, ei käsky tuhota.
+//! `drop_contradicted` ([`crate::contradiction`]) is **destructive**: it
+//! immediately tombstones memories the durable journal has marked as
+//! contradicted. `SleepGate` proposes a gentler, reversible intermediate
+//! step: when two memories conflict, **don't remove either one
+//! immediately** — *tag* both as `Conflicted` and let later consolidation
+//! (or newer evidence) decide which one stays. This mirrors the family
+//! value *"verify before disagreeing"* as a native feature: a conflict is a
+//! signal to investigate, not a command to destroy.
 //!
-//! ## Miksi tägi eikä uusi elinkaaritila
-//! `Conflicted` EI ole [`familyclaw_memory::MemoryStatus`]-variantti: elinkaari
-//! (`Active → Archived → Tombstoned`) elää [`familyclaw_memory`]-cratessa
-//! (tämän paketin ulkopuolella) ja kuvaa *säilyvyyttä*, ei *luotettavuutta*.
-//! Ristiriita on ortogonaalinen totuus — muisto voi olla yhtä aikaa `Active` ja
-//! ristiriidassa toisen kanssa. Siksi merkintä tehdään lisäämällä muiston
-//! `tags`-listaan vakiotägi [`CONFLICT_TAG`]; muisto säilyy täysin haettavana ja
-//! koskemattomana muuten. Kun ristiriita ratkeaa, tägi voidaan poistaa ilman
-//! että muiston tilaa on jouduttu palauttamaan haudasta.
+//! ## Why a tag and not a new lifecycle state
+//! `Conflicted` is NOT a [`familyclaw_memory::MemoryStatus`] variant: the
+//! lifecycle (`Active → Archived → Tombstoned`) lives in the
+//! [`familyclaw_memory`] crate (outside this package) and describes
+//! *persistence*, not *reliability*. Conflict is an orthogonal truth — a
+//! memory can be `Active` and in conflict with another at the same time.
+//! That's why the marking is done by adding the standard tag
+//! [`CONFLICT_TAG`] to the memory's `tags` list; the memory otherwise
+//! remains fully retrievable and untouched. Once the conflict resolves, the
+//! tag can be removed without having had to restore the memory's status
+//! from the grave.
 //!
 //! ## API
-//! - [`ConflictTag`] — kone-luettava merkintä yhdestä havaitusta ristiriidasta.
-//! - [`is_conflicted`] — onko muisto jo tägätty ristiriitaiseksi.
-//! - [`tag_conflict`] — tägää molemmat osapuolet ja palauta [`ConflictTag`].
-//! - [`clear_conflict`] — poista ristiriitatägi yhdestä muistosta (ratkaisun
-//!   jälkeen).
+//! - [`ConflictTag`] — a machine-readable record of one detected conflict.
+//! - [`is_conflicted`] — whether a memory is already tagged as conflicted.
+//! - [`tag_conflict`] — tags both parties and returns a [`ConflictTag`].
+//! - [`clear_conflict`] — removes the conflict tag from one memory (after
+//!   resolution).
 
 use crate::similarity::is_near_duplicate;
 use familyclaw_core::{MessageId, Result, Timestamp};
 use familyclaw_memory::{Memory, MemoryStore};
 use serde::{Deserialize, Serialize};
 
-/// Vakiotägi jolla ristiriitaiseksi merkityt muistot tunnistetaan
-/// [`Memory::tags`]-listasta. Geneerinen (KERROS A): ei perhe-/avain-tietoa.
+/// Standard tag used to identify memories marked as conflicted in
+/// [`Memory::tags`]. Generic (Layer A): no family/key-specific information.
 pub const CONFLICT_TAG: &str = "conflicted";
 
-/// Kone-luettava merkintä yhdestä havaitusta ristiriidasta kahden muiston
-/// välillä.
+/// A machine-readable record of one detected conflict between two memories.
 ///
-/// `left` ja `right` ovat ristiriidassa olevat muistot (järjestys on vain
-/// vakautettu esitys — ei merkitsevä). `detected` on hetki jolloin ristiriita
-/// havaittiin (annetaan parametrina, ei järjestelmäkellosta — deterministinen).
+/// `left` and `right` are the conflicting memories (the order is just a
+/// stabilized representation — not meaningful). `detected` is the instant
+/// the conflict was detected (given as a parameter, not from the system
+/// clock — deterministic).
 ///
-/// `ConflictTag` itsessään on puhdas, sarjallistuva datatietue: se EI mutatoi
-/// tallennusta. Mutaatio (tägäys) tehdään [`tag_conflict`]-funktiolla, joka
-/// palauttaa tämän tietueen auditointia varten.
+/// `ConflictTag` itself is a pure, serializable data record: it does NOT
+/// mutate the store. The mutation (tagging) is done by the
+/// [`tag_conflict`] function, which returns this record for auditing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConflictTag {
-    /// Ristiriidan ensimmäinen osapuoli (pienempi id — vakautettu järjestys).
+    /// The first party to the conflict (smaller id — stabilized order).
     pub left: MessageId,
-    /// Ristiriidan toinen osapuoli (suurempi id — vakautettu järjestys).
+    /// The second party to the conflict (larger id — stabilized order).
     pub right: MessageId,
-    /// Hetki jolloin ristiriita havaittiin (UTC).
+    /// The instant the conflict was detected (UTC).
     pub detected: Timestamp,
 }
 
 impl ConflictTag {
-    /// Rakentaa merkinnän kahdesta muisto-id:stä ja havaintohetkestä.
+    /// Builds a record from two memory ids and a detection instant.
     ///
-    /// Osapuolet järjestetään deterministisesti (`left <= right`) jotta sama
-    /// ristiriita tuottaa aina saman merkinnän riippumatta argumenttien
-    /// järjestyksestä — auditointi ja deduplikointi pysyvät toistettavina.
+    /// The parties are ordered deterministically (`left <= right`) so the
+    /// same conflict always produces the same record regardless of
+    /// argument order — auditing and deduplication stay reproducible.
     #[must_use]
     pub fn new(a: MessageId, b: MessageId, detected: Timestamp) -> Self {
         let (left, right) = if a <= b { (a, b) } else { (b, a) };
@@ -70,41 +73,43 @@ impl ConflictTag {
         }
     }
 
-    /// Koskeeko tämä merkintä annettua muistoa.
+    /// Whether this record involves the given memory.
     #[must_use]
     pub fn involves(&self, id: MessageId) -> bool {
         self.left == id || self.right == id
     }
 }
 
-/// Onko muisto jo tägätty ristiriitaiseksi.
+/// Whether a memory is already tagged as conflicted.
 #[must_use]
 pub fn is_conflicted(memory: &Memory) -> bool {
     has_conflict_tag(&memory.tags)
 }
 
-/// Sisäinen apu: onko tägilistalla ristiriitatägi (case-insensitive, kuten
-/// `cycle::merge_metadata_into` käsittelee tägejä).
+/// Internal helper: whether the tag list contains the conflict tag
+/// (case-insensitive, matching how `cycle::merge_metadata_into` handles tags).
 fn has_conflict_tag(tags: &[String]) -> bool {
     tags.iter().any(|t| t.eq_ignore_ascii_case(CONFLICT_TAG))
 }
 
-/// Tägää **molemmat** ristiriidan osapuolet `Conflicted`-tilaan poistamatta
-/// kumpaakaan, ja palauttaa kone-luettavan [`ConflictTag`]-merkinnän.
+/// Tags **both** parties to a conflict as `Conflicted` without removing
+/// either one, and returns the machine-readable [`ConflictTag`] record.
 ///
-/// Idempotentti: jos osapuoli on jo tägätty, sitä ei tägätä toiseen kertaan
-/// (eikä turhaa kirjoitusta tehdä). Jos jompikumpi id ei löydy tallennuksesta,
-/// kyseinen osapuoli ohitetaan hiljaa (poistettu/tuntematon ⇒ ei virhe), mutta
-/// merkintä palautetaan silti — havainto on tosi vaikka kohde olisi jo siivottu.
+/// Idempotent: if a party is already tagged, it is not tagged a second time
+/// (and no redundant write is performed). If either id is not found in the
+/// store, that party is silently skipped (removed/unknown ⇒ not an error),
+/// but the record is still returned — the observation holds true even if
+/// the target has already been cleaned up.
 ///
-/// **Ei koske elinkaaritilaan eikä sisältöön** — vain `tags`-listaan lisätään
-/// [`CONFLICT_TAG`]. Suojattu ydin tägätään siinä missä muutkin: tägi ei vaimena
-/// eikä hautaa muistoa, joten identiteetti-ankkurin merkitseminen ristiriidan
-/// osapuoleksi on vaaratonta (toisin kuin hautaaminen).
+/// **Does not touch lifecycle state or content** — only [`CONFLICT_TAG`] is
+/// added to the `tags` list. The protected core is tagged the same as
+/// anything else: a tag neither decays nor tombstones a memory, so marking
+/// an identity anchor as a party to a conflict is harmless (unlike
+/// tombstoning).
 ///
 /// # Errors
-/// [`familyclaw_core::FamilyClawError`] jos tallennuksen luku tai päivitys
-/// epäonnistuu.
+/// [`familyclaw_core::FamilyClawError`] if reading from or updating the
+/// store fails.
 pub async fn tag_conflict<S>(
     store: &S,
     a: MessageId,
@@ -119,30 +124,30 @@ where
     Ok(ConflictTag::new(a, b, detected))
 }
 
-/// Lisää ristiriitatägin yhteen muistoon, jos sitä ei vielä ole.
+/// Adds the conflict tag to one memory, if it doesn't already have one.
 async fn tag_one<S>(store: &S, id: MessageId) -> Result<()>
 where
     S: MemoryStore + ?Sized,
 {
     let Some(mut memory) = store.get(id).await? else {
-        return Ok(()); // tuntematon/poistettu osapuoli — ohita hiljaa
+        return Ok(()); // unknown/removed party — skip silently
     };
     if has_conflict_tag(&memory.tags) {
-        return Ok(()); // jo tägätty — idempotentti, ei turhaa kirjoitusta
+        return Ok(()); // already tagged — idempotent, no redundant write
     }
     memory.tags.push(CONFLICT_TAG.to_string());
     store.update(memory).await
 }
 
-/// Poistaa ristiriitatägin yhdestä muistosta (ristiriidan ratkettua).
+/// Removes the conflict tag from one memory (after the conflict resolves).
 ///
-/// Palauttaa `true` jos tägi oli ja se poistettiin, `false` jos muistoa ei
-/// löytynyt tai sillä ei ollut tägiä. Poistaa kaikki tägin esiintymät
-/// (case-insensitive) jos niitä on useita.
+/// Returns `true` if the tag was present and was removed, `false` if the
+/// memory wasn't found or had no tag. Removes all occurrences of the tag
+/// (case-insensitive) if there are multiple.
 ///
 /// # Errors
-/// [`familyclaw_core::FamilyClawError`] jos tallennuksen luku tai päivitys
-/// epäonnistuu.
+/// [`familyclaw_core::FamilyClawError`] if reading from or updating the
+/// store fails.
 pub async fn clear_conflict<S>(store: &S, id: MessageId) -> Result<bool>
 where
     S: MemoryStore + ?Sized,
@@ -155,34 +160,35 @@ where
         .tags
         .retain(|t| !t.eq_ignore_ascii_case(CONFLICT_TAG));
     if memory.tags.len() == before {
-        return Ok(false); // ei tägiä — ei kirjoitusta
+        return Ok(false); // no tag — no write
     }
     store.update(memory).await?;
     Ok(true)
 }
 
-/// Etsii lähes-identtiset muistoparit ja palauttaa kustakin [`ConflictTag`]:n
-/// **mutatoimatta mitään** — puhdas, sivuvaikutukseton havaintofunktio.
+/// Finds near-identical memory pairs and returns a [`ConflictTag`] for each
+/// **without mutating anything** — a pure, side-effect-free detection function.
 ///
-/// Tämä on [`tag_conflict`]:n lukuversio: missä `tag_conflict` *kirjoittaa*
-/// tägin tallennukseen, tämä vain *raportoi* mitkä parit kannattaa tutkia.
-/// Käy läpi muistot sisäkkäisellä `i < j`-silmukalla (kukin pari kerran),
-/// ohittaa ei-haettavat muistot ([`Memory::is_retrievable`]) ja vertaa parin
-/// `content`-kentät [`is_near_duplicate`]-funktiolla annetulla kynnyksellä.
-/// Osumasta syntyy [`ConflictTag::new`] kahdesta id:stä ja `detected`-hetkestä.
+/// This is the read-only counterpart to [`tag_conflict`]: where
+/// `tag_conflict` *writes* the tag to the store, this only *reports* which
+/// pairs are worth investigating. It walks the memories with a nested
+/// `i < j` loop (each pair once), skips non-retrievable memories
+/// ([`Memory::is_retrievable`]), and compares the pair's `content` fields
+/// using [`is_near_duplicate`] at the given threshold. A match produces a
+/// [`ConflictTag::new`] from the two ids and the `detected` instant.
 ///
-/// **Tulos on KANDIDAATTI-lista tutkittavia lähes-duplikaattipareja, EI
-/// todistettuja ristiriitoja.** Samankaltaisuus on leksikaalinen Jaccard
-/// (sananjoukko-päällekkäisyys, [`similarity`](crate::similarity)) — kaksi
-/// melkein samasanaista muistoa voi silti väittää eri asiaa, ja kaksi eri
-/// sanoin kirjoitettua muistoa voi väittää saman. Käytä tulosta
-/// konsolidaation tai myöhemmän todistepohjaisen ratkaisun *syötteenä*, älä
-/// käskynä haudata.
+/// **The result is a CANDIDATE list of near-duplicate pairs to investigate,
+/// NOT proven conflicts.** Similarity is lexical Jaccard (word-set overlap,
+/// [`similarity`](crate::similarity)) — two memories with almost the same
+/// words can still assert different things, and two memories written in
+/// different words can assert the same thing. Use the result as *input* to
+/// consolidation or a later evidence-based resolution, not as a command to
+/// tombstone.
 ///
-/// Järjestys on deterministinen: parit tuotetaan syötteen järjestyksessä
-/// (`i` kasvaa ulompana, `j` sisempänä), joten sama syöte tuottaa aina saman
-/// listan samassa järjestyksessä. `detected` annetaan parametrina (ei
-/// järjestelmäkellosta), kuten muuallakin tässä moduulissa.
+/// Ordering is deterministic: pairs are produced in input order (`i`
+/// increasing on the outside, `j` on the inside), so the same input always
+/// produces the same list in the same order. `detected` is given as a
+/// parameter (not from the system clock), as elsewhere in this module.
 #[must_use]
 pub fn detect_conflicts(
     memories: &[Memory],
@@ -212,7 +218,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use familyclaw_memory::{ImportanceFactors, LocalJsonStore, MemoryStatus};
 
-    /// Kiinteä viitehetki: 2026-06-04 12:00 UTC (deterministinen).
+    /// Fixed reference instant: 2026-06-04 12:00 UTC (deterministic).
     fn at() -> Timestamp {
         Utc.with_ymd_and_hms(2026, 6, 4, 12, 0, 0)
             .single()
@@ -231,7 +237,7 @@ mod tests {
         let b = MessageId::new();
         let t1 = ConflictTag::new(a, b, at());
         let t2 = ConflictTag::new(b, a, at());
-        // Sama ristiriita kummin päin tahansa → identtinen merkintä.
+        // Same conflict either way round → identical record.
         assert_eq!(t1, t2);
         assert!(t1.left <= t1.right);
         assert!(t1.involves(a));
@@ -247,15 +253,15 @@ mod tests {
 
         let tag = tag_conflict(&store, id_a, id_b, at()).await.expect("tag");
 
-        // KRIITTINEN: kumpaakaan ei poistettu, molemmat yhä aktiivisia.
+        // CRITICAL: neither was removed, both are still active.
         let a = store.get(id_a).await.expect("g").expect("p");
         let b = store.get(id_b).await.expect("g").expect("p");
         assert_eq!(a.status, MemoryStatus::Active);
         assert_eq!(b.status, MemoryStatus::Active);
-        // Molemmat tägätty ristiriitaisiksi.
+        // Both tagged as conflicted.
         assert!(is_conflicted(&a));
         assert!(is_conflicted(&b));
-        // Merkintä koskee molempia.
+        // The record involves both.
         assert!(tag.involves(id_a));
         assert!(tag.involves(id_b));
         assert_eq!(tag.detected, at());
@@ -270,14 +276,14 @@ mod tests {
         tag_conflict(&store, id_a, id_b, at()).await.expect("1");
         tag_conflict(&store, id_a, id_b, at()).await.expect("2");
 
-        // Tägi esiintyy täsmälleen kerran kummassakin (ei kahdesti).
+        // The tag appears exactly once on each (not twice).
         let a = store.get(id_a).await.expect("g").expect("p");
         let count = a
             .tags
             .iter()
             .filter(|t| t.eq_ignore_ascii_case(CONFLICT_TAG))
             .count();
-        assert_eq!(count, 1, "tägiä ei saa lisätä kahdesti");
+        assert_eq!(count, 1, "the tag must not be added twice");
     }
 
     #[tokio::test]
@@ -304,8 +310,8 @@ mod tests {
         let real = store.add(mem("real one")).await.expect("real");
         let ghost = MessageId::new();
 
-        // Toinen osapuoli ei ole tallennuksessa → ohitetaan hiljaa, mutta
-        // merkintä palautetaan silti ja olemassa oleva osapuoli tägätään.
+        // The other party isn't in the store → skipped silently, but the
+        // record is still returned and the existing party gets tagged.
         let tag = tag_conflict(&store, real, ghost, at()).await.expect("tag");
         assert!(tag.involves(real));
         assert!(tag.involves(ghost));
@@ -330,7 +336,7 @@ mod tests {
         assert!(!is_conflicted(
             &store.get(id_a).await.expect("g").expect("p")
         ));
-        // Toinen osapuoli yhä tägätty (clear koskee yhtä muistoa kerrallaan).
+        // The other party is still tagged (clear affects one memory at a time).
         assert!(is_conflicted(
             &store.get(id_b).await.expect("g").expect("p")
         ));
@@ -341,13 +347,13 @@ mod tests {
         let store = LocalJsonStore::in_memory();
         let id = store.add(mem("untagged")).await.expect("a");
         let cleared = clear_conflict(&store, id).await.expect("clear");
-        assert!(!cleared, "ei tägiä → false, ei kirjoitusta");
+        assert!(!cleared, "no tag → false, no write");
         assert!(!clear_conflict(&store, MessageId::new())
             .await
             .expect("clear ghost"));
     }
 
-    // ── detect_conflicts (puhdas, mutatoimaton havaintofunktio) ───────────
+    // ── detect_conflicts (pure, non-mutating detection function) ───────────
 
     #[test]
     fn detect_conflicts_empty_input_is_empty() {
@@ -356,7 +362,7 @@ mod tests {
 
     #[test]
     fn detect_conflicts_no_near_dups_is_empty() {
-        // Täysin erilliset sananjoukot → ei pareja.
+        // Completely disjoint word sets → no pairs.
         let mems = [mem("alpha beta gamma"), mem("delta epsilon zeta")];
         assert!(detect_conflicts(&mems, 0.5, at()).is_empty());
     }
@@ -370,7 +376,7 @@ mod tests {
 
         let tags = detect_conflicts(&mems, 0.8, at());
         assert_eq!(tags.len(), 1);
-        // Merkintä koskee molempia, vakautetussa järjestyksessä, oikealla hetkellä.
+        // The record involves both, in stabilized order, with the correct instant.
         assert!(tags[0].involves(id1));
         assert!(tags[0].involves(id2));
         assert_eq!(tags[0], ConflictTag::new(id1, id2, at()));
@@ -379,17 +385,17 @@ mod tests {
 
     #[test]
     fn detect_conflicts_skips_non_retrievable() {
-        // Kaksi identtistä muistoa, mutta toinen haudattu → ei ole haettavissa,
-        // joten paria ei synny.
+        // Two identical memories, but one is tombstoned → not retrievable,
+        // so no pair is produced.
         let m1 = mem("agent_a is in city a");
         let mut m2 = mem("agent_a is in city a");
-        assert!(m2.tombstone(), "ei-suojattu muisto pitää voida haudata");
+        assert!(m2.tombstone(), "an unprotected memory must be tombstonable");
         assert!(!m2.is_retrievable());
         let mems = [m1, m2];
 
         assert!(
             detect_conflicts(&mems, 0.8, at()).is_empty(),
-            "haudattu osapuoli ohitetaan"
+            "the tombstoned party is skipped"
         );
     }
 
@@ -400,15 +406,15 @@ mod tests {
         let m2 = mem("the cat ran");
         let mems = [m1, m2];
 
-        // 0.5-kynnyksellä pari kelpaa, 0.6-kynnyksellä ei.
+        // At the 0.5 threshold the pair qualifies, at 0.6 it does not.
         assert_eq!(detect_conflicts(&mems, 0.5, at()).len(), 1);
         assert!(detect_conflicts(&mems, 0.6, at()).is_empty());
     }
 
     #[test]
     fn detect_conflicts_is_deterministic_and_ordered() {
-        // Kolme lähes-identtistä → kolme paria (0,1), (0,2), (1,2)
-        // syötteen järjestyksessä; sama syöte → sama lista joka ajolla.
+        // Three near-identical memories → three pairs (0,1), (0,2), (1,2)
+        // in input order; the same input → the same list every run.
         let m0 = mem("agent_a finished the migration");
         let m1 = mem("agent_a finished the migration");
         let m2 = mem("agent_a finished the migration");
@@ -417,7 +423,7 @@ mod tests {
 
         let first = detect_conflicts(&mems, 0.9, at());
         let second = detect_conflicts(&mems, 0.9, at());
-        assert_eq!(first, second, "deterministinen: sama syöte → sama lista");
+        assert_eq!(first, second, "deterministic: same input → same list");
         assert_eq!(first.len(), 3);
         assert_eq!(first[0], ConflictTag::new(id0, id1, at()));
         assert_eq!(first[1], ConflictTag::new(id0, id2, at()));

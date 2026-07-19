@@ -1,20 +1,25 @@
-//! Integraatiotesti: **live multi-agent -orkestrointi päästä päähän**.
+//! Integration test: **live multi-agent orchestration end to end**.
 //!
-//! Tämä todistaa README:n itse myöntämän suurimman aukon ("live multi-agent
-//! orchestration — built, UNPROVEN"): kolmen solmun DAG ajetaan
-//! [`Orchestrator::run_with`]:n läpi **oikealla [`LiveTurnExecutor`]:lla**, joka
-//! soittaa mock-HTTP-LLM:ää. Ennen tätä koko orkestrointi oli todistettu vain
-//! hermeettistä [`MockTurnExecutor`]:ia vasten (ks. `bridge/tests/homepage_factory.rs`),
-//! eikä mikään testi ajanut suunnitelmaa oikean LLM-/HTTP-polun yli.
+//! This proves the README's own admitted biggest gap ("live multi-agent
+//! orchestration — built, UNPROVEN"): a three-node DAG is run through
+//! [`Orchestrator::run_with`] with a **real [`LiveTurnExecutor`]**, which
+//! calls a mock HTTP LLM. Before this, the entire orchestration had only
+//! been proven against the hermetic [`MockTurnExecutor`] (see
+//! `bridge/tests/homepage_factory.rs`), and no test ran the plan over a
+//! real LLM/HTTP path.
 //!
-//! ## Mikä todistetaan
-//! - Orkesteri ajaa `design → review → deploy` -DAG:n oikealla LLM-suorittimella.
-//! - `design`-toimite, joka on **oikean (mockatun) LLM-vastauksen** tuottama
-//!   JSON, läpäisee `homepage_design`-sopimusrajan (tulosskeema + jälkiehdot).
-//! - Kaikki kolme solmua etenevät `Done`-tilaan riippuvuusjärjestyksessä.
-//! - Orkesteria EI muutettu lainkaan — vain suoritin vaihtui mockista liveen.
+//! ## What is proven
+//! - The orchestrator runs the `design → review → deploy` DAG with a
+//!   real LLM executor.
+//! - The `design` deliverable, which is JSON produced by a **real
+//!   (mocked) LLM response**, passes the `homepage_design` contract
+//!   boundary (result schema + postconditions).
+//! - All three nodes progress to the `Done` state in dependency order.
+//! - The orchestrator was NOT changed at all — only the executor
+//!   switched from mock to live.
 //!
-//! Mock on pelkkä `std::net::TcpListener` (ei `wiremock`/`httpmock`-dependencyä).
+//! The mock is a plain `std::net::TcpListener` (no `wiremock`/`httpmock`
+//! dependency).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -29,12 +34,13 @@ use familyclaw_core::ids::AgentId;
 use familyclaw_core::time::{self, Timestamp};
 use familyclaw_core::ModelConfig;
 
-// ── Mock-HTTP-LLM: palauttaa kiinteän assistant-sisällön jokaiseen pyyntöön ──
+// ── Mock HTTP LLM: returns a fixed assistant content for every request ──
 
-/// Minimaalinen HTTP/1.1-mock-LLM joka palauttaa AINA saman OpenAI-yhteensopivan
-/// `chat.completion`-rungon, jonka assistant-sisältö on `content`. Determinismin
-/// vuoksi sama jokaiselle solmulle; sisällön on täytettävä DAG:n kaikkien
-/// sopimuskantavien solmujen tulosskeemat yhtä aikaa.
+/// A minimal HTTP/1.1 mock LLM that ALWAYS returns the same
+/// OpenAI-compatible `chat.completion` body, whose assistant content is
+/// `content`. The same for every node, for determinism; the content must
+/// satisfy the result schemas of all contract-bearing nodes in the DAG
+/// at once.
 struct MockLlm {
     base_url: String,
 }
@@ -91,9 +97,10 @@ async fn online_agent(
     bridge.heartbeat(id, now).await.expect("heartbeat");
 }
 
-/// `homepage_design`-kyky tyhjällä syöteskeemalla (orkesterin sisäinen
-/// sopimusrata ehdottaa kyvyn `{}`-syötteellä). Tulosskeema vaatii
-/// `headline:Str, sections:Arr, cta:Str` + jälkiehdot.
+/// The `homepage_design` capability with an empty input schema (the
+/// orchestrator's internal contract route proposes the capability with
+/// `{}` input). The result schema requires
+/// `headline:Str, sections:Arr, cta:Str` + postconditions.
 fn homepage_design_node_capability() -> Capability {
     Capability::new(
         "homepage_design",
@@ -110,7 +117,7 @@ fn homepage_design_node_capability() -> Capability {
     ])
 }
 
-/// `deploy`-kyky: tulos jolla on `result`-objektikenttä.
+/// The `deploy` capability: a result with a `result` object field.
 fn deploy_capability() -> Capability {
     Capability::new(
         "deploy",
@@ -119,7 +126,7 @@ fn deploy_capability() -> Capability {
     )
 }
 
-/// Sama kolmen solmun DAG kuin hermeettisessä homepage_factory-testissä:
+/// The same three-node DAG as in the hermetic `homepage_factory` test:
 /// `design → review → deploy`.
 fn factory_plan() -> OrchestrationPlan {
     OrchestrationPlan::new(
@@ -171,7 +178,7 @@ async fn register_factory_agents(bridge: &FamilyBridge, now: Timestamp) {
     .await;
 }
 
-/// Rakentaa live-suorittimen joka osoittaa mock-HTTP-LLM:ään.
+/// Builds a live executor pointing at the mock HTTP LLM.
 fn live_executor(mock: &MockLlm) -> LiveTurnExecutor {
     let resolver = EnvEndpointResolver::new().with_provider(
         "mock",
@@ -192,12 +199,12 @@ async fn live_multi_agent_orchestration_runs_end_to_end() {
 
     let mut events = bridge.subscribe();
 
-    // Mock-LLM palauttaa JSON-objektin joka täyttää BOTH:
-    //  - homepage_design-tulosskeeman (headline non-empty, sections >= 1, cta)
-    //  - deploy-tulosskeeman (result: object)
-    // Sama vastaus kaikille solmuille; review-solmulla ei ole sopimusta, joten
-    // se hyväksyy minkä tahansa. Tämä on oikean LLM:n tuottama hyötykuorma —
-    // todistaa että live-vastaus läpäisee sopimusrajan.
+    // The mock LLM returns a JSON object that satisfies BOTH:
+    //  - the homepage_design result schema (headline non-empty, sections >= 1, cta)
+    //  - the deploy result schema (result: object)
+    // The same response for all nodes; the review node has no contract,
+    // so it accepts anything. This is a payload produced by a real LLM —
+    // it proves that a live response passes the contract boundary.
     let llm_json = serde_json::json!({
         "headline": "DuckUps — ship faster",
         "sections": ["hero", "features", "pricing"],
@@ -210,14 +217,14 @@ async fn live_multi_agent_orchestration_runs_end_to_end() {
     let plan = factory_plan();
     let orch = Orchestrator::new(bridge.clone());
 
-    // *** Ainoa ero hermeettiseen homepage_factory-testiin: live-suoritin. ***
+    // *** The only difference from the hermetic homepage_factory test: the live executor. ***
     let executor = live_executor(&mock);
     let report = orch
         .run_with(&plan, now, &executor)
         .await
         .expect("live homepage factory run");
 
-    // --- Kaikki kolme solmua valmistuivat riippuvuusjärjestyksessä. ----------
+    // --- All three nodes completed in dependency order. ----------------------
     assert_eq!(
         report.completed.len(),
         3,
@@ -234,7 +241,7 @@ async fn live_multi_agent_orchestration_runs_end_to_end() {
         "design before review before deploy (dependency order) over real HTTP"
     );
 
-    // Jokainen solmun tehtävä on Done — toimitteet läpäisivät sopimusrajat.
+    // Every node's task is Done — the deliverables passed the contract boundaries.
     for (node, task_id) in &report.completed {
         let task = bridge.board().get(*task_id).await.expect("task exists");
         assert_eq!(
@@ -244,7 +251,7 @@ async fn live_multi_agent_orchestration_runs_end_to_end() {
         );
     }
 
-    // --- step_assigned-tapahtumat järjestyksessä design → review → deploy. ---
+    // --- step_assigned events in order design → review → deploy. -------------
     let mut assigned_nodes: Vec<String> = Vec::new();
     while let Ok(Some(ev)) = events.try_recv() {
         if let familyclaw_bridge::EventKind::Custom(name) = &ev.kind {
@@ -268,15 +275,17 @@ async fn live_multi_agent_orchestration_runs_end_to_end() {
 
 #[tokio::test]
 async fn live_orchestration_halts_when_llm_breaches_contract() {
-    // Mock-LLM palauttaa JSON:n JOSTA PUUTTUU headline → design-solmun
-    // homepage_design-sopimus rikkoutuu tulosskeemalla → DAG pysähtyy designiin,
-    // review/deploy ei koskaan aja. Todistaa että sopimusraja suojaa myös live-
-    // polulla: huono LLM-vastaus ei vuoda eteenpäin hiljaa.
+    // The mock LLM returns JSON THAT IS MISSING headline → the design
+    // node's homepage_design contract is breached by the result schema →
+    // the DAG halts at design, review/deploy never run. Proves that the
+    // contract boundary protects the live path too: a bad LLM response
+    // does not silently leak forward.
     let bridge = FamilyBridge::new();
     let now = ts(1_700_000_000);
     register_factory_agents(&bridge, now).await;
 
-    // Validi JSON-objekti mutta EI sisällä "headline"-kenttää (skeema rikkoutuu).
+    // A valid JSON object but it does NOT contain the "headline" field
+    // (the schema is breached).
     let bad_json = serde_json::json!({
         "sections": ["hero"],
         "cta": "Start"
@@ -298,7 +307,7 @@ async fn live_orchestration_halts_when_llm_breaches_contract() {
         "no node completes when the live LLM response breaches the design contract"
     );
 
-    // review/deploy ei koskaan osoitettu.
+    // review/deploy were never assigned.
     let all_tasks = bridge.board().list().await;
     assert!(
         !all_tasks.iter().any(|t| t.title == "review the design"),

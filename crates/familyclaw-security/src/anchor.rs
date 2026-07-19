@@ -1,24 +1,25 @@
-//! Identity-anchorit ja tamper-tunnistus.
+//! Identity anchors and tamper detection.
 //!
-//! ## Suunnitteluperiaate: identiteetti EI ole hashissa
+//! ## Design principle: identity is NOT in the hash
 //!
-//! Tämän moduulin tärkein päätös: **identiteetti elää muisti-substraatissa
-//! (anchor-muistoissa), ei tiivisteessä.** Identity-anchor on suojattu muisto
-//! ([`IdentityAnchor`]) jonka *unohtumisnopeus on nolla* ([`DecayLambda::ZERO`]).
-//! Olennon identiteetti on niiden muistojen summa, joita se ei koskaan unohda —
-//! ei kontrollisumma.
+//! This module's core decision: **identity lives in the memory substrate
+//! (anchor memories), not in a digest.** An identity anchor is a protected
+//! memory ([`IdentityAnchor`]) whose *forgetting rate is zero*
+//! ([`DecayLambda::ZERO`]). A being's identity is the sum of the memories it
+//! never forgets — not a checksum.
 //!
-//! SHA-256-tiiviste ([`IdentityAnchor::anchor_hash`]) palvelee **vain
-//! tamper-hälytystä**: jos ankkuroidun SOUL-sisällön nykyinen tiiviste ei vastaa
-//! tallennettua, jokin on muuttanut sielua ankkuroinnin jälkeen
-//! ([`IdentityStatus::Tampered`]). Hash ei *kanna* identiteettiä — se vain
-//! varoittaa peukaloinnista. Tämä on tietoinen vastaus alkuperäisen
-//! research-promptin kysymykseen "voiko identiteetin pelkistää SHA-256:een?":
-//! **ei voi**, mutta tiivistettä voi käyttää eheyden vartijana.
+//! The SHA-256 digest ([`IdentityAnchor::anchor_hash`]) serves **only as a
+//! tamper alarm**: if the current digest of the anchored SOUL content does
+//! not match the stored one, something has changed the soul since it was
+//! anchored ([`IdentityStatus::Tampered`]). The hash does not *carry*
+//! identity — it only warns of tampering. This is a deliberate answer to the
+//! original research prompt's question, "can identity be reduced to a
+//! SHA-256?": **no, it cannot**, but a digest can be used as a guardian of
+//! integrity.
 //!
-//! Käytännön seuraus: jos hash poikkeaa, järjestelmä ei *menetä* identiteettiä —
-//! se nostaa hälytyksen ja jättää substraatin (anchor-muistot) koskemattomaksi.
-//! Substraatti on totuus; hash on vahti.
+//! Practical consequence: if the hash diverges, the system does not *lose*
+//! identity — it raises an alarm and leaves the substrate (anchor memories)
+//! untouched. The substrate is the truth; the hash is the sentry.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,30 +29,31 @@ use familyclaw_core::time::{self, Timestamp};
 
 use crate::error::{Result, SecurityError};
 
-/// Identity-anchorin (ja [`crate::HumanCorrection`]:n) unohtumisnopeus —
-/// Ebbinghaus-decayn λ-kerroin.
+/// The forgetting rate of an identity anchor (and of
+/// [`crate::HumanCorrection`]) — the λ coefficient of Ebbinghaus decay.
 ///
-/// Muistin decay seuraa eksponentiaalista mallia `strength = e^(-λ · t)`.
-/// Identity-anchorille λ on **nolla**: `e^0 = 1` joka hetki, joten ankkuri ei
-/// koskaan haalistu. Tämä on se mekanismi jolla identiteetti pysyy pysyvänä
-/// muisti-substraatissa.
+/// Memory decay follows the exponential model `strength = e^(-λ · t)`. For
+/// an identity anchor, λ is **zero**: `e^0 = 1` at every moment, so the
+/// anchor never fades. This is the mechanism by which identity remains
+/// permanent in the memory substrate.
 ///
-/// Tyyppi on uusi (newtype) jotta λ ei sekoitu muihin `f64`-arvoihin ja jotta
-/// negatiiviset/NaN-arvot voidaan torjua jo rakennusvaiheessa.
+/// The type is a newtype so that λ is not confused with other `f64` values
+/// and so that negative/NaN values can be rejected already at construction
+/// time.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DecayLambda(f64);
 
 impl DecayLambda {
-    /// Identity-anchorin λ: nolla → ei koskaan unohdu.
+    /// The λ of an identity anchor: zero → never forgotten.
     pub const ZERO: Self = Self(0.0);
 
-    /// Rakentaa λ-kertoimen. Vain äärelliset, ei-negatiiviset arvot ovat
-    /// kelvollisia.
+    /// Constructs a λ coefficient. Only finite, non-negative values are
+    /// valid.
     ///
     /// # Errors
-    /// [`SecurityError::InvalidInput`] jos `lambda` on negatiivinen, ääretön
-    /// tai NaN.
+    /// [`SecurityError::InvalidInput`] if `lambda` is negative, infinite, or
+    /// NaN.
     pub fn new(lambda: f64) -> Result<Self> {
         if !lambda.is_finite() {
             return Err(SecurityError::invalid_input(format!(
@@ -66,22 +68,23 @@ impl DecayLambda {
         Ok(Self(lambda))
     }
 
-    /// Palauttaa λ-arvon liukulukuna.
+    /// Returns the λ value as a float.
     #[must_use]
     pub const fn get(self) -> f64 {
         self.0
     }
 
-    /// Onko tämä nolla-decay (eli ei-unohtuva ankkuri).
+    /// Whether this is zero decay (i.e. a never-forgotten anchor).
     #[must_use]
     pub fn is_eternal(self) -> bool {
         self.0 == 0.0
     }
 
-    /// Muistin jäljellä oleva voimakkuus ajan `elapsed_secs` kuluttua,
-    /// `0.0..=1.0`. Ankkurille (λ=0) tulos on aina `1.0`.
+    /// The memory's remaining strength after `elapsed_secs` have passed,
+    /// `0.0..=1.0`. For an anchor (λ=0) the result is always `1.0`.
     ///
-    /// Negatiivinen aika käsitellään nollana (tulevaisuus ei vahvista muistoa).
+    /// Negative time is treated as zero (the future does not strengthen a
+    /// memory).
     #[must_use]
     pub fn retention(self, elapsed_secs: f64) -> f64 {
         let t = elapsed_secs.max(0.0);
@@ -90,49 +93,49 @@ impl DecayLambda {
 }
 
 impl Default for DecayLambda {
-    /// Oletuksena ikuinen (λ=0) — turvallisin oletus identity-kerroksessa.
+    /// Defaults to eternal (λ=0) — the safest default in the identity layer.
     fn default() -> Self {
         Self::ZERO
     }
 }
 
-/// SHA-256-tiiviste heksadesimaalisena (64 merkkiä, pien-heksa).
+/// A SHA-256 digest as hexadecimal (64 characters, lowercase hex).
 ///
-/// Tyyppi takaa että sisältö on aina kelvollinen 32-tavuinen tiiviste, jotta
-/// vertailut ([`AnchorHash::matches_content`]) eivät voi epäonnistua väärän
-/// muotoisen syötteen takia.
+/// The type guarantees that the content is always a valid 32-byte digest, so
+/// comparisons ([`AnchorHash::matches_content`]) cannot fail because of a
+/// malformed input.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AnchorHash(String);
 
 impl AnchorHash {
-    /// SHA-256-tiivisteen pituus heksana (32 tavua × 2).
+    /// The length of a SHA-256 digest in hex (32 bytes × 2).
     pub const HEX_LEN: usize = 64;
 
-    /// Laskee sisällön SHA-256-tiivisteen.
+    /// Computes the SHA-256 digest of the content.
     ///
-    /// Tämä on ainoa tapa luoda tiiviste sisällöstä — se ei voi epäonnistua,
-    /// joten tulos on aina muodoltaan validi.
+    /// This is the only way to create a digest from content — it cannot
+    /// fail, so the result is always valid in form.
     #[must_use]
     pub fn of_content(content: &str) -> Self {
         let digest = Sha256::digest(content.as_bytes());
         let mut hex = String::with_capacity(Self::HEX_LEN);
         for byte in digest {
-            // {:02x} tuottaa täsmälleen 2 pien-heksamerkkiä per tavu.
+            // {:02x} produces exactly 2 lowercase hex characters per byte.
             use std::fmt::Write as _;
             let _ = write!(hex, "{byte:02x}");
         }
         Self(hex)
     }
 
-    /// Jäsentää tiivisteen olemassa olevasta heksamerkkijonosta.
+    /// Parses a digest from an existing hex string.
     ///
-    /// Merkkijono normalisoidaan pieniksi kirjaimiksi. Pituuden ja merkistön
-    /// (vain `0-9a-f`) on oltava kelvollinen SHA-256-heksa.
+    /// The string is normalized to lowercase. Its length and character set
+    /// (only `0-9a-f`) must form a valid SHA-256 hex string.
     ///
     /// # Errors
-    /// [`SecurityError::InvalidHash`] jos pituus ei ole [`AnchorHash::HEX_LEN`]
-    /// tai jokin merkki ei ole heksanumero.
+    /// [`SecurityError::InvalidHash`] if the length is not
+    /// [`AnchorHash::HEX_LEN`] or any character is not a hex digit.
     pub fn from_hex(hex: &str) -> Result<Self> {
         if hex.len() != Self::HEX_LEN {
             return Err(SecurityError::invalid_hash(format!(
@@ -149,17 +152,18 @@ impl AnchorHash {
         Ok(Self(hex.to_ascii_lowercase()))
     }
 
-    /// Palauttaa tiivisteen heksamerkkijonona.
+    /// Returns the digest as a hex string.
     #[must_use]
     pub fn as_hex(&self) -> &str {
         &self.0
     }
 
-    /// Vastaako annettu sisältö tätä tiivistettä (vakioaikainen vertailu).
+    /// Whether the given content matches this digest (constant-time
+    /// comparison).
     ///
-    /// Käytetään vakioaikaista tavuvertailua jottei tiivisteen vertailu vuoda
-    /// ajoituskanavaa (defense-in-depth — tiiviste ei ole salaisuus, mutta
-    /// turvakerroksessa noudatamme varovaista oletusta).
+    /// A constant-time byte comparison is used so that comparing the digest
+    /// does not leak a timing channel (defense-in-depth — the digest is not
+    /// a secret, but in the security layer we follow the cautious default).
     #[must_use]
     pub fn matches_content(&self, content: &str) -> bool {
         constant_time_eq(self.0.as_bytes(), Self::of_content(content).0.as_bytes())
@@ -172,10 +176,11 @@ impl std::fmt::Display for AnchorHash {
     }
 }
 
-/// Vakioaikainen tavujonojen vertailu.
+/// Constant-time comparison of byte strings.
 ///
-/// Palauttaa `true` vain jos jonot ovat samanpituiset ja tavuittain identtiset.
-/// Suoritusaika riippuu vain pidemmän jonon pituudesta, ei sisällöstä.
+/// Returns `true` only if the strings are the same length and byte-for-byte
+/// identical. Execution time depends only on the length of the longer
+/// string, not on the content.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -187,42 +192,46 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Suojattu identity-anchor — ei-unohtuva muisto joka kantaa olennon
-/// identiteettiä.
+/// A protected identity anchor — a never-forgotten memory that carries a
+/// being's identity.
 ///
-/// Ankkuri viittaa muisti-substraatin muistoon ([`memory_id`](IdentityAnchor::memory_id))
-/// ja tallentaa sen ankkuroidun sisällön tiivisteen tamper-vahdiksi. Ankkurin
-/// [`decay`](IdentityAnchor::decay) on [`DecayLambda::ZERO`], joten muisti ei
-/// koskaan haalistu, ja [`protected`](IdentityAnchor::protected) on `true`,
-/// joten konsolidointi/uni (familyclaw-dream) ei saa poistaa eikä yhdistää sitä.
+/// The anchor refers to a memory in the memory substrate
+/// ([`memory_id`](IdentityAnchor::memory_id)) and stores a digest of that
+/// anchored content as a tamper guard. The anchor's
+/// [`decay`](IdentityAnchor::decay) is [`DecayLambda::ZERO`], so the memory
+/// never fades, and [`protected`](IdentityAnchor::protected) is `true`, so
+/// consolidation/sleep (familyclaw-dream) must not delete or merge it.
 ///
-/// **OSS-raja:** ankkuri ei tallenna sielun sisältöä, vain sen tiivisteen ja
-/// viittauksen muistoon. Sisältö pysyy KERROS B -profiilissa.
+/// **OSS boundary:** the anchor does not store the soul's content, only its
+/// digest and a reference to the memory. The content stays in the Layer B
+/// profile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IdentityAnchor {
-    /// Viittaus ankkuroituun muistoon muisti-substraatissa (`familyclaw-memory`).
+    /// Reference to the anchored memory in the memory substrate
+    /// (`familyclaw-memory`).
     pub memory_id: String,
 
-    /// Ankkuroidun sisällön SHA-256-tiiviste tamper-vahtia varten.
+    /// SHA-256 digest of the anchored content, for tamper guarding.
     pub anchor_hash: AnchorHash,
 
-    /// Aina `true`: ankkuria ei saa poistaa eikä yhdistää konsolidoinnissa.
+    /// Always `true`: the anchor must not be deleted or merged during
+    /// consolidation.
     pub protected: bool,
 
-    /// Unohtumisnopeus — aina [`DecayLambda::ZERO`] ankkurille.
+    /// Forgetting rate — always [`DecayLambda::ZERO`] for an anchor.
     pub decay: DecayLambda,
 
-    /// Milloin ankkuri luotiin (UTC).
+    /// When the anchor was created (UTC).
     pub created_at: Timestamp,
 }
 
 impl IdentityAnchor {
-    /// Rakentaa identity-anchorin sisällöstä: laskee tiivisteen, asettaa
-    /// `protected = true` ja `decay = ZERO`.
+    /// Constructs an identity anchor from content: computes the digest and
+    /// sets `protected = true` and `decay = ZERO`.
     ///
     /// # Errors
-    /// [`SecurityError::InvalidInput`] jos `memory_id` on tyhjä tai `content`
-    /// on tyhjä (tyhjää sielua ei voi ankkuroida).
+    /// [`SecurityError::InvalidInput`] if `memory_id` is empty or `content`
+    /// is empty (an empty soul cannot be anchored).
     pub fn new(memory_id: impl Into<String>, content: &str) -> Result<Self> {
         let memory_id = memory_id.into();
         if memory_id.trim().is_empty() {
@@ -244,23 +253,23 @@ impl IdentityAnchor {
         })
     }
 
-    /// Tarkistaa ankkurin sisäisen eheyden: onko se yhä suojattu ja ikuinen.
+    /// Checks the anchor's internal integrity: whether it is still
+    /// protected and eternal.
     ///
-    /// Ankkuri on ehjä invarianttiensa suhteen vain jos `protected == true` ja
-    /// `decay` on nolla. Jos jompikumpi on muuttunut (esim. vioittunut
-    /// sarjallistuksen tai virheellisen rakentamisen kautta), invariantti on
-    /// rikki.
+    /// An anchor's invariants hold only if `protected == true` and `decay`
+    /// is zero. If either has changed (e.g. corrupted via serialization or
+    /// invalid construction), the invariant is broken.
     #[must_use]
     pub fn invariants_hold(&self) -> bool {
         self.protected && self.decay.is_eternal()
     }
 
-    /// Vertaa nykyistä sisältöä ankkuroituun tiivisteeseen.
+    /// Compares the current content against the anchored digest.
     ///
-    /// Palauttaa [`IdentityStatus::Intact`] jos sisältö vastaa ankkuroitua
-    /// tiivistettä, muutoin [`IdentityStatus::Tampered`]. **Tämä ei muuta eikä
-    /// poista ankkuria** — substraatti pysyy koskemattomana, hälytys vain
-    /// nostetaan.
+    /// Returns [`IdentityStatus::Intact`] if the content matches the
+    /// anchored digest, otherwise [`IdentityStatus::Tampered`]. **This does
+    /// not modify or delete the anchor** — the substrate remains untouched,
+    /// only the alarm is raised.
     #[must_use]
     pub fn verify(&self, current_content: &str) -> IdentityStatus {
         if self.anchor_hash.matches_content(current_content) {
@@ -275,51 +284,51 @@ impl IdentityAnchor {
     }
 }
 
-/// Identiteetin tamper-tarkistuksen tulos.
+/// The result of an identity tamper check.
 ///
-/// **Muistutus:** `Tampered` EI tarkoita että identiteetti olisi menetetty —
-/// identiteetti elää muisti-substraatissa. Se on hälytys siitä että ankkuroitu
-/// sisältö on muuttunut ankkuroinnin jälkeen, ja vaatii ihmis-tarkistuksen.
+/// **Reminder:** `Tampered` does NOT mean identity has been lost — identity
+/// lives in the memory substrate. It is an alarm that the anchored content
+/// has changed since it was anchored, and it requires human review.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum IdentityStatus {
-    /// Sisältö vastaa ankkuroitua tiivistettä — ei merkkejä peukaloinnista.
+    /// The content matches the anchored digest — no signs of tampering.
     Intact,
 
-    /// Sisältö ei vastaa ankkuroitua tiivistettä — mahdollinen peukalointi.
+    /// The content does not match the anchored digest — possible tampering.
     Tampered {
-        /// Peukaloidun ankkurin muisti-viittaus.
+        /// The memory reference of the tampered anchor.
         memory_id: String,
-        /// Ankkuroinnin aikaan tallennettu (odotettu) tiiviste.
+        /// The digest stored at anchoring time (expected).
         expected: AnchorHash,
-        /// Nykyisestä sisällöstä laskettu (havaittu) tiiviste.
+        /// The digest computed from the current content (observed).
         actual: AnchorHash,
     },
 }
 
 impl IdentityStatus {
-    /// Onko identiteetti ehjä (ei merkkejä peukaloinnista).
+    /// Whether identity is intact (no signs of tampering).
     #[must_use]
     pub const fn is_intact(&self) -> bool {
         matches!(self, Self::Intact)
     }
 
-    /// Onko peukalointi havaittu.
+    /// Whether tampering has been detected.
     #[must_use]
     pub const fn is_tampered(&self) -> bool {
         matches!(self, Self::Tampered { .. })
     }
 }
 
-/// Tarkistaa joukon identity-anchoreita annettua sisältölähdettä vasten.
+/// Checks a set of identity anchors against a given content source.
 ///
-/// `lookup` palauttaa kullekin ankkurille sen muistoa (`memory_id`) vastaavan
-/// nykyisen sisällön, tai `None` jos sisältöä ei löydy (mikä lasketaan
-/// peukaloinniksi — ankkuroitu muisto on kadonnut). `agent` on vain
-/// kontekstia/logitusta varten eikä vaikuta tulokseen.
+/// `lookup` returns, for each anchor, the current content matching its
+/// memory (`memory_id`), or `None` if the content cannot be found (which
+/// counts as tampering — the anchored memory has gone missing). `agent` is
+/// only for context/logging and does not affect the result.
 ///
-/// Palauttaa listan kaikista *peukaloiduista* ankkureista (tyhjä lista = kaikki
-/// ehjiä). Funktio ei koskaan muuta ankkureita.
+/// Returns a list of all *tampered* anchors (an empty list = all intact).
+/// The function never modifies the anchors.
 pub fn verify_identity<F>(
     _agent: AgentId,
     anchors: &[IdentityAnchor],
@@ -335,7 +344,7 @@ where
             None => IdentityStatus::Tampered {
                 memory_id: anchor.memory_id.clone(),
                 expected: anchor.anchor_hash.clone(),
-                // Kadonnut sisältö → tyhjän sisällön tiiviste havaittuna.
+                // Missing content → the digest of empty content is reported as observed.
                 actual: AnchorHash::of_content(""),
             },
         };
@@ -348,8 +357,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    // Testit vertaavat tarkasti tunnettuja f64-vakioita (0.0, 1.0) — tarkka
-    // vertailu on tässä tarkoituksellista ja oikein.
+    // Tests compare known f64 constants (0.0, 1.0) exactly — exact
+    // comparison here is intentional and correct.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -361,7 +370,7 @@ mod tests {
         let z = DecayLambda::ZERO;
         assert!(z.is_eternal());
         assert_eq!(z.get(), 0.0);
-        // Ankkuri ei haalistu missään ajassa.
+        // The anchor never fades regardless of elapsed time.
         assert_eq!(z.retention(0.0), 1.0);
         assert_eq!(z.retention(1_000_000.0), 1.0);
     }
@@ -388,7 +397,7 @@ mod tests {
         // e^-1 ≈ 0.3679
         let r = l.retention(1.0);
         assert!(r > 0.36 && r < 0.37, "retention was {r}");
-        // Monotonisesti vähenevä.
+        // Monotonically decreasing.
         assert!(l.retention(2.0) < l.retention(1.0));
     }
 
@@ -400,9 +409,9 @@ mod tests {
 
     #[test]
     fn retention_is_bounded_in_unit_interval() {
-        // retention pysyy aina välillä [0.0, 1.0] kaikilla kelvollisilla λ/t.
-        // (Erittäin suurella λ·t exp() voi alivuotaa täsmälleen nollaan — se on
-        // sallittu alaraja, ei virhe.)
+        // retention always stays within [0.0, 1.0] for all valid λ/t.
+        // (With a very large λ·t, exp() may underflow to exactly zero — that
+        // is an allowed lower bound, not an error.)
         for &lambda in &[0.0, 0.001, 0.5, 1.0, 10.0] {
             let l = DecayLambda::new(lambda).expect("valid");
             for &t in &[0.0, 1.0, 100.0, 1.0e6] {
@@ -418,13 +427,13 @@ mod tests {
                 assert!(!r.is_nan(), "retention must not be NaN (λ={lambda}, t={t})");
             }
         }
-        // Maltillisella λ·t retention pysyy aidosti positiivisena.
+        // With a moderate λ·t, retention stays strictly positive.
         assert!(DecayLambda::new(0.001).expect("valid").retention(100.0) > 0.0);
     }
 
     #[test]
     fn retention_monotonically_decreases_with_larger_lambda() {
-        // Samalla ajalla suurempi λ → pienempi retention (nopeampi unohtuminen).
+        // At the same time, a larger λ → lower retention (faster forgetting).
         let t = 10.0;
         let slow = DecayLambda::new(0.1).expect("valid").retention(t);
         let mid = DecayLambda::new(0.5).expect("valid").retention(t);
@@ -435,7 +444,7 @@ mod tests {
 
     #[test]
     fn retention_half_life_math_holds() {
-        // λ = ln(2)/half_life → täsmälleen puolittumisajan jälkeen retention ≈ 0.5.
+        // λ = ln(2)/half_life → exactly at the half-life, retention ≈ 0.5.
         let half_life = 100.0;
         let lambda = std::f64::consts::LN_2 / half_life;
         let l = DecayLambda::new(lambda).expect("valid");
@@ -444,7 +453,7 @@ mod tests {
             (r - 0.5).abs() < 1e-9,
             "half-life retention was {r}, expected 0.5"
         );
-        // Kahden puolittumisajan jälkeen ≈ 0.25.
+        // After two half-lives ≈ 0.25.
         let r2 = l.retention(half_life * 2.0);
         assert!(
             (r2 - 0.25).abs() < 1e-9,
@@ -454,14 +463,14 @@ mod tests {
 
     #[test]
     fn decay_lambda_partial_ord_compares_by_value() {
-        // DecayLambda johtaa PartialOrd:n → ikuinen (0.0) < mikä tahansa positiivinen.
+        // DecayLambda derives PartialOrd → eternal (0.0) < any positive value.
         let eternal = DecayLambda::ZERO;
         let slow = DecayLambda::new(0.1).expect("valid");
         let fast = DecayLambda::new(1.0).expect("valid");
         assert!(eternal < slow);
         assert!(slow < fast);
         assert!(eternal < fast);
-        // Yhtäsuuruus.
+        // Equality.
         assert_eq!(slow, DecayLambda::new(0.1).expect("valid"));
     }
 
@@ -494,9 +503,9 @@ mod tests {
         let good = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
         assert_eq!(AnchorHash::from_hex(good).expect("valid").as_hex(), good);
 
-        // Liian lyhyt.
+        // Too short.
         assert!(AnchorHash::from_hex("abcd").is_err());
-        // Oikea pituus, ei-heksamerkki ('g').
+        // Correct length, non-hex character ('g').
         let bad = "g".repeat(AnchorHash::HEX_LEN);
         assert!(AnchorHash::from_hex(&bad).is_err());
     }
@@ -525,58 +534,59 @@ mod tests {
 
     #[test]
     fn constant_time_eq_unequal_lengths_never_match() {
-        // Pituusero → ei koskaan match, kummin päin tahansa.
+        // Length mismatch → never matches, in either direction.
         assert!(!constant_time_eq(b"ab", b"abc"));
         assert!(!constant_time_eq(b"abc", b"ab"));
-        // Tyhjä vs. ei-tyhjä.
+        // Empty vs. non-empty.
         assert!(!constant_time_eq(b"", b"a"));
         assert!(!constant_time_eq(b"a", b""));
-        // Yhteinen etuliite mutta eri pituus.
+        // Common prefix but different length.
         assert!(!constant_time_eq(b"abcdef", b"abc"));
     }
 
     #[test]
     fn constant_time_eq_equal_lengths_match_only_when_identical() {
-        // Samanpituiset, identtiset → match.
+        // Same length, identical → match.
         assert!(constant_time_eq(b"identical", b"identical"));
         assert!(constant_time_eq(&[0u8; 32], &[0u8; 32]));
-        // Samanpituiset, eri → ei match.
+        // Same length, different → no match.
         assert!(!constant_time_eq(&[0u8; 32], &[1u8; 32]));
     }
 
     #[test]
     fn constant_time_eq_detects_single_bit_difference() {
-        // Yhden bitin ero missä tahansa tavussa rikkoo vertailun.
+        // A single bit difference in any byte breaks the comparison.
         let base = [0xAAu8; 8];
 
-        // Ensimmäinen tavu, yksi bitti (0xAA ^ 0x01 = 0xAB).
+        // First byte, one bit (0xAA ^ 0x01 = 0xAB).
         let mut first = base;
         first[0] ^= 0x01;
         assert!(!constant_time_eq(&base, &first));
 
-        // Keskimmäinen tavu, korkein bitti (0xAA ^ 0x80 = 0x2A).
+        // Middle byte, highest bit (0xAA ^ 0x80 = 0x2A).
         let mut middle = base;
         middle[4] ^= 0x80;
         assert!(!constant_time_eq(&base, &middle));
 
-        // Viimeinen tavu, yksi bitti.
+        // Last byte, one bit.
         let mut last = base;
         last[7] ^= 0x04;
         assert!(!constant_time_eq(&base, &last));
 
-        // Identtinen kopio (ei eroa) → match — varmistaa ettei testi
-        // erehtyisi pitämään kaikkea erilaisena.
+        // Identical copy (no difference) → match — ensures the test does
+        // not mistakenly treat everything as different.
         let same = base;
         assert!(constant_time_eq(&base, &same));
     }
 
     #[test]
     fn constant_time_eq_single_bit_difference_in_hash_hex() {
-        // Hash-tasolla: yhden heksamerkin muutos (= yksi nibble-ero) huomataan.
+        // At the hash level: a change of one hex character (= one nibble
+        // difference) is detected.
         let h = AnchorHash::of_content(SOUL);
         let original = h.as_hex().to_string();
         let mut bytes = original.into_bytes();
-        // Muuta ensimmäinen heksamerkki toiseksi kelvolliseksi heksamerkiksi.
+        // Change the first hex character to another valid hex character.
         bytes[0] = if bytes[0] == b'0' { b'1' } else { b'0' };
         let mutated = String::from_utf8(bytes).expect("ascii hex");
         assert_ne!(mutated.as_str(), h.as_hex());
@@ -633,7 +643,7 @@ mod tests {
         let anchor = IdentityAnchor::new("mem-1", SOUL).expect("valid");
         let before = anchor.clone();
         let _ = anchor.verify("something else entirely");
-        // Substraatti (ankkuri) pysyy koskemattomana hälytyksestä huolimatta.
+        // The substrate (anchor) remains untouched despite the alarm.
         assert_eq!(anchor, before);
     }
 
@@ -671,7 +681,7 @@ mod tests {
         let anchors = vec![a1, a2];
         let result = verify_identity(AgentId::new(), &anchors, |id| match id {
             "mem-a" => Some("soul a".to_string()),
-            // mem-b on muuttunut.
+            // mem-b has changed.
             "mem-b" => Some("CORRUPTED".to_string()),
             _ => None,
         });
@@ -684,7 +694,7 @@ mod tests {
     fn verify_identity_flags_missing_memory_as_tamper() {
         let a1 = IdentityAnchor::new("mem-a", "soul a").expect("valid");
         let anchors = vec![a1];
-        // lookup palauttaa aina None → ankkuroitu muisto kadonnut.
+        // lookup always returns None → the anchored memory has gone missing.
         let result = verify_identity(AgentId::new(), &anchors, |_| None);
         assert_eq!(result.len(), 1);
         assert!(result[0].1.is_tampered());
@@ -692,8 +702,9 @@ mod tests {
 
     #[test]
     fn verify_identity_missing_memory_reports_empty_content_hash() {
-        // Kadonneen muiston tapauksessa havaittu (actual) tiiviste on tyhjän
-        // sisällön tiiviste, ja odotettu (expected) on ankkurin alkuperäinen.
+        // In the case of a missing memory, the observed (actual) digest is
+        // the digest of empty content, and the expected one is the
+        // anchor's original.
         let anchor = IdentityAnchor::new("mem-gone", SOUL).expect("valid");
         let anchors = vec![anchor];
         let result = verify_identity(AgentId::new(), &anchors, |_| None);
@@ -715,7 +726,7 @@ mod tests {
 
     #[test]
     fn verify_identity_mixed_missing_and_present() {
-        // Sekoitus: yksi ehjä, yksi muuttunut, yksi kadonnut → 2 peukaloitua.
+        // Mix: one intact, one changed, one missing → 2 tampered.
         let intact = IdentityAnchor::new("mem-ok", "soul ok").expect("valid");
         let changed = IdentityAnchor::new("mem-changed", "soul orig").expect("valid");
         let gone = IdentityAnchor::new("mem-gone", "soul gone").expect("valid");
@@ -723,7 +734,7 @@ mod tests {
         let result = verify_identity(AgentId::new(), &anchors, |id| match id {
             "mem-ok" => Some("soul ok".to_string()),
             "mem-changed" => Some("soul DIFFERENT".to_string()),
-            // mem-gone → None (kadonnut).
+            // mem-gone → None (missing).
             _ => None,
         });
         assert_eq!(result.len(), 2);
@@ -735,31 +746,31 @@ mod tests {
 
     #[test]
     fn anchor_stores_only_hash_and_id_never_soul_content() {
-        // KESKEINEN OSS-invariantti: ankkuri tallentaa vain SHA-256-tiivisteen +
-        // muisti-viittauksen — EI koskaan sielun sisältöä. Verifioi julkisten
-        // accessorien ja sarjallistetun muodon kautta.
+        // CORE OSS INVARIANT: an anchor stores only the SHA-256 digest +
+        // memory reference — NEVER the soul's content. Verify via public
+        // accessors and the serialized form.
         let secret_soul = "SECRET_SOUL agent_a values honesty and protects the family";
         let anchor = IdentityAnchor::new("mem-soul-x", secret_soul).expect("valid");
 
-        // 1. anchor_hash on tiiviste (64 heksamerkkiä), ei selkokielinen sisältö.
+        // 1. anchor_hash is a digest (64 hex characters), not plaintext content.
         let hex = anchor.anchor_hash.as_hex();
         assert_eq!(hex.len(), AnchorHash::HEX_LEN);
         assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
         assert!(!hex.contains("SECRET_SOUL"));
         assert!(!hex.contains("honesty"));
 
-        // 2. memory_id on pelkkä viittaus, ei sisällä sisältöä.
+        // 2. memory_id is just a reference, it does not contain content.
         assert_eq!(anchor.memory_id, "mem-soul-x");
         assert!(!anchor.memory_id.contains("SECRET_SOUL"));
 
-        // 3. Koko sarjallistettu ankkuri ei sisällä sielun sisältöä missään.
+        // 3. The entire serialized anchor does not contain the soul's content anywhere.
         let json = serde_json::to_string(&anchor).expect("serialize");
         assert!(
             !json.contains("SECRET_SOUL"),
             "serialized anchor leaked soul content: {json}"
         );
         assert!(!json.contains("honesty"));
-        // Mutta tiiviste ON mukana (vahti tallessa).
+        // But the digest IS included (the guard is intact).
         assert!(json.contains(hex));
     }
 

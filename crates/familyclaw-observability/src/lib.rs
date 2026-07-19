@@ -1,38 +1,38 @@
 //! # familyclaw-observability
 //!
-//! Havainnoitavuus- ja pääsynvalvontakerros monen agentin laivueelle:
-//! **mittarit**, **tapahtumatallennus** ja **roolipohjainen pääsynvalvonta**
-//! (RBAC) — kaikki riippuvuuskevyenä (vain `familyclaw-core`,
-//! `familyclaw-bridge`, `serde`, `serde_json`). Ei raskaita
-//! `metrics`-/`opentelemetry`-pinoja: Prometheus-tekstivienti on käsin
-//! kirjoitettu, jotta binääri pysyy pienenä (`FamilyClaw`n 2–8 MB tavoite).
+//! An observability and access-control layer for a multi-agent fleet:
+//! **metrics**, **event recording**, and **role-based access control**
+//! (RBAC) — all dependency-light (only `familyclaw-core`,
+//! `familyclaw-bridge`, `serde`, `serde_json`). No heavy
+//! `metrics`/`opentelemetry` stacks: the Prometheus text export is
+//! hand-written so the binary stays small (`FamilyClaw`'s 2-8 MB target).
 //!
-//! ## Osat
-//! - [`metrics`] — [`MetricsRegistry`] ja sen tyypit ([`Counter`], [`Gauge`],
-//!   [`Histogram`]) sekä deterministinen [`MetricsRegistry::prometheus_export`].
-//! - [`event_recorder`] — [`EventRecorder`] tilaa siltakerroksen
-//!   tapahtumaväylän ([`FamilyBridge`]) ja muuntaa tapahtumat
-//!   mittaripäivityksiksi (vain lukeva, eteenpäin-yhteensopiva).
-//! - [`rbac`] — [`RbacPolicy`] per-rooli-kyvykkyysluvat (syvyyspuolustus
-//!   sandboxin päällä).
+//! ## Parts
+//! - [`metrics`] — [`MetricsRegistry`] and its types ([`Counter`], [`Gauge`],
+//!   [`Histogram`]), plus deterministic [`MetricsRegistry::prometheus_export`].
+//! - [`event_recorder`] — [`EventRecorder`] subscribes to the bridge
+//!   layer's event bus ([`FamilyBridge`]) and converts events into
+//!   metric updates (read-only, forward-compatible).
+//! - [`rbac`] — [`RbacPolicy`] per-role capability grants (defense in
+//!   depth on top of the sandbox).
 //!
-//! ## Suunnitteluperiaatteet
-//! - **Riippuvuuskevyt.** Ei verkko- eikä HTTP-kerrosta tässä cratessa:
-//!   [`MetricsRegistry::prometheus_export`] palauttaa pelkän `String`:n, jonka
-//!   gateway voi tarjoilla (esim. `GET /metrics`).
-//! - **Deterministinen vienti.** Mittarit järjestetään nimen mukaan; tuloste
-//!   on vakaa (golden-string-testattava).
-//! - **Eteenpäin-yhteensopiva.** [`EventRecorder`] ohittaa tuntemattomat
-//!   ([`EventKind`]) lajit `_ => {}`-haarassa, joten uudet tapahtumatyypit
-//!   eivät riko sitä.
-//! - **Kuljetuksesta riippumaton.** Kuten [`familyclaw_bridge`], tämä crate
-//!   kuluttaa vain sillan julkista rajapintaa — ei sidontaa Resonance Busiin
-//!   tai muihin liikkuviin osiin.
+//! ## Design principles
+//! - **Dependency-light.** No network or HTTP layer in this crate:
+//!   [`MetricsRegistry::prometheus_export`] returns a plain `String`, which
+//!   the gateway can serve (e.g. `GET /metrics`).
+//! - **Deterministic export.** Metrics are ordered by name; the output is
+//!   stable (golden-string testable).
+//! - **Forward-compatible.** [`EventRecorder`] skips unknown
+//!   ([`EventKind`]) variants in a `_ => {}` branch, so new event types
+//!   don't break it.
+//! - **Transport-independent.** Like [`familyclaw_bridge`], this crate
+//!   consumes only the bridge's public interface — no binding to the
+//!   Resonance Bus or other moving parts.
 //!
 //! [`EventKind`]: familyclaw_bridge::EventKind
 //! [`FamilyBridge`]: familyclaw_bridge::FamilyBridge
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_bridge::{AgentRole, FamilyBridge};
 //! use familyclaw_observability::{EventRecorder, MetricsRegistry, RbacPolicy};
@@ -42,16 +42,16 @@
 //! let metrics = MetricsRegistry::with_fleet_defaults();
 //! let mut recorder = EventRecorder::new(&bridge, metrics.clone());
 //!
-//! // Pääsynvalvonta: Executor saa ajaa komentoja, Scout ei.
+//! // Access control: Executor may run commands, Scout may not.
 //! let policy = RbacPolicy::new().allow(AgentRole::Executor, "system.run");
 //! assert!(policy.check(AgentRole::Executor, "system.run").is_ok());
 //! assert!(policy.check(AgentRole::Scout, "system.run").is_err());
 //!
-//! // Tuota liikennettä ja valuta se mittareihin.
+//! // Generate some traffic and drain it into the metrics.
 //! bridge.create_task("seed", None).await?;
 //! recorder.drain_once().await;
 //!
-//! // Vie Prometheus-tekstinä (gateway voi tarjoilla tämän).
+//! // Export as Prometheus text (the gateway can serve this).
 //! let text = metrics.prometheus_export();
 //! assert!(text.contains("tasks_created 1"));
 //! # Ok(())
@@ -72,7 +72,7 @@ pub use metrics::{
 };
 pub use rbac::{RbacError, RbacPolicy};
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -90,7 +90,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_api_is_reexported() {
-        // Jos jokin re-export poistetaan, tämä testi ei käänny.
+        // If any re-export is removed, this test will fail to compile.
         let metrics: MetricsRegistry = MetricsRegistry::with_fleet_defaults();
         let _counter: Counter = metrics.counter(COUNTER_TASKS_CREATED);
         let _gauge: Gauge = metrics.gauge(GAUGE_AGENTS_ONLINE);

@@ -1,24 +1,27 @@
-//! Moniagenttiorkesterointi: DAG-pohjainen työnkulkumoottori (director→worker).
+//! Multi-agent orchestration: a DAG-based workflow engine (director→worker).
 //!
-//! Tämä moduuli rakentuu **pelkästään** sillan julkisen rajapinnan
-//! ([`crate::bridge::FamilyBridge`]) päälle: agenttirekisteri, tehtävätaulu ja
-//! tapahtumaväylä. Se mallintaa työnkulun suunnattuna syklittömänä verkkona
-//! ([`OrchestrationPlan`]), jossa jokainen solmu ([`TaskNode`]) muuttuu
-//! ajossa konkreettiseksi [`crate::task::Task`]:ksi tehtävätaululla.
+//! This module builds **solely** on the bridge's public interface
+//! ([`crate::bridge::FamilyBridge`]): the agent registry, task board, and
+//! event bus. It models a workflow as a directed acyclic graph
+//! ([`OrchestrationPlan`]), where each node ([`TaskNode`]) turns into a
+//! concrete [`crate::task::Task`] on the task board at run time.
 //!
-//! ## Suunnitteluperiaatteet
-//! - **Vain lailliset tilasiirtymät.** Orkesteri ohjaa tehtäviä ainoastaan
-//!   jäädytetyn [`crate::task::TaskStatus`]-tilakoneen sallimia siirtymiä pitkin
-//!   (`Pending → Active → Done`), jotta durable-replay pysyy ehjänä.
-//! - **Determinismi.** Kaikki ajalliset päätökset (liveness) ottavat `now`-
-//!   parametrin; samasta suunnitelmasta ja samasta `now`-arvosta seuraa aina
-//!   sama työjärjestys ja sama työntekijävalinta. Järjestelmäkelloa ei lueta.
-//! - **Ei ydintyyppien laajennusta.** Koordinointitapahtumat julkaistaan
-//!   [`crate::event::EventKind::Custom`]-muodossa etuliitteellä `orchestration.`.
-//! - **Rajattu sub-delegointi.** Rekursiivinen alityönkulkujen ajo on katkaistu
-//!   syvyysbudjettiin (vrt. Hermesin iteraatiobudjetti).
+//! ## Design principles
+//! - **Only legal state transitions.** The orchestrator drives tasks only
+//!   along transitions permitted by the frozen [`crate::task::TaskStatus`]
+//!   state machine (`Pending → Active → Done`), so that durable replay stays
+//!   intact.
+//! - **Determinism.** Every time-dependent decision (liveness) takes a `now`
+//!   parameter; the same plan and the same `now` value always yield the same
+//!   work order and the same worker selection. The system clock is never
+//!   read.
+//! - **No extension of core types.** Coordination events are published as
+//!   [`crate::event::EventKind::Custom`] with the prefix `orchestration.`.
+//! - **Bounded sub-delegation.** Recursive execution of sub-workflows is
+//!   capped by a depth budget (cf. an iteration budget for nested agent
+//!   calls).
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_bridge::{
 //!     AgentInfo, AgentRole, FamilyBridge, HostKind, NodeId, OrchestrationPlan,
@@ -33,7 +36,7 @@
 //! let wid = worker.id;
 //! bridge.register_agent(worker).await?;
 //! let now = time::now();
-//! bridge.heartbeat(wid, now).await?; // tee työntekijästä online
+//! bridge.heartbeat(wid, now).await?; // bring the worker online
 //!
 //! let plan = OrchestrationPlan::new("demo", vec![
 //!     TaskNode::new("a", "step a", "do a"),
@@ -60,43 +63,44 @@ use crate::event::{Event, EventKind};
 use crate::executor::{OrchestratedTurn, TurnExecutor};
 use crate::task::{TaskId, TaskStatus};
 
-/// Tapahtuma jonka orkesteri julkaisee kun solmun tehtävä on osoitettu
-/// työntekijälle ja aktivoitu.
+/// The event the orchestrator publishes when a node's task has been assigned
+/// to a worker and activated.
 pub const STEP_ASSIGNED: &str = "orchestration.step_assigned";
 
-/// Tapahtuma jonka orkesteri julkaisee kun koko työnkulku on valmis (kaikki
-/// solmut tilassa [`TaskStatus::Done`]).
+/// The event the orchestrator publishes when the entire workflow is complete
+/// (all nodes in the [`TaskStatus::Done`] state).
 pub const WORKFLOW_DONE: &str = "orchestration.workflow_done";
 
-/// Tapahtuma jonka orkesteri julkaisee kun solmun vuoro **epäonnistui**:
-/// suorittaja palautti virheen tai toimite rikkoi solmun kyvyn sopimuksen
-/// (tulosskeema/jälkiehto). Solmun tehtävä jätetään ei-`Done`-tilaan eikä sen
-/// jälkeläisiä etenetä — [`TaskStatus`]-tilakoneessa ei ole `Failed`-arvoa,
-/// joten epäonnistuminen ilmaistaan tällä [`EventKind::Custom`]-tapahtumalla.
+/// The event the orchestrator publishes when a node's turn **fails**: the
+/// executor returned an error, or the deliverable breached the node's
+/// capability contract (output schema/postcondition). The node's task is left
+/// in a non-`Done` state and its descendants are not advanced — the
+/// [`TaskStatus`] state machine has no `Failed` value, so failure is
+/// expressed via this [`EventKind::Custom`] event.
 pub const STEP_FAILED: &str = "orchestration.step_failed";
 
-/// Rekursiivisen sub-delegoinnin syvyyskatto (vrt. iteraatiobudjetti).
+/// The depth cap for recursive sub-delegation (cf. an iteration budget).
 ///
-/// Tämän ylittävä [`Orchestrator::run_nested`]-kutsu palauttaa virheen sen
-/// sijaan että ajaisi rajattomasti syvemmälle.
+/// An [`Orchestrator::run_nested`] call that exceeds this returns an error
+/// instead of running unboundedly deeper.
 pub const MAX_DELEGATION_DEPTH: usize = 4;
 
-/// Työnkulun yksittäisen solmun vakaa tunniste (ihmisluettava merkkijono).
+/// The stable identifier of a single workflow node (a human-readable string).
 ///
-/// Toisin kuin UUID-pohjaiset [`crate::task::TaskId`]-arvot, `NodeId` on
-/// suunnittelijan antama nimi (esim. `"build"`, `"test"`), jolloin
-/// riippuvuudet kirjoitetaan luettavasti ja topologinen järjestys on vakaa.
+/// Unlike UUID-based [`crate::task::TaskId`] values, `NodeId` is a name given
+/// by the planner (e.g. `"build"`, `"test"`), so dependencies are written
+/// readably and the topological order is stable.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct NodeId(pub String);
 
 impl NodeId {
-    /// Rakentaa tunnisteen mistä tahansa merkkijonoksi muunnettavasta arvosta.
+    /// Builds an identifier from any value convertible to a string.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
-    /// Palauttaa tunnisteen merkkijonona.
+    /// Returns the identifier as a string.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -121,53 +125,56 @@ impl From<String> for NodeId {
     }
 }
 
-/// Yksittäinen työnkulun solmu: yksi delegoitava työvaihe.
+/// A single workflow node: one delegatable work step.
 ///
-/// Solmu kuvaa *mitä* tehdään ja *kenelle se sopii* (rooli + kyvykkyydet),
-/// sekä *minkä jälkeen* se voi alkaa ([`deps`](Self::deps)). Ajossa solmu
-/// muuttuu yhdeksi tehtäväksi tehtävätaululla.
+/// A node describes *what* is done and *who it fits* (role + capabilities),
+/// and *after what* it can start ([`deps`](Self::deps)). At run time, a node
+/// turns into a single task on the task board.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskNode {
-    /// Solmun vakaa tunniste työnkulun sisällä (oltava uniikki).
+    /// The node's stable identifier within the workflow (must be unique).
     pub id: NodeId,
 
-    /// Lyhyt otsikko (tulee tehtävän otsikoksi).
+    /// Short title (becomes the task's title).
     pub title: String,
 
-    /// Vapaamuotoinen kuvaus työvaiheesta.
+    /// Free-form description of the work step.
     #[serde(default)]
     pub description: String,
 
-    /// Vaadittu rooli työntekijälle, tai `None` jos mikä tahansa rooli kelpaa.
+    /// The role required of the worker, or `None` if any role is acceptable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_role: Option<AgentRole>,
 
-    /// Vaaditut kyvykkyydet: työntekijän kyvykkyysjoukon on oltava näiden
-    /// ylijoukko (superset).
+    /// The required capabilities: the worker's capability set must be a
+    /// superset of these.
     #[serde(default)]
     pub required_capabilities: Vec<String>,
 
-    /// Solmut joiden on oltava valmiita ennen kuin tämä voi alkaa.
+    /// Nodes that must be complete before this one can start.
     #[serde(default)]
     pub deps: Vec<NodeId>,
 
-    /// Kiinnitetty työntekijä: jos asetettu, valinta ohitetaan ja tehtävä
-    /// osoitetaan suoraan tälle agentille (jos se on online).
+    /// A pinned worker: if set, selection is bypassed and the task is
+    /// assigned directly to this agent (if it is online).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_assignee: Option<AgentId>,
 
-    /// Valinnainen kyky/sopimus jota solmun toimite todennetaan vasten
-    /// suoritussauman ([`crate::executor::TurnExecutor`]) jälkeen. Jos asetettu,
-    /// [`Orchestrator::run_with`] ajaa toimitteen
-    /// [`crate::contract::ContractBoard::fulfill`]-todennuksen läpi (tulosskeema
-    /// ja jälkiehdot) **ennen** kuin solmu siirretään `Done`-tilaan; rikkomus
-    /// merkitsee solmun epäonnistuneeksi eikä jälkeläisiä eteneä.
+    /// An optional capability/contract against which the node's deliverable
+    /// is verified after the execution seam
+    /// ([`crate::executor::TurnExecutor`]). If set,
+    /// [`Orchestrator::run_with`] runs the deliverable through
+    /// [`crate::contract::ContractBoard::fulfill`] verification (output
+    /// schema and postconditions) **before** the node is moved to the `Done`
+    /// state; a violation marks the node as failed and its descendants are
+    /// not advanced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability: Option<Capability>,
 }
 
 impl TaskNode {
-    /// Rakentaa solmun tunnisteella, otsikolla ja kuvauksella ilman rajoitteita.
+    /// Builds a node with an identifier, title, and description, without
+    /// constraints.
     pub fn new(
         id: impl Into<NodeId>,
         title: impl Into<String>,
@@ -185,14 +192,14 @@ impl TaskNode {
         }
     }
 
-    /// Asettaa vaaditun roolin (builder-tyyli).
+    /// Sets the required role (builder style).
     #[must_use]
     pub fn with_role(mut self, role: AgentRole) -> Self {
         self.required_role = Some(role);
         self
     }
 
-    /// Asettaa vaaditut kyvykkyydet (builder-tyyli).
+    /// Sets the required capabilities (builder style).
     #[must_use]
     pub fn with_capabilities<I, S>(mut self, caps: I) -> Self
     where
@@ -203,7 +210,7 @@ impl TaskNode {
         self
     }
 
-    /// Asettaa riippuvuudet (builder-tyyli).
+    /// Sets the dependencies (builder style).
     #[must_use]
     pub fn with_deps<I, N>(mut self, deps: I) -> Self
     where
@@ -214,18 +221,19 @@ impl TaskNode {
         self
     }
 
-    /// Kiinnittää työntekijän (builder-tyyli).
+    /// Pins the worker (builder style).
     #[must_use]
     pub fn with_pinned_assignee(mut self, agent: AgentId) -> Self {
         self.pinned_assignee = Some(agent);
         self
     }
 
-    /// Liittää solmuun todennettavan kyvyn/sopimuksen (builder-tyyli).
+    /// Attaches a verifiable capability/contract to the node (builder style).
     ///
-    /// Kun solmulla on kyky, [`Orchestrator::run_with`] ajaa suoritussauman
-    /// tuottaman toimitteen [`crate::contract::ContractBoard::fulfill`]-
-    /// todennuksen läpi ennen `Done`-siirtymää.
+    /// When a node has a capability, [`Orchestrator::run_with`] runs the
+    /// deliverable produced by the execution seam through
+    /// [`crate::contract::ContractBoard::fulfill`] verification before the
+    /// `Done` transition.
     #[must_use]
     pub fn with_capability(mut self, capability: Capability) -> Self {
         self.capability = Some(capability);
@@ -233,24 +241,24 @@ impl TaskNode {
     }
 }
 
-/// Suunnattu syklitön työnkulkukuvaus (DAG).
+/// A directed acyclic workflow description (DAG).
 ///
-/// Suunnitelma kootaan solmuista, joiden väliset riippuvuudet
-/// ([`TaskNode::deps`]) muodostavat verkon. [`validate`](Self::validate)
-/// varmistaa että verkko on kelvollinen (ei syklejä, ei roikkuvia
-/// riippuvuuksia, ei kaksoistunnisteita) ja [`topo_order`](Self::topo_order)
-/// palauttaa deterministisen suoritusjärjestyksen.
+/// A plan is assembled from nodes whose dependencies between each other
+/// ([`TaskNode::deps`]) form a graph. [`validate`](Self::validate) verifies
+/// that the graph is valid (no cycles, no dangling dependencies, no duplicate
+/// identifiers), and [`topo_order`](Self::topo_order) returns a deterministic
+/// execution order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestrationPlan {
-    /// Suunnitelman ihmisluettava tunniste.
+    /// The plan's human-readable identifier.
     pub id: String,
 
-    /// Työnkulun solmut.
+    /// The workflow's nodes.
     pub nodes: Vec<TaskNode>,
 }
 
 impl OrchestrationPlan {
-    /// Rakentaa suunnitelman tunnisteella ja solmuilla (validoimatta).
+    /// Builds a plan with an identifier and nodes (without validating).
     pub fn new(id: impl Into<String>, nodes: Vec<TaskNode>) -> Self {
         Self {
             id: id.into(),
@@ -258,24 +266,24 @@ impl OrchestrationPlan {
         }
     }
 
-    /// Hakee solmun tunnisteen perusteella.
+    /// Looks up a node by identifier.
     #[must_use]
     pub fn node(&self, id: &NodeId) -> Option<&TaskNode> {
         self.nodes.iter().find(|n| &n.id == id)
     }
 
-    /// Validoi suunnitelman rakenteen.
+    /// Validates the plan's structure.
     ///
-    /// Hylkää:
-    /// - **kaksoistunnisteen** (sama [`NodeId`] kahdesti),
-    /// - **roikkuvan riippuvuuden** (dep osoittaa tuntemattomaan solmuun),
-    /// - **syklin** (verkossa on kehä — topologinen järjestys ei onnistu).
+    /// Rejects:
+    /// - a **duplicate identifier** (the same [`NodeId`] twice),
+    /// - a **dangling dependency** (a dep points to an unknown node),
+    /// - a **cycle** (the graph has a loop — topological ordering fails).
     ///
     /// # Errors
-    /// [`FamilyClawError::InvalidInput`] kuvaavalla viestillä jos jokin yllä
-    /// mainituista ehdoista rikkoutuu.
+    /// [`FamilyClawError::InvalidInput`] with a descriptive message if any of
+    /// the conditions above is violated.
     pub fn validate(&self) -> Result<()> {
-        // 1) Kaksoistunnisteet.
+        // 1) Duplicate identifiers.
         let mut seen: HashSet<&NodeId> = HashSet::with_capacity(self.nodes.len());
         for node in &self.nodes {
             if !seen.insert(&node.id) {
@@ -286,7 +294,7 @@ impl OrchestrationPlan {
             }
         }
 
-        // 2) Roikkuvat riippuvuudet + itseviittaus.
+        // 2) Dangling dependencies + self-reference.
         for node in &self.nodes {
             for dep in &node.deps {
                 if !seen.contains(dep) {
@@ -304,25 +312,25 @@ impl OrchestrationPlan {
             }
         }
 
-        // 3) Syklit: topo-sort onnistuu vain syklittömälle verkolle.
+        // 3) Cycles: topo-sort only succeeds for an acyclic graph.
         self.topo_order()?;
         Ok(())
     }
 
-    /// Palauttaa deterministisen topologisen suoritusjärjestyksen.
+    /// Returns a deterministic topological execution order.
     ///
-    /// Käyttää Kahnin algoritmia, jossa tasapelit (useita yhtä aikaa
-    /// suoritettavissa olevia solmuja) ratkaistaan [`NodeId`]:n mukaan
-    /// nousevasti — näin järjestys on sama joka ajolla.
+    /// Uses Kahn's algorithm, where ties (multiple nodes ready to run at the
+    /// same time) are broken by [`NodeId`] in ascending order — so the order
+    /// is the same on every run.
     ///
     /// # Errors
-    /// - [`FamilyClawError::InvalidInput`] jos jokin riippuvuus osoittaa
-    ///   tuntemattomaan solmuun (roikkuva dep).
-    /// - [`FamilyClawError::InvalidInput`] jos verkossa on sykli.
+    /// - [`FamilyClawError::InvalidInput`] if a dependency points to an
+    ///   unknown node (a dangling dep).
+    /// - [`FamilyClawError::InvalidInput`] if the graph has a cycle.
     pub fn topo_order(&self) -> Result<Vec<NodeId>> {
         let index: HashMap<&NodeId, &TaskNode> = self.nodes.iter().map(|n| (&n.id, n)).collect();
 
-        // Lähtevien kaarien (dep → riippuva) muodostus + sisääntuloasteet.
+        // Build outgoing edges (dep → dependent) + in-degrees.
         let mut in_degree: HashMap<&NodeId, usize> =
             self.nodes.iter().map(|n| (&n.id, 0usize)).collect();
         let mut dependents: HashMap<&NodeId, Vec<&NodeId>> =
@@ -336,7 +344,7 @@ impl OrchestrationPlan {
                         node.id, dep
                     )));
                 }
-                // dep → node: node:n sisääntuloaste kasvaa.
+                // dep → node: node's in-degree increases.
                 if let Some(d) = in_degree.get_mut(&node.id) {
                     *d += 1;
                 }
@@ -346,7 +354,7 @@ impl OrchestrationPlan {
             }
         }
 
-        // Kahn: ota aina pienin valmis solmu (deterministinen tasapelin ratko).
+        // Kahn: always take the smallest ready node (deterministic tie-break).
         let mut ready: Vec<&NodeId> = in_degree
             .iter()
             .filter(|(_, &d)| d == 0)
@@ -369,8 +377,8 @@ impl OrchestrationPlan {
                     }
                 }
             }
-            // Lisää valmistuneet pienin-ensin ja pidä jono lajiteltuna jotta
-            // järjestys on täysin deterministinen.
+            // Add newly-ready nodes smallest-first and keep the queue sorted
+            // so the order is fully deterministic.
             if !newly_ready.is_empty() {
                 let mut rest: Vec<&NodeId> = queue.drain(..).collect();
                 rest.extend(newly_ready);
@@ -388,67 +396,67 @@ impl OrchestrationPlan {
     }
 }
 
-/// Yhteenveto yhden työntekijävalinnan ehdokkaasta (sisäinen apurakenne).
+/// A summary of one worker-selection candidate (internal helper struct).
 struct Candidate {
     id: AgentId,
     in_flight: usize,
 }
 
-/// Yhden solmun ajon lopputulos (sisäinen).
+/// The outcome of running a single node (internal).
 enum NodeOutcome {
-    /// Solmu valmistui: tehtävä on `Done`.
+    /// The node completed: the task is `Done`.
     Completed(TaskId),
-    /// Solmu epäonnistui: tehtävä jäi ei-`Done`-tilaan, haara pysähtyy.
+    /// The node failed: the task stayed in a non-`Done` state, its branch
+    /// halts.
     Failed,
 }
 
-/// DAG-työnkulkumoottori joka ohjaa sillan tehtävätaulua.
+/// A DAG workflow engine that drives the bridge's task board.
 ///
-/// `Orchestrator` ei omista omaa tilaa — se kuljettaa jaettua
-/// [`FamilyBridge`]-julkisivua ja on siksi `Clone`. Kaikki ajalliset
-/// päätökset (liveness) ottavat `now`-parametrin determinismin vuoksi.
+/// `Orchestrator` does not own any state itself — it carries a shared
+/// [`FamilyBridge`] facade and is therefore `Clone`. Every time-dependent
+/// decision (liveness) takes a `now` parameter, for determinism.
 #[derive(Debug, Clone)]
 pub struct Orchestrator {
     bridge: FamilyBridge,
 }
 
-/// Raportti yhden suunnitelman ajosta.
+/// A report on running a single plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReport {
-    /// Suunnitelman tunniste.
+    /// The plan's identifier.
     pub plan_id: String,
 
-    /// Valmistuneet solmut ja niiden tehtävätunnisteet topologisessa
-    /// järjestyksessä.
+    /// The completed nodes and their task identifiers, in topological order.
     pub completed: Vec<(NodeId, TaskId)>,
 }
 
 impl Orchestrator {
-    /// Rakentaa orkesterin annetun sillan ympärille.
+    /// Builds an orchestrator around the given bridge.
     #[must_use]
     pub fn new(bridge: FamilyBridge) -> Self {
         Self { bridge }
     }
 
-    /// Pääsy taustalla olevaan siltaan.
+    /// Access to the underlying bridge.
     #[must_use]
     pub fn bridge(&self) -> &FamilyBridge {
         &self.bridge
     }
 
-    /// Valitsee parhaan online-työntekijän annetuilla rajoitteilla hetkellä
+    /// Selects the best online worker under the given constraints at time
     /// `now`.
     ///
-    /// Valintasäännöt:
-    /// 1. Rooli täsmää (jos `required_role` annettu).
-    /// 2. Kyvykkyydet ovat ylijoukko: agentin kyvyt sisältävät kaikki
-    ///    vaaditut kyvyt.
-    /// 3. Agentti on [`Liveness::Online`] hetkellä `now`.
+    /// Selection rules:
+    /// 1. The role matches (if `required_role` is given).
+    /// 2. The capabilities are a superset: the agent's capabilities contain
+    ///    every required capability.
+    /// 3. The agent is [`Liveness::Online`] at time `now`.
     ///
-    /// Tasapeli ratkaistaan deterministisesti: ensin vähiten keskeneräisiä
-    /// (ei-terminaalisia) tehtäviä, sitten pienin [`AgentId`].
+    /// Ties are broken deterministically: first by fewest in-flight
+    /// (non-terminal) tasks, then by smallest [`AgentId`].
     ///
-    /// Palauttaa `None` jos kukaan ei täytä ehtoja.
+    /// Returns `None` if no one satisfies the conditions.
     pub async fn select_worker(
         &self,
         required_role: Option<AgentRole>,
@@ -461,13 +469,13 @@ impl Orchestrator {
 
         let mut candidates: Vec<Candidate> = Vec::new();
         for info in agents {
-            // 1) Rooli.
+            // 1) Role.
             if let Some(role) = required_role {
                 if info.role != role {
                     continue;
                 }
             }
-            // 2) Kyvykkyydet (superset).
+            // 2) Capabilities (superset).
             let has_all = required_caps
                 .iter()
                 .all(|need| info.capabilities.iter().any(|have| have == need));
@@ -498,42 +506,43 @@ impl Orchestrator {
             .map(|c| c.id)
     }
 
-    /// Ajaa työnkulun loppuun ohjaten jäädytettyä tehtävätaulua.
+    /// Runs the workflow to completion, driving the frozen task board.
     ///
-    /// Eteneminen: validoi suunnitelma, käy solmut läpi topologisessa
-    /// järjestyksessä, ja jokaiselle solmulle (jonka kaikki riippuvuudet ovat
-    /// [`TaskStatus::Done`]) luo tehtävän, valitsee työntekijän, asettaa
-    /// `Pending → Active → Done`. Koordinointitapahtumat julkaistaan väylälle.
+    /// Progression: validate the plan, walk the nodes in topological order,
+    /// and for each node (whose dependencies are all [`TaskStatus::Done`])
+    /// create a task, select a worker, and set `Pending → Active → Done`.
+    /// Coordination events are published to the bus.
     ///
-    /// Tämä on **synkroninen, in-process** ajuri: se simuloi työntekijän
-    /// työn valmistumisen (siirtää tehtävän `Done`-tilaan) heti osoituksen
-    /// jälkeen, koska varsinainen LLM-/kuljetuskerros kytketään adapterilla
-    /// myöhemmin. Tärkeää on että **vain laillisia tilasiirtymiä** käytetään.
+    /// This is a **synchronous, in-process** driver: it simulates the
+    /// worker's completion of the work (moves the task to `Done`) right
+    /// after assignment, because the actual LLM/transport layer is wired in
+    /// later via an adapter. What matters is that **only legal state
+    /// transitions** are used.
     ///
     /// # Errors
-    /// - [`FamilyClawError::InvalidInput`] jos suunnitelma on kelvoton
-    ///   (sykli/roikkuva dep/kaksoistunniste).
-    /// - [`FamilyClawError::NotFound`] jos kiinnitettyä työntekijää ei löydy
-    ///   tai sopivaa työntekijää ei ole (`NotFound` solmun nimellä).
-    /// - Välittää tehtävätaulun siirtymävirheet.
+    /// - [`FamilyClawError::InvalidInput`] if the plan is invalid
+    ///   (cycle/dangling dep/duplicate identifier).
+    /// - [`FamilyClawError::NotFound`] if a pinned worker cannot be found or
+    ///   no suitable worker exists (`NotFound` with the node's name).
+    /// - Propagates the task board's transition errors.
     pub async fn run(&self, plan: &OrchestrationPlan, now: Timestamp) -> Result<RunReport> {
         self.run_nested(plan, now, 0).await
     }
 
-    /// Kuten [`run`](Self::run), mutta seuraa rekursiivista delegointisyvyyttä.
+    /// Like [`run`](Self::run), but tracks the recursive delegation depth.
     ///
-    /// Sub-työnkulut (esim. solmu joka itse delegoi alityönkulun) kutsuvat
-    /// tätä kasvavalla `depth`-arvolla. Kun `depth` ylittää
-    /// [`MAX_DELEGATION_DEPTH`]:n, ajo katkaistaan virheellä budjetin
-    /// ylityksen estämiseksi.
+    /// Sub-workflows (e.g. a node that itself delegates a sub-workflow) call
+    /// this with an increasing `depth` value. When `depth` exceeds
+    /// [`MAX_DELEGATION_DEPTH`], the run is aborted with an error to prevent
+    /// exceeding the budget.
     ///
-    /// Tämä on takautuvasti yhteensopiva sisäänkäynti: se delegoi
-    /// [`run_nested_with`](Self::run_nested_with):lle hermeettisellä
-    /// [`MockTurnExecutor`](crate::executor::MockTurnExecutor)-suorittajalla,
-    /// joten simuloitu in-process-valmistuminen säilyy bittiyhteensopivana.
+    /// This is a backward-compatible entry point: it delegates to
+    /// [`run_nested_with`](Self::run_nested_with) with the hermetic
+    /// [`MockTurnExecutor`](crate::executor::MockTurnExecutor), so the
+    /// simulated in-process completion stays bit-for-bit compatible.
     ///
     /// # Errors
-    /// Kuten [`run`](Self::run), sekä [`FamilyClawError::InvalidInput`] jos
+    /// As in [`run`](Self::run), plus [`FamilyClawError::InvalidInput`] if
     /// `depth > MAX_DELEGATION_DEPTH`.
     pub async fn run_nested(
         &self,
@@ -545,32 +554,33 @@ impl Orchestrator {
         self.run_nested_with(plan, now, depth, &executor).await
     }
 
-    /// Ajaa työnkulun loppuun reitittäen jokaisen solmun vuoron annetun
-    /// [`TurnExecutor`]-sauman läpi.
+    /// Runs the workflow to completion, routing each node's turn through the
+    /// given [`TurnExecutor`] seam.
     ///
-    /// Toisin kuin [`run`](Self::run) (joka simuloi valmistumisen sisäisesti
-    /// [`MockTurnExecutor`](crate::executor::MockTurnExecutor):lla), tämä antaa
-    /// kutsujan kytkeä **oikean** suorittajan (esim. LLM-/kuljetuskerros) ilman
-    /// että orkesteri muuttuu. Jokaiselle ajovalmiille solmulle:
+    /// Unlike [`run`](Self::run) (which simulates completion internally with
+    /// [`MockTurnExecutor`](crate::executor::MockTurnExecutor)), this lets the
+    /// caller plug in the **real** executor (e.g. the LLM/transport layer)
+    /// without changing the orchestrator. For each node ready to run:
     ///
-    /// 1. rakennetaan [`OrchestratedTurn`] (solmun otsikko/kuvaus + valittu
-    ///    suorittaja + injektoitu `now`),
-    /// 2. kutsutaan [`TurnExecutor::execute`] joka palauttaa toimitteen,
-    /// 3. jos solmulla on kyky/sopimus ([`TaskNode::capability`]), toimite
-    ///    ajetaan [`ContractBoard::fulfill`]-todennuksen läpi (tulosskeema +
-    ///    jälkiehdot) **ennen** `Done`-siirtymää,
-    /// 4. hyväksyttävä toimite siirtää tehtävän `Active → Done`; muutoin solmu
-    ///    merkitään epäonnistuneeksi (tehtävä jää ei-`Done`-tilaan,
-    ///    [`STEP_FAILED`] julkaistaan) eikä sen jälkeläisiä eteneä.
+    /// 1. an [`OrchestratedTurn`] is built (the node's title/description +
+    ///    chosen executor + injected `now`),
+    /// 2. [`TurnExecutor::execute`] is called, which returns a deliverable,
+    /// 3. if the node has a capability/contract ([`TaskNode::capability`]),
+    ///    the deliverable is run through [`ContractBoard::fulfill`]
+    ///    verification (output schema + postconditions) **before** the
+    ///    `Done` transition,
+    /// 4. an accepted deliverable moves the task `Active → Done`; otherwise
+    ///    the node is marked failed (the task stays in a non-`Done` state,
+    ///    [`STEP_FAILED`] is published) and its descendants are not advanced.
     ///
-    /// Determinismi säilyy: kelloa ei lueta, vaan `now` injektoidaan. Suorittajan
-    /// palauttama [`Err`] (esim. kuljetusvirhe) ei jää roikkumaan: solmu merkitään
-    /// epäonnistuneeksi ja sen haara pysähtyy.
+    /// Determinism is preserved: the clock is never read; `now` is injected
+    /// instead. An [`Err`] returned by the executor (e.g. a transport error)
+    /// does not hang: the node is marked failed and its branch halts.
     ///
     /// # Errors
-    /// Sama virhejoukko kuin [`run`](Self::run): kelvoton suunnitelma, ei
-    /// kelvollista työntekijää, offline kiinnitetty työntekijä, syvyysbudjetin
-    /// ylitys tai tehtävätaulun siirtymävirhe.
+    /// The same error set as [`run`](Self::run): an invalid plan, no
+    /// eligible worker, an offline pinned worker, exceeding the depth
+    /// budget, or a task board transition error.
     pub async fn run_with(
         &self,
         plan: &OrchestrationPlan,
@@ -580,15 +590,15 @@ impl Orchestrator {
         self.run_nested_with(plan, now, 0, executor).await
     }
 
-    /// [`run_with`](Self::run_with) + rekursiivinen delegointisyvyys.
+    /// [`run_with`](Self::run_with) + recursive delegation depth.
     ///
-    /// Tämä on **varsinainen** orkesterointisilmukka jonka kautta
-    /// [`run`](Self::run), [`run_nested`](Self::run_nested) ja
-    /// [`run_with`](Self::run_with) kaikki kulkevat.
+    /// This is the **actual** orchestration loop through which
+    /// [`run`](Self::run), [`run_nested`](Self::run_nested), and
+    /// [`run_with`](Self::run_with) all pass.
     ///
     /// # Errors
-    /// Kuten [`run_with`](Self::run_with), sekä [`FamilyClawError::InvalidInput`]
-    /// jos `depth > MAX_DELEGATION_DEPTH`.
+    /// As in [`run_with`](Self::run_with), plus
+    /// [`FamilyClawError::InvalidInput`] if `depth > MAX_DELEGATION_DEPTH`.
     pub async fn run_nested_with(
         &self,
         plan: &OrchestrationPlan,
@@ -608,9 +618,9 @@ impl Orchestrator {
         let board = self.bridge.board();
         let bus = self.bridge.bus();
 
-        // Solmun → luodun tehtävän kuvaus, jotta riippuvuuksien valmistuminen
-        // voidaan tarkistaa. `failed` kerää epäonnistuneet solmut, jotta niiden
-        // jälkeläiset jätetään etenemättä (haara pysähtyy).
+        // A node → created-task mapping, so dependency completion can be
+        // checked. `failed` collects failed nodes, so their descendants are
+        // left un-advanced (the branch halts).
         let mut node_task: HashMap<NodeId, TaskId> = HashMap::with_capacity(order.len());
         let mut completed: Vec<(NodeId, TaskId)> = Vec::with_capacity(order.len());
         let mut failed: HashSet<NodeId> = HashSet::new();
@@ -620,16 +630,17 @@ impl Orchestrator {
                 FamilyClawError::not_found(format!("node {node_id} vanished from plan"))
             })?;
 
-            // Jos jokin riippuvuus epäonnistui, tämä solmu peritään
-            // epäonnistuneeksi: haara on jo katkennut eikä työtä aloiteta.
+            // If any dependency failed, this node inherits the failure: its
+            // branch has already been cut, so the work is not started.
             if node.deps.iter().any(|dep| failed.contains(dep)) {
                 failed.insert(node_id.clone());
                 continue;
             }
 
-            // Solmu on valmis ajettavaksi vain jos KAIKKI riippuvuudet ovat
-            // Done. Topologinen järjestys takaa että ne on jo käsitelty, mutta
-            // varmistamme tilan taululta (ei oleteta).
+            // A node is ready to run only if ALL its dependencies are Done.
+            // The topological order guarantees they have already been
+            // processed, but we still confirm the status from the board (we
+            // do not assume it).
             for dep in &node.deps {
                 let dep_task = node_task.get(dep).ok_or_else(|| {
                     FamilyClawError::invalid_input(format!(
@@ -644,9 +655,10 @@ impl Orchestrator {
                 }
             }
 
-            // Valitse työntekijä, aja vuoro sauman läpi ja vie solmu joko
-            // `Done`-tilaan tai merkitse epäonnistuneeksi. Koko per-solmu-logiikka
-            // on `drive_node`-apurissa, jotta tämä silmukka pysyy luettavana.
+            // Select a worker, run the turn through the seam, and move the
+            // node either to the `Done` state or mark it failed. The full
+            // per-node logic lives in the `drive_node` helper, so this loop
+            // stays readable.
             match self.drive_node(plan, node, node_id, now, executor).await? {
                 NodeOutcome::Completed(task_id) => {
                     node_task.insert(node_id.clone(), task_id);
@@ -658,7 +670,7 @@ impl Orchestrator {
             }
         }
 
-        // Koko työnkulku valmis (vain valmistuneet solmut lasketaan).
+        // The whole workflow is complete (only completed nodes are counted).
         let done_payload = WorkflowDonePayload {
             plan_id: plan.id.clone(),
             node_count: completed.len(),
@@ -674,15 +686,16 @@ impl Orchestrator {
         })
     }
 
-    /// Vie yhden solmun läpi: valitsee työntekijän, julkaisee [`STEP_ASSIGNED`],
-    /// rakentaa vuoron, ajaa sen [`TurnExecutor`]-sauman läpi ja vie tehtävän
-    /// joko `Done`-tilaan (hyväksytty toimite) tai merkitsee epäonnistuneeksi
-    /// ([`STEP_FAILED`], tehtävä jää ei-`Done`-tilaan).
+    /// Drives a single node through: selects a worker, publishes
+    /// [`STEP_ASSIGNED`], builds the turn, runs it through the
+    /// [`TurnExecutor`] seam, and moves the task either to the `Done` state
+    /// (an accepted deliverable) or marks it failed ([`STEP_FAILED`], the
+    /// task stays in a non-`Done` state).
     ///
     /// # Errors
-    /// - [`FamilyClawError::NotFound`] jos kiinnitetty työntekijä ei ole online
-    ///   tai sopivaa työntekijää ei löydy.
-    /// - Välittää tehtävätaulun siirtymä-/luontivirheet.
+    /// - [`FamilyClawError::NotFound`] if the pinned worker is not online or
+    ///   no suitable worker can be found.
+    /// - Propagates the task board's transition/creation errors.
     async fn drive_node(
         &self,
         plan: &OrchestrationPlan,
@@ -694,7 +707,7 @@ impl Orchestrator {
         let board = self.bridge.board();
         let bus = self.bridge.bus();
 
-        // Valitse työntekijä: kiinnitetty (jos online) tai sääntöpohjainen.
+        // Select a worker: pinned (if online) or rule-based.
         let assignee = match node.pinned_assignee {
             Some(pinned) => match self.bridge.registry().liveness_at(pinned, now).await {
                 Ok(Liveness::Online) => pinned,
@@ -712,11 +725,11 @@ impl Orchestrator {
                 })?,
         };
 
-        // Luo tehtävä, osoita työntekijälle ja aktivoi (Pending → Active).
+        // Create the task, assign it to the worker, and activate it (Pending → Active).
         let task = board.create(node.title.clone(), Some(assignee)).await?;
         board.update_status(task.id, TaskStatus::Active).await?;
 
-        // Julkaise osoitustapahtuma.
+        // Publish the assignment event.
         let assigned_payload = StepPayload {
             plan_id: plan.id.clone(),
             node_id: node_id.0.clone(),
@@ -731,8 +744,8 @@ impl Orchestrator {
         .unwrap_or_else(|_| Event::new(EventKind::Custom(STEP_ASSIGNED.into()), Some(assignee)));
         bus.publish(event);
 
-        // Rakenna vuoro ja delegoi sauman kautta. Suorittajan virhe EI jää
-        // roikkumaan: se tulkitaan ei-hyväksyttäväksi toimitteeksi.
+        // Build the turn and delegate through the seam. An executor error
+        // does NOT hang: it is treated as an unaccepted deliverable.
         let turn = OrchestratedTurn::new(
             plan.id.clone(),
             node_id.clone(),
@@ -751,12 +764,12 @@ impl Orchestrator {
         };
 
         if acceptable {
-            // Active → Done (laillinen).
+            // Active → Done (legal).
             board.update_status(task.id, TaskStatus::Done).await?;
             return Ok(NodeOutcome::Completed(task.id));
         }
 
-        // Epäonnistui: tehtävä jää ei-Done-tilaan. Julkaise step_failed.
+        // Failed: the task stays in a non-Done state. Publish step_failed.
         let failed_payload = StepFailedPayload {
             plan_id: plan.id.clone(),
             node_id: node_id.0.clone(),
@@ -773,12 +786,12 @@ impl Orchestrator {
         Ok(NodeOutcome::Failed)
     }
 
-    /// Rakentaa solmusta suoritussauman koneluettavan syötteen.
+    /// Builds the execution seam's machine-readable input from a node.
     ///
-    /// Aloittaa otsikosta ja kuvauksesta. Jos kuvaus jäsentyy JSON-objektiksi,
-    /// sen avaimet nostetaan myös syötteen juureen, jolloin rakenteellinen
-    /// solmun syöte (esim. `{"brand": "...", "audience": "..."}`) virtaa
-    /// suorittajalle sellaisenaan.
+    /// Starts with the title and description. If the description parses as a
+    /// JSON object, its keys are also lifted to the input's root, so a
+    /// structured node input (e.g. `{"brand": "...", "audience": "..."}`)
+    /// flows through to the executor as-is.
     fn turn_input(node: &TaskNode) -> serde_json::Value {
         let mut input = serde_json::Map::new();
         input.insert(
@@ -799,13 +812,13 @@ impl Orchestrator {
         serde_json::Value::Object(input)
     }
 
-    /// Todentaa toimitteen solmun kykyä vasten (jos kyky on annettu).
+    /// Verifies the deliverable against the node's capability (if given).
     ///
-    /// Kun `capability` on `None`, mikä tahansa toimite hyväksytään (simuloitu
-    /// polku). Kun kyky on annettu, ajetaan kertakäyttöisen
-    /// [`ContractBoard`]-sopimuksen kautta: `propose → accept → fulfill`. Vain
-    /// täysi läpäisy (tulosskeema + jälkiehdot) palauttaa `true`; mikä tahansa
-    /// rikkomus tai sopimusvirhe palauttaa `false`.
+    /// When `capability` is `None`, any deliverable is accepted (the
+    /// simulated path). When a capability is given, it is run through a
+    /// one-off [`ContractBoard`] contract: `propose → accept → fulfill`. Only
+    /// a full pass (output schema + postconditions) returns `true`; any
+    /// violation or contract error returns `false`.
     async fn deliverable_accepted(
         capability: Option<&Capability>,
         deliverable: Deliverable,
@@ -816,8 +829,9 @@ impl Orchestrator {
         };
         let board = ContractBoard::new();
         let provider = deliverable.from;
-        // Käytä kyvyn syöteskeeman täyttävää tyhjää syötettä silloin kun se on
-        // tyhjä; muutoin ehdotus validoidaan annettua kyvyn syötettä vasten.
+        // Use an empty input that satisfies the capability's input schema
+        // when the schema is empty; otherwise the proposal is validated
+        // against the capability's given input schema.
         let proposed = board
             .propose(capability, provider, provider, serde_json::json!({}), now)
             .await;
@@ -831,7 +845,7 @@ impl Orchestrator {
     }
 }
 
-/// Hyötykuorma `orchestration.step_assigned`-tapahtumalle.
+/// Payload for the `orchestration.step_assigned` event.
 #[derive(Debug, Serialize, Deserialize)]
 struct StepPayload {
     plan_id: String,
@@ -840,7 +854,7 @@ struct StepPayload {
     assignee: String,
 }
 
-/// Hyötykuorma `orchestration.step_failed`-tapahtumalle.
+/// Payload for the `orchestration.step_failed` event.
 #[derive(Debug, Serialize, Deserialize)]
 struct StepFailedPayload {
     plan_id: String,
@@ -849,7 +863,7 @@ struct StepFailedPayload {
     assignee: String,
 }
 
-/// Hyötykuorma `orchestration.workflow_done`-tapahtumalle.
+/// Payload for the `orchestration.workflow_done` event.
 #[derive(Debug, Serialize, Deserialize)]
 struct WorkflowDonePayload {
     plan_id: String,
@@ -921,7 +935,7 @@ mod tests {
 
     #[test]
     fn topo_order_is_deterministic_linear() {
-        // c -> b -> a (deps), joten järjestys a, b, c.
+        // c -> b -> a (deps), so the order is a, b, c.
         let plan = OrchestrationPlan::new(
             "p",
             vec![
@@ -939,7 +953,7 @@ mod tests {
 
     #[test]
     fn topo_order_ties_break_by_node_id() {
-        // a -> {b, c} -> d. b ja c ovat tasapelissä → aakkosjärjestys.
+        // a -> {b, c} -> d. b and c are tied → alphabetical order.
         let plan = OrchestrationPlan::new(
             "p",
             vec![
@@ -992,7 +1006,7 @@ mod tests {
     async fn select_worker_requires_capability_superset() {
         let bridge = FamilyBridge::new();
         let now = ts(1000);
-        // Agentilla on vain "browser"; vaaditaan myös "system.run" → ei kelpaa.
+        // The agent only has "browser"; "system.run" is also required → does not qualify.
         let _weak = online_worker(&bridge, AgentRole::Executor, &["browser"], now).await;
         let strong = online_worker(
             &bridge,
@@ -1016,11 +1030,11 @@ mod tests {
     async fn select_worker_excludes_offline() {
         let bridge = FamilyBridge::new();
         let now = ts(1000);
-        // Heartbeat vanha → offline hetkellä now.
+        // Stale heartbeat → offline at time now.
         let info = AgentInfo::new(AgentId::new(), "old", AgentRole::Executor, HostKind::Local);
         let id = info.id;
         bridge.register_agent(info).await.expect("register");
-        bridge.heartbeat(id, ts(0)).await.expect("hb"); // 1000s vanha > 30s timeout
+        bridge.heartbeat(id, ts(0)).await.expect("hb"); // 1000s old > 30s timeout
 
         let chosen = bridge_select(&bridge, Some(AgentRole::Executor), &[], now).await;
         assert_eq!(chosen, None);
@@ -1037,7 +1051,7 @@ mod tests {
             bridge.register_agent(info).await.expect("reg");
             bridge.heartbeat(id, now).await.expect("hb");
         }
-        // Anna a:lle yksi keskeneräinen tehtävä → b:llä on vähemmän.
+        // Give a one in-flight task → b has fewer.
         let t = bridge.create_task("busy", Some(a)).await.expect("task");
         bridge
             .update_task_status(t.id, TaskStatus::Active)
@@ -1047,7 +1061,7 @@ mod tests {
         let chosen = bridge_select(&bridge, Some(AgentRole::Executor), &[], now).await;
         assert_eq!(chosen, Some(b));
 
-        // Kun a:n tehtävä on valmis (terminaalinen), tasapeli ratkeaa id:llä → a.
+        // Once a's task is complete (terminal), the tie is broken by id → a.
         bridge
             .update_task_status(t.id, TaskStatus::Done)
             .await
@@ -1056,7 +1070,7 @@ mod tests {
         assert_eq!(chosen2, Some(a));
     }
 
-    // Apufunktio testeille (Orchestrator::select_worker ottaa &[String]).
+    // Test helper function (Orchestrator::select_worker takes &[String]).
     async fn bridge_select(
         bridge: &FamilyBridge,
         role: Option<AgentRole>,
@@ -1093,13 +1107,13 @@ mod tests {
         assert_eq!(report.completed[0].0, NodeId::new("a"));
         assert_eq!(report.completed[2].0, NodeId::new("c"));
 
-        // Kaikki tehtävät Done.
+        // All tasks Done.
         for (_node, task_id) in &report.completed {
             let t = bridge.board().get(*task_id).await.expect("task");
             assert_eq!(t.status, TaskStatus::Done);
         }
 
-        // Tapahtumia tuli: 3x step_assigned + 1x workflow_done (vähintään).
+        // Events received: 3x step_assigned + 1x workflow_done (at least).
         let mut step = 0;
         let mut done = 0;
         while let Ok(Some(ev)) = sub.try_recv() {
@@ -1137,7 +1151,7 @@ mod tests {
         let orch = Orchestrator::new(bridge.clone());
         let report = orch.run(&plan, now).await.expect("run");
         assert_eq!(report.completed.len(), 4);
-        // a ensin, d viimeisenä; b ja c välissä aakkosjärjestyksessä.
+        // a first, d last; b and c in between in alphabetical order.
         let order: Vec<NodeId> = report.completed.iter().map(|(n, _)| n.clone()).collect();
         assert_eq!(
             order,
@@ -1150,24 +1164,24 @@ mod tests {
         );
     }
 
-    /// Phase 5 (D3): Orkestraattori koordinoi **≥2 live-agenttia** reitittäen
-    /// solmut KYVYKKYYDEN mukaan oikealle työntekijälle. Tämä on aito
-    /// multi-agent-koordinointi joka toimii nykyrakenteella: kahdella eri-
-    /// kykyisellä työntekijällä eri solmut menevät eri agenteille
-    /// ([`Orchestrator::select_worker`] suodattaa `required_capabilities`:n
-    /// mukaan). `TurnExecutor`-sauma (tässä mock) on sama jonka läpi
-    /// `LiveTurnExecutor` ajaa tuotannossa.
+    /// Phase 5 (D3): the orchestrator coordinates **≥2 live agents** by
+    /// routing nodes to the right worker based on CAPABILITY. This is genuine
+    /// multi-agent coordination that works with the current architecture:
+    /// with two workers of different capabilities, different nodes go to
+    /// different agents ([`Orchestrator::select_worker`] filters by
+    /// `required_capabilities`). The `TurnExecutor` seam (a mock here) is the
+    /// same one `LiveTurnExecutor` runs through in production.
     ///
-    /// Huom (rehellinen rajaus): solmut ajetaan **sekventiaalisesti** loppuun
-    /// (kukin Done ennen seuraavaa), joten pelkkä kuorma-tasapainotus ei vielä
-    /// hajauta riippumattomia solmuja rinnakkain — rinnakkaissuoritus on osa
-    /// Phase 5:n isompaa työtä (per-node journal ownership). Kyvykkyys­reititys
-    /// sen sijaan koordinoi ≥2 agenttia jo nyt.
+    /// Note (honest scope): nodes are run **sequentially** to completion
+    /// (each reaches Done before the next starts), so load balancing alone
+    /// does not yet parallelize independent nodes — parallel execution is
+    /// part of Phase 5's larger body of work (per-node journal ownership).
+    /// Capability-based routing, however, already coordinates ≥2 agents now.
     #[tokio::test]
     async fn run_routes_nodes_to_capable_workers() {
         let bridge = FamilyBridge::new();
         let now = ts(1000);
-        // Työntekijä A osaa "sql", työntekijä B osaa "vision".
+        // Worker A knows "sql", worker B knows "vision".
         let a = AgentId::from_uuid(uuid::Uuid::from_u128(1));
         let b = AgentId::from_uuid(uuid::Uuid::from_u128(2));
         let info_a = AgentInfo::new(a, "w-sql", AgentRole::Executor, HostKind::Local)
@@ -1179,7 +1193,7 @@ mod tests {
         bridge.heartbeat(a, now).await.expect("hb a");
         bridge.heartbeat(b, now).await.expect("hb b");
 
-        // Kaksi solmua: toinen vaatii "sql" → A, toinen "vision" → B.
+        // Two nodes: one requires "sql" → A, the other "vision" → B.
         let plan = OrchestrationPlan::new(
             "capability-routed",
             vec![
@@ -1195,8 +1209,8 @@ mod tests {
         let report = orch.run(&plan, now).await.expect("run");
         assert_eq!(report.completed.len(), 2);
 
-        // Kumpikin työntekijä sai TÄSMÄLLEEN kykyään vastaavan solmun → ≥2
-        // agenttia koordinoitiin kyvykkyysreitityksellä.
+        // Each worker got EXACTLY the node matching its capability → ≥2
+        // agents were coordinated via capability-based routing.
         let a_tasks = bridge.board().list_for_assignee(a).await.len();
         let b_tasks = bridge.board().list_for_assignee(b).await.len();
         assert_eq!(a_tasks, 1, "sql-työntekijä sai sql-solmun, sai {a_tasks}");
@@ -1210,7 +1224,7 @@ mod tests {
     async fn run_errors_when_no_eligible_worker() {
         let bridge = FamilyBridge::new();
         let now = ts(1000);
-        // Ei yhtään agenttia.
+        // No agents at all.
         let plan = OrchestrationPlan::new(
             "p",
             vec![TaskNode::new("a", "ta", "").with_role(AgentRole::Executor)],
@@ -1243,7 +1257,7 @@ mod tests {
         let info = AgentInfo::new(AgentId::new(), "p", AgentRole::Scout, HostKind::Local);
         let pinned = info.id;
         bridge.register_agent(info).await.expect("reg");
-        // Ei heartbeatia → Unknown, ei Online.
+        // No heartbeat → Unknown, not Online.
         let plan = OrchestrationPlan::new(
             "p",
             vec![TaskNode::new("a", "ta", "").with_pinned_assignee(pinned)],
@@ -1271,7 +1285,7 @@ mod tests {
         let now = ts(1000);
         let make = || async move {
             let bridge = FamilyBridge::new();
-            // Kaksi yhtä kelvollista työntekijää, kiinteät id:t.
+            // Two equally eligible workers, fixed ids.
             for n in 1..=2u128 {
                 let id = AgentId::from_uuid(uuid::Uuid::from_u128(n));
                 let info = AgentInfo::new(id, "w", AgentRole::Executor, HostKind::Local);
@@ -1289,7 +1303,7 @@ mod tests {
             );
             let orch = Orchestrator::new(bridge.clone());
             let report = orch.run(&plan, now).await.expect("run");
-            // Palauta solmu→assignee-kartta vertailua varten.
+            // Return a node→assignee map for comparison.
             let mut out = Vec::new();
             for (node, task_id) in report.completed {
                 let t = bridge.board().get(task_id).await.expect("task");
@@ -1300,19 +1314,20 @@ mod tests {
         let r1 = make().await;
         let r2 = make().await;
         assert_eq!(r1, r2);
-        // Ensimmäinen työntekijä (vähiten in-flight, pienin id) on u128=1.
+        // The first worker (fewest in-flight, smallest id) is u128=1.
         assert_eq!(r1[0].1, Some(AgentId::from_uuid(uuid::Uuid::from_u128(1))));
     }
 
     // =======================================================================
-    // run_with — orkesteri reititettynä TurnExecutor-sauman läpi
+    // run_with — the orchestrator routed through the TurnExecutor seam
     // =======================================================================
 
     use crate::contract::{Capability, Field, FieldType, Schema};
     use crate::executor::{MockFailure, MockTurnExecutor};
 
-    /// HomepageDesign-muotoinen tulosskeema johon mockin onnistuva toimite
-    /// sopii mutta `failing()`-toimite ei (puuttuva `headline`).
+    /// A HomepageDesign-shaped result schema that the mock's succeeding
+    /// deliverable satisfies but the `failing()` deliverable does not
+    /// (missing `headline`).
     fn homepage_capability() -> Capability {
         Capability::new(
             "design_homepage",
@@ -1327,8 +1342,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_mock_executor_runs_linear_plan_to_completion() {
-        // run_with + MockTurnExecutor ajaa A→B-suunnitelman loppuun: molemmat
-        // tehtävät Done, raportin järjestys [A, B].
+        // run_with + MockTurnExecutor runs the A→B plan to completion: both
+        // tasks Done, report order [A, B].
         let bridge = FamilyBridge::new();
         let now = ts(1000);
         let _w = online_worker(&bridge, AgentRole::Executor, &[], now).await;
@@ -1361,8 +1376,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_failing_executor_leaves_node_non_done_and_blocks_dependents() {
-        // run_with + MockTurnExecutor::failing() (skeemarikkomus) solmulla joka
-        // KANTAA kykyä → solmu jää ei-Done, eikä sen jälkeläistä etenetä.
+        // run_with + MockTurnExecutor::failing() (a schema violation) on a node that
+        // CARRIES a capability → the node stays non-Done, and its descendant is not advanced.
         let bridge = FamilyBridge::new();
         let now = ts(1000);
         let worker = online_worker(&bridge, AgentRole::Executor, &[], now).await;
@@ -1381,17 +1396,17 @@ mod tests {
         );
 
         let orch = Orchestrator::new(bridge.clone());
-        // failing() tuottaa toimitteen ilman headline-kenttää → fulfill kaatuu.
+        // failing() produces a deliverable without a headline field → fulfill fails.
         let executor = MockTurnExecutor::failing();
         let report = orch
             .run_with(&plan, now, &executor)
             .await
             .expect("run_with");
 
-        // Mikään solmu ei valmistunut.
+        // No node completed.
         assert!(report.completed.is_empty(), "no node should complete");
 
-        // A:lle luotiin tehtävä mutta se EI ole Done (jäi Active-tilaan).
+        // A task was created for A but it is NOT Done (stayed in the Active state).
         let a_tasks = bridge
             .board()
             .list_for_assignee(worker)
@@ -1403,7 +1418,7 @@ mod tests {
         assert_ne!(a_tasks[0].status, TaskStatus::Done, "A must not be Done");
         assert_eq!(a_tasks[0].status, TaskStatus::Active);
 
-        // B:tä (A:n jälkeläinen) ei koskaan osoitettu → ei tehtävää otsikolla tb.
+        // B (A's descendant) was never assigned → no task with the title tb.
         let b_tasks = bridge
             .board()
             .list_for_assignee(worker)
@@ -1413,7 +1428,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(b_tasks.is_empty(), "dependent B must not be scheduled");
 
-        // step_failed julkaistiin A:lle; step_assigned vain A:lle (ei B:lle).
+        // step_failed was published for A; step_assigned only for A (not B).
         let mut assigned = 0;
         let mut step_failed = 0;
         while let Ok(Some(ev)) = sub.try_recv() {
@@ -1429,8 +1444,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_delegates_to_run_with_mock_identically() {
-        // run() ja run_with(MockTurnExecutor::default()) tuottavat saman
-        // tuloksen — delegointi pitää (taaksepäinyhteensopivuus).
+        // run() and run_with(MockTurnExecutor::default()) produce
+        // the same result — the delegation holds (backward compatibility).
         let now = ts(1000);
         let build = |use_default_run: bool| async move {
             let bridge = FamilyBridge::new();
@@ -1469,14 +1484,14 @@ mod tests {
         let via_run_with = build(false).await;
         assert_eq!(via_run, via_run_with);
         assert_eq!(via_run.len(), 2);
-        // Molemmat solmut Done molemmissa poluissa.
+        // Both nodes Done on both paths.
         assert!(via_run.iter().all(|(_, s, _)| *s == TaskStatus::Done));
     }
 
     #[tokio::test]
     async fn run_with_erroring_executor_marks_node_failed_without_hanging() {
-        // Err-palauttava suorittaja → solmu epäonnistuu (ei Done), ajo palaa
-        // ilman roikkumista. Yksisolmuinen suunnitelma riittää.
+        // An executor returning Err → the node fails (not Done), the run
+        // returns without hanging. A single-node plan is enough.
         let bridge = FamilyBridge::new();
         let now = ts(1000);
         let w = online_worker(&bridge, AgentRole::Executor, &[], now).await;
@@ -1495,7 +1510,7 @@ mod tests {
             .expect("run_with");
         assert!(report.completed.is_empty(), "node must not complete on Err");
 
-        // Tehtävä luotiin ja jäi ei-Done-tilaan.
+        // The task was created and stayed in a non-Done state.
         let tasks = bridge.board().list_for_assignee(w).await;
         assert_eq!(tasks.len(), 1);
         assert_ne!(tasks[0].status, TaskStatus::Done);
@@ -1503,9 +1518,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_capability_node_reaches_done_when_deliverable_valid() {
-        // Solmu jolla on kyky + onnistuva mock → toimite läpäisee fulfillin →
-        // Done. Kuvauksessa brand/audience ohjaa mockin tuottamaan
-        // HomepageDesign-muotoisen (skeeman täyttävän) toimitteen.
+        // A node with a capability + a succeeding mock → the deliverable
+        // passes fulfill → Done. In the description, brand/audience steers
+        // the mock to produce a HomepageDesign-shaped (schema-satisfying)
+        // deliverable.
         let bridge = FamilyBridge::new();
         let now = ts(1000);
         let _w = online_worker(&bridge, AgentRole::Executor, &[], now).await;

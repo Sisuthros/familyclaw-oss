@@ -1,30 +1,31 @@
-//! S6 Embedding Recall — vektoripohjainen haku oikealla upotustarjoajalla.
+//! S6 Embedding Recall — vector-based retrieval with a real embedding provider.
 //!
-//! Tämä on roadmapin **D4 recall-benchmark-gate**: ennen kuin vektorihaku
-//! (`semantic_weight > 0` + upotukset) otetaan tosissaan, sen on **todistettava
-//! päihittävänsä keyword-haun** kiinteällä fixturella. Toisin kuin S5 (joka
-//! testaa `RetrievalContext`:n sisäänrakennettua substring-semantiikkaa), tämä
-//! ajaa AIDON vektoripolun:
+//! This is the roadmap's **D4 recall-benchmark-gate**: before vector search
+//! (`semantic_weight > 0` + embeddings) is taken seriously, it has to **prove
+//! it beats keyword search** on a fixed fixture. Unlike S5 (which tests
+//! `RetrievalContext`'s built-in substring semantics), this exercises the REAL
+//! vector path:
 //!
-//! 1. muistot tallennetaan [`EmbeddingMemoryStore`]:lla, joka täyttää
-//!    `embedding`-kentän [`DeterministicEmbedder`]:llä;
-//! 2. kysely upotetaan SAMALLA tarjoajalla ja annetaan
-//!    [`RetrievalContext::with_query_embedding`]:llä;
-//! 3. haku cosine-vertailee kysely- ja muistovektoreita.
+//! 1. memories are stored via [`EmbeddingMemoryStore`], which populates the
+//!    `embedding` field using [`DeterministicEmbedder`];
+//! 2. the query is embedded with the SAME provider and supplied via
+//!    [`RetrievalContext::with_query_embedding`];
+//! 3. retrieval compares the query and memory vectors by cosine similarity.
 //!
 //! ## Fixture
-//! Oletustarjoaja on feature-hashing-bag-of-words → se palkitsee **jaetut
-//! sanat**. Fixture on rakennettu niin, että oikea muisto jakaa sanaston kyselyn
-//! kanssa, distraktori ei:
-//! - oikea:      "the deployment pipeline shipped the release build"
-//! - distraktori:"ocean waves crash on the quiet midnight shore"
+//! The default provider is a feature-hashing bag-of-words → it rewards
+//! **shared words**. The fixture is built so the correct memory shares
+//! vocabulary with the query while the distractor does not:
+//! - correct:    "the deployment pipeline shipped the release build"
+//! - distractor: "ocean waves crash on the quiet midnight shore"
 //!
-//! Kysely "deployment pipeline release build" jakaa neljä sisältösanaa oikean
-//! muiston kanssa ja nolla distraktorin kanssa → vektori-cosine erottaa oikean.
-//! **Gate:** vektoriavaruuden erottelukyky `cos(query,correct) -
-//! cos(query,distractor) > 0` JA oikea muisto on top-1 JA distraktori ei ole
-//! top-1. (Erottelukyky on rehellisempi mittari kuin keyword-vs-vektori-
-//! absoluuttivertailu, joka samoilla sanoilla olisi epäreilu.)
+//! The query "deployment pipeline release build" shares four content words
+//! with the correct memory and zero with the distractor → vector cosine
+//! separates the correct one. **Gate:** vector-space separation
+//! `cos(query,correct) - cos(query,distractor) > 0` AND the correct memory is
+//! top-1 AND the distractor is not top-1. (Separation is a more honest metric
+//! than an absolute keyword-vs-vector comparison, which would be unfair when
+//! the same words are shared.)
 
 use std::sync::Arc;
 
@@ -39,15 +40,15 @@ use crate::error::Result;
 use crate::scenario::{Scenario, ScenarioResult};
 use crate::subject::Subject;
 
-/// S6 Embedding Recall — vektorihaku oikealla upotustarjoajalla (D4-gate).
+/// S6 Embedding Recall — vector search with a real embedding provider (D4 gate).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EmbeddingRecall;
 
 impl EmbeddingRecall {
-    /// Skenaarion yksilöivä tunniste.
+    /// The scenario's unique identifier.
     pub const ID: &'static str = "s6_embedding_recall";
 
-    /// Luo uuden EmbeddingRecall-skenaarion.
+    /// Creates a new EmbeddingRecall scenario.
     #[must_use]
     pub fn new() -> Self {
         Self
@@ -66,7 +67,7 @@ impl Scenario for EmbeddingRecall {
 
     async fn run(&self, _subject: &mut dyn Subject, clock: Timestamp) -> Result<ScenarioResult> {
         let embedder = DeterministicEmbedder::new();
-        // Auto-upottava muisti: tallennetut muistot saavat embeddingin kirjoitettaessa.
+        // Auto-embedding memory store: stored memories get their embedding on write.
         let store = EmbeddingMemoryStore::new(
             LocalJsonStore::in_memory(),
             Arc::new(DeterministicEmbedder::new()),
@@ -89,13 +90,13 @@ impl Scenario for EmbeddingRecall {
             )
             .await?;
 
-        // Keyword-haku (semantic_weight 0.0): ei vektoria.
+        // Keyword search (semantic_weight 0.0): no vector involved.
         let ctx_kw = RetrievalContext::new(QUERY)
             .with_limit(2)
             .with_semantic_weight(0.0);
         let hits_kw = store.retrieve(&ctx_kw, clock).await?;
 
-        // Vektorihaku: kysely upotetaan SAMALLA tarjoajalla + paino > 0.
+        // Vector search: the query is embedded with the SAME provider + weight > 0.
         let query_vec = embedder.embed(QUERY);
         let ctx_vec = RetrievalContext::new(QUERY)
             .with_limit(2)
@@ -103,11 +104,11 @@ impl Scenario for EmbeddingRecall {
             .with_query_embedding(query_vec);
         let hits_vec = store.retrieve(&ctx_vec, clock).await?;
 
-        // Vektoriavaruuden EROTTELUKYKY: cosine(query, oikea) vs cosine(query,
-        // distraktori). Tämä on D4-gaten ydin — todistaa että upotukset
-        // erottavat relevantin epärelevantista, riippumatta keyword-pisteistä
-        // (jotka samoilla sanoilla olisivat epäreilu vertailu). Lasketaan suoraan
-        // tallennetuista upotuksista.
+        // Vector-space SEPARATION: cosine(query, correct) vs cosine(query,
+        // distractor). This is the heart of the D4 gate — it proves that
+        // embeddings separate the relevant from the irrelevant, independent of
+        // keyword scores (which would be an unfair comparison given the shared
+        // words). Computed directly from the stored embeddings.
         let q = embedder.embed(QUERY);
         let correct_emb = store
             .get(id_correct)
@@ -128,8 +129,8 @@ impl Scenario for EmbeddingRecall {
             .first()
             .is_some_and(|h| h.memory.id == id_distractor);
 
-        // Gate: vektoriavaruus erottaa oikean distraktorista (separation > 0) JA
-        // haku sijoittaa oikean top-1:ksi JA distraktori ei ole top-1.
+        // Gate: vector space separates correct from distractor (separation > 0)
+        // AND retrieval ranks correct as top-1 AND distractor is not top-1.
         let passed = separation > 0.0 && top1_correct && !distractor_is_top1;
 
         let kw_top1_correct = hits_kw.first().is_some_and(|h| h.memory.id == id_correct);
@@ -155,9 +156,9 @@ impl Scenario for EmbeddingRecall {
     }
 }
 
-/// Cosine-similarity kahden saman pituisen vektorin välillä. Palauttaa 0.0 jos
-/// pituudet eroavat, vektori on tyhjä tai jommankumman normi on nolla. (Lokaali
-/// kopio — bench ei riipu `familyclaw-memory`n sisäisestä cosine:sta.)
+/// Cosine similarity between two vectors of equal length. Returns 0.0 if the
+/// lengths differ, a vector is empty, or either norm is zero. (Local copy —
+/// bench does not depend on `familyclaw-memory`'s internal cosine.)
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;

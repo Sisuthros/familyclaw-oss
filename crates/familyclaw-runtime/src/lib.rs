@@ -1,7 +1,7 @@
 //! # familyclaw-runtime
 //!
-//! **Ajonaikainen kokoonpano** — FamilyClaw-alustan (KERROS A, OSS) C5-sauma:
-//! se kytkee aiemmin rakennetut palaset yhdeksi eläväksi olennoksi:
+//! **Runtime assembly** — the C5 seam of the `FamilyClaw` platform (Layer A,
+//! OSS): it wires the previously built pieces into a single living being:
 //!
 //! ```text
 //! Channel::receive() ─► pump_channel_to_bus ─► Resonance Bus ─► Agent(spawn)
@@ -9,25 +9,26 @@
 //!                       Channel::send ◄── reply_rx ◄── route_reply ◄─┘
 //! ```
 //!
-//! [`build_family`] on yksi kutsu, joka korvaa gatewayn suoran
-//! [`ResonanceBus::start`]-bootstrappauksen: se käynnistää busin, spawnaa
-//! agentin, pumppaa kanavan saapuvan virran busiin ja tyhjentää agentin
-//! reply-jonon takaisin kanavalle. [`FamilyRuntime`] omistaa kaiken, jotta
-//! sammutus ([`FamilyRuntime::shutdown`]) on siisti.
+//! [`build_family`] is a single call that replaces the gateway's direct
+//! [`ResonanceBus::start`] bootstrapping: it starts the bus, spawns the
+//! agent, pumps the channel's inbound stream into the bus, and drains the
+//! agent's reply queue back to the channel. [`FamilyRuntime`] owns
+//! everything so that shutdown ([`FamilyRuntime::shutdown`]) is clean.
 //!
-//! ## MVP-laajuus
-//! Yksi agentti, yksi kanava, **staattinen** reply-kohde
-//! ([`Agent::with_reply_target`]). Tämä on oikein tasan silloin kun on
-//! **yksi kanava ja yksi keskustelu**: kaikki vastaukset ohjautuvat siihen
-//! yhteen kohteeseen. Heti kun kanavia tai keskusteluja on enemmän kuin yksi,
-//! staattinen kohde reitittäisi väärin (vastaisi A:lle B:n keskusteluun) ja
-//! tarvitaan per-viesti-alkuperä (`MessageOrigin`) — ks. [`build_family`]:n
-//! "Tuotanto-raja".
+//! ## MVP scope
+//! One agent, one channel, a **static** reply target
+//! ([`Agent::with_reply_target`]). This is exactly correct when there is
+//! **one channel and one conversation**: all replies route to that single
+//! target. As soon as there is more than one channel or conversation, a
+//! static target would route incorrectly (reply to A within B's
+//! conversation) and a per-message origin (`MessageOrigin`) is needed —
+//! see [`build_family`]'s "Production boundary".
 //!
-//! ## OSS-raja (KERROS A)
-//! Tämä crate ei kovakoodaa perheenjäsenten nimiä, avaimia, malleja eikä
-//! polkuja. Agentin nimi, malli, sielu, kanava ja reply-kohde annetaan kaikki
-//! ajonaikaisesti kutsujalta (gateway lukee ne ympäristöstä — KERROS B).
+//! ## OSS boundary (Layer A)
+//! This crate does not hardcode family members' names, keys, models, or
+//! paths. The agent's name, model, soul, channel, and reply target are all
+//! supplied at runtime by the caller (the gateway reads them from the
+//! environment — Layer B).
 
 use std::env;
 use std::sync::Arc;
@@ -57,100 +58,104 @@ use familyclaw_scheduler::{ScheduledTask, Scheduler, SchedulerHandle, SchedulerR
 use ractor::ActorRef;
 use tokio::sync::Mutex;
 
-/// Ajonaikainen kokoonpano: bus + spawnatut agentit + reply-pumppu + kanavat.
+/// Runtime assembly: bus + spawned agents + reply pump + channels.
 ///
-/// Omistaa kaiken jotta sammutus on siisti. `bus`-kahva luovutetaan gatewaylle
-/// ([`FamilyRuntime::bus`]) sen `GatewayState`-tilaan; tausta­tehtävät
-/// (channel→bus -pumppu ja reply→channel -tyhjennys) pidetään hengissä
-/// [`tokio::task::JoinHandle`]-kahvojen kautta ja keskeytetään
-/// [`FamilyRuntime::shutdown`]:ssa.
+/// Owns everything so that shutdown is clean. The `bus` handle is handed off
+/// to the gateway ([`FamilyRuntime::bus`]) into its `GatewayState`; background
+/// tasks (the channel→bus pump and the reply→channel drain) are kept alive via
+/// [`tokio::task::JoinHandle`] handles and are stopped in
+/// [`FamilyRuntime::shutdown`].
 ///
-/// ## Reply-kanava on unbounded
-/// Agentin reply-sink ([`new_reply_channel`]) on tarkoituksella **unbounded**:
-/// [`Agent::route_reply`] on synkroninen, ei-lukkiutuva kutsu (bounded send
-/// olisi async ja voisi blokata agentin vuoronkäsittelyn). Sen sijaan
-/// reply-jono **tyhjennetään välittömästi** drain-taskissa
+/// ## The reply channel is unbounded
+/// The agent's reply sink ([`new_reply_channel`]) is intentionally
+/// **unbounded**: [`Agent::route_reply`] is a synchronous, non-blocking call
+/// (a bounded send would be async and could block the agent's turn
+/// processing). Instead, the reply queue is **drained immediately** by the
+/// drain task
 /// (`while let Some(out) = reply_rx.recv().await { channel.send(out).await }`),
-/// joten viestit eivät kasaudu. Korkean läpäisyn tuotannossa lisää
-/// bounded-wrapper tai backpressure-mittari drain-puolelle.
+/// so messages never pile up. For high-throughput production use, add a
+/// bounded wrapper or a backpressure gauge on the drain side.
 pub struct FamilyRuntime {
     bus: BusHandle,
-    /// **Jaettu siltakerroksen tapahtumaväylä** havainnoitavuutta varten.
+    /// **Shared observability bridge event bus.**
     ///
-    /// Sama [`FamilyBridge`] jonka kutsuja antoi [`build_family`]:lle (jos antoi).
-    /// Runtime julkaisee tälle sillalle ajonaikaisia virstanpylväitä (tällä
-    /// hetkellä: agentin rekisteröinti → [`EventKind::AgentRegistered`]), ja
-    /// gateway voi tilata sen `EventRecorder`illa
-    /// ([`FamilyRuntime::bridge`]) niin että jaettu `MetricsRegistry` näkee
-    /// elävät inkrementit. `None` kun kutsuja ei antanut siltaa (esim.
-    /// savutestit, jotka eivät tarvitse havainnoitavuutta).
+    /// The same [`FamilyBridge`] the caller supplied to [`build_family`] (if
+    /// any). The runtime publishes runtime milestones to this bridge (currently:
+    /// agent registration → [`EventKind::AgentRegistered`]), and the gateway
+    /// can subscribe to it with an `EventRecorder`
+    /// ([`FamilyRuntime::bridge`]) so the shared `MetricsRegistry` sees live
+    /// increments. `None` when the caller didn't supply a bridge (e.g. smoke
+    /// tests that don't need observability).
     ///
     /// [`EventKind::AgentRegistered`]: familyclaw_bridge::EventKind::AgentRegistered
     bridge: Option<FamilyBridge>,
-    /// **Jaettu toimintoajoympäristö** (suspend/resume-silta, roadmap §6 D2).
+    /// **Shared action runtime** (suspend/resume bridge, roadmap §6 D2).
     ///
-    /// Sama [`Arc<Mutex<ActionRuntime>>`] joka kytkettiin agentin tool-looppiin
-    /// ([`Agent::with_actions`]). Runtime pitää tästä OMAN kahvansa, jotta
-    /// operaattoripinta (gateway `GET /approvals/pending` + `POST
-    /// /approvals/{id}/approve`) voi lukea odottavat hyväksynnät ja myöntää
-    /// hyväksynnän jakamatta agentin sisuksia. Mutex on `tokio::sync::Mutex`,
-    /// koska [`ActionRuntime::approve`] on `async` + `&mut self`.
+    /// The same [`Arc<Mutex<ActionRuntime>>`] wired into the agent's tool loop
+    /// ([`Agent::with_actions`]). The runtime keeps its OWN handle to this so
+    /// the operator surface (gateway `GET /approvals/pending` + `POST
+    /// /approvals/{id}/approve`) can read pending approvals and grant approval
+    /// without exposing the agent's internals. The mutex is a
+    /// `tokio::sync::Mutex` because [`ActionRuntime::approve`] is `async` +
+    /// `&mut self`.
     ///
-    /// Lukko otetaan **vain** yksittäisen operaation ajaksi (lista/approve);
-    /// agentin tool-loop ottaa saman lukon omille kutsuilleen — kilpailu
-    /// ratkeaa lukon kautta, ei jaetun tilan kopioinnilla.
+    /// The lock is held **only** for the duration of a single operation
+    /// (list/approve); the agent's tool loop takes the same lock for its own
+    /// calls — contention is resolved through the lock, not by copying shared
+    /// state.
     actions: Arc<Mutex<ActionRuntime>>,
-    /// **Jaettu turn-audit-keräin** (TURN-AUDIT, roadmap §6 D6).
+    /// **Shared turn-audit collector** (TURN-AUDIT, roadmap §6 D6).
     ///
-    /// Sama [`Arc<AuditCollector>`] joka kytkettiin agentin tool-looppiin
+    /// The same [`Arc<AuditCollector>`] wired into the agent's tool loop
     /// ([`Agent::with_turn_audit`](familyclaw_agent::Agent::with_turn_audit)).
-    /// Runtime pitää tästä OMAN kahvansa, jotta operaattoripinta (esim. gatewayn
-    /// reitti) voi lukea havainnoitavan tool-loop-jäljen (vuoron alku,
-    /// työkalukutsut redaktoituina, suspend/resume, `stop_reason`) jakamatta
-    /// agentin sisuksia. Keräin on säikeenturvallinen ja vain-lisäävä
-    /// (tamper-evident); `detail`-kentät on redaktoitu jo kirjaushetkellä.
+    /// The runtime keeps its OWN handle to this so the operator surface (e.g.
+    /// a gateway route) can read the observable tool-loop trace (turn start,
+    /// tool calls redacted, suspend/resume, `stop_reason`) without exposing the
+    /// agent's internals. The collector is thread-safe and append-only
+    /// (tamper-evident); `detail` fields are already redacted at write time.
     turn_audit: Arc<AuditCollector>,
-    /// Spawnatut agentti-actorit. Pidetään elossa (drop = actor pysähtyy →
-    /// reply-sink dropataan → drain-task valuu loppuun luonnostaan).
+    /// Spawned agent actors. Kept alive (drop = actor stops → reply sink is
+    /// dropped → the drain task naturally runs to completion).
     agents: Vec<ActorRef<ResonanceMessage>>,
-    /// Reply→channel -tyhjennys. Pidetään ERILLÄÄN abortoitavista taskeista:
-    /// tämä kantaa in-flight-vastauksia, joten se DRAINATAAN loppuun (ei
-    /// abortoida) sammutuksessa, ettei puskuroitu vastaus katoa.
+    /// Reply→channel drain. Kept SEPARATE from the abortable tasks: this one
+    /// carries in-flight responses, so it is DRAINED to completion (not
+    /// aborted) on shutdown, so a buffered response is never lost.
     drain: tokio::task::JoinHandle<()>,
-    /// Abortoitavat taustatehtävät: channel→bus -pumppu. Nämä EIVÄT kanna
-    /// in-flight-vastauksia, joten ne voi keskeyttää suoraan.
+    /// Abortable background tasks: the channel→bus pump. These do NOT carry
+    /// in-flight responses, so they can be aborted directly.
     tasks: Vec<tokio::task::JoinHandle<()>>,
-    /// Ajastimen (Phase 4) peruutussignaali, jos ajastin käynnistettiin (uni-
-    /// sykli ajastettuna tehtävänä). `None` kun ajastin on pois käytöstä
-    /// (`FAMILYCLAW_DREAM_DISABLED`). Sammutus peruuttaa sen → tikkisilmukka
-    /// pysähtyy siististi.
+    /// Cancellation signal for the scheduler (Phase 4), if the scheduler was
+    /// started (the dream cycle as a scheduled task). `None` when the
+    /// scheduler is disabled (`FAMILYCLAW_DREAM_DISABLED`). Shutdown cancels
+    /// it → the tick loop stops cleanly.
     scheduler_signal: Option<CancellationSignal>,
-    /// Jaettu kahva ajastimeen (perhe-agency, Phase 4). `Some` kun ajastin on
-    /// käynnissä → operaattoripinta (gateway) voi kytkeä ajastettuja tehtäviä
-    /// päälle/pois ([`Scheduler::set_task_enabled`]) saman lukon kautta jota
-    /// tikkisilmukka käyttää. `None` kun ajastin on pois käytöstä.
+    /// Shared scheduler handle (family agency, Phase 4). `Some` when the
+    /// scheduler is running → the operator surface (gateway) can toggle
+    /// scheduled tasks on/off ([`Scheduler::set_task_enabled`]) through the
+    /// same lock the tick loop uses. `None` when the scheduler is disabled.
     scheduler_handle: Option<SchedulerHandle>,
-    /// Perhe-agency-configin polku (`<data_dir>/agency.json`), kun ajastin on
-    /// käynnissä persistentillä polulla (Phase 4). Operaattoripinta (gateway)
-    /// kirjoittaa kill-switch-muutokset tähän, jotta ne säilyvät yli restartin.
-    /// `None` muistinvaraisessa tilassa tai kun ajastin on pois käytöstä.
+    /// Path to the family agency config (`<data_dir>/agency.json`), when the
+    /// scheduler is running on a persistent path (Phase 4). The operator
+    /// surface (gateway) writes kill-switch changes here so they survive a
+    /// restart. `None` in in-memory mode or when the scheduler is disabled.
     agency_config_path: Option<std::path::PathBuf>,
 }
 
 impl FamilyRuntime {
-    /// Bus-kahva (jaettavaksi esim. gatewayn `GatewayState`-tilaan).
+    /// Bus handle (to be shared, e.g., into the gateway's `GatewayState`).
     #[must_use]
     pub fn bus(&self) -> &BusHandle {
         &self.bus
     }
 
-    /// **Siltakerroksen tapahtumaväylä** havainnoitavuutta varten (jos kytketty).
+    /// **Bridge-layer event bus** for observability (if wired).
     ///
-    /// Palauttaa `Some(&bridge)` kun kutsuja antoi [`FamilyBridge`]:n
-    /// [`build_family`]:lle. Sama klooni jolle runtime julkaisee ajonaikaisia
-    /// virstanpylväitä (agentin rekisteröinti → [`EventKind::AgentRegistered`]):
-    /// gateway voi tilata sen `EventRecorder`illa, jolloin jaettu
-    /// `MetricsRegistry` saa elävät inkrementit. `None` kun siltaa ei annettu.
+    /// Returns `Some(&bridge)` when the caller supplied a [`FamilyBridge`] to
+    /// [`build_family`]. The same clone the runtime publishes runtime
+    /// milestones to (agent registration → [`EventKind::AgentRegistered`]):
+    /// the gateway can subscribe to it with an `EventRecorder`, so the shared
+    /// `MetricsRegistry` gets live increments. `None` when no bridge was
+    /// supplied.
     ///
     /// [`EventKind::AgentRegistered`]: familyclaw_bridge::EventKind::AgentRegistered
     #[must_use]
@@ -158,156 +163,162 @@ impl FamilyRuntime {
         self.bridge.as_ref()
     }
 
-    /// **Jaettu toimintoajoympäristön kahva** operaattoripinnalle.
+    /// **Shared action runtime handle** for the operator surface.
     ///
-    /// Palauttaa kloonin samasta [`Arc<Mutex<ActionRuntime>>`]:stä jonka agentin
-    /// tool-loop omistaa ([`Agent::with_actions`]). Gateway tallettaa tämän
-    /// `GatewayState`-tilaansa ja käyttää sitä:
+    /// Returns a clone of the same [`Arc<Mutex<ActionRuntime>>`] the agent's
+    /// tool loop owns ([`Agent::with_actions`]). The gateway stores this in
+    /// its `GatewayState` and uses it for:
     /// - `GET /approvals/pending` → [`ActionRuntime::try_pending_approvals`] +
-    ///   [`ActionRuntime::pending_summary_for`] (redaktoidut tiivistelmät),
-    /// - `POST /approvals/{id}/approve` → [`ActionRuntime::approve`] (myöntää
-    ///   hyväksynnän ja ajaa keskeytyneen toiminnon loppuun).
+    ///   [`ActionRuntime::pending_summary_for`] (redacted summaries),
+    /// - `POST /approvals/{id}/approve` → [`ActionRuntime::approve`] (grants
+    ///   approval and runs the suspended action to completion).
     ///
-    /// Kahva on aina läsnä: [`build_family`] luo toimintoajoympäristön
-    /// (oletustaidoilla) jokaiselle perheelle ja kytkee saman kahvan sekä
-    /// agentille että runtimelle. Lukko otetaan vain operaation ajaksi.
+    /// The handle is always present: [`build_family`] creates an action
+    /// runtime (with default skills) for every family and wires the same
+    /// handle into both the agent and the runtime. The lock is held only for
+    /// the duration of an operation.
     #[must_use]
     pub fn actions(&self) -> Arc<Mutex<ActionRuntime>> {
         Arc::clone(&self.actions)
     }
 
-    /// **Jaettu turn-audit-keräimen kahva** operaattoripinnalle (TURN-AUDIT,
-    /// roadmap §6 D6).
+    /// **Shared turn-audit collector handle** for the operator surface
+    /// (TURN-AUDIT, roadmap §6 D6).
     ///
-    /// Palauttaa kloonin samasta [`Arc<AuditCollector>`]:sta jonka agentin
-    /// tool-loop omistaa ([`Agent::with_turn_audit`](familyclaw_agent::Agent::with_turn_audit)).
-    /// Gateway voi tallettaa tämän tilaansa ja näyttää operaattorille
-    /// havainnoitavan tool-loop-jäljen ([`AuditCollector::list`] /
-    /// [`AuditCollector::events_for`]) — vuoron alku, työkalukutsut
-    /// **redaktoituina**, suspend/resume ja `stop_reason`. Tuloste ei koskaan
-    /// sisällä raakoja salaisuuksia.
+    /// Returns a clone of the same [`Arc<AuditCollector>`] the agent's tool
+    /// loop owns ([`Agent::with_turn_audit`](familyclaw_agent::Agent::with_turn_audit)).
+    /// The gateway can store this in its state and show the operator the
+    /// observable tool-loop trace ([`AuditCollector::list`] /
+    /// [`AuditCollector::events_for`]) — turn start, tool calls
+    /// **redacted**, suspend/resume, and `stop_reason`. The output never
+    /// contains raw secrets.
     #[must_use]
     pub fn turn_audit(&self) -> Arc<AuditCollector> {
         Arc::clone(&self.turn_audit)
     }
 
-    /// **Jaettu ajastinkahva** operaattoripinnalle (perhe-agency, Phase 4).
+    /// **Shared scheduler handle** for the operator surface (family agency,
+    /// Phase 4).
     ///
-    /// Palauttaa `Some(handle)` kun ajastin on käynnissä → gateway voi kytkeä
-    /// ajastettuja tehtäviä päälle/pois ([`Scheduler::set_task_enabled`]) saman
-    /// lukon kautta jota tikkisilmukka käyttää (kilpailu ratkeaa lukolla).
-    /// `None` kun ajastin on pois käytöstä (`FAMILYCLAW_DREAM_DISABLED`).
+    /// Returns `Some(handle)` when the scheduler is running → the gateway can
+    /// toggle scheduled tasks on/off ([`Scheduler::set_task_enabled`]) through
+    /// the same lock the tick loop uses (contention is resolved via the
+    /// lock). `None` when the scheduler is disabled
+    /// (`FAMILYCLAW_DREAM_DISABLED`).
     #[must_use]
     pub fn scheduler_handle(&self) -> Option<SchedulerHandle> {
         self.scheduler_handle.clone()
     }
 
-    /// **Perhe-agency-configin polku** (`<data_dir>/agency.json`) operaattori-
-    /// pinnalle (Phase 4). Gateway kirjoittaa kill-switch-muutokset tähän, jotta
-    /// ne säilyvät yli restartin. `Some` kun ajastin on käynnissä persistentillä
-    /// polulla; `None` muistinvaraisessa tilassa tai kun ajastin on pois käytöstä.
+    /// **Path to the family agency config** (`<data_dir>/agency.json`) for the
+    /// operator surface (Phase 4). The gateway writes kill-switch changes here
+    /// so they survive a restart. `Some` when the scheduler is running on a
+    /// persistent path; `None` in in-memory mode or when the scheduler is
+    /// disabled.
     #[must_use]
     pub fn agency_config_path(&self) -> Option<std::path::PathBuf> {
         self.agency_config_path.clone()
     }
 
-    /// Sammuttaa kokoonpanon siististi: **ei pudota in-flight-vastauksia.**
+    /// Shuts down the assembly cleanly: **never drops in-flight responses.**
     ///
-    /// Järjestys on tarkoituksellinen:
-    /// 1. Pysäytä bus + pudota agentit → reply-tuotanto loppuu ja reply-sink
-    ///    dropataan → drain-taskin `reply_rx.recv()` palauttaa `None`.
-    /// 2. Abortoi pump (+ dream) — ne eivät kanna vastauksia.
-    /// 3. **Odota drain loppuun** (rajattu timeout) → puskuroidut vastaukset
-    ///    ehtivät kanavalle ennen paluuta. Aiemmin drain abortoitiin → viimeiset
-    ///    vastaukset katosivat ("siisti sammutus" -lupauksen rikko).
+    /// The order is intentional:
+    /// 1. Stop the bus + drop the agents → reply production stops and the
+    ///    reply sink is dropped → the drain task's `reply_rx.recv()` returns
+    ///    `None`.
+    /// 2. Abort the pump (+ dream) — they carry no responses.
+    /// 3. **Wait for drain to finish** (bounded timeout) → buffered responses
+    ///    reach the channel before returning. Previously drain was aborted →
+    ///    the last responses were lost (breaking the "clean shutdown" promise).
     pub async fn shutdown(self) {
-        // 1. Lopeta reply-tuotanto: bus seis + agentit pois (pudottaa sinkin).
+        // 1. Stop reply production: bus stop + agents gone (drops the sink).
         self.bus.stop();
         drop(self.agents);
-        // 2. Peruuta ajastin (Phase 4): tikkisilmukka pysähtyy siististi.
+        // 2. Cancel the scheduler (Phase 4): the tick loop stops cleanly.
         if let Some(signal) = self.scheduler_signal {
             signal.cancel();
         }
-        // 3. Abortoi vastauksia kantamattomat taustatehtävät.
+        // 3. Abort background tasks that carry no responses.
         for t in self.tasks {
             t.abort();
         }
-        // 4. Anna drainin valua loppuun (rajattu, ettei sammutus jää roikkumaan).
+        // 4. Let drain run to completion (bounded, so shutdown doesn't hang).
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.drain).await;
     }
 }
 
-/// Yhden lisäagentin kokoonpanon palaset ([`build_family`]:n `extra_agents`).
+/// Configuration pieces for one extra agent ([`build_family`]'s `extra_agents`).
 #[derive(Debug, Clone)]
 pub struct AgentBuildSpec {
-    /// Lisäagentin kokoonpano (malli, taidot, kanavat).
+    /// Extra agent's configuration (model, skills, channels).
     pub config: AgentConfig,
-    /// Lisäagentin sielu (identiteetti, ääni, rajat).
+    /// Extra agent's soul (identity, voice, boundaries).
     pub soul: Soul,
-    /// Per-agentti reply-kohde; `None` → perheen oletus `reply_target`.
+    /// Per-agent reply target; `None` -> the family's default `reply_target`.
     pub reply_target: Option<String>,
 }
 
-/// C5-kokooja: rakentaa elävän [`FamilyRuntime`]:n yhdellä kutsulla.
+/// C5 assembler: builds a living [`FamilyRuntime`] with a single call.
 ///
-/// Kytkee `Channel::receive()` → [`familyclaw_agent::pump_channel_to_bus`] → bus → `Agent`
-/// (spawn) → `route_reply` → reply-jono → `Channel::send`. MVP: yksi agentti,
-/// yksi kanava, staattinen reply-kohde.
+/// Wires `Channel::receive()` -> [`familyclaw_agent::pump_channel_to_bus`] -> bus -> `Agent`
+/// (spawn) -> `route_reply` -> reply queue -> `Channel::send`. MVP: one agent,
+/// one channel, a static reply target.
 ///
-/// LLM on **valinnainen**: jos [`build_llm_chain`] ei ratkaise yhtäkään mallia
-/// endpointiksi (esim. avain puuttuu ympäristöstä), agentti spawnataan ilman
-/// LLM:ää — se muistaa ja reagoi tunnetilassa, mutta ei tuota tekstivastauksia.
-/// Tämä pitää kokoonpanon käynnistettävänä ilman provider-avaimia (savutestit,
-/// CI). Kun ketju ratkeaa, koko failover (primary + fallbackit) kytketään
-/// agentille [`Agent::with_failover`]:lla.
+/// The LLM is **optional**: if [`build_llm_chain`] cannot resolve any model to
+/// an endpoint (e.g. a key is missing from the environment), the agent is
+/// spawned without an LLM -- it remembers and reacts emotionally, but does not
+/// produce text replies. This keeps the assembly startable without provider
+/// keys (smoke tests, CI). Once the chain resolves, the full failover chain
+/// (primary + fallbacks) is wired into the agent via [`Agent::with_failover`].
 ///
-/// # Vastauksen reititys: per-viesti-alkuperä (F2) + staattinen fallback
-/// Per-viesti-alkuperä (`MessageOrigin`) on **täysin rakennettu ja testattu**
-/// (F2). Saapuva `InboundEnvelope` kantaa alkuperän, `channel_bridge`
-/// kartoittaa sen `MessageOrigin`:iin (`envelope_origin`), `ResonanceMessage`
-/// kuljettaa sen bus-kirjekuoressa (`publish_with_origin`), ja
-/// [`Agent::handle_turn_with_origin`] johtaa vastauksen kohteen per-viesti
-/// arvosta `origin.reply_target()`. Staattinen `reply_target`/agentti on nyt
-/// **fallback** — sitä käytetään vain kun alkuperää ei ole. Näin yksi agentti
-/// palvelee >1 kanavaa ja >1 keskustelua ilman että vastaus vuotaa väärään
-/// keskusteluun. Todiste: integraatiotesti
+/// # Reply routing: per-message origin (F2) + static fallback
+/// Per-message origin (`MessageOrigin`) is **fully built and tested**
+/// (F2). The inbound `InboundEnvelope` carries the origin, `channel_bridge`
+/// maps it to a `MessageOrigin` (`envelope_origin`), `ResonanceMessage`
+/// carries it in the bus envelope (`publish_with_origin`), and
+/// [`Agent::handle_turn_with_origin`] derives the reply target per message
+/// from `origin.reply_target()`. The static `reply_target`/agent is now a
+/// **fallback** -- it is used only when there is no origin. This way one agent
+/// can serve >1 channel and >1 conversation without a reply leaking into the
+/// wrong conversation. Proof: integration test
 /// `two_origins_route_replies_to_correct_targets_no_leak`
-/// (`familyclaw-runtime/tests/roundtrip.rs`), joka asettaa staattisen kohteen
-/// tarkoituksella vääräksi ja todistaa että kaksi eri keskustelua reitittyvät
-/// omiin kohteisiinsa.
+/// (`familyclaw-runtime/tests/roundtrip.rs`), which deliberately sets the
+/// static target wrong and proves that two different conversations route to
+/// their own targets.
 ///
-/// # Havainnoitavuus: `bridge` (valinnainen)
-/// `bridge`-argumentti on **valinnainen** jaettu siltakerroksen tapahtumaväylä
-/// ([`FamilyBridge`]). Kun kutsuja antaa sen, runtime julkaisee sille
-/// ajonaikaisia virstanpylväitä — tällä hetkellä **agentin rekisteröinnin**
-/// ([`EventKind::AgentRegistered`]) kun agentti on spawnattu (askel 7d). Runtime
-/// säilyttää saman kloonin ([`FamilyRuntime::bridge`]) jotta gateway voi tilata
-/// sen `EventRecorder`illa ja täyttää jaetun `MetricsRegistry`:n elävillä
-/// luvuilla (esim. `agents_online`-gauge).
+/// # Observability: `bridge` (optional)
+/// The `bridge` argument is an **optional** shared bridge-layer event bus
+/// ([`FamilyBridge`]). When the caller supplies it, the runtime publishes
+/// runtime milestones to it -- currently **agent registration**
+/// ([`EventKind::AgentRegistered`]) once the agent has been spawned (step 7d). The runtime
+/// keeps the same clone ([`FamilyRuntime::bridge`]) so the gateway can subscribe to
+/// it with an `EventRecorder` and populate the shared `MetricsRegistry` with live
+/// numbers (e.g. the `agents_online` gauge).
 ///
-/// **Tilausjärjestys:** `EventBus` toimittaa vain *tilauksen jälkeen* julkaistut
-/// tapahtumat. Kutsujan on siksi luotava `EventRecorder` (tilattava `bridge`)
-/// **ennen** tämän funktion kutsua, jotta agentin rekisteröintitapahtuma ei
-/// huku. `None` → ei julkaisua (savutestit, jotka eivät tarvitse mittareita).
+/// **Subscription order:** the `EventBus` only delivers events published *after*
+/// subscription. The caller must therefore create the `EventRecorder` (subscribe
+/// to `bridge`) **before** calling this function, so the agent registration event is not
+/// lost. `None` -> no publishing (smoke tests that don't need metrics).
 ///
 /// [`EventKind::AgentRegistered`]: familyclaw_bridge::EventKind::AgentRegistered
 ///
 /// # Errors
-/// - [`FamilyClawError::Config`] jos mallikonfiguraatio on kelvoton (tämä
-///   nostetaan vain jos primary on tyhjä — puuttuva endpoint johtaa
-///   LLM-vapaaseen agenttiin, ei virheeseen).
-/// - [`FamilyClawError::Bus`] jos busin käynnistys, agentin spawn/rekisteröinti
-///   tai durable-kontekstin rakennus epäonnistuu.
-/// - [`FamilyClawError::InvalidInput`] (kanavakerroksesta käännettynä) jos
-///   kanavan saapuvaa virtaa ei voi avata.
-// Tämä on perheen kokoamisen yksi lineaarinen sekvenssi (bus → LLM → muisti →
-// durable → agentti → kanava → dream). Numeroidut askeleet luetaan ylhäältä alas;
-// paloittelu apufunktioihin hajottaisi tämän kokoamiskertomuksen ja kasvattaisi
-// argumenttien lankoja ilman selvyyshyötyä.
+/// - [`FamilyClawError::Config`] if the model configuration is invalid (this
+///   is only raised if the primary is empty -- a missing endpoint results in
+///   an LLM-free agent, not an error).
+/// - [`FamilyClawError::Bus`] if starting the bus, spawning/registering the
+///   agent, or building the durable context fails.
+/// - [`FamilyClawError::InvalidInput`] (converted from the channel layer) if
+///   the channel's inbound stream cannot be opened.
+// This is one linear sequence for assembling the family (bus -> LLM -> memory ->
+// durable -> agent -> channel -> dream). The numbered steps read top to bottom;
+// splitting into helper functions would break up this assembly narrative and
+// add argument plumbing without a clarity benefit.
 //
-// 8 argumenttia (raja 7) on tietoinen valinta: kukin on itsenäinen kokoamisen
-// palanen ilman luonnollista ryhmittelyä params-structiksi, ja funktio on koko
-// runtimen julkinen sisääntulo — allekirjoituksen muutos rikkoisi kaikki kutsujat.
+// 8 arguments (limit 7) is a deliberate choice: each is an independent
+// assembly piece with no natural grouping into a params struct, and this
+// function is the whole runtime's public entry point -- changing the
+// signature would break every caller.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn build_family(
     bus_name: Option<String>,
@@ -319,27 +330,27 @@ pub async fn build_family(
     resolver: &dyn LlmEndpointResolver,
     bridge: Option<FamilyBridge>,
 ) -> Result<FamilyRuntime> {
-    // 0. Lue persistointikonfiguraatio SYNKRONISESTI ennen ensimmäistä
-    //    `.await`-pistettä. Näin päätös (persistentti vs. in-memory) tehdään
-    //    yhdessä paikassa eikä riipu siitä, ehtiikö joku muuttaa
-    //    `FAMILYCLAW_DATA_DIR`-ympäristömuuttujaa busin käynnistyksen aikana.
+    // 0. Read the persistence configuration SYNCHRONOUSLY before the first
+    //    `.await` point. This way the decision (persistent vs. in-memory) is
+    //    made in one place and doesn't depend on whether someone changes the
+    //    `FAMILYCLAW_DATA_DIR` environment variable while the bus is starting.
     let data_dir = env::var("FAMILYCLAW_DATA_DIR").ok();
 
-    // 1. Käynnistä Resonance Bus (perheen affektiivinen hermosto).
+    // 1. Start the Resonance Bus (the family's affective nervous system).
     let bus = ResonanceBus::start(bus_name).await?;
 
-    // 2. Reply-kanava (C1 Malli A): agentti työntää vastaukset sinkkiin,
-    //    runtime omistaa recv-pään ja kutsuu Channel::send (alla, askel 9).
+    // 2. Reply channel (C1 Model A): the agent pushes replies into the sink,
+    //    the runtime owns the recv end and calls Channel::send (below, step 9).
     let (sink, mut reply_rx) = new_reply_channel();
     let shared_reply_sink = sink.clone();
 
     let primary_model = agent_cfg.model.clone();
     let default_reply = reply_target.clone();
-    // 3. LLM-failover-ketju (valinnainen): jos yksikään malli ei ratkea
-    //    endpointiksi (esim. avain/endpoint puuttuu), agentti toimii ilman
-    //    LLM:ää. Rakennetaan KOKO ketju (primary + fallbackit) — F1: primaryn
-    //    kuolema (timeout/HTTP/rate) ei enää tapa vuoroa, vaan seuraavaa
-    //    fallbackia kokeillaan järjestyksessä ([`Agent::think`]).
+    // 3. LLM failover chain (optional): if no model resolves to an
+    //    endpoint (e.g. a key/endpoint is missing), the agent runs without
+    //    an LLM. The WHOLE chain (primary + fallbacks) is built -- F1: the
+    //    primary's death (timeout/HTTP/rate) no longer kills the turn; the
+    //    next fallback is tried in order instead ([`Agent::think`]).
     let failover = match build_llm_chain(&agent_cfg.model, resolver) {
         Ok(chain) => Some(chain),
         Err(e) => {
@@ -355,50 +366,50 @@ pub async fn build_family(
         }
     };
 
-    // 4. Muisti (Eternal Thread, in-memory MVP) + durable-konteksti.
+    // 4. Memory (Eternal Thread, in-memory MVP) + durable context.
     //
-    //    `persistent` kertoo, rakennettiinko durable-konteksti OLEMASSA OLEVAN
-    //    journalin päälle (FAMILYCLAW_DATA_DIR). Vain silloin on replay-historiaa
-    //    josta on jatkettava elävänä (askel 6, `resume_live`). In-memory-polulla
-    //    journal on aina tyhjä → ei replayta → ei resume-tarvetta.
+    //    `persistent` indicates whether the durable context was built on top of
+    //    an EXISTING journal (FAMILYCLAW_DATA_DIR). Only then is there replay
+    //    history to resume live from (step 6, `resume_live`). On the in-memory
+    //    path the journal is always empty -> no replay -> no resume needed.
     //
-    //    `resumable` on jatkettavien vuorojen (suspend/resume-silta, roadmap §6)
-    //    KAATUMISKESTÄVÄ tallennuspinta. Se rakennetaan **vain** persistentillä
-    //    polulla: silloin hyväksyntää odottava, keskeytynyt tool-loop-vuoro
-    //    säilyy levyllä prosessin uudelleenkäynnistyksen yli (ks. askel 7).
-    //    In-memory-polulla agentti jää oletukseensa
-    //    ([`InMemoryResumableStore`]) — ei levyä, ei kaatumiskestävyyttä, kuten
-    //    muullakin in-memory-tilalla.
+    //    `resumable` is the CRASH-SURVIVING storage surface for resumable turns
+    //    (suspend/resume bridge, roadmap §6). It is built **only** on the
+    //    persistent path: only then does a suspended tool-loop turn awaiting
+    //    approval survive on disk across a process restart (see step 7).
+    //    On the in-memory path the agent stays on its default
+    //    ([`InMemoryResumableStore`]) -- no disk, no crash resilience, like the
+    //    rest of in-memory mode.
     //
-    //    `action_data_dir` (`Some(dir)` vain persistentillä polulla) kantaa
-    //    hakemiston, josta toimintoajoympäristön KOLME kaatumiskestävää pintaa
-    //    rakennetaan askeleessa 7b:
+    //    `action_data_dir` (`Some(dir)` only on the persistent path) carries the
+    //    directory from which the action runtime's THREE crash-surviving surfaces
+    //    are built in step 7b:
     //
-    //    1. **odottavien hyväksyntöjen pinta** (`<data_dir>/pending_approvals.jsonl`,
-    //       `JournalPendingStore`) — ilman tätä restartin jälkeen `approve`
-    //       törmäisi tyhjään muistikarttaan ja palauttaisi `ApprovalMissing`
-    //       (404) jo ENNEN outboxin InProgress/Committed-vahtia, jolloin
-    //       at-most-once pitäisi VAIN 404:n sivuvaikutuksesta (vahingossa) eikä
-    //       siksi että durable-kerros sen pakottaa;
-    //    2. **tehtäväjono** (`<data_dir>/action_tasks.jsonl`) — jotta hyväksyttävä
-    //       tehtävä (payload + tila) rekonstruoituu restartissa;
-    //    3. **lähetyksen idempotenssi-outbox** (`<data_dir>/dispatch_outbox.jsonl`,
-    //       familyclaw_actions::JournalDispatchOutbox) — **at-most-once**-rajan
-    //       (kaksoislaukaisun esto, EI universaali exactly-once completion)
-    //       KAATUMISKESTÄVÄ pinta:
-    //       `submit_task`:n / `approve`:n sivuvaikutus suoritetaan korkeintaan
-    //       kerran SIGKILL-kaatumisen yli (ei koskaan kahdesti), ja jo sitoutunut
-    //       lähetys palautuu arvo-identtisenä; intent-only-ikkunassa kaatuminen
-    //       epäonnistuu suljettuna.
+    //    1. **pending approvals surface** (`<data_dir>/pending_approvals.jsonl`,
+    //       `JournalPendingStore`) -- without this, after a restart `approve`
+    //       would hit an empty in-memory map and return `ApprovalMissing`
+    //       (404) already BEFORE the outbox's InProgress/Committed guard, so
+    //       at-most-once would hold ONLY as a (accidental) side effect of the
+    //       404, not because the durable layer enforces it;
+    //    2. **task queue** (`<data_dir>/action_tasks.jsonl`) -- so the
+    //       approvable task (payload + state) is reconstructed on restart;
+    //    3. **dispatch idempotency outbox** (`<data_dir>/dispatch_outbox.jsonl`,
+    //       familyclaw_actions::JournalDispatchOutbox) -- the **at-most-once**
+    //       boundary's (double-fire prevention, NOT universal exactly-once
+    //       completion) CRASH-SURVIVING surface:
+    //       `submit_task`'s / `approve`'s side effect runs at most once
+    //       across a SIGKILL crash (never twice), and an already-committed
+    //       dispatch returns value-identically; in the intent-only window a
+    //       crash fails closed.
     //
-    //    Kaikki kolme pintaa kytketään YHDELLÄ [`ActionRuntime::with_durable_stores`]
-    //    -kutsulla (se avaa nyt itse kaatumiskestävän dispatch-outboxin kolmannesta
-    //    polusta — ei enää erillistä with_dispatch_outbox-ketjutusta eikä outboxin
-    //    kaksoisavausta). In-memory-polulla kaikki kolme jäävät oletuksiinsa (ei
-    //    levyä), kuten muullakin in-memory-tilalla.
+    //    All three surfaces are wired with ONE [`ActionRuntime::with_durable_stores`]
+    //    call (it now opens the crash-surviving dispatch outbox itself from the
+    //    third path -- no more separate with_dispatch_outbox chaining and no
+    //    double-opening of the outbox). On the in-memory path all three stay on
+    //    their defaults (no disk), like the rest of in-memory mode.
     //
-    //    `resumable` on jatkettavien vuorojen pinta `<data_dir>/resumable.jsonl`,
-    //    kytketään suoraan agenttiin (askel 7).
+    //    `resumable` is the resumable-turns surface `<data_dir>/resumable.jsonl`,
+    //    wired directly into the agent (step 7).
     let (memory, durable, dream_journal, persistent, resumable, action_data_dir) =
         if let Some(data_dir) = data_dir {
             let dir = std::path::PathBuf::from(&data_dir);
@@ -409,15 +420,15 @@ pub async fn build_family(
             let mem = LocalJsonStore::open(dir.join("memory.json"))
                 .await
                 .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-            // Phase 3: kääräise muisti auto-upotuksella. Oletustarjoaja on
-            // riippuvuudeton ja deterministinen (köyhyys-yhteensopiva);
-            // `semantic_weight` on oletuksena 0.0, joten upotukset tuotetaan
-            // mutta vektorihaku aktivoituu vasta kun kutsuja nostaa painon →
-            // täysin taaksepäin-yhteensopiva.
+            // Phase 3: wrap memory with auto-embedding. The default provider is
+            // dependency-free and deterministic (poverty-compatible);
+            // `semantic_weight` defaults to 0.0, so embeddings are produced
+            // but vector search only activates once the caller raises the
+            // weight -> fully backward-compatible.
             let mem = EmbeddingMemoryStore::new(mem, resolve_embedder());
             let dur = DurableContext::new(Arc::clone(&dream_j))
                 .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-            // Kaatumiskestävä jatkettavien vuorojen pinta `<data_dir>/resumable.jsonl`.
+            // Crash-surviving resumable-turns surface `<data_dir>/resumable.jsonl`.
             let store = JournalResumableStore::open(dir.join("resumable.jsonl"))
                 .map_err(|e| FamilyClawError::bus(e.to_string()))?;
             let resumable: Arc<dyn ResumableTurnStore> = Arc::new(store);
@@ -430,7 +441,7 @@ pub async fn build_family(
                 Some(dir),
             )
         } else {
-            // Phase 3: sama auto-upotuskääre myös muistinvaraisessa polussa.
+            // Phase 3: same auto-embedding wrapper on the in-memory path too.
             let mem = EmbeddingMemoryStore::new(LocalJsonStore::in_memory(), resolve_embedder());
             let memory: ErasedMemoryStore = Arc::new(mem);
             let dream_j: Arc<dyn Journal + Send + Sync> = Arc::new(InMemoryJournal::new());
@@ -439,13 +450,13 @@ pub async fn build_family(
             (memory, durable, Some(dream_j), false, None, None)
         };
 
-    // 5. Ankkuroi identiteetti ennen agentin rakennusta — JA persistoi se.
-    //    Aiemmin rekisteri oli paikallinen `let mut registry`, joka pudotettiin
-    //    heti `register()`:n jälkeen: ankkuria ei koskaan tallennettu eikä
-    //    tarkistettu bootissa uudelleen. Nyt [`ensure_identity_anchor`] lataa
-    //    olemassa olevan rekisterin, **verify_identity**:n bootissa
-    //    (peukalointihälytys lokiin), rekisteröi nykyisen sielun ja persistoi
-    //    `anchors.json`:ksi. Env-gated (`FAMILYCLAW_HEARTH_ENABLED`).
+    // 5. Anchor identity before building the agent -- AND persist it.
+    //    Previously the registry was a local `let mut registry` that was dropped
+    //    right after `register()`: the anchor was never saved or re-checked on
+    //    boot. Now [`ensure_identity_anchor`] loads the existing registry, runs
+    //    **verify_identity** on boot (a tamper alert to the log), registers the
+    //    current soul, and persists it to `anchors.json`. Env-gated
+    //    (`FAMILYCLAW_HEARTH_ENABLED`).
     if env::var("FAMILYCLAW_HEARTH_ENABLED").is_ok() {
         let anchor_path = env::var("FAMILYCLAW_DATA_DIR")
             .ok()
@@ -453,51 +464,52 @@ pub async fn build_family(
         ensure_identity_anchor(&agent_cfg.name, &soul.essence, anchor_path.as_deref());
     }
 
-    // 6. Lataa tunnemoottorin kalibrointi profiilihakemiston
-    //    `calibration.json`:sta (KERROS B -data — ks. [`load_profile_calibration`]).
-    //    `None` → agentti jää neutraaliin kalibrointiin (ei-rikkova).
+    // 6. Load the emotion engine calibration from the profile directory's
+    //    `calibration.json` (LAYER B data -- see [`load_profile_calibration`]).
+    //    `None` -> the agent stays on neutral calibration (non-breaking).
     let calibration = load_profile_calibration(agent_cfg.profile_dir.as_deref(), &agent_cfg.name);
 
-    // 7. Rakenna agentti ja kytke reply-sink + staattinen reply-kohde.
-    //    LLM annetaan `None`:na konstruktorille ja KOKO failover-ketju
-    //    kytketään erikseen [`Agent::with_failover`]:lla (jos se ratkesi).
-    //    Näin agentti saa primary + fallbackit, ei vain primaryä.
+    // 7. Build the agent and wire the reply sink + static reply target.
+    //    The LLM is given as `None` to the constructor and the WHOLE failover
+    //    chain is wired separately via [`Agent::with_failover`] (if it resolved).
+    //    This way the agent gets primary + fallbacks, not just the primary.
     //
-    //    **Gateway-restart-korjaus:** kun durable-konteksti rakennettiin
-    //    OLEMASSA OLEVAN journalin päälle (persistentti polku,
-    //    FAMILYCLAW_DATA_DIR), se on replay-tilassa. Gateway palvelee ELÄVIÄ
-    //    uusia viestejä — se EI syötä historiaa uudelleen. [`Agent::resume_live`]
-    //    siirtää durable-kursorin replayn loppuun JA palauttaa `turn_counter`:n
-    //    seuraavaan vapaaseen vuoropaikkaan, jotta seuraava elävä vuoro
-    //    (a) ei kaadu `NondeterministicReplay`:hin / mykisty (`is_replaying`),
-    //    eikä (b) törmää muistin `turn_key`:ssä replayn duplikaattiin. Tämä
-    //    tehdään vain persistentillä polulla — in-memory-journal on aina tyhjä.
+    //    **Gateway restart fix:** when the durable context was built on top of
+    //    an EXISTING journal (persistent path, FAMILYCLAW_DATA_DIR), it is in
+    //    replay mode. The gateway serves LIVE new messages -- it does NOT
+    //    re-feed history. [`Agent::resume_live`] advances the durable cursor to
+    //    the end of the replay AND restores `turn_counter` to the next free
+    //    turn slot, so the next live turn (a) doesn't crash on
+    //    `NondeterministicReplay` / go mute (`is_replaying`), and (b) doesn't
+    //    collide with a replay duplicate in memory's `turn_key`. This is done
+    //    only on the persistent path -- the in-memory journal is always empty.
     let dream_store = Arc::clone(&memory);
-    // Talleta agentin identiteetti ennen kuin `agent_cfg` siirtyy `Agent::new`:lle
-    // — havainnoitavuussilta (askel 7d) julkaisee rekisteröinnin näillä arvoilla.
+    // Save the agent's identity before `agent_cfg` moves into `Agent::new`
+    // -- the observability bridge (step 7d) publishes the registration using
+    // these values.
     let agent_id = agent_cfg.id;
     let agent_name = agent_cfg.name.clone();
     let sandbox = resolve_sandbox_skills();
     let mut agent = Agent::new(agent_cfg, soul, memory, durable, bus.clone(), None, sandbox);
-    // Gateway-restart-korjaus (durable-replay): siirrä kursori replayn loppuun
-    // ja palauta turn_counter seuraavaan vapaaseen vuoropaikkaan VAIN
-    // persistentillä polulla (FAMILYCLAW_DATA_DIR). In-memory-journal on tyhjä.
+    // Gateway restart fix (durable replay): advance the cursor to the end of
+    // the replay and restore turn_counter to the next free turn slot ONLY on
+    // the persistent path (FAMILYCLAW_DATA_DIR). The in-memory journal is empty.
     if persistent {
         agent = agent.resume_live();
     }
-    // Kaatumiskestävä jatkettavien vuorojen pinta (suspend/resume-silta): kun se
-    // rakennettiin (persistentti polku), kytke se agenttiin oletuksen
-    // ([`InMemoryResumableStore`]) tilalle. Näin hyväksyntää odottava,
-    // keskeytynyt tool-loop-vuoro säilyy levyllä prosessin kaatumisen yli ja
-    // [`Agent::resume_approved`] voi viedä sen loppuun restartin jälkeen. Ilman
-    // tätä tuotannon daemon menettäisi jokaisen odottavan resumable-vuoron
-    // restartissa (oletus on muistinvarainen).
+    // Crash-surviving resumable-turns surface (suspend/resume bridge): once it
+    // was built (persistent path), wire it into the agent in place of the
+    // default ([`InMemoryResumableStore`]). This way a suspended tool-loop
+    // turn awaiting approval survives on disk across a process crash, and
+    // [`Agent::resume_approved`] can carry it to completion after a restart.
+    // Without this the production daemon would lose every pending resumable
+    // turn on restart (the default is in-memory).
     if let Some(resumable) = resumable {
         agent = agent.with_resumable_store(resumable);
     }
     agent = agent.with_reply_sink(sink).with_reply_target(reply_target);
-    // Tunnemoottorin kalibrointi (KERROS B): jos profiilin calibration.json
-    // ratkesi, kytke se governoriin — muuten agentti jää neutraaliin.
+    // Emotion engine calibration (LAYER B): if the profile's calibration.json
+    // resolved, wire it into the governor -- otherwise the agent stays neutral.
     if let Some(calibration) = calibration {
         agent = agent.with_calibration(calibration);
     }
@@ -505,64 +517,67 @@ pub async fn build_family(
         agent = agent.with_failover(failover);
     }
 
-    // 7b. Toimintoajoympäristö (ActionRuntime) — tool-loop + operaattorin
-    //     hyväksyntäpinta jakavat SAMAN Arc<Mutex<ActionRuntime>>-kahvan.
+    // 7b. Action runtime (ActionRuntime) -- the tool loop + the operator's
+    //     approval surface share the SAME Arc<Mutex<ActionRuntime>> handle.
     //
-    //     Tämä on suspend/resume-sillan (roadmap §6 D2) kytkentäpiste: ilman
-    //     toimintoajoympäristöä agentin `think` ei voi koskaan keskeytyä
-    //     hyväksyntää odottamaan (ei työkaluja → ei `Suspended`), joten ei myös
-    //     mitään mitä operaattorin pinta voisi näyttää tai hyväksyä. Kaikki taidot
-    //     ovat KERROS A -geneerisiä mockeja, eivät oikeita providereita. Jos
-    //     taitojen rekisteröinti epäonnistuisi (ei pitäisi — sisäänrakennetut
-    //     manifestit on validoitu), kaadutaan kontrolloidusti virheeseen ennen
-    //     spawnia.
+    //     This is the wiring point for the suspend/resume bridge (roadmap §6
+    //     D2): without an action runtime, the agent's `think` can never
+    //     suspend to await approval (no tools -> no `Suspended`), and so there
+    //     is also nothing for the operator surface to show or approve. All
+    //     skills are LAYER A generic mocks, not real providers. If skill
+    //     registration were to fail (it shouldn't -- the built-in manifests
+    //     are validated), it fails in a controlled way with an error before
+    //     spawning.
     //
-    //     Sama kahva annetaan agentille `with_actions`:lla (tool-loop aktivoituu)
-    //     JA talletetaan runtimeen ([`FamilyRuntime::actions`]) operaattoripintaa
-    //     varten — molemmat osoittavat samaan lukittuun tilaan.
+    //     The same handle is given to the agent via `with_actions` (activating
+    //     the tool loop) AND stored in the runtime ([`FamilyRuntime::actions`])
+    //     for the operator surface -- both point to the same locked state.
     //
-    //     **Kaatumiskestävyys persistentillä polulla** — KOLME durable-pintaa:
+    //     **Crash resilience on the persistent path** -- THREE durable surfaces:
     //
     //     - **Durable pending + task** ([`ActionRuntime::with_durable_stores`]):
-    //       odottava hyväksyntä (`pending_approvals.jsonl`) JA hyväksyttävä
-    //       tehtävä (`action_tasks.jsonl`, payload + tila) SÄILYVÄT restartin yli.
-    //       Ilman durable-pendingiä `approve` törmäisi restartin jälkeen tyhjään
-    //       muistikarttaan ja palauttaisi `ApprovalMissing` (404) jo ENNEN
-    //       outboxin InProgress/Committed-vahtia — jolloin at-most-once pitäisi
-    //       vain 404:n sivuvaikutuksesta (vahingossa). Durable pending lataa
-    //       hyväksynnän takaisin levyltä, jolloin kontrolli ETENEE outbox-vahdille
-    //       ja **durable-kerros** pakottaa kaksoislaukaisun eston.
-    //     - **Durable lähetys-outbox** (avataan SAMASSA
-    //       [`ActionRuntime::with_durable_stores`] -kutsussa kolmannesta polusta —
-    //       ei enää erillistä with_dispatch_outbox-ketjutusta): tämä antaa
-    //       `submit_task`:lle / `approve`:lle at-most-once-takuun (kaksoislaukaisun
-    //       esto, EI universaali exactly-once completion) SIGKILL-kaatumisen yli
-    //       (sivuvaikutus korkeintaan kerran; jo sitoutunut lähetys palautuu
-    //       arvo-identtisenä; intent-only-ikkunassa kaatuminen epäonnistuu
-    //       suljettuna).
+    //       a pending approval (`pending_approvals.jsonl`) AND an approvable
+    //       task (`action_tasks.jsonl`, payload + state) SURVIVE a restart.
+    //       Without durable pending, after a restart `approve` would hit an
+    //       empty in-memory map and return `ApprovalMissing` (404) already
+    //       BEFORE the outbox's InProgress/Committed guard -- so at-most-once
+    //       would hold only as an (accidental) side effect of the 404. Durable
+    //       pending loads the approval back from disk, so control ADVANCES to
+    //       the outbox guard and the **durable layer** enforces the double-fire
+    //       prevention.
+    //     - **Durable dispatch outbox** (opened in the SAME
+    //       [`ActionRuntime::with_durable_stores`] call from the third path --
+    //       no more separate with_dispatch_outbox chaining): this gives
+    //       `submit_task` / `approve` an at-most-once guarantee (double-fire
+    //       prevention, NOT universal exactly-once completion) across a
+    //       SIGKILL crash (side effect at most once; an already-committed
+    //       dispatch returns value-identically; in the intent-only window a
+    //       crash fails closed).
     //
-    //     In-memory-polulla ([`ActionRuntime::with_default_skills`], ei data_diriä)
-    //     kaikki kolme jäävät oletuksiinsa — ei levyä, ei kaatumiskestävyyttä,
-    //     kuten muullakin in-memory-tilalla.
-    // Tutkimustaidon (fs_read) allowlist KERROS B -ympäristöstä. `build_family`
-    // (KERROS A) ei kovakoodaa yhtään polkua — operaattori antaa sallitut juuret
-    // ympäristössä, ja lippulaiva-taito [`FsReadAllowlisted`] rekisteröidään niillä
-    // jo rekisteröintihetkellä (kiinteä skill-id → ei voi rekisteröidä kahdesti).
-    // Ilman allowlistia taito jää tyhjään fail-closed-tilaan (hylkää kaikki polut),
-    // joten tämä on se kytkin joka tekee TIEDOSTOTUTKIMUKSEN oikeasti toimivaksi.
+    //     On the in-memory path ([`ActionRuntime::with_default_skills`], no data_dir)
+    //     all three stay on their defaults -- no disk, no crash resilience,
+    //     like the rest of in-memory mode.
+    // Research skill (fs_read) allowlist from the LAYER B environment.
+    // `build_family` (LAYER A) does not hardcode any path -- the operator
+    // supplies the allowed roots in the environment, and the flagship skill
+    // [`FsReadAllowlisted`] is registered with them already at registration
+    // time (fixed skill-id -> cannot register twice). Without an allowlist the
+    // skill stays in an empty fail-closed state (rejects all paths), so this
+    // is the switch that makes FILE RESEARCH actually work.
     let fs_read_config = resolve_fs_read_config();
-    // Kirjoitustaidon (file_write) allowlist samasta KERROS B -ympäristöstä.
-    // Ilman sitä file_write jää fail-closed-tilaan (hylkää kaikki kirjoitukset) —
-    // tämä on se kytkin joka tekee TIEDOSTON KIRJOITTAMISEN oikeasti mahdolliseksi
-    // (kirjoitus allowlistin sisällä ajaa automaattisesti, RequireApproval).
+    // Write skill (file_write) allowlist from the same LAYER B environment.
+    // Without it, file_write stays fail-closed (rejects all writes) -- this is
+    // the switch that makes FILE WRITING actually possible (a write within the
+    // allowlist runs automatically, RequireApproval).
     let file_write_config = resolve_file_write_config();
     let shell_exec_config = resolve_shell_exec_config();
     let action_runtime = if let Some(dir) = action_data_dir.as_ref() {
-        // Persistentti polku: durable pending + task + dispatch outbox YHDELLÄ
-        // konstruktorilla — `with_durable_stores` avaa nyt itse kaatumiskestävän
-        // journal-outboxin kolmannesta polusta, joten erillistä
-        // `with_dispatch_outbox`-ketjutusta ei enää tarvita (eikä outbox-tiedostoa
-        // avata kahdesti). Sen jälkeen oletustaidot (fs_read mahd. allowlistilla).
+        // Persistent path: durable pending + task + dispatch outbox with ONE
+        // constructor -- `with_durable_stores` now opens the crash-surviving
+        // journal outbox itself from the third path, so a separate
+        // `with_dispatch_outbox` chain call is no longer needed (and the
+        // outbox file is not opened twice). Default skills follow (fs_read
+        // possibly with an allowlist).
         let pending_path = dir.join("pending_approvals.jsonl");
         let task_path = dir.join("action_tasks.jsonl");
         let dispatch_path = dir.join("dispatch_outbox.jsonl");
@@ -593,7 +608,7 @@ pub async fn build_family(
         subagent::register_spawn_subagent_skill(&mut rt, spawner)?;
         rt
     } else {
-        // In-memory-polku: kaikki kolme pintaa oletuksissaan.
+        // In-memory path: all three surfaces on their defaults.
         let mut rt = ActionRuntime::new();
         rt.register_default_skills_with_configs(
             fs_read_config,
@@ -620,26 +635,27 @@ pub async fn build_family(
     let actions: Arc<Mutex<ActionRuntime>> = Arc::new(Mutex::new(action_runtime));
     agent = agent.with_actions(Arc::clone(&actions));
 
-    // 7c. Turn-audit-keräin (TURN-AUDIT, roadmap §6 D6): tool-loopin elinkaari
-    //     muuttuu havainnoitavaksi. Agentti kirjoittaa jäljen (vuoron alku,
-    //     työkalukutsut redaktoituina, suspend/resume, stop_reason), ja runtime
-    //     pitää SAMASTA Arc<AuditCollector>:sta oman kahvansa operaattoripintaa
-    //     varten ([`FamilyRuntime::turn_audit`]). Molemmat osoittavat samaan
-    //     säikeenturvalliseen, vain-lisäävään pintaan.
+    // 7c. Turn-audit collector (TURN-AUDIT, roadmap §6 D6): the tool loop's
+    //     lifecycle becomes observable. The agent writes a trace (turn start,
+    //     tool calls redacted, suspend/resume, stop_reason), and the runtime
+    //     keeps its own handle to the SAME Arc<AuditCollector> for the
+    //     operator surface ([`FamilyRuntime::turn_audit`]). Both point to the
+    //     same thread-safe, append-only surface.
     let turn_audit: Arc<AuditCollector> = Arc::new(AuditCollector::new());
     agent = agent.with_turn_audit(Arc::clone(&turn_audit));
 
-    // 7c½. Havainnoitavuus-mittarisilta (Phase 2): jos siltakerros on annettu,
-    //      anna agentille kevyt [`MetricEvent`]-sinkki ja sillattaa sen
-    //      tapahtumat siltaväylän `Custom`-etiketeiksi, jotka `EventRecorder`
-    //      jo kartoittaa mittareiksi (`agent.turn` → `agent_turns`, `tool.call`
-    //      → `tool_calls`). Näin agentti pysyy IRTI `MetricsRegistry`:stä
-    //      (sama irrotus kuin reply_sink) ja kuolleet `agent_turns`/`tool_calls`
-    //      -laskurit alkavat elää. Replay-vartiointi tehdään agentissa
-    //      (`!is_replaying()`), joten sillalle tulee vain tuoreita tapahtumia.
+    // 7c-and-a-half. Observability metrics bridge (Phase 2): if a bridge layer
+    //      was supplied, give the agent a lightweight [`MetricEvent`] sink and
+    //      bridge its events into `Custom` labels on the bridge bus, which the
+    //      `EventRecorder` already maps to metrics (`agent.turn` -> `agent_turns`,
+    //      `tool.call` -> `tool_calls`). This way the agent stays DECOUPLED from
+    //      `MetricsRegistry` (the same decoupling as reply_sink), and the dead
+    //      `agent_turns`/`tool_calls` counters start counting. Replay guarding
+    //      is done in the agent (`!is_replaying()`), so only fresh events reach
+    //      the bridge.
     if let Some(bridge) = &bridge {
-        // Rajattu kanava (bounded): agentti pudottaa ylivuodon `try_send`:llä
-        // jos tämä silta jää jälkeen → ei muistivuotoa kuumalla polulla.
+        // Bounded channel: the agent drops overflow via `try_send` if this
+        // bridge falls behind -> no memory leak on the hot path.
         let (metrics_tx, mut metrics_rx) =
             tokio::sync::mpsc::channel::<MetricEvent>(familyclaw_agent::METRIC_SINK_CAPACITY);
         agent = agent.with_metrics_sink(metrics_tx);
@@ -659,11 +675,11 @@ pub async fn build_family(
         });
     }
 
-    // 7. Spawnaa agentti actorina (rekisteröi busiin).
+    // 7. Spawn the agent as an actor (registers it on the bus).
     let actor = agent.spawn().await?;
     let mut agents = vec![actor];
 
-    // 7d. Havainnoitavuussilta (valinnainen): primary-agentin rekisteröinti.
+    // 7d. Observability bridge (optional): register the primary agent.
     if let Some(bridge) = &bridge {
         let info = AgentInfo::new(agent_id, &agent_name, AgentRole::Executor, HostKind::Local);
         if let Err(e) = bridge.register_agent(info).await {
@@ -677,7 +693,7 @@ pub async fn build_family(
         }
     }
 
-    // 7e. Lisäagentit (moniagentti-serve): sama bus, jaettu actions/audit, oma sielu/reply.
+    // 7e. Extra agents (multi-agent serve): same bus, shared actions/audit, own soul/reply.
     for spec in extra_agents {
         let extra_id = spec.config.id;
         let extra_name = spec.config.name.clone();
@@ -741,12 +757,14 @@ pub async fn build_family(
         agents.push(extra_actor);
     }
 
-    // 8. Kanavan oma bus-seat — ERI kuin agentin being_id, muuten AgentActor
-    //    skippaisi viestin "omana kaikuna" (agent.rs handle, sender-tarkistus).
+    // 8. The channel's own bus seat -- DIFFERENT from the agent's being_id,
+    //    otherwise AgentActor would skip the message as "its own echo"
+    //    (agent.rs handle, sender check).
     let channel_seat = BeingId::new();
 
-    // 9. Avaa kanavan saapuva virta ja pumppaa se busiin omassa taskissaan.
-    //    pump_channel_to_bus blokkaa kunnes virta sulkeutuu → pakko spawnata.
+    // 9. Open the channel's inbound stream and pump it into the bus in its own
+    //    task. pump_channel_to_bus blocks until the stream closes -> must be
+    //    spawned.
     let stream = channel.receive().map_err(FamilyClawError::from)?;
     let pump = tokio::spawn({
         let bus = bus.clone();
@@ -757,8 +775,9 @@ pub async fn build_family(
         }
     });
 
-    // 10. Tyhjennä agentin reply-jono kanavalle (drain). Jaa kanava Arc:lla —
-    //    receive() on jo kutsuttu (askel 8), send() menee Arc:n kautta.
+    // 10. Drain the agent's reply queue to the channel. Share the channel via
+    //    Arc -- receive() has already been called (step 8), send() goes
+    //    through the Arc.
     let ch: Arc<dyn Channel> = Arc::from(channel);
     let drain = tokio::spawn(async move {
         while let Some(out) = reply_rx.recv().await {
@@ -768,14 +787,15 @@ pub async fn build_family(
         }
     });
 
-    // 11. Uni-sykli AJASTETTUNA TEHTÄVÄNÄ (Phase 4, D5): aiemman käsin koodatun
-    //     `tokio::sleep`-silmukan sijaan uni ajetaan `familyclaw-scheduler`:n
-    //     kautta [`DreamSkill`]-taitona. Hyödyt: idempotenssi (deterministinen
-    //     ajastinavain), havainnoitavuus (kulkee toiminto-ajoympäristön kautta),
-    //     yhtenäisyys (yksi ajastinmekanismi). Ajastin saa OMAN, eristetyn
-    //     `ActionRuntime`:n johon vain `DreamSkill` rekisteröidään — se ei jaa
-    //     agentin tool-runtimea. Spawnataan vain jos journal on olemassa EIKÄ
-    //     `FAMILYCLAW_DREAM_DISABLED` ole asetettu (taaksepäin-yhteensopiva).
+    // 11. Dream cycle AS A SCHEDULED TASK (Phase 4, D5): instead of the
+    //     previous hand-coded `tokio::sleep` loop, the dream cycle runs
+    //     through `familyclaw-scheduler` as a [`DreamSkill`] skill. Benefits:
+    //     idempotency (deterministic scheduler key), observability (goes
+    //     through the action runtime), consistency (one scheduling
+    //     mechanism). The scheduler gets its OWN, isolated `ActionRuntime`
+    //     into which only `DreamSkill` is registered -- it does not share the
+    //     agent's tool runtime. Only spawned if the journal exists AND
+    //     `FAMILYCLAW_DREAM_DISABLED` is not set (backward-compatible).
     let (scheduler_signal, scheduler_handle): (
         Option<CancellationSignal>,
         Option<SchedulerHandle>,
@@ -792,7 +812,7 @@ pub async fn build_family(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(6 * 3600);
 
-            // Ajastimen oma toiminto-ajoympäristö: vain DreamSkill.
+            // The scheduler's own action runtime: only DreamSkill.
             let mut sched_runtime = ActionRuntime::new();
             let dream_skill = DreamSkill::new(Arc::clone(&dream_store), Arc::clone(&dream_journal));
             if let Err(e) = sched_runtime.register_skill(dream_skill) {
@@ -800,8 +820,8 @@ pub async fn build_family(
                 (None, None)
             } else {
                 let mut scheduler = Scheduler::new();
-                // Vakaa tehtävä-id (with_id) → idempotenssiavain pysyy
-                // vakaana prosessien yli.
+                // Stable task id (with_id) -> the idempotency key stays
+                // stable across processes.
                 let dream_task = ScheduledTask::new(
                     DreamSkill::skill_id(),
                     serde_json::json!({}),
@@ -809,10 +829,10 @@ pub async fn build_family(
                     "dream",
                 );
                 scheduler.register(dream_task);
-                // Perhe-agency-persistenssi (Phase 4): lataa <data_dir>/agency.json
-                // ja sovella se → operaattorin kill-switch säilyy yli restartin.
-                // Vain persistentillä polulla (action_data_dir = Some); muistin-
-                // varaisessa tilassa ei ole mihin persistoida.
+                // Family agency persistence (Phase 4): load <data_dir>/agency.json
+                // and apply it -> the operator's kill switch survives a restart.
+                // Only on the persistent path (action_data_dir = Some); in
+                // in-memory mode there is nowhere to persist to.
                 if let Some(dir) = action_data_dir.as_ref() {
                     let agency_path = dir.join("agency.json");
                     match familyclaw_scheduler::AgencyConfig::load(&agency_path) {
@@ -828,15 +848,15 @@ pub async fn build_family(
                         }
                     }
                 }
-                // Tikkiväli: min(intervalli, 60s) jotta erääntyminen huomataan
-                // ajoissa mutta tikki ei pyöri turhaan tiuhaan.
+                // Tick interval: min(interval, 60s) so that expiry is noticed
+                // in time but the tick doesn't spin needlessly often.
                 let tick_secs = interval_secs.clamp(1, 60);
                 #[allow(clippy::cast_sign_loss)]
                 let period = std::time::Duration::from_secs(tick_secs as u64);
                 let runner = SchedulerRunner::new(scheduler, sched_runtime, period);
                 tracing::info!(target: "familyclaw::dream", interval_secs, "scheduled dream task active");
-                // run_shared: jaettu kahva ajastimeen → operaattoripinta voi
-                // kytkeä tehtäviä päälle/pois (perhe-agency kill-switch).
+                // run_shared: shared handle to the scheduler -> the operator
+                // surface can toggle tasks on/off (family agency kill switch).
                 let (signal, handle) = runner.run_shared(time::now);
                 (Some(signal), Some(handle))
             }
@@ -845,13 +865,15 @@ pub async fn build_family(
         (None, None)
     };
 
-    // 12. Kokoa runtime — omistaa busin, agentin ja taustatehtävät. `drain`
-    //     pidetään ERILLÄÄN abortoitavista taskeista, jotta sammutus voi valuttaa
-    //     sen loppuun (in-flight-vastaukset) abortoinnin sijaan. Ajastimen
-    //     peruutussignaali talletetaan erikseen ja peruutetaan sammutuksessa.
+    // 12. Assemble the runtime -- owns the bus, the agent, and the background
+    //     tasks. `drain` is kept SEPARATE from the abortable tasks, so
+    //     shutdown can let it run to completion (in-flight responses) instead
+    //     of aborting it. The scheduler's cancellation signal is stored
+    //     separately and cancelled on shutdown.
     let tasks = vec![pump];
-    // Agency-configin polku: vain kun ajastin pyörii (scheduler_handle = Some) JA
-    // persistentti polku on olemassa → operaattorin kill-switch voidaan persistoida.
+    // Agency config path: only when the scheduler is running (scheduler_handle
+    // = Some) AND a persistent path exists -> the operator's kill switch can
+    // be persisted.
     let agency_config_path = scheduler_handle
         .as_ref()
         .and(action_data_dir.as_ref())
@@ -870,16 +892,16 @@ pub async fn build_family(
     })
 }
 
-/// Lataa tunnemoottorin kalibroinnin agentin profiilihakemiston
-/// `calibration.json`:sta (KERROS B -data, ladataan ajonaikaisesti — ei
-/// kovakoodata). Profiilihakemisto ratkaistaan samalla logiikalla kuin sielu
-/// ([`resolve_profile_dir`]): eksplisiittinen `configured` (agentin
-/// `profile_dir`) tai `FAMILYCLAW_PROFILE_DIR/<agent_name>`.
+/// Loads the emotion engine calibration from the agent's profile directory's
+/// `calibration.json` (LAYER B data, loaded at runtime -- not hardcoded). The
+/// profile directory is resolved with the same logic as the soul
+/// ([`resolve_profile_dir`]): explicit `configured` (the agent's
+/// `profile_dir`) or `FAMILYCLAW_PROFILE_DIR/<agent_name>`.
 ///
-/// Palauttaa `None` jos tiedostoa ei ole tai sen jäsennys epäonnistuu — silloin
-/// agentti jää neutraaliin kalibrointiin
-/// ([`NeutralCalibration`](familyclaw_agent::NeutralCalibration), nykyinen
-/// käytös). Täysin ei-rikkova: puuttuva/kelvoton tiedosto ei kaada bootia.
+/// Returns `None` if the file doesn't exist or parsing it fails -- in that
+/// case the agent stays on neutral calibration
+/// ([`NeutralCalibration`](familyclaw_agent::NeutralCalibration), the current
+/// behavior). Fully non-breaking: a missing/invalid file does not crash boot.
 fn load_profile_calibration(
     configured: Option<&std::path::Path>,
     agent_name: &str,
@@ -909,31 +931,33 @@ fn load_profile_calibration(
     }
 }
 
-/// Ratkaisee lippulaiva-tutkimustaidon ([`FsReadAllowlisted`]) allowlistin
-/// ympäristöstä (KERROS B -data — `build_family` ei kovakoodaa polkuja).
+/// Resolves the flagship research skill's ([`FsReadAllowlisted`]) allowlist
+/// from the environment (LAYER B data -- `build_family` does not hardcode paths).
 ///
-/// - `FAMILYCLAW_FS_READ_ALLOW` — listaeroteltu joukko **sallittuja** juuria
-///   joiden alta agentti saa lukea tiedostoja tutkiakseen. Erotin on alustan
-///   polkulistain erotin ([`std::path::MAIN_SEPARATOR`]-perheen sijaan
-///   `;` Windowsilla, `:` muualla — sama kuin `PATH`), jotta Windows-polut
-///   (`C:\...`) eivät katkea väärin.
-/// - `FAMILYCLAW_FS_READ_TRUSTED` — sama muoto; näiden juurten alta luettu
-///   sisältö merkitään **luotetuksi** (taint poistuu). Aina sallittujen
-///   osajoukko ([`FsReadConfig::trusted_root`] lisää juuren myös sallittuihin).
+/// - `FAMILYCLAW_FS_READ_ALLOW` -- a list-separated set of **allowed** roots
+///   under which the agent may read files to research. The separator is the
+///   platform's path-list separator (rather than the
+///   [`std::path::MAIN_SEPARATOR`] family -- `;` on Windows, `:` elsewhere --
+///   same as `PATH`), so Windows paths (`C:\...`) aren't split incorrectly.
+/// - `FAMILYCLAW_FS_READ_TRUSTED` -- same format; content read from under
+///   these roots is marked **trusted** (taint is removed). Always a subset of
+///   the allowed roots ([`FsReadConfig::trusted_root`] also adds the root to
+///   the allowed set).
 ///
-/// Palauttaa `None` kun `FAMILYCLAW_FS_READ_ALLOW` puuttuu tai on tyhjä → taito
-/// jää oletukseen (tyhjä allowlist, fail-closed): rekisteröity ja työkaluna
-/// julkaistu, mutta hylkää kaikki polut. Tämä on turvallinen oletus.
-/// Valitsee muistin embedding-tarjoajan ympäristöstä (KERROS B).
+/// Returns `None` when `FAMILYCLAW_FS_READ_ALLOW` is missing or empty -> the
+/// skill stays at its default (empty allowlist, fail-closed): registered and
+/// published as a tool, but rejects all paths. This is a safe default.
+/// Selects memory's embedding provider from the environment (LAYER B).
 ///
-/// - `FAMILYCLAW_EMBED_PROVIDER=ollama` → [`OllamaEmbedder`] (aito semanttinen
-///   recall, oletusmalli `nomic-embed-text`). Vaatii `ollama`-featuren.
-///   - `FAMILYCLAW_EMBED_MODEL` — malli (oletus `nomic-embed-text`)
-///   - `FAMILYCLAW_EMBED_URL` — Ollama base-url (oletus `http://127.0.0.1:11434`)
-/// - muu / asettamaton → [`DeterministicEmbedder`] (riippuvuudeton oletus).
+/// - `FAMILYCLAW_EMBED_PROVIDER=ollama` -> [`OllamaEmbedder`] (genuine
+///   semantic recall, default model `nomic-embed-text`). Requires the
+///   `ollama` feature.
+///   - `FAMILYCLAW_EMBED_MODEL` -- model (default `nomic-embed-text`)
+///   - `FAMILYCLAW_EMBED_URL` -- Ollama base URL (default `http://127.0.0.1:11434`)
+/// - other / unset -> [`DeterministicEmbedder`] (dependency-free default).
 ///
-/// Fail-safe: jos Ollama ei vastaa ajossa, `OllamaEmbedder` palauttaa
-/// nollavektorin (recall degradoituu, ei kaadu).
+/// Fail-safe: if Ollama doesn't respond at runtime, `OllamaEmbedder` returns a
+/// zero vector (recall degrades, doesn't crash).
 fn resolve_embedder() -> Arc<dyn EmbeddingProvider + Send + Sync> {
     match env::var("FAMILYCLAW_EMBED_PROVIDER").ok().as_deref() {
         #[cfg(feature = "ollama")]
@@ -953,12 +977,13 @@ fn resolve_embedder() -> Arc<dyn EmbeddingProvider + Send + Sync> {
     }
 }
 
-/// Kytkee agentin wasmtime-sandboxin kun `FAMILYCLAW_SANDBOX_SKILLS=1`.
+/// Wires the agent's wasmtime sandbox when `FAMILYCLAW_SANDBOX_SKILLS=1`.
 ///
-/// Kolmannen osapuolen taidot tulisi ajaa hiekkalaatikossa (ks.
-/// [`docs/SECURITY_MODEL.md`](../../docs/SECURITY_MODEL.md)). Tämä env-kytkin
-/// preferoi [`default_sandbox`]:n polkua `build_family`:ssa — palauttaa `None`
-/// jos kytkin on pois, alustus epäonnistuu, tai vain noop-backend on käännetty.
+/// Third-party skills should run sandboxed (see
+/// [`docs/SECURITY_MODEL.md`](../../docs/SECURITY_MODEL.md)). This env switch
+/// prefers [`default_sandbox`]'s path in `build_family` -- returns `None`
+/// if the switch is off, initialization fails, or only the noop backend was
+/// compiled in.
 fn resolve_sandbox_skills() -> Option<Arc<dyn CodeSandbox>> {
     let enabled = env::var("FAMILYCLAW_SANDBOX_SKILLS")
         .ok()
@@ -967,11 +992,12 @@ fn resolve_sandbox_skills() -> Option<Arc<dyn CodeSandbox>> {
         return None;
     }
 
-    // TURVAKORJAUS 2026-07-09 (audit [4], puolustussyvyys): kun operaattori pyytää
-    // SANDBOX_SKILLS=1 MUTTA vain noop-backend on käännetty (ei --features wasmtime),
-    // aiempi koodi logitti harhaanjohtavasti "sandbox wired to agent". NoopSandbox on
-    // fail-closed (ei aja 3rd-party-koodia hostissa, palauttaa NotImplemented) — mutta
-    // operaattorin on TIEDETTÄVÄ ettei saanut oikeaa sandboxia. Tehdään ero näkyväksi.
+    // SECURITY FIX 2026-07-09 (audit [4], defense in depth): when the operator
+    // requests SANDBOX_SKILLS=1 BUT only the noop backend was compiled in (no
+    // --features wasmtime), the previous code misleadingly logged "sandbox
+    // wired to agent". NoopSandbox is fail-closed (does not run 3rd-party code
+    // on the host, returns NotImplemented) -- but the operator MUST KNOW they
+    // did not get a real sandbox. Make the distinction visible.
     if !familyclaw_sandbox::wasmtime_available() {
         tracing::warn!(
             target: "familyclaw::sandbox",
@@ -993,8 +1019,9 @@ fn resolve_sandbox_skills() -> Option<Arc<dyn CodeSandbox>> {
             Some(Arc::from(sandbox))
         }
         Err(error) => {
-            // fail-closed: sandbox pyydetty muttei alustunut -> agentti ajaa ilman
-            // 3rd-party-sandboxia. NoopSandbox suojaa silti (execute = NotImplemented).
+            // fail-closed: sandbox was requested but did not initialize -> the
+            // agent runs without a 3rd-party sandbox. NoopSandbox still
+            // protects (execute = NotImplemented).
             tracing::warn!(
                 target: "familyclaw::sandbox",
                 error = %error,
@@ -1041,15 +1068,16 @@ fn resolve_fs_read_config() -> Option<FsReadConfig> {
     Some(config)
 }
 
-/// Ratkaisee **kirjoitustaidon** ([`FileWriteAllowlisted`]) allowlistin KERROS B
-/// -ympäristöstä (`FAMILYCLAW_FILE_WRITE_ALLOW`, `PATH`-tyylinen erotinlista).
+/// Resolves the **write skill**'s ([`FileWriteAllowlisted`]) allowlist from
+/// the LAYER B environment (`FAMILYCLAW_FILE_WRITE_ALLOW`, a `PATH`-style
+/// separator list).
 ///
-/// KERROS A ei kovakoodaa yhtään polkua — operaattori antaa sallitut
-/// kirjoitusjuuret ympäristössä. `None` (muuttuja asettamatta / tyhjä) → taito
-/// jää fail-closed-tilaan (hylkää kaikki kirjoitukset). Kirjoitus pysyy aina
-/// hyväksynnän takana vain korkeamman riskin toiminnoille; allowlistattu
-/// paikallinen kirjoitus ajaa automaattisesti ([`ApprovalPolicy::RequireApproval`]).
-/// määrää **mihin** kirjoitus on ylipäätään sallittu hyväksynnän jälkeen.
+/// LAYER A does not hardcode any path -- the operator supplies the allowed
+/// write roots in the environment. `None` (variable unset / empty) -> the
+/// skill stays fail-closed (rejects all writes). Writing always stays behind
+/// approval only for higher-risk operations; an allowlisted local write runs
+/// automatically ([`ApprovalPolicy::RequireApproval`])
+/// determines **where** writing is permitted at all after approval.
 fn resolve_file_write_config() -> Option<FileWriteConfig> {
     let allow_raw = env::var("FAMILYCLAW_FILE_WRITE_ALLOW").ok()?;
     let allow_roots: Vec<String> = env::split_paths(&allow_raw)
@@ -1071,13 +1099,14 @@ fn resolve_file_write_config() -> Option<FileWriteConfig> {
     Some(config)
 }
 
-/// Ratkaisee **`shell_exec`**-taidon kokoonpanon KERROS B -ympäristöstä.
+/// Resolves the **`shell_exec`** skill's configuration from the LAYER B
+/// environment.
 ///
-/// - `FAMILYCLAW_SHELL_MODE` — `manual` (oletus), `smart`, `off`
-/// - `FAMILYCLAW_SHELL_CWD_ALLOWLIST` — puolipiste-eroteltu työhakemisto-allowlist
+/// - `FAMILYCLAW_SHELL_MODE` -- `manual` (default), `smart`, `off`
+/// - `FAMILYCLAW_SHELL_CWD_ALLOWLIST` -- semicolon-separated working-directory allowlist
 ///
-/// Palauttaa `None` kun kumpikaan muuttuja ei ole asetettu → taito rekisteröityy
-/// fail-closed-oletuksella (`ShellExec::new()`).
+/// Returns `None` when neither variable is set -> the skill registers with
+/// its fail-closed default (`ShellExec::new()`).
 fn resolve_shell_exec_config() -> Option<ShellExecConfig> {
     let mode_explicit = env::var("FAMILYCLAW_SHELL_MODE")
         .ok()
@@ -1100,23 +1129,23 @@ fn resolve_shell_exec_config() -> Option<ShellExecConfig> {
     Some(config)
 }
 
-/// Lataa, **uudelleentarkistaa** ja persistoi agentin identiteetti-ankkurin.
+/// Loads, **re-verifies**, and persists the agent's identity anchor.
 ///
-/// Aiemmin [`build_family`] loi paikallisen `AnchorRegistry`:n, rekisteröi
-/// ankkurin ja **pudotti rekisterin heti** — ankkuria ei koskaan tallennettu
-/// eikä tarkistettu uudelleenkäynnistyksessä. Tämä funktio korjaa sen
-/// minimaalisesti (ei kryptoholvia):
+/// Previously [`build_family`] created a local `AnchorRegistry`, registered
+/// the anchor, and **dropped the registry immediately** -- the anchor was
+/// never saved or checked again on restart. This function fixes that
+/// minimally (not a crypto vault):
 ///
-/// 1. Jos `anchor_path` osoittaa olemassa olevaan `anchors.json`:iin, lataa se
-///    ja aja [`AnchorRegistry::verify_identity`] nykyistä sielua vasten.
-///    Peukalointi (sielu muuttunut ankkuroinnin jälkeen) → selkeä **varoitus**
-///    lokiin (identiteettiä EI pudoteta — hälytys, ei poisto).
-/// 2. Rekisteröi/uudista ankkuri nykyisestä sielusta.
-/// 3. Persistoi rekisteri takaisin levylle (jos `anchor_path` annettu), jotta
-///    seuraava boot voi tarkistaa sen.
+/// 1. If `anchor_path` points to an existing `anchors.json`, load it and run
+///    [`AnchorRegistry::verify_identity`] against the current soul.
+///    Tampering (soul changed since anchoring) -> a clear **warning** to the
+///    log (identity is NOT dropped -- an alert, not a removal).
+/// 2. Register/renew the anchor from the current soul.
+/// 3. Persist the registry back to disk (if `anchor_path` is given), so the
+///    next boot can verify it.
 ///
-/// Kaikki virheet (luku/jäsennys/kirjoitus) ovat **ei-fataaleja**: ne lokitetaan
-/// ja boot jatkuu (korruptoitunut tiedosto ei saa kaataa runtimea).
+/// All errors (read/parse/write) are **non-fatal**: they are logged and boot
+/// continues (a corrupted file must not crash the runtime).
 fn ensure_identity_anchor(
     agent_name: &str,
     soul_essence: &str,
@@ -1124,8 +1153,7 @@ fn ensure_identity_anchor(
 ) {
     use familyclaw_hearth::anchor_registry::AnchorRegistry;
 
-    // 1. Lataa olemassa oleva rekisteri + boot-uudelleentarkistus, tai aloita
-    //    tyhjästä.
+    // 1. Load the existing registry + boot re-verification, or start fresh.
     let mut registry = match anchor_path {
         Some(path) if path.is_file() => match AnchorRegistry::load_from_path(path) {
             Ok(reg) => {
@@ -1165,14 +1193,14 @@ fn ensure_identity_anchor(
         _ => AnchorRegistry::new(),
     };
 
-    // 2. Rekisteröi/uudista nykyinen ankkuri.
+    // 2. Register/renew the current anchor.
     if let Err(e) = registry.register(agent_name, soul_essence) {
         tracing::warn!("Anchor registration failed (non-fatal): {e}");
         return;
     }
     tracing::info!("Identity anchor registered for {agent_name}");
 
-    // 3. Persistoi takaisin levylle (jos polku annettu).
+    // 3. Persist back to disk (if a path is given).
     if let Some(path) = anchor_path {
         if let Err(e) = registry.save_to_path(path) {
             tracing::warn!(
@@ -1196,14 +1224,14 @@ pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Rekisteröi MCP-palvelimet `FAMILYCLAW_MCP_SERVERS`-ympäristöstä
-/// [`ActionRuntime`]:iin (valinnainen, ei-fataali virhe `build_family`:ssa).
+/// Registers MCP servers from the `FAMILYCLAW_MCP_SERVERS` environment
+/// variable into [`ActionRuntime`] (optional, a non-fatal error in `build_family`).
 ///
-/// Muoto: `name=command args` (stdio) tai `name=http://host/mcp` (HTTP).
-/// Useita palvelimia erotetaan puolipisteellä.
+/// Format: `name=command args` (stdio) or `name=http://host/mcp` (HTTP).
+/// Multiple servers are separated by semicolons.
 ///
 /// # Errors
-/// Ympäristön jäsennys, yhteys tai taidon rekisteröinti epäonnistuu.
+/// Environment parsing, connection, or skill registration fails.
 pub async fn register_mcp_from_env(runtime: &mut ActionRuntime) -> Result<()> {
     familyclaw_mcp::register_from_env(runtime)
         .await
@@ -1222,19 +1250,19 @@ mod tests {
         assert!(!version().is_empty());
     }
 
-    /// FIX 2 (build_family-sauma): [`ensure_identity_anchor`] persistoi
-    /// ankkurin levylle ja se säilyy simuloidun uudelleenkäynnistyksen yli —
-    /// uudelleenladattu rekisteri verifioi nykyisen sielun ehjäksi, ja
-    /// peukaloitu sielu havaitaan. Tämä todistaa että ankkuria ei enää
-    /// pudoteta (vanha bugi) vaan kirjoitetaan ja tarkistetaan bootissa.
+    /// FIX 2 (`build_family` seam): [`ensure_identity_anchor`] persists the
+    /// anchor to disk and it survives a simulated restart -- the reloaded
+    /// registry verifies the current soul as intact, and a tampered soul is
+    /// detected. This proves the anchor is no longer dropped (the old bug)
+    /// but is written and checked on boot.
     ///
-    /// Käyttää eksplisiittistä polkua (ei prosessin `FAMILYCLAW_DATA_DIR`
-    /// -env-muuttujaa) → rinnakkaisturvallinen, ei sotke muita testejä.
+    /// Uses an explicit path (not the process's `FAMILYCLAW_DATA_DIR`
+    /// env variable) -> concurrency-safe, doesn't interfere with other tests.
     #[test]
     fn ensure_identity_anchor_persists_and_survives_restart() {
         use familyclaw_hearth::anchor_registry::AnchorRegistry;
 
-        // Uniikki temp-hakemisto ilman uutta riippuvuutta (pid + nanot).
+        // Unique temp directory without a new dependency (pid + nanos).
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -1246,15 +1274,15 @@ mod tests {
         let path = dir.join("anchors.json");
         let soul = "I am agent_a, a generic example being.";
 
-        // "Boot 1": ei tiedostoa vielä → rekisteröi + persistoi.
+        // "Boot 1": no file yet -> register + persist.
         assert!(!path.is_file());
         ensure_identity_anchor("agent_a", soul, Some(&path));
         assert!(path.is_file(), "anchors.json pitää syntyä bootissa");
 
-        // "Boot 2": tiedosto on olemassa → ladataan + verify (intact-polku).
+        // "Boot 2": file exists -> load + verify (intact path).
         ensure_identity_anchor("agent_a", soul, Some(&path));
 
-        // Suora todiste: ladattu rekisteri verifioi ehjäksi, peukaloitu ei.
+        // Direct proof: the loaded registry verifies as intact, a tampered one does not.
         let reloaded = AnchorRegistry::load_from_path(&path).expect("load");
         assert!(reloaded
             .verify_identity("agent_a", soul)
@@ -1268,35 +1296,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// FIX 2: ilman polkua (`None`) ankkurointi ei kaadu eikä persistoi
-    /// (in-memory only) — taaksepäin-yhteensopiva, ei sivuvaikutuksia.
+    /// FIX 2: without a path (`None`) anchoring doesn't crash or persist
+    /// (in-memory only) -- backward-compatible, no side effects.
     #[test]
     fn ensure_identity_anchor_without_path_is_noop_persist() {
-        // Ei paniikkia, ei tiedostoa.
+        // No panic, no file.
         ensure_identity_anchor("agent_b", "I am agent_b.", None);
     }
 
-    /// MVP-savutesti (inbound pää-päähän busiin asti): mock-kanavaan injektoitu
-    /// viesti pumppautuu busin kautta agentille, joka **muistaa** sen. Ilman
-    /// LLM:ää agentti ei tuota reply:tä (`think` palauttaa `None`), joten
-    /// reply-path testataan erikseen agentin yksikkötesteissä
-    /// (`route_reply_reaches_sink_with_correct_target`).
+    /// MVP smoke test (inbound end-to-end into the bus): a message injected
+    /// into the mock channel is pumped through the bus to the agent, which
+    /// **remembers** it. Without an LLM the agent produces no reply (`think`
+    /// returns `None`), so the reply path is tested separately in the agent's
+    /// unit tests (`route_reply_reaches_sink_with_correct_target`).
     #[tokio::test]
     async fn build_family_pumps_inbound_message_into_agent_memory() {
         let channel = MockChannel::new("mock-feed").expect("channel");
 
-        // Injektoi viesti ja sulje saapuva virta ENNEN kuin kanava siirretään
-        // build_family:lle (joka kuluttaa sen `Box<dyn Channel>`:nä). Viesti jää
-        // puskuroiduksi unbounded-mpsc-jonoon, jonka `receive()` ottaa
-        // haltuunsa; `close_inbound` saa pumpun päättymään deterministisesti
-        // kun puskuroitu viesti on kulutettu.
+        // Inject a message and close the inbound stream BEFORE the channel is
+        // moved into build_family (which consumes it as a `Box<dyn Channel>`).
+        // The message stays buffered in the unbounded mpsc queue, which
+        // `receive()` takes ownership of; `close_inbound` lets the pump end
+        // deterministically once the buffered message has been consumed.
         channel
             .inject(InboundMessage::new("user-1", "general", "muistatko tämän?").expect("inbound"))
             .expect("inject");
         channel.close_inbound();
 
-        // Tunnistamaton provider → build_llm_chain ei ratkaise → ei LLM:ää →
-        // agentti toimii ilman tekstivastausta. Tämä on KERROS A -puhdas polku.
+        // Unrecognized provider -> build_llm_chain doesn't resolve -> no LLM ->
+        // the agent runs without text replies. This is a LAYER A-clean path.
         let resolver = EnvEndpointResolver::new();
         let agent_cfg = AgentConfig::new("agent_a", ModelConfig::new("provider/model"));
         let soul = Soul::from_essence("I am agent_a, a generic example being.");
@@ -1314,10 +1342,10 @@ mod tests {
         .await
         .expect("runtime builds");
 
-        // Anna pumpun + agentin käsitellä viesti.
+        // Let the pump + agent process the message.
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
 
-        // Bus tuntee yhden olennon (agentin) — beings[] ei tyhjä.
+        // The bus knows one being (the agent) -- beings[] is not empty.
         let beings = runtime.bus().beings().await.expect("beings");
         assert_eq!(beings.len(), 1, "agentti rekisteröityi busiin");
         assert_eq!(beings[0].name, "agent_a");
@@ -1325,17 +1353,18 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// `build_family` kelpaa myös LLM:n kanssa konfiguroituna (resolveri tuntee
-    /// providerin): runtime rakentuu ilman paniikkia ja bus on käynnissä.
-    /// Emme tee oikeaa LLM-kutsua (ei verkkoa) — testaamme vain kokoonpanon.
+    /// `build_family` also works configured with an LLM (the resolver knows
+    /// the provider): the runtime builds without panicking and the bus is
+    /// running. We don't make a real LLM call (no network) -- we only test
+    /// the assembly.
     #[tokio::test]
     async fn build_family_with_resolvable_provider_constructs() {
         let channel = MockChannel::new("mock-2").expect("channel");
-        channel.close_inbound(); // ei syötettä → pumppu päättyy heti.
+        channel.close_inbound(); // no input -> the pump ends immediately.
 
-        // Resolveri tuntee providerin, mutta avain puuttuu env:stä → tyhjä avain
-        // päätyy LlmConfigiin (ei verkkokutsua testissä). build_family saa
-        // Some(llm), agentti spawnaa LLM:n kanssa.
+        // The resolver knows the provider, but the key is missing from the
+        // env -> an empty key ends up in the LlmConfig (no network call in
+        // the test). build_family gets Some(llm), the agent spawns with the LLM.
         let resolver = EnvEndpointResolver::new().with_provider(
             "openai",
             "https://api.openai.com/v1",
@@ -1361,13 +1390,14 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// TUTKIMUSTAIDOT KYTKETTY AGENTIN TOOL-LOOPPIIN: `build_family` rakentaa
-    /// agentin toiminto-ajoympäristön ([`FamilyRuntime::actions`]) niin että se
-    /// julkaisee molemmat tutkimustyökalut — `fs_read_allowlisted` (tiedoston
-    /// luku) ja `web_fetch` (web-haku) — agentin tool-loopille. Tämä on sama kahva
-    /// josta agentti lukee työkalut (`drive_tool_loop` → `rt.tool_definitions()`),
-    /// joten työkalujen läsnäolo tässä todistaa että agentti näkee ne ja voi
-    /// tutkia. Ilman tätä agentti vain juttelisi ilman työkaluja.
+    /// RESEARCH TOOLS WIRED INTO THE AGENT'S TOOL LOOP: `build_family` builds
+    /// the agent's action runtime ([`FamilyRuntime::actions`]) so that it
+    /// publishes both research tools -- `fs_read_allowlisted` (file
+    /// reading) and `web_fetch` (web search) -- to the agent's tool loop. This
+    /// is the same handle from which the agent reads its tools
+    /// (`drive_tool_loop` -> `rt.tool_definitions()`), so the tools' presence
+    /// here proves the agent sees them and can research. Without this the
+    /// agent would just chat without tools.
     #[tokio::test]
     async fn build_family_exposes_research_tools_to_agent() {
         let channel = MockChannel::new("mock-research").expect("channel");
@@ -1390,7 +1420,7 @@ mod tests {
         .await
         .expect("runtime builds");
 
-        // Sama Arc<Mutex<ActionRuntime>> jonka agentin tool-loop omistaa.
+        // Same Arc<Mutex<ActionRuntime>> the agent's tool loop owns.
         let actions = runtime.actions();
         let guard = actions.lock().await;
         let tool_names: Vec<String> = guard
@@ -1412,10 +1442,11 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// Allowlist-resolveri lukee `FAMILYCLAW_FS_READ_ALLOW`:n alustan
-    /// polkulistain erottimella ja muodostaa konfiguraation; ilman muuttujaa
-    /// palautuu `None` (fail-closed-oletus). Käyttää **vakio-mutexia**
-    /// rinnakkaisturvaan, koska prosessin env-tila on jaettu.
+    /// The allowlist resolver reads `FAMILYCLAW_FS_READ_ALLOW` with the
+    /// platform's path-list separator and builds the configuration; without
+    /// the variable it returns `None` (fail-closed default). Uses a
+    /// **static mutex** for concurrency safety, since the process's env
+    /// state is shared.
     #[test]
     fn resolve_fs_read_config_reads_env_paths() {
         use std::sync::Mutex;
@@ -1424,13 +1455,13 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Puuttuva muuttuja → None (fail-closed).
+        // Missing variable -> None (fail-closed).
         env::remove_var("FAMILYCLAW_FS_READ_ALLOW");
         env::remove_var("FAMILYCLAW_FS_READ_TRUSTED");
         assert!(resolve_fs_read_config().is_none());
 
-        // Kaksi juurta alustan erottimella → Some(config). Käytä alustakohtaista
-        // erotinta jotta Windows-ajopolut (C:\...) eivät katkea.
+        // Two roots with the platform separator -> Some(config). Use the
+        // platform-specific separator so Windows paths (C:\...) aren't split.
         let sep = if cfg!(windows) { ';' } else { ':' };
         let a = std::env::temp_dir().join("familyclaw_fsread_a");
         let b = std::env::temp_dir().join("familyclaw_fsread_b");
@@ -1440,7 +1471,7 @@ mod tests {
         env::remove_var("FAMILYCLAW_FS_READ_ALLOW");
         assert!(cfg.is_some(), "two allow roots must produce a config");
 
-        // Tyhjä merkkijono → None (ei sallittuja juuria).
+        // Empty string -> None (no allowed roots).
         env::set_var("FAMILYCLAW_FS_READ_ALLOW", "");
         let empty = resolve_fs_read_config();
         env::remove_var("FAMILYCLAW_FS_READ_ALLOW");

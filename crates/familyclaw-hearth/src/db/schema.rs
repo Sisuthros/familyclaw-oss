@@ -1,14 +1,14 @@
-//! SurrealDB-skeema The Hearthille.
+//! `SurrealDB` schema for The Hearth.
 //!
-//! Määrittelee taulut ja indeksit Hearthin pysyvälle tallennukselle:
-//! muistitapahtumat (vektorihaku HNSW), narratiiviset langat ja niiden
-//! tapahtumat, agenttien tunnetila sekä identiteettiankkurit.
+//! Defines the tables and indexes for the Hearth's durable storage:
+//! memory events (HNSW vector search), narrative threads and their
+//! events, agents' emotional state, and identity anchors.
 //!
-//! Skeema on `SurrealDB` v3 -syntaksia (`DEFINE TABLE ... SCHEMAFULL`,
-//! `array<float>`, `HNSW`-indeksit). Sitä sovelletaan kerran tietokannan
-//! alustuksessa `SurrealHearthStore`:n toimesta (`surreal`-feature).
+//! The schema uses `SurrealDB` v3 syntax (`DEFINE TABLE ... SCHEMAFULL`,
+//! `array<float>`, `HNSW` indexes). It is applied once during database
+//! initialization by `SurrealHearthStore` (the `surreal` feature).
 
-/// SurrealDB-skeema The Hearthille.
+/// `SurrealDB` schema for The Hearth.
 pub const HEARTH_SCHEMA: &str = r"
 DEFINE TABLE memory_event SCHEMAFULL;
 DEFINE FIELD id ON memory_event TYPE string;

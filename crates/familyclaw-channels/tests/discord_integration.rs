@@ -1,10 +1,10 @@
-//! Discord-adapterin integraatiotesti oikeaa bottia vasten.
+//! Integration test for the Discord adapter against a real bot.
 //!
-//! Ajetaan VAIN jos ympäristömuuttujat `DISCORD_TEST_TOKEN` ja
-//! `DISCORD_TEST_CHANNEL_ID` on asetettu — muuten testi ohittaa itsensä
-//! siististi (CI ei vaadi secretiä peruskäännökseen). Testi todentaa
-//! kaksisuuntaisen liikenteen: `start` → `send` → odota viestin paluuta
-//! `receive()`-streamiin → `stop`.
+//! Runs ONLY if the environment variables `DISCORD_TEST_TOKEN` and
+//! `DISCORD_TEST_CHANNEL_ID` are set — otherwise the test skips itself
+//! cleanly (CI does not require a secret for a basic build). The test
+//! verifies bidirectional traffic: `start` → `send` → wait for the message
+//! to come back on the `receive()` stream → `stop`.
 #![cfg(feature = "discord")]
 
 use std::env;
@@ -20,48 +20,42 @@ async fn test_discord_round_trip() {
 
     if token.is_empty() || channel_id_str.is_empty() {
         eprintln!(
-            "DISCORD_TEST_TOKEN tai DISCORD_TEST_CHANNEL_ID puuttuu, ohitetaan integraatiotesti."
+            "DISCORD_TEST_TOKEN or DISCORD_TEST_CHANNEL_ID is missing, skipping the integration test."
         );
         return;
     }
 
-    let channel_id: u64 = channel_id_str.parse().expect("Virheellinen Channel ID");
+    let channel_id: u64 = channel_id_str.parse().expect("Invalid Channel ID");
 
-    // owner_id 0 = DM-portti pois (integraatiotesti todentaa vain guild-round-tripin).
-    let channel = DiscordChannel::new(token, channel_id, 0).expect("Kanavan luonti epäonnistui");
+    // owner_id 0 = DM gate disabled (the integration test only verifies the guild round trip).
+    let channel = DiscordChannel::new(token, channel_id, 0).expect("Channel creation failed");
 
-    // Käynnistä gateway (palaa vasta ready/virhe).
-    channel
-        .start()
-        .await
-        .expect("Kanavan käynnistys epäonnistui");
+    // Start the gateway (returns only once ready/error).
+    channel.start().await.expect("Channel start failed");
 
-    // Avaa saapuvan virran (kutsuttavissa kerran).
+    // Open the inbound stream (callable once).
     let mut stream = channel
         .receive()
-        .expect("receive-stream avaaminen epäonnistui");
+        .expect("opening the receive stream failed");
 
     let random_id = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("kello")
+        .expect("clock")
         .as_millis()
         .to_string();
     let test_message = format!("familyclaw-integration-ping {random_id}");
 
-    // Lähetä testiviesti. OutboundMessage::new(target, body): target on
-    // kanava-id, johon adapteri reitittää (DiscordChannel käyttää omaa
-    // target_channel_id:tään lähetyksessä, joten target on tässä sama).
+    // Send the test message. OutboundMessage::new(target, body): target is
+    // the channel id the adapter routes to (DiscordChannel uses its own
+    // target_channel_id for sending, so target is the same value here).
     let outbound = OutboundMessage::new(channel_id.to_string(), test_message.clone())
-        .expect("outbound-viestin rakennus");
-    channel
-        .send(outbound)
-        .await
-        .expect("Viestin lähetys epäonnistui");
+        .expect("building the outbound message");
+    channel.send(outbound).await.expect("Message send failed");
 
-    // Odota viestin paluuta streamiin max 15 s. Botti EI näe omia viestejään
-    // (map_message suodattaa bot-lähettäjät), joten round trip onnistuu vain jos
-    // joku muu kaiuttaa viestin. Tämä on odotettua: ellei vastausta tule,
-    // riittää että send onnistui.
+    // Wait up to 15s for the message to come back on the stream. The bot
+    // does NOT see its own messages (map_message filters out bot senders),
+    // so the round trip only succeeds if someone else echoes the message.
+    // This is expected: if no reply arrives, it is enough that send succeeded.
     let result = timeout(Duration::from_secs(15), async {
         while let Some(msg) = stream.recv().await {
             if msg.body.contains(&random_id) {
@@ -73,15 +67,15 @@ async fn test_discord_round_trip() {
     .await;
 
     match result {
-        Ok(true) => println!("Round-trip onnistui!"),
+        Ok(true) => println!("Round trip succeeded!"),
         Ok(false) | Err(_) => {
             println!(
-                "Viestiä ei näkynyt streamissa 15 sekunnin kuluessa. \
-                 Botti ei näe omia viestejään — send-onnistuminen riittää."
+                "The message did not appear on the stream within 15 seconds. \
+                 The bot does not see its own messages — a successful send is sufficient."
             );
         }
     }
 
-    // Sulje gateway siististi.
-    channel.stop().await.expect("Kanavan pysäytys epäonnistui");
+    // Shut down the gateway cleanly.
+    channel.stop().await.expect("Channel stop failed");
 }

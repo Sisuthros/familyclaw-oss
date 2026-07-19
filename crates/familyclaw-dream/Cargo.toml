@@ -1,12 +1,15 @@
 [package]
 name = "familyclaw-dream"
-description = "Dreaming — overnight memory consolidation (hippocampal model)"
+description = "Scheduled memory consolidation for agents, modeled on hippocampal replay: deduplicates, resolves conflicts, and cleans up stored memories"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["agent", "memory", "consolidation", "scheduler", "runtime"]
+categories = ["asynchronous", "development-tools"]
 
 [lints]
 workspace = true

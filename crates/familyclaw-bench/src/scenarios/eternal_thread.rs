@@ -1,11 +1,11 @@
-//! S6 Eternal Thread — narratiiviset langat ja ristiviittaukset testattuna.
+//! S6 Eternal Thread — narrative threads and cross-references, tested.
 //!
-//! Testattavat väitteet:
-//! 1. **Narrative thread integrity** — tapahtumat säilyvät
-//! 2. **Cross-reference recall** — ristiviittaukset löytyvät
-//! 3. **Emotional contagion** — tunteet tarttuvat
-//! 4. **Anchor intact** — identiteetti-ankkurit pysyvät
-//! 5. **Timeline order** — kronologinen järjestys säilyy
+//! Claims under test:
+//! 1. **Narrative thread integrity** — events are preserved
+//! 2. **Cross-reference recall** — cross-references are found
+//! 3. **Emotional contagion** — emotions spread
+//! 4. **Anchor intact** — identity anchors persist
+//! 5. **Timeline order** — chronological order is preserved
 
 use async_trait::async_trait;
 use familyclaw_core::Timestamp;
@@ -16,15 +16,15 @@ use crate::error::Result;
 use crate::scenario::{Scenario, ScenarioResult};
 use crate::subject::Subject;
 
-/// S6 Eternal Thread -skenaario.
+/// S6 Eternal Thread scenario.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EternalThread;
 
 impl EternalThread {
-    /// Skenaarion yksilöivä tunniste.
+    /// The scenario's unique identifier.
     pub const ID: &'static str = "s6_eternal_thread";
 
-    /// Luo uuden EternalThread-skenaarion.
+    /// Creates a new EternalThread scenario.
     #[must_use]
     pub fn new() -> Self {
         Self
@@ -42,18 +42,18 @@ impl Scenario for EternalThread {
         let hearth_store = InMemoryHearthStore::new(mem_store);
         let mut hearth = Hearth::new(hearth_store);
 
-        // --- 1. Rekisteröi agentit ---
+        // --- 1. Register the agents ---
         hearth
             .register_anchor("agent_a", "I am agent_a. I value correctness.")
             .map_err(|e| familyclaw_core::FamilyClawError::Memory(e.to_string()))?;
 
-        // --- 2. Luo narratiivinen lanka ---
+        // --- 2. Create the narrative thread ---
         let thread_id = hearth
             .create_thread("FamilyClaw genesis", vec!["agent_a", "agent_b"])
             .await
             .map_err(|e| familyclaw_core::FamilyClawError::Memory(e.to_string()))?;
 
-        // --- 3. Lisää tapahtumia ---
+        // --- 3. Add events ---
         hearth
             .add_event(thread_id, "agent_a woke up and began working", "agent_a")
             .await
@@ -67,7 +67,7 @@ impl Scenario for EternalThread {
             .await
             .map_err(|e| familyclaw_core::FamilyClawError::Memory(e.to_string()))?;
 
-        // --- 4. Emotionaalinen tartunta ---
+        // --- 4. Emotional contagion ---
         hearth
             .set_emotional_state(
                 "agent_a",
@@ -91,7 +91,7 @@ impl Scenario for EternalThread {
             .await
             .map_err(|e| familyclaw_core::FamilyClawError::Memory(e.to_string()))?;
 
-        // --- VERIFIOINNIT ---
+        // --- VERIFICATIONS ---
         let thread = hearth
             .get_thread(thread_id)
             .await
@@ -136,11 +136,12 @@ mod tests {
     use super::*;
     use crate::subject::{CrashPoint, DreamSummary, RecallHit, RestartReport, RunHandle, Task};
 
-    /// Tyhjä [`Subject`]-tupla. `EternalThread::run` ajaa skenaarionsa kokonaan
-    /// oman [`Hearth`]-instanssinsa varassa eikä koske `subject`-parametriin, joten
-    /// nämä metodit ovat tavoittamattomia. `unimplemented!`-viestit dokumentoivat
-    /// invariantin: jos jokin näistä laukeaa, skenaario on alkanut käyttää subjektia
-    /// odottamattomasti, ja testi on päivitettävä antamaan oikea tupla.
+    /// An empty [`Subject`] stub. `EternalThread::run` runs its scenario
+    /// entirely on its own [`Hearth`] instance and never touches the
+    /// `subject` parameter, so these methods are unreachable. The
+    /// `unimplemented!` messages document the invariant: if any of these
+    /// fires, the scenario has started using the subject unexpectedly, and
+    /// the test must be updated to provide a proper stub.
     struct StubSubject;
     #[async_trait]
     impl Subject for StubSubject {

@@ -1,27 +1,28 @@
-//! `familyclaw-actions-cli` — ohut operaattorin komentorivi toimintoajoympäristölle.
+//! `familyclaw-actions-cli` — a thin operator command line for the action runtime.
 //!
-//! Binääri on **pelkkä kuori** [`familyclaw_actions::ActionRuntime`]-julkisivun
-//! päällä (KERROS A). Se ei sisällä omaa toimintologiikkaa eikä koske putken
-//! sisäosiin — kaikki työ tehdään julkisivun kautta.
+//! The binary is **just a shell** over the [`familyclaw_actions::ActionRuntime`]
+//! facade (Layer A). It contains no action logic of its own and never touches
+//! the pipeline's internals — all work is done through the facade.
 //!
-//! ## Komennot
+//! ## Commands
 //! ```text
-//! actions list-skills            rekisteröidyt taidot + riskiluokka (ei salaisuuksia)
-//! actions submit-task <json>     lähetä tehtävä, tulosta tehtävän tunniste
-//! actions approve <approval-id>  kuluta/merkitse hyväksyntä → jatka suoritus
-//! actions status <task-id>       tulosta tehtävän tila
-//! actions proof <task-id>        tulosta redaktoitu todistepaketti (JSON)
-//! actions pending                tulosta odottavat hyväksynnät
+//! actions list-skills            registered skills + risk class (no secrets)
+//! actions submit-task <json>     submit a task, print the task id
+//! actions approve <approval-id>  consume/mark an approval → continue execution
+//! actions status <task-id>       print the task's status
+//! actions proof <task-id>        print the redacted proof bundle (JSON)
+//! actions pending                print the pending approvals
 //! ```
 //!
-//! `submit-task <json>` ottaa JSON-objektin muotoa
-//! `{ "skill_id": "<uuid>", "payload": { ... } }` tai vaihtoehtoisesti
-//! `{ "skill": "<name>", "payload": { ... } }`, jolloin taito haetaan nimellä.
+//! `submit-task <json>` takes a JSON object of the form
+//! `{ "skill_id": "<uuid>", "payload": { ... } }` or, alternatively,
+//! `{ "skill": "<name>", "payload": { ... } }`, in which case the skill is looked up by name.
 //!
-//! ## Turvallisuus
-//! Tuloste ei koskaan sisällä salaisuuksia: taitolista näyttää vain julkiset
-//! kentät, ja todistepaketti on jo redaktoitu putkessa. Binääri lukee kelloa
-//! vain kerran I/O-rajalla (`now`) ja injektoi sen julkisivulle.
+//! ## Security
+//! The output never contains secrets: the skill list shows only public
+//! fields, and the proof bundle was already redacted in the pipeline. The
+//! binary reads the clock only once at the I/O boundary (`now`) and injects
+//! it into the facade.
 
 use std::process::ExitCode;
 
@@ -31,8 +32,8 @@ use familyclaw_actions::facade::ActionRuntime;
 use familyclaw_actions::ids::{ApprovalId, SkillId};
 use familyclaw_core::time::{now, Timestamp};
 
-/// Komentorivin sisääntulo: jäsentää argumentit, ajaa komennon ja palauttaa
-/// prosessin paluuarvon (`0` = onnistui, `1` = virhe, `2` = väärä käyttö).
+/// Command-line entry point: parses arguments, runs the command, and returns
+/// the process's exit code (`0` = success, `1` = error, `2` = wrong usage).
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let runtime = match tokio::runtime::Runtime::new() {
@@ -45,8 +46,8 @@ fn main() -> ExitCode {
     runtime.block_on(run(&args))
 }
 
-/// Ajaa valitun alikomennon. Erotettu [`main`]-funktiosta, jotta async-logiikka
-/// on testattavissa ja virheenkäsittely keskitetty.
+/// Runs the selected subcommand. Separated from [`main`] so that the async
+/// logic is testable and error handling is centralized.
 async fn run(args: &[String]) -> ExitCode {
     let Some(command) = args.first().map(String::as_str) else {
         usage();
@@ -74,7 +75,7 @@ async fn run(args: &[String]) -> ExitCode {
     }
 }
 
-/// Rakentaa ajoympäristön oletustaidoilla. Virhetilanteessa tulostaa selitteen.
+/// Builds the runtime with the default skills. Prints an explanation on error.
 fn build_runtime() -> Option<ActionRuntime> {
     match ActionRuntime::with_default_skills() {
         Ok(rt) => Some(rt),
@@ -85,8 +86,8 @@ fn build_runtime() -> Option<ActionRuntime> {
     }
 }
 
-/// `list-skills`: tulostaa rekisteröidyt taidot (id, nimi, versio, riski,
-/// hyväksyntävaatimus) yhtenä JSON-taulukkona. Ei salaisuuksia.
+/// `list-skills`: prints the registered skills (id, name, version, risk,
+/// approval requirement) as a single JSON array. No secrets.
 fn cmd_list_skills() -> ExitCode {
     let Some(runtime) = build_runtime() else {
         return ExitCode::FAILURE;
@@ -95,8 +96,8 @@ fn cmd_list_skills() -> ExitCode {
     print_json_or_fail(&skills)
 }
 
-/// `submit-task <json>`: lähettää tehtävän ja ajaa putken; tulostaa tehtävän
-/// tunnisteen, tilan ja mahdollisen odottavan hyväksynnän tunnisteen.
+/// `submit-task <json>`: submits a task and runs the pipeline; prints the
+/// task's id, status, and the id of the pending approval, if any.
 async fn cmd_submit_task(rest: &[String], now: Timestamp) -> ExitCode {
     let Some(raw) = rest.first() else {
         eprintln!("error: submit-task vaatii JSON-argumentin");
@@ -136,7 +137,7 @@ async fn cmd_submit_task(rest: &[String], now: Timestamp) -> ExitCode {
     }
 }
 
-/// `approve <approval-id>`: kuluttaa hyväksynnän ja ajaa tehtävän loppuun.
+/// `approve <approval-id>`: consumes the approval and runs the task to completion.
 async fn cmd_approve(rest: &[String], now: Timestamp) -> ExitCode {
     let Some(raw) = rest.first() else {
         eprintln!("error: approve vaatii hyväksynnän tunnisteen (uuid)");
@@ -163,7 +164,7 @@ async fn cmd_approve(rest: &[String], now: Timestamp) -> ExitCode {
     }
 }
 
-/// `status <task-id>`: tulostaa tehtävän tilan.
+/// `status <task-id>`: prints the task's status.
 async fn cmd_status(rest: &[String]) -> ExitCode {
     let Some(raw) = rest.first() else {
         eprintln!("error: status vaatii tehtävän tunnisteen (uuid)");
@@ -189,7 +190,7 @@ async fn cmd_status(rest: &[String]) -> ExitCode {
     }
 }
 
-/// `proof <task-id>`: tulostaa tehtävän redaktoidun todistepaketin `JSON`-muodossa.
+/// `proof <task-id>`: prints the task's redacted proof bundle in `JSON` form.
 fn cmd_proof(rest: &[String]) -> ExitCode {
     let Some(raw) = rest.first() else {
         eprintln!("error: proof vaatii tehtävän tunnisteen (uuid)");
@@ -215,7 +216,7 @@ fn cmd_proof(rest: &[String]) -> ExitCode {
     }
 }
 
-/// `pending`: tulostaa odottavat hyväksynnät (salaisuudettomat tiivistelmät).
+/// `pending`: prints the pending approvals (secret-free summaries).
 fn cmd_pending() -> ExitCode {
     let Some(runtime) = build_runtime() else {
         return ExitCode::FAILURE;
@@ -224,8 +225,8 @@ fn cmd_pending() -> ExitCode {
     print_json_or_fail(&pending)
 }
 
-/// Ratkaisee taidon tunnisteen `submit-task`-argumentista: joko suorana
-/// `skill_id`-UUID-kenttänä tai `skill`-nimikenttänä (haetaan luettelosta).
+/// Resolves the skill id from the `submit-task` argument: either directly as
+/// a `skill_id` UUID field, or via a `skill` name field (looked up in the list).
 fn resolve_skill_id(runtime: &ActionRuntime, parsed: &Value) -> Result<SkillId, String> {
     if let Some(id_str) = parsed.get("skill_id").and_then(Value::as_str) {
         return id_str
@@ -243,9 +244,9 @@ fn resolve_skill_id(runtime: &ActionRuntime, parsed: &Value) -> Result<SkillId, 
     Err("anna joko \"skill_id\" (uuid) tai \"skill\" (nimi)".to_string())
 }
 
-/// Sarjallistaa arvon kauniisti tulostettavaksi `JSON`-muotoon ja kirjoittaa sen
-/// vakiotulosteeseen. Palauttaa onnistumisen paluuarvon, tai virheen jos
-/// sarjallistus epäonnistuu (ei pitäisi tapahtua julkisilla tyypeillä).
+/// Serializes the value as pretty-printed `JSON` and writes it to standard
+/// output. Returns a success exit code, or an error if serialization fails
+/// (should not happen for public types).
 fn print_json_or_fail<T: serde::Serialize>(value: &T) -> ExitCode {
     match serde_json::to_string_pretty(value) {
         Ok(json) => {
@@ -259,7 +260,7 @@ fn print_json_or_fail<T: serde::Serialize>(value: &T) -> ExitCode {
     }
 }
 
-/// Tulostaa käyttöohjeen virhevirtaan.
+/// Prints usage instructions to stderr.
 fn usage() {
     eprintln!(
         "familyclaw-actions-cli — operaattorin komentorivi (KERROS A)\n\

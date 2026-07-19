@@ -1,23 +1,23 @@
-//! S4 Emotional Contagion — Resonance Busin affektiivinen tartunta testattuna.
+//! S4 Emotional Contagion — the Resonance Bus's affective contagion, tested.
 //!
-//! Tämä skenaario todistaa kolme asiaa:
-//! 1. **Affective contagion** — agentin tunnetila tarttuu sisarukseen
-//!    Resonance Busin kautta oikealla kertoimella.
-//! 2. **Homeostasis** — ilman jatkuvaa ärsykettä tunnetila palautuu
-//!    kohti neutraalia (ei saturoidu).
-//! 3. **Memory isolation** — agentin omat muistit eivät vuoda toiselle
-//!    agentille busin kautta; jokainen muistaa vain omat kokemuksensa.
+//! This scenario proves three things:
+//! 1. **Affective contagion** — an agent's emotional state spreads to a
+//!    sibling via the Resonance Bus with the correct coefficient.
+//! 2. **Homeostasis** — without continued stimulus, emotional state returns
+//!    toward neutral (no saturation).
+//! 3. **Memory isolation** — an agent's own memories do not leak to another
+//!    agent via the bus; each remembers only its own experiences.
 //!
-//! ## Miksi tämä on uniikki
-//! Kukaan kilpailija ei markkinoi *affektiivista hermostoa* agenttien
-//! välillä. FamilyClaw'n Resonance Bus on biologinen vastine: tunteet
-//! tarttuvat, mutta homeostaasi estää feedback-loopin saturaation.
-//! Tämä skenaario tekee siitä mitattavan.
+//! ## Why this is unique
+//! No competitor markets an *affective nervous system* between agents.
+//! FamilyClaw's Resonance Bus is a biological analog: emotions spread, but
+//! homeostasis prevents the feedback loop from saturating. This scenario
+//! makes that measurable.
 //!
-//! ## Reprodusoitavuus
-//! Sama injektoitu kello → identtinen tulos (design §2.2).
+//! ## Reproducibility
+//! Same injected clock → identical result (design §2.2).
 //!
-//! ## Testattava väite
+//! ## Claim under test
 //! > *"When one agent feels joy, the family feels it — but no one
 //! > burns out."*
 
@@ -31,7 +31,7 @@ use crate::error::Result;
 use crate::scenario::{Scenario, ScenarioResult};
 use crate::subject::Subject;
 
-/// Agentin tunnetila ennen ja jälkeen pulssin.
+/// An agent's emotional state before and after the pulse.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 struct EmotionalSnapshot {
@@ -50,15 +50,15 @@ impl EmotionalSnapshot {
     }
 }
 
-/// S4 Emotional Contagion -skenaario.
+/// S4 Emotional Contagion scenario.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EmotionalContagion;
 
 impl EmotionalContagion {
-    /// Skenaarion yksilöivä tunniste.
+    /// The scenario's unique identifier.
     pub const ID: &'static str = "s4_emotional_contagion";
 
-    /// Luo uuden EmotionalContagion-skenaarion.
+    /// Creates a new EmotionalContagion scenario.
     #[must_use]
     pub fn new() -> Self {
         Self
@@ -71,21 +71,21 @@ impl Scenario for EmotionalContagion {
         Self::ID
     }
 
-    // Skenaario on yhtenäinen vaiheittainen koeasetelma; rivimäärän takia
-    // pilkkominen hajottaisi sen luettavuuden. `agent_a_*`/`agent_b_*` -nimet
-    // ovat tarkoituksella samankaltaisia (kaksi symmetristä agenttia).
+    // The scenario is a cohesive, staged test rig; splitting it up because of
+    // line count would break up its readability. The `agent_a_*`/`agent_b_*`
+    // names are deliberately similar (two symmetric agents).
     #[allow(
         clippy::too_many_lines,
         clippy::similar_names,
         clippy::cast_precision_loss
     )]
     async fn run(&self, subject: &mut dyn Subject, clock: Timestamp) -> Result<ScenarioResult> {
-        // ── 1. Käynnistä Resonance Bus ─────────────────────────────────────
+        // ── 1. Start the Resonance Bus ─────────────────────────────────────
         let bus = ResonanceBus::start(None)
             .await
             .map_err(|e| crate::BenchError::scenario(format!("bus start: {e}")))?;
 
-        // ── 2. Rakenna kahden agentin tila ─────────────────────────────────
+        // ── 2. Build the state of two agents ─────────────────────────────────
         let store_a = LocalJsonStore::in_memory();
         let store_b = LocalJsonStore::in_memory();
 
@@ -95,37 +95,37 @@ impl Scenario for EmotionalContagion {
         let agent_a_id = BeingId::new();
         let _agent_b_id = BeingId::new();
 
-        // ── 3. Testaa pulssin tartunta ─────────────────────────────────────
-        // agent_a tuntee voimakasta iloa → agent_b:n pitäisi tuntea osa siitä.
+        // ── 3. Test pulse contagion ─────────────────────────────────────
+        // agent_a feels strong joy → agent_b should feel some of it.
 
         let _before_pulse = EmotionalSnapshot::from_state(&agent_b_emotion);
 
         agent_a_emotion.set(Dimension::Joy, 80.0);
         agent_a_emotion.set(Dimension::Curiosity, 60.0);
 
-        // agent_a lähettää tunnepulssin busiin
+        // agent_a sends an emotion pulse to the bus
         let pulse = BusMessage::emotion_pulse(agent_a_emotion);
         bus.publish(agent_a_id, pulse)
             .map_err(|e| crate::BenchError::scenario(format!("publish pulse: {e}")))?;
 
-        // Anna pulssin levitä (async bus, pieni viive)
+        // Let the pulse propagate (async bus, small delay)
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        // Simuloi agent_b:n vastaanotto: affektiivinen tartunta
+        // Simulate agent_b's reception: affective contagion.
         // CONTAGION_FACTOR = 0.25 (familyclaw-agent/src/agent.rs).
-        // Contagion on *lähestymistä* lähdettä kohti (ei kasausta), jotta
-        // toistuva pulssi ei saturoidu kattoon: delta = (lähde − oma) · kerroin.
-        // agent_b alkaa neutraalista (0), joten tulos = lähde · kerroin.
+        // Contagion is *approaching* the source (not accumulating), so that a
+        // repeated pulse does not saturate to the ceiling: delta = (source − own) · factor.
+        // agent_b starts from neutral (0), so the result = source · factor.
         let contagion: f32 = 0.25;
 
-        // Käy läpi dimension ja sovella tartunta
+        // Iterate over dimensions and apply contagion
         for dim in [Dimension::Joy, Dimension::Curiosity] {
             let current = agent_b_emotion.value(dim);
             let delta = (agent_a_emotion.value(dim) - current) * contagion;
             agent_b_emotion.stimulate(dim, delta);
         }
 
-        // Homeostaasi: 10% palautuminen kohti neutraalia
+        // Homeostasis: 10% recovery toward neutral
         let homeostasis: f32 = 0.10;
         let neutral = EmotionState::neutral();
         for dim in [Dimension::Joy, Dimension::Curiosity, Dimension::Sadness] {
@@ -137,8 +137,8 @@ impl Scenario for EmotionalContagion {
 
         let after_pulse = EmotionalSnapshot::from_state(&agent_b_emotion);
 
-        // ── 4. Varmenna affektiivinen tartunta ────────────────────────────
-        // Odotettu: Joy = 80*0.25*0.9 = 18.0, Curiosity = 60*0.25*0.9 = 13.5
+        // ── 4. Verify affective contagion ────────────────────────────
+        // Expected: Joy = 80*0.25*0.9 = 18.0, Curiosity = 60*0.25*0.9 = 13.5
         let expected_joy: f32 = 80.0 * contagion * (1.0 - homeostasis);
         let expected_curiosity: f32 = 60.0 * contagion * (1.0 - homeostasis);
 
@@ -146,13 +146,13 @@ impl Scenario for EmotionalContagion {
         let curiosity_ok = (after_pulse.curiosity - expected_curiosity).abs() < 0.001;
         let contagion_works = joy_ok && curiosity_ok;
 
-        // ── 5. Testaa homeostaasi useammalla vuorolla ──────────────────────
-        // Ilman uutta pulssia, agent_b:n tunnetilan pitäisi palautua
+        // ── 5. Test homeostasis over multiple turns ──────────────────────
+        // Without a new pulse, agent_b's emotional state should recover.
         let mut turns_without_stimulus = 0;
         let mut state_before_homeostasis = agent_b_emotion;
         for turn in 0..10 {
             let _snapshot = EmotionalSnapshot::from_state(&agent_b_emotion);
-            // Ei pulssia tällä vuorolla
+            // No pulse on this turn
 
             for dim in [Dimension::Joy, Dimension::Curiosity, Dimension::Sadness] {
                 let current = agent_b_emotion.value(dim);
@@ -164,7 +164,7 @@ impl Scenario for EmotionalContagion {
             if turn > 0 {
                 let prev = EmotionalSnapshot::from_state(&state_before_homeostasis);
                 let curr = EmotionalSnapshot::from_state(&agent_b_emotion);
-                // Jokaisen dimension pitäisi olla lähempänä neutraalia
+                // Every dimension should be closer to neutral
                 if (curr.joy - neutral.value(Dimension::Joy)).abs()
                     < (prev.joy - neutral.value(Dimension::Joy)).abs()
                 {
@@ -174,10 +174,10 @@ impl Scenario for EmotionalContagion {
             state_before_homeostasis = agent_b_emotion;
         }
 
-        let homeostasis_works = turns_without_stimulus >= 9; // 9/9 vuoroa lähempänä neutraalia
+        let homeostasis_works = turns_without_stimulus >= 9; // 9/9 turns closer to neutral
 
-        // ── 6. Testaa muistin eristys ──────────────────────────────────────
-        // agent_a "näkee" viestin → muistaa sen. agent_b EI saa nähdä agent_a:n muistoja.
+        // ── 6. Test memory isolation ──────────────────────────────────────
+        // agent_a "sees" a message → remembers it. agent_b must NOT see agent_a's memories.
         let mem_a =
             familyclaw_memory::Memory::builder("agent_a saw: the family shipped the feature")
                 .source("agent_a")
@@ -197,14 +197,14 @@ impl Scenario for EmotionalContagion {
             .await
             .map_err(|e| crate::BenchError::scenario(format!("add mem b: {e}")))?;
 
-        // agent_a hakee "feature" → löytää omansa
+        // agent_a searches "feature" → finds its own
         let ctx_a = RetrievalContext::new("feature").with_limit(5);
         let hits_a = store_a
             .retrieve(&ctx_a, clock)
             .await
             .map_err(|e| crate::BenchError::scenario(format!("retrieve a: {e}")))?;
 
-        // agent_b hakee "weather" → löytää omansa, EI agent_a:n muistoja
+        // agent_b searches "weather" → finds its own, NOT agent_a's memories
         let ctx_b = RetrievalContext::new("weather").with_limit(5);
         let hits_b = store_b
             .retrieve(&ctx_b, clock)
@@ -223,10 +223,10 @@ impl Scenario for EmotionalContagion {
         let memory_isolation_works =
             a_remembers && b_isolated && b_remembers_own && a_isolated_from_b;
 
-        // ── 7. Elävyyskoe: subjektin recall ────────────────────────────────
+        // ── 7. Liveness check: the subject's recall ────────────────────────────────
         let subject_hits = subject.recall("emotion", clock).await?;
 
-        // ── 8. Tulokset ────────────────────────────────────────────────────
+        // ── 8. Results ────────────────────────────────────────────────────
         let contagion_score = if contagion_works { 1.0 } else { 0.0 };
         let homeostasis_score = if homeostasis_works { 1.0 } else { 0.0 };
         let isolation_score = if memory_isolation_works { 1.0 } else { 0.0 };

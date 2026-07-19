@@ -1,38 +1,40 @@
 //! # familyclaw-bus
 //!
-//! **Resonance Bus** — FamilyClaw v2:n *affektiivinen hermosto* (design §2.2,
-//! KERROS A / OSS). Bus on [Ractor](https://docs.rs/ractor)-pohjainen
-//! actor-malli, jonka yli perheenjäsenet (olennot) viestivät — ja jonka yli
-//! heidän **tunnetilansa vuotaa toisilleen** (affective contagion).
+//! **Resonance Bus** — FamilyClaw v2's *affective nervous system* (design
+//! §2.2, Layer A / OSS). The bus is a [Ractor](https://docs.rs/ractor)-based
+//! actor model over which family members (beings) communicate — and over
+//! which their **emotional states leak into each other** (affective
+//! contagion).
 //!
-//! ## Mitä tämä crate ratkaisee
-//! Live-tuotannossa havaittu Resonance Bus palautti `beings:[]` — tyhjän
-//! olentolistan, vaikka agentteja oli liittynyt. Tämä crate korjaa sen
-//! rakenteellisesti: [`BusHandle::beings`] palauttaa todelliset liittyneet
-//! olennot, eikä lista ole koskaan tyhjä kun olentoja on rekisteröity.
+//! ## What this crate solves
+//! A Resonance Bus observed in live production returned `beings:[]` — an
+//! empty list of beings, even though agents had joined. This crate fixes
+//! that structurally: [`BusHandle::beings`] returns the actual joined
+//! beings, and the list is never empty once beings have registered.
 //!
-//! ## Ydinkäsitteet
-//! - [`BusMessage`] — busin "kieli": teksti, latent-telepatia, **tunnepulssi**
-//!   ([`BusMessage::EmotionPulse`]), tehtävätapahtumat ja vapaat custom-viestit.
-//! - [`ResonanceMessage`] — kirjekuori (hyötykuorma + lähettäjä + aikaleima).
-//! - [`ResonanceBus`] — actor, joka rekisteröi olennot, lähettää viestit
-//!   kaikille muille ja leviää tunnepulssina. Supervision pitää busin elossa
-//!   vaikka yksittäinen olento kaatuisi.
-//! - [`BusHandle`] — ergonominen, `unwrap`-vapaa rajapinta busiin.
-//! - [`BeingInfo`] / [`BeingId`] / [`BeingSnapshot`] — liittyneen olennon
-//!   tiedot, tunniste ja sarjallistuva tilannekuva.
+//! ## Core concepts
+//! - [`BusMessage`] — the bus's "language": text, latent telepathy, an
+//!   **emotion pulse** ([`BusMessage::EmotionPulse`]), task events, and
+//!   free-form custom messages.
+//! - [`ResonanceMessage`] — an envelope (payload + sender + timestamp).
+//! - [`ResonanceBus`] — the actor that registers beings, sends messages to
+//!   all others, and propagates emotion pulses. Supervision keeps the bus
+//!   alive even if an individual being crashes.
+//! - [`BusHandle`] — an ergonomic, `unwrap`-free interface to the bus.
+//! - [`BeingInfo`] / [`BeingId`] / [`BeingSnapshot`] — a joined being's
+//!   info, identifier, and serializable snapshot.
 //!
-//! ## Affektiivinen hermosto
-//! Kun olento julkaisee tunnetilansa pulssina, **kaikki muut olennot saavat
-//! sen** ja voivat reagoida sisaruksen mielialaan. Tämä on se "veri" joka
-//! tekee busista hermoston eikä pelkkää viestijonoa.
+//! ## Affective nervous system
+//! When a being publishes its emotion state as a pulse, **all other beings
+//! receive it** and can react to a sibling's mood. This is the "blood"
+//! that makes the bus a nervous system rather than just a message queue.
 //!
-//! ## OSS-raja (KERROS A)
-//! Tämä crate ei kovakoodaa perheenjäsenten sieluja, mallinimiä, avaimia eikä
-//! polkuja. Olentojen tunnisteet ja nimet annetaan ajonaikaisesti; esimerkit
-//! käyttävät geneerisiä nimiä (`agent_a`, `agent_b`).
+//! ## OSS boundary (Layer A)
+//! This crate does not hardcode family members' souls, model names, keys,
+//! or paths. Beings' identifiers and names are supplied at runtime;
+//! examples use generic names (`agent_a`, `agent_b`).
 //!
-//! ## Pikaesimerkki
+//! ## Quick example
 //! ```
 //! use familyclaw_bus::{BeingId, BeingInfo, BusMessage, CollectorBeing, ResonanceBus};
 //! use ractor::Actor;
@@ -42,10 +44,10 @@
 //!     .build()
 //!     .expect("runtime");
 //! rt.block_on(async {
-//!     // Käynnistä bus.
+//!     // Start the bus.
 //!     let bus = ResonanceBus::start(None).await.expect("start");
 //!
-//!     // Liitä olento (tässä kerääjä-esimerkki-actor).
+//!     // Join a being (here, the collector example actor).
 //!     let log_b = CollectorBeing::new_log();
 //!     let (inbox_b, _h) = Actor::spawn(None, CollectorBeing, log_b.clone())
 //!         .await
@@ -54,10 +56,10 @@
 //!     let id_b = BeingId::new();
 //!     bus.register(BeingInfo::new(id_b, "agent_b", inbox_b)).expect("register");
 //!
-//!     // beings[] ei ole tyhjä.
+//!     // beings[] is not empty.
 //!     assert_eq!(bus.count().await.expect("count"), 1);
 //!
-//!     // agent_a julkaisee viestin → agent_b saa sen.
+//!     // agent_a publishes a message → agent_b receives it.
 //!     bus.publish(id_a, BusMessage::text("hei sisarus")).expect("publish");
 //!     bus.stop();
 //! });
@@ -79,11 +81,11 @@ pub use latent_channel::BusLatentChannel;
 pub use message::{BeingId, BusMessage, MessageOrigin, ResonanceMessage, TaskEventKind};
 pub use uacp::{AcpEnvelope, AcpVerb, ACP_MESSAGE_NAME};
 
-// Re-export ydinvirhetyypit, jotta kutsujan ei tarvitse riippua
-// `familyclaw-core`sta erikseen bussia käyttäessään.
+// Re-export the core error types so callers don't need to depend on
+// `familyclaw-core` separately when using the bus.
 pub use familyclaw_core::{FamilyClawError, Result};
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -100,7 +102,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_api_is_reachable_from_root() {
-        // Jos jokin re-export poistetaan, tämä testi ei käänny.
+        // If any re-export is removed, this test will fail to compile.
         let bus: BusHandle = ResonanceBus::start(None).await.expect("start");
 
         let log: CollectedLog = CollectorBeing::new_log();

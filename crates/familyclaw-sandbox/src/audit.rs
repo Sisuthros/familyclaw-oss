@@ -1,25 +1,23 @@
-//! Tarkastusloki (audit log) sandboxin kyvykkyystarkistuksille ja
-//! suoritusten elinkaarelle.
+//! Audit log for the sandbox's capability checks and execution lifecycle.
 //!
-//! Containment-vaatimus #5 (audit logging) edellyttää että **jokainen
-//! kyvykkyystarkistus** (myönnetty / evätty) sekä **jokaisen suorituksen
-//! alku ja loppu** kirjataan muuttumattomaan, sarjallistuvaan lokiin. 698:n
-//! incidentin analyysi (2604.23425) osoitti että ilman tarkastuslokia
-//! karkaamisia ei voi havaita jälkikäteen.
+//! Containment requirement #5 (audit logging) requires that **every
+//! capability check** (granted / denied) as well as **the start and end of
+//! every execution** be recorded to an immutable, serializable log. An
+//! analysis of 698 incidents (2604.23425) showed that without an audit log,
+//! escapes cannot be detected after the fact.
 //!
-//! ## Suunnitteluperiaate: ei riko olemassa olevaa rajapintaa
-//! [`CapabilitySet`]:in julkiset metodit pysyvät
-//! ennallaan (ne ovat puhtaita, sivuvaikutuksettomia kyselyitä). Tarkastus
-//! kytketään **valinnaisena** [`AuditedCapabilities`]-näkymän kautta: se
-//! kietoo viittauksen [`CapabilitySet`]:iin ja viittauksen [`AuditLog`]:iin,
-//! ja tarjoaa samat tarkistusmetodit jotka **lisäksi** kirjaavat tuloksen.
-//! Kutsuja joka ei tarvitse tarkastusta voi käyttää [`CapabilitySet`]:iä
-//! suoraan kuten ennenkin.
+//! ## Design principle: does not break the existing interface
+//! [`CapabilitySet`]'s public methods remain unchanged (they are pure,
+//! side-effect-free queries). Auditing is wired in as an **optional**
+//! [`AuditedCapabilities`] view: it wraps a reference to a [`CapabilitySet`]
+//! and a reference to an [`AuditLog`], and offers the same check methods,
+//! which **additionally** record the result. A caller that doesn't need
+//! auditing can use [`CapabilitySet`] directly as before.
 //!
-//! Loki on **append-only**: julkinen API ei tarjoa muokkausta eikä poistoa,
-//! vain lisäystä ja lukua.
+//! The log is **append-only**: the public API offers no modification or
+//! deletion, only appending and reading.
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_sandbox::{AuditLog, AuditedCapabilities, Capability, CapabilitySet};
 //!
@@ -27,8 +25,8 @@
 //! let mut log = AuditLog::new();
 //! {
 //!     let mut audited = AuditedCapabilities::new(&caps, &mut log);
-//!     assert!(audited.allows_network_host("api.example.com")); // myönnetty
-//!     assert!(!audited.allows_network_host("evil.example.com")); // evätty
+//!     assert!(audited.allows_network_host("api.example.com")); // granted
+//!     assert!(!audited.allows_network_host("evil.example.com")); // denied
 //! }
 //!
 //! assert_eq!(log.len(), 2);
@@ -39,76 +37,76 @@ use serde::{Deserialize, Serialize};
 
 use crate::capability::CapabilitySet;
 
-/// Kyvykkyystarkistuksen kohde — mitä pääsyä koodi yritti käyttää.
+/// The target of a capability check — what access the code attempted to use.
 ///
-/// Geneerinen ja sarjallistuva, jotta loki voidaan kirjata durable-storeen.
+/// Generic and serializable so the log can be persisted to a durable store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "target")]
 #[non_exhaustive]
 pub enum CapabilityCheck {
-    /// Verkkopääsy nimettyyn isäntään.
+    /// Network access to a named host.
     Network(String),
-    /// Lukupääsy tiedostopolkuun.
+    /// Read access to a filesystem path.
     ReadPath(String),
-    /// Ympäristömuuttujan luku.
+    /// Reading an environment variable.
     EnvVar(String),
 }
 
 impl CapabilityCheck {
-    /// Verkkotarkistus annettuun isäntään.
+    /// A network check against the given host.
     pub fn network(host: impl Into<String>) -> Self {
         Self::Network(host.into())
     }
 
-    /// Polkutarkistus annettuun polkuun.
+    /// A path check against the given path.
     pub fn read_path(path: impl Into<String>) -> Self {
         Self::ReadPath(path.into())
     }
 
-    /// Ympäristömuuttujatarkistus annetulle nimelle.
+    /// An environment variable check for the given name.
     pub fn env_var(name: impl Into<String>) -> Self {
         Self::EnvVar(name.into())
     }
 }
 
-/// Yksittäinen merkintä tarkastuslokissa.
+/// A single entry in the audit log.
 ///
-/// `#[non_exhaustive]` jotta uusia tapahtumatyyppejä voi lisätä rikkomatta
-/// downstream-koodia.
+/// `#[non_exhaustive]` so that new event types can be added without breaking
+/// downstream code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "event")]
 #[non_exhaustive]
 pub enum AuditEntry {
-    /// Suoritus alkoi — kirjaa backendin nimi ja koodin koko tavuina.
+    /// Execution started — records the backend name and the code size in bytes.
     ExecutionStart {
-        /// Backendin tunniste (esim. `"noop"`, `"wasmtime"`).
+        /// The backend identifier (e.g. `"noop"`, `"wasmtime"`).
         backend: String,
-        /// Ajettavan koodin koko tavuina.
+        /// The size of the executed code in bytes.
         code_len: usize,
     },
 
-    /// Kyvykkyystarkistus tehtiin.
+    /// A capability check was performed.
     CapabilityCheck {
-        /// Mitä pääsyä yritettiin.
+        /// What access was attempted.
         check: CapabilityCheck,
-        /// Myönnettiinkö pääsy (`true`) vai evättiinkö (`false`).
+        /// Whether access was granted (`true`) or denied (`false`).
         granted: bool,
     },
 
-    /// Suoritus päättyi — kirjaa onnistuiko se ja kulutettu polttoaine.
+    /// Execution ended — records whether it succeeded and the fuel consumed.
     ExecutionEnd {
-        /// Päättyikö suoritus onnistuneesti.
+        /// Whether the execution completed successfully.
         success: bool,
-        /// Kulutettu polttoaine, jos tiedossa.
+        /// Fuel consumed, if known.
         fuel_consumed: Option<u64>,
     },
 }
 
-/// Append-only-tarkastusloki.
+/// An append-only audit log.
 ///
-/// Kirjaa kyvykkyystarkistukset ja suoritusten elinkaaren. Julkinen API
-/// sallii vain lisäyksen ja luvun — ei muokkausta eikä poistoa — joten loki
-/// on muuttumaton todiste containment-vaatimus #5:n mukaisesti.
+/// Records capability checks and the execution lifecycle. The public API
+/// permits only appending and reading — no modification or deletion — so the
+/// log is immutable evidence per containment requirement #5.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AuditLog {
@@ -116,18 +114,18 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
-    /// Luo tyhjän lokin.
+    /// Creates an empty log.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Lisää merkinnän lokin loppuun (append-only).
+    /// Appends an entry to the end of the log (append-only).
     pub fn record(&mut self, entry: AuditEntry) {
         self.entries.push(entry);
     }
 
-    /// Kirjaa suorituksen alku.
+    /// Records the start of an execution.
     pub fn record_execution_start(&mut self, backend: impl Into<String>, code_len: usize) {
         self.record(AuditEntry::ExecutionStart {
             backend: backend.into(),
@@ -135,7 +133,7 @@ impl AuditLog {
         });
     }
 
-    /// Kirjaa suorituksen loppu.
+    /// Records the end of an execution.
     pub fn record_execution_end(&mut self, success: bool, fuel_consumed: Option<u64>) {
         self.record(AuditEntry::ExecutionEnd {
             success,
@@ -143,30 +141,30 @@ impl AuditLog {
         });
     }
 
-    /// Kirjaa kyvykkyystarkistus tuloksineen.
+    /// Records a capability check along with its result.
     pub fn record_capability_check(&mut self, check: CapabilityCheck, granted: bool) {
         self.record(AuditEntry::CapabilityCheck { check, granted });
     }
 
-    /// Kaikki merkinnät lisäysjärjestyksessä.
+    /// All entries in append order.
     #[must_use]
     pub fn entries(&self) -> &[AuditEntry] {
         &self.entries
     }
 
-    /// Merkintöjen lukumäärä.
+    /// The number of entries.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Onko loki tyhjä.
+    /// Whether the log is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Evättyjen kyvykkyystarkistusten lukumäärä.
+    /// The number of denied capability checks.
     #[must_use]
     pub fn denied_count(&self) -> usize {
         self.entries
@@ -175,7 +173,7 @@ impl AuditLog {
             .count()
     }
 
-    /// Myönnettyjen kyvykkyystarkistusten lukumäärä.
+    /// The number of granted capability checks.
     #[must_use]
     pub fn granted_count(&self) -> usize {
         self.entries
@@ -185,15 +183,15 @@ impl AuditLog {
     }
 }
 
-/// Tarkastava näkymä [`CapabilitySet`]:iin.
+/// An auditing view over a [`CapabilitySet`].
 ///
-/// Kietoo viittauksen kyvykkyysjoukkoon ja muuttuvan viittauksen
-/// [`AuditLog`]:iin. Tarjoaa samat tarkistusmetodit kuin [`CapabilitySet`],
-/// mutta **kirjaa jokaisen tarkistuksen** lokiin. Tämä on valinnainen koukku:
-/// olemassa olevien tyyppien julkinen API ei muutu.
+/// Wraps a reference to the capability set and a mutable reference to an
+/// [`AuditLog`]. Offers the same check methods as [`CapabilitySet`], but
+/// **records every check** to the log. This is an optional hook: the
+/// public API of the existing types does not change.
 ///
-/// Elinaika `'a` sitoo molemmat lainat samaan kestoon: näkymä ei voi elää
-/// joukkoa tai lokia pidempään.
+/// The lifetime `'a` binds both borrows to the same duration: the view
+/// cannot outlive the set or the log.
 #[derive(Debug)]
 pub struct AuditedCapabilities<'a> {
     caps: &'a CapabilitySet,
@@ -201,12 +199,12 @@ pub struct AuditedCapabilities<'a> {
 }
 
 impl<'a> AuditedCapabilities<'a> {
-    /// Rakentaa tarkastavan näkymän kyvykkyysjoukolle ja lokille.
+    /// Builds an auditing view over a capability set and a log.
     pub fn new(caps: &'a CapabilitySet, log: &'a mut AuditLog) -> Self {
         Self { caps, log }
     }
 
-    /// Onko verkkopääsy isäntään myönnetty — tarkistus kirjataan.
+    /// Whether network access to the host is granted — the check is recorded.
     pub fn allows_network_host(&mut self, host: &str) -> bool {
         let granted = self.caps.allows_network_host(host);
         self.log
@@ -214,7 +212,7 @@ impl<'a> AuditedCapabilities<'a> {
         granted
     }
 
-    /// Onko lukupääsy polkuun myönnetty — tarkistus kirjataan.
+    /// Whether read access to the path is granted — the check is recorded.
     pub fn allows_read_path(&mut self, path: &str) -> bool {
         let granted = self.caps.allows_read_path(path);
         self.log
@@ -222,7 +220,7 @@ impl<'a> AuditedCapabilities<'a> {
         granted
     }
 
-    /// Onko ympäristömuuttujan luku sallittu — tarkistus kirjataan.
+    /// Whether reading the environment variable is allowed — the check is recorded.
     pub fn allows_env_var(&mut self, name: &str) -> bool {
         let granted = self.caps.allows_env_var(name);
         self.log
@@ -261,7 +259,7 @@ mod tests {
 
     #[test]
     fn audited_view_records_denied_capability() {
-        // Tyhjä joukko: kaikki tarkistukset evätään.
+        // Empty set: all checks are denied.
         let caps = CapabilitySet::deny_all();
         let mut log = AuditLog::new();
         {
@@ -325,8 +323,8 @@ mod tests {
 
     #[test]
     fn underlying_capability_set_api_unchanged() {
-        // Tarkastus ei muuta CapabilitySet:in käyttäytymistä: suora kysely
-        // antaa saman tuloksen kuin tarkastettu näkymä.
+        // Auditing does not change CapabilitySet's behavior: a direct query
+        // gives the same result as the audited view.
         let caps = CapabilitySet::deny_all().with(Capability::network("h"));
         let direct = caps.allows_network_host("h");
         let mut log = AuditLog::new();

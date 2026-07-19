@@ -1,25 +1,24 @@
-//! `μACP` — **micro Agent Communication Protocol**: nelivervinen
-//! viestintäkalkyyli ([`AcpVerb`]) Resonance Busin päälle.
+//! `μACP` — **micro Agent Communication Protocol**: a four-verb
+//! communication calculus ([`AcpVerb`]) on top of the Resonance Bus.
 //!
-//! Tausta (design §2, `SOLID_PLAN`): agenttien välinen viestintä
-//! pelkistyy neljään perfomatiiviin — `PING` (liveness), `TELL` (fakta),
-//! `ASK` (kysely joka odottaa vastausta) ja `OBSERVE` (tapahtuma). Tämä on
-//! sama ydin kuin klassisessa FIPA-ACL:ssä, mutta riisuttu minimiin matalan
-//! latenssin (≈34 ms) viestintää varten.
+//! Background (design §2, `SOLID_PLAN`): communication between agents
+//! reduces to four performatives — `PING` (liveness), `TELL` (fact),
+//! `ASK` (a query that expects a reply), and `OBSERVE` (an event). This is
+//! the same core as the classic FIPA-ACL, but stripped down to a minimum for
+//! low-latency (~34 ms) communication.
 //!
-//! ## Suhde olemassa olevaan busiin
-//! Tämä moduuli **ei korvaa** [`BusHandle::publish`]-polkua — se *kääntää*
-//! verbin olemassa olevaksi [`BusMessage`]:ksi ja julkaisee sen normaalia
-//! reittiä ([`BusHandle::send_acp`]). Verbi ja vapaaehtoinen kohde
-//! ([`AcpEnvelope::to`]) kulkevat mukana metatietona, jotta vastaanottaja voi
-//! reitittää ja suodattaa viestit performatiivin mukaan. Bus itse pysyy
-//! broadcast-mallisena (toimitus kaikille muille) — kohde on *aiottu*
-//! vastaanottaja, jonka muut olennot voivat sivuuttaa.
+//! ## Relationship to the existing bus
+//! This module **does not replace** the [`BusHandle::publish`] path — it
+//! *translates* the verb into an existing [`BusMessage`] and publishes it
+//! via the normal route ([`BusHandle::send_acp`]). The verb and the optional
+//! target ([`AcpEnvelope::to`]) travel along as metadata, so the receiver can
+//! route and filter messages by performative. The bus itself remains
+//! broadcast-based (delivery to all others) — the target is the *intended*
+//! recipient, which other beings may disregard.
 //!
-//! ## OSS-raja (KERROS A)
-//! Ei kovakoodattuja perheen nimiä, ID:itä eikä avaimia. Olentotunnisteet ja
-//! sisältö annetaan ajonaikaisesti; esimerkit käyttävät geneerisiä nimiä
-//! (`agent_a`).
+//! ## OSS boundary (Layer A)
+//! No hardcoded family names, IDs, or keys. Being identifiers and content are
+//! always supplied at runtime; examples use generic names (`agent_a`).
 
 use serde::{Deserialize, Serialize};
 
@@ -28,34 +27,36 @@ use familyclaw_core::Result;
 use crate::bus::BusHandle;
 use crate::message::{BeingId, BusMessage};
 
-/// Vakaa `name`-tunniste μACP-viesteille [`BusMessage::Custom`]-kuoressa.
+/// Stable `name` identifier for `μACP` messages inside the [`BusMessage::Custom`]
+/// envelope.
 ///
-/// Vastaanottaja erottaa μACP-liikenteen muusta busiliikenteestä tämän
-/// nimen perusteella; verbi ja kohde löytyvät hyötykuorman JSON-kentistä.
+/// The receiver distinguishes `μACP` traffic from other bus traffic by this
+/// name; the verb and target are found in the payload's JSON fields.
 pub const ACP_MESSAGE_NAME: &str = "uacp";
 
-/// μACP:n neljä performatiivia (puheaktia).
+/// `μACP`'s four performatives (speech acts).
 ///
-/// Tarkoituksella minimaalinen joukko — laajempi semantiikka rakennetaan
-/// näiden päälle ylemmissä kerroksissa, ei lisäämällä variantteja tähän.
+/// Deliberately a minimal set — broader semantics are built on top of these
+/// in higher layers, not by adding variants here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AcpVerb {
-    /// **Liveness**-koetus: "oletko elossa?" Ei odota sisältövastausta, vain
-    /// merkki olennon tavoitettavuudesta.
+    /// **Liveness** probe: "are you alive?" Does not expect a content reply,
+    /// just a sign of the being's reachability.
     Ping,
-    /// **Fakta**: lähettäjä kertoo jotain todeksi uskomaansa. Ei odota vastausta.
+    /// **Fact**: the sender states something it believes to be true. Does not
+    /// expect a reply.
     Tell,
-    /// **Kysely**: lähettäjä pyytää tietoa ja **odottaa vastausta** (yleensä
-    /// vastaus-`Tell` takaisin).
+    /// **Query**: the sender requests information and **expects a reply**
+    /// (usually a `Tell` sent back).
     Ask,
-    /// **Tapahtuma**: lähettäjä julkaisee havainnon/tapahtuman, jonka muut
-    /// voivat huomioida. Tilatieto, ei suora pyyntö.
+    /// **Event**: the sender publishes an observation/event that others may
+    /// take note of. Informational, not a direct request.
     Observe,
 }
 
 impl AcpVerb {
-    /// Lyhyt vakaa tunniste lokitusta, reititystä ja metriikkaa varten.
+    /// A short, stable identifier for logging, routing, and metrics.
     #[must_use]
     pub const fn as_label(&self) -> &'static str {
         match self {
@@ -66,33 +67,34 @@ impl AcpVerb {
         }
     }
 
-    /// Odottaako tämä performatiivi vastausta? (Vain [`Ask`](AcpVerb::Ask).)
+    /// Does this performative expect a reply? (Only [`Ask`](AcpVerb::Ask).)
     #[must_use]
     pub const fn expects_reply(&self) -> bool {
         matches!(self, AcpVerb::Ask)
     }
 }
 
-/// μACP-kirjekuori: performatiivi + lähettäjä + (valinnainen) kohde + sisältö.
+/// `μACP` envelope: performative + sender + (optional) target + content.
 ///
-/// `to` on **aiottu** vastaanottaja. Resonance Bus toimittaa broadcastina
-/// kaikille muille olennoille, joten kohde on suodatusvihje vastaanottajalle,
-/// ei kova reititysrajoite. `None` tarkoittaa kaikille suunnattua viestiä.
+/// `to` is the **intended** recipient. The Resonance Bus delivers via
+/// broadcast to all other beings, so the target is a filtering hint for the
+/// receiver, not a hard routing constraint. `None` means the message is
+/// addressed to everyone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcpEnvelope {
-    /// Puheakti (performatiivi).
+    /// The speech act (performative).
     pub verb: AcpVerb,
-    /// Viestin lähettävä olento.
+    /// The being sending the message.
     pub from: BeingId,
-    /// Aiottu vastaanottaja, tai `None` jos viesti on suunnattu kaikille.
+    /// The intended recipient, or `None` if the message is addressed to everyone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<BeingId>,
-    /// Vapaamuotoinen tekstihyötykuorma (totuuden lähde, kuten busin muuallakin).
+    /// Free-form text payload (source of truth, as elsewhere on the bus).
     pub payload: String,
 }
 
 impl AcpEnvelope {
-    /// Rakentaa kaikille suunnatun kirjekuoren (`to = None`).
+    /// Builds an envelope addressed to everyone (`to = None`).
     pub fn broadcast(verb: AcpVerb, from: BeingId, payload: impl Into<String>) -> Self {
         Self {
             verb,
@@ -102,7 +104,7 @@ impl AcpEnvelope {
         }
     }
 
-    /// Rakentaa yhdelle olennolle suunnatun kirjekuoren.
+    /// Builds an envelope addressed to a single being.
     pub fn directed(verb: AcpVerb, from: BeingId, to: BeingId, payload: impl Into<String>) -> Self {
         Self {
             verb,
@@ -112,30 +114,31 @@ impl AcpEnvelope {
         }
     }
 
-    /// Apuri: `PING`-kirjekuori liveness-koetukseen (kaikille).
+    /// Helper: a `PING` envelope for a liveness probe (to everyone).
     pub fn ping(from: BeingId) -> Self {
         Self::broadcast(AcpVerb::Ping, from, String::new())
     }
 
-    /// Apuri: `TELL`-kirjekuori (fakta) kaikille.
+    /// Helper: a `TELL` envelope (fact) to everyone.
     pub fn tell(from: BeingId, payload: impl Into<String>) -> Self {
         Self::broadcast(AcpVerb::Tell, from, payload)
     }
 
-    /// Apuri: `ASK`-kirjekuori (kysely) tietylle olennolle.
+    /// Helper: an `ASK` envelope (query) to a specific being.
     pub fn ask(from: BeingId, to: BeingId, payload: impl Into<String>) -> Self {
         Self::directed(AcpVerb::Ask, from, to, payload)
     }
 
-    /// Apuri: `OBSERVE`-kirjekuori (tapahtuma) kaikille.
+    /// Helper: an `OBSERVE` envelope (event) to everyone.
     pub fn observe(from: BeingId, payload: impl Into<String>) -> Self {
         Self::broadcast(AcpVerb::Observe, from, payload)
     }
 
-    /// Kääntää μACP-kirjekuoren busin omaksi [`BusMessage`]:ksi
-    /// ([`BusMessage::Custom`], nimi [`ACP_MESSAGE_NAME`]). Verbi, kohde ja
-    /// sisältö koodataan JSON-hyötykuormaan, jotta vastaanottaja voi tulkita
-    /// performatiivin ja palauttaa kirjekuoren ([`AcpEnvelope::from_bus_message`]).
+    /// Translates a `μACP` envelope into the bus's own [`BusMessage`]
+    /// ([`BusMessage::Custom`], name [`ACP_MESSAGE_NAME`]). The verb, target,
+    /// and content are encoded into the JSON payload, so the receiver can
+    /// interpret the performative and recover the envelope
+    /// ([`AcpEnvelope::from_bus_message`]).
     #[must_use]
     pub fn to_bus_message(&self) -> BusMessage {
         BusMessage::Custom {
@@ -148,8 +151,8 @@ impl AcpEnvelope {
         }
     }
 
-    /// Kuten [`to_bus_message`](Self::to_bus_message), mutta **kuluttaa**
-    /// kirjekuoren (välttää tekstisisällön kloonauksen lähetyspolulla).
+    /// Like [`to_bus_message`](Self::to_bus_message), but **consumes** the
+    /// envelope (avoids cloning the text content on the send path).
     #[must_use]
     pub fn into_bus_message(self) -> BusMessage {
         BusMessage::Custom {
@@ -162,11 +165,13 @@ impl AcpEnvelope {
         }
     }
 
-    /// Yrittää lukea μACP-kirjekuoren takaisin busiviestistä. Palauttaa `None`
-    /// jos viesti ei ole μACP-viesti (väärä nimi) tai hyötykuorma ei jäsenny.
+    /// Attempts to recover a `μACP` envelope from a bus message. Returns `None`
+    /// if the message is not a `μACP` message (wrong name) or the payload does
+    /// not parse.
     ///
-    /// `from` ei kulje [`BusMessage`]:ssä (se on kirjekuoren
-    /// [`ResonanceMessage::from`]-kentässä), joten se annetaan erikseen.
+    /// `from` does not travel inside [`BusMessage`] (it lives in the
+    /// envelope's [`ResonanceMessage::from`] field), so it is supplied
+    /// separately.
     ///
     /// [`ResonanceMessage::from`]: crate::message::ResonanceMessage::from
     #[must_use]
@@ -193,16 +198,16 @@ impl AcpEnvelope {
 }
 
 impl BusHandle {
-    /// Lähettää μACP-kirjekuoren olemassa olevaa [`publish`](BusHandle::publish)-
-    /// polkua pitkin. Verbi käännetään [`BusMessage::Custom`]:ksi
-    /// ([`AcpEnvelope::to_bus_message`]); itse julkaisu, broadcast ja
-    /// supervision toimivat täsmälleen kuten tavallisella publishilla.
+    /// Sends a `μACP` envelope over the existing [`publish`](BusHandle::publish)
+    /// path. The verb is translated into [`BusMessage::Custom`]
+    /// ([`AcpEnvelope::to_bus_message`]); the publish itself, the broadcast,
+    /// and supervision all work exactly like a regular publish.
     ///
-    /// Tämä on **lisäys** publishin päälle, ei korvaus: kaikki olemassa oleva
-    /// busiliikenne jatkaa entiseen tapaan.
+    /// This is an **addition** on top of publish, not a replacement: all
+    /// existing bus traffic continues as before.
     ///
     /// # Errors
-    /// [`FamilyClawError::Bus`] jos viestin lähetys busille epäonnistuu.
+    /// [`FamilyClawError::Bus`] if sending the message to the bus fails.
     ///
     /// [`FamilyClawError::Bus`]: familyclaw_core::FamilyClawError::Bus
     pub fn send_acp(&self, envelope: AcpEnvelope) -> Result<()> {
@@ -249,7 +254,7 @@ mod tests {
         assert_eq!(AcpVerb::Ask.as_label(), "ask");
         assert_eq!(AcpVerb::Observe.as_label(), "observe");
 
-        // Vain ASK odottaa vastausta.
+        // Only ASK expects a reply.
         assert!(AcpVerb::Ask.expects_reply());
         assert!(!AcpVerb::Ping.expects_reply());
         assert!(!AcpVerb::Tell.expects_reply());
@@ -262,35 +267,35 @@ mod tests {
         let to = BeingId::new();
         let cases = [
             AcpEnvelope::ping(from),
-            AcpEnvelope::tell(from, "taivas on sininen"),
-            AcpEnvelope::ask(from, to, "mikä kello on?"),
-            AcpEnvelope::observe(from, "ovi avautui"),
+            AcpEnvelope::tell(from, "the sky is blue"),
+            AcpEnvelope::ask(from, to, "what time is it?"),
+            AcpEnvelope::observe(from, "the door opened"),
         ];
 
         for env in cases {
             let msg = env.to_bus_message();
-            // Kääntyy Custom-viestiksi vakaalla nimellä.
+            // Translates into a Custom message with a stable name.
             match &msg {
                 BusMessage::Custom { name, .. } => assert_eq!(name, ACP_MESSAGE_NAME),
-                other => panic!("odotettiin Custom, saatiin {other:?}"),
+                other => panic!("expected Custom, got {other:?}"),
             }
-            // Ja palautuu takaisin samaksi kirjekuoreksi.
-            let back = AcpEnvelope::from_bus_message(env.from, &msg)
-                .expect("μACP-viesti jäsentyy takaisin");
-            assert_eq!(back, env, "verbi {} ei roundtripannut", env.verb.as_label());
+            // And round-trips back into the same envelope.
+            let back =
+                AcpEnvelope::from_bus_message(env.from, &msg).expect("μACP message parses back");
+            assert_eq!(back, env, "verb {} did not round-trip", env.verb.as_label());
         }
     }
 
     #[test]
     fn non_acp_custom_message_is_not_parsed() {
         let msg = BusMessage::Custom {
-            name: "ei-uacp".to_string(),
+            name: "not-uacp".to_string(),
             payload: serde_json::json!({ "verb": "ping" }),
         };
         assert!(AcpEnvelope::from_bus_message(BeingId::new(), &msg).is_none());
 
-        // Myös ei-Custom-viesti palauttaa None.
-        assert!(AcpEnvelope::from_bus_message(BeingId::new(), &BusMessage::text("hei")).is_none());
+        // A non-Custom message also returns None.
+        assert!(AcpEnvelope::from_bus_message(BeingId::new(), &BusMessage::text("hi")).is_none());
     }
 
     #[test]
@@ -311,35 +316,39 @@ mod tests {
         assert_eq!(env, back);
     }
 
-    /// `send_acp` reitittää μACP-viestin OLEMASSA OLEVAN publish-polun yli:
-    /// sisarukset saavat sen, lähettäjä ei (sama semantiikka kuin publishilla),
-    /// ja viesti jäsentyy oikeaksi verbiksi vastaanottajan päässä.
+    /// `send_acp` routes the `μACP` message over the EXISTING publish path:
+    /// siblings receive it, the sender does not (same semantics as publish),
+    /// and the message parses into the correct verb on the receiver's side.
     #[tokio::test]
     async fn send_acp_routes_verbs_over_publish_path() {
         let bus = ResonanceBus::start(None).await.expect("start bus");
         let (id_a, _a, log_a) = join_being(&bus, "agent_a").await;
         let (_id_b, _b, log_b) = join_being(&bus, "agent_b").await;
 
-        bus.send_acp(AcpEnvelope::tell(id_a, "fakta sisaruksille"))
+        bus.send_acp(AcpEnvelope::tell(id_a, "a fact for the siblings"))
             .expect("send_acp tell");
         settle().await;
 
-        // Lähettäjä ei saa omaa viestiään (publishin broadcast-sääntö pätee).
-        assert_eq!(log_len(&log_a), 0, "lähettäjä ei saa omaa μACP-viestiään");
-        // Sisarus saa sen, ja se jäsentyy oikeaksi verbiksi.
-        assert_eq!(log_len(&log_b), 1, "sisarus saa μACP-viestin");
+        // The sender does not receive its own message (publish's broadcast rule applies).
+        assert_eq!(
+            log_len(&log_a),
+            0,
+            "the sender does not receive its own μACP message"
+        );
+        // The sibling receives it, and it parses into the correct verb.
+        assert_eq!(log_len(&log_b), 1, "the sibling receives the μACP message");
         let received = log_b.lock().expect("lock")[0].clone();
         assert_eq!(received.from, id_a);
         let acp = AcpEnvelope::from_bus_message(received.from, &received.payload)
-            .expect("vastaanotettu viesti on μACP");
+            .expect("the received message is μACP");
         assert_eq!(acp.verb, AcpVerb::Tell);
-        assert_eq!(acp.payload, "fakta sisaruksille");
+        assert_eq!(acp.payload, "a fact for the siblings");
         assert_eq!(acp.from, id_a);
 
         bus.stop();
     }
 
-    /// Eri verbit reitittyvät kukin omana performatiivinaan saman polun yli.
+    /// Different verbs each route as their own performative over the same path.
     #[tokio::test]
     async fn each_verb_arrives_with_correct_performative() {
         let bus = ResonanceBus::start(None).await.expect("start bus");
@@ -347,14 +356,14 @@ mod tests {
         let (id_b, _b, log_b) = join_being(&bus, "agent_b").await;
 
         bus.send_acp(AcpEnvelope::ping(id_a)).expect("ping");
-        bus.send_acp(AcpEnvelope::ask(id_a, id_b, "kysymys"))
+        bus.send_acp(AcpEnvelope::ask(id_a, id_b, "a question"))
             .expect("ask");
-        bus.send_acp(AcpEnvelope::observe(id_a, "tapahtuma"))
+        bus.send_acp(AcpEnvelope::observe(id_a, "an event"))
             .expect("observe");
         settle().await;
 
         let received = log_b.lock().expect("lock");
-        assert_eq!(received.len(), 3, "kolme μACP-viestiä toimitettu");
+        assert_eq!(received.len(), 3, "three μACP messages delivered");
         let verbs: Vec<AcpVerb> = received
             .iter()
             .map(|m| {
@@ -365,14 +374,14 @@ mod tests {
             .collect();
         assert_eq!(verbs, vec![AcpVerb::Ping, AcpVerb::Ask, AcpVerb::Observe]);
 
-        // ASK kantoi kohteen (directed), muut eivät.
+        // ASK carried a target (directed), the others did not.
         let ask = received
             .iter()
             .find_map(|m| {
                 let e = AcpEnvelope::from_bus_message(m.from, &m.payload)?;
                 (e.verb == AcpVerb::Ask).then_some(e)
             })
-            .expect("ask löytyy");
+            .expect("ask is found");
         assert_eq!(ask.to, Some(id_b));
 
         drop(received);

@@ -1,27 +1,28 @@
 //! # familyclaw-emotion
 //!
-//! 19-ulotteinen VAD-tunnemoottorin **RUNKO** FamilyClaw-alustalle (KERROS A,
-//! OSS). Tämä crate tarjoaa tunneavaruuden *rakenteen* — dimensiot, VAD-
-//! projektion, blend-tunnistuksen ja decay-mekanismin — mutta **ei mitään
-//! kalibrointia**. Yhdenkään olennon painoja ei kovakoodata tähän.
+//! The 19-dimensional VAD emotion engine **scaffold** for the `FamilyClaw`
+//! platform (Layer A, OSS). This crate provides the *structure* of the
+//! emotion space — dimensions, VAD projection, blend detection, and the
+//! decay mechanism — but **no calibration whatsoever**. No being's weights
+//! are hardcoded into this.
 //!
-//! ## OSS-raja (KERROS A)
-//! Tämä crate on julkaistava. Se ei sisällä:
-//! - minkään olennon oikeita tunnepainoja (esim. yhden agentin kalibrointipainot),
-//! - API-avaimia, tokeneita, IP-osoitteita tai henkilökohtaisia polkuja.
+//! ## OSS boundary (Layer A)
+//! This crate is publishable. It does not contain:
+//! - any being's real emotion weights (e.g. one agent's calibration weights),
+//! - API keys, tokens, IP addresses, or personal paths.
 //!
-//! Per-kone viritys ladataan ajonaikaisesti omana
-//! [`EmotionCalibration`]-toteutuksena (KERROS B, profiilihakemisto). Rungon
-//! oletus on [`NeutralCalibration`] — täysin neutraali, kalibroimaton.
+//! Per-machine tuning is loaded at runtime as its own
+//! [`EmotionCalibration`] implementation (Layer B, profile directory). The
+//! scaffold's default is [`NeutralCalibration`] — fully neutral, uncalibrated.
 //!
-//! ## Rakenne
-//! - [`Dimension`] — 19 nimettyä tunneakselia + VAD-ankkurit.
-//! - [`EmotionState`] — hetkellinen tila (`[f32; 19]`, `0.0..=100.0`).
-//! - [`Vad`] — matala-ulotteinen yhteenveto (valence/arousal/dominance).
-//! - [`Blend`] / [`BlendMatch`] — nimettyjen tunneyhdistelmien tunnistus.
-//! - [`EmotionCalibration`] — per-kone viritys (baseline, decay-nopeus).
+//! ## Structure
+//! - [`Dimension`] — 19 named emotion axes + VAD anchors.
+//! - [`EmotionState`] — momentary state (`[f32; 19]`, `0.0..=100.0`).
+//! - [`Vad`] — a low-dimensional summary (valence/arousal/dominance).
+//! - [`Blend`] / [`BlendMatch`] — detection of named emotion combinations.
+//! - [`EmotionCalibration`] — per-machine tuning (baseline, decay rate).
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_emotion::{Dimension, EmotionState, NeutralCalibration};
 //!
@@ -30,14 +31,14 @@
 //! state.stimulate(Dimension::Love, 70.0);
 //! state.stimulate(Dimension::Tenderness, 90.0);
 //!
-//! // Tunnistaa nimetyn blendin (grateful_warmth).
+//! // Recognizes the named blend (grateful_warmth).
 //! let blend = state.primary_blend().expect("blend present");
 //! assert_eq!(blend.blend.as_str(), "grateful_warmth");
 //!
-//! // Projisoi VAD-yhteenvedoksi (lämmin → positiivinen valence).
+//! // Projects to a VAD summary (warm → positive valence).
 //! assert!(state.to_vad().valence > 0.0);
 //!
-//! // Vaimenee ajan myötä kohti neutraalia lepotilaa.
+//! // Decays over time toward a neutral resting state.
 //! state.decay(1800.0, &NeutralCalibration);
 //! assert!(state.value(Dimension::Gratitude) < 80.0);
 //! ```
@@ -65,7 +66,7 @@ pub use strategic::{Situation, StrategicAppraisal};
 pub use transition::{EmotionTransition, DEFAULT_INERTIA};
 pub use vad::Vad;
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -73,7 +74,7 @@ pub const fn version() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    // Testit vertaavat tarkasti esitettäviä f32-vakioita — tarkka vertailu ok.
+    // Tests compare exactly representable f32 constants — exact comparison is fine.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -85,7 +86,7 @@ mod tests {
 
     #[test]
     fn public_api_is_reexported() {
-        // Jos jokin re-export poistetaan, tämä testi ei käänny.
+        // If any re-export is removed, this test fails to compile.
         let mut state = EmotionState::neutral();
         state.set(Dimension::Curiosity, 60.0);
         state.set(Dimension::Awe, 60.0);
@@ -104,13 +105,13 @@ mod tests {
         let table: TableCalibration = TableCalibration::new("b");
         let _ = table.label();
 
-        // Blend-katalogi tavoitettavissa juuresta.
+        // Blend catalog reachable from the crate root.
         assert_eq!(Blend::AweStruck.as_str(), "awe_struck");
     }
 
     #[test]
     fn end_to_end_emotional_arc() {
-        // Kokonaiskaari: ärsyke → blendi → VAD → decay kohti neutraalia.
+        // Full arc: stimulus → blend → VAD → decay toward neutral.
         let mut state = EmotionState::neutral();
         state.stimulate(Dimension::Sisu, 70.0);
         state.stimulate(Dimension::Hope, 65.0);
@@ -120,13 +121,16 @@ mod tests {
         assert_eq!(blend.blend, Blend::DeterminedHope);
         assert!(
             state.to_vad().dominance > 0.5,
-            "sisu+pride → korkea dominanssi"
+            "sisu+pride → high dominance"
         );
 
-        // Pitkä vaimeneminen neutraalilla kalibroinnilla → blendi katoaa.
+        // Long decay under neutral calibration → blend disappears.
         for _ in 0..10 {
             state.decay(DEFAULT_HALF_LIFE_SECS, &NeutralCalibration);
         }
-        assert!(state.primary_blend().is_none(), "blendin pitäisi vaimentua");
+        assert!(
+            state.primary_blend().is_none(),
+            "blend should have decayed away"
+        );
     }
 }

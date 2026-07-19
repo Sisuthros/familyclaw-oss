@@ -1,10 +1,10 @@
-//! ACP-clientin ydin — spawnaa CLI-agentin ja hallinnoi JSON-viestiliikennettä.
+//! Core of the ACP client — spawns a CLI agent and manages JSON message traffic.
 //!
-//! [`AcpClient`] käynnistää CLI-agentin aliprosessina ACP-moodissa
-//! (`--acp`-lippu), lähettää promptit stdin:iin JSON-muodossa ja palauttaa
-//! vastaukset [`AcpResponse`]-olioina.
+//! [`AcpClient`] launches a CLI agent as a subprocess in ACP mode
+//! (the `--acp` flag), sends prompts to stdin as JSON, and returns
+//! responses as [`AcpResponse`] objects.
 //!
-//! ## Käyttö
+//! ## Usage
 //! ```ignore
 //! use familyclaw_acp::{AcpClient, AcpAgentConfig, AcpRequest};
 //!
@@ -25,50 +25,50 @@ use crate::config::AcpAgentConfig;
 use crate::error::AcpError;
 use crate::message::{AcpRequest, AcpResponse};
 
-/// Aktiivinen ACP-yhteys CLI-agenttiin.
+/// An active ACP connection to a CLI agent.
 ///
-/// Omistaa aliprosessin ja hallinnoi stdin/stdout-yhteyttä.
-/// Vapauta [`shutdown`](Self::shutdown):lla kun sessio päättyy.
+/// Owns the subprocess and manages the stdin/stdout connection.
+/// Release it with [`shutdown`](Self::shutdown) when the session ends.
 #[derive(Debug)]
 pub struct AcpClient {
-    /// Konfiguraatio jolla agentti spawnattiin.
+    /// Configuration the agent was spawned with.
     config: AcpAgentConfig,
-    /// Aliprosessi (pidetään elossa koko session ajan).
+    /// The subprocess (kept alive for the duration of the session).
     child: Child,
-    /// Agentin stdout-lukija (rivipohjainen JSON).
+    /// The agent's stdout reader (line-based JSON).
     reader: BufReader<tokio::process::ChildStdout>,
 }
 
 impl AcpClient {
-    /// Spawnaa ACP-agentin aliprosessina.
+    /// Spawns the ACP agent as a subprocess.
     ///
-    /// Lisää automaattisesti `--acp`-lipun argumentteihin.
+    /// Automatically adds the `--acp` flag to the arguments.
     ///
     /// # Errors
-    /// [`AcpError::Spawn`] jos binääriä ei löydy tai prosessi ei käynnisty.
+    /// [`AcpError::Spawn`] if the binary cannot be found or the process fails to start.
     pub fn spawn(config: &AcpAgentConfig) -> Result<Self, AcpError> {
         let mut cmd = Command::new(&config.binary);
 
-        // ACP-moodi päälle
+        // Enable ACP mode
         cmd.arg("--acp");
 
-        // Lisäargumentit
+        // Additional arguments
         for arg in &config.args {
             cmd.arg(arg);
         }
 
-        // Työhakemisto
+        // Working directory
         if let Some(ref dir) = config.working_dir {
             cmd.current_dir(dir);
         }
 
-        // Stdio: stdin kirjoitusta varten, stdout lukemista varten,
-        // stderr peritään (debug-lokit näkyviin).
+        // Stdio: stdin for writing, stdout for reading,
+        // stderr is inherited (so debug logs are visible).
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::inherit());
 
-        // Estä prosessia perimästä signaaleja suoraan
+        // Prevent the process from inheriting signals directly
         cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn().map_err(|e| AcpError::Spawn {
@@ -97,19 +97,19 @@ impl AcpClient {
         })
     }
 
-    /// Lähettää promptin agentille ja palauttaa vastauksen.
+    /// Sends a prompt to the agent and returns the response.
     ///
     /// # Errors
-    /// [`AcpError::Io`] jos stdin/stdout-yhteys katkeaa.
-    /// [`AcpError::Timeout`] jos agentti ei vastaa aikarajan puitteissa.
-    /// [`AcpError::Json`] jos vastausta ei voi parsia.
+    /// [`AcpError::Io`] if the stdin/stdout connection breaks.
+    /// [`AcpError::Timeout`] if the agent doesn't respond within the time limit.
+    /// [`AcpError::Json`] if the response cannot be parsed.
     pub async fn send(&mut self, request: AcpRequest) -> Result<AcpResponse, AcpError> {
         let stdin = self.child.stdin.as_mut().ok_or_else(|| AcpError::Spawn {
             binary: self.config.binary.clone(),
             reason: "stdin already consumed".to_string(),
         })?;
 
-        // Lähetä prompt JSON-muodossa
+        // Send the prompt as JSON
         let json = serde_json::to_string(&request)?;
         let mut line = json;
         line.push('\n');
@@ -118,7 +118,7 @@ impl AcpClient {
 
         tracing::debug!(agent = %self.config.name, "ACP prompt sent");
 
-        // Lue vastaus (yksi JSON-rivi)
+        // Read the response (a single JSON line)
         let response = timeout(
             std::time::Duration::from_secs(self.config.timeout_secs),
             self.read_response(),
@@ -139,13 +139,13 @@ impl AcpClient {
         Ok(response)
     }
 
-    /// Lukee yhden JSON-vastauksen agentin stdout:sta.
+    /// Reads a single JSON response from the agent's stdout.
     async fn read_response(&mut self) -> Result<AcpResponse, AcpError> {
         let mut line = String::new();
         self.reader.read_line(&mut line).await?;
 
         if line.is_empty() {
-            // Agentti sammui — tarkista exit-koodi
+            // The agent exited — check the exit code
             let status = self.child.wait().await?;
             return Err(AcpError::Crash {
                 agent: self.config.name.clone(),
@@ -157,21 +157,21 @@ impl AcpClient {
         serde_json::from_str(trimmed).map_err(AcpError::from)
     }
 
-    /// Samuttaa agentin siististi.
+    /// Shuts the agent down cleanly.
     ///
-    /// Lähettää shutdown-viestin ja odottaa prosessin päättymistä.
+    /// Sends a shutdown message and waits for the process to exit.
     pub async fn shutdown(mut self) -> Result<(), AcpError> {
-        // Yritä siisti sammutus
+        // Attempt a clean shutdown
         if let Some(ref mut stdin) = self.child.stdin {
             let _ = stdin.write_all(b"{\"shutdown\": true}\n").await;
             let _ = stdin.flush().await;
         }
 
-        // Anna hetki aikaa siivota, sitten force-kill
+        // Give it a moment to clean up, then force-kill
         let _ = timeout(std::time::Duration::from_secs(5), self.child.wait()).await;
 
         if let Err(e) = self.child.kill().await {
-            // Prosessi saattaa olla jo kuollut — ok
+            // The process may already be dead — that's fine
             tracing::debug!(agent = %self.config.name, "kill result: {e:?}");
         }
 
@@ -179,21 +179,21 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Palauttaa agentin nimen.
+    /// Returns the agent's name.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.config.name
     }
 
-    /// Palauttaa prosessin PID:n (jos elossa).
+    /// Returns the process PID (if alive).
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
     }
 }
 
-// AcpClient EI ole Send/Sync koska se omistaa aliprosessin —
-// tämä on tarkoituksellista. Agentti on yhden säikeen omistuksessa.
+// AcpClient is NOT Send/Sync because it owns the subprocess —
+// this is intentional. The agent is owned by a single thread.
 //
-// Jos halutaan jakaa agentti usealle säikeelle, käytä `Arc<Mutex<AcpClient>>`:ia
-// tai `Actor`-mallia (Ractor).
+// To share an agent across multiple threads, use `Arc<Mutex<AcpClient>>`
+// or an `Actor` pattern (Ractor).

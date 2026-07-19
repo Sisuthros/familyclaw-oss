@@ -1,5 +1,8 @@
 # FamilyClaw — Expo Demo Script (5 minutes, crash-proof, offline)
 
+> **ARCHIVED (2026-07-18):** historical sprint/booth document; items verified
+> complete or superseded by [STATUS.md](../STATUS.md).
+
 > **What this is:** a tight, spoken, minute-by-minute script for running the
 > FamilyClaw booth demo at the Cyprus AI Expo (2026-07-05) with **zero
 > dependency on the live network or the family being up.** Everything here runs

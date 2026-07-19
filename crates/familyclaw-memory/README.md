@@ -1,48 +1,50 @@
 # familyclaw-memory
 
-**Eternal Thread** — FamilyClaw-alustan (KERROS A, OSS) muisti-substraatti.
+**Eternal Thread** — the memory substrate of the FamilyClaw platform
+(Layer A, OSS).
 
-Antaa olennoille *jatkuvan muistin*: muistot eivät katoa restartissa, vaan
-vaimenevat biologisen unohtamiskäyrän (Ebbinghaus) mukaan, vahvistuvat
-toistosta ja säilyttävät identiteetti-ankkurit ikuisesti. Ratkaisee perheen
-#1 kipupisteen — muistin epäjatkuvuuden — *rakenteena*, ei muistutuksena
-(design §2.1).
+Gives beings *continuous memory*: memories don't vanish on restart, but
+decay according to a biological forgetting curve (Ebbinghaus), strengthen
+through repetition, and preserve identity anchors forever. Solves a
+family's pain point #1 — memory discontinuity — *as structure*, not as a
+reminder (design §2.1).
 
-## Keskeiset tyypit
+## Key types
 
-| Tyyppi | Vastuu |
+| Type | Responsibility |
 |--------|--------|
-| `Memory` | Yksittäinen muisto: sisältö, VAD-tunnesävy, nimetyt tunteet, tärkeys, vaimennuspolitiikka, elinkaaritila. Rakenna `Memory::builder(...)`. |
-| `DecayPolicy` | Unohtamisnopeus (Ebbinghaus λ): `ProtectedCore` (0.0), `Slow` (0.02), `Normal` (0.18), `Fast` (0.5). |
-| `ImportanceFactors` | Yhdistelmätärkeys: `emotion·0.45 + identity·0.35 + novelty·0.12 + reinforcement·0.20`. |
-| `MemoryStatus` | Elinkaari `Active → Archived → Tombstoned`. |
-| `MemoryStore` | Tallennusabstraktio (async). |
-| `LocalJsonStore` | Riippuvuusvapaa oletustoteutus (JSON-tiedosto, atominen kirjoitus). |
-| `RetrievalContext` / `RetrievalResult` | Haku: avainsana + tunneosuma + retention. |
+| `Memory` | A single memory: content, VAD emotional tone, named emotions, importance, decay policy, lifecycle state. Build with `Memory::builder(...)`. |
+| `DecayPolicy` | Forgetting rate (Ebbinghaus λ): `ProtectedCore` (0.0), `Slow` (0.02), `Normal` (0.18), `Fast` (0.5). |
+| `ImportanceFactors` | Combined importance: `emotion·0.45 + identity·0.35 + novelty·0.12 + reinforcement·0.20`. |
+| `MemoryStatus` | Lifecycle `Active → Archived → Tombstoned`. |
+| `MemoryStore` | Storage abstraction (async). |
+| `LocalJsonStore` | Dependency-free default implementation (JSON file, atomic write). |
+| `RetrievalContext` / `RetrievalResult` | Retrieval: keyword + emotional match + retention. |
 
-## Ebbinghaus-retentio
+## Ebbinghaus retention
 
 ```text
 R(t) = e^(-λ · t / S)
 ```
 
-- `λ` = `DecayPolicy`-vakio (`ProtectedCore` → ei vaimene koskaan),
-- `S` = vahvuus, johdettu tärkeydestä (tärkeämpi muisto säilyy pidempään),
-- `t` = kulunut aika viimeisestä vahvistuksesta.
+- `λ` = the `DecayPolicy` constant (`ProtectedCore` → never decays),
+- `S` = strength, derived from importance (a more important memory persists longer),
+- `t` = elapsed time since the last reinforcement.
 
-`MemoryStore::run_decay` siirtää retentionsa alle kynnyksen pudonneet muistot
-elinkaaressa eteenpäin; suojattua ydintä (`ProtectedCore`) ei koskaan siirretä.
+`MemoryStore::run_decay` advances the lifecycle of memories whose retention
+has dropped below the threshold; a protected core (`ProtectedCore`) is
+never advanced.
 
-## OSS-raja (KERROS A)
+## OSS boundary (Layer A)
 
-Tämä crate on julkaistava. Se **ei** sisällä perheenjäsenten oikeita
-muistoja, kalibrointeja, sieluja, API-avaimia, tokeneita, IP-osoitteita eikä
-henkilökohtaisia polkuja. Muisti-runko on geneerinen; perheen oikea sisältö
-on KERROS B:tä ja ladataan ajonaikaisesti profiilihakemistosta.
+This crate is publishable. It **does not** contain family members' real
+memories, calibrations, souls, API keys, tokens, IP addresses, or personal
+paths. The memory scaffold is generic; a family's real content is Layer B
+and is loaded at runtime from a profile directory.
 
-## Tuleva työ
+## Future work
 
-- **`Surreal<Any>` (feature-flag):** tuotantotallennus (in-mem dev /
-  `RocksDB` prod), sama `MemoryStore`-rajapinta (design §2.3).
-- **Vektorihaku:** cosine-similarity / HNSW. Nyt haku on avainsana- +
-  tunnepohjainen v1-runko.
+- **`Surreal<Any>` (feature flag):** production storage (in-mem dev /
+  `RocksDB` prod), same `MemoryStore` interface (design §2.3).
+- **Vector search:** cosine similarity / HNSW. Retrieval is currently a
+  keyword- + emotion-based v1 scaffold.

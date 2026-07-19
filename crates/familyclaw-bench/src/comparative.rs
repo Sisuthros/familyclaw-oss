@@ -1,26 +1,25 @@
-//! [`ComparativeScorecard`]: kahden subjektin tulosten **vertailu kasvotusten**.
+//! [`ComparativeScorecard`]: a **head-to-head comparison** of two subjects' results.
 //!
-//! Tämä on `surpass`-todistuksen julkinen artefakti: sama deterministinen
-//! skenaariosarja ajetaan **molemmilla** subjekteilla
-//! ([`FamilyClawSubject`](crate::FamilyClawSubject) ja
-//! [`MarkdownFileSubject`](crate::subjects::MarkdownFileSubject)) ja tulokset
-//! renderöidään rinnakkain kaksisarakkeiseen taulukkoon per skenaario. Lukija
-//! näkee yhdellä silmäyksellä missä FamilyClaw läpäisee ja perustaso epäonnistuu.
+//! This is the public artifact for the `surpass` proof: the same
+//! deterministic scenario suite is run against **both** subjects
+//! ([`FamilyClawSubject`](crate::FamilyClawSubject) and
+//! [`MarkdownFileSubject`](crate::subjects::MarkdownFileSubject)), and the
+//! results are rendered side by side in a two-column table per scenario. The
+//! reader sees at a glance where FamilyClaw passes and the baseline fails.
 //!
-//! ## Rehellisyysvaroitus (kova vaatimus)
-//! Perustaso EI ole aito OpenClaw eikä Hermes Agent — se on
-//! *kilpailijan-MUOTOINEN malli* (truncaava `MEMORY.md` + sivuvaikutukset
-//! ajetaan uudelleen restartissa). Vertailuraportin **ylätunniste sanoo tämän
-//! suoraan**, jottei kukaan voi lukea sitä väitteenä jonkin oikean tuotteen
-//! sisäelimistä. Mallinnetut käyttäytymiset ovat dokumentoituja
-//! epäonnistumistiloja — ei kärjistyksiä.
+//! ## Honesty warning (hard requirement)
+//! The baseline is NOT a real OpenClaw or Hermes Agent — it is a
+//! *competitor-SHAPED model* (a truncating `MEMORY.md` plus side effects
+//! that re-run on restart). The comparison report's **header states this
+//! plainly**, so no one can read it as a claim about any real product's
+//! internals. The modeled behaviors are documented failure modes — not
+//! exaggerations.
 //!
-//! ## Reprodusoitavuus (design §2.2, §6)
-//! Molemmat scorecardit rakennetaan **injektoidulla** kellolla
-//! ([`Timestamp`]) — järjestelmäkelloa ei lueta. Skenaariotulokset
-//! lajitellaan tunnisteella ([`Scorecard::new`]), ja vertailu yhdistää ne
-//! tunnisteen mukaan, joten sama syöte → tavu-tavulta identtinen markdown
-//! joka ajolla.
+//! ## Reproducibility (design §2.2, §6)
+//! Both scorecards are built with an **injected** clock ([`Timestamp`]) —
+//! the system clock is never read. Scenario results are sorted by ID
+//! ([`Scorecard::new`]), and the comparison joins them by ID, so the same
+//! input produces byte-for-byte identical markdown on every run.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -30,52 +29,51 @@ use familyclaw_core::{time, Timestamp};
 use crate::scenario::ScenarioResult;
 use crate::scorecard::Scorecard;
 
-/// Avain niille mittareille jotka nostetaan vertailutaulukkoon näkyviin
-/// (design §3: nämä erottavat durable-replayn truncaavasta perustasosta).
+/// Keys for the metrics surfaced in the comparison table (design §3: these
+/// are what distinguish durable replay from the truncating baseline).
 ///
-/// Jos skenaario ei kirjaa jotakin näistä, sarakkeeseen tulee `—`.
+/// If a scenario doesn't record one of these, the column shows `—`.
 const KEY_METRICS: [&str; 4] = [
-    // S1: kuinka moni sivuvaikutus ajettiin uudelleen restartissa (tavoite 0).
+    // S1: how many side effects were re-run on restart (target: 0).
     "side_effect_overcount",
-    // S1: jatkuiko työ täsmälleen oikeasta askelesta (1.0 = täydellinen).
+    // S1: did work resume from exactly the right step (1.0 = perfect).
     "resume_correctness",
-    // S2: säilyivätkö identiteetti-ankkurit 90 päivän jälkeen (retention).
+    // S2: did identity anchors survive after 90 days (retention).
     "anchor_retention_90d",
-    // S2: löysikö subjektin oma recall odotetut osumat.
+    // S2: did the subject's own recall find the expected hits.
     "subject_recall_hits",
 ];
 
-/// Kahden subjektin scorecardien vertailu kasvotusten.
+/// A head-to-head comparison of two subjects' scorecards.
 ///
-/// `familyclaw` ja `baseline` on ajettu **samalla** skenaariosarjalla ja
-/// **samalla** injektoidulla kellolla. [`to_markdown`](Self::to_markdown)
-/// renderöi rehellisesti merkityn vertailuraportin.
+/// `familyclaw` and `baseline` were run with the **same** scenario suite and
+/// the **same** injected clock. [`to_markdown`](Self::to_markdown) renders
+/// an honestly labeled comparison report.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComparativeScorecard {
-    /// FamilyClaw-subjektin tuloskortti (ensimmäinen sarake).
+    /// The FamilyClaw subject's scorecard (first column).
     pub familyclaw: Scorecard,
-    /// Kilpailijan-muotoisen perustason tuloskortti (toinen sarake).
+    /// The competitor-shaped baseline's scorecard (second column).
     pub baseline: Scorecard,
-    /// Injektoitu referenssihetki — EI järjestelmäkello (reprodusoitavuus).
+    /// The injected reference instant — NOT the system clock (reproducibility).
     pub clock: Timestamp,
 }
 
-/// Yhden mittarin vertailurivi (FamilyClaw vs perustaso) renderöintiä varten.
+/// A single metric's comparison row (FamilyClaw vs baseline) for rendering.
 struct MetricRow {
-    /// Mittarin avain (esim. `side_effect_overcount`).
+    /// The metric's key (e.g. `side_effect_overcount`).
     key: String,
-    /// FamilyClaw-arvo muotoiltuna tai `—` jos puuttuu.
+    /// The FamilyClaw value, formatted, or `—` if missing.
     familyclaw: String,
-    /// Perustason arvo muotoiltuna tai `—` jos puuttuu.
+    /// The baseline value, formatted, or `—` if missing.
     baseline: String,
 }
 
 impl ComparativeScorecard {
-    /// Rakentaa vertailun kahdesta scorecardista ja injektoidusta kellosta.
+    /// Builds a comparison from two scorecards and an injected clock.
     ///
-    /// Molempien scorecardien skenaariot ovat jo lajiteltuja tunnisteella
-    /// ([`Scorecard::new`]:n takaama), joten yhdistäminen tunnisteella on
-    /// deterministinen.
+    /// Both scorecards' scenarios are already sorted by ID (guaranteed by
+    /// [`Scorecard::new`]), so joining by ID is deterministic.
     #[must_use]
     pub fn new(familyclaw: Scorecard, baseline: Scorecard, clock: Timestamp) -> Self {
         Self {
@@ -85,13 +83,13 @@ impl ComparativeScorecard {
         }
     }
 
-    /// Etsii skenaariotuloksen tunnisteella scorecardista (lineaarinen haku;
-    /// skenaarioita on kourallinen).
+    /// Looks up a scenario result by ID in a scorecard (linear search; there
+    /// are only a handful of scenarios).
     fn find<'a>(card: &'a Scorecard, id: &str) -> Option<&'a ScenarioResult> {
         card.scenarios.iter().find(|s| s.id == id)
     }
 
-    /// Muotoilee yhden subjektin pass/fail-merkinnän skenaariolle.
+    /// Formats a single subject's pass/fail label for a scenario.
     fn outcome(result: Option<&ScenarioResult>) -> &'static str {
         match result {
             Some(r) if r.passed => "PASS",
@@ -100,8 +98,8 @@ impl ComparativeScorecard {
         }
     }
 
-    /// Kokoaa skenaarion avainmittarit vertailuriveiksi (deterministinen
-    /// järjestys: [`KEY_METRICS`]).
+    /// Assembles a scenario's key metrics into comparison rows (deterministic
+    /// order: [`KEY_METRICS`]).
     fn metric_rows(fc: Option<&ScenarioResult>, base: Option<&ScenarioResult>) -> Vec<MetricRow> {
         let fmt = |result: Option<&ScenarioResult>, key: &str| -> String {
             result
@@ -111,7 +109,7 @@ impl ComparativeScorecard {
         KEY_METRICS
             .iter()
             .filter(|key| {
-                // Näytä mittari vain jos vähintään toinen subjekti kirjasi sen.
+                // Only show a metric if at least one subject recorded it.
                 fc.is_some_and(|r| r.metrics.contains_key(**key))
                     || base.is_some_and(|r| r.metrics.contains_key(**key))
             })
@@ -123,13 +121,13 @@ impl ComparativeScorecard {
             .collect()
     }
 
-    /// Onnistuiko FamilyClaw S1 Crash Matrix -skenaariossa siellä missä
-    /// perustaso epäonnistuu — eli `side_effect_overcount: 0` vs `> 0`.
+    /// Did FamilyClaw succeed on the S1 Crash Matrix scenario where the
+    /// baseline fails — i.e. `side_effect_overcount: 0` vs `> 0`.
     ///
-    /// Tämä on `surpass`-todistuksen ydinväite koneluettavana: durable-replay
-    /// ajaa sivuvaikutukset täsmälleen kerran, truncaava perustaso ajaa ne
-    /// uudelleen. Palauttaa `true` vain jos molemmat subjektit kirjasivat
-    /// `side_effect_overcount`-mittarin ja FamilyClaw = 0 < perustaso.
+    /// This is the `surpass` proof's core claim, machine-checkable: durable
+    /// replay runs side effects exactly once, the truncating baseline re-runs
+    /// them. Returns `true` only if both subjects recorded the
+    /// `side_effect_overcount` metric and FamilyClaw = 0 < baseline.
     #[must_use]
     pub fn familyclaw_wins_crash_matrix(&self) -> bool {
         let id = "s1_crash_matrix";
@@ -143,27 +141,27 @@ impl ComparativeScorecard {
         else {
             return false;
         };
-        // FamilyClaw ajaa nolla sivuvaikutusta uudelleen; perustaso ajaa > 0,
-        // ja FamilyClaw läpäisee skenaarion siinä missä perustaso ei.
+        // FamilyClaw re-runs zero side effects; the baseline re-runs > 0,
+        // and FamilyClaw passes the scenario where the baseline does not.
         fc_val == 0.0 && base_val > 0.0 && fc.passed && !base.passed
     }
 
-    /// Renderöi vertailun ihmisluettavaksi markdowniksi (`COMPARISON.md`).
+    /// Renders the comparison as human-readable markdown (`COMPARISON.md`).
     ///
-    /// Rakenne:
-    /// 1. **Rehellisyys-ylätunniste** — perustaso on kilpailijan-MUOTOINEN
-    ///    malli, EI aito OpenClaw/Hermes-instanssi.
-    /// 2. **Yhteenvetotaulukko** — kokonaistulos per subjekti.
-    /// 3. **Per-skenaario** — kaksisarakkeinen PASS/FAIL + avainmittarit.
+    /// Structure:
+    /// 1. **Honesty header** — the baseline is a competitor-SHAPED model,
+    ///    NOT a real OpenClaw/Hermes instance.
+    /// 2. **Summary table** — overall result per subject.
+    /// 3. **Per-scenario** — two-column PASS/FAIL + key metrics.
     ///
-    /// Tuloste on tavu-tavulta deterministinen: kentät kiinteässä
-    /// järjestyksessä, skenaariot tunnisteen mukaan, mittarit
-    /// `KEY_METRICS`-järjestyksessä, kello injektoidusta arvosta.
+    /// The output is byte-for-byte deterministic: fields in a fixed order,
+    /// scenarios by ID, metrics in `KEY_METRICS` order, clock from the
+    /// injected value.
     #[must_use]
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
 
-        // 1) Otsikko + rehellisyysvaroitus (kova vaatimus).
+        // 1) Header + honesty warning (hard requirement).
         out.push_str("# FamilyClaw vs Baseline — Continuity Comparison\n\n");
         out.push_str(
             "> **Honesty note:** the baseline is a *competitor-SHAPED model* \
@@ -180,7 +178,7 @@ impl ComparativeScorecard {
         let _ = writeln!(out, "- **FamilyClaw subject:** {}", self.familyclaw.subject);
         let _ = writeln!(out, "- **Baseline subject:** {}\n", self.baseline.subject);
 
-        // 2) Yhteenvetotaulukko: kokonaistulos kasvotusten.
+        // 2) Summary table: overall result head to head.
         out.push_str("## Summary\n\n");
         out.push_str("| Subject | Overall |\n|---------|---------|\n");
         let _ = writeln!(
@@ -205,8 +203,8 @@ impl ComparativeScorecard {
         );
         out.push('\n');
 
-        // 3) Per-skenaario vertailu. Skenaariotunnisteet kerätään molemmista
-        //    korteista BTreeSet:iin → deterministinen aakkosjärjestys.
+        // 3) Per-scenario comparison. Scenario IDs are collected from both
+        //    cards into a BTreeSet → deterministic alphabetical order.
         let ids: BTreeSet<&str> = self
             .familyclaw
             .scenarios
@@ -238,7 +236,7 @@ impl ComparativeScorecard {
             out.push('\n');
         }
 
-        // 4) Verdict — koneluettava ydinväite proosana.
+        // 4) Verdict — the machine-checkable core claim in prose.
         out.push_str("## Verdict\n\n");
         if self.familyclaw_wins_crash_matrix() {
             out.push_str(
@@ -266,18 +264,18 @@ impl ComparativeScorecard {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)] // Vakiot 0.0/>0.0 ovat tarkkoja float-arvoja testeissä.
+#[allow(clippy::float_cmp)] // Constants 0.0/>0.0 are exact float values in tests.
 mod tests {
     use super::*;
     use crate::scorecard::Scorecard;
 
-    /// Kiinteä injektoitu kello — testeissä vakio (reprodusoitavuus).
+    /// A fixed injected clock — constant in tests (reproducibility).
     fn fixed_clock() -> Timestamp {
         time::from_unix_secs(1_717_000_000).expect("valid clock")
     }
 
-    /// Rakentaa FamilyClaw-tyylisen "voittaja"-scorecardin: S1 läpäisee
-    /// nollalla sivuvaikutusten ylityksellä.
+    /// Builds a FamilyClaw-style "winner" scorecard: S1 passes with zero
+    /// side-effect overcount.
     fn familyclaw_card() -> Scorecard {
         let s1 = ScenarioResult::new("s1_crash_matrix", true)
             .with_metric("resume_correctness", 1.0)
@@ -289,8 +287,8 @@ mod tests {
         Scorecard::new("familyclaw", vec![s1, s2], fixed_clock())
     }
 
-    /// Rakentaa perustason "häviäjä"-scorecardin: S1 epäonnistuu koska
-    /// sivuvaikutuksia ajetaan uudelleen.
+    /// Builds a baseline "loser" scorecard: S1 fails because side effects
+    /// are re-run.
     fn baseline_card() -> Scorecard {
         let s1 = ScenarioResult::new("s1_crash_matrix", false)
             .with_metric("resume_correctness", 0.0)
@@ -309,7 +307,7 @@ mod tests {
         assert_eq!(
             cmp_a.to_markdown(),
             cmp_b.to_markdown(),
-            "sama syöte → tavu-tavulta identtinen vertailuraportti"
+            "same input → byte-for-byte identical comparison report"
         );
     }
 
@@ -319,11 +317,11 @@ mod tests {
         let md = cmp.to_markdown();
         assert!(
             md.contains("competitor-SHAPED model"),
-            "ylätunniste merkitsee perustason rehellisesti"
+            "header honestly labels the baseline"
         );
         assert!(
             md.contains("NOT") && md.contains("OpenClaw") && md.contains("Hermes"),
-            "raportti kieltää eksplisiittisesti olevansa aito tuote"
+            "report explicitly denies being a real product"
         );
     }
 
@@ -332,16 +330,16 @@ mod tests {
         let cmp = ComparativeScorecard::new(familyclaw_card(), baseline_card(), fixed_clock());
         assert!(
             cmp.familyclaw_wins_crash_matrix(),
-            "FamilyClaw läpäisee S1 (side_effect_overcount=0) siellä missä \
-             perustaso epäonnistuu (side_effect_overcount>0)"
+            "FamilyClaw passes S1 (side_effect_overcount=0) where the \
+             baseline fails (side_effect_overcount>0)"
         );
 
-        // Ja sama näkyy renderöidyssä raportissa.
+        // And the same shows up in the rendered report.
         let md = cmp.to_markdown();
-        // S1-rivillä FamilyClaw=0.0000, baseline=12.0000.
+        // On the S1 row FamilyClaw=0.0000, baseline=12.0000.
         assert!(md.contains("| side_effect_overcount | 0.0000 | 12.0000 |"));
-        // Verdict toteaa edun rehellisellä rajalla: at-most-once / fail-closed,
-        // EI universaalia "exactly-once completion" -lupausta.
+        // The verdict states the advantage on honest grounds: at-most-once /
+        // fail-closed, NOT a universal "exactly-once completion" promise.
         assert!(md.contains("at most once"));
         assert!(md.contains("not a guarantee of universal"));
         assert!(!md.contains("each side effect exactly once"));
@@ -349,7 +347,7 @@ mod tests {
 
     #[test]
     fn wins_is_false_when_baseline_also_zero() {
-        // Jos perustaso EI aja sivuvaikutuksia uudelleen, väite ei päde.
+        // If the baseline does NOT re-run side effects, the claim doesn't hold.
         let weak_baseline = Scorecard::new(
             "markdown-file-baseline",
             vec![ScenarioResult::new("s1_crash_matrix", true)
@@ -359,13 +357,13 @@ mod tests {
         let cmp = ComparativeScorecard::new(familyclaw_card(), weak_baseline, fixed_clock());
         assert!(
             !cmp.familyclaw_wins_crash_matrix(),
-            "ilman perustason sivuvaikutus-ylitystä edusväite ei päde"
+            "without a side-effect overcount on the baseline, the advantage claim doesn't hold"
         );
     }
 
     #[test]
     fn missing_metric_renders_as_dash() {
-        // Skenaario ilman avainmittareita → sarakkeissa lukee '—' tai jätetään pois.
+        // A scenario with no key metrics → columns show '—' or are omitted.
         let bare_fc = Scorecard::new(
             "familyclaw",
             vec![ScenarioResult::new("s9_bare", true)],
@@ -378,7 +376,7 @@ mod tests {
         );
         let cmp = ComparativeScorecard::new(bare_fc, bare_base, fixed_clock());
         let md = cmp.to_markdown();
-        // Tuloksen pass/fail näkyy aina, vaikka mittareita ei olisi.
+        // The pass/fail result always shows even without metrics.
         assert!(md.contains("| result | PASS | FAIL |"));
     }
 }

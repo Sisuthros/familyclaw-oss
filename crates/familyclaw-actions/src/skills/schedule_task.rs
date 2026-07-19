@@ -1,14 +1,14 @@
-//! Ajastettu tehtävä agency-configiin (KERROS A).
+//! Scheduled task in agency config (Layer A).
 //!
-//! [`ScheduleTaskSkill`] mahdollistaa agentin rekisteröidä cron-pohjaisen
-//! ajastetun tehtävän persistoituun [`AgencyConfig`]-tiedostoon (`agency.json`).
-//! Taito kirjoittaa geneerisen merkinnän (cron-lauseke + `skill_id` + payload)
-//! — ei kovakoodattuja polkuja eikä henkilökohtaisia tunnisteita.
+//! [`ScheduleTaskSkill`] lets an agent register a cron-based scheduled task in
+//! the persisted [`AgencyConfig`] file (`agency.json`). The skill writes a
+//! generic entry (cron expression + `skill_id` + payload) — no hardcoded
+//! paths and no personal identifiers.
 //!
-//! ## Turvallisuus
-//! Riskiluokka on [`ActionRisk::WriteLocal`] ja käytäntö vaatii ihmisen
-//! hyväksynnän ennen kirjoitusta. Config-polku annetaan payloadissa
-//! (`agency_config_path`) — operaattori hallitsee sallitut polut (KERROS B).
+//! ## Security
+//! The risk class is [`ActionRisk::WriteLocal`] and the policy requires human
+//! approval before writing. The config path is supplied in the payload
+//! (`agency_config_path`) — the operator controls the allowed paths (Layer B).
 
 use std::path::Path;
 
@@ -25,35 +25,35 @@ use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 
 use super::Skill;
 
-/// Taidon kiinteä tunniste.
+/// Fixed identifier for the skill.
 const SKILL_UUID: uuid::Uuid = uuid::uuid!("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaf");
 
-/// Geneerinen oletus-olento ajastetuille tehtäthe operator.
+/// Generic default being for scheduled tasks.
 const DEFAULT_BEING_ID: &str = "operator";
 
-/// Taidon syöte: agency-config-polku + ajastettavan tehtävän määrittely.
+/// Skill input: agency config path + the scheduled task's definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleTaskInput {
-    /// Polku `agency.json`-tiedostoon (operaattorin datahakemisto).
+    /// Path to the `agency.json` file (the operator's data directory).
     pub agency_config_path: String,
-    /// Valinnainen vakaa tehtävä-id (UUID-merkkijono). Jos puuttuu, luodaan uusi.
+    /// Optional stable task ID (UUID string). If absent, a new one is created.
     #[serde(default)]
     pub task_id: Option<String>,
-    /// Suoritettavan taidon tunniste (UUID-merkkijono).
+    /// Identifier of the skill to execute (UUID string).
     pub skill_id: String,
-    /// Taidolle annettava geneerinen JSON-payload.
+    /// The generic JSON payload passed to the skill.
     pub payload: Value,
-    /// Cron-lauseke (esim. `"0 */6 * * *"`).
+    /// Cron expression (e.g. `"0 */6 * * *"`).
     pub cron_expression: String,
-    /// Valinnainen olentotunniste lähetykselle (oletus `operator`).
+    /// Optional being identifier for dispatch (default `operator`).
     #[serde(default)]
     pub being_id: Option<String>,
 }
 
-/// Yhden persistoidun ajastetun tehtävän merkintä agency-configissa.
+/// A single persisted scheduled task entry in the agency config.
 ///
-/// Peilaa [`familyclaw_scheduler::persistence::AgencyScheduledTask`]:a —
-/// pidetään synkassa manuaalisesti (ei riippuvuutta scheduler-crateen).
+/// Mirrors [`familyclaw_scheduler::persistence::AgencyScheduledTask`] — kept
+/// in sync manually (no dependency on the scheduler crate).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AgencyScheduledTaskEntry {
     id: String,
@@ -77,7 +77,7 @@ const fn default_enabled() -> bool {
     true
 }
 
-/// Agency-configin JSON-muoto (yhteensopiva scheduler-craten kanssa).
+/// The agency config's JSON shape (compatible with the scheduler crate).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct AgencyConfigFile {
     #[serde(default)]
@@ -126,26 +126,26 @@ impl AgencyConfigFile {
     }
 }
 
-/// Taito ajastetun tehtävän rekisteröintiin agency-configiin.
+/// Skill for registering a scheduled task in agency config.
 #[derive(Debug, Default, Clone)]
 pub struct ScheduleTaskSkill;
 
 impl ScheduleTaskSkill {
-    /// Luo uuden taidon.
+    /// Creates a new skill.
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 
-    /// Taidon kiinteä tunniste.
+    /// The skill's fixed identifier.
     #[must_use]
     pub fn skill_id() -> SkillId {
         SkillId::from_uuid(SKILL_UUID)
     }
 
-    /// Validoi syötteen ja muodostaa persistoitavan merkinnän.
-    // Palauttaa crate-yksityisen `AgencyScheduledTaskEntry`-tyypin, joten
-    // näkyvyys on `pub(crate)` (ei julkista API-pintaa).
+    /// Validates the input and builds the persistable entry.
+    // Returns the crate-private `AgencyScheduledTaskEntry` type, so
+    // visibility is `pub(crate)` (no public API surface).
     pub(crate) fn build_entry(input: &ScheduleTaskInput) -> Result<AgencyScheduledTaskEntry> {
         let cron = input.cron_expression.trim();
         if cron.is_empty() {
@@ -153,10 +153,10 @@ impl ScheduleTaskSkill {
                 "cron_expression must not be empty".to_string(),
             ));
         }
-        // TURVAKORJAUS 2026-07-09 (audit-löytö [5]): validoi cron-lauseke
-        // KIRJOITUSHETKELLÄ samalla parserilla jota scheduler käyttää ajossa
-        // (croner::Cron). Ilman tätä esim. "not a cron" / "99 99 99" tallentui
-        // ja jäi hiljaa ikuisesti laukeamatta.
+        // SECURITY FIX 2026-07-09 (audit finding [5]): validate the cron
+        // expression AT WRITE TIME with the same parser the scheduler uses at
+        // runtime (croner::Cron). Without this, e.g. "not a cron" / "99 99 99"
+        // was persisted and silently never fired.
         {
             use std::str::FromStr as _;
             croner::Cron::from_str(cron).map_err(|e| {
@@ -188,9 +188,9 @@ impl ScheduleTaskSkill {
         })
     }
 
-    /// Kirjoittaa tai päivittää ajastetun tehtävän agency-config-tiedostoon.
-    // Palauttaa crate-yksityisen `AgencyScheduledTaskEntry`-tyypin, joten
-    // näkyvyys on `pub(crate)` (ei julkista API-pintaa).
+    /// Writes or updates the scheduled task in the agency config file.
+    // Returns the crate-private `AgencyScheduledTaskEntry` type, so
+    // visibility is `pub(crate)` (no public API surface).
     pub(crate) fn register(input: &ScheduleTaskInput) -> Result<AgencyScheduledTaskEntry> {
         let path = Path::new(&input.agency_config_path);
         let entry = Self::build_entry(input)?;
@@ -280,8 +280,8 @@ mod tests {
         };
         assert!(ScheduleTaskSkill::build_entry(&bad_cron).is_err());
 
-        // TURVAKORJAUS 2026-07-09 (audit [5]): jäsentymätön cron on estettävä
-        // kirjoitushetkellä (ennen: tallentui, jäi hiljaa laukeamatta ikuisesti).
+        // SECURITY FIX 2026-07-09 (audit [5]): an unparseable cron must be
+        // rejected at write time (before: it was persisted and silently never fired).
         for junk in ["not a cron", "99 99 99 99 99", "* * *", "@nonsense"] {
             let bad = ScheduleTaskInput {
                 cron_expression: junk.to_string(),
@@ -292,7 +292,7 @@ mod tests {
                 "jäsentymätön cron '{junk}' pitäisi estää"
             );
         }
-        // Kelvollinen 5-kenttäinen cron sallitaan.
+        // A valid 5-field cron is allowed.
         let ok = ScheduleTaskInput {
             cron_expression: "*/15 * * * *".to_string(),
             ..input.clone()

@@ -1,5 +1,5 @@
-//! TOML-pohjainen konfiguraatio (KERROS B).
-//! Lukee `~/.config/familyclaw/familyclaw.toml` + env-ylikirjoitukset.
+//! TOML-based configuration (Layer B).
+//! Reads `~/.config/familyclaw/familyclaw.toml` + env overrides.
 
 use familyclaw_core::FamilyClawError;
 use serde::{Deserialize, Serialize};
@@ -12,8 +12,8 @@ pub const CONFIG_FILE_NAME: &str = "familyclaw.toml";
 #[derive(Default)]
 pub struct FamilyConfig {
     pub agent: AgentCfg,
-    /// Valinnainen moniagentti-lista (`[[agents]]` TOML:ssa). Tyhjä → käytetään
-    /// vain [`FamilyConfig::agent`]-kenttää (taaksepäin-yhteensopiva yksi agentti).
+    /// Optional multi-agent list (`[[agents]]` in TOML). Empty → only the
+    /// [`FamilyConfig::agent`] field is used (backward-compatible single agent).
     #[serde(default)]
     pub agents: Vec<AgentCfg>,
     pub channel: ChannelCfg,
@@ -26,7 +26,7 @@ pub struct FamilyConfig {
 #[serde(default)]
 pub struct AgentCfg {
     pub name: String,
-    /// Valinnainen per-agentti reply-kohde (ylikirjoittaa kanavan oletuksen).
+    /// Optional per-agent reply target (overrides the channel default).
     #[serde(default)]
     pub reply_target: String,
 }
@@ -47,13 +47,13 @@ pub struct DiscordCfg {
     pub channel_id: String,
     /// Ed25519 public key (hex) Discord Interactions -verifyyn.
     pub public_key: String,
-    /// Discord bot token. Jos asetettu, gateway käyttää kaksisuuntaista
-    /// serenity-bot-yhteyttä (kuuntelee + postaa) webhook-postauksen sijaan.
+    /// Discord bot token. If set, the gateway uses a two-way serenity bot
+    /// connection (listens + posts) instead of webhook posting.
     pub bot_token: String,
-    /// Huoltajan/operaattorin Discord-user-id. Vain tämä id saa `DMata` agenttia
-    /// (kahdenkeskinen keskustelu). 0 = ei asetettu → DM:t pudotetaan kaikilta
-    /// (turvallinen oletus, ei koskaan "kaikki DM:t sallittu"). TOML-kentästä tai
-    /// env-ylikirjoituksesta `FAMILYCLAW_OWNER_ID`.
+    /// The operator's Discord user id. Only this id may DM the agent
+    /// (one-on-one conversation). 0 = unset → DMs are dropped from everyone
+    /// (safe default, never "all DMs allowed"). From the TOML field or the
+    /// `FAMILYCLAW_OWNER_ID` env override.
     pub owner_id: u64,
 }
 
@@ -85,9 +85,9 @@ pub struct MemoryCfg {
 #[serde(default)]
 pub struct SecurityCfg {
     pub profile: String,
-    /// Valinnainen bearer-token, jolla `POST /inject` suojataan. Tyhjä = ei
-    /// tokenia → loopback-only-oletuskäytös (avoin). Asetettuna `/inject`
-    /// vaatii `Authorization: Bearer <token>` ja hylkää väärät 401:llä.
+    /// Optional bearer token used to protect `POST /inject`. Empty = no
+    /// token → loopback-only default behavior (open). When set, `/inject`
+    /// requires `Authorization: Bearer <token>` and rejects mismatches with 401.
     pub gateway_token: String,
 }
 
@@ -117,7 +117,7 @@ impl Default for DiscordCfg {
             channel_id: "discord-main".into(),
             public_key: String::new(),
             bot_token: String::new(),
-            // 0 = ei huoltajaa asetettu → DM:t pois (turvallinen oletus).
+            // 0 = no operator set → DMs off (safe default).
             owner_id: 0,
         }
     }
@@ -126,9 +126,9 @@ impl Default for ProviderCfg {
     fn default() -> Self {
         Self {
             kind: "openai".into(),
-            // Provider-prefixed (`provider/model`) muoto: resolveri vaatii sen,
-            // muuten bare-nimi tulkitaan provider-nimeksi → ei ratkea → agentti
-            // jää mykäksi (ei tekstivastauksia). Ks. build_llm_chain.
+            // Provider-prefixed (`provider/model`) form: the resolver requires
+            // it, otherwise a bare name is interpreted as the provider name →
+            // fails to resolve → the agent goes mute (no text replies). See build_llm_chain.
             model: "openai/gpt-4.1-mini".into(),
             api_key: String::new(),
         }
@@ -205,11 +205,11 @@ impl FamilyConfig {
         if let Ok(v) = std::env::var("FAMILYCLAW_CHANNEL_KIND") {
             self.channel.kind = v;
         }
-        // Reply-kohde: kanoninen `FAMILYCLAW_REPLY_TARGET` (sama nimi kuin
-        // .env.example, docs/RUNBOOK_WINDOWS.md ja main.rs:n REPLY_TARGET_ENV).
-        // `FAMILYCLAW_CHANNEL_REPLY_TARGET` säilytetään vanhentuneena aliaksena
-        // taaksepäin-yhteensopivuudelle — luetaan VAIN jos kanonista ei ole
-        // asetettu (kanoninen voittaa, jos molemmat on asetettu).
+        // Reply target: canonical `FAMILYCLAW_REPLY_TARGET` (same name as
+        // .env.example, docs/RUNBOOK_WINDOWS.md, and main.rs's REPLY_TARGET_ENV).
+        // `FAMILYCLAW_CHANNEL_REPLY_TARGET` is kept as a deprecated alias for
+        // backward compatibility — read ONLY if the canonical one is not set
+        // (the canonical one wins if both are set).
         if let Ok(v) = std::env::var("FAMILYCLAW_REPLY_TARGET") {
             self.channel.reply_target = v;
         } else if let Ok(v) = std::env::var("FAMILYCLAW_CHANNEL_REPLY_TARGET") {
@@ -242,10 +242,10 @@ impl FamilyConfig {
         if let Ok(v) = std::env::var("DISCORD_BOT_TOKEN") {
             self.channel.discord.bot_token = v;
         }
-        // Huoltajan Discord-user-id DM-portille. Virheellinen arvo EI ohita
-        // turvallista oletusta: varoitetaan ja säilytetään TOML-/default-arvo
-        // (ei koskaan "kaikki DM:t sallittu"). Tyhjä string parsitaan myös
-        // virheelliseksi → varoitus, mutta tyhjä env-arvo on harvinainen.
+        // Operator's Discord user id for the DM gate. An invalid value does
+        // NOT override the safe default: a warning is logged and the
+        // TOML/default value is kept (never "all DMs allowed"). An empty
+        // string also parses as invalid → warning, but an empty env value is rare.
         if let Ok(v) = std::env::var("FAMILYCLAW_OWNER_ID") {
             if let Ok(n) = v.trim().parse::<u64>() {
                 self.channel.discord.owner_id = n;
@@ -273,15 +273,15 @@ impl FamilyConfig {
 
 // Accessor helpers
 impl FamilyConfig {
-    // Osa julkista accessor-pintaa `model()`/`all_agents()`:n rinnalla.
-    // Nykyinen koodi lukee `agent.name`-kentän suoraan, joten metodia ei
-    // vielä kutsuta — säilytetään API-symmetrian vuoksi.
+    // Part of the public accessor surface alongside `model()`/`all_agents()`.
+    // Current code reads the `agent.name` field directly, so this method is
+    // not yet called — kept for API symmetry.
     #[allow(dead_code)]
     pub fn agent_name(&self) -> &str {
         &self.agent.name
     }
 
-    /// Palauttaa kaikki serve-agentit: `[[agents]]` jos asetettu, muuten yksi
+    /// Returns all serve agents: `[[agents]]` if set, otherwise a single
     /// [`Self::agent`].
     pub fn all_agents(&self) -> Vec<AgentCfg> {
         if self.agents.is_empty() {
@@ -293,12 +293,12 @@ impl FamilyConfig {
     pub fn model(&self) -> &str {
         &self.provider.model
     }
-    /// Varamallit järjestyksessä, luettuna `FAMILYCLAW_FALLBACK_MODELS`-env-
-    /// muuttujasta (pilkulla erotettu lista, esim.
+    /// Fallback models in order, read from the `FAMILYCLAW_FALLBACK_MODELS`
+    /// env var (comma-separated list, e.g.
     /// `"nvidia/nemotron-3-ultra-550b-a55b,deepseek-ai/deepseek-v4-pro"`).
-    /// Tyhjät ja primaryn kanssa identtiset karsitaan. Tyhjä lista = ei
-    /// fallbackeja (sama käytös kuin ennen). KERROS A: ei kovakoodattuja
-    /// mallinimiä — perheenjäsenkohtainen ketju tulee ympäristöstä.
+    /// Empty entries and ones identical to the primary are pruned. Empty list =
+    /// no fallbacks (same behavior as before). Layer A: no hardcoded
+    /// model names — the per-operator chain comes from the environment.
     pub fn fallback_models(&self) -> Vec<String> {
         std::env::var("FAMILYCLAW_FALLBACK_MODELS")
             .ok()
@@ -311,7 +311,7 @@ impl FamilyConfig {
             })
             .unwrap_or_default()
     }
-    /// Primary + varamallit ajettavaksi [`ModelConfig`]:ksi (sama kuin serve-polku).
+    /// Primary + fallback models as a runnable [`ModelConfig`] (same as the serve path).
     pub fn model_config(&self) -> familyclaw_core::ModelConfig {
         let mut cfg = familyclaw_core::ModelConfig::new(self.model().to_string());
         for fb in self.fallback_models() {
@@ -337,7 +337,7 @@ impl FamilyConfig {
     pub fn discord_bot_token(&self) -> &str {
         &self.channel.discord.bot_token
     }
-    /// Huoltajan Discord-user-id DM-portille. 0 = ei asetettu → DM:t pois.
+    /// Operator's Discord user id for the DM gate. 0 = unset → DMs off.
     pub fn discord_owner_id(&self) -> u64 {
         self.channel.discord.owner_id
     }
@@ -347,8 +347,8 @@ impl FamilyConfig {
     pub fn telegram_channel_id(&self) -> &str {
         &self.channel.telegram.channel_id
     }
-    /// Valinnainen `POST /inject`-bearer-token. Tyhjä = ei suojausta
-    /// (loopback-only-oletuskäytös).
+    /// Optional `POST /inject` bearer token. Empty = no protection
+    /// (loopback-only default behavior).
     pub fn gateway_token(&self) -> &str {
         &self.security.gateway_token
     }
@@ -358,66 +358,65 @@ impl FamilyConfig {
 mod tests {
     use super::*;
 
-    /// FIX 3: `FAMILYCLAW_REPLY_TARGET` on kanoninen reply-kohteen
-    /// ympäristömuuttuja (sama nimi kuin .env.example, RUNBOOK ja main.rs);
-    /// `FAMILYCLAW_CHANNEL_REPLY_TARGET` jää vanhentuneeksi aliakseksi.
-    /// Kanoninen voittaa, jos molemmat on asetettu — niin docs-ohjeita
-    /// seuraava käyttäjä saa odotetun käytöksen.
+    /// FIX 3: `FAMILYCLAW_REPLY_TARGET` is the canonical reply-target
+    /// environment variable (same name as .env.example, RUNBOOK, and main.rs);
+    /// `FAMILYCLAW_CHANNEL_REPLY_TARGET` remains a deprecated alias.
+    /// The canonical one wins if both are set — so a user following the docs
+    /// gets the expected behavior.
     ///
-    /// Env-muuttujat ovat prosessin laajuisia → ajetaan kaikki tapaukset
-    /// peräkkäin yhdessä testissä (ei rinnakkaiskilpailua muiden testien
-    /// kanssa) ja siivotaan lopuksi.
+    /// Env vars are process-wide → all cases run sequentially in one test
+    /// (no parallel race with other tests) and are cleaned up at the end.
     #[test]
     fn reply_target_env_canonical_wins_over_deprecated_alias() {
         const CANON: &str = "FAMILYCLAW_REPLY_TARGET";
         const ALIAS: &str = "FAMILYCLAW_CHANNEL_REPLY_TARGET";
 
-        // Lähtötilanne: kumpikaan ei asetettu → reply_target pysyy default-tyhjänä.
+        // Starting state: neither set → reply_target stays default-empty.
         std::env::remove_var(CANON);
         std::env::remove_var(ALIAS);
         let mut cfg = FamilyConfig::default();
         cfg.apply_env();
-        assert_eq!(cfg.reply_target(), "", "ei env → default tyhjä");
+        assert_eq!(cfg.reply_target(), "", "no env -> default empty");
 
-        // Vain vanhentunut alias → luetaan (taaksepäin-yhteensopivuus).
+        // Only the deprecated alias set → it is read (backward compatibility).
         std::env::set_var(ALIAS, "legacy-target");
         let mut cfg = FamilyConfig::default();
         cfg.apply_env();
         assert_eq!(
             cfg.reply_target(),
             "legacy-target",
-            "alias luetaan kun ei kanonista"
+            "alias is read when canonical is absent"
         );
 
-        // Molemmat asetettu → KANONINEN voittaa.
+        // Both set → CANONICAL wins.
         std::env::set_var(CANON, "canonical-target");
         let mut cfg = FamilyConfig::default();
         cfg.apply_env();
         assert_eq!(
             cfg.reply_target(),
             "canonical-target",
-            "kanoninen voittaa aliaksen"
+            "canonical wins over the alias"
         );
 
-        // Vain kanoninen → luetaan.
+        // Only canonical set → it is read.
         std::env::remove_var(ALIAS);
         let mut cfg = FamilyConfig::default();
         cfg.apply_env();
         assert_eq!(
             cfg.reply_target(),
             "canonical-target",
-            "kanoninen luetaan yksinään"
+            "canonical is read on its own"
         );
 
-        // Siivous.
+        // Cleanup.
         std::env::remove_var(CANON);
         std::env::remove_var(ALIAS);
     }
 
-    /// `FAMILYCLAW_FALLBACK_MODELS` parsitaan pilkulla erotetuksi listaksi;
-    /// tyhjät ja primaryn kanssa identtiset karsitaan; puuttuva env = tyhjä
-    /// (taaksepäin-yhteensopiva: agentti ajaa vain primaryllä kuten ennen).
-    /// Env on prosessin laajuinen → kaikki tapaukset peräkkäin + siivous.
+    /// `FAMILYCLAW_FALLBACK_MODELS` is parsed as a comma-separated list;
+    /// empty entries and ones identical to the primary are pruned; missing
+    /// env = empty (backward-compatible: the agent runs on the primary only,
+    /// as before). Env is process-wide → all cases run sequentially + cleanup.
     #[test]
     fn fallback_models_parsed_from_env() {
         const VAR: &str = "FAMILYCLAW_FALLBACK_MODELS";
@@ -426,21 +425,21 @@ mod tests {
         let mut cfg = FamilyConfig::default();
         cfg.provider.model = "primary/model".to_string();
 
-        // Ei env → tyhjä lista (ennallaan).
-        assert!(cfg.fallback_models().is_empty(), "ei env → ei fallbackeja");
+        // No env → empty list (unchanged).
+        assert!(cfg.fallback_models().is_empty(), "no env -> no fallbacks");
 
-        // Pilkkulista, välilyönnit + tyhjät + primary-duplikaatti karsitaan.
+        // Comma list; whitespace, empty entries, and primary duplicate are pruned.
         std::env::set_var(VAR, " a/one ,, primary/model , b/two ,");
         assert_eq!(
             cfg.fallback_models(),
             vec!["a/one".to_string(), "b/two".to_string()],
-            "trim + tyhjien + primaryn karsinta"
+            "trim + pruning of empty entries and the primary"
         );
 
         std::env::remove_var(VAR);
     }
 
-    /// Huoltajan `owner_id` latautuu TOML:sta DiscordCfg-kenttänä.
+    /// Operator's `owner_id` loads from TOML as a `DiscordCfg` field.
     #[test]
     fn owner_id_loads_from_toml() {
         let toml = r"
@@ -451,35 +450,35 @@ owner_id = 123456789
         assert_eq!(cfg.discord_owner_id(), 123_456_789);
     }
 
-    /// Puuttuva `owner_id` → oletus 0 → DM:t pois (turvallinen oletus).
+    /// Missing `owner_id` → default 0 → DMs off (safe default).
     #[test]
     fn missing_owner_id_defaults_to_zero_disabling_dms() {
         let cfg = FamilyConfig::default();
         assert_eq!(
             cfg.discord_owner_id(),
             0,
-            "puuttuva owner_id → 0 → DM:t pudotetaan, ei koskaan 'kaikki sallittu'"
+            "missing owner_id -> 0 -> DMs dropped, never 'all allowed'"
         );
     }
 
-    /// `FAMILYCLAW_OWNER_ID` ylikirjoittaa TOML-arvon; virheellinen arvo
-    /// EI ohita turvallista oletusta (säilyttää TOML-/default-arvon + varoittaa).
+    /// `FAMILYCLAW_OWNER_ID` overrides the TOML value; an invalid value does
+    /// NOT override the safe default (keeps the TOML/default value + warns).
     ///
-    /// Env-muuttujat ovat prosessin laajuisia → kaikki tapaukset peräkkäin
-    /// yhdessä testissä ja siivous lopuksi.
+    /// Env vars are process-wide → all cases run sequentially in one test
+    /// and cleanup at the end.
     #[test]
     fn owner_id_env_overrides_toml_and_invalid_fails_safe() {
         const ENV: &str = "FAMILYCLAW_OWNER_ID";
         std::env::remove_var(ENV);
 
-        // Validi env → ylikirjoittaa TOML-arvon.
+        // Valid env → overrides the TOML value.
         let mut cfg: FamilyConfig =
             toml::from_str("[channel.discord]\nowner_id = 111\n").expect("parse toml");
         std::env::set_var(ENV, "222");
         cfg.apply_env();
-        assert_eq!(cfg.discord_owner_id(), 222, "env voittaa TOML:n");
+        assert_eq!(cfg.discord_owner_id(), 222, "env wins over TOML");
 
-        // Virheellinen env → EI ohita: TOML-arvo säilyy (fail-safe + varoitus).
+        // Invalid env → does NOT override: the TOML value is kept (fail-safe + warning).
         let mut cfg: FamilyConfig =
             toml::from_str("[channel.discord]\nowner_id = 333\n").expect("parse toml");
         std::env::set_var(ENV, "not-a-number");
@@ -487,25 +486,25 @@ owner_id = 123456789
         assert_eq!(
             cfg.discord_owner_id(),
             333,
-            "virheellinen env ei ohita turvallista oletusta → TOML-arvo säilyy"
+            "invalid env does not override the safe default -> TOML value is kept"
         );
 
-        // Virheellinen env ilman TOML-arvoa → pysyy default 0 (DM:t pois).
+        // Invalid env without a TOML value → stays at default 0 (DMs off).
         let mut cfg = FamilyConfig::default();
         std::env::set_var(ENV, "xyz");
         cfg.apply_env();
         assert_eq!(
             cfg.discord_owner_id(),
             0,
-            "virheellinen env + ei TOML → 0 → DM:t pois (fail-safe)"
+            "invalid env + no TOML -> 0 -> DMs off (fail-safe)"
         );
 
         std::env::remove_var(ENV);
     }
 
-    /// FIX 4: oletusmallin on oltava provider-prefixed `provider/model`
-    /// muodossa, muuten resolveri tulkitsee bare-nimen provider-nimeksi ja
-    /// agentti jää mykäksi. Suojaa regressiolta takaisin bare-nimeen.
+    /// FIX 4: the default model must be in provider-prefixed `provider/model`
+    /// form, otherwise the resolver interprets the bare name as the provider
+    /// name and the agent goes mute. Guards against a regression back to a bare name.
     #[test]
     fn default_provider_model_is_provider_prefixed() {
         let cfg = ProviderCfg::default();
@@ -516,7 +515,7 @@ owner_id = 123456789
         );
     }
 
-    /// `[[agents]]` parsitaan TOML-listana; tyhjä lista → vain `[agent]`.
+    /// `[[agents]]` parses as a TOML list; empty list → only `[agent]`.
     #[test]
     fn agents_table_parses_from_toml() {
         let toml = r#"

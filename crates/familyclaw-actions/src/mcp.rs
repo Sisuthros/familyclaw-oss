@@ -1,26 +1,26 @@
-//! MCP-sovitin: kuvaa toimintopinon taidot MCP-työkaluiksi ja reitittää
-//! työkalukutsut capability-tarkistuksen läpi (KERROS A).
+//! MCP adapter: describes the action stack's skills as MCP tools and routes
+//! tool calls through a capability check (Layer A).
 //!
-//! Tämä moduuli on tarkoituksella **rajapinta**, ei täysi MCP-palvelin: se
-//! määrittelee miten taidot esitetään MCP-työkaluina ([`McpToolDescriptor`]),
-//! miten työkalua kutsutaan ([`McpToolCall`]) ja mitä se palauttaa
-//! ([`McpToolResult`]), sekä käytäntöportin ([`call_with_policy`]) joka:
-//! - hylkää tuntemattoman työkalun ([`ActionError::McpUnknownTool`]),
-//! - hylkää kutsun jos vaadittu oikeus puuttuu myönnetyistä
-//!   ([`ActionError::McpDenied`]) ja kirjaa eväyksen audit-lokiin,
-//! - merkitsee tulosteen epäluotettavaksi (taint) **ellei** työkalun lähde ole
-//!   eksplisiittisesti luotettu ([`McpToolDescriptor::trusted`]).
+//! This module is intentionally an **interface**, not a full MCP server: it
+//! defines how skills are presented as MCP tools ([`McpToolDescriptor`]), how
+//! a tool is called ([`McpToolCall`]) and what it returns
+//! ([`McpToolResult`]), plus a policy gate ([`call_with_policy`]) that:
+//! - rejects an unknown tool ([`ActionError::McpUnknownTool`]),
+//! - rejects a call if the required permission is missing from the granted
+//!   set ([`ActionError::McpDenied`]) and records the denial to the audit log,
+//! - marks the output as untrusted (taint) **unless** the tool's source is
+//!   explicitly trusted ([`McpToolDescriptor::trusted`]).
 //!
-//! ## OSS-raja (KERROS A)
-//! Tarjoajat ovat **mockeja** ([`MockMcpProvider`]) — ei oikeita verkkokutsuja,
-//! ei providereita, sieluja eikä avaimia. Tuloste on oletuksena epäluotettava,
-//! kuten suorituskerroksessakin ([`crate::executor`]), kunnes lähde on todettu
-//! luotettavaksi.
+//! ## OSS boundary (Layer A)
+//! Providers are **mocks** ([`MockMcpProvider`]) — no real network calls, no
+//! providers, no personas, and no keys. The output is untrusted by default,
+//! just as in the execution layer ([`crate::executor`]), until the source is
+//! established as trusted.
 //!
-//! ## Determinismi
-//! Käytäntöportti ottaa aikaleiman injektoituna
-//! ([`familyclaw_core::time::Timestamp`]) — kelloa ei lueta logiikan sisällä,
-//! jotta audit-tapahtumat ovat deterministisiä testeissä ja replayssa.
+//! ## Determinism
+//! The policy gate takes the timestamp injected
+//! ([`familyclaw_core::time::Timestamp`]) — the clock is never read inside
+//! the logic, so audit events are deterministic in tests and replay.
 
 use std::collections::BTreeMap;
 
@@ -35,36 +35,36 @@ use crate::error::{ActionError, Result};
 use crate::ids::ActionId;
 use crate::policy::SkillPermission;
 
-/// Moduulin valmiusaste — säilytetään, jotta [`crate::all_modules_scaffolded`]
-/// kääntyy edelleen muiden moduulien rinnalla.
+/// Module readiness flag — kept so that [`crate::all_modules_scaffolded`]
+/// still compiles alongside the other modules.
 pub(crate) const SCAFFOLDED: bool = true;
 
-/// Yhden MCP-työkalun kuvaus: se mitä tarjoaja julkaisee asiakkaalle.
+/// The description of a single MCP tool: what the provider publishes to the client.
 ///
-/// Kuvaus kertoo työkalun nimen ja kuvauksen, sen syöteskeeman (geneerinen
-/// JSON-schema arvona), työkalun vaatiman oikeuden sekä onko työkalun lähde
-/// luotettu. Luotettu lähde tuottaa luotettua dataa; muutoin tuloste
-/// merkitään epäluotettavaksi (taint).
+/// The descriptor states the tool's name and description, its input schema
+/// (a generic JSON schema as a value), the permission the tool requires, and
+/// whether the tool's source is trusted. A trusted source produces trusted
+/// data; otherwise the output is marked as untrusted (taint).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpToolDescriptor {
-    /// Työkalun yksilöivä nimi (esim. `echo`). Käytetään reitityksessä.
+    /// The tool's unique name (e.g. `echo`). Used for routing.
     pub name: String,
-    /// Lyhyt ihmisluettava kuvaus mitä työkalu tekee.
+    /// A short human-readable description of what the tool does.
     pub description: String,
-    /// Työkalun syöteskeema geneerisenä JSON-arvona (esim. JSON-schema).
+    /// The tool's input schema as a generic JSON value (e.g. a JSON schema).
     pub input_schema: Value,
-    /// Oikeus jonka kutsujalla on oltava ennen kuin työkalua saa kutsua.
+    /// The permission the caller must have before the tool may be called.
     pub required_permission: SkillPermission,
-    /// Onko työkalun lähde luotettu. Jos `true`, tuloste ei saa taint-leimaa;
-    /// jos `false`, tuloste merkitään epäluotettavaksi.
+    /// Whether the tool's source is trusted. If `true`, the output does not
+    /// get the taint marker; if `false`, the output is marked as untrusted.
     pub trusted: bool,
 }
 
 impl McpToolDescriptor {
-    /// Rakentaa uuden työkalukuvauksen.
+    /// Builds a new tool descriptor.
     ///
-    /// Lähde merkitään oletuksena **epäluotetuksi** (`trusted = false`);
-    /// luotettavuus on nostettava eksplisiittisesti [`McpToolDescriptor::trust`]:lla.
+    /// The source is marked **untrusted** by default (`trusted = false`);
+    /// trust must be raised explicitly via [`McpToolDescriptor::trust`].
     #[must_use]
     pub fn new(
         name: impl Into<String>,
@@ -81,9 +81,9 @@ impl McpToolDescriptor {
         }
     }
 
-    /// Merkitsee työkalun lähteen luotetuksi (tuloste ei saa taint-leimaa).
+    /// Marks the tool's source as trusted (the output does not get the taint marker).
     ///
-    /// Käytetään vain kun lähde on eksplisiittisesti todettu luotettavaksi.
+    /// Use only when the source has been explicitly established as trusted.
     #[must_use]
     pub fn trust(mut self) -> Self {
         self.trusted = true;
@@ -91,17 +91,17 @@ impl McpToolDescriptor {
     }
 }
 
-/// Yhden MCP-työkalukutsun pyyntö: mihin työkaluun ja millä syötteellä.
+/// A single MCP tool call request: which tool and with what input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpToolCall {
-    /// Kutsuttavan työkalun nimi (täsmättävä [`McpToolDescriptor::name`]-arvoon).
+    /// The name of the tool to call (must match [`McpToolDescriptor::name`]).
     pub tool: String,
-    /// Työkalulle välitettävä syöte geneerisenä JSON-arvona.
+    /// The input passed to the tool as a generic JSON value.
     pub input: Value,
 }
 
 impl McpToolCall {
-    /// Rakentaa uuden työkalukutsun.
+    /// Builds a new tool call.
     #[must_use]
     pub fn new(tool: impl Into<String>, input: Value) -> Self {
         Self {
@@ -111,22 +111,22 @@ impl McpToolCall {
     }
 }
 
-/// Yhden MCP-työkalukutsun tulos.
+/// The result of a single MCP tool call.
 ///
-/// `untrusted` kertoo onko tuloste peräisin epäluotettavasta lähteestä (taint).
-/// Tarjoajan oma tulos on oletuksena epäluotettava; käytäntöportti
-/// ([`call_with_policy`]) nollaa leiman vain jos työkalukuvauksen lähde on
-/// luotettu.
+/// `untrusted` reports whether the output originates from an untrusted
+/// source (taint). A provider's own result is untrusted by default; the
+/// policy gate ([`call_with_policy`]) clears the flag only if the tool
+/// descriptor's source is trusted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpToolResult {
-    /// Työkalun tuottama tuloste geneerisenä JSON-arvona.
+    /// The output produced by the tool as a generic JSON value.
     pub output: Value,
-    /// Onko tuloste peräisin epäluotettavasta lähteestä (taint).
+    /// Whether the output originates from an untrusted source (taint).
     pub untrusted: bool,
 }
 
 impl McpToolResult {
-    /// Rakentaa uuden epäluotettavaksi merkityn tuloksen (oletus taint).
+    /// Builds a new result marked as untrusted (the default taint).
     #[must_use]
     pub fn untrusted(output: Value) -> Self {
         Self {
@@ -135,7 +135,7 @@ impl McpToolResult {
         }
     }
 
-    /// Rakentaa uuden luotetuksi merkityn tuloksen (ei taint-leimaa).
+    /// Builds a new result marked as trusted (no taint marker).
     #[must_use]
     pub fn trusted(output: Value) -> Self {
         Self {
@@ -145,62 +145,62 @@ impl McpToolResult {
     }
 }
 
-/// MCP-työkalujen tarjoaja.
+/// A provider of MCP tools.
 ///
-/// Toteutus julkaisee joukon työkaluja ([`McpToolProvider::describe`]) ja ajaa
-/// yksittäisen työkalukutsun ([`McpToolProvider::call`]). KERROS A -toteutukset
-/// ovat **mockeja** — ei oikeita verkkokutsuja.
+/// An implementation publishes a set of tools ([`McpToolProvider::describe`])
+/// and runs a single tool call ([`McpToolProvider::call`]). Layer A
+/// implementations are **mocks** — no real network calls.
 #[async_trait]
 pub trait McpToolProvider: Send + Sync {
-    /// Palauttaa kaikki tarjoajan julkaisemat työkalukuvaukset.
+    /// Returns all tool descriptors the provider publishes.
     async fn describe(&self) -> Vec<McpToolDescriptor>;
 
-    /// Ajaa yhden työkalukutsun ja palauttaa tuloksen.
+    /// Runs a single tool call and returns the result.
     ///
     /// # Errors
-    /// Palauttaa [`ActionError::McpUnknownTool`] jos työkalua ei ole, ja muita
-    /// [`ActionError`]-variantteja jos suoritus ei voi alkaa. Suositeltavaa on
-    /// reitittää kutsut [`call_with_policy`]:n kautta, joka tekee oikeus- ja
-    /// taint-tarkistukset.
+    /// Returns [`ActionError::McpUnknownTool`] if the tool does not exist,
+    /// and other [`ActionError`] variants if execution cannot start. It is
+    /// recommended to route calls through [`call_with_policy`], which
+    /// performs the permission and taint checks.
     async fn call(&self, call: McpToolCall) -> Result<McpToolResult>;
 }
 
-/// Yhden mock-työkalun toiminta: kuvaus + valmis tuloste.
+/// A single mock tool's behavior: descriptor + a canned result.
 #[derive(Debug, Clone)]
 struct MockTool {
-    /// Työkalun kuvaus jonka tarjoaja julkaisee.
+    /// The descriptor the provider publishes for this tool.
     descriptor: McpToolDescriptor,
-    /// Kiinteä tuloste jonka työkalu palauttaa (mock — ei verkkokutsua).
-    /// `None` tarkoittaa "kaiuta syöte takaisin" (esim. `echo`-työkalu).
+    /// A fixed result the tool returns (mock — no network call).
+    /// `None` means "echo the input back" (e.g. the `echo` tool).
     canned: Option<Value>,
 }
 
-/// Testikäyttöinen MCP-tarjoaja, jolla on muistinvarainen työkalurekisteri.
+/// A test-oriented MCP provider with an in-memory tool registry.
 ///
-/// Oletuksena rekisteri sisältää kaksi geneeristä mock-työkalua:
-/// - `echo` — kaiuttaa syötteen takaisin tulosteena (epäluotettu lähde),
-/// - `fetch_mock` — palauttaa kiinteän valmiin tuloksen (epäluotettu lähde).
+/// By default the registry contains two generic mock tools:
+/// - `echo` — echoes the input back as output (untrusted source),
+/// - `fetch_mock` — returns a fixed canned result (untrusted source).
 ///
-/// Lisää työkaluja voi rekisteröidä [`MockMcpProvider::with_tool`]:lla.
-/// Yksikään mock ei tee verkkokutsuja (KERROS A).
+/// Additional tools can be registered via [`MockMcpProvider::with_tool`]. No
+/// mock makes network calls (Layer A).
 #[derive(Debug, Clone, Default)]
 pub struct MockMcpProvider {
-    /// Työkalut nimellä avainnettuna (vakaa, deterministinen järjestys).
+    /// Tools keyed by name (stable, deterministic order).
     tools: BTreeMap<String, MockTool>,
 }
 
 impl MockMcpProvider {
-    /// Luo tyhjän tarjoajan ilman työkaluja.
+    /// Creates an empty provider with no tools.
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }
 
-    /// Luo tarjoajan oletustyökaluilla (`echo`, `fetch_mock`).
+    /// Creates a provider with the default tools (`echo`, `fetch_mock`).
     ///
-    /// Oletustyökalut vaativat [`SkillPermission::NetworkRead`]-oikeuden ja
-    /// niiden lähde on epäluotettu (tuloste taintataan ellei kutsuja erikseen
-    /// merkitse työkalua luotetuksi).
+    /// The default tools require the [`SkillPermission::NetworkRead`]
+    /// permission and their source is untrusted (the output is tainted
+    /// unless the caller separately marks the tool as trusted).
     #[must_use]
     pub fn with_defaults() -> Self {
         let echo = McpToolDescriptor::new(
@@ -221,10 +221,10 @@ impl MockMcpProvider {
         )
     }
 
-    /// Rekisteröi työkalun kuvauksella ja valmiilla tuloksella.
+    /// Registers a tool with a descriptor and a canned result.
     ///
-    /// Jos `canned` on `None`, työkalu kaiuttaa kutsun syötteen takaisin
-    /// tulosteena. Sama nimi korvaa aiemman rekisteröinnin.
+    /// If `canned` is `None`, the tool echoes the call's input back as
+    /// output. The same name replaces a prior registration.
     #[must_use]
     pub fn with_tool(mut self, descriptor: McpToolDescriptor, canned: Option<Value>) -> Self {
         let name = descriptor.name.clone();
@@ -232,7 +232,7 @@ impl MockMcpProvider {
         self
     }
 
-    /// Hakee työkalun kuvauksen nimellä (jos rekisteröity).
+    /// Looks up a tool's descriptor by name (if registered).
     #[must_use]
     pub fn descriptor(&self, name: &str) -> Option<&McpToolDescriptor> {
         self.tools.get(name).map(|t| &t.descriptor)
@@ -249,33 +249,33 @@ impl McpToolProvider for MockMcpProvider {
         let Some(tool) = self.tools.get(&call.tool) else {
             return Err(ActionError::McpUnknownTool(call.tool));
         };
-        // Mock: joko kaiuta syöte tai palauta valmis tulos. Aina epäluotettu
-        // lähteenä; käytäntöportti päättää lopullisen taint-tilan kuvauksen
-        // `trusted`-lipun perusteella.
+        // Mock: either echo the input or return a canned result. Always
+        // untrusted as a source; the policy gate decides the final taint
+        // state based on the descriptor's `trusted` flag.
         let output = tool.canned.clone().unwrap_or(call.input);
         Ok(McpToolResult::untrusted(output))
     }
 }
 
-/// Reitittää työkalukutsun käytäntöportin läpi: oikeustarkistus, audit-kirjaus
-/// ja taint-merkintä.
+/// Routes a tool call through the policy gate: permission check, audit
+/// logging, and taint marking.
 ///
-/// Vaiheet:
-/// 1. **Tuntematon työkalu** → [`ActionError::McpUnknownTool`] (ei audit-
-///    kirjausta: kutsua ei ollut olemassa).
-/// 2. **Oikeus puuttuu** → [`ActionError::McpDenied`] ja
-///    [`AuditKind::PolicyDenied`]-tapahtuma kirjataan.
-/// 3. **Sallittu** → tarjoaja ajaa kutsun. Tuloste merkitään
-///    epäluotettavaksi ([`AuditKind::TaintMarked`]) **ellei** kuvauksen lähde
-///    ole luotettu; luotetulla lähteellä leima nollataan.
+/// Steps:
+/// 1. **Unknown tool** → [`ActionError::McpUnknownTool`] (no audit entry: the
+///    call never existed).
+/// 2. **Missing permission** → [`ActionError::McpDenied`] and an
+///    [`AuditKind::PolicyDenied`] event is recorded.
+/// 3. **Allowed** → the provider runs the call. The output is marked
+///    untrusted ([`AuditKind::TaintMarked`]) **unless** the descriptor's
+///    source is trusted; with a trusted source the flag is cleared.
 ///
-/// `action_id` sitoo audit-tapahtumat tähän kutsuun, `now` on injektoitu
-/// aikaleima (ei luettu kellosta), `audit` kerää tapahtumat.
+/// `action_id` binds audit events to this call, `now` is the injected
+/// timestamp (never read from the clock), `audit` collects the events.
 ///
 /// # Errors
-/// Palauttaa [`ActionError::McpUnknownTool`] tuntemattomalle työkalulle,
-/// [`ActionError::McpDenied`] kun vaadittu oikeus puuttuu, ja edelleen
-/// tarjoajan palauttaman virheen jos suoritus epäonnistuu.
+/// Returns [`ActionError::McpUnknownTool`] for an unknown tool,
+/// [`ActionError::McpDenied`] when the required permission is missing, and
+/// otherwise propagates the provider's returned error if execution fails.
 pub async fn call_with_policy<P: McpToolProvider + ?Sized>(
     provider: &P,
     granted_permissions: &[SkillPermission],
@@ -284,13 +284,13 @@ pub async fn call_with_policy<P: McpToolProvider + ?Sized>(
     audit: &AuditCollector,
     action_id: ActionId,
 ) -> Result<McpToolResult> {
-    // 1. Etsi työkalukuvaus. Tuntematon työkalu hylätään ennen mitään muuta.
+    // 1. Look up the tool descriptor. An unknown tool is rejected before anything else.
     let descriptors = provider.describe().await;
     let Some(descriptor) = descriptors.into_iter().find(|d| d.name == call.tool) else {
         return Err(ActionError::McpUnknownTool(call.tool));
     };
 
-    // 2. Oikeustarkistus: vaadittu oikeus on oltava myönnettyjen joukossa.
+    // 2. Permission check: the required permission must be in the granted set.
     if !granted_permissions.contains(&descriptor.required_permission) {
         audit.record(ExecAuditEvent::new(
             AuditKind::PolicyDenied,
@@ -307,10 +307,10 @@ pub async fn call_with_policy<P: McpToolProvider + ?Sized>(
         )));
     }
 
-    // 3. Sallittu — aja kutsu tarjoajalla.
+    // 3. Allowed — run the call with the provider.
     let result = provider.call(call).await?;
 
-    // 4. Taint-päätös: luotettu lähde nollaa leiman, muutoin tuloste taintataan.
+    // 4. Taint decision: a trusted source clears the flag, otherwise the output is tainted.
     if descriptor.trusted {
         Ok(McpToolResult::trusted(result.output))
     } else {
@@ -330,7 +330,7 @@ mod tests {
     use familyclaw_core::time::from_unix_secs;
     use serde_json::json;
 
-    /// Apuri: injektoitu aikaleima testeihin.
+    /// Helper: an injected timestamp for tests.
     fn ts() -> Timestamp {
         from_unix_secs(1_700_000_000).expect("valid unix seconds")
     }
@@ -342,7 +342,7 @@ mod tests {
         let names: Vec<&str> = described.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"echo"));
         assert!(names.contains(&"fetch_mock"));
-        // Oletustyökalut ovat epäluotettuja lähteinä.
+        // The default tools are untrusted as sources.
         assert!(described.iter().all(|d| !d.trusted));
     }
 
@@ -358,11 +358,11 @@ mod tests {
             .await
             .expect("granted permission allows call");
 
-        // echo kaiuttaa syötteen takaisin.
+        // echo echoes the input back.
         assert_eq!(result.output, json!({ "user": "agent_a", "msg": "hi" }));
-        // Oletuksena epäluotettu (taint), koska lähde ei ole luotettu.
+        // Untrusted (taint) by default, because the source is not trusted.
         assert!(result.untrusted);
-        // Taint-merkintä kirjattiin audit-lokiin.
+        // The taint marker was recorded to the audit log.
         assert!(audit
             .list()
             .iter()
@@ -394,7 +394,7 @@ mod tests {
             .await
             .expect_err("unknown tool must be rejected");
         assert!(matches!(err, ActionError::McpUnknownTool(_)));
-        // Tuntemattomasta työkalusta ei synny audit-tapahtumaa.
+        // An unknown tool produces no audit event.
         assert!(audit.is_empty());
     }
 
@@ -403,7 +403,7 @@ mod tests {
         let provider = MockMcpProvider::with_defaults();
         let audit = AuditCollector::new();
         let action_id = ActionId::new();
-        // Myönnetään VÄÄRÄ oikeus (työkalu vaatii NetworkRead).
+        // Grant the WRONG permission (the tool requires NetworkRead).
         let granted = [SkillPermission::ReadFiles];
 
         let call = McpToolCall::new("echo", json!({ "user": "agent_a" }));
@@ -412,18 +412,18 @@ mod tests {
             .expect_err("missing permission must block");
         assert!(matches!(err, ActionError::McpDenied(_)));
 
-        // Eväys kirjattiin audit-lokiin.
+        // The denial was recorded to the audit log.
         let events = audit.list();
         assert!(events
             .iter()
             .any(|e| e.kind == AuditKind::PolicyDenied && e.action_id == action_id));
-        // Eikä taint-tapahtumaa synny kun kutsu estettiin.
+        // And no taint event occurs when the call was blocked.
         assert!(!events.iter().any(|e| e.kind == AuditKind::TaintMarked));
     }
 
     #[tokio::test]
     async fn trusted_source_output_is_not_tainted() {
-        // Rekisteröi luotettu työkalu kiinteällä tuloksella.
+        // Register a trusted tool with a fixed result.
         let trusted_tool = McpToolDescriptor::new(
             "trusted_lookup",
             "Luotettu sisäinen haku.",
@@ -441,10 +441,10 @@ mod tests {
             .await
             .expect("trusted tool allowed");
 
-        // Luotettu lähde → ei taint-leimaa.
+        // Trusted source → no taint marker.
         assert!(!result.untrusted);
         assert_eq!(result.output, json!({ "result": "general" }));
-        // Eikä taint-tapahtumaa kirjata luotetulle lähteelle.
+        // And no taint event is recorded for a trusted source.
         assert!(!audit
             .list()
             .iter()
@@ -453,9 +453,9 @@ mod tests {
 
     #[tokio::test]
     async fn secret_looking_output_passes_through_call_result_for_proof_redaction() {
-        // Tarjoaja ei redaktoi itse — redaktointi tapahtuu todistepaketissa.
-        // Tässä varmistetaan vain että salaisuudelta näyttävä arvo kulkee
-        // tuloksessa läpi ilman lähdeliteraalia (Layer B -audit).
+        // The provider does not redact by itself — redaction happens in the
+        // proof bundle. This only verifies that a secret-looking value
+        // passes through in the result without a source literal (Layer B audit).
         let fake = format!("sk-{}", "live".repeat(4));
         let tool = McpToolDescriptor::new(
             "leaky_mock",
@@ -472,7 +472,7 @@ mod tests {
         let result = call_with_policy(&provider, &granted, call, ts(), &audit, ActionId::new())
             .await
             .expect("call allowed");
-        // Epäluotettu lähde → taint asetettu (redaktointi tehdään proof-kerroksessa).
+        // Untrusted source → taint set (redaction happens at the proof layer).
         assert!(result.untrusted);
         assert_eq!(result.output, json!({ "blob": fake }));
     }

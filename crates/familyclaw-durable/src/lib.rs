@@ -1,54 +1,55 @@
 //! # familyclaw-durable
 //!
-//! **Durable substrate — deterministinen replay (crash-proof).**
+//! **Durable substrate — deterministic replay (crash-proof).**
 //!
-//! Tämä crate on FamilyClaw-alustan KERROS 1 (design §2.1) ja perheen **#1
-//! kipupisteen — muistin epäjatkuvuuden — rakenteellinen ratkaisu**. Sen sijaan
-//! että muistutettaisiin agenttia tallentamaan tilansa, durable execution tekee
-//! jatkuvuudesta *rakenteen*: workflow kirjataan tapahtumalokiin, ja jos
-//! prosessi kaatuu, työ jatkuu täsmälleen siitä mihin se jäi — sivuvaikutuksia
-//! toistamatta.
+//! This crate is layer 1 of the `FamilyClaw` platform (design §2.1) and the
+//! **structural solution to a family's pain point #1 — memory
+//! discontinuity**. Rather than relying on the agent to remember to save
+//! its state, durable execution turns continuity into *structure*: the
+//! workflow is recorded to an event journal, and if the process crashes,
+//! the work resumes exactly where it left off — without replaying side
+//! effects.
 //!
-//! ## Malli
-//! Toteutus on **journal-pohjainen deterministinen replay** (Temporal-/Flawless-
-//! malli puhtaana Rustina, ilman wasmtimea tässä vaiheessa):
+//! ## Model
+//! The implementation is **journal-based deterministic replay** (the
+//! Temporal/Flawless model in pure Rust, without wasmtime at this stage):
 //!
-//! 1. Workflow kääritään askeliin [`DurableContext::step`].
-//! 2. Jokainen valmistunut askel kirjoitetaan [`JournalEntry`]:nä append-only
-//!    [`Journal`]:iin.
-//! 3. Uudelleenkäynnistyksessä [`DurableContext`] rakennetaan samasta
-//!    journalista, ja jo suoritetut askeleet **palautetaan lokista ajamatta
-//!    niiden sulkimia uudelleen**.
+//! 1. The workflow is wrapped into steps via [`DurableContext::step`].
+//! 2. Every completed step is written as a [`JournalEntry`] to an
+//!    append-only [`Journal`].
+//! 3. On restart, [`DurableContext`] is rebuilt from the same journal, and
+//!    steps that already ran **are restored from the log without
+//!    re-running their closures**.
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_durable::{DurableContext, InMemoryJournal};
 //!
 //! # fn main() -> familyclaw_durable::Result<()> {
-//! // Tuore ajo: suljin ajetaan ja tulos kirjataan lokiin.
+//! // Fresh run: the closure executes and the result is written to the log.
 //! let mut ctx = DurableContext::new(InMemoryJournal::new())?;
 //! let greeting: String = ctx.step("greet", || Ok("hello".to_string()))?;
 //! assert_eq!(greeting, "hello");
 //!
-//! // "Kaatuminen": otetaan journal talteen ja rakennetaan konteksti uudelleen.
+//! // "Crash": take the journal and rebuild the context from it.
 //! let journal = ctx.finish();
 //! let mut resumed = DurableContext::new(journal)?;
 //!
-//! // Replay: sama askel palautuu lokista — suljinta EI ajeta uudelleen.
+//! // Replay: the same step is restored from the log — the closure is NOT re-run.
 //! let again: String = resumed.step("greet", || Ok("DIFFERENT".to_string()))?;
-//! assert_eq!(again, "hello"); // tallennettu arvo, ei sulkimen uusi arvo
+//! assert_eq!(again, "hello"); // the recorded value, not the closure's new value
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! ## Toteutukset
-//! - [`InMemoryJournal`] — kestämätön, testaukseen/kehitykseen.
-//! - [`FileJournal`] — kaatumiskestävä append-only JSONL (`flush` + `fsync`).
+//! ## Implementations
+//! - [`InMemoryJournal`] — non-durable, for testing/development.
+//! - [`FileJournal`] — crash-safe append-only JSONL (`flush` + `fsync`).
 //!
-//! ## OSS-raja (KERROS A)
-//! Tämä crate on geneeristä alustakoodia: se ei kovakoodaa perheenjäsenten
-//! sieluja, avaimia, tokeneita, IP-osoitteita tai henkilökohtaisia polkuja.
-//! Journalin polku annetaan ajonaikaisesti.
+//! ## OSS boundary (Layer A)
+//! This crate is generic platform code: it does not hardcode family
+//! members' souls, keys, tokens, IP addresses, or personal paths. The
+//! journal path is supplied at runtime.
 
 pub mod context;
 pub mod entry;
@@ -69,7 +70,7 @@ pub use time_machine::{
     TimelineStep, FORK_MARKER,
 };
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -86,7 +87,7 @@ mod tests {
 
     #[test]
     fn public_api_is_reexported() {
-        // Jos jokin re-export poistetaan, tämä testi lakkaa kääntymästä.
+        // If any re-export is removed, this test stops compiling.
         let mut ctx: DurableContext<InMemoryJournal> =
             DurableContext::new(InMemoryJournal::new()).expect("ctx");
         let v: u8 = ctx.step("s", || Ok(7)).expect("step");
@@ -101,14 +102,14 @@ mod tests {
         assert!(ok.is_ok());
     }
 
-    /// End-to-end: kaksi journal-toteutusta tuottavat saman deterministisen
-    /// replay-tuloksen (vahvistaa että `DurableContext` on aidosti journal-
-    /// agnostinen).
+    /// End-to-end: two journal implementations produce the same deterministic
+    /// replay result (confirms that `DurableContext` is genuinely journal-
+    /// agnostic).
     #[test]
     fn in_memory_and_file_produce_identical_replay() {
         use std::cell::Cell;
 
-        // Apuri: aja workflow ja palauta (tulos, sivuvaikutusmäärä).
+        // Helper: run the workflow and return (result, side-effect count).
         fn run<J: Journal>(journal: J, effects: &Cell<u32>) -> (i64, J) {
             let mut ctx = DurableContext::new(journal).expect("ctx");
             let a: i64 = ctx
@@ -135,7 +136,7 @@ mod tests {
         assert_eq!(
             mem_effects.get(),
             2,
-            "memory: ei uusia sivuvaikutuksia replayssa"
+            "memory: no new side effects during replay"
         );
 
         // --- File ---
@@ -152,7 +153,7 @@ mod tests {
         let file_effects = Cell::new(0u32);
         let first_journal = FileJournal::open(&path).expect("open 1");
         let (file_first, _) = run(first_journal, &file_effects);
-        // Uusi kahva = simuloitu restart.
+        // New handle = simulated restart.
         let second_journal = FileJournal::open(&path).expect("open 2");
         let (file_replay, _) = run(second_journal, &file_effects);
 
@@ -161,10 +162,10 @@ mod tests {
         assert_eq!(
             file_effects.get(),
             2,
-            "file: ei uusia sivuvaikutuksia replayssa"
+            "file: no new side effects during replay"
         );
 
-        // Sama tulos molemmilla taustoilla.
+        // Same result on both backends.
         assert_eq!(mem_replay, file_replay);
 
         let _ = std::fs::remove_file(&path);

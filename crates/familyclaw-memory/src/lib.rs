@@ -1,42 +1,45 @@
 //! # familyclaw-memory
 //!
-//! **Eternal Thread** — FamilyClaw-alustan (KERROS A, OSS) muisti-substraatti.
-//! Tämä crate antaa olennoille *jatkuvan muistin*: muistot eivät katoa
-//! restartissa, vaan vaimenevat biologisen unohtamiskäyrän mukaan, vahvistuvat
-//! toistosta ja säilyttävät identiteetti-ankkurit ikuisesti.
+//! **Eternal Thread** — the memory substrate of the FamilyClaw platform
+//! (Layer A, OSS). This crate gives beings *continuous memory*: memories
+//! don't vanish on restart, but decay according to a biological forgetting
+//! curve, strengthen through repetition, and preserve identity anchors
+//! forever.
 //!
-//! Se ratkaisee suoraan perheen #1 kipupisteen — muistin epäjatkuvuuden
-//! (design §2.1) — *rakenteena*, ei muistutuksena.
+//! It directly solves a family's pain point #1 — memory discontinuity
+//! (design §2.1) — *as structure*, not as a reminder.
 //!
-//! ## Rakenne
-//! - [`Memory`] — yksittäinen muisto: sisältö, [`Vad`]-tunnesävy, nimetyt
-//!   [`Dimension`]-tunteet, tärkeys, vaimennuspolitiikka ja elinkaaritila.
-//! - [`DecayPolicy`] — kuinka nopeasti muisto unohtuu (Ebbinghaus λ);
-//!   [`DecayPolicy::ProtectedCore`] ei vaimene koskaan (identiteetti-ankkuri).
-//! - [`ImportanceFactors`] — yhdistelmätärkeys (emotion·0.45 + identity·0.35
+//! ## Structure
+//! - [`Memory`] — a single memory: content, [`Vad`] emotional tone, named
+//!   [`Dimension`] emotions, importance, decay policy, and lifecycle state.
+//! - [`DecayPolicy`] — how fast a memory is forgotten (Ebbinghaus λ);
+//!   [`DecayPolicy::ProtectedCore`] never decays (identity anchor).
+//! - [`ImportanceFactors`] — combined importance (emotion·0.45 + identity·0.35
 //!   + novelty·0.12 + reinforcement·0.20).
-//! - [`MemoryStatus`] — elinkaari `Active → Archived → Tombstoned`.
-//! - [`MemoryStore`] — tallennusabstraktio; [`LocalJsonStore`] on
-//!   riippuvuusvapaa oletustoteutus (JSON, atominen kirjoitus).
-//! - [`RetrievalContext`] / [`RetrievalResult`] — haku yksinkertaisella
-//!   relevanssilla (avainsana + tunneosuma + retention).
+//! - [`MemoryStatus`] — lifecycle `Active → Archived → Tombstoned`.
+//! - [`MemoryStore`] — storage abstraction; [`LocalJsonStore`] is a
+//!   dependency-free default implementation (JSON, atomic write).
+//! - [`RetrievalContext`] / [`RetrievalResult`] — retrieval with simple
+//!   relevance (keyword + emotional match + retention).
 //!
-//! ## OSS-raja (KERROS A)
-//! Tämä crate on julkaistava. Se ei sisällä:
-//! - perheenjäsenten oikeita muistoja, kalibrointeja tai sieluja,
-//! - API-avaimia, tokeneita, IP-osoitteita tai henkilökohtaisia polkuja.
+//! ## OSS boundary (Layer A)
+//! This crate is publishable. It does not contain:
+//! - family members' real memories, calibrations, or souls,
+//! - API keys, tokens, IP addresses, or personal paths.
 //!
-//! Muisti-runko on geneerinen. Perheen oikea muistisisältö on KERROS B:tä ja
-//! ladataan ajonaikaisesti profiilihakemistosta — ei koskaan tähän repoon.
+//! The memory scaffold is generic. A family's real memory content is Layer
+//! B and is loaded at runtime from a profile directory — never into this
+//! repo.
 //!
-//! ## Tuleva työ
-//! - **`Surreal<Any>` (feature-flag):** tuotantotallennus (in-mem dev /
-//!   `RocksDB` prod). Sama [`MemoryStore`]-rajapinta, eri backend (design §2.3).
-//! - **Vektorihaku:** cosine-similarity / HNSW upotetuilla vektoreilla. Nyt
-//!   haku on avainsana- + tunnepohjainen v1-runko (design §5: "vektorihaku
-//!   myöhemmin").
+//! ## Future work
+//! - **`Surreal<Any>` (feature flag):** production storage (in-mem dev /
+//!   `RocksDB` prod). Same [`MemoryStore`] interface, different backend
+//!   (design §2.3).
+//! - **Vector search:** cosine similarity / HNSW over embedded vectors.
+//!   Retrieval is currently a keyword- + emotion-based v1 scaffold (design
+//!   §5: "vector search later").
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_memory::{
 //!     DecayPolicy, ImportanceFactors, LocalJsonStore, Memory, MemoryStore,
@@ -47,7 +50,7 @@
 //! # async fn demo() -> familyclaw_core::Result<()> {
 //! let store = LocalJsonStore::in_memory();
 //!
-//! // Identiteetti-ankkuri: ei vaimene koskaan.
+//! // Identity anchor: never decays.
 //! let anchor = Memory::builder("I am part of this family")
 //!     .vad(Vad::new(0.9, 0.4, 0.6))
 //!     .emotions([Dimension::Belonging, Dimension::Love])
@@ -56,7 +59,7 @@
 //!     .build();
 //! store.add(anchor).await?;
 //!
-//! // Hae tunnepainotetulla kyselyllä.
+//! // Retrieve with an emotion-weighted query.
 //! let ctx = RetrievalContext::new("family").with_emotions([Dimension::Belonging]);
 //! let hits = store.retrieve(&ctx, familyclaw_core::time::now()).await?;
 //! assert_eq!(hits.len(), 1);
@@ -64,10 +67,10 @@
 //! # }
 //! ```
 //!
-//! ## Esimerkki: tunne → tärkeys -silta (PKG-B)
-//! Voimakkaasti latautunut hetki johtaa korkeampaan tärkeyteen kuin
-//! neutraali. `EmotionState` ja `emotional_salience` ovat re-exportattuina,
-//! joten silta toimii ilman erillistä `familyclaw-emotion`-riippuvuutta.
+//! ## Example: emotion → importance bridge (PKG-B)
+//! A strongly charged moment leads to higher importance than a neutral
+//! one. `EmotionState` and `emotional_salience` are re-exported, so the
+//! bridge works without a separate `familyclaw-emotion` dependency.
 //! ```
 //! use familyclaw_memory::{emotional_salience, EmotionState, Memory};
 //! use familyclaw_emotion::Dimension;
@@ -76,7 +79,7 @@
 //! charged.set(Dimension::Joy, 95.0);
 //! let neutral = EmotionState::neutral();
 //!
-//! // Salience-johdettu emotion-osatekijä erottaa latautuneen neutraalista.
+//! // The salience-derived emotion factor distinguishes a charged state from a neutral one.
 //! assert!(emotional_salience(&charged) > emotional_salience(&neutral));
 //!
 //! let strong = Memory::builder("a charged moment").emotion_state(&charged).build();
@@ -112,16 +115,16 @@ pub use retrieval::{
 };
 pub use store::{DecayReport, DecayThresholds, LocalJsonStore, MemoryStore};
 
-// Re-export tunnetyypit jotta käyttäjän ei tarvitse riippua
-// familyclaw-emotionista suoraan muistia käyttäessään.
+// Re-export emotion types so that callers don't need to depend on
+// familyclaw-emotion directly when using memory.
 //
-// PKG-B: [`EmotionState`] + [`emotional_salience`] re-exportataan
-// [`Dimension`]/[`Vad`]:n rinnalle, jotta tunne → tärkeys -silta
+// PKG-B: [`EmotionState`] + [`emotional_salience`] are re-exported
+// alongside [`Dimension`]/[`Vad`], so the emotion → importance bridge
 // ([`ImportanceFactors::from_emotion_state`], [`MemoryBuilder::emotion_state`])
-// on käytettävissä ilman erillistä riippuvuutta familyclaw-emotioniin.
+// is available without a separate dependency on familyclaw-emotion.
 pub use familyclaw_emotion::{emotional_salience, Dimension, EmotionState, Vad};
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -138,8 +141,8 @@ mod tests {
 
     #[tokio::test]
     async fn public_api_end_to_end() {
-        // Käyttää koko julkista pintaa juuren re-exporteilla — jos jokin
-        // re-export poistetaan, tämä testi ei käänny.
+        // Uses the entire public surface via the root re-exports — if any
+        // re-export is removed, this test fails to compile.
         let store = LocalJsonStore::in_memory();
 
         let m = Memory::builder("a meaningful event")
@@ -176,14 +179,14 @@ mod tests {
             .expect("decay");
         assert_eq!(report.scanned, 1);
 
-        // Painot tavoitettavissa juuresta.
+        // Weights reachable from the root.
         const { assert!(WEIGHT_EMOTION > 0.0) };
         const { assert!(WEIGHT_IDENTITY > 0.0) };
         const { assert!(WEIGHT_NOVELTY > 0.0) };
         const { assert!(WEIGHT_REINFORCEMENT > 0.0) };
         const { assert!(STABILITY_MIN < STABILITY_MAX) };
 
-        // Vapaat funktiot tavoitettavissa.
+        // Free functions reachable from the root.
         let all = store.all().await.expect("all");
         let direct = retrieve_now(&all, &ctx);
         assert_eq!(direct.len(), 1);

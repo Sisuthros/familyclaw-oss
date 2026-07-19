@@ -1,30 +1,29 @@
 //! # familyclaw-core
 //!
-//! FamilyClaw-alustan **ydincrate**: yhteiset tyypit, virheenkäsittely,
-//! konfiguraatio ja ajan apufunktiot, joiden päälle muut KERROS A
-//! -crateit (`familyclaw-bus`, `familyclaw-memory`, `familyclaw-durable`, …)
-//! rakentuvat.
+//! The `FamilyClaw` platform's **core crate**: shared types, error
+//! handling, configuration, and time helpers, on which the other Layer A
+//! crates (`familyclaw-bus`, `familyclaw-memory`, `familyclaw-durable`, …)
+//! are built.
 //!
-//! Tämä crate on tarkoituksella **riippumaton muista familyclaw-crateista** —
-//! se on perustus, joten riippuvuussuunta kulkee vain tähän, ei tästä
-//! poispäin. Pidä se puhtaana.
+//! This crate is deliberately **independent of other familyclaw crates**
+//! — it is the foundation, so the dependency direction only points into
+//! it, never away from it. Keep it clean.
 //!
-//! ## Suunnitteluperiaatteet
-//! - **Ei `unwrap()`/`expect()`/`panic!()` tuotantopolulla.** Kaikki
-//!   epäonnistumiset kulkevat [`FamilyClawError`]- ja [`Result`]-tyyppien
-//!   kautta. (Testeissä `unwrap`/`expect` on sallittu.)
-//! - **Tyypitetyt tunnisteet** ([`AgentId`], [`FamilyId`], [`MessageId`])
-//!   estävät tunnisteiden sekoittamisen käännösaikana.
-//! - **OSS-raja (KERROS A):** mikään tässä cratessa ei kovakoodaa
-//!   perheenjäsenten sieluja, API-avaimia, tokeneita, IP-osoitteita tai
-//!   henkilökohtaisia polkuja. Profiilit ladataan ajonaikaisesti
-//!   ([`AgentConfig::profile_dir`]).
+//! ## Design principles
+//! - **No `unwrap()`/`expect()`/`panic!()` on the production path.** All
+//!   failures flow through the [`FamilyClawError`] and [`Result`] types.
+//!   (`unwrap`/`expect` is allowed in tests.)
+//! - **Typed identifiers** ([`AgentId`], [`FamilyId`], [`MessageId`])
+//!   prevent identifiers from being mixed up at compile time.
+//! - **OSS boundary (Layer A):** nothing in this crate hardcodes family
+//!   members' souls, API keys, tokens, IP addresses, or personal paths.
+//!   Profiles are loaded at runtime ([`AgentConfig::profile_dir`]).
 //!
-//! ## Moduulit
+//! ## Modules
 //! - [`error`] — [`FamilyClawError`], [`Result`].
-//! - [`ids`] — newtype-tunnisteet.
+//! - [`ids`] — newtype identifiers.
 //! - [`config`] — [`FamilyConfig`], [`AgentConfig`], [`ModelConfig`].
-//! - [`time`] — UTC-aikaleimat ja apufunktiot.
+//! - [`time`] — UTC timestamps and helper functions.
 
 pub mod config;
 pub mod error;
@@ -36,7 +35,7 @@ pub use error::{FamilyClawError, Result};
 pub use ids::{AgentId, FamilyId, MessageId};
 pub use time::Timestamp;
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -53,8 +52,8 @@ mod tests {
 
     #[test]
     fn public_api_is_reexported() {
-        // Varmistaa että julkinen pinta on saatavilla juuresta — jos jokin
-        // re-export poistetaan, tämä testi ei käänny.
+        // Confirms that the public surface is available from the crate root — if a
+        // re-export is removed, this test will fail to compile.
         let model = ModelConfig::new("provider/model");
         let agent = AgentConfig::new("agent_a", model);
         let family = FamilyConfig::new("family").with_agent(agent);

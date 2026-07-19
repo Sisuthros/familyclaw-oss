@@ -73,7 +73,11 @@ logs, operator UIs, or memory.
 
 **Mechanism:** Proof bundles, suspend summaries, and turn-audit records pass through
 `redact_free_text` before persistence. Manifests are scanned for secret-like
-patterns at registration time.
+patterns at registration time. This redaction is **heuristic and pattern-based**
+(regex/keyword matching over free text), not a formally verified guarantee — it
+reduces the chance of a known-shaped secret (e.g. an API key pattern) reaching a
+proof or log, but it cannot prove the absence of all sensitive content in
+arbitrary free text.
 
 | Surface | Crate / module |
 |---------|----------------|
@@ -108,20 +112,30 @@ without destroying the substrate.
 
 **What it protects:** Arbitrary code execution from third-party or LLM-generated skills.
 
-**Mechanism:** Optional Wasmtime backend with fuel metering, deny-by-default host
-imports, and capability grants. Third-party skills **should** run inside the
-sandbox; built-in Layer A skills are pure Rust. Enable at runtime with
+**Mechanism:** Optional Wasmtime backend with fuel metering. The current shipped
+enforcement is **categorical: any WASM module that declares one or more host
+imports is rejected outright** at instantiation time (`wasmtime_backend.rs`,
+`module.imports().len() > 0` → `SandboxError::Setup`), regardless of what a
+`CapabilitySet` on the request grants. This is strictly stronger than
+capability-scoped host access — it is "no host imports at all," not "only
+granted imports are linked." `CapabilitySet` is validated as a
+well-formed request field (`request.validate()`), but the wasmtime backend does
+not yet consult it to selectively link WASI host functions; it exists today as
+the declared policy surface for a future capability-gated WASI host-function
+implementation. Third-party skills **should** run inside the sandbox; built-in
+Layer A skills are pure Rust. Enable at runtime with
 `FAMILYCLAW_SANDBOX_SKILLS=1` (wired by `build_family` when the sandbox crate
 is available).
 
 | Surface | Crate / module |
 |---------|----------------|
 | Sandbox trait | `familyclaw-sandbox` → `CodeSandbox` |
-| Wasmtime backend | `familyclaw-sandbox` (feature `wasmtime`) |
+| Wasmtime backend | `familyclaw-sandbox` (feature `wasmtime`) → `wasmtime_backend.rs` |
 | Agent wiring | `familyclaw-runtime` → `build_family` |
 
 **Invariant:** Without sandbox, `execute_code` returns an error — no silent fallback
-to host execution.
+to host execution. A module requiring any host import is rejected before it can
+run, independent of capability grants.
 
 ---
 

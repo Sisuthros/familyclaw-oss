@@ -63,6 +63,47 @@ jobs:
           DISCORD_TEST_TOKEN: ${{ secrets.DISCORD_TEST_TOKEN }}
           DISCORD_TEST_CHANNEL_ID: ${{ secrets.DISCORD_TEST_CHANNEL_ID }}
 
+  feature-isolation:
+    name: Feature isolation (${{ matrix.name }})
+    needs: layer-b-audit
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: channels/telegram
+            crate: familyclaw-channels
+            feature: telegram
+          - name: channels/whatsapp
+            crate: familyclaw-channels
+            feature: whatsapp
+          - name: channels/signal
+            crate: familyclaw-channels
+            feature: signal
+          - name: gateway/wasmtime
+            crate: familyclaw-gateway
+            feature: wasmtime
+          - name: sandbox/wasmtime
+            crate: familyclaw-sandbox
+            feature: wasmtime
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # Each entry tests exactly ONE feature enabled in isolation (no `discord`,
+      # no `--all-features`). This catches a bug that only manifests when a
+      # single feature is compiled alone — --all-features enables every feature
+      # together and can mask a feature that is broken (or that silently
+      # depends on another feature) in isolation.
+      - name: cargo test -p ${{ matrix.crate }} --no-default-features --features ${{ matrix.feature }}
+        run: cargo test -p ${{ matrix.crate }} --no-default-features --features ${{ matrix.feature }}
+
   msrv:
     name: MSRV (1.88)
     needs: layer-b-audit
@@ -96,44 +137,44 @@ jobs:
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
 
-      # familyclaw-bench-integraatiotestit ajavat continuity_daemon-binäärin
-      # lapsiprosessina ja paikantavat sen valmiiksi käännettynä target/debug/-
-      # kansiosta. `cargo test --workspace` EI rakenna toisen craten [[bin]]-
-      # kohdetta testiajoa varten, joten daemon on käännettävä eksplisiittisesti
-      # ennen testejä — muuten familyclaw_subject.rs panikoi "binary not found".
-      - name: Build continuity_daemon binary (familyclaw-bench prosessiraja)
+      # familyclaw-bench integration tests spawn the continuity_daemon binary
+      # as a child process and locate it already built under target/debug/.
+      # `cargo test --workspace` does NOT build another crate's [[bin]]
+      # target for the test run, so the daemon must be built explicitly
+      # before tests — otherwise familyclaw_subject.rs panics with "binary not found".
+      - name: Build continuity_daemon binary (familyclaw-bench process boundary)
         run: cargo build -p familyclaw-agent --bin continuity_daemon
 
-      # Käytämme --all-features (EI eksplisiittistä featurelistaa) tarkoituksella:
-      # se on ainoa gate joka nappaa MINKÄ TAHANSA workspace-featuren rikkoutumisen,
-      # myös vasta lisätyn. Regressio jonka tämä estää (2026-07): familyclaw-hearthin
-      # `surreal`-feature rikkoutui (test + rustdoc) ja pääsi CI:stä läpi koska tämä
-      # job listasi featuret käsin ja jätti `surreal`n pois. Nyt kaikki featuret
-      # (surreal mukaan lukien) aktivoituvat, ja test + doc + clippy ajetaan niillä.
-      # Sandbox: --all-features aktivoi sekä familyclaw-gateway/wasmtime että
-      # familyclaw-sandbox/wasmtime, joten gatewayn oma `cfg!(feature = "wasmtime")`
-      # pysyy synkassa käännetyn backendin kanssa ja
-      # sandbox_label_matches_compiled_feature menee läpi (verifioitu lokaalisti).
+      # We use --all-features (NOT an explicit feature list) on purpose:
+      # it's the only gate that catches ANY workspace feature breaking,
+      # including newly added ones. Regression this prevents (2026-07): familyclaw-hearth's
+      # `surreal` feature broke (test + rustdoc) and slipped through CI because this
+      # job listed features by hand and left `surreal` out. Now all features
+      # (including surreal) are activated, and test + doc + clippy run with them.
+      # Sandbox: --all-features activates both familyclaw-gateway/wasmtime and
+      # familyclaw-sandbox/wasmtime, so the gateway's own `cfg!(feature = "wasmtime")`
+      # stays in sync with the compiled backend and
+      # sandbox_label_matches_compiled_feature passes (verified locally).
       - name: cargo test --workspace --all-features
         run: cargo test --workspace --all-features
 
-      # Doc all-featuresilla -D warnings: nappaa rikkinäiset rustdoc-linkit myös
-      # feature-gated moduuleissa (esim. surreal.rs), joita default/discord-doc ei kata.
+      # Doc with all-features -D warnings: catches broken rustdoc links even in
+      # feature-gated modules (e.g. surreal.rs) that default/discord-doc doesn't cover.
       - name: cargo doc --workspace --all-features (-D warnings)
         run: cargo doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-      # Clippy all-featuresilla -D warnings: nappaa lint-rikkoutumiset feature-gated
-      # koodissa jota discord-only-clippy (check + windows-msvc-lint) ei käännä.
+      # Clippy with all-features -D warnings: catches lint breaks in feature-gated
+      # code that discord-only-clippy (check + windows-msvc-lint) doesn't compile.
       - name: cargo clippy --workspace --all-features --all-targets (-D warnings)
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
       - name: Continuity scorecard gate (bench all)
         run: cargo run -p familyclaw-bench --bin bench -- all
 
-      # Julkinen todiste: scorecard näkyy suoraan run-sivun Summary-osiossa,
-      # jotta skeptikko näkee 8/8-tuloksen ilman kloonausta tai toolchainia.
+      # Public proof: the scorecard shows up directly in the run page's Summary
+      # section, so a skeptic sees the 8/8 result without cloning or a toolchain.
       - name: Publish scorecard to job summary
         run: cat crates/familyclaw-bench/out/SCORECARD.md >> "$GITHUB_STEP_SUMMARY"
 
@@ -164,6 +205,21 @@ jobs:
 
       - name: Run unit tests (discord feature)
         run: cargo test --workspace --features discord
+
+      # Mirrors the `all-features` (ubuntu) job: familyclaw-bench integration
+      # tests spawn the continuity_daemon binary as a child process and locate
+      # it already built under target/debug/ (target\debug\continuity_daemon.exe
+      # on Windows). `cargo test --workspace` does not build another crate's
+      # [[bin]] target for the test run, so it must be built explicitly first
+      # or familyclaw_subject.rs panics with "binary not found".
+      - name: Build continuity_daemon binary (familyclaw-bench process boundary)
+        run: cargo build -p familyclaw-agent --bin continuity_daemon
+
+      # Windows never previously built --all-features, so the wasmtime sandbox
+      # backend (familyclaw-gateway/wasmtime -> familyclaw-sandbox/wasmtime,
+      # Cranelift + JIT) was unverified on MSVC. This closes that gap.
+      - name: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features
 
   windows-msvc-lint:
     # Phase 0 (v1.0 roadmap): the per-phase "green on MSVC" gate must be enforced
@@ -213,11 +269,11 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Run cargo audit
-        # cargo-audit EI lue deny.tomlia → ignoret toistettava tässä.
-        # Pidä synkassa deny.toml:n [advisories].ignore-listan kanssa.
-        # Perustelut: rsa Marvin (ei korjausta), rustls-webpki (discord-ketju,
-        # ei korjaavaa serenity-versiota), atomic-polyfill+number_prefix
-        # (unmaintained, ei haavoittuvuus). wasmtime-advisoryt korjattu 35→45.
+        # cargo-audit does NOT read deny.toml -> ignores must be repeated here.
+        # Keep in sync with deny.toml's [advisories].ignore list.
+        # Rationale: rsa Marvin (no fix), rustls-webpki (discord chain,
+        # no fixed serenity version), atomic-polyfill+number_prefix
+        # (unmaintained, not a vulnerability). wasmtime advisories fixed 35->45.
         run: |
           cargo audit \
             --ignore RUSTSEC-2023-0071 \

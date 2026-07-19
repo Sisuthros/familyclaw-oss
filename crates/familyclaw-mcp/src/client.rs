@@ -1,4 +1,4 @@
-//! MCP-asiakas: työkalujen listaus ja kutsu (KERROS A).
+//! MCP client: tool listing and invocation (Layer A).
 
 use std::sync::Arc;
 
@@ -12,17 +12,18 @@ use crate::error::{McpError, Result};
 use crate::redact::redact_for_log;
 use crate::transport::Transport;
 
-/// MCP-palvelinasiakas (stdio tai HTTP).
+/// An MCP server client (stdio or HTTP).
 pub struct McpClient {
     server_name: String,
     transport: Mutex<Transport>,
 }
 
 impl McpClient {
-    /// Yhdistää palvelimeen ja suorittaa MCP-kättelyn.
+    /// Connects to the server and performs the MCP handshake.
     ///
     /// # Errors
-    /// Kuljetuksen avaus tai `initialize`-kättely epäonnistuu.
+    /// Returns an error if opening the transport or the `initialize`
+    /// handshake fails.
     pub async fn connect(config: McpServerConfig) -> Result<SharedMcpClient> {
         let server_name = config.name.clone();
         let mut transport = Transport::connect(&config.transport, &server_name)?;
@@ -33,22 +34,23 @@ impl McpClient {
         }))
     }
 
-    /// Palvelimen looginen nimi.
+    /// The server's logical name.
     #[must_use]
     pub fn server_name(&self) -> &str {
         &self.server_name
     }
 
-    /// Onko konfiguraatio HTTP-kuljetukselle.
+    /// Whether the configuration is for an HTTP transport.
     #[must_use]
     pub fn is_http(config: &McpTransportConfig) -> bool {
         matches!(config, McpTransportConfig::Http { .. })
     }
 
-    /// Listaa palvelimen työkalut MCP-protokollan kautta.
+    /// Lists the server's tools via the MCP protocol.
     ///
     /// # Errors
-    /// JSON-RPC tai protokollavastauksen jäsennys epäonnistuu.
+    /// Returns an error if the JSON-RPC call or parsing the protocol
+    /// response fails.
     pub async fn list_tools(&self) -> Result<Vec<McpToolDescriptor>> {
         let mut transport = self.transport.lock().await;
         let result = transport.request("tools/list", json!({})).await?;
@@ -89,13 +91,14 @@ impl McpClient {
         Ok(descriptors)
     }
 
-    /// Kutsuu nimettyä MCP-työkalua.
+    /// Calls the named MCP tool.
     ///
-    /// `tool_name` voi olla täysin qualifioitu (`mcp_server_tool`) tai pelkkä
-    /// alkuperäinen nimi — molemmat hyväksytään.
+    /// `tool_name` may be fully qualified (`mcp_server_tool`) or just the
+    /// original tool name — both are accepted.
     ///
     /// # Errors
-    /// JSON-RPC, protokolla tai työkalun `isError`-lippu epäonnistuu.
+    /// Returns an error if the JSON-RPC call, the protocol response, or the
+    /// tool's `isError` flag indicates failure.
     pub async fn call_tool(&self, tool_name: &str, input: Value) -> Result<McpToolResult> {
         let remote_name = remote_tool_name(&self.server_name, tool_name);
         tracing::debug!(
@@ -129,7 +132,7 @@ impl McpClient {
     }
 }
 
-/// Jaettu [`Arc`]-asiakas dynaamisille taidoille.
+/// A shared [`Arc`] client for use by dynamic skills.
 pub type SharedMcpClient = Arc<McpClient>;
 
 fn qualify_tool_name(server: &str, tool: &str) -> String {

@@ -1,30 +1,30 @@
-# Ruflo vs FamilyClaw — kartoitus
+# Ruflo vs FamilyClaw — mapping
 
-> **Tarkoitus:** Selvittää, mitä [Ruflo](https://github.com/ruvnet/ruflo) (agent meta-harness Claude Code / Codex -ympäristöön) tarjoaa, miten se suhteutuu FamilyClawiin, ja mitä kannattaa lainata vs. hylätä.
+> **Purpose:** Determine what [Ruflo](https://github.com/ruvnet/ruflo) (agent meta-harness for Claude Code / Codex environments) offers, how it relates to FamilyClaw, and what is worth borrowing vs. discarding.
 >
-> **Päivämäärä:** 2026-07-08  
-> **Konteksti:** Julkinen Layer A -repo + yksityinen Layer B -profiili (esim. Discord-operaattori-DM).  
-> **Liittyvät docit:** [ARCHITECTURE.md](./ARCHITECTURE.md) · [LAYER_BOUNDARY.md](./LAYER_BOUNDARY.md) · [SECURITY_MODEL.md](./SECURITY_MODEL.md) · [COMPARISON.md](./COMPARISON.md)
+> **Date:** 2026-07-08  
+> **Context:** Public Layer A repo + private Layer B profile (e.g. Discord operator DM).  
+> **Related docs:** [ARCHITECTURE.md](./ARCHITECTURE.md) · [LAYER_BOUNDARY.md](./LAYER_BOUNDARY.md) · [SECURITY_MODEL.md](./SECURITY_MODEL.md) · [COMPARISON.md](./COMPARISON.md)
 
 ---
 
-## 1. Tiivistelmä
+## 1. Summary
 
 | | **Ruflo** | **FamilyClaw** |
 |---|-----------|----------------|
-| **Ydinlupaus** | “Agent = Model + Harness” — 100+ agenttia, swarmit, self-learning | Crash-safe runtime — durable replay, at-most-once ulkoiset side-effectit |
-| **Pino** | TypeScript/Node + pluginit; Rust-kernel (WASM/NAPI) MetaHarness-suunnassa | Rust-first workspace (agent, durable, actions, gateway, channels) |
-| **Kohdeyleisö** | Claude Code / Codex / Hermes -käyttäjät, npm-ekosysteemi | Operaattorit, jotka tarvitsevat **todistettavaa** käyttäytymistä tuotannossa |
-| **Muisti** | RAG, ReasoningBank, SONA, graph hops | Eternal Thread, provenance gate, dream cycle, semanttinen recall |
-| **Turva** | Enterprise guardrails (markkinointitaso) | 8 kerrosta, fail-closed approvalit, manifest-pohjainen policy |
-| **Moni-agentti** | Swarm-topologiat (hierarkia, mesh, federation) | Resonance Bus + `spawn_subagent` |
-| **Onboarding** | `npx ruflo init`, plugin marketplace, lite vs full | `familyclaw-gateway doctor`, `init`-wizard, expo-demo |
+| **Core promise** | "Agent = Model + Harness" — 100+ agents, swarms, self-learning | Crash-safe runtime — durable replay, at-most-once external side effects |
+| **Stack** | TypeScript/Node + plugins; Rust kernel (WASM/NAPI) in the MetaHarness direction | Rust-first workspace (agent, durable, actions, gateway, channels) |
+| **Target audience** | Claude Code / Codex / Hermes users, npm ecosystem | Operators who need **provable** behavior in production |
+| **Memory** | RAG, ReasoningBank, SONA, graph hops | Eternal Thread, provenance gate, dream cycle, semantic recall |
+| **Security** | Enterprise guardrails (marketing-level) | 8 layers, fail-closed approvals, manifest-based policy |
+| **Multi-agent** | Swarm topologies (hierarchy, mesh, federation) | Resonance Bus + `spawn_subagent` |
+| **Onboarding** | `npx ruflo init`, plugin marketplace, lite vs full | `familyclaw-gateway doctor`, `init` wizard, expo demo |
 
-**Johtopäätös:** Ruflo on **laaja harness-tuote** IDE/CLI-hosteille. FamilyClaw on **durable agent runtime** kanavilla ja approval-putkella. Ne eivät ole suoria kilpailijoita — mutta Ruflon **rakenteelliset** ideat (kernel vs sisältö, host-adapterit, progressiivinen onboarding) ovat opittavissa. Ruflon **pinta-alue** (swarm-hype, aggressiivinen self-learning) on FamilyClawille riski, ei etu.
+**Conclusion:** Ruflo is a **broad harness product** for IDE/CLI hosts. FamilyClaw is a **durable agent runtime** with channels and an approval pipeline. They are not direct competitors — but Ruflo's **structural** ideas (kernel vs. content, host adapters, progressive onboarding) are worth learning from. Ruflo's **surface area** (swarm hype, aggressive self-learning) is a risk for FamilyClaw, not an advantage.
 
 ---
 
-## 2. Arkkitehtuurinen vastine
+## 2. Architectural comparison
 
 ```mermaid
 flowchart TB
@@ -52,172 +52,172 @@ flowchart TB
     end
 ```
 
-### 2.1 Termistön kartta
+### 2.1 Terminology map
 
-| Ruflo-käsite | FamilyClaw-vastine | Huomio |
+| Ruflo concept | FamilyClaw equivalent | Note |
 |--------------|-------------------|--------|
-| Harness | `familyclaw-gateway` + `familyclaw-agent` + `familyclaw-actions` | Meillä harness on runtime, ei npm-plugin |
-| Kernel (`@metaharness/kernel`) | Layer A -cratet (`durable`, `actions`, `bus`, `memory`) | Sama ajatus: ydin erillään brändistä |
-| Plugin / skill | `Skill` + `SkillManifest` + registry | Policy manifestista, ei payloadista |
-| Host adapter | `familyclaw-channels` (Discord, Telegram, …) | Ohut adapteri; logiikka agentissa |
-| Memory namespace | Layer B `data/` + provenance tags | Ei commitoida repoon |
-| `npx ruflo init` | `doctor` + profiilin env | Voimme selkeyttää “lite vs full” -polun |
-| Swarm | `spawn_subagent` + Resonance Bus | Tarkoituksella kapeampi |
-| Federation / comms | Ei vastinetta (tahallisesti) | Ei ennen kuin yksi agentti on luotettava |
-| Self-learning loop | `dream_skill`, recall | **Ei** automaattista “opettele onnistuneista malleista” ilman guardia |
-| Witness / provenance | Ed25519 skillit, proof bundles | Jo linjassa SECURITY_MODEL.md:n kanssa |
+| Harness | `familyclaw-gateway` + `familyclaw-agent` + `familyclaw-actions` | For us the harness is the runtime, not an npm plugin |
+| Kernel (`@metaharness/kernel`) | Layer A crates (`durable`, `actions`, `bus`, `memory`) | Same idea: core separate from branding |
+| Plugin / skill | `Skill` + `SkillManifest` + registry | Policy comes from the manifest, not the payload |
+| Host adapter | `familyclaw-channels` (Discord, Telegram, …) | Thin adapter; logic lives in the agent |
+| Memory namespace | Layer B `data/` + provenance tags | Not committed to the repo |
+| `npx ruflo init` | `doctor` + profile env | We can clarify the "lite vs full" path |
+| Swarm | `spawn_subagent` + Resonance Bus | Intentionally narrower |
+| Federation / comms | No equivalent (deliberately) | Not until a single agent is reliable |
+| Self-learning loop | `dream_skill`, recall | **No** automatic "learn from successful patterns" without a guard |
+| Witness / provenance | Ed25519 skills, proof bundles | Already aligned with SECURITY_MODEL.md |
 
 ---
 
-## 3. Mitä meillä on jo (Ruflo-linssin läpi)
+## 3. What we already have (through the Ruflo lens)
 
-### 3.1 Reliability (FamilyClawin erottelu)
+### 3.1 Reliability (FamilyClaw's differentiator)
 
-| Ominaisuus | Crate / moduuli | Ruflo-vastine |
+| Feature | Crate / module | Ruflo equivalent |
 |------------|-----------------|---------------|
-| Crash-safe replay | `familyclaw-durable`, `FileJournal` | Ei korostettu |
-| At-most-once ulkoiset side-effectit | `familyclaw-actions` pipeline + idempotency | Ei korostettu |
-| Turn-watchdog (ei hiljaista timeoutia) | `familyclaw-agent/watchdog.rs` | Autopilot-loop eri filosofialla |
-| Syvä `/readyz` | `familyclaw-gateway/readiness.rs` | Health checks pluginissa |
-| Kanarialintu `POST /canary` | `readiness.rs` | Daemon health |
-| Approval-jumien siivous | `cleanup_stale_approval_tasks` + `doctor --fix` | Ei vastaavaa dokumentoitua polkua |
+| Crash-safe replay | `familyclaw-durable`, `FileJournal` | Not emphasized |
+| At-most-once external side effects | `familyclaw-actions` pipeline + idempotency | Not emphasized |
+| Turn watchdog (no silent timeout) | `familyclaw-agent/watchdog.rs` | Autopilot loop, different philosophy |
+| Deep `/readyz` | `familyclaw-gateway/readiness.rs` | Health checks in plugin |
+| Canary `POST /canary` | `readiness.rs` | Daemon health |
+| Stale approval cleanup | `cleanup_stale_approval_tasks` + `doctor --fix` | No equivalent documented path |
 
-### 3.2 Työkalut ja integraatiot
+### 3.2 Tools and integrations
 
-| Skill / ominaisuus | Tila | Ruflo-vastine |
+| Skill / feature | Status | Ruflo equivalent |
 |--------------------|------|---------------|
-| `fs_read` / `file_write` (allowlist) | Valmis | Filesystem plugins |
-| `shell_exec` (off/smart/manual + blocklist) | Valmis | Sandbox / terminal plugins |
-| `web_fetch` / `web_search` | Valmis | Browser / search plugins |
-| `file_patch` / `file_patch_apply` | Valmis (oikea toteutus) | Code plugins |
-| `github_issue` | Valmis | GitHub plugins |
-| `schedule_task` + cron scheduler | Valmis | `ruflo-loop-workers` |
-| `spawn_subagent` | Valmis | `ruflo-swarm` (kevyempi) |
-| MCP-client (`familyclaw-mcp`) | Valmis crate | Ruflo MCP server (314 työkalua) |
-| LLM streaming + Discord edit | Valmis | UI beta (flo.ruv.io) |
+| `fs_read` / `file_write` (allowlist) | Done | Filesystem plugins |
+| `shell_exec` (off/smart/manual + blocklist) | Done | Sandbox / terminal plugins |
+| `web_fetch` / `web_search` | Done | Browser / search plugins |
+| `file_patch` / `file_patch_apply` | Done (real implementation) | Code plugins |
+| `github_issue` | Done | GitHub plugins |
+| `schedule_task` + cron scheduler | Done | `ruflo-loop-workers` |
+| `spawn_subagent` | Done | `ruflo-swarm` (lighter) |
+| MCP client (`familyclaw-mcp`) | Done crate | Ruflo MCP server (314 tools) |
+| LLM streaming + Discord edit | Done | UI beta (flo.ruv.io) |
 
-### 3.3 Operaattori-UX (tuore)
+### 3.3 Operator UX (recent)
 
-| Ominaisuus | Moduuli | Miksi tärkeää |
+| Feature | Module | Why it matters |
 |------------|---------|---------------|
-| Identity guard (`FAMILYCLAW_OWNER_ID`) | `identity.rs` | Estää roolipelinimen vuodon recallista |
-| Operator capability rules | `identity.rs` | Ei `shell_exec` analyysiin; tekninen tyyli |
-| Brief-ping fast path | `agent.rs` | Lyhyt ack ilman LLM:ää |
-| Operator diagnostic fast path | `agent.rs` + `identity.rs` | P0/P1/P2 ilman esseitä |
-| Memory filter operator-turneille | `identity.rs` | Suodattaa fiction-recallin |
+| Identity guard (`FAMILYCLAW_OWNER_ID`) | `identity.rs` | Prevents roleplay-name leakage from recall |
+| Operator capability rules | `identity.rs` | No `shell_exec` for analysis; technical style |
+| Brief-ping fast path | `agent.rs` | Short ack without an LLM call |
+| Operator diagnostic fast path | `agent.rs` + `identity.rs` | P0/P1/P2 without essays |
+| Memory filter for operator turns | `identity.rs` | Filters out fiction recall |
 
-### 3.4 Turva ja rajat
+### 3.4 Security and boundaries
 
-| Kerros | Dokumentti / toteutus |
+| Layer | Document / implementation |
 |--------|----------------------|
 | Layer A / Layer B | `LAYER_BOUNDARY.md`, `scripts/audit-layer-b.sh` |
 | 8 defense layers | `SECURITY_MODEL.md` |
 | Fail-closed approvals | `familyclaw-actions/approval` |
-| WASM sandbox (valinnainen) | `familyclaw-sandbox` + `wasmtime` feature |
+| WASM sandbox (optional) | `familyclaw-sandbox` + `wasmtime` feature |
 
 ---
 
-## 4. Mitä Ruflosta kannattaa lainata
+## 4. What's worth borrowing from Ruflo
 
-Priorisoitu lista — **ei kopioi koodia**, vaan **malleja**.
+Prioritized list — **not copying code**, but **patterns**.
 
-### P0 — Heti hyödyllistä
+### P0 — Immediately useful
 
-| Idea | Ruflo-esimerkki | FamilyClaw-toimenpide |
+| Idea | Ruflo example | FamilyClaw action |
 |------|---------------|----------------------|
-| **Kernel vs sisältö -tarina** | MetaHarness: `@metaharness/kernel` + branded harness | Dokumentoi ja myy: *Layer A = kernel, Layer B = profiili* (jo olemassa, vahvista viestintä) |
-| **Deterministiset operator-polut** | Hooks reitittävät taustalla | Laajenna fast path -kuvio: diagnoosi, status, “jatka” → ei LLM ellei tarpeen |
-| **Lite vs full install** | Plugin-only vs `npx ruflo init` | `doctor` → smoke (`healthz`) → deep (`readyz`) → full (channels + LLM + skills) |
-| **Host-adapter ohut** | Claude Code / Codex / Hermes adapter | Pidä `familyclaw-channels` ohuesta; älä siirrä policyä channeleihin |
+| **Kernel vs. content narrative** | MetaHarness: `@metaharness/kernel` + branded harness | Document and sell it: *Layer A = kernel, Layer B = profile* (already exists, strengthen the messaging) |
+| **Deterministic operator paths** | Hooks route in the background | Extend the fast-path pattern: diagnosis, status, "continue" → no LLM unless needed |
+| **Lite vs. full install** | Plugin-only vs. `npx ruflo init` | `doctor` → smoke (`healthz`) → deep (`readyz`) → full (channels + LLM + skills) |
+| **Thin host adapter** | Claude Code / Codex / Hermes adapter | Keep `familyclaw-channels` thin; don't move policy into channels |
 
-### P1 — Seuraava aalto
+### P1 — Next wave
 
-| Idea | Ruflo-esimerkki | FamilyClaw-toimenpide |
+| Idea | Ruflo example | FamilyClaw action |
 |------|---------------|----------------------|
-| **Harness factory -ajattelu** | `agent-harness-generator` | `familyclaw init` generoi Layer B -profiilin (SOUL-pohja, env, allowlistit) — ei 60 agenttia |
-| **Skill marketplace -meta** | 35 pluginia, manifestit | Julkaise skill-signing + manifest-skeema “third-party skill pack” -tarinaan |
-| **Trajectory / reasoning bank** | ReasoningBank, SONA | **Rajattu** versio: tallenna vain *hyväksytyt* operator-diagnostiikat proof-journaliin, ei vapaa self-learning |
-| **Multi-host MCP** | Sama kernel, eri host | `familyclaw-mcp` bridge → ActionRuntime; dokumentoi “MCP in, skill out” |
+| **Harness factory thinking** | `agent-harness-generator` | `familyclaw init` generates a Layer B profile (SOUL template, env, allowlists) — not 60 agents |
+| **Skill marketplace meta** | 35 plugins, manifests | Publish skill-signing + manifest schema for a "third-party skill pack" story |
+| **Trajectory / reasoning bank** | ReasoningBank, SONA | **Limited** version: only store *approved* operator diagnostics in the proof journal, no free-form self-learning |
+| **Multi-host MCP** | Same kernel, different host | `familyclaw-mcp` bridge → ActionRuntime; document "MCP in, skill out" |
 
-### P2 — Myöhemmin, jos tarve
+### P2 — Later, if needed
 
-| Idea | Ruflo-esimerkki | FamilyClaw-toimenpide |
+| Idea | Ruflo example | FamilyClaw action |
 |------|---------------|----------------------|
-| **Federation** | `ruflo-federation` | Vain jos useampi gateway-instanssi tarvitsee turvallista työnjakoa |
-| **Graph RAG** | `ruflo-knowledge-graph` | Eternal Thread + graph vain jos recall-laatu vaatii |
-| **Local LLM routing** | `ruflo-ruvllm` | Provider chain jo olemassa; lisää eksplisiittinen “local fallback” -polku |
+| **Federation** | `ruflo-federation` | Only if multiple gateway instances need safe work division |
+| **Graph RAG** | `ruflo-knowledge-graph` | Eternal Thread + graph only if recall quality demands it |
+| **Local LLM routing** | `ruflo-ruvllm` | Provider chain already exists; add an explicit "local fallback" path |
 
 ---
 
-## 5. Mitä hylätään eksplisiittisesti
+## 5. What's explicitly rejected
 
-| Ruflo-suunta | Miksi ei FamilyClawiin | Mitä teemme sen sijaan |
+| Ruflo direction | Why not for FamilyClaw | What we do instead |
 |--------------|------------------------|------------------------|
-| **100+ geneeristä agenttia** | Pinta > luotettavuus; roolipelivuoto, approval-loopit | Pieni allekirjoitettu skill-setti; domain-spesifit taidot Layer B:ssä |
-| **Swarm-topologiat (mesh, consensus)** | Monimutkaisuus ennen yhden agentin vakautta | `spawn_subagent` rajattuna; bus vain kun tarve todistettu |
-| **Aggressiivinen self-learning** | Recall sekoittaa fiction + fakta (nähty tuotannossa) | Provenance gate + operator memory filter + deterministiset fast pathit |
-| **314 MCP-työkalua** | Hyökkäyspinta, hämmentää mallia | MCP → skill wrapper; allowlistatut työkalut |
-| **npm/Node-first runtime** | FamilyClawin USP on Rust + crash-safety | Pidä Node vain esimerkeissä / bridgeissä tarvittaessa |
-| **Starit/lataukset uskottavuutena** | 60k+ tähteä, 0 forkia — markkinointisignaali | Mittaa `side_effect_overcount`, scorecard, crash_replay |
-| **“Autopilot loop” ilman approval-rajoja** | Rikkoisi SECURITY_MODEL layer 2 | Autonomia vain low-risk + eksplisiittinen policy |
+| **100+ generic agents** | Surface area > reliability; roleplay leakage, approval loops | Small signed skill set; domain-specific skills live in Layer B |
+| **Swarm topologies (mesh, consensus)** | Complexity before a single agent is stable | `spawn_subagent` scoped narrowly; bus only when the need is proven |
+| **Aggressive self-learning** | Recall mixes fiction + fact (seen in production) | Provenance gate + operator memory filter + deterministic fast paths |
+| **314 MCP tools** | Attack surface, confuses the model | MCP → skill wrapper; allowlisted tools |
+| **npm/Node-first runtime** | FamilyClaw's USP is Rust + crash-safety | Keep Node only in examples / bridges where needed |
+| **Stars/downloads as credibility** | 60k+ stars, 0 forks — a marketing signal | Measure `side_effect_overcount`, scorecard, crash_replay |
+| **"Autopilot loop" without approval boundaries** | Would break SECURITY_MODEL layer 2 | Autonomy only for low-risk + explicit policy |
 
 ---
 
-## 6. Opetukset operaattori-DM:stä (Layer B, geneerisesti)
+## 6. Lessons from the operator DM (Layer B, generalized)
 
-Nämä eivät ole Ruflo-spesifejä, mutta kartoitus selitti **miksi** Ruflo-tyylinen laaja pinta pahentaa niitä:
+These aren't Ruflo-specific, but the mapping explained **why** a Ruflo-style broad surface would make them worse:
 
-| Ongelma | Juurisyy | FamilyClaw-vastaus | Ruflo pahentaisi? |
+| Problem | Root cause | FamilyClaw response | Would Ruflo make it worse? |
 |---------|----------|-------------------|-------------------|
-| Hiljaisuus / timeout | LLM-ketju jumittaa | Turn-watchdog + selkeä virheviesti | Autopilot-loop voi pitkittää |
-| Esseet diagnoosissa | Heikko prompt + ei fast pathia | `operator_diagnostic_reply()` | 100 agenttia = enemmän ääniä |
-| Väärä nimi (fiction) | Semanttinen recall | Identity guard + memory filter | RAG/graph recall lisää riskiä |
-| `shell_exec` approval-jumi | LLM valitsi väärän työkalun | Capability rules + smart shell | Enemmän työkaluja = enemmän virheitä |
-| “Mitä seuraavaksi?” | Avoin lopetus kehotteessa | Kielletty guardissa | Swarm-koordinaatio rohkaisee jatkoa |
+| Silence / timeout | LLM chain hangs | Turn watchdog + clear error message | Autopilot loop can prolong it |
+| Essays in diagnostics | Weak prompt + no fast path | `operator_diagnostic_reply()` | 100 agents = more voices |
+| Wrong name (fiction) | Semantic recall | Identity guard + memory filter | RAG/graph recall increases risk |
+| `shell_exec` approval stall | LLM picked the wrong tool | Capability rules + smart shell | More tools = more mistakes |
+| "What's next?" | Open-ended prompt closing | Forbidden by the guard | Swarm coordination encourages continuation |
 
-**Operaattoritila** = engineering mode: P0/P1/P2, konkreettiset korjaukset, ei rooliprosaa. **Persona-tila** = Layer B SOUL, erillinen kanava/konteksti.
+**Operator mode** = engineering mode: P0/P1/P2, concrete fixes, no roleplay prose. **Persona mode** = Layer B SOUL, separate channel/context.
 
 ---
 
-## 7. Gap-analyysi (nykytila)
+## 7. Gap analysis (current state)
 
-| Alue | FamilyClaw | Ruflo | Gap / toimenpide |
+| Area | FamilyClaw | Ruflo | Gap / action |
 |------|------------|-------|------------------|
-| Crash-safety | Vahva, benchmarkattu | Heikosti dokumentoitu | **Pidä etu** — demo scorecard |
-| IDE-integraatio | Gateway + channels | Claude Code natiivi | Harkitse ohut “Cursor/Claude plugin” myöhemmin |
-| Onboarding < 5 min | `doctor`, expo-demo | `npx ruflo init` | Selkeytä 3-portainen polku (smoke/deep/full) |
-| Muisti / RAG | Eternal Thread | Graph RAG, hybrid search | Ei kiire; provenance tärkeämpi |
-| UI | Discord-viestit | flo.ruv.io beta | Ei prioriteetti |
-| Multi-machine | Ei | Federation | Hylätty toistaiseksi |
-| Skill-ekosysteemi | Sisäänrakennetut + signing | 35 npm-pluginia | Dokumentoi “skill pack” -formaatti |
-| Operator determinism | Fast pathit (uusi) | Hooks (tausta) | **Testaa ja laajenna** fast path -luetteloa |
+| Crash safety | Strong, benchmarked | Poorly documented | **Keep the advantage** — demo scorecard |
+| IDE integration | Gateway + channels | Native Claude Code | Consider a thin "Cursor/Claude plugin" later |
+| Onboarding < 5 min | `doctor`, expo demo | `npx ruflo init` | Clarify the 3-stage path (smoke/deep/full) |
+| Memory / RAG | Eternal Thread | Graph RAG, hybrid search | No rush; provenance matters more |
+| UI | Discord messages | flo.ruv.io beta | Not a priority |
+| Multi-machine | No | Federation | Rejected for now |
+| Skill ecosystem | Built-in + signing | 35 npm plugins | Document a "skill pack" format |
+| Operator determinism | Fast paths (new) | Hooks (background) | **Test and expand** the fast-path list |
 
 ---
 
-## 8. Ehdotettu tiekartta (FamilyClaw-spesifinen)
+## 8. Proposed roadmap (FamilyClaw-specific)
 
-### P0 (1–2 viikkoa)
+### P0 (1–2 weeks)
 
-- [ ] Vahvista operator diagnostic fast path tuotannossa (yksi testikysymys deployn jälkeen)
-- [ ] Dokumentoi `doctor` → smoke → deep → full -polku QUICKSTARTiin
-- [ ] Fast path -luettelo: ping, status, diagnoosi, “jatka viime tehtävä”
+- [ ] Reinforce the operator diagnostic fast path in production (one test question after deploy)
+- [ ] Document the `doctor` → smoke → deep → full path in QUICKSTART
+- [ ] Fast-path list: ping, status, diagnosis, "continue last task"
 
-### P1 (1 kk)
+### P1 (1 month)
 
-- [ ] `familyclaw init` generoi minimaalisen Layer B -profiilin (geneeriset nimet)
-- [ ] Rajattu “operator journal”: vain hyväksytyt diagnoosit / korjaukset muistiin
-- [ ] MCP-työkalujen allowlist per profiili
+- [ ] `familyclaw init` generates a minimal Layer B profile (generic names)
+- [ ] Limited "operator journal": only approved diagnostics/fixes go to memory
+- [ ] MCP tool allowlist per profile
 
-### P2 (myöhemmin)
+### P2 (later)
 
-- [ ] Valinnainen graph-recall Eternal Threadin päälle
-- [ ] Federation vain jos multi-gateway tarve todistettu
+- [ ] Optional graph recall on top of Eternal Thread
+- [ ] Federation only if a multi-gateway need is proven
 
 ---
 
-## 9. Viitteet
+## 9. References
 
-| Lähde | URL |
+| Source | URL |
 |-------|-----|
 | Ruflo | https://github.com/ruvnet/ruflo |
 | MetaHarness / agent-harness-generator | https://github.com/ruvnet/metaharness |
@@ -227,6 +227,6 @@ Nämä eivät ole Ruflo-spesifejä, mutta kartoitus selitti **miksi** Ruflo-tyyl
 
 ---
 
-## 10. Yksi lause tiimin käyttöön
+## 10. One sentence for the team
 
-> **Ruflo opettaa rakentamaan laajan harness-pinnan; FamilyClaw voittaa todistamalla, että agentti ei kuole, ei toista side-effectejä, eikä vuoda fictionia operaattorille — vähemmän magiaa, enemmän invariantteja.**
+> **Ruflo teaches you to build a broad harness surface; FamilyClaw wins by proving the agent doesn't die, doesn't repeat side effects, and doesn't leak fiction to the operator — less magic, more invariants.**

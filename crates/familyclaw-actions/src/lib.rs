@@ -1,70 +1,71 @@
 //! # familyclaw-actions
 //!
-//! FamilyClaw-alustan **toiminto- ja todistepino**: kerros, joka muuntaa
-//! agentin aikeen turvalliseksi, todennettavaksi ja muistettavaksi
-//! toiminnoksi. Crate toteuttaa seuraavan putken:
+//! The **action and proof pipeline** of the `FamilyClaw` platform: the layer
+//! that turns an agent's intent into a safe, verifiable, and rememberable
+//! action. The crate implements the following pipeline:
 //!
 //! ```text
-//! observe → plan → request approval (jos tarpeen) → execute action
+//! observe → plan → request approval (if needed) → execute action
 //!         → verify → persist proof → remember → report
 //! ```
 //!
-//! - **observe** — havaitse tilanne ja kerää konteksti.
-//! - **plan** — valitse taito ([`registry`]) ja muodosta toimintotehtävä ([`task`]).
-//! - **request approval** — pyydä ihmisen hyväksyntä ([`approval`]) jos
-//!   käytäntö ([`policy`]) niin vaatii; hyväksyntä on TTL-rajattu,
-//!   kertakäyttöinen ja sidottu payload-tiivisteeseen.
-//! - **execute** — aja hyväksytty toiminto ([`executor`]) taidon kautta.
-//! - **verify** — tarkista tuloksen kelpoisuus jälkiehtoja vasten.
-//! - **persist proof** — koosta redaktoitu todistepaketti ([`proof`]).
-//! - **remember** — talleta jälki muistiin (substraattikerros erikseen).
-//! - **report** — kirjaa audit-tapahtuma ([`audit`]) ja raportoi tulos.
+//! - **observe** — perceive the situation and gather context.
+//! - **plan** — pick a skill ([`registry`]) and form an action task ([`task`]).
+//! - **request approval** — ask for human approval ([`approval`]) if the
+//!   policy ([`policy`]) requires it; an approval is TTL-bound,
+//!   single-use, and bound to a payload hash.
+//! - **execute** — run the approved action ([`executor`]) via the skill.
+//! - **verify** — check the result's validity against postconditions.
+//! - **persist proof** — assemble a redacted proof bundle ([`proof`]).
+//! - **remember** — persist a trace to memory (a separate substrate layer).
+//! - **report** — record an audit event ([`audit`]) and report the result.
 //!
-//! Taidot voi myös julkaista MCP-työkaluina ([`mcp`]), ja koko putken
-//! end-to-end-käyttäytyminen katetaan arvioinneilla ([`evals`]).
+//! Skills can also be published as MCP tools ([`mcp`]), and the pipeline's
+//! full end-to-end behavior is covered by evals ([`evals`]).
 //!
-//! ## OSS-raja (KERROS A)
-//! Tämä crate on julkaistava. Se sisältää vain **geneerisiä tyyppejä** — ei
-//! oikeita providereita, sieluja, API-avaimia, tokeneita, IP-osoitteita eikä
-//! henkilökohtaisia polkuja. Mukana on **kaksi aitoa referenssitaitoa**
-//! ([`FsReadAllowlisted`] paikallinen tiedostonluku,
+//! ## OSS boundary (Layer A)
+//! This crate is publishable. It contains only **generic types** — no real
+//! providers, souls, API keys, tokens, IP addresses, or personal paths. It
+//! includes **two genuine reference skills**
+//! ([`FsReadAllowlisted`] local file reads,
 //! [`WebFetchSkill`](skills::WebFetchSkill) read-only
-//! HTTP-GET SSRF-vartioinnilla) jotka tekevät oikeaa työtä ilman avaimia; loput
-//! taidot ovat **esimerkkimalleja** jotka näyttävät taidon sopimuksen ja joihin
-//! kytket oman tarjoajasi (ei oikeita Gmail-/GitHub-verkkokutsuja valmiina).
-//! Todistepaketit **redaktoivat** salaisuudelta näyttävät arvot ennen
-//! tallennusta.
+//! HTTP GET with SSRF guarding) that do real work without keys; the rest of
+//! the skills are **example templates** that show the skill contract, into
+//! which you wire your own provider (no real Gmail/GitHub network calls
+//! out of the box). Proof bundles **redact** values that look like secrets
+//! before persisting.
 //!
-//! ## Suunnitteluperiaatteet
-//! - **Ei `unwrap()`/`expect()`/`panic!()` tuotantopolulla.** Kaikki virheet
-//!   kulkevat [`ActionError`]- ja [`Result`]-tyyppien kautta.
-//! - **Determinismi:** puhdas logiikka ottaa aikaleiman injektoituna
-//!   ([`familyclaw_core::time::Timestamp`]) — kelloa ei lueta logiikan sisällä.
-//! - **Tyypitetyt tunnisteet** ([`SkillId`], [`ActionTaskId`], [`ApprovalId`],
-//!   [`ProofBundleId`], [`ActionId`], [`AuditEventId`]) estävät sekoittamisen
-//!   käännösaikana.
+//! ## Design principles
+//! - **No `unwrap()`/`expect()`/`panic!()` on the production path.** All
+//!   errors flow through the [`ActionError`] and [`Result`] types.
+//! - **Determinism:** pure logic takes the timestamp as an injected value
+//!   ([`familyclaw_core::time::Timestamp`]) — the clock is never read
+//!   inside the logic.
+//! - **Typed identifiers** ([`SkillId`], [`ActionTaskId`], [`ApprovalId`],
+//!   [`ProofBundleId`], [`ActionId`], [`AuditEventId`]) prevent mix-ups at
+//!   compile time.
 //!
-//! ## Moduulit
-//! - [`manifest`] — skill-manifestit (kuvaus, skeema, capabilityt).
-//! - [`registry`] — skill-rekisteri (mock-taidot).
-//! - [`policy`] — käytäntö: sallinta + hyväksyntävaatimus.
-//! - [`approval`] — ihmisen hyväksyntä (TTL, nonce, payload-sidonta).
-//! - [`audit`] — tamper-evident audit-loki.
-//! - [`task`] — toimintotehtävän tila ja elinkaari.
-//! - [`executor`] — hyväksytyn toiminnon suoritus.
-//! - [`proof`] — redaktoitu todistepaketti.
-//! - [`mcp`] — taitojen julkaisu MCP-työkaluina.
-//! - [`pending_store`] — odottavien hyväksyntöjen kaatumiskestävä tallennuspinta.
-//! - [`skills`] — realistiset mock-taidot + koko putken ([`skills::Pipeline`]).
-//! - [`facade`] — operaattoripinta ([`ActionRuntime`]) koko putken päälle.
-//! - [`evals`] — end-to-end-arvioinnit.
-//! - [`ids`] — tyypitetyt tunnisteet.
+//! ## Modules
+//! - [`manifest`] — skill manifests (description, schema, capabilities).
+//! - [`registry`] — skill registry (mock skills).
+//! - [`policy`] — policy: permission + approval requirement.
+//! - [`approval`] — human approval (TTL, nonce, payload binding).
+//! - [`audit`] — tamper-evident audit log.
+//! - [`task`] — action task state and lifecycle.
+//! - [`executor`] — execution of an approved action.
+//! - [`proof`] — redacted proof bundle.
+//! - [`mcp`] — publishing skills as MCP tools.
+//! - [`pending_store`] — crash-safe storage surface for pending approvals.
+//! - [`skills`] — realistic mock skills + the full pipeline ([`skills::Pipeline`]).
+//! - [`facade`] — an operator surface ([`ActionRuntime`]) over the whole pipeline.
+//! - [`evals`] — end-to-end evals.
+//! - [`ids`] — typed identifiers.
 //! - [`error`] — [`ActionError`], [`Result`].
 //!
-//! ## Operaattorin komentorivi
-//! Crate sisältää myös ohuen komentorivibinäärin
-//! (`src/bin/familyclaw-actions-cli.rs`), joka käyttää [`ActionRuntime`]-
-//! julkisivua: `list-skills`, `submit-task`, `approve`, `status`, `proof`.
+//! ## Operator CLI
+//! The crate also includes a thin command-line binary
+//! (`src/bin/familyclaw-actions-cli.rs`) that uses the [`ActionRuntime`]
+//! facade: `list-skills`, `submit-task`, `approve`, `status`, `proof`.
 
 pub mod approval;
 pub mod audit;
@@ -117,17 +118,17 @@ pub use skills::{
     Skill, SpawnSubagentSkill, SubagentSpawner, WebSearchSkill,
 };
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Onko koko crate luurankovaiheessa (kaikki putken moduulit pystyssä).
+/// Whether the whole crate is in its scaffold stage (all pipeline modules wired up).
 ///
-/// Väliaikainen totuusarvo joka pitää luuranko-moduulien placeholderit
-/// "elossa" (estää `dead_code`-varoitukset CI:n `-D warnings`-portissa)
-/// kunnes varsinaiset moduulitoteutukset korvaavat ne.
+/// A temporary boolean that keeps the scaffold modules' placeholders "alive"
+/// (prevents `dead_code` warnings under CI's `-D warnings` gate) until the
+/// real module implementations replace them.
 #[must_use]
 pub const fn all_modules_scaffolded() -> bool {
     manifest::SCAFFOLDED
@@ -162,7 +163,7 @@ mod tests {
 
     #[test]
     fn public_ids_are_reexported() {
-        // Jos jokin re-export poistuu, tämä testi ei käänny.
+        // If any re-export is removed, this test fails to compile.
         let _s: SkillId = SkillId::new();
         let _t: ActionTaskId = ActionTaskId::new();
         let _a: ApprovalId = ApprovalId::new();

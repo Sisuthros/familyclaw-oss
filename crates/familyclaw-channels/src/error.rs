@@ -1,67 +1,68 @@
-//! Kanavakerroksen virhetyypit.
+//! Channel layer error types.
 //!
-//! [`ChannelError`] kattaa kanavan kuljetus- ja elinkaarivirheet (kanava
-//! suljettu, vastaanotto/lähetys epäonnistui, tuntematon kanava). Tyyppi
-//! muuntuu alustan keskitettyyn [`FamilyClawError`]-tyyppiin
-//! ([`FamilyClawError::Bus`]) [`From`]-toteutuksella, jotta kanavavirheet
-//! virtaavat samaan virhepolkuun kuin muu Resonance Bus -liikenne.
+//! [`ChannelError`] covers the channel's transport and lifecycle errors
+//! (channel closed, receive/send failed, unknown channel). The type
+//! converts into the platform's centralized [`FamilyClawError`] type
+//! ([`FamilyClawError::Bus`]) via a [`From`] implementation, so channel
+//! errors flow through the same error path as the rest of the Resonance Bus
+//! traffic.
 //!
-//! Tuotantopolulla EI käytetä `unwrap()`/`expect()`/`panic!()` — kaikki
-//! kanavavirheet kulkevat [`Result`]-tyypin kautta.
+//! The production path does NOT use `unwrap()`/`expect()`/`panic!()` — all
+//! channel errors flow through the [`Result`] type.
 
 use familyclaw_core::FamilyClawError;
 use thiserror::Error;
 
-/// Kanavakerroksen virhe.
+/// A channel layer error.
 ///
-/// `#[non_exhaustive]` jotta uusia variantteja voi lisätä myöhemmin
-/// rikkomatta downstream-koodia.
+/// `#[non_exhaustive]` so new variants can be added later without breaking
+/// downstream code.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ChannelError {
-    /// Kanava on suljettu eikä voi enää lähettää tai vastaanottaa.
+    /// The channel is closed and can no longer send or receive.
     #[error("channel '{0}' is closed")]
     Closed(String),
 
-    /// Viestin lähetys kanavalle epäonnistui.
+    /// Sending a message on the channel failed.
     #[error("send failed on channel '{channel}': {reason}")]
     Send {
-        /// Kanavan tunniste johon lähetys epäonnistui.
+        /// The identifier of the channel the send failed on.
         channel: String,
-        /// Ihmisluettava syy.
+        /// A human-readable reason.
         reason: String,
     },
 
-    /// Viestin vastaanotto kanavalta epäonnistui.
+    /// Receiving a message from the channel failed.
     #[error("receive failed on channel '{channel}': {reason}")]
     Receive {
-        /// Kanavan tunniste jolta vastaanotto epäonnistui.
+        /// The identifier of the channel the receive failed on.
         channel: String,
-        /// Ihmisluettava syy.
+        /// A human-readable reason.
         reason: String,
     },
 
-    /// Annettu syöte (esim. tyhjä viestiteksti tai kanava-id) oli kelvoton.
+    /// The given input (e.g. empty message text or channel id) was invalid.
     #[error("invalid channel input: {0}")]
     InvalidInput(String),
 
-    /// Taustalla oleva kanava-adapteri (Discord/Telegram/…) raportoi virheen.
+    /// The underlying channel adapter (Discord/Telegram/…) reported an error.
     #[error("backend error on channel '{channel}': {reason}")]
     Backend {
-        /// Kanavan tunniste.
+        /// The channel's identifier.
         channel: String,
-        /// Adapterin raportoima syy.
+        /// The reason reported by the adapter.
         reason: String,
     },
 }
 
 impl ChannelError {
-    /// Rakentaa [`ChannelError::Closed`]-variantin.
+    /// Builds a [`ChannelError::Closed`] variant.
     pub fn closed(channel: impl Into<String>) -> Self {
         Self::Closed(channel.into())
     }
 
-    /// Rakentaa [`ChannelError::Send`]-variantin.
+    /// Builds a [`ChannelError::Send`] variant.
     pub fn send(channel: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::Send {
             channel: channel.into(),
@@ -69,7 +70,7 @@ impl ChannelError {
         }
     }
 
-    /// Rakentaa [`ChannelError::Receive`]-variantin.
+    /// Builds a [`ChannelError::Receive`] variant.
     pub fn receive(channel: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::Receive {
             channel: channel.into(),
@@ -77,12 +78,12 @@ impl ChannelError {
         }
     }
 
-    /// Rakentaa [`ChannelError::InvalidInput`]-variantin.
+    /// Builds a [`ChannelError::InvalidInput`] variant.
     pub fn invalid_input(msg: impl Into<String>) -> Self {
         Self::InvalidInput(msg.into())
     }
 
-    /// Rakentaa [`ChannelError::Backend`]-variantin.
+    /// Builds a [`ChannelError::Backend`] variant.
     pub fn backend(channel: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::Backend {
             channel: channel.into(),
@@ -92,14 +93,14 @@ impl ChannelError {
 }
 
 impl From<ChannelError> for FamilyClawError {
-    /// Kanavavirhe luokitellaan alustan tasolla bus-virheeksi: kanavat ovat
-    /// Resonance Busin reunat ulkomaailmaan.
+    /// A channel error is classified at the platform level as a bus error:
+    /// channels are the Resonance Bus's edges to the outside world.
     fn from(err: ChannelError) -> Self {
         FamilyClawError::bus(err.to_string())
     }
 }
 
-/// Kanavakerroksen vakiotulostyyppi.
+/// The channel layer's standard result type.
 pub type ChannelResult<T> = std::result::Result<T, ChannelError>;
 
 #[cfg(test)]

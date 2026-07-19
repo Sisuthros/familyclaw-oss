@@ -1,31 +1,34 @@
-//! `OllamaEmbedder` — oikea semanttinen embedder Ollaman kautta.
+//! `OllamaEmbedder` — a real semantic embedder via Ollama.
 //!
-//! Toteuttaa [`EmbeddingProvider`]-traitin kutsumalla Ollaman
-//! `/api/embeddings`-endpointia (oletusmalli `nomic-embed-text`). Tämä korvaa
-//! [`DeterministicEmbedder`](crate::DeterministicEmbedder)-oletuksen kun tarvitaan
-//! aitoa semanttista recallia (feature-hashing-bag-of-words tuottaa liian karkeat
-//! vektorit → cosine-similarity jää matalaksi ~0.1, oikea malli antaa ~0.7+).
+//! Implements the [`EmbeddingProvider`] trait by calling Ollama's
+//! `/api/embeddings` endpoint (default model `nomic-embed-text`). This
+//! replaces the [`DeterministicEmbedder`](crate::DeterministicEmbedder)
+//! default when genuine semantic recall is needed (feature-hashing
+//! bag-of-words produces vectors that are too coarse -> cosine similarity
+//! stays low at ~0.1, a real model gives ~0.7+).
 //!
-//! **Feature-gated (`ollama`)** — ei vedä `reqwest`-riippuvuutta oletusrakennukseen
-//! (Layer A / OSS -köyhyysrajoite). Upotus tapahtuu muistin KIRJOITUKSESSA
-//! `familyclaw-memory`n `EmbeddingMemoryStore`-kirjoituspolulla, ei vastauksen hot-polulla, joten synkroninen
-//! `reqwest::blocking` on turvallinen (Ollama on paikallinen ja nopea).
+//! **Feature-gated (`ollama`)** — does not pull the `reqwest` dependency
+//! into the default build (Layer A / OSS resource-constraint requirement).
+//! Embedding happens on the memory WRITE path, in `familyclaw-memory`'s
+//! `EmbeddingMemoryStore` write path, not on the response hot path, so
+//! synchronous `reqwest::blocking` is safe (Ollama is local and fast).
 //!
 //! ## Fail-safe
-//! Jos Ollama ei vastaa (ei käynnissä, väärä malli, verkkovirhe), `embed`
-//! palauttaa **nollavektorin** — sama sopimus kuin tyhjällä syötteellä. Cosine
-//! käsittelee nollanormin 0.0-similariteettina, joten recall degradoituu
-//! turvallisesti (ei kaadu, ei hallusinoi naapureita) sen sijaan että paniikkaisi.
+//! If Ollama doesn't respond (not running, wrong model, network error),
+//! `embed` returns a **zero vector** — the same contract as for empty
+//! input. Cosine treats a zero norm as 0.0 similarity, so recall degrades
+//! safely (no crash, no hallucinated neighbors) instead of panicking.
 
 use crate::EmbeddingProvider;
 
-/// Ollama-pohjainen embedder. Kutsuu `POST {base_url}/api/embeddings`.
+/// An Ollama-based embedder. Calls `POST {base_url}/api/embeddings`.
 ///
-/// Rakenna [`OllamaEmbedder::new`]:llä (oletukset) tai
-/// [`OllamaEmbedder::with_config`]:lla. Dimensio kysytään laiskasti ensimmäisellä
-/// upotuksella ja välimuistitetaan, koska se riippuu mallista (nomic-embed-text =
-/// 768). Ennen ensimmäistä onnistunutta kutsua [`dimensions`](Self::dimensions)
-/// palauttaa konfiguroidun `fallback_dimensions`-arvon.
+/// Build it with [`OllamaEmbedder::new`] (defaults) or
+/// [`OllamaEmbedder::with_config`]. The dimensionality is queried lazily on
+/// the first embedding and cached, since it depends on the model
+/// (nomic-embed-text = 768). Before the first successful call,
+/// [`dimensions`](Self::dimensions) returns the configured
+/// `fallback_dimensions` value.
 #[derive(Debug, Clone)]
 pub struct OllamaEmbedder {
     base_url: String,
@@ -36,20 +39,21 @@ pub struct OllamaEmbedder {
 }
 
 impl OllamaEmbedder {
-    /// nomic-embed-text tuottaa 768-ulotteisia vektoreita.
+    /// nomic-embed-text produces 768-dimensional vectors.
     pub const DEFAULT_MODEL: &'static str = "nomic-embed-text";
-    /// Oletusdimensio ennen kuin mallin oikea dimensio on havaittu.
+    /// The default dimensionality before the model's real dimension is
+    /// detected.
     pub const DEFAULT_DIMENSIONS: usize = 768;
-    /// Oletus-base-url (paikallinen Ollama).
+    /// The default base URL (local Ollama).
     pub const DEFAULT_BASE_URL: &'static str = "http://127.0.0.1:11434";
 
-    /// Luo embedderin oletuksilla (paikallinen Ollama, `nomic-embed-text`).
+    /// Creates an embedder with defaults (local Ollama, `nomic-embed-text`).
     #[must_use]
     pub fn new() -> Self {
         Self::with_config(Self::DEFAULT_BASE_URL, Self::DEFAULT_MODEL)
     }
 
-    /// Luo embedderin annetulla base-url:lla ja mallilla.
+    /// Creates an embedder with the given base URL and model.
     #[must_use]
     pub fn with_config(base_url: impl Into<String>, model: impl Into<String>) -> Self {
         let base_url = base_url.into();
@@ -68,7 +72,7 @@ impl OllamaEmbedder {
         }
     }
 
-    /// Kysyy embeddingin Ollamalta. Palauttaa `None` virheessä (fail-safe).
+    /// Requests an embedding from Ollama. Returns `None` on error (fail-safe).
     fn request_embedding(&self, text: &str) -> Option<Vec<f32>> {
         let url = format!("{}/api/embeddings", self.base_url);
         let body = serde_json::json!({ "model": self.model, "prompt": text });
@@ -78,8 +82,8 @@ impl OllamaEmbedder {
         }
         let json: serde_json::Value = resp.json().ok()?;
         let arr = json.get("embedding")?.as_array()?;
-        // f64→f32 on tarkoituksellinen: embeddingit ovat f32-vektoreita
-        // (cosine-vertailu). Tarkkuuden pieni menetys on hyväksyttävä.
+        // f64->f32 is deliberate: embeddings are f32 vectors (cosine
+        // comparison). A small loss of precision is acceptable.
         #[allow(clippy::cast_possible_truncation)]
         let vec: Vec<f32> = arr
             .iter()
@@ -108,20 +112,20 @@ impl EmbeddingProvider for OllamaEmbedder {
     }
 
     fn embed(&self, text: &str) -> Vec<f32> {
-        // Tyhjä syöte → nollavektori (sama sopimus kuin DeterministicEmbedder).
+        // Empty input -> zero vector (same contract as DeterministicEmbedder).
         if text.trim().is_empty() {
             return vec![0.0; self.fallback_dimensions];
         }
         match self.request_embedding(text) {
             Some(v) => v,
-            // Ollama alhaalla / virhe → nollavektori (fail-safe, cosine→0.0).
+            // Ollama down / error -> zero vector (fail-safe, cosine->0.0).
             None => vec![0.0; self.fallback_dimensions],
         }
     }
 }
 
-/// L2-normalisoi vektorin yksikköpituuteen (cosine-yhteensopivuus). Nollavektori
-/// palautetaan sellaisenaan (nollanormia ei voi normalisoida).
+/// L2-normalizes a vector to unit length (cosine compatibility). A zero
+/// vector is returned as-is (a zero norm cannot be normalized).
 fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > f32::EPSILON {
@@ -152,7 +156,7 @@ mod tests {
 
     #[test]
     fn unreachable_ollama_fails_safe_to_zero() {
-        // Portti johon mikään ei vastaa → nollavektori, ei paniikkia.
+        // A port nothing responds on -> zero vector, no panic.
         let e = OllamaEmbedder::with_config("http://127.0.0.1:1", "nomic-embed-text");
         let v = e.embed("hello world");
         assert_eq!(v.len(), OllamaEmbedder::DEFAULT_DIMENSIONS);

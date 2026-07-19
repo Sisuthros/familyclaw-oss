@@ -1,20 +1,20 @@
-//! [`InMemoryJournal`] — kestämätön journal-toteutus testaukseen ja
-//! kehitykseen.
+//! [`InMemoryJournal`] — a non-durable journal implementation for testing
+//! and development.
 //!
-//! Pitää rivit `Vec`-vektorissa suojattuna `Arc<Mutex<...>>`-alla jotta
-//! trait on `dyn`-yhteensopiva. Ei kestä prosessin uudelleenkäynnistystä —
-//! kaatumiskestävyyteen käytä [`crate::FileJournal`]:ia. Tämä on silti hyödyllinen
-//! yksikkötesteissä ja deterministisen replayn varmentamisessa ilman levyä.
+//! Holds rows in a `Vec` guarded by `Arc<Mutex<...>>` so the trait is
+//! `dyn`-compatible. Does not survive a process restart — use
+//! [`crate::FileJournal`] for crash resistance. This is still useful for
+//! unit tests and for verifying deterministic replay without touching disk.
 
 use crate::entry::{JournalEntry, StepId};
 use crate::error::Result;
 use crate::journal::Journal;
 use std::sync::{Arc, Mutex};
 
-/// Muistinvarainen append-only journal.
+/// An in-memory append-only journal.
 ///
-/// Säilyttää rivit lisäysjärjestyksessä. Klooni on syvä (täysi kopio rivistä),
-/// joten kloonatun journalin muokkaus ei vaikuta alkuperäiseen.
+/// Preserves rows in append order. Cloning is deep (a full copy of the
+/// rows), so modifying a cloned journal does not affect the original.
 #[derive(Debug, Default)]
 pub struct InMemoryJournal {
     entries: Arc<Mutex<Vec<JournalEntry>>>,
@@ -30,14 +30,14 @@ impl Clone for InMemoryJournal {
 }
 
 impl InMemoryJournal {
-    /// Luo tyhjän muistijournalin.
+    /// Creates an empty in-memory journal.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Luo muistijournalin valmiista riveistä (esim. aiemmasta lokista
-    /// ladatuista).
+    /// Creates an in-memory journal from ready-made rows (e.g. loaded from a
+    /// prior log).
     #[must_use]
     pub fn from_entries(entries: Vec<JournalEntry>) -> Self {
         Self {
@@ -45,13 +45,13 @@ impl InMemoryJournal {
         }
     }
 
-    /// Palauttaa viittauksen kaikkiin riveihin ilman kloonausta.
+    /// Returns all rows without cloning the wrapper.
     #[must_use]
     pub fn entries(&self) -> Vec<JournalEntry> {
         self.entries.lock().unwrap().clone()
     }
 
-    /// Kuluttaa journalin ja palauttaa rivit.
+    /// Consumes the journal and returns its rows.
     #[must_use]
     pub fn into_entries(self) -> Vec<JournalEntry> {
         Arc::try_unwrap(self.entries).unwrap().into_inner().unwrap()

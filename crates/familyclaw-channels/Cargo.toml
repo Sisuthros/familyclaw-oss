@@ -1,12 +1,15 @@
 [package]
 name = "familyclaw-channels"
-description = "Discord/Telegram/WhatsApp/Signal channel layer"
+description = "Unified messaging channel abstraction with feature-gated adapters for Discord, Telegram, WhatsApp, and Signal"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["chat", "messaging", "discord", "telegram", "bot"]
+categories = ["asynchronous", "network-programming"]
 
 [lints]
 workspace = true

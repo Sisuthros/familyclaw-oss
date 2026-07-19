@@ -1,11 +1,11 @@
-# FamilyClaw gateway watchdog — kanarialintu 5 min välein.
-# Layer B: kopioi/kytke operaattorin data-hakemistoon (esim. operaattoriagentin deploy).
+# FamilyClaw gateway watchdog — canary check every 5 min.
+# Layer B: copy/wire into the operator's data directory (e.g. the operator agent's deploy).
 #
-# Käyttö:
+# Usage:
 #   .\scripts\watchdog.ps1
-# Ympäristö:
-#   FAMILYCLAW_GATEWAY_ADDR (oletus 127.0.0.1:8787)
-#   FAMILYCLAW_GATEWAY_TOKEN (valinnainen, bearer /canary:lle jos suojattu)
+# Environment:
+#   FAMILYCLAW_GATEWAY_ADDR (default 127.0.0.1:8787)
+#   FAMILYCLAW_GATEWAY_TOKEN (optional, bearer for /canary if protected)
 
 param(
     [string]$Addr = $(if ($env:FAMILYCLAW_GATEWAY_ADDR) { $env:FAMILYCLAW_GATEWAY_ADDR } else { "127.0.0.1:8787" }),

@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+keywords = ["agent", "gateway", "http", "runtime", "server"]
+categories = ["command-line-utilities", "asynchronous"]
 
 [[bin]]
 name = "familyclaw-gateway"

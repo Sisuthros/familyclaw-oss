@@ -1,27 +1,27 @@
-//! Tyypitetyt mittarit jatkuvuustyökuorman pisteytykseen.
+//! Typed metrics for scoring the continuity workload.
 //!
-//! Nämä apurit muuntavat raa'at havainnot vertailukelpoisiksi luvuiksi joita
-//! skenaariot kirjaavat [`ScenarioResult`](crate::scenario::ScenarioResult):iin
-//! ja jotka aggregoidaan scorecardiin. Kaikki funktiot ovat puhtaita ja
-//! deterministisiä — sama syöte → sama luku (design §2.2).
+//! These helpers convert raw observations into comparable numbers that
+//! scenarios record on [`ScenarioResult`](crate::scenario::ScenarioResult)
+//! and that get aggregated into the scorecard. All functions are pure and
+//! deterministic — same input → same number (design §2.2).
 //!
-//! Mittarit (design §3):
-//! - [`resume_correctness`] — S1: jatkuiko työ täsmälleen oikeasta askelesta.
-//! - [`recall_at_k`] — S2: kuinka moni odotetuista muistoista löytyi top-k:sta.
-//! - [`dedup_precision`] — S3: kuinka tarkasti unijakso poisti duplikaatit.
-//! - [`protected_core_intact`] — S3: säilyivätkö identiteetti-ankkurit (1.0/0.0).
+//! Metrics (design §3):
+//! - [`resume_correctness`] — S1: did work resume from exactly the right step.
+//! - [`recall_at_k`] — S2: how many of the expected memories were found in the top-k.
+//! - [`dedup_precision`] — S3: how accurately the sleep cycle removed duplicates.
+//! - [`protected_core_intact`] — S3: did identity anchors survive (1.0/0.0).
 
 use crate::error::Result;
 
-/// Resume-oikeellisuus: `1.0` jos jokainen odotettu askel jatkui oikein ilman
-/// uudelleen ajettuja sivuvaikutuksia, muuten suhteellinen osuus.
+/// Resume correctness: `1.0` if every expected step resumed correctly with
+/// no re-executed side effects, otherwise the proportional ratio.
 ///
-/// `side_effects_reexecuted > 0` pakottaa tuloksen nollaan — sivuvaikutus saa
-/// tapahtua täsmälleen kerran (design §3 S1).
+/// `side_effects_reexecuted > 0` forces the result to zero — a side effect
+/// is allowed to happen exactly once (design §3 S1).
 ///
 /// # Errors
-/// Palauttaa [`BenchError::Metric`](crate::BenchError::Metric) jos
-/// `expected_steps == 0` (jaettaisiin nollalla).
+/// Returns [`BenchError::Metric`](crate::BenchError::Metric) if
+/// `expected_steps == 0` (would divide by zero).
 #[must_use = "metric result must be recorded"]
 pub fn resume_correctness(
     expected_steps: usize,
@@ -41,11 +41,11 @@ pub fn resume_correctness(
     Ok(ratio)
 }
 
-/// `recall@k`: osuus odotetuista muistoista jotka löytyivät palautettujen
-/// top-k joukosta.
+/// `recall@k`: the proportion of expected memories found among the
+/// returned top-k set.
 ///
 /// # Errors
-/// Palauttaa [`BenchError::Metric`](crate::BenchError::Metric) jos
+/// Returns [`BenchError::Metric`](crate::BenchError::Metric) if
 /// `expected_total == 0`.
 #[must_use = "metric result must be recorded"]
 pub fn recall_at_k(expected_total: usize, found_in_top_k: usize) -> Result<f64> {
@@ -60,14 +60,14 @@ pub fn recall_at_k(expected_total: usize, found_in_top_k: usize) -> Result<f64> 
     )
 }
 
-/// Dedup-tarkkuus: oikein poistetut duplikaatit suhteessa kaikkiin poistoihin.
+/// Dedup precision: correctly removed duplicates relative to all removals.
 ///
-/// `precision = true_merges / (true_merges + false_merges)`. Jos yhtään poistoa
-/// ei tehty, tulos on `1.0` (ei vääriä positiivisia).
+/// `precision = true_merges / (true_merges + false_merges)`. If no removals
+/// were made, the result is `1.0` (no false positives).
 ///
 /// # Errors
-/// Tämä funktio ei voi epäonnistua, mutta palauttaa [`Result`] yhtenäisyyden
-/// vuoksi muiden mittarien kanssa.
+/// This function cannot fail, but returns [`Result`] for consistency with
+/// the other metrics.
 #[must_use = "metric result must be recorded"]
 pub fn dedup_precision(true_merges: usize, false_merges: usize) -> Result<f64> {
     let total = true_merges + false_merges;
@@ -78,8 +78,8 @@ pub fn dedup_precision(true_merges: usize, false_merges: usize) -> Result<f64> {
         / f64::from(u32::try_from(total).unwrap_or(u32::MAX)))
 }
 
-/// Suojatun ytimen eheys: `1.0` jos yksikään identiteetti-ankkuri ei kadonnut
-/// konsolidaatiossa, muuten `0.0` (design §3 S3, hyväksyntäkriteeri 4).
+/// Protected core integrity: `1.0` if no identity anchor was lost during
+/// consolidation, otherwise `0.0` (design §3 S3, acceptance criterion 4).
 #[must_use]
 pub fn protected_core_intact(intact: bool) -> f64 {
     if intact {
@@ -90,7 +90,7 @@ pub fn protected_core_intact(intact: bool) -> f64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)] // Vakiot 0.0/1.0 ovat tarkkoja float-arvoja testeissä.
+#[allow(clippy::float_cmp)] // Constants 0.0/1.0 are exact float values in tests.
 mod tests {
     use super::*;
 

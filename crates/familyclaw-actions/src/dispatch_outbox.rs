@@ -1,58 +1,65 @@
-//! Lähetyksen idempotenssi-outbox ([`DispatchOutboxStore`]) — KERROS A.
+//! Dispatch idempotency outbox ([`DispatchOutboxStore`]) — Layer A.
 //!
-//! ## Ongelma jonka tämä ratkaisee (exactly-once-rajan kivijalka)
-//! [`crate::facade::ActionRuntime::submit_task`] suorittaa **ulkoisen
-//! sivuvaikutuksen** (putken ajo, todisteen tallennus, odottavan hyväksynnän
-//! kirjaus). Agenttikerros kääräisee tämän durable-askeleeseen, mutta
-//! sivuvaikutuksen **suoritus** ja askeleen **journalointi** ovat kaksi erillistä
-//! tapahtumaa: niiden VÄLISSÄ on ikkuna. Jos prosessi tapetaan (SIGKILL) juuri
-//! siinä — sivuvaikutus on jo tapahtunut mutta journal-riviä ei ole — replay ei
-//! näe riviä, luulee askelta ajamattomaksi ja **ajaa `submit_task`:n uudelleen**.
-//! Tulos: kaksoislaukaisu (double-fire), joka rikkoo "exactly-once side effects
-//! under SIGKILL" -väitteen.
+//! ## The problem this solves (the cornerstone of the exactly-once boundary)
+//! [`crate::facade::ActionRuntime::submit_task`] performs an **external
+//! side effect** (running the pipeline, storing the proof, recording a
+//! pending approval). The agent layer wraps this in a durable step, but the
+//! side effect's **execution** and the step's **journaling** are two separate
+//! events: there is a WINDOW between them. If the process is killed
+//! (SIGKILL) right in that window — the side effect has already happened but
+//! the journal row does not exist — replay does not see the row, assumes the
+//! step never ran, and **runs `submit_task` again**. Result: a double-fire,
+//! which violates the "exactly-once side effects under SIGKILL" invariant.
 //!
-//! Pelkkä journaloinnin siirtäminen sivuvaikutuksen **eteen** ei korjaa tätä:
-//! silloin voisi journaloida sivuvaikutuksen joka ei koskaan tapahtunut (kaatui
-//! ennen suoritusta) → väärä "exactly-once" toiseen suuntaan.
+//! Simply moving the journaling to **before** the side effect does not fix
+//! this either: then a side effect that never actually happened (crashed
+//! before execution) could be journaled → a false "exactly-once" in the
+//! other direction.
 //!
-//! ## Ratkaisu: idempotenssi-avain ajoympäristön RAJALLA
-//! Outbox kytkee jokaiseen lähetykseen **vakaan idempotenssi-avaimen** (kutsuja
-//! johtaa sen deterministisesti, esim. `turn-{turn}-dispatch-{k}`). Lähetys
-//! kirjataan kaksivaiheisesti **kaatumiskestävään** lokiin:
+//! ## Solution: an idempotency key at the runtime BOUNDARY
+//! The outbox attaches a **stable idempotency key** to every dispatch (the
+//! caller derives it deterministically, e.g. `turn-{turn}-dispatch-{k}`).
+//! The dispatch is recorded in two phases to a **crash-durable** log:
 //!
-//! 1. **intent** (`DISPATCH_INTENT`) kirjataan **ENNEN** sivuvaikutusta.
-//! 2. sivuvaikutus suoritetaan.
-//! 3. **committed** (`DISPATCH_COMMITTED`) kirjataan sivuvaikutuksen jälkeen,
-//!    sisältäen lähetyksen lopputuloksen ([`DispatchedOutcome`]).
+//! 1. **intent** (`DISPATCH_INTENT`) is recorded **BEFORE** the side effect.
+//! 2. the side effect is executed.
+//! 3. **committed** (`DISPATCH_COMMITTED`) is recorded after the side
+//!    effect, containing the dispatch outcome ([`DispatchedOutcome`]).
 //!
-//! Kun sama avain nähdään uudelleen (replay tai restart):
-//! - **committed** löytyy → palautetaan tallennettu lopputulos **arvo-identtisenä**
-//!   (sama `task_id` / `ApprovalId` / TTL) **ajamatta sivuvaikutusta uudelleen**.
-//! - **intent mutta ei committed** → prosessi kaatui kesken sivuvaikutuksen.
-//!   Sivuvaikutus on voinut tapahtua osittain → palautusperiaate on **eksplisiittinen
-//!   ja fail-closed** ([`DispatchLookup::InProgress`]): kutsua EI ajeta uudelleen,
-//!   vaan se hylätään, ettei sokeasti kahdenneta.
-//! - **ei mitään** → avainta ei ole koskaan aloitettu → sivuvaikutus on
-//!   turvallista suorittaa.
+//! When the same key is seen again (replay or restart):
+//! - **committed** is found → the stored outcome is returned
+//!   **value-identically** (same `task_id` / `ApprovalId` / TTL) **without
+//!   re-running the side effect**.
+//! - **intent but no committed** → the process crashed mid-side-effect. The
+//!   side effect may have partially happened → the recovery policy is
+//!   **explicit and fail-closed** ([`DispatchLookup::InProgress`]): the call
+//!   is NOT re-run — it is rejected instead, so it is never blindly
+//!   duplicated.
+//! - **neither** → the key was never started → it is safe to perform the
+//!   side effect.
 //!
-//! ## Takuun tarkka raja (rehellisesti)
-//! - **Prosessin kaatuminen / SIGKILL:** taattu. Sivuvaikutus suoritetaan
-//!   korkeintaan kerran; committed-tilan saavuttanut lähetys palautuu identtisenä
-//!   eikä koskaan ajeta uudelleen.
-//! - **Power-loss / hakemiston metadata-fsync:** [`crate::pending_store::JournalPendingStore`]:n
-//!   tavoin tämä nojaa [`familyclaw_durable::FileJournal`]:n `flush` + `fsync`-takuuseen
-//!   *tiedoston* sisällölle. Hakemiston merkinnän (dir-fsync) ja laitteiston
-//!   kirjoituspuskureiden osalta takuu on yhtä vahva kuin alla oleva FS/laitteisto —
-//!   tätä **ei yliluvata**. Intent-only-jälki kaatumisen jälkeen on aina
-//!   havaittavissa, ja palautusperiaate sen varalle on eksplisiittinen.
+//! ## The exact boundary of the guarantee (stated honestly)
+//! - **Process crash / SIGKILL:** guaranteed. The side effect runs at most
+//!   once; a dispatch that reached the committed state is returned
+//!   identically and is never re-run.
+//! - **Power loss / directory metadata fsync:** like
+//!   [`crate::pending_store::JournalPendingStore`], this relies on
+//!   [`familyclaw_durable::FileJournal`]'s `flush` + `fsync` guarantee for
+//!   the *file's* contents. For the directory entry (dir-fsync) and
+//!   hardware write buffers, the guarantee is only as strong as the
+//!   underlying FS/hardware — this is **not overclaimed**. An intent-only
+//!   trace after a crash is always detectable, and the recovery policy for
+//!   that case is explicit.
 //!
-//! ## Salaisuusinvariantti
-//! Tallennettu muoto ([`DispatchedOutcome`]) sisältää vain tunnisteet, tilan ja
-//! mahdollisen hyväksynnän tunnisteen + virheviestin — **ei raakaa payloadia eikä
-//! salaisuuksia**. Sama invariantti kuin [`crate::pending_store::PendingRecord`]:lla.
+//! ## Secrecy invariant
+//! The stored form ([`DispatchedOutcome`]) contains only identifiers, the
+//! status, and a possible approval identifier + error message — **no raw
+//! payload and no secrets**. Same invariant as
+//! [`crate::pending_store::PendingRecord`].
 //!
-//! ## Determinismi
-//! Aikaa ei lueta moduulin sisällä; idempotenssi-avain annetaan kutsujalta.
+//! ## Determinism
+//! The clock is never read inside this module; the idempotency key is
+//! supplied by the caller.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -67,37 +74,39 @@ use crate::facade::SubmitOutcome;
 use crate::ids::{ActionTaskId, ApprovalId};
 use crate::task::TaskStatus;
 
-/// Moduulin valmiusaste — säilytetään, jotta [`crate::all_modules_scaffolded`]
-/// kääntyy edelleen muiden moduulien rinnalla.
+/// Module readiness level — kept so that [`crate::all_modules_scaffolded`]
+/// still compiles alongside other modules that are still in the scaffold
+/// stage.
 pub(crate) const SCAFFOLDED: bool = true;
 
-/// Journal-rivin looginen nimi lähetyksen **aikeelle** (kirjataan ENNEN sivuvaikutusta).
+/// Journal row logical name for a dispatch's **intent** (recorded BEFORE the side effect).
 const DISPATCH_INTENT: &str = "dispatch_intent";
-/// Journal-rivin looginen nimi lähetyksen **sitoutumiselle** (kirjataan sivuvaikutuksen jälkeen).
+/// Journal row logical name for a dispatch's **commitment** (recorded after the side effect).
 const DISPATCH_COMMITTED: &str = "dispatch_committed";
 
-/// Lähetyksen journaloitava, **salaisuudeton** lopputulos.
+/// A dispatch's journalable, **secret-free** outcome.
 ///
-/// Tämä on [`SubmitOutcome`]:n tallennusmuoto outboxissa: tasan se osa jonka
-/// kutsuja tarvitsee jatkaakseen — `task_id`, `status` ja mahdollinen
-/// `pending_approval` — sekä mahdollinen `submit_task`:n virheviesti, jotta
-/// myös epäonnistunut lähetys palautuu samana ajamatta sivuvaikutusta uudelleen.
+/// This is the stored form of [`SubmitOutcome`] in the outbox: exactly the
+/// part the caller needs to continue — `task_id`, `status`, and a possible
+/// `pending_approval` — plus a possible `submit_task` error message, so that
+/// even a failed dispatch is returned identically without re-running the
+/// side effect.
 ///
-/// Ei sisällä raakaa payloadia eikä salaisuuksia.
+/// Contains no raw payload and no secrets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchedOutcome {
-    /// Lähetetyn tehtävän tunniste.
+    /// The identifier of the dispatched task.
     pub task_id: ActionTaskId,
-    /// Tehtävän tila lähetyksen jälkeen.
+    /// The task's status after the dispatch.
     pub status: TaskStatus,
-    /// Hyväksynnän tunniste jos lähetys jäi odottamaan hyväksyntää (muuten `None`).
+    /// The approval identifier if the dispatch was left pending approval (otherwise `None`).
     pub pending_approval: Option<ApprovalId>,
-    /// `submit_task`:n virheviesti jos lähetys epäonnistui (muuten `None`).
+    /// `submit_task`'s error message if the dispatch failed (otherwise `None`).
     pub error: Option<String>,
 }
 
 impl DispatchedOutcome {
-    /// Rakentaa journaloitavan lopputuloksen onnistuneesta lähetyksestä.
+    /// Builds the journalable outcome for a successful dispatch.
     #[must_use]
     pub const fn from_submit(outcome: &SubmitOutcome) -> Self {
         Self {
@@ -108,10 +117,10 @@ impl DispatchedOutcome {
         }
     }
 
-    /// Rakentaa journaloitavan lopputuloksen epäonnistuneesta lähetyksestä.
+    /// Builds the journalable outcome for a failed dispatch.
     ///
-    /// Tallentaa virheviestin (nil-tunniste + [`TaskStatus::Failed`]), jotta
-    /// replay palauttaa saman virheen ajamatta sivuvaikutusta uudelleen.
+    /// Stores the error message (nil identifier + [`TaskStatus::Failed`]) so
+    /// that replay returns the same error without re-running the side effect.
     #[must_use]
     pub fn from_error(message: impl Into<String>) -> Self {
         Self {
@@ -122,14 +131,14 @@ impl DispatchedOutcome {
         }
     }
 
-    /// Palauttaa tämän lopputuloksen [`Result<SubmitOutcome>`]-muodossa.
+    /// Returns this outcome as a [`Result<SubmitOutcome>`].
     ///
-    /// Jos tallennettu lopputulos kantoi virheen, palautetaan
-    /// [`ActionError::ExecutionFailed`] samalla viestillä; muuten onnistunut
-    /// [`SubmitOutcome`] arvo-identtisenä alkuperäisen lähetyksen kanssa.
+    /// If the stored outcome carried an error, returns
+    /// [`ActionError::ExecutionFailed`] with the same message; otherwise a
+    /// successful [`SubmitOutcome`] value-identical to the original dispatch.
     ///
     /// # Errors
-    /// [`ActionError::ExecutionFailed`] jos tallennettu lähetys oli virhe.
+    /// [`ActionError::ExecutionFailed`] if the stored dispatch was an error.
     pub fn into_result(self) -> Result<SubmitOutcome> {
         if let Some(message) = self.error {
             return Err(ActionError::ExecutionFailed(message));
@@ -142,90 +151,93 @@ impl DispatchedOutcome {
     }
 }
 
-/// Yhden idempotenssi-avaimen tila outboxissa.
+/// The state of a single idempotency key in the outbox.
 ///
-/// Palautetaan [`DispatchOutboxStore::lookup`]:sta jotta kutsuja tietää, onko
-/// sivuvaikutus turvallista suorittaa, jo suoritettu vai kesken kaatunut.
+/// Returned by [`DispatchOutboxStore::lookup`] so the caller knows whether
+/// it is safe to perform the side effect, whether it already ran, or
+/// whether it crashed mid-flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchLookup {
-    /// Avainta ei ole koskaan aloitettu → sivuvaikutus on turvallista suorittaa.
+    /// The key was never started → it is safe to perform the side effect.
     NotStarted,
-    /// Lähetys on jo sitoutunut → palautettava lopputulos ajamatta uudelleen.
+    /// The dispatch has already committed → the outcome must be returned without re-running.
     Committed(DispatchedOutcome),
-    /// Aie kirjattu mutta ei sitoutumista → prosessi kaatui kesken sivuvaikutuksen.
-    /// Palautusperiaate: fail-closed (älä aja uudelleen).
+    /// Intent was recorded but not commitment → the process crashed mid-side-effect.
+    /// Recovery policy: fail-closed (do not re-run).
     InProgress,
 }
 
-/// Yhden avaimen sisäinen rekonstruoitu tila (intent nähty? committed nähty?).
+/// The internal reconstructed state of a single key (intent seen? committed seen?).
 #[derive(Debug, Clone, Default)]
 struct KeyState {
-    /// Onko avaimelle kirjattu aie (`DISPATCH_INTENT`).
+    /// Whether intent (`DISPATCH_INTENT`) has been recorded for this key.
     intent: bool,
-    /// Sitoutunut lopputulos, jos `DISPATCH_COMMITTED` on kirjattu.
+    /// The committed outcome, if `DISPATCH_COMMITTED` was recorded.
     committed: Option<DispatchedOutcome>,
 }
 
-/// Kaatumiskestävä lähetyksen idempotenssi-outbox.
+/// Crash-durable dispatch idempotency outbox.
 ///
-/// Trait jotta julkisivu ([`crate::facade::ActionRuntime`]) voi käyttää joko
-/// muistinvaraista ([`InMemoryDispatchOutbox`], oletus, ei selviä kaatumisesta)
-/// tai kaatumiskestävää ([`JournalDispatchOutbox`]) toteutusta vaihtamatta
-/// logiikkaansa. Kaikki metodit ovat `&self` (sisäinen mutaatio lukon takana),
-/// jotta trait on `dyn`-yhteensopiva.
+/// A trait so the facade ([`crate::facade::ActionRuntime`]) can use either
+/// the in-memory implementation ([`InMemoryDispatchOutbox`], the default,
+/// which does not survive a crash) or the crash-durable implementation
+/// ([`JournalDispatchOutbox`]) without changing its logic. All methods take
+/// `&self` (internal mutation behind a lock), so the trait is
+/// `dyn`-compatible.
 pub trait DispatchOutboxStore: std::fmt::Debug + Send + Sync {
-    /// Palauttaa toteutuksen **vakaan lajitunnisteen** (`"in-memory"` tai
+    /// Returns the implementation's **stable kind identifier** (`"in-memory"` or
     /// `"journal"`).
     ///
-    /// Tämä on tarkoituksellisesti pieni, salaisuudeton koukku jolla kutsuja
-    /// (ja testit) voi todeta KUMPI outbox on kytketty paljastamatta sisäistä
-    /// tilaa tai polkua. Kaatumiskestävyyttä vaativa kokoonpano voi näin
-    /// varmistaa että `dyn`-takana on `"journal"`-variantti eikä oletuksellinen
-    /// `"in-memory"`. Arvo on stabiili kontrakti — älä muuta olemassa olevia
-    /// merkkijonoja.
+    /// This is deliberately a small, secret-free hook that lets the caller
+    /// (and tests) determine WHICH outbox is wired up without exposing
+    /// internal state or a path. A configuration that requires crash
+    /// durability can thus confirm that the `"journal"` variant is behind
+    /// the `dyn`, not the default `"in-memory"` one. The value is a stable
+    /// contract — do not change existing strings.
     fn kind(&self) -> &'static str;
 
-    /// Tarkistaa avaimen nykytilan **suorittamatta** mitään.
+    /// Checks a key's current state **without performing** anything.
     ///
     /// # Errors
-    /// Levytoteutuksilla [`ActionError::Proof`] jos lokin luku epäonnistuu.
+    /// For disk-backed implementations, [`ActionError::Proof`] if reading the log fails.
     fn lookup(&self, key: &str) -> Result<DispatchLookup>;
 
-    /// Kirjaa avaimen **aikeen** (`DISPATCH_INTENT`) — kutsuttava **ENNEN**
-    /// sivuvaikutuksen suoritusta.
+    /// Records the key's **intent** (`DISPATCH_INTENT`) — must be called
+    /// **BEFORE** the side effect is executed.
     ///
     /// # Errors
-    /// Levytoteutuksilla [`ActionError::Proof`] jos kirjoitus epäonnistuu.
+    /// For disk-backed implementations, [`ActionError::Proof`] if the write fails.
     fn record_intent(&self, key: &str) -> Result<()>;
 
-    /// Kirjaa avaimen **sitoutumisen** (`DISPATCH_COMMITTED`) lopputuloksineen —
-    /// kutsuttava **vasta** sivuvaikutuksen onnistuneen suorituksen jälkeen.
+    /// Records the key's **commitment** (`DISPATCH_COMMITTED`) with its
+    /// outcome — must be called **only** after the side effect has
+    /// executed successfully.
     ///
     /// # Errors
-    /// Levytoteutuksilla [`ActionError::Proof`] jos kirjoitus epäonnistuu.
+    /// For disk-backed implementations, [`ActionError::Proof`] if the write fails.
     fn record_committed(&self, key: &str, outcome: &DispatchedOutcome) -> Result<()>;
 }
 
-/// Muistinvarainen outbox (oletus + testikäyttö).
+/// In-memory outbox (default + test use).
 ///
-/// Nopea, mutta **ei selviä prosessin kaatumisesta** — uudelleenkäynnistyksessä
-/// tila on tyhjä. Tämä on tarkoituksellisesti sama käyttäytyminen kuin ennen
-/// outboxia: in-memory-ajoympäristö ei tarjoa exactly-once-takuuta kaatumisen
-/// yli (käytä [`JournalDispatchOutbox`]:a tuotannossa).
+/// Fast, but **does not survive a process crash** — state is empty after a
+/// restart. This is deliberately the same behavior as before the outbox
+/// existed: an in-memory runtime does not provide an exactly-once guarantee
+/// across a crash (use [`JournalDispatchOutbox`] in production).
 #[derive(Debug, Default)]
 pub struct InMemoryDispatchOutbox {
-    /// Avain → tila.
+    /// Key → state.
     inner: Mutex<HashMap<String, KeyState>>,
 }
 
 impl InMemoryDispatchOutbox {
-    /// Luo tyhjän muistinvaraisen outboxin.
+    /// Creates an empty in-memory outbox.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Lukitsee sisäisen kartan, toipuen myrkytetystä lukosta paniikkaamatta.
+    /// Locks the internal map, recovering from a poisoned lock without panicking.
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, KeyState>> {
         self.inner
             .lock()
@@ -264,33 +276,33 @@ impl DispatchOutboxStore for InMemoryDispatchOutbox {
     }
 }
 
-/// Outboxin yksi tallennusrivi (intent tai committed) levymuodossa.
+/// A single stored row (intent or committed) of the outbox, in on-disk form.
 ///
-/// Pieni salaisuudeton tietue: avain + valinnainen lopputulos (vain
-/// committed-riveillä).
+/// A small, secret-free record: key + optional outcome (only on committed rows).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OutboxRow {
-    /// Idempotenssi-avain.
+    /// The idempotency key.
     key: String,
-    /// Lopputulos (vain committed-riveillä; intent-riveillä `None`).
+    /// The outcome (only on committed rows; `None` on intent rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     outcome: Option<DispatchedOutcome>,
 }
 
-/// Kaatumiskestävä outbox [`FileJournal`]:n päällä.
+/// Crash-durable outbox on top of [`FileJournal`].
 ///
-/// Append-only-loki: `dispatch_intent`- ja `dispatch_committed`-markerit, joista
-/// tila rekonstruoidaan toistamalla. Koska [`FileJournal::append`] flushaa ja
-/// fsyncaa ennen paluuta, kirjattu intent/committed on levyllä myös äkillisen
-/// kaatumisen jälkeen — tämä on koko exactly-once-takuun kivijalka.
+/// An append-only log: `dispatch_intent` and `dispatch_committed` markers,
+/// from which state is reconstructed by replay. Because
+/// [`FileJournal::append`] flushes and fsyncs before returning, a recorded
+/// intent/committed is on disk even after an abrupt crash — this is the
+/// cornerstone of the whole exactly-once guarantee.
 ///
-/// ## Salaisuusinvariantti
-/// Levylle kirjoitetaan vain `OutboxRow`:n salaisuudettomat kentät (avain +
-/// tunnisteet + tila). Ei raakaa payloadia eikä salaisuuksia.
+/// ## Secrecy invariant
+/// Only `OutboxRow`'s secret-free fields (key + identifiers + status) are
+/// written to disk. No raw payload and no secrets.
 pub struct JournalDispatchOutbox {
-    /// Append-only-loki johon aikeet ja sitoutumiset kirjataan.
+    /// Append-only log to which intents and commitments are recorded.
     journal: FileJournal,
-    /// Seuraavan rivin sekvenssipaikka (monotoninen).
+    /// The next row's sequence slot (monotonic).
     next_step: Mutex<StepId>,
 }
 
@@ -303,14 +315,15 @@ impl std::fmt::Debug for JournalDispatchOutbox {
 }
 
 impl JournalDispatchOutbox {
-    /// Avaa (tai luo) kaatumiskestävän outboxin annetusta tiedostopolusta.
+    /// Opens (or creates) a crash-durable outbox at the given file path.
     ///
-    /// Olemassa olevasta lokista avainten tila rekonstruoituu heti, joten
-    /// uudelleenkäynnistyksen jälkeen jo sitoutuneet lähetykset palautuvat
-    /// identtisinä ja kesken jääneet havaitaan ([`DispatchLookup::InProgress`]).
+    /// Key state is reconstructed from the existing log immediately, so
+    /// after a restart, already-committed dispatches are returned
+    /// identically and unfinished ones are detected
+    /// ([`DispatchLookup::InProgress`]).
     ///
     /// # Errors
-    /// [`ActionError::Proof`] jos journalia ei voi avata tai lukea.
+    /// [`ActionError::Proof`] if the journal cannot be opened or read.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let journal = FileJournal::open(path)
             .map_err(|e| ActionError::Proof(format!("open dispatch outbox failed: {e}")))?;
@@ -324,13 +337,13 @@ impl JournalDispatchOutbox {
         })
     }
 
-    /// Palauttaa lokin tiedostopolun.
+    /// Returns the log's file path.
     #[must_use]
     pub fn path(&self) -> &Path {
         self.journal.path()
     }
 
-    /// Varaa ja palauttaa seuraavan sekvenssipaikan (monotoninen).
+    /// Reserves and returns the next sequence slot (monotonic).
     fn next_step_id(&self) -> StepId {
         let mut guard = self
             .next_step
@@ -341,7 +354,7 @@ impl JournalDispatchOutbox {
         current
     }
 
-    /// Liittää markerin lokiin annetulla nimellä ja rivillä.
+    /// Appends a marker to the log with the given name and row.
     fn append_marker(&self, name: &str, row: &OutboxRow) -> Result<()> {
         let payload = serde_json::to_value(row)
             .map_err(|e| ActionError::Proof(format!("encode outbox row failed: {e}")))?;
@@ -351,10 +364,10 @@ impl JournalDispatchOutbox {
             .map_err(|e| ActionError::Proof(format!("append outbox marker failed: {e}")))
     }
 
-    /// Rekonstruoi yhden avaimen tilan toistamalla lokin.
+    /// Reconstructs the state of a single key by replaying the log.
     ///
-    /// Toisto käy rivit järjestyksessä: `dispatch_intent` merkitsee aikeen,
-    /// `dispatch_committed` tallentaa lopputuloksen. Myöhempi committed voittaa.
+    /// Replay walks the rows in order: `dispatch_intent` marks the intent,
+    /// `dispatch_committed` stores the outcome. A later committed wins.
     fn replay_key(&self, key: &str) -> Result<KeyState> {
         let entries = self
             .journal
@@ -426,7 +439,7 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-    /// RAII-temp-tiedosto ilman ulkoisia crateja.
+    /// RAII temp file without external crates.
     struct TempPath(PathBuf);
 
     impl TempPath {
@@ -501,7 +514,7 @@ mod tests {
         let tmp = TempPath::new("commit-survives");
         let outcome = sample_outcome();
 
-        // Vaihe 1: kirjaa intent + committed, sitten "kaadu" (drop).
+        // Step 1: record intent + committed, then "crash" (drop).
         {
             let outbox = JournalDispatchOutbox::open(tmp.path()).expect("open 1");
             outbox.record_intent("turn-0-dispatch-0").expect("intent");
@@ -510,7 +523,7 @@ mod tests {
                 .expect("commit");
         }
 
-        // Vaihe 2: avaa UUDELLEEN — committed-lopputulos palautuu identtisenä.
+        // Step 2: re-open — the committed outcome is returned identically.
         let resumed = JournalDispatchOutbox::open(tmp.path()).expect("open 2");
         match resumed.lookup("turn-0-dispatch-0").expect("lookup") {
             DispatchLookup::Committed(got) => assert_eq!(got, outcome),
@@ -522,20 +535,20 @@ mod tests {
     fn durable_intent_only_is_in_progress_after_restart() {
         let tmp = TempPath::new("intent-only");
 
-        // Vaihe 1: kirjaa VAIN intent (simuloi kaatuminen kesken sivuvaikutuksen).
+        // Step 1: record ONLY intent (simulates a crash mid-side-effect).
         {
             let outbox = JournalDispatchOutbox::open(tmp.path()).expect("open 1");
             outbox.record_intent("turn-0-dispatch-0").expect("intent");
         }
 
-        // Vaihe 2: avaa uudelleen — intent-only → InProgress (fail-closed).
+        // Step 2: re-open — intent-only → InProgress (fail-closed).
         let resumed = JournalDispatchOutbox::open(tmp.path()).expect("open 2");
         assert_eq!(
             resumed.lookup("turn-0-dispatch-0").expect("lookup"),
             DispatchLookup::InProgress,
-            "intent ilman committed → InProgress kaatumisen jälkeen"
+            "intent without committed → InProgress after a crash"
         );
-        // Tuntematon avain on yhä NotStarted.
+        // An unknown key is still NotStarted.
         assert_eq!(
             resumed.lookup("turn-0-dispatch-9").expect("lookup"),
             DispatchLookup::NotStarted
@@ -545,8 +558,8 @@ mod tests {
     #[test]
     fn durable_persisted_form_contains_no_raw_secret() {
         let tmp = TempPath::new("no-secret");
-        // Avain on kutsujan johtama, ei salaisuus; varmistetaan silti ettei
-        // outcome-tallennus vuoda mitään avainten/tunnisteiden ulkopuolelta.
+        // The key is derived by the caller, not a secret; still verify that
+        // storing the outcome does not leak anything beyond keys/identifiers.
         let outbox = JournalDispatchOutbox::open(tmp.path()).expect("open");
         outbox.record_intent("turn-3-dispatch-2").expect("intent");
         outbox
@@ -565,7 +578,7 @@ mod tests {
         outbox
             .record_committed("a", &sample_outcome())
             .expect("a commit");
-        // Eri avain on koskematon.
+        // A different key is untouched.
         assert_eq!(
             outbox.lookup("b").expect("lookup"),
             DispatchLookup::NotStarted

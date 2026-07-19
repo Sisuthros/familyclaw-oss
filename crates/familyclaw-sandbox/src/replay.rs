@@ -1,28 +1,29 @@
-//! Deterministinen uudelleenajo (LOOP-idea).
+//! Deterministic replay (the LOOP idea).
 //!
-//! Paperi **LOOP** (2605.14237) esittää: tallenna suoritus *kerran*
-//! järjestettynä tapahtumalokina, ja toista se sen jälkeen deterministisesti
-//! pelkästä lokista — ilman kelloa, verkkoa tai mitään ulkoista syötettä.
-//! Koska kaikki ei-deterministiset syötteet (luetut tavut, polttoaineen
-//! kulutus, lopputulos) on *tallennettu* tapahtumiin, uudelleenajo ei tarvitse
-//! alkuperäistä backendia eikä ympäristöä. Tämä on edellytys luotettavalle
-//! debuggaukselle ja auditoinnille (sama suoritus voidaan tutkia bitintarkasti
-//! jälkikäteen) ja se leikkaa token/laskenta-kustannuksen murto-osaan.
+//! The **LOOP** paper (2605.14237) proposes: record an execution *once* as
+//! an ordered event log, and afterward replay it deterministically from the
+//! log alone — with no clock, network, or any external input. Because all
+//! non-deterministic inputs (bytes read, fuel consumed, final result) are
+//! *recorded* into the events, replay needs neither the original backend nor
+//! the original environment. This is a prerequisite for reliable debugging
+//! and auditing (the same execution can be inspected bit-exactly after the
+//! fact), and it cuts the token/compute cost to a fraction.
 //!
-//! ## Mitä tallennetaan
-//! [`ExecutionTrace`] on järjestetty [`TraceEvent`]-jono. Tapahtumat kuvaavat
-//! determinismin kannalta olennaiset *havainnot*:
-//! - [`TraceEvent::Started`] — suoritus alkoi (backend + koodin koko).
-//! - [`TraceEvent::Output`] — koodi tuotti tavulohkon.
-//! - [`TraceEvent::FuelConsumed`] — polttoainetta kului `amount` yksikköä.
-//! - [`TraceEvent::Finished`] — suoritus päättyi (onnistui / epäonnistui).
+//! ## What gets recorded
+//! [`ExecutionTrace`] is an ordered sequence of [`TraceEvent`]s. The events
+//! describe the *observations* relevant to determinism:
+//! - [`TraceEvent::Started`] — execution began (backend + code size).
+//! - [`TraceEvent::Output`] — the code produced a byte chunk.
+//! - [`TraceEvent::FuelConsumed`] — `amount` units of fuel were consumed.
+//! - [`TraceEvent::Finished`] — execution ended (succeeded / failed).
 //!
-//! ## Uudelleenajo
-//! [`replay`] kävelee tapahtumat läpi ja kokoaa [`Outcome`]:n täysin
-//! deterministisesti: se *ei* aja WASM-koodia, *ei* lue kelloa eikä verkkoa. Saman
-//! [`ExecutionTrace`]:n uudelleenajo tuottaa aina identtisen [`Outcome`]:n.
+//! ## Replay
+//! [`replay`] walks the events and assembles an [`Outcome`] fully
+//! deterministically: it *does not* run WASM code, and *does not* read the
+//! clock or the network. Replaying the same [`ExecutionTrace`] always
+//! produces an identical [`Outcome`].
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_sandbox::{ExecutionTrace, TraceEvent, replay};
 //!
@@ -35,7 +36,7 @@
 //!
 //! let a = replay(&trace).expect("replay ok");
 //! let b = replay(&trace).expect("replay ok again");
-//! assert_eq!(a, b); // determinismi
+//! assert_eq!(a, b); // determinism
 //! assert_eq!(a.output, b"hello");
 //! assert_eq!(a.fuel_consumed, 7);
 //! assert!(a.success);
@@ -46,47 +47,47 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, SandboxError};
 use crate::sandbox::SandboxOutput;
 
-/// Yksittäinen tallennettu tapahtuma suorituksen aikana.
+/// A single recorded event during execution.
 ///
-/// Tapahtumat ovat sarjallistuvia ja determinismin kannalta täydellisiä:
-/// uudelleenajo ei tarvitse mitään tapahtumien ulkopuolelta.
+/// Events are serializable and complete with respect to determinism: replay
+/// needs nothing from outside the events.
 ///
-/// `#[non_exhaustive]` jotta uusia tapahtumatyyppejä voi lisätä rikkomatta
-/// downstream-koodia.
+/// `#[non_exhaustive]` so that new event types can be added without breaking
+/// downstream code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "event")]
 #[non_exhaustive]
 pub enum TraceEvent {
-    /// Suoritus alkoi.
+    /// Execution started.
     Started {
-        /// Backendin tunniste joka tuotti tämän lokin.
+        /// The identifier of the backend that produced this log.
         backend: String,
-        /// Ajetun koodin koko tavuina.
+        /// The size of the executed code in bytes.
         code_len: usize,
     },
 
-    /// Koodi tuotti tulostavuja. Useita lohkoja voi esiintyä; ne ketjutetaan
-    /// uudelleenajossa esiintymisjärjestyksessä.
+    /// The code produced output bytes. Multiple chunks may occur; they are
+    /// concatenated in order of occurrence during replay.
     Output {
-        /// Tuotettu tavulohko.
+        /// The produced byte chunk.
         bytes: Vec<u8>,
     },
 
-    /// Polttoainetta kului. Useat merkinnät lasketaan yhteen.
+    /// Fuel was consumed. Multiple entries are summed.
     FuelConsumed {
-        /// Kulutettu määrä tässä askeleessa.
+        /// The amount consumed at this step.
         amount: u64,
     },
 
-    /// Suoritus päättyi.
+    /// Execution ended.
     Finished {
-        /// Päättyikö suoritus onnistuneesti.
+        /// Whether the execution completed successfully.
         success: bool,
     },
 }
 
 impl TraceEvent {
-    /// [`TraceEvent::Started`]-tapahtuma.
+    /// A [`TraceEvent::Started`] event.
     pub fn started(backend: impl Into<String>, code_len: usize) -> Self {
         Self::Started {
             backend: backend.into(),
@@ -94,30 +95,30 @@ impl TraceEvent {
         }
     }
 
-    /// [`TraceEvent::Output`]-tapahtuma.
+    /// A [`TraceEvent::Output`] event.
     pub fn output(bytes: impl Into<Vec<u8>>) -> Self {
         Self::Output {
             bytes: bytes.into(),
         }
     }
 
-    /// [`TraceEvent::FuelConsumed`]-tapahtuma.
+    /// A [`TraceEvent::FuelConsumed`] event.
     #[must_use]
     pub const fn fuel_consumed(amount: u64) -> Self {
         Self::FuelConsumed { amount }
     }
 
-    /// [`TraceEvent::Finished`]-tapahtuma.
+    /// A [`TraceEvent::Finished`] event.
     #[must_use]
     pub const fn finished(success: bool) -> Self {
         Self::Finished { success }
     }
 }
 
-/// Järjestetty, sarjallistuva loki yhdestä sandbox-suorituksesta.
+/// An ordered, serializable log of a single sandbox execution.
 ///
-/// Tämä on LOOP-mekanismin tallenne: kerran kirjattuna se voidaan toistaa
-/// deterministisesti [`replay`]:n kautta ilman alkuperäistä backendia.
+/// This is the record of the LOOP mechanism: once recorded, it can be
+/// replayed deterministically via [`replay`] without the original backend.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ExecutionTrace {
@@ -125,7 +126,7 @@ pub struct ExecutionTrace {
 }
 
 impl ExecutionTrace {
-    /// Rakentaa lokin valmiista tapahtumajonosta.
+    /// Builds a log from a ready sequence of events.
     #[must_use]
     pub fn new(events: impl Into<Vec<TraceEvent>>) -> Self {
         Self {
@@ -133,53 +134,54 @@ impl ExecutionTrace {
         }
     }
 
-    /// Tyhjä loki, johon tapahtumia lisätään [`push`](ExecutionTrace::push):lla.
+    /// An empty log, to which events are added via [`push`](ExecutionTrace::push).
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }
 
-    /// Lisää tapahtuman lokin loppuun (append-only).
+    /// Appends an event to the end of the log (append-only).
     pub fn push(&mut self, event: TraceEvent) {
         self.events.push(event);
     }
 
-    /// Tapahtumat lisäysjärjestyksessä.
+    /// The events in append order.
     #[must_use]
     pub fn events(&self) -> &[TraceEvent] {
         &self.events
     }
 
-    /// Tapahtumien lukumäärä.
+    /// The number of events.
     #[must_use]
     pub fn len(&self) -> usize {
         self.events.len()
     }
 
-    /// Onko loki tyhjä.
+    /// Whether the log is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
 }
 
-/// Uudelleenajon lopputulos.
+/// The result of a replay.
 ///
-/// Sarjallistuva tiivistelmä siitä mitä suoritus tuotti: tulostavut, kulutettu
-/// polttoaine ja onnistuiko se. [`From<Outcome>`] tuottaa [`SandboxOutput`]:n
-/// jotta uudelleenajo voidaan verrata alkuperäiseen suoritustulokseen.
+/// A serializable summary of what the execution produced: output bytes,
+/// fuel consumed, and whether it succeeded. [`From<Outcome>`] produces a
+/// [`SandboxOutput`] so the replay can be compared to the original
+/// execution result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outcome {
-    /// Yhdistetyt tulostavut esiintymisjärjestyksessä.
+    /// The combined output bytes in order of occurrence.
     pub output: Vec<u8>,
-    /// Yhteenlaskettu kulutettu polttoaine.
+    /// The total fuel consumed.
     pub fuel_consumed: u64,
-    /// Onnistuiko suoritus.
+    /// Whether the execution succeeded.
     pub success: bool,
 }
 
 impl Outcome {
-    /// Rakentaa lopputuloksen sen osista.
+    /// Builds a result from its parts.
     #[must_use]
     pub fn new(output: impl Into<Vec<u8>>, fuel_consumed: u64, success: bool) -> Self {
         Self {
@@ -191,29 +193,31 @@ impl Outcome {
 }
 
 impl From<Outcome> for SandboxOutput {
-    /// Onnistunut/epäonnistunut [`Outcome`] kartoittuu tavuihin ja kulutukseen
-    /// jotka [`SandboxOutput`] kantaa (success-lippu ei kuulu outputtiin —
-    /// epäonnistuminen ilmaistaan tyypillisesti virheellä ylemmällä tasolla).
+    /// A successful/failed [`Outcome`] maps to the bytes and consumption
+    /// that [`SandboxOutput`] carries (the success flag is not part of the
+    /// output — failure is typically expressed via an error at a higher
+    /// level).
     fn from(outcome: Outcome) -> Self {
         SandboxOutput::new(outcome.output, outcome.fuel_consumed)
     }
 }
 
-/// Toistaa tallennetun [`ExecutionTrace`]:n deterministisesti.
+/// Deterministically replays a recorded [`ExecutionTrace`].
 ///
-/// Kävelee tapahtumat läpi ja kokoaa [`Outcome`]:n **pelkästä lokista** — ei
-/// aja WASM-koodia, ei lue kelloa eikä verkkoa. Saman lokin uudelleenajo tuottaa
-/// aina identtisen tuloksen (LOOP-takuu).
+/// Walks through the events and assembles an [`Outcome`] **from the log
+/// alone** — it does not run WASM code, and does not read the clock or the
+/// network. Replaying the same log always produces an identical result (the
+/// LOOP guarantee).
 ///
-/// Determinismin vuoksi loki validoidaan rakenteellisesti: sen on alettava
-/// [`TraceEvent::Started`]:lla ja loputtava [`TraceEvent::Finished`]:iin, ja
-/// kumpaakaan ei saa esiintyä kahdesti. Näin epätäydellinen tai vioittunut
-/// loki havaitaan eikä se tuota harhaanjohtavaa "onnistunutta" tulosta.
+/// For determinism, the log is structurally validated: it must begin with
+/// [`TraceEvent::Started`] and end with [`TraceEvent::Finished`], and
+/// neither may occur twice. This way an incomplete or corrupted log is
+/// detected instead of producing a misleading "successful" result.
 ///
 /// # Errors
-/// [`SandboxError::Execution`] jos loki on rakenteellisesti kelvoton (tyhjä,
-/// ei ala `Started`:lla, ei pääty `Finished`:iin, tai sisältää toisteisia
-/// elinkaaritapahtumia).
+/// [`SandboxError::Execution`] if the log is structurally invalid (empty,
+/// does not begin with `Started`, does not end with `Finished`, or contains
+/// duplicate lifecycle events).
 pub fn replay(trace: &ExecutionTrace) -> Result<Outcome> {
     let events = trace.events();
     if events.is_empty() {
@@ -250,7 +254,7 @@ pub fn replay(trace: &ExecutionTrace) -> Result<Outcome> {
                         "FuelConsumed event outside the Started..Finished window",
                     ));
                 }
-                // Saturoiva yhteenlasku: vioittunut loki ei panikoi ylivuodosta.
+                // Saturating addition: a corrupted log does not panic on overflow.
                 fuel_consumed = fuel_consumed.saturating_add(*amount);
             }
             TraceEvent::Finished { success: s } => {
@@ -406,7 +410,7 @@ mod tests {
         let json = serde_json::to_string(&trace).expect("serialize");
         let back: ExecutionTrace = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(trace, back);
-        // Uudelleenajon tulos säilyy serde-kierroksen yli.
+        // The replay result survives a serde round-trip.
         assert_eq!(replay(&trace).unwrap(), replay(&back).unwrap());
     }
 

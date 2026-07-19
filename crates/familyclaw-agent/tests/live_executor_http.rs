@@ -1,16 +1,17 @@
-//! Integraatiotesti: todistaa että [`LiveTurnExecutor::execute`] ajaa oikean
-//! HTTP-LLM-polun päästä päähän mock-palvelinta vasten.
+//! Integration test: proves that [`LiveTurnExecutor::execute`] runs the
+//! real HTTP LLM path end to end against a mock server.
 //!
-//! Tämä sulkee README:n myöntämän luottamusaukon "built but unproven": ennen
-//! tätä testiä `live_executor`-yksikkötestit kattoivat vain *puhtaat* osat
-//! (kehotteen rakennus, hyötykuorman kääräys, konstruktorit) — varsinainen
-//! `execute()` ei ajanut edes mockia vasten, joten oikea reqwest → vastaus →
-//! [`Deliverable`] -polku oli todistamaton.
+//! This closes the trust gap the README itself admitted to ("built but
+//! unproven"): before this test, `live_executor`'s unit tests only
+//! covered the *pure* parts (prompt construction, payload wrapping,
+//! constructors) — the actual `execute()` never ran against even a mock,
+//! so the real reqwest → response → [`Deliverable`] path was unproven.
 //!
-//! Mock on pelkkä `std::net::TcpListener` (ei `wiremock`/`httpmock`-dependencyä),
-//! joten tämä ei lisää yhtään dev-dependencyä eikä riko `cargo-deny`-gatea. Se
-//! palauttaa OpenAI-yhteensopivan `chat.completion`-rungon, jolloin koko
-//! `LlmFailover::complete`-ketju ajetaan oikealla HTTP-kuljetuksella.
+//! The mock is a plain `std::net::TcpListener` (no `wiremock`/`httpmock`
+//! dependency), so this adds no dev-dependency and doesn't break the
+//! `cargo-deny` gate. It returns an OpenAI-compatible
+//! `chat.completion` body, so the entire `LlmFailover::complete` chain
+//! runs over a real HTTP transport.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -26,7 +27,8 @@ use familyclaw_bridge::TaskId;
 use familyclaw_core::ids::AgentId;
 use familyclaw_core::{time, ModelConfig};
 
-/// Yksi skriptattu HTTP-vastaus: status + assistant-sisältö (200-tapauksessa).
+/// A single scripted HTTP response: status + assistant content (for the
+/// 200 case).
 #[derive(Clone)]
 struct Reply {
     status: u16,
@@ -48,9 +50,9 @@ impl Reply {
     }
 }
 
-/// Minimaalinen HTTP/1.1-mock ilman axumia: lukee pyynnön, valitsee
-/// `script[min(call, len-1)]`-vastauksen (saturoi viimeiseen) ja vastaa
-/// OpenAI-yhteensopivalla rungolla. Laskee pyynnöt.
+/// A minimal HTTP/1.1 mock without axum: reads the request, picks the
+/// `script[min(call, len-1)]` response (saturating at the last one), and
+/// replies with an OpenAI-compatible body. Counts requests.
 struct MockLlm {
     base_url: String,
     calls: Arc<AtomicUsize>,
@@ -80,8 +82,8 @@ impl MockLlm {
     }
 
     fn handle(mut stream: TcpStream, call_index: usize, script: &[Reply]) {
-        // Lue request (headerit + alku bodysta) yhteen bufferiin; emme tarvitse
-        // koko bodya, vain triggerin vastaukselle.
+        // Read the request (headers + start of the body) into one buffer;
+        // we don't need the whole body, just the trigger for the response.
         let mut buf = [0_u8; 4096];
         let _ = stream.read(&mut buf).unwrap_or(0);
 
@@ -121,8 +123,8 @@ fn ts(secs: i64) -> time::Timestamp {
     time::from_unix_secs(secs).expect("valid unix seconds")
 }
 
-/// Rakentaa vuoron jolla on tunnettu assignee + now, jotta toimitteen kentät
-/// voidaan tarkistaa.
+/// Builds a turn with a known assignee + now, so the deliverable's fields
+/// can be checked.
 fn turn(assignee: AgentId, input: Value) -> OrchestratedTurn {
     OrchestratedTurn::new(
         "plan",
@@ -136,7 +138,8 @@ fn turn(assignee: AgentId, input: Value) -> OrchestratedTurn {
     )
 }
 
-/// Rakentaa [`LiveTurnExecutor`]:n yhden mallin ketjusta joka osoittaa mockiin.
+/// Builds a [`LiveTurnExecutor`] from a single-model chain pointing at
+/// the mock.
 fn live_executor_pointing_at(mock: &MockLlm) -> LiveTurnExecutor {
     let resolver = EnvEndpointResolver::new().with_provider(
         "mock",
@@ -148,15 +151,16 @@ fn live_executor_pointing_at(mock: &MockLlm) -> LiveTurnExecutor {
     LiveTurnExecutor::new(chain)
 }
 
-/// Rakentaa kahden mallin (primary + fallback) ketjun mockiin: failover-todiste.
+/// Builds a two-model (primary + fallback) chain against the mock: proof
+/// of failover.
 fn live_executor_with_fallback(mock: &MockLlm) -> LiveTurnExecutor {
     let resolver = EnvEndpointResolver::new().with_provider(
         "mock",
         mock.base_url.clone(),
         "FAMILYCLAW_TEST_KEY_UNSET",
     );
-    // Sama provider, kaksi mallia: ketju yrittää primaryn, sitten fallbackin.
-    // Molemmat osuvat samaan mockiin, joka skriptaa vastaukset kutsujärjestyksellä.
+    // Same provider, two models: the chain tries the primary, then the
+    // fallback. Both hit the same mock, which scripts responses by call order.
     let mut model = ModelConfig::new("mock/primary");
     model.fallbacks.push("mock/fallback".to_string());
     let chain = build_llm_chain(&model, &resolver).expect("chain builds");
@@ -165,8 +169,8 @@ fn live_executor_with_fallback(mock: &MockLlm) -> LiveTurnExecutor {
 
 #[tokio::test]
 async fn execute_returns_json_object_payload_over_real_http() {
-    // Mock palauttaa validin JSON-objektin → toimitteen hyötykuorma on se objekti
-    // sellaisenaan (ei "result"-kääräystä), todistettuna oikean HTTP-rungon yli.
+    // The mock returns a valid JSON object → the deliverable's payload is
+    // that object as-is (no "result" wrapping), proven over a real HTTP body.
     let mock = MockLlm::spawn(vec![Reply::ok(r#"{"headline":"Hi","ok":true}"#)]);
     let assignee = AgentId::new();
     let exec = live_executor_pointing_at(&mock);
@@ -182,7 +186,7 @@ async fn execute_returns_json_object_payload_over_real_http() {
         deliverable.payload.get("result").is_none(),
         "valid JSON object must not be wrapped under result"
     );
-    // Sauma-invariantit: from = assignee, at = injektoitu now (ei kelloa).
+    // Joint invariants: from = assignee, at = injected now (no clock read).
     assert_eq!(deliverable.from, assignee);
     assert_eq!(deliverable.at, ts(1000));
     assert_eq!(mock.total_calls(), 1, "exactly one LLM call for one turn");
@@ -190,8 +194,9 @@ async fn execute_returns_json_object_payload_over_real_http() {
 
 #[tokio::test]
 async fn execute_wraps_plain_text_under_result_over_real_http() {
-    // Mock palauttaa ei-JSON-tekstiä → hyötykuorma kääritään { result: text }.
-    // Todistaa wrap_payload-integraation oikean HTTP-vastauksen yli.
+    // The mock returns non-JSON text → the payload is wrapped as
+    // { result: text }. Proves the wrap_payload integration over a real
+    // HTTP response.
     let mock = MockLlm::spawn(vec![Reply::ok("just some prose, not json")]);
     let exec = live_executor_pointing_at(&mock);
 
@@ -208,9 +213,9 @@ async fn execute_wraps_plain_text_under_result_over_real_http() {
 
 #[tokio::test]
 async fn execute_surfaces_provider_error_as_err() {
-    // Yhden mallin ketju + mock palauttaa 503 → koko ketju epäonnistuu →
-    // execute() palauttaa Err (ei tyhjää/roskaista Deliverablea). Todistaa että
-    // providerivirhe propagoituu virheeksi, ei valehtelevaksi toimitteeksi.
+    // A single-model chain + the mock returns 503 → the whole chain fails →
+    // execute() returns Err (not an empty/garbage Deliverable). Proves
+    // that a provider error propagates as an error, not a lying deliverable.
     let mock = MockLlm::spawn(vec![Reply::status(503)]);
     let exec = live_executor_pointing_at(&mock);
 
@@ -224,9 +229,9 @@ async fn execute_surfaces_provider_error_as_err() {
 
 #[tokio::test]
 async fn execute_recovers_via_fallback_over_real_http() {
-    // Primary 503, fallback 200 → execute() palauttaa fallbackin sisällön.
-    // Todistaa että LlmFailover.complete-failover toimii execute():n kautta
-    // päästä päähän oikealla HTTP-kuljetuksella.
+    // Primary 503, fallback 200 → execute() returns the fallback's content.
+    // Proves that LlmFailover.complete's failover works through execute()
+    // end to end over a real HTTP transport.
     let mock = MockLlm::spawn(vec![Reply::status(503), Reply::ok("recovered by fallback")]);
     let exec = live_executor_with_fallback(&mock);
 

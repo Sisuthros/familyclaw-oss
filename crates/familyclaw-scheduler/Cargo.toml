@@ -1,12 +1,14 @@
 [package]
 name = "familyclaw-scheduler"
-description = "Minimaalinen intervalliperustainen ajastin idempotenteille proaktiivisille työkalutehtäthe operator (KERROS A, OSS)"
+description = "Minimal interval-based scheduler that dispatches proactive agent tool tasks through an idempotent submission path"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+keywords = ["scheduler", "cron", "agent", "idempotent", "async"]
+categories = ["asynchronous", "date-and-time"]
 
 [lints]
 workspace = true

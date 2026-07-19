@@ -1,32 +1,36 @@
-//! Tuottajapuolen suoritussauma: oikealla LLM-kerroksella varustettu
-//! [`TurnExecutor`]-toteutus.
+//! Producer-side execution joint: a [`TurnExecutor`] implementation backed
+//! by a real LLM layer.
 //!
-//! Tämä moduuli täyttää suunnitellun **tuottajapuolen** aukon: kuluttajapuoli
-//! (orkesteri + hermeettinen [`MockTurnExecutor`](familyclaw_bridge::executor::MockTurnExecutor))
-//! elää cratessa `familyclaw-bridge`, ja tässä cratessa toteutetaan **sama**
-//! [`TurnExecutor`]-rajapinta nimellä [`LiveTurnExecutor`]. Näin orkesteri saa
-//! ajaa oikean LLM-pohjaisen vuoron **muuttamatta itseään lainkaan** — se näkee
-//! vain trait-objektin `Arc<dyn TurnExecutor>`, kuten ennenkin.
+//! This module fills the planned **producer-side** gap: the consumer side
+//! (the orchestrator + the hermetic
+//! [`MockTurnExecutor`](familyclaw_bridge::executor::MockTurnExecutor))
+//! lives in the `familyclaw-bridge` crate, and this crate implements the
+//! **same** [`TurnExecutor`] interface under the name [`LiveTurnExecutor`].
+//! This lets the orchestrator run a real LLM-backed turn **without
+//! changing itself at all** — it only ever sees the trait object
+//! `Arc<dyn TurnExecutor>`, as before.
 //!
-//! ## Riippuvuussuunta
-//! `familyclaw-bridge` riippuu vain `familyclaw-core`:sta eikä tästä cratesta.
-//! Siksi `familyclaw-agent` saa riippua `familyclaw-bridge`:stä **ilman
-//! sykliä**: tuottaja (tämä crate) viittaa saumaan (bridge), ei toisinpäin.
+//! ## Dependency direction
+//! `familyclaw-bridge` depends only on `familyclaw-core`, not on this
+//! crate. That's why `familyclaw-agent` is allowed to depend on
+//! `familyclaw-bridge` **without a cycle**: the producer (this crate)
+//! refers to the joint (bridge), not the other way around.
 //!
-//! ## Determinismi ja kello
-//! Toteutus **ei koskaan lue järjestelmäkelloa**: toimitteen aikaleima otetaan
-//! aina [`OrchestratedTurn::now`]-kentästä, joka injektoidaan orkesterista.
-//! Ainoa ei-deterministinen osa on LLM-kutsu itse; kaikki sen ympärillä oleva
-//! logiikka (kehotteen rakennus, vastauksen kääriminen toimitteeksi) on puhdasta
-//! ja yksikkötestattu ilman verkkoa.
+//! ## Determinism and the clock
+//! The implementation **never reads the system clock**: the deliverable's
+//! timestamp is always taken from the [`OrchestratedTurn::now`] field,
+//! which is injected by the orchestrator. The only non-deterministic part
+//! is the LLM call itself; all the logic around it (prompt construction,
+//! wrapping the response into a deliverable) is pure and unit-tested
+//! without a network.
 //!
-//! ## Hyötykuorman muoto
-//! LLM:n tekstivastaus yritetään jäsentää JSON-**objektiksi**. Jos se on validi
-//! JSON-objekti, sitä käytetään sellaisenaan toimitteen hyötykuormana (jolloin
-//! sopimuksen tulosskeema voidaan todentaa kentittäin). Muussa tapauksessa
-//! (ei-JSON tai JSON joka ei ole objekti, esim. pelkkä merkkijono tai taulukko)
-//! teksti kääritään muotoon `{ "result": "<teksti>" }`, jotta hyötykuorma on
-//! aina JSON-objekti.
+//! ## Payload shape
+//! The LLM's text response is attempted to be parsed as a JSON
+//! **object**. If it is a valid JSON object, it is used as-is as the
+//! deliverable's payload (so the contract's result schema can be
+//! validated field by field). Otherwise (non-JSON, or JSON that isn't an
+//! object, e.g. a bare string or array), the text is wrapped as
+//! `{ "result": "<text>" }`, so the payload is always a JSON object.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -38,53 +42,57 @@ use familyclaw_core::{FamilyClawError, ModelConfig, Result};
 use crate::llm::LlmMessage;
 use crate::llm_chain::{build_llm_chain, LlmEndpointResolver, LlmFailover};
 
-/// Tuottajapuolen [`TurnExecutor`]: ajaa yhden vuoron oikealla LLM-ketjulla.
+/// Producer-side [`TurnExecutor`]: runs a single turn using a real LLM
+/// chain.
 ///
-/// Omistaa [`LlmFailover`]-ketjun (primary + fallbackit) ja delegoi varsinaisen
-/// täydennyksen sille. Itse sauma-logiikka — kehotteen rakennus syötteestä ja
-/// vastauksen kääriminen [`Deliverable`]:ksi — on deterministä ja kellotonta.
+/// Owns an [`LlmFailover`] chain (primary + fallbacks) and delegates the
+/// actual completion to it. The joint logic itself — building the prompt
+/// from the input and wrapping the response into a [`Deliverable`] — is
+/// deterministic and clock-free.
 pub struct LiveTurnExecutor {
-    /// Ajettava failover-ketju, joka suorittaa varsinaisen LLM-täydennyksen.
+    /// The failover chain to run, which performs the actual LLM
+    /// completion.
     chain: LlmFailover,
 }
 
 impl LiveTurnExecutor {
-    /// Rakentaa suorittajan valmiista [`LlmFailover`]-ketjusta.
+    /// Builds the executor from a ready-made [`LlmFailover`] chain.
     #[must_use]
     pub fn new(chain: LlmFailover) -> Self {
         Self { chain }
     }
 
-    /// Rakentaa suorittajan mallikonfiguraatiosta ([`ModelConfig`]) ja
-    /// resolverista: kokoaa failover-ketjun [`build_llm_chain`]illa.
+    /// Builds the executor from a model configuration ([`ModelConfig`])
+    /// and a resolver: assembles the failover chain via
+    /// [`build_llm_chain`].
     ///
     /// # Errors
-    /// [`FamilyClawError::Config`] jos mallikonfiguraatio on kelvoton tai jos
-    /// yksikään malli ei ratkennut endpointiksi (ks. [`build_llm_chain`]).
+    /// [`FamilyClawError::Config`] if the model configuration is invalid
+    /// or if no model resolved to an endpoint (see [`build_llm_chain`]).
     pub fn from_model(model: &ModelConfig, resolver: &dyn LlmEndpointResolver) -> Result<Self> {
         let chain = build_llm_chain(model, resolver)?;
         Ok(Self::new(chain))
     }
 
-    /// Primary-mallin nimi (raportointiin/lokitukseen).
+    /// The primary model's name (for reporting/logging).
     #[must_use]
     pub fn primary_model(&self) -> &str {
         self.chain.primary_model()
     }
 }
 
-/// Rakentaa LLM-kehotteen vuorosta puhtaasti (ei kelloa, ei satunnaisuutta).
+/// Builds the LLM prompt from a turn, purely (no clock, no randomness).
 ///
-/// Yhdistää otsikon, kuvauksen ja koneluettavan syötteen yhdeksi
-/// käyttäjäviestiksi. Syöte serialisoidaan vakaasti (pretty JSON), jotta sama
-/// vuoro tuottaa aina saman kehotteen. Palauttaa järjestetyn viestilistan
-/// (system + user) suoraan [`LlmFailover::complete`]:lle.
+/// Combines the title, description, and machine-readable input into a
+/// single user message. The input is serialized stably (pretty JSON) so
+/// the same turn always produces the same prompt. Returns the ordered
+/// message list (system + user) ready for [`LlmFailover::complete`].
 fn build_messages(turn: &OrchestratedTurn) -> Vec<LlmMessage> {
     let system = "You are a task executor. Complete the assigned task using the provided \
          input. If the task expects a structured result, respond with a single valid JSON \
          object and nothing else.";
 
-    // Vakaa serialisointi: pretty-printattu JSON on luettava ja deterministinen.
+    // Stable serialization: pretty-printed JSON is readable and deterministic.
     let input_json =
         serde_json::to_string_pretty(&turn.input).unwrap_or_else(|_| turn.input.to_string());
 
@@ -97,33 +105,36 @@ fn build_messages(turn: &OrchestratedTurn) -> Vec<LlmMessage> {
     vec![LlmMessage::system(system), LlmMessage::user(user)]
 }
 
-/// Kääräisee LLM:n tekstivastauksen JSON-**objektiksi** toimitteen
-/// hyötykuormaksi.
+/// Wraps the LLM's text response into a JSON **object** as the
+/// deliverable's payload.
 ///
-/// - Jos `text` jäsentyy validiksi JSON-**objektiksi**, se palautetaan
-///   sellaisenaan (sopimuksen tulosskeema voidaan todentaa kentittäin).
-/// - Muutoin (ei-JSON, tai JSON joka ei ole objekti) teksti kääritään muotoon
-///   `{ "result": "<text>" }`. Näin hyötykuorma on **aina** JSON-objekti.
+/// - If `text` parses as a valid JSON **object**, it is returned as-is
+///   (the contract's result schema can be validated field by field).
+/// - Otherwise (non-JSON, or JSON that isn't an object) the text is
+///   wrapped as `{ "result": "<text>" }`. This way the payload is
+///   **always** a JSON object.
 fn wrap_payload(text: &str) -> Value {
     match serde_json::from_str::<Value>(text) {
         Ok(Value::Object(map)) => Value::Object(map),
-        // Validi JSON mutta ei objekti (esim. merkkijono/numero/taulukko) tai
-        // täysin jäsentymätön teksti → kääri raakatekstin alle.
+        // Valid JSON but not an object (e.g. string/number/array), or
+        // completely unparseable text → wrap under the raw text.
         _ => json!({ "result": text }),
     }
 }
 
 #[async_trait]
 impl TurnExecutor for LiveTurnExecutor {
-    /// Suorittaa vuoron oikealla LLM-ketjulla ja kääräisee tuloksen
-    /// toimitteeksi.
+    /// Executes the turn using the real LLM chain and wraps the result
+    /// into a deliverable.
     ///
-    /// Toimitteen `from` on aina [`OrchestratedTurn::assignee`] ja `at` aina
-    /// [`OrchestratedTurn::now`] — kelloa ei lueta.
+    /// The deliverable's `from` is always [`OrchestratedTurn::assignee`]
+    /// and `at` is always [`OrchestratedTurn::now`] — the clock is never
+    /// read.
     ///
     /// # Errors
-    /// [`FamilyClawError::Llm`] jos koko failover-ketju epäonnistuu (kaikki
-    /// klientit antoivat virheen). LLM-virhe kuvataan ydinvirheeksi tekstinä.
+    /// [`FamilyClawError::Llm`] if the whole failover chain fails (all
+    /// clients returned an error). The LLM error is described as a core
+    /// error, as text.
     async fn execute(&self, turn: OrchestratedTurn) -> Result<Deliverable> {
         let messages = build_messages(&turn);
         let text = self
@@ -173,14 +184,14 @@ mod tests {
         )
     }
 
-    // --- wrap_payload: puhdas JSON-kääräyslogiikka -----------------------
+    // --- wrap_payload: pure JSON-wrapping logic ---------------------------
 
     #[test]
     fn wrap_payload_keeps_valid_json_object() {
         let payload = wrap_payload(r#"{"headline":"Hi","ok":true}"#);
         assert_eq!(payload["headline"], json!("Hi"));
         assert_eq!(payload["ok"], json!(true));
-        // Ei "result"-käärettä validin objektin kohdalla.
+        // No "result" wrapper for a valid object.
         assert!(payload.get("result").is_none());
     }
 
@@ -192,7 +203,7 @@ mod tests {
 
     #[test]
     fn wrap_payload_wraps_json_array_under_result() {
-        // Validi JSON mutta ei objekti → kääritään raakatekstinä result-kenttään.
+        // Valid JSON but not an object → wrapped as raw text under the result field.
         let raw = "[1, 2, 3]";
         let payload = wrap_payload(raw);
         assert_eq!(payload["result"], json!(raw));
@@ -201,7 +212,7 @@ mod tests {
 
     #[test]
     fn wrap_payload_wraps_bare_json_string_under_result() {
-        // `"hello"` on validi JSON (merkkijono) mutta ei objekti.
+        // `"hello"` is valid JSON (a string) but not an object.
         let raw = "\"hello\"";
         let payload = wrap_payload(raw);
         assert_eq!(payload["result"], json!(raw));
@@ -217,13 +228,13 @@ mod tests {
         }
     }
 
-    // --- build_messages: puhdas kehotteen rakennus -----------------------
+    // --- build_messages: pure prompt construction -------------------------
 
     #[test]
     fn build_messages_has_system_then_user() {
         let msgs = build_messages(&turn_with(json!({ "x": 1 })));
         assert_eq!(msgs.len(), 2);
-        // Ensimmäinen on system, toinen user (järjestys taattu).
+        // The first is system, the second is user (order guaranteed).
         assert_eq!(msgs[0].role, LlmRole::System);
         assert_eq!(msgs[1].role, LlmRole::User);
     }
@@ -246,11 +257,12 @@ mod tests {
         assert_eq!(a[1].content, b[1].content);
     }
 
-    // --- konstruktorit (ei verkkoa) --------------------------------------
+    // --- constructors (no network) ----------------------------------------
 
     #[test]
     fn from_model_builds_executor_without_network() {
-        // Avainta ei tarvita rakennukseen; virhe näkyisi vasta complete()-kutsussa.
+        // No key is needed for construction; an error would only show up
+        // on the complete() call.
         let resolver = test_resolver();
         let model = ModelConfig::new("openai/gpt-4o");
         let exec = LiveTurnExecutor::from_model(&model, &resolver).expect("builds");
@@ -266,8 +278,8 @@ mod tests {
 
     #[test]
     fn live_executor_is_usable_as_dyn_trait_object() {
-        // Sauma: orkesteri pitää Arc<dyn TurnExecutor>. Todistetaan että
-        // LiveTurnExecutor sopii siihen (vain tyyppitason todiste, ei ajoa).
+        // Joint: the orchestrator holds Arc<dyn TurnExecutor>. Prove that
+        // LiveTurnExecutor fits it (a type-level proof only, no execution).
         let resolver = test_resolver();
         let model = ModelConfig::new("openai/gpt-4o");
         let exec = LiveTurnExecutor::from_model(&model, &resolver).expect("builds");

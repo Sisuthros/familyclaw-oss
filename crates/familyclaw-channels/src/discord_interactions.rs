@@ -1,30 +1,30 @@
-//! Discord Interactions HTTP — allekirjoituksen tarkistus ja payload → viesti.
+//! Discord Interactions HTTP — signature verification and payload → message.
 //!
-//! MVP: slash-komennon `message`-option parsitaan [`InboundMessage`]:ksi.
-//! Verify noudattaa Discord-dokumentaatiota: `timestamp || raw_body`.
+//! MVP: a slash command's `message` option is parsed into an [`InboundMessage`].
+//! Verification follows Discord's documentation: `timestamp || raw_body`.
 
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::error::{ChannelError, ChannelResult};
 use crate::message::InboundMessage;
 
-/// Discord interaction -tyypit (API v10).
+/// Discord interaction types (API v10).
 const INTERACTION_PING: u8 = 1;
 const INTERACTION_APPLICATION_COMMAND: u8 = 2;
 
-/// Discord-vastauksen tyypit.
+/// Discord response types.
 pub const RESPONSE_PONG: u8 = 1;
-/// Discord-vastaus: kanavaviestin lähetys.
+/// Discord response: send a channel message.
 pub const RESPONSE_CHANNEL_MESSAGE: u8 = 4;
-/// Discord-vastaus: deferred (agentti vastaa webhookilla myöhemmin).
+/// Discord response: deferred (the agent replies via webhook later).
 pub const RESPONSE_DEFERRED_CHANNEL_MESSAGE: u8 = 5;
 
-/// Tarkistaa Discord Interactions -allekirjoituksen (Ed25519).
+/// Verifies a Discord Interactions signature (Ed25519).
 ///
-/// `public_key_hex` — 32 tavua hex-muodossa (Developer Portal).
-/// `signature_hex` — 64 tavua hex (`X-Signature-Ed25519`).
-/// `timestamp` — raakamerkkijono headerista (`X-Signature-Timestamp`).
-/// `body` — pyynnön raakabody allekirjoitusta varten.
+/// `public_key_hex` — 32 bytes in hex form (Developer Portal).
+/// `signature_hex` — 64 bytes in hex (`X-Signature-Ed25519`).
+/// `timestamp` — the raw string from the header (`X-Signature-Timestamp`).
+/// `body` — the request's raw body for signature verification.
 pub fn verify_signature(
     public_key_hex: &str,
     signature_hex: &str,
@@ -75,23 +75,23 @@ pub fn verify_signature(
     Ok(())
 }
 
-/// Parsittu Discord-interaction (MVP: slash-komennot).
+/// A parsed Discord interaction (MVP: slash commands).
 #[derive(Debug, Clone)]
 pub struct DiscordInteraction {
     /// Discord interaction type (1 = PING, 2 = `APPLICATION_COMMAND`, …).
     pub interaction_type: u8,
-    /// Slash-komennon nimi, jos type == 2.
+    /// The slash command's name, if type == 2.
     pub command_name: Option<String>,
-    /// `message`-optionin arvo slash-komennossa.
+    /// The value of the `message` option in the slash command.
     pub message_text: Option<String>,
-    /// Käyttäjän snowflake (member.user.id tai user.id).
+    /// The user's snowflake (member.user.id or user.id).
     pub user_id: Option<String>,
-    /// Kanavan snowflake.
+    /// The channel's snowflake.
     pub channel_id: Option<String>,
 }
 
 impl DiscordInteraction {
-    /// Deserialisoi interaction JSON:sta.
+    /// Deserializes an interaction from JSON.
     pub fn from_payload(payload: &serde_json::Value) -> ChannelResult<Self> {
         let interaction_type = u8::try_from(
             payload
@@ -129,9 +129,9 @@ impl DiscordInteraction {
         })
     }
 
-    /// Muuntaa slash-komennon [`InboundMessage`]:ksi.
+    /// Converts the slash command into an [`InboundMessage`].
     ///
-    /// Käyttää `user_id` lähettäjänä ja `channel_id` tai `"discord"` keskusteluna.
+    /// Uses `user_id` as the sender and `channel_id` or `"discord"` as the conversation.
     pub fn into_inbound(self) -> ChannelResult<InboundMessage> {
         let body = self
             .message_text
@@ -142,13 +142,13 @@ impl DiscordInteraction {
         InboundMessage::new(sender, conversation, body)
     }
 
-    /// Onko tämä Discord PING (type 1)?
+    /// Is this a Discord PING (type 1)?
     #[must_use]
     pub fn is_ping(&self) -> bool {
         self.interaction_type == INTERACTION_PING
     }
 
-    /// Onko tämä slash-komento (type 2)?
+    /// Is this a slash command (type 2)?
     #[must_use]
     pub fn is_application_command(&self) -> bool {
         self.interaction_type == INTERACTION_APPLICATION_COMMAND
@@ -216,7 +216,7 @@ mod tests {
         assert!(matches!(err, ChannelError::InvalidInput(_)));
     }
 
-    /// Pieni hex-enkooderi testidataa varten (`decode_hex`:n käänteisoperaatio).
+    /// A small hex encoder for test data (the inverse of `decode_hex`).
     fn encode_hex(bytes: &[u8]) -> String {
         use std::fmt::Write as _;
         let mut s = String::with_capacity(bytes.len() * 2);
@@ -230,16 +230,17 @@ mod tests {
     fn verify_accepts_valid_signature() {
         use ed25519_dalek::{Signer, SigningKey};
 
-        // Deterministinen avain testiä varten (EI tuotantosalaisuus).
+        // A deterministic key for testing (NOT a production secret).
         let signing_key = SigningKey::from_bytes(&[0u8; 32]);
         let verifying_key = signing_key.verifying_key();
 
-        // FRESH timestamp: replay-suoja vaatii että aikaleima on freshness-ikkunan
-        // sisällä, joten käytetään nyt-hetkeä (kiinteä menneisyys hylättäisiin).
+        // FRESH timestamp: replay protection requires the timestamp to be
+        // within the freshness window, so we use the current moment (a fixed
+        // past value would be rejected).
         let timestamp = chrono::Utc::now().timestamp().to_string();
         let body = br#"{"type":1}"#;
 
-        // Discord allekirjoittaa `timestamp || raw_body`.
+        // Discord signs `timestamp || raw_body`.
         let mut message = Vec::new();
         message.extend_from_slice(timestamp.as_bytes());
         message.extend_from_slice(body);
@@ -299,7 +300,7 @@ mod tests {
         let pk_hex = encode_hex(verifying_key.as_bytes());
         let sig_hex = encode_hex(&signature.to_bytes());
 
-        // Eri body kuin allekirjoitettu → verify epäonnistuu vaikka avain täsmää.
+        // A different body than what was signed → verification fails even though the key matches.
         let tampered_body = br#"{"type":3}"#;
         let err = verify_signature(&pk_hex, &sig_hex, timestamp, tampered_body).unwrap_err();
         assert!(matches!(err, ChannelError::InvalidInput(_)));
@@ -307,31 +308,31 @@ mod tests {
 
     #[test]
     fn verify_rejects_odd_length_hex() {
-        // Pariton hex-pituus → decode_hex palauttaa virheen (InvalidInput).
+        // Odd hex length → decode_hex returns an error (InvalidInput).
         let err = verify_signature("abc", &"b".repeat(128), "1", b"{}").unwrap_err();
         assert!(matches!(err, ChannelError::InvalidInput(_)));
     }
 
     #[test]
     fn verify_rejects_wrong_length_public_key() {
-        // Validi hex mutta väärä tavumäärä (16 tavua eikä 32) → 32-tavun try_into epäonnistuu.
-        let short_pk = "a".repeat(32); // 16 tavua
+        // Valid hex but the wrong byte count (16 bytes instead of 32) → the 32-byte try_into fails.
+        let short_pk = "a".repeat(32); // 16 bytes
         let err = verify_signature(&short_pk, &"b".repeat(128), "1", b"{}").unwrap_err();
         assert!(matches!(err, ChannelError::InvalidInput(_)));
     }
 
     #[test]
     fn verify_rejects_wrong_length_signature() {
-        // Validi 32-tavun avain mutta liian lyhyt allekirjoitus (32 tavua eikä 64).
+        // A valid 32-byte key but a signature that's too short (32 bytes instead of 64).
         let pk = "a".repeat(64);
-        let short_sig = "b".repeat(64); // 32 tavua
+        let short_sig = "b".repeat(64); // 32 bytes
         let err = verify_signature(&pk, &short_sig, "1", b"{}").unwrap_err();
         assert!(matches!(err, ChannelError::InvalidInput(_)));
     }
 
     #[test]
     fn from_payload_missing_type_errors() {
-        // Ei "type"-kenttää → InvalidInput ("interaction missing type").
+        // No "type" field → InvalidInput ("interaction missing type").
         let json = serde_json::json!({ "data": { "name": "x" } });
         let err = DiscordInteraction::from_payload(&json).unwrap_err();
         assert!(matches!(err, ChannelError::InvalidInput(_)));
@@ -339,7 +340,7 @@ mod tests {
 
     #[test]
     fn from_payload_type_out_of_range_errors() {
-        // type > u8::MAX → u8::try_from epäonnistuu ("interaction type out of range").
+        // type > u8::MAX → u8::try_from fails ("interaction type out of range").
         let json = serde_json::json!({ "type": 300 });
         let err = DiscordInteraction::from_payload(&json).unwrap_err();
         assert!(matches!(err, ChannelError::InvalidInput(_)));
@@ -347,7 +348,7 @@ mod tests {
 
     #[test]
     fn from_payload_non_numeric_type_errors() {
-        // type ei ole numero → as_u64() palauttaa None → InvalidInput.
+        // type is not a number → as_u64() returns None → InvalidInput.
         let json = serde_json::json!({ "type": "ping" });
         let err = DiscordInteraction::from_payload(&json).unwrap_err();
         assert!(matches!(err, ChannelError::InvalidInput(_)));
@@ -355,7 +356,7 @@ mod tests {
 
     #[test]
     fn from_payload_without_data_yields_none_fields() {
-        // Pelkkä type, ei dataa eikä käyttäjää/kanavaa → kaikki optiot None.
+        // Only type, no data and no user/channel → all options are None.
         let json = serde_json::json!({ "type": 2 });
         let ix = DiscordInteraction::from_payload(&json).expect("parse");
         assert!(ix.is_application_command());
@@ -367,7 +368,7 @@ mod tests {
 
     #[test]
     fn from_payload_falls_back_to_top_level_user_id() {
-        // member.user.id puuttuu → fallback user.id (DM-konteksti).
+        // member.user.id is missing → falls back to user.id (DM context).
         let json = serde_json::json!({
             "type": 2,
             "user": { "id": "dm-user-9" }
@@ -378,7 +379,7 @@ mod tests {
 
     #[test]
     fn into_inbound_uses_defaults_when_ids_missing() {
-        // user_id/channel_id puuttuvat → oletukset "discord-user" ja "discord".
+        // user_id/channel_id are missing → defaults are "discord-user" and "discord".
         let json = serde_json::json!({
             "type": 2,
             "data": {
@@ -395,7 +396,7 @@ mod tests {
 
     #[test]
     fn into_inbound_empty_message_errors() {
-        // message-option on pelkkää whitespacea → filter pudottaa → InvalidInput.
+        // The message option is pure whitespace → filter drops it → InvalidInput.
         let json = serde_json::json!({
             "type": 2,
             "data": {
@@ -410,7 +411,7 @@ mod tests {
 
     #[test]
     fn into_inbound_no_message_option_errors() {
-        // Ei message_text:iä lainkaan → into_inbound antaa InvalidInput.
+        // No message_text at all → into_inbound gives InvalidInput.
         let json = serde_json::json!({ "type": 2, "data": { "name": "fc" } });
         let ix = DiscordInteraction::from_payload(&json).expect("parse");
         assert_eq!(ix.message_text, None);
@@ -420,7 +421,7 @@ mod tests {
 
     #[test]
     fn extract_message_option_ignores_non_message_options() {
-        // Vain "channel"-niminen option → message_text jää None:ksi.
+        // Only an option named "channel" → message_text remains None.
         let json = serde_json::json!({
             "type": 2,
             "data": {
@@ -434,7 +435,7 @@ mod tests {
 
     #[test]
     fn extract_message_option_skips_non_string_value() {
-        // message-option arvo ei ole string (numero) → as_str() None → ei poimita.
+        // The message option's value is not a string (a number) → as_str() is None → not extracted.
         let json = serde_json::json!({
             "type": 2,
             "data": {
@@ -448,7 +449,7 @@ mod tests {
 
     #[test]
     fn extract_message_option_picks_message_among_many() {
-        // Useita optioita, message poimitaan oikein muiden joukosta.
+        // Multiple options; message is correctly picked out among the others.
         let json = serde_json::json!({
             "type": 2,
             "data": {

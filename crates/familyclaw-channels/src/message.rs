@@ -1,56 +1,56 @@
-//! Kanavaviestien tyypit ja silta Resonance Busiin.
+//! Channel message types and the bridge to the Resonance Bus.
 //!
-//! Tämä moduuli määrittelee kolme tasoa:
-//! - [`ChannelKind`] — mitä kanavateknologiaa viesti edustaa.
-//! - [`OutboundMessage`] — alustalta ulospäin lähetettävä viesti.
-//! - [`InboundMessage`] — kanavalta sisään saapunut raakaviesti.
-//! - [`InboundEnvelope`] — kanonisoitu envelope, joksi saapuva viesti
-//!   muunnetaan ennen kuin se julkaistaan Resonance Busiin.
+//! This module defines three layers:
+//! - [`ChannelKind`] — which channel technology a message represents.
+//! - [`OutboundMessage`] — a message sent outward from the platform.
+//! - [`InboundMessage`] — a raw message received from a channel.
+//! - [`InboundEnvelope`] — the canonicalized envelope an inbound message is
+//!   converted into before being published to the Resonance Bus.
 //!
-//! ## Miksi `InboundEnvelope` asuu täällä
-//! Kanavakerros on Resonance Busin **reuna ulkomaailmaan**: se on se kerros,
-//! joka tuottaa bus-viestit saapuvasta liikenteestä (`saapuva viesti →
-//! InboundEnvelope → familyclaw_bus::BusMessage`, design §3).
+//! ## Why `InboundEnvelope` lives here
+//! The channel layer is the Resonance Bus's **edge to the outside world**:
+//! it is the layer that produces bus messages from inbound traffic
+//! (`inbound message → InboundEnvelope → familyclaw_bus::BusMessage`, design §3).
 //!
-//! Tyyppi on tarkoituksella **erillinen** `familyclaw_bus::BusMessage`:sta
-//! (busin hyötykuorma-enum): tämä on alkuperätietoinen *kirjekuori*
-//! (kanava-id, lähettäjä, keskustelu), kun taas busin `BusMessage` on
-//! sisältö-enum (teksti/tunnepulssi/latent/…). Nimet erotettiin, jotta
-//! kaksi eri tyyppiä eivät enää jaa nimeä `BusMessage` yli crate-rajojen.
-//! Varsinainen muunnos `InboundEnvelope → familyclaw_bus::BusMessage` tehdään
-//! agent-kerroksessa (joka riippuu molemmista crateista), jotta kanavakerros
-//! pysyy riippumattomana busin sisäisestä Ractor-toteutuksesta ja jotta
-//! envelope on serde-sarjallistuva durable-replayta varten.
+//! The type is deliberately **separate** from `familyclaw_bus::BusMessage`
+//! (the bus's payload enum): this is an origin-aware *envelope* (channel id,
+//! sender, conversation), whereas the bus's `BusMessage` is a content enum
+//! (text/emotional pulse/latent/…). The names were separated so the two
+//! distinct types no longer share the name `BusMessage` across crate
+//! boundaries. The actual conversion `InboundEnvelope → familyclaw_bus::BusMessage`
+//! is done in the agent layer (which depends on both crates), so the channel
+//! layer stays independent of the bus's internal Ractor implementation and
+//! the envelope remains serde-serializable for durable replay.
 
 use familyclaw_core::{time, MessageId, Timestamp};
 use serde::{Deserialize, Serialize};
 
-/// Tuettu kanavateknologia.
+/// A supported channel technology.
 ///
-/// Oikeat adapterit (serenity Discordille, teloxide Telegramille, …) ovat
-/// craten feature-flagien takana; tämä enum kantaa vain tiedon siitä, mistä
-/// kanavasta viesti tuli tai mihin se menee.
+/// The real adapters (serenity for Discord, teloxide for Telegram, …) sit
+/// behind the crate's feature flags; this enum only carries the information
+/// about which channel a message came from or is going to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ChannelKind {
-    /// Discord (adapteri `discord`-featuren takana, esim. serenity).
+    /// Discord (adapter behind the `discord` feature, e.g. serenity).
     Discord,
-    /// Telegram (adapteri `telegram`-featuren takana, esim. teloxide).
+    /// Telegram (adapter behind the `telegram` feature, e.g. teloxide).
     Telegram,
-    /// `WhatsApp` (adapteri `whatsapp`-featuren takana).
-    // Eksplisiittinen rename, jotta serde-muoto vastaa `as_str()`-arvoa
-    // ("whatsapp"); `snake_case` tuottaisi muuten "whats_app".
+    /// `WhatsApp` (adapter behind the `whatsapp` feature).
+    // Explicit rename so the serde form matches `as_str()`'s value
+    // ("whatsapp"); `snake_case` would otherwise produce "whats_app".
     #[serde(rename = "whatsapp")]
     WhatsApp,
-    /// Signal (adapteri `signal`-featuren takana).
+    /// Signal (adapter behind the `signal` feature).
     Signal,
-    /// In-memory testikanava ([`crate::MockChannel`]) — ei ulkoista SDK:ta.
+    /// In-memory test channel ([`crate::MockChannel`]) — no external SDK.
     Mock,
 }
 
 impl ChannelKind {
-    /// Lyhyt, vakaa tunnistemerkkijono lokeja ja reititystä varten.
+    /// A short, stable identifier string for logs and routing.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -62,9 +62,9 @@ impl ChannelKind {
         }
     }
 
-    /// Vaatiiko kanava ulkoisen kanava-SDK:n (ja siten feature-flagin).
+    /// Whether the channel requires an external channel SDK (and thus a feature flag).
     ///
-    /// [`ChannelKind::Mock`] on ainoa joka toimii ilman ulkoista riippuvuutta.
+    /// [`ChannelKind::Mock`] is the only one that works without an external dependency.
     #[must_use]
     pub const fn requires_external_sdk(self) -> bool {
         !matches!(self, Self::Mock)
@@ -77,39 +77,39 @@ impl std::fmt::Display for ChannelKind {
     }
 }
 
-/// Ulospäin lähetettävän signaalin tyyppi.
+/// The type of an outbound signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OutboundKind {
-    /// Tavallinen tekstiviesti käyttäjälle.
+    /// A regular text message to the user.
     #[default]
     Message,
-    /// Kanavan "kirjoittaa…" -ilmaisin (Discord typing, Telegram chat action).
+    /// The channel's "is typing…" indicator (Discord typing, Telegram chat action).
     Typing,
-    /// Lyhyt väliraportti pitkän työkaluvuoron aikana (ei lopullinen vastaus).
+    /// A short progress update during a long tool turn (not the final reply).
     Progress,
 }
 
-/// Alustalta ulospäin lähetettävä viesti.
+/// A message sent outward from the platform.
 ///
-/// `target` on kanavakohtainen vastaanottaja-osoite (esim. Discord-kanavan
-/// id, Telegram-chat-id). Kanava-adapteri tulkitsee sen.
+/// `target` is a channel-specific recipient address (e.g. a Discord channel
+/// id, a Telegram chat id). It is interpreted by the channel adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundMessage {
-    /// Kanavakohtainen kohde (kanava-id, chat-id, puhelinnumero, …).
+    /// The channel-specific destination (channel id, chat id, phone number, …).
     pub target: String,
-    /// Viestin tekstisisältö (`Typing`-tyypillä jätetään tyhjäksi).
+    /// The message's text content (left empty for the `Typing` kind).
     pub body: String,
-    /// Signaalin tyyppi — oletus on tavallinen viesti.
+    /// The signal's type — defaults to a regular message.
     #[serde(default)]
     pub kind: OutboundKind,
 }
 
 impl OutboundMessage {
-    /// Rakentaa ulospäin lähetettävän viestin.
+    /// Builds an outbound message.
     ///
     /// # Errors
-    /// [`crate::ChannelError::InvalidInput`] jos kohde tai sisältö on tyhjä.
+    /// [`crate::ChannelError::InvalidInput`] if the target or body is empty.
     pub fn new(target: impl Into<String>, body: impl Into<String>) -> crate::ChannelResult<Self> {
         let target = target.into();
         let body = body.into();
@@ -130,10 +130,10 @@ impl OutboundMessage {
         })
     }
 
-    /// Rakentaa typing-indikaattorin annetulle kanavakohteelle.
+    /// Builds a typing indicator for the given channel target.
     ///
     /// # Errors
-    /// [`crate::ChannelError::InvalidInput`] jos kohde on tyhjä.
+    /// [`crate::ChannelError::InvalidInput`] if the target is empty.
     pub fn typing(target: impl Into<String>) -> crate::ChannelResult<Self> {
         let target = target.into();
         if target.trim().is_empty() {
@@ -148,10 +148,10 @@ impl OutboundMessage {
         })
     }
 
-    /// Rakentaa lyhyen väliraportin pitkän työkaluvuoron aikana.
+    /// Builds a short progress update during a long tool turn.
     ///
     /// # Errors
-    /// [`crate::ChannelError::InvalidInput`] jos kohde tai sisältö on tyhjä.
+    /// [`crate::ChannelError::InvalidInput`] if the target or body is empty.
     pub fn progress(
         target: impl Into<String>,
         body: impl Into<String>,
@@ -176,27 +176,27 @@ impl OutboundMessage {
     }
 }
 
-/// Kanavalta sisään saapunut raakaviesti, ennen bus-kanonisointia.
+/// A raw message received from a channel, before bus canonicalization.
 ///
-/// `sender` on kanavakohtainen lähettäjä-osoite (käyttäjä-id, puhelinnumero),
-/// `conversation` on keskustelun/ryhmän/kanavan tunniste jonka sisällä viesti
-/// saapui (käytetään vastaamiseen).
+/// `sender` is a channel-specific sender address (user id, phone number),
+/// `conversation` is the conversation/group/channel identifier the message
+/// arrived within (used for replying).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundMessage {
-    /// Kanavakohtainen lähettäjän tunniste.
+    /// The channel-specific sender identifier.
     pub sender: String,
-    /// Keskustelun/ryhmän/kanavan tunniste (vastausosoite).
+    /// The conversation/group/channel identifier (reply address).
     pub conversation: String,
-    /// Viestin tekstisisältö.
+    /// The message's text content.
     pub body: String,
 }
 
 impl InboundMessage {
-    /// Rakentaa saapuneen raakaviestin.
+    /// Builds a received raw message.
     ///
     /// # Errors
-    /// [`crate::ChannelError::InvalidInput`] jos lähettäjä, keskustelu tai
-    /// sisältö on tyhjä.
+    /// [`crate::ChannelError::InvalidInput`] if the sender, conversation, or
+    /// body is empty.
     pub fn new(
         sender: impl Into<String>,
         conversation: impl Into<String>,
@@ -227,11 +227,11 @@ impl InboundMessage {
         })
     }
 
-    /// Kanonisoi saapuneen viestin [`InboundEnvelope`]:ksi.
+    /// Canonicalizes the received message into an [`InboundEnvelope`].
     ///
-    /// `kind` ja `channel_id` kertovat mistä kanavasta viesti tuli. Uusi
-    /// [`MessageId`] ja UTC-aikaleima liitetään mukaan, jotta bus ja durable-
-    /// loki voivat viitata viestiin yksikäsitteisesti ja deterministisesti.
+    /// `kind` and `channel_id` indicate which channel the message came from.
+    /// A new [`MessageId`] and UTC timestamp are attached so the bus and the
+    /// durable log can reference the message uniquely and deterministically.
     #[must_use]
     pub fn into_envelope(
         self,
@@ -250,42 +250,42 @@ impl InboundMessage {
     }
 }
 
-/// Kanonisoitu, alkuperätietoinen viesti-kirjekuori joka virtaa kohti
-/// Resonance Busia.
+/// A canonicalized, origin-aware message envelope flowing toward the
+/// Resonance Bus.
 ///
-/// Tämä on se muoto, jonka kanavakerros tuottaa saapuvasta liikenteestä. Se on
-/// täysin serde-sarjallistuva durable-replayta varten ja sisältää
-/// alkuperätiedot ([`ChannelKind`], `channel_id`, `sender`, `conversation`),
-/// jotta vastaus voidaan reitittää takaisin oikealle kanavalle.
+/// This is the shape the channel layer produces from inbound traffic. It is
+/// fully serde-serializable for durable replay and carries origin
+/// information ([`ChannelKind`], `channel_id`, `sender`, `conversation`) so
+/// a reply can be routed back to the correct channel.
 ///
-/// **Huom:** tämä on eri tyyppi kuin `familyclaw_bus::BusMessage` (busin
-/// sisältö-enum). Muunnos busin hyötykuormaksi tehdään agent-kerroksessa,
-/// joka riippuu molemmista crateista.
+/// **Note:** this is a different type from `familyclaw_bus::BusMessage` (the
+/// bus's content enum). Conversion into the bus payload is done in the agent
+/// layer, which depends on both crates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundEnvelope {
-    /// Viestin yksikäsitteinen tunniste busissa.
+    /// The message's unique identifier on the bus.
     pub id: MessageId,
-    /// Kanavatyyppi josta viesti saapui.
+    /// The channel type the message arrived from.
     pub kind: ChannelKind,
-    /// Sen konkreettisen kanavainstanssin tunniste, jolta viesti saapui
-    /// (vastaa [`crate::Channel::channel_id`]-arvoa).
+    /// The identifier of the concrete channel instance the message arrived
+    /// from (matches the [`crate::Channel::channel_id`] value).
     pub channel_id: String,
-    /// Kanavakohtainen lähettäjän tunniste.
+    /// The channel-specific sender identifier.
     pub sender: String,
-    /// Keskustelun/ryhmän tunniste (vastausosoite).
+    /// The conversation/group identifier (reply address).
     pub conversation: String,
-    /// Viestin tekstisisältö.
+    /// The message's text content.
     pub body: String,
-    /// Vastaanottohetki UTC:ssä.
+    /// The time of receipt in UTC.
     pub received_at: Timestamp,
 }
 
 impl InboundEnvelope {
-    /// Rakentaa [`OutboundMessage`]-vastauksen tähän viestiin annetulla
-    /// sisällöllä. Vastaus ohjautuu takaisin samaan keskusteluun.
+    /// Builds an [`OutboundMessage`] reply to this message with the given
+    /// content. The reply is routed back to the same conversation.
     ///
     /// # Errors
-    /// [`crate::ChannelError::InvalidInput`] jos vastaussisältö on tyhjä.
+    /// [`crate::ChannelError::InvalidInput`] if the reply content is empty.
     pub fn reply(&self, body: impl Into<String>) -> crate::ChannelResult<OutboundMessage> {
         OutboundMessage::new(self.conversation.clone(), body)
     }
@@ -318,8 +318,8 @@ mod tests {
 
     #[test]
     fn channel_kind_serde_matches_as_str_for_all_variants() {
-        // Lukitse invariantti: serde-muoto == as_str() jokaiselle variantille,
-        // jotta lokit ja sarjallistus eivät eriydy.
+        // Lock in the invariant: serde form == as_str() for every variant, so
+        // that logs and serialization never diverge.
         for kind in [
             ChannelKind::Discord,
             ChannelKind::Telegram,

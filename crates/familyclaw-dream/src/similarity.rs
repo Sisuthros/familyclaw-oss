@@ -1,27 +1,27 @@
-//! Tekstisamankaltaisuus duplikaattien tunnistukseen.
+//! Text similarity for duplicate detection.
 //!
-//! `merge_duplicates`-vaihe (design §2.3, Anthropic Dreaming) tarvitsee tavan
-//! tunnistaa *lähes-identtiset* muistot ilman ulkoista upotusmallia. Tämä
-//! moduuli antaa riippuvuusvapaan, deterministisen sananjoukko-pohjaisen
-//! samankaltaisuuden (Jaccard) — KERROS A toimii ilman vektorimallia.
+//! The `merge_duplicates` phase (design §2.3, Anthropic Dreaming) needs a
+//! way to identify *near-identical* memories without an external embedding
+//! model. This module provides a dependency-free, deterministic word-set-
+//! based similarity measure (Jaccard) — Layer A works without a vector
+//! model.
 //!
-//! Vektoripohjainen semanttinen samankaltaisuus (cosine / HNSW) tulee
-//! myöhemmin samalla rajapinnalla feature-flagin taakse, kuten
-//! `familyclaw-memory`-haussa.
+//! Vector-based semantic similarity (cosine / HNSW) will come later behind
+//! a feature flag on the same interface, as in `familyclaw-memory` search.
 
 use std::collections::BTreeSet;
 
-/// Pienin sananpituus joka huomioidaan (lyhyemmät täytesanat ohitetaan).
+/// Minimum word length considered (shorter filler words are skipped).
 const MIN_TOKEN_LEN: usize = 2;
 
-/// Pilkkoo tekstin normalisoiduksi sanajoukoksi.
+/// Splits text into a normalized word set.
 ///
-/// - Pieniksi kirjaimiksi (case-insensitive vertailu).
-/// - Erottimina kaikki ei-aakkosnumeeriset merkit.
-/// - Alle [`MIN_TOKEN_LEN`]-mittaiset sanat karsitaan.
+/// - Lowercased (case-insensitive comparison).
+/// - Split on all non-alphanumeric characters.
+/// - Words shorter than [`MIN_TOKEN_LEN`] are dropped.
 ///
-/// `BTreeSet` antaa deterministisen järjestyksen ja poistaa toistot, jotta
-/// Jaccard on vakaa ajojen välillä.
+/// `BTreeSet` gives a deterministic order and removes duplicates, so
+/// Jaccard is stable across runs.
 fn token_set(text: &str) -> BTreeSet<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.chars().count() >= MIN_TOKEN_LEN)
@@ -29,13 +29,12 @@ fn token_set(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Jaccard-samankaltaisuus kahden tekstin sananjoukoille, `0.0..=1.0`.
+/// Jaccard similarity between the word sets of two texts, `0.0..=1.0`.
 ///
-/// `J(A, B) = |A ∩ B| / |A ∪ B|`. Kaksi tyhjää (tai pelkkiä täytesanoja
-/// sisältävää) tekstiä katsotaan identtisiksi (`1.0`); jos vain toinen on
-/// tyhjä, tulos on `0.0`.
+/// `J(A, B) = |A ∩ B| / |A ∪ B|`. Two empty (or filler-word-only) texts are
+/// considered identical (`1.0`); if only one is empty, the result is `0.0`.
 ///
-/// Vertailu on symmetrinen ja deterministinen.
+/// The comparison is symmetric and deterministic.
 #[must_use]
 pub fn jaccard(a: &str, b: &str) -> f32 {
     let sa = token_set(a);
@@ -55,11 +54,11 @@ pub fn jaccard(a: &str, b: &str) -> f32 {
     ratio
 }
 
-/// Ovatko kaksi tekstiä lähes-identtisiä annetulla kynnyksellä.
+/// Whether two texts are near-identical at the given threshold.
 ///
-/// Kynnys puristetaan välille `0.0..=1.0`. Identtinen teksti on aina yli
-/// minkä tahansa kynnyksen (paitsi jos kynnys on tarkalleen yli 1.0, mikä
-/// ei ole mahdollista puristuksen jälkeen).
+/// The threshold is clamped to `0.0..=1.0`. Identical text is always above
+/// any threshold (unless the threshold is exactly above 1.0, which isn't
+/// possible after clamping).
 #[must_use]
 pub fn is_near_duplicate(a: &str, b: &str, threshold: f32) -> bool {
     let t = if threshold.is_finite() {
@@ -72,7 +71,7 @@ pub fn is_near_duplicate(a: &str, b: &str, threshold: f32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    // Tarkka f32-vertailu sallittu — vakioidut Jaccard-arvot.
+    // Exact f32 comparison allowed — fixed Jaccard values.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -97,7 +96,7 @@ mod tests {
         // A = {the, cat, sat}, B = {the, cat, ran}
         // ∩ = {the, cat} = 2, ∪ = {the, cat, sat, ran} = 4 → 0.5
         let s = jaccard("the cat sat", "the cat ran");
-        assert!((s - 0.5).abs() < 1e-6, "odotettiin 0.5, saatiin {s}");
+        assert!((s - 0.5).abs() < 1e-6, "expected 0.5, got {s}");
     }
 
     #[test]
@@ -110,7 +109,7 @@ mod tests {
     #[test]
     fn both_empty_are_identical() {
         assert_eq!(jaccard("", ""), 1.0);
-        // Pelkät täytesanat (1-merkkiset) → tyhjät joukot → identtisiä.
+        // Only filler words (1-character) → empty sets → identical.
         assert_eq!(jaccard("a", "x"), 1.0);
     }
 
@@ -122,7 +121,7 @@ mod tests {
 
     #[test]
     fn short_tokens_are_filtered() {
-        // "a" karsiutuu (1 merkki), joten näiden joukot ovat samat.
+        // "a" gets dropped (1 character), so these sets are equal.
         assert_eq!(jaccard("a big house", "big house"), 1.0);
     }
 
@@ -136,7 +135,7 @@ mod tests {
 
     #[test]
     fn near_duplicate_clamps_invalid_threshold() {
-        // Kelvoton kynnys → 1.0 → vain identtinen kelpaa.
+        // Invalid threshold → 1.0 → only identical text qualifies.
         assert!(is_near_duplicate("same words", "same words", f32::NAN));
         assert!(!is_near_duplicate("same words", "other text", f32::NAN));
     }

@@ -1,30 +1,31 @@
-//! Suoritussauma: orkesteroinnin ja konkreettisen agentin välinen rajapinta.
+//! Execution seam: the interface between orchestration and a concrete agent.
 //!
-//! Tämä moduuli määrittelee **yhden jaetun sauman** ([`TurnExecutor`]) jonka
-//! kautta [`crate::orchestrator::Orchestrator`] delegoi yksittäisen työvaiheen
-//! ("vuoron") konkreettiselle suorittajalle saamatta koskaan riippuvuutta
-//! mihinkään tiettyyn agenttiin, LLM-providajaan tai kuljetuskerrokseen.
+//! This module defines **one shared seam** ([`TurnExecutor`]) through which
+//! [`crate::orchestrator::Orchestrator`] delegates a single work step (a
+//! "turn") to a concrete executor, without ever depending on any specific
+//! agent, LLM provider, or transport layer.
 //!
-//! ## Saumamalli
-//! Orkesteri tuottaa [`OrchestratedTurn`]-kuvauksen (mitä, kuka, millä
-//! syötteellä, milloin) ja antaa sen `TurnExecutor`-toteutukselle. Toteutus
-//! palauttaa [`crate::contract::Deliverable`]-toimitteen, joka voidaan ajaa
-//! [`crate::contract::ContractBoard::fulfill`]-todennuksen läpi tulosskeemaa ja
-//! jälkiehtoja vasten. Näin sopimustakuut säilyvät riippumatta siitä, kuka
-//! vuoron oikeasti suoritti.
+//! ## Seam model
+//! The orchestrator produces an [`OrchestratedTurn`] description (what, who,
+//! with what input, when) and passes it to a `TurnExecutor` implementation.
+//! The implementation returns a [`crate::contract::Deliverable`], which can be
+//! run through [`crate::contract::ContractBoard::fulfill`] verification
+//! against the output schema and postconditions. This way, contract
+//! guarantees hold regardless of who actually executed the turn.
 //!
-//! ## Vastuunjako
-//! - **Kuluttajapuoli (tämä moduuli):** sauman tyyppi + hermeettinen
-//!   [`MockTurnExecutor`] determinististä testausta ja paikallisajoa varten.
-//! - **Tuottajapuoli (myöhemmin):** Layer B -tuottaja toteuttaa `LiveTurnExecutor`:n
-//!   crateen `familyclaw-agent` **saman** [`TurnExecutor`]-trapin taakse, jolloin
-//!   se kytkee oikean LLM-/kuljetuskerroksen muuttamatta orkesteria lainkaan.
+//! ## Division of responsibility
+//! - **Consumer side (this module):** the seam's type + the hermetic
+//!   [`MockTurnExecutor`] for deterministic testing and local runs.
+//! - **Producer side (later):** the Layer B producer implements
+//!   `LiveTurnExecutor` in the `familyclaw-agent` crate behind the **same**
+//!   [`TurnExecutor`] trait, which plugs in the real LLM/transport layer
+//!   without changing the orchestrator at all.
 //!
-//! ## Determinismi
-//! [`MockTurnExecutor`] ei lue kelloa eikä käytä satunnaisuutta: toimitteen
-//! hyötykuorma riippuu **ainoastaan** [`OrchestratedTurn::input`]-syötteestä ja
-//! suorittajan tunnisteesta ([`OrchestratedTurn::assignee`]). Sama vuoro
-//! tuottaa siten aina identtisen toimitteen.
+//! ## Determinism
+//! [`MockTurnExecutor`] does not read the clock or use randomness: the
+//! deliverable's payload depends **only** on the [`OrchestratedTurn::input`]
+//! input and the executor's identifier ([`OrchestratedTurn::assignee`]). The
+//! same turn therefore always produces an identical deliverable.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -37,47 +38,48 @@ use crate::contract::Deliverable;
 use crate::orchestrator::NodeId;
 use crate::task::TaskId;
 
-/// Yhden delegoitavan työvaiheen ("vuoron") täysi kuvaus suorittajalle.
+/// A full description of a single delegatable work step ("turn") for an
+/// executor.
 ///
-/// Orkesteri rakentaa tämän kun se osoittaa työnkulun solmun työntekijälle.
-/// Kuvaus on itsenäinen: se sisältää suunnitelma- ja solmukontekstin, valitun
-/// suorittajan, ihmisluettavan otsikon ja kuvauksen, koneluettavan syötteen
-/// sekä injektoidun hetken (`now`). Aikaleima injektoidaan aina — kelloa ei
-/// lueta saumassa.
+/// The orchestrator builds this when it assigns a workflow node to a worker.
+/// The description is self-contained: it includes the plan and node context,
+/// the chosen executor, a human-readable title and description, a
+/// machine-readable input, and the injected time (`now`). The timestamp is
+/// always injected — the clock is never read within the seam.
 #[derive(Debug, Clone)]
 pub struct OrchestratedTurn {
-    /// Vuoron synnyttäneen suunnitelman ihmisluettava tunniste.
+    /// The human-readable identifier of the plan that produced this turn.
     pub plan_id: String,
 
-    /// Työnkulun solmun vakaa tunniste (suunnittelijan antama nimi).
+    /// The workflow node's stable identifier (the name given by the planner).
     pub node_id: NodeId,
 
-    /// Tehtävätaululle luodun tehtävän tunniste.
+    /// The identifier of the task created on the task board.
     pub task_id: TaskId,
 
-    /// Vuoron suorittava agentti (orkesterin valitsema työntekijä).
+    /// The agent executing the turn (the worker chosen by the orchestrator).
     pub assignee: AgentId,
 
-    /// Lyhyt otsikko (peräisin solmun otsikosta).
+    /// Short title (taken from the node's title).
     pub title: String,
 
-    /// Vapaamuotoinen kuvaus työvaiheesta (peräisin solmusta).
+    /// Free-form description of the work step (taken from the node).
     pub description: String,
 
-    /// Koneluettava syöte vuorolle (validoidaan tyypillisesti kyvyn
-    /// syöteskeemaa vasten ennen suoritusta).
+    /// Machine-readable input for the turn (typically validated against the
+    /// capability's input schema before execution).
     pub input: Value,
 
-    /// Injektoitu suoritushetki (UTC). Saumassa ei koskaan lueta
-    /// järjestelmäkelloa — determinismin vuoksi `now` annetaan aina.
+    /// The injected execution time (UTC). The seam never reads the system
+    /// clock — `now` is always supplied, for determinism.
     pub now: Timestamp,
 }
 
 impl OrchestratedTurn {
-    /// Rakentaa vuoron kuvauksen kaikilla kentillä.
+    /// Builds a turn description with all fields.
     ///
-    /// `now` on injektoitava aikaleima (UTC); kutsuja vastaa sen
-    /// determinismistä, jotta sauma pysyy toistettavana.
+    /// `now` is the timestamp to inject (UTC); the caller is responsible for
+    /// its determinism, so that the seam stays reproducible.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -103,85 +105,89 @@ impl OrchestratedTurn {
     }
 }
 
-/// Saumarajapinta jonka kautta orkesteri suorittaa yhden vuoron.
+/// The seam interface through which the orchestrator executes a single turn.
 ///
-/// Tämä on **se sauma**: [`crate::orchestrator::Orchestrator`] riippuu tästä
-/// trapista, ei koskaan konkreettisesta agentista. Kuluttajapuoli (orkesteri +
-/// [`MockTurnExecutor`]) elää tässä cratessa; tuottajapuolen (`LiveTurnExecutor`
-/// cratessa `familyclaw-agent`) on tarkoitus toteuttaa
-/// **sama** rajapinta, jolloin oikea LLM-/kuljetuskerros kytkeytyy muuttamatta
-/// orkesteria.
+/// This is **the seam**: [`crate::orchestrator::Orchestrator`] depends on
+/// this trait, never on a concrete agent. The consumer side (orchestrator +
+/// [`MockTurnExecutor`]) lives in this crate; the producer side
+/// (`LiveTurnExecutor` in the `familyclaw-agent` crate) is meant to implement
+/// **the same** interface, so that the real LLM/transport layer plugs in
+/// without changing the orchestrator.
 ///
-/// Toteutusten on oltava [`Send`] + [`Sync`], jotta ne voidaan jakaa
-/// tehtävien välillä (`Arc<dyn TurnExecutor>`).
+/// Implementations must be [`Send`] + [`Sync`] so they can be shared across
+/// tasks (`Arc<dyn TurnExecutor>`).
 #[async_trait]
 pub trait TurnExecutor: Send + Sync {
-    /// Suorittaa annetun vuoron ja palauttaa toimitteen.
+    /// Executes the given turn and returns the deliverable.
     ///
-    /// Palautettu [`Deliverable`] voidaan ajaa
-    /// [`crate::contract::ContractBoard::fulfill`]-todennuksen läpi: vain
-    /// tulosskeeman ja jälkiehdot läpäisevä toimite täyttää sopimuksen.
+    /// The returned [`Deliverable`] can be run through
+    /// [`crate::contract::ContractBoard::fulfill`] verification: only a
+    /// deliverable that passes the output schema and postconditions fulfills
+    /// the contract.
     ///
     /// # Errors
-    /// Palauttaa [`familyclaw_core::FamilyClawError`]:n jos suoritus
-    /// epäonnistuu (esim. tuottajapuolen kuljetus- tai kykyvirhe). Hermeettinen
-    /// [`MockTurnExecutor`] palauttaa virheen vain `failing`-tilan
-    /// [`MockFailure::Error`]-variantissa.
+    /// Returns a [`familyclaw_core::FamilyClawError`] if execution fails
+    /// (e.g. a producer-side transport or capability error). The hermetic
+    /// [`MockTurnExecutor`] only returns an error in the `failing`-mode
+    /// [`MockFailure::Error`] variant.
     async fn execute(&self, turn: OrchestratedTurn) -> Result<Deliverable>;
 }
 
-/// Tapa jolla [`MockTurnExecutor`] simuloi epäonnistuvaa suoritusta.
+/// The way [`MockTurnExecutor`] simulates a failing execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MockFailure {
-    /// Suoritus tuottaa toimitteen, jonka hyötykuorma **rikkoo** tyypillisen
-    /// tulosskeeman (puuttuva `headline`-kenttä). Tämä todistaa
-    /// `fulfill`-todennuksen `Failed`-polun ilman virhettä suorituksesta.
+    /// Execution produces a deliverable whose payload **breaches** the
+    /// typical output schema (missing `headline` field). This proves the
+    /// `fulfill` verification's `Failed` path without an error from
+    /// execution itself.
     SchemaBreach,
 
-    /// Suoritus palauttaa [`Err`]:n simuloiden kuljetus-/kykyvirhettä, jolloin
-    /// vuoroa ei koskaan valmistu.
+    /// Execution returns an [`Err`], simulating a transport/capability
+    /// error, so the turn never completes.
     Error,
 }
 
-/// Hermeettinen, deterministinen [`TurnExecutor`]-toteutus testaukseen ja
-/// paikallisajoon.
+/// A hermetic, deterministic [`TurnExecutor`] implementation for testing and
+/// local runs.
 ///
-/// **Ei verkkoa, ei kelloa, ei satunnaisuutta.** Toimitteen hyötykuorma
-/// johdetaan ainoastaan [`OrchestratedTurn::input`]-syötteestä ja
-/// [`OrchestratedTurn::assignee`]-suorittajasta, joten sama vuoro tuottaa aina
-/// identtisen toimitteen.
+/// **No network, no clock, no randomness.** The deliverable's payload is
+/// derived solely from the [`OrchestratedTurn::input`] input and the
+/// [`OrchestratedTurn::assignee`] executor, so the same turn always produces
+/// an identical deliverable.
 ///
-/// ## Hyötykuorman muoto
-/// - Jos syöte on objekti, jossa on kenttä `brand` **tai** `audience`, mock
-///   tuottaa `HomepageDesign`-muotoisen toimitteen: `{ headline, sections, cta }`,
-///   jossa arvot johdetaan syötteestä deterministisesti.
-/// - Muutoin syöte kaiutetaan takaisin avaimen `result` alla yhdessä
-///   suorittajan tunnisteen kanssa (`assignee`).
+/// ## Payload shape
+/// - If the input is an object containing a `brand` **or** `audience` field,
+///   the mock produces a `HomepageDesign`-shaped deliverable:
+///   `{ headline, sections, cta }`, with values derived deterministically
+///   from the input.
+/// - Otherwise, the input is echoed back under the `result` key together
+///   with the executor's identifier (`assignee`).
 ///
-/// ## Epäonnistumistila
-/// [`MockTurnExecutor::failing`] palauttaa toteutuksen joka tuottaa
-/// rikkovan toimitteen tai virheen ([`MockFailure`]) — näin testit voivat
-/// todentaa `Failed`-polun.
+/// ## Failure mode
+/// [`MockTurnExecutor::failing`] returns an implementation that produces
+/// either a breaching deliverable or an error ([`MockFailure`]) — this lets
+/// tests verify the `Failed` path.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MockTurnExecutor {
-    /// `None` = onnistuva (deterministinen) tila; `Some(_)` = simuloitu
-    /// epäonnistuminen valitulla tavalla.
+    /// `None` = succeeding (deterministic) mode; `Some(_)` = simulated
+    /// failure of the chosen kind.
     failure: Option<MockFailure>,
 }
 
 impl MockTurnExecutor {
-    /// Rakentaa onnistuvan, deterministisen mockin.
+    /// Builds a succeeding, deterministic mock.
     #[must_use]
     pub fn new() -> Self {
         Self { failure: None }
     }
 
-    /// Rakentaa mockin joka **rikkoo tulosskeeman** (puuttuva `headline`).
+    /// Builds a mock that **breaches the output schema** (missing
+    /// `headline`).
     ///
-    /// Tämä on oikotie [`MockTurnExecutor::with_failure`]:lle
-    /// [`MockFailure::SchemaBreach`]-tavalla; tuotettu toimite saa
-    /// [`crate::contract::ContractBoard::fulfill`]-todennuksen siirtämään
-    /// sopimuksen [`crate::contract::ContractStatus::Failed`]-tilaan.
+    /// This is a shortcut for [`MockTurnExecutor::with_failure`] with the
+    /// [`MockFailure::SchemaBreach`] mode; the produced deliverable makes
+    /// [`crate::contract::ContractBoard::fulfill`] verification move the
+    /// contract to the [`crate::contract::ContractStatus::Failed`] state.
     #[must_use]
     pub fn failing() -> Self {
         Self {
@@ -189,7 +195,7 @@ impl MockTurnExecutor {
         }
     }
 
-    /// Rakentaa mockin valitulla epäonnistumistavalla.
+    /// Builds a mock with the chosen failure mode.
     #[must_use]
     pub fn with_failure(failure: MockFailure) -> Self {
         Self {
@@ -197,10 +203,10 @@ impl MockTurnExecutor {
         }
     }
 
-    /// Johtaa onnistuvan toimitteen hyötykuorman puhtaasti vuorosta.
+    /// Derives the succeeding deliverable's payload purely from the turn.
     ///
-    /// Riippuu vain `turn.input`:sta ja `turn.assignee`:sta — ei kellosta eikä
-    /// satunnaisuudesta.
+    /// Depends only on `turn.input` and `turn.assignee` — never on the clock
+    /// or randomness.
     fn success_payload(turn: &OrchestratedTurn) -> Value {
         let is_homepage = turn
             .input
@@ -238,12 +244,12 @@ impl MockTurnExecutor {
 
 #[async_trait]
 impl TurnExecutor for MockTurnExecutor {
-    /// Suorittaa vuoron deterministisesti (tai simuloi epäonnistumisen).
+    /// Executes the turn deterministically (or simulates a failure).
     ///
     /// # Errors
-    /// Palauttaa [`familyclaw_core::FamilyClawError::Llm`]:n (simuloitu
-    /// tuottajapuolen kuljetus-/kykyvirhe) vain kun mock on rakennettu
-    /// [`MockFailure::Error`]-tavalla.
+    /// Returns a [`familyclaw_core::FamilyClawError::Llm`] (a simulated
+    /// producer-side transport/capability error) only when the mock was
+    /// built with the [`MockFailure::Error`] mode.
     async fn execute(&self, turn: OrchestratedTurn) -> Result<Deliverable> {
         match self.failure {
             Some(MockFailure::Error) => Err(familyclaw_core::FamilyClawError::llm(format!(
@@ -251,8 +257,8 @@ impl TurnExecutor for MockTurnExecutor {
                 turn.node_id
             ))),
             Some(MockFailure::SchemaBreach) => {
-                // Tarkoituksella ilman `headline`-kenttää → rikkoo tyypillisen
-                // HomepageDesign-tulosskeeman, mutta on silti validi toimite.
+                // Deliberately without a `headline` field → breaches the
+                // typical HomepageDesign output schema, but is still a valid deliverable.
                 let payload = json!({
                     "sections": [],
                     "cta": "",
@@ -291,8 +297,8 @@ mod tests {
         )
     }
 
-    /// HomepageDesign-muotoinen tulosskeema johon mockin onnistuva toimite
-    /// sopii mutta `failing()`-toimite ei.
+    /// A HomepageDesign-shaped output schema that the mock's succeeding
+    /// deliverable satisfies but the `failing()` deliverable does not.
     fn homepage_capability() -> Capability {
         Capability::new(
             "design_homepage",
@@ -326,7 +332,7 @@ mod tests {
     async fn execute_is_deterministic_same_turn_twice() {
         let mock = MockTurnExecutor::new();
         let assignee = AgentId::new();
-        // Sama syöte + sama suorittaja → identtinen hyötykuorma.
+        // Same input + same executor → identical payload.
         let d1 = mock
             .execute(turn_with(json!({ "topic": "rust" }), assignee))
             .await
@@ -341,7 +347,7 @@ mod tests {
     #[tokio::test]
     async fn execute_payload_depends_on_assignee() {
         let mock = MockTurnExecutor::new();
-        // Ei-homepage-syöte kaiuttaa myös suorittajan tunnisteen → eri payload.
+        // Non-homepage input also echoes the executor's identifier → different payload.
         let d1 = mock
             .execute(turn_with(json!({ "topic": "rust" }), AgentId::new()))
             .await
@@ -365,14 +371,14 @@ mod tests {
         assert!(payload.get("headline").and_then(Value::as_str).is_some());
         assert!(payload.get("sections").and_then(Value::as_array).is_some());
         assert!(payload.get("cta").and_then(Value::as_str).is_some());
-        // Sections ei ole tyhjä.
+        // Sections is not empty.
         assert!(!payload["sections"].as_array().expect("array").is_empty());
     }
 
     #[tokio::test]
     async fn execute_homepage_payload_satisfies_output_schema() {
-        // Onnistuvan toimitteen on läpäistävä HomepageDesign-tulosskeema
-        // ContractBoard.fulfill-todennuksessa.
+        // A succeeding deliverable must satisfy the HomepageDesign output
+        // schema in ContractBoard.fulfill verification.
         let board = ContractBoard::new();
         let cap = homepage_capability();
         let provider = AgentId::new();
@@ -408,8 +414,8 @@ mod tests {
 
     #[tokio::test]
     async fn failing_variant_breaches_output_schema() {
-        // failing() tuottaa toimitteen ilman `headline`-kenttää →
-        // HomepageDesign-tulosskeema rikkoutuu Schema.check-tasolla.
+        // failing() produces a deliverable without a `headline` field →
+        // the HomepageDesign output schema is breached at the Schema.check level.
         let cap = homepage_capability();
         let mock = MockTurnExecutor::failing();
         let provider = AgentId::new();
@@ -428,8 +434,8 @@ mod tests {
 
     #[tokio::test]
     async fn failing_variant_drives_contract_to_failed() {
-        // Sama todistus ContractBoard.fulfill-reitin kautta:
-        // rikkova toimite siirtää sopimuksen Failed-tilaan.
+        // Same proof via the ContractBoard.fulfill path:
+        // a breaching deliverable moves the contract to the Failed state.
         let board = ContractBoard::new();
         let cap = homepage_capability();
         let provider = AgentId::new();
@@ -468,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn dyn_trait_object_is_usable() {
-        // Sauma on käytettävissä trait-objektina (orkesteri pitää Arc<dyn _>).
+        // The seam is usable as a trait object (the orchestrator holds Arc<dyn _>).
         let exec: std::sync::Arc<dyn TurnExecutor> = std::sync::Arc::new(MockTurnExecutor::new());
         let assignee = AgentId::new();
         let deliverable = exec

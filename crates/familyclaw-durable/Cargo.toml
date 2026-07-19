@@ -1,12 +1,15 @@
 [package]
 name = "familyclaw-durable"
-description = "Durable substrate — deterministic replay (crash-proof)"
+description = "Durable execution substrate providing deterministic, crash-proof replay of agent workflows with at-most-once side-effect dispatch"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["durable-execution", "replay", "workflow", "crash-recovery", "agent"]
+categories = ["asynchronous", "development-tools"]
 
 [lints]
 workspace = true

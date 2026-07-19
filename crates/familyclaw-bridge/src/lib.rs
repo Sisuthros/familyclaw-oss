@@ -1,42 +1,43 @@
 //! # familyclaw-bridge
 //!
-//! Siltakerros (KERROS A, OSS): **agenttirekisteri, tehtävätaulu ja
-//! tapahtumaväylä** puhtaana, kuljetuskerroksesta riippumattomana
-//! Rust-rajapintana. Design §3: *"käytä olemassa olevaa"* —
-//! tämä crate mallintaa olemassa olevan `family-bridge`-MCP:n semantiikan
-//! natiivina Rustina, jonka MCP-/HTTP-adapterit voivat myöhemmin kääriä.
+//! The bridge layer (Layer A, OSS): an **agent registry, task board, and
+//! event bus** as a pure, transport-layer-independent Rust interface.
+//! Design §3: *"use what already exists"* —
+//! this crate models the semantics of an existing `family-bridge` MCP as
+//! native Rust, which MCP/HTTP adapters can wrap later.
 //!
-//! ## Osat
+//! ## Parts
 //! - [`agent`] — [`AgentRegistry`], [`AgentInfo`], liveness/heartbeat.
-//! - [`task`] — [`Task`], [`TaskStatus`]-tilakone, [`TaskBoard`] (sis. handoff).
+//! - [`task`] — [`Task`], the [`TaskStatus`] state machine, [`TaskBoard`] (incl. handoff).
 //! - [`event`] — [`Event`], [`EventKind`], publish/subscribe ([`EventBus`]).
-//! - [`work_executor`] — [`WorkExecutor`]-sauma ja [`DefaultSimulatingExecutor`]
-//!   (Homepage Factory, KERROS A producer).
-//! - [`executor`] — orkesteroinnin ja konkreettisen agentin välinen suoritussauma
-//!   ([`TurnExecutor`], [`OrchestratedTurn`]) hermeettisellä [`MockTurnExecutor`]:lla.
-//! - [`bridge`] — [`FamilyBridge`] koostaa edellä mainitut ja julkaisee
-//!   tapahtumat tilamuutoksista.
-//! - [`orchestrator`] — DAG-pohjainen moniagenttiorkesterointi
-//!   ([`OrchestrationPlan`], [`Orchestrator`]) joka ohjaa tehtävätaulua
-//!   vain laillisin tilasiirtymin.
-//! - [`contract`] — tyypitetty FIPA-ContractNet ([`Capability`], [`Contract`],
-//!   [`ContractBoard`]) todennettavalla täyttämisellä (skeema + jälkiehdot).
-//! - [`contract_bus`] — kuljetuksesta riippumattomat sopimusviestit
-//!   ([`ContractMessage`]) puhtaalla serdellä.
+//! - [`work_executor`] — the [`WorkExecutor`] seam and [`DefaultSimulatingExecutor`]
+//!   (Homepage Factory, Layer A producer).
+//! - [`executor`] — the execution seam between orchestration and a concrete
+//!   agent ([`TurnExecutor`], [`OrchestratedTurn`]) with the hermetic
+//!   [`MockTurnExecutor`].
+//! - [`bridge`] — [`FamilyBridge`] composes the above and publishes
+//!   events on state changes.
+//! - [`orchestrator`] — DAG-based multi-agent orchestration
+//!   ([`OrchestrationPlan`], [`Orchestrator`]) that drives the task board
+//!   only through legal state transitions.
+//! - [`contract`] — typed FIPA `ContractNet` ([`Capability`], [`Contract`],
+//!   [`ContractBoard`]) with verifiable fulfillment (schema + postconditions).
+//! - [`contract_bus`] — transport-independent contract messages
+//!   ([`ContractMessage`]) with plain serde.
 //!
-//! ## Suunnitteluperiaatteet
-//! - **Tokio-pohjainen, säieturvallinen.** Jaettu tila on `Arc<RwLock<…>>`
-//!   (rekisteri, taulu) tai `tokio::sync::broadcast` (väylä). Kaikki
-//!   julkisivut ovat `Clone` ja jakavat tilansa.
-//! - **Ei `unwrap()`/`expect()`/`panic!()` tuotantopolulla.** Kaikki virheet
-//!   kulkevat [`familyclaw_core::Result`]- ja [`familyclaw_core::FamilyClawError`]-tyyppien
-//!   kautta.
-//! - **Tiukka tehtävän tilakone.** Laittomat siirtymät hylätään virheellä,
-//!   jotta durable-replay ja konsolidointi pysyvät johdonmukaisina.
-//! - **OSS-raja (KERROS A):** ei kovakoodattuja sieluja, avaimia, tokeneita,
-//!   IP-osoitteita eikä henkilökohtaisia polkuja. Tyypit ovat geneerisiä.
+//! ## Design principles
+//! - **Tokio-based, thread-safe.** Shared state is `Arc<RwLock<…>>`
+//!   (registry, board) or `tokio::sync::broadcast` (bus). All
+//!   facades are `Clone` and share their state.
+//! - **No `unwrap()`/`expect()`/`panic!()` on the production path.** All
+//!   errors flow through the [`familyclaw_core::Result`] and
+//!   [`familyclaw_core::FamilyClawError`] types.
+//! - **Strict task state machine.** Illegal transitions are rejected with
+//!   an error, so durable replay and consolidation stay consistent.
+//! - **OSS boundary (Layer A):** no hardcoded souls, keys, tokens, IP
+//!   addresses, or personal paths. Types are generic.
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_bridge::{
 //!     AgentInfo, AgentRole, FamilyBridge, HostKind, TaskStatus,
@@ -47,14 +48,14 @@
 //! let bridge = FamilyBridge::new();
 //! let mut events = bridge.subscribe();
 //!
-//! // Rekisteröi kaksi agenttia.
+//! // Register two agents.
 //! let a = AgentInfo::new(AgentId::new(), "agent_a", AgentRole::Strategy, HostKind::Local);
 //! let b = AgentInfo::new(AgentId::new(), "agent_b", AgentRole::Executor, HostKind::Wsl);
 //! let (a_id, b_id) = (a.id, b.id);
 //! bridge.register_agent(a).await?;
 //! bridge.register_agent(b).await?;
 //!
-//! // Luo tehtävä, ota työn alle, luovuta toiselle.
+//! // Create a task, pick it up, hand it off to the other agent.
 //! let task = bridge.create_task("ship the seed", Some(a_id)).await?;
 //! bridge.update_task_status(task.id, TaskStatus::Active).await?;
 //! let handed = bridge.handoff_task(task.id, a_id, b_id).await?;
@@ -90,7 +91,7 @@ pub use orchestrator::{
 pub use task::{Task, TaskBoard, TaskId, TaskStatus};
 pub use work_executor::{DefaultSimulatingExecutor, WorkExecutor, WorkOutcome};
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -108,8 +109,8 @@ mod tests {
 
     #[tokio::test]
     async fn public_api_is_reexported() {
-        // Varmistaa että julkinen pinta on saatavilla juuresta. Jos jokin
-        // re-export poistetaan, tämä testi ei käänny.
+        // Verifies that the public surface is available from the crate root.
+        // If any re-export is removed, this test will fail to compile.
         let bridge: FamilyBridge = FamilyBridge::new();
         let _registry: &AgentRegistry = bridge.registry();
         let _board: &TaskBoard = bridge.board();

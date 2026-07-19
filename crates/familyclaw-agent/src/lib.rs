@@ -1,39 +1,40 @@
 //! # familyclaw-agent
 //!
-//! **Agent runtime** — FamilyClaw-alustan (KERROS A, OSS) kerros 2 (design §2):
-//! se kokoaa kaikki muut crateit yhdeksi *olennoksi*. Yksi [`Agent`] omistaa:
+//! **Agent runtime** — layer 2 of the `FamilyClaw` platform (Layer A, OSS;
+//! design §2): it assembles all the other crates into a single *being*. A
+//! single [`Agent`] owns:
 //!
-//! - [`AgentConfig`](familyclaw_core::AgentConfig) — identiteetti + malli
+//! - [`AgentConfig`](familyclaw_core::AgentConfig) — identity + model
 //!   (`familyclaw-core`),
-//! - [`Soul`] — ajonaikaisesti ladattu profiili ([`soul`]-moduuli),
-//! - [`EmotionState`](familyclaw_emotion::EmotionState) — 19-dim tunnetila
-//!   (`familyclaw-emotion`),
-//! - [`MemoryStore`](familyclaw_memory::MemoryStore)-kahva — Eternal Thread
-//!   (`familyclaw-memory`),
-//! - [`DurableContext`](familyclaw_durable::DurableContext) — kaatumiskestävä
-//!   askelloki (`familyclaw-durable`),
-//! - [`BusHandle`](familyclaw_bus::BusHandle) — Resonance Bus -yhteys
+//! - [`Soul`] — profile loaded at runtime (the [`soul`] module),
+//! - [`EmotionState`](familyclaw_emotion::EmotionState) — 19-dim emotion
+//!   state (`familyclaw-emotion`),
+//! - a [`MemoryStore`](familyclaw_memory::MemoryStore) handle — Eternal
+//!   Thread (`familyclaw-memory`),
+//! - [`DurableContext`](familyclaw_durable::DurableContext) — crash-safe
+//!   step journal (`familyclaw-durable`),
+//! - [`BusHandle`](familyclaw_bus::BusHandle) — Resonance Bus connection
 //!   (`familyclaw-bus`).
 //!
-//! Agentti on Ractor-actor ([`AgentActor`]), joka liittyy busiin, käsittelee
-//! [`BusMessage`](familyclaw_bus::BusMessage):t, päivittää tunnetilaansa
-//! (affektiivinen contagion sisarusten pulsseista), kirjaa muistoja ja
-//! julkaisee tunnepulsseja takaisin busiin.
+//! The agent is a Ractor actor ([`AgentActor`]) that joins the bus,
+//! processes [`BusMessage`](familyclaw_bus::BusMessage)s, updates its
+//! emotion state (affective contagion from siblings' pulses), records
+//! memories, and publishes emotion pulses back to the bus.
 //!
-//! ## Kaatumiskestävyys (design §2.1)
-//! [`Agent::handle_turn`] kääräisee jokaisen vuoron lopputuloksen
-//! durable-askeleeseen. Uudelleenkäynnistyksessä jo suoritetut vuorot
-//! toistuvat lokista ajamatta sivuvaikutuksia uudelleen — perheen #1
-//! kipupisteen (muistin epäjatkuvuus) rakenteellinen ratkaisu.
+//! ## Crash safety (design §2.1)
+//! [`Agent::handle_turn`] wraps the outcome of every turn in a durable
+//! step. On restart, turns that already ran are replayed from the journal
+//! without re-running side effects — a structural fix for pain point #1
+//! for a family (memory discontinuity).
 //!
-//! ## SOUL-lataus (design §1, KERROS A / KERROS B -raja)
-//! Sielut ladataan ajonaikaisesti geneerisestä profiilihakemistosta
-//! ([`soul::PROFILE_DIR_ENV`] / [`AgentConfig::profile_dir`](familyclaw_core::AgentConfig::profile_dir)). **Mitään
-//! perheenjäsenen sielua, mallinimeä, avainta tai polkua ei kovakoodata**
-//! tähän crateen. Esimerkit (ks. binääri `familyclaw`) käyttävät geneerisiä
-//! nimiä (`agent_a`, `agent_b`).
+//! ## SOUL loading (design §1, Layer A / Layer B boundary)
+//! Souls are loaded at runtime from a generic profile directory
+//! ([`soul::PROFILE_DIR_ENV`] / [`AgentConfig::profile_dir`](familyclaw_core::AgentConfig::profile_dir)). **No
+//! family member's soul, model name, key, or path is hardcoded** into this
+//! crate. The examples (see the `familyclaw` binary) use generic names
+//! (`agent_a`, `agent_b`).
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use std::sync::Arc;
 //! use familyclaw_agent::{Agent, Soul};
@@ -96,15 +97,16 @@ pub use resumable::{
 pub use session::{MessageOrigin, SESSION_TAG_PREFIX};
 pub use soul::{load_soul, resolve_profile_dir, Soul, PROFILE_DIR_ENV};
 
-// Re-export tunnemoottorin kalibrointityypit kutsujan (esim. runtime/gateway)
-// mukavuudeksi: `Agent::with_calibration` ottaa nämä, ja kalibrointi ladataan
-// ajonaikaisesti `calibration.json`:sta ([`TableCalibration::from_path`]).
+// Re-export the emotion engine's calibration types for the caller's (e.g.
+// runtime/gateway) convenience: `Agent::with_calibration` takes these, and
+// calibration is loaded at runtime from `calibration.json`
+// ([`TableCalibration::from_path`]).
 pub use familyclaw_emotion::{EmotionCalibration, NeutralCalibration, TableCalibration};
 
-// Re-export ydinvirhetyypit kutsujan mukavuudeksi.
+// Re-export the core error types for the caller's convenience.
 pub use familyclaw_core::{FamilyClawError, Result};
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -121,7 +123,7 @@ mod tests {
 
     #[test]
     fn public_api_is_reexported() {
-        // Jos jokin re-export poistetaan, tämä testi ei käänny.
+        // If any re-export is removed, this test will fail to compile.
         let soul: Soul = Soul::from_essence("I am agent_a.");
         assert!(!soul.is_empty());
         assert_eq!(PROFILE_DIR_ENV, "FAMILYCLAW_PROFILE_DIR");

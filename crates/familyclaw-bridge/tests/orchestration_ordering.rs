@@ -1,16 +1,16 @@
-//! Integraatiotesti: moniagenttiorkesterointi ajaa A→B-suunnitelman ja
-//! todistaa että B osoitetaan työntekijälle vasta kun A on tilassa
-//! [`TaskStatus::Done`].
+//! Integration test: multi-agent orchestration runs an A→B plan and proves
+//! that B is only assigned to a worker once A is in the
+//! [`TaskStatus::Done`] state.
 //!
-//! Tämä testi rakentaa [`FamilyBridge`]in vain julkisen rajapinnan kautta,
-//! rekisteröi kaksi kyvykkyyksin varustettua agenttia ja ajaa kaksisolmuisen
-//! suunnitelman ([`Orchestrator::run`]). Riippuvuusportin (`B.deps = [A]`)
-//! kunnioittaminen varmennetaan kahdella tavalla:
+//! This test builds [`FamilyBridge`] only through its public interface,
+//! registers two agents with capabilities, and runs a two-node plan
+//! ([`Orchestrator::run`]). Respecting the dependency gate (`B.deps = [A]`)
+//! is verified in two ways:
 //!
-//! 1. **Tapahtumajärjestys.** `orchestration.step_assigned`-tapahtumat
-//!    julkaistaan A:lle ennen B:tä — eli B aktivoidaan A:n jälkeen.
-//! 2. **Lopputila.** Molemmat solmut päätyvät `Done`-tilaan, ja raportin
-//!    järjestys on `[A, B]`.
+//! 1. **Event order.** `orchestration.step_assigned` events are published
+//!    for A before B — i.e. B is activated after A.
+//! 2. **Final state.** Both nodes end up in the `Done` state, and the
+//!    report's order is `[A, B]`.
 
 use familyclaw_bridge::{
     AgentInfo, AgentRole, FamilyBridge, HostKind, NodeId, OrchestrationPlan, Orchestrator,
@@ -19,7 +19,7 @@ use familyclaw_bridge::{
 use familyclaw_core::ids::AgentId;
 use familyclaw_core::time;
 
-/// Rakentaa ja rekisteröi online-agentin annetuilla kyvyillä hetkellä `now`.
+/// Builds and registers an online agent with the given capabilities at time `now`.
 async fn online_agent(
     bridge: &FamilyBridge,
     id: AgentId,
@@ -39,8 +39,8 @@ async fn two_node_plan_assigns_b_only_after_a_is_done() {
     let bridge = FamilyBridge::new();
     let now = time::from_unix_secs(1_700_000_000).expect("valid timestamp");
 
-    // Kaksi agenttia, kiinteät id:t determinismin vuoksi. Molemmilla riittävät
-    // kyvyt; solmut kiinnitetään silti rooleihin että valinta on yksiselitteinen.
+    // Two agents, fixed ids for determinism. Both have sufficient
+    // capabilities; nodes are still pinned to roles so the selection is unambiguous.
     let strategist = AgentId::from_uuid(uuid::Uuid::from_u128(0xA));
     let executor = AgentId::from_uuid(uuid::Uuid::from_u128(0xB));
     online_agent(
@@ -62,7 +62,7 @@ async fn two_node_plan_assigns_b_only_after_a_is_done() {
     )
     .await;
 
-    // Tilaa tapahtumaväylä ENNEN ajoa, jotta näemme step_assigned-järjestyksen.
+    // Subscribe to the event bus BEFORE running, so we see the step_assigned order.
     let mut events = bridge.subscribe();
 
     // Suunnitelma: A (strategia) → B (suoritus), B riippuu A:sta ja vaatii
@@ -83,7 +83,7 @@ async fn two_node_plan_assigns_b_only_after_a_is_done() {
     let orch = Orchestrator::new(bridge.clone());
     let report = orch.run(&plan, now).await.expect("orchestration run");
 
-    // --- Lopputila: molemmat valmiita, järjestys A sitten B. ---------------
+    // --- Final state: both complete, order A then B. ---------------
     assert_eq!(report.completed.len(), 2, "both nodes must complete");
     assert_eq!(report.completed[0].0, NodeId::new("A"), "A runs first");
     assert_eq!(report.completed[1].0, NodeId::new("B"), "B runs second");
@@ -107,7 +107,7 @@ async fn two_node_plan_assigns_b_only_after_a_is_done() {
         "B must be created only after A reached Done"
     );
 
-    // --- Tapahtumajärjestys: step_assigned A:lle ennen B:tä. ---------------
+    // --- Event order: step_assigned for A before B. ---------------
     let mut assigned_order: Vec<AgentId> = Vec::new();
     while let Ok(Some(ev)) = events.try_recv() {
         if let familyclaw_bridge::EventKind::Custom(name) = &ev.kind {
@@ -127,12 +127,12 @@ async fn two_node_plan_assigns_b_only_after_a_is_done() {
 
 #[tokio::test]
 async fn dependent_node_blocks_when_predecessor_has_no_worker() {
-    // Jos A:lle ei ole kelvollista työntekijää, koko ajo epäonnistuu eikä B:tä
-    // koskaan osoiteta — riippuvuusketju ei etene ohi tyngän.
+    // If there is no eligible worker for A, the entire run fails and B is
+    // never assigned — the dependency chain does not advance past the stub.
     let bridge = FamilyBridge::new();
     let now = time::from_unix_secs(1_700_000_000).expect("valid timestamp");
 
-    // Vain executor on online; A vaatii Strategy-roolin → ei työntekijää A:lle.
+    // Only executor is online; A requires the Strategy role → no worker for A.
     let executor = AgentId::from_uuid(uuid::Uuid::from_u128(0xB));
     online_agent(
         &bridge,
@@ -161,7 +161,7 @@ async fn dependent_node_blocks_when_predecessor_has_no_worker() {
         .expect_err("A has no eligible worker");
     assert!(matches!(err, familyclaw_core::FamilyClawError::NotFound(_)));
 
-    // B:tä ei koskaan osoitettu: ainoalla online-agentilla ei ole tehtäviä.
+    // B was never assigned: the only online agent has no tasks.
     let executor_tasks = bridge.board().list_for_assignee(executor).await;
     assert!(
         executor_tasks.is_empty(),

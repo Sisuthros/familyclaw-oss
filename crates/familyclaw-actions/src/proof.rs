@@ -1,21 +1,21 @@
-//! Todistepaketti (proof bundle): suorituksen todennettava jälki, jossa
-//! salaisuudelta näyttävät arvot on redaktoitu (KERROS A).
+//! Proof bundle: a verifiable trace of an execution, in which values that
+//! look like secrets have been redacted (Layer A).
 //!
-//! Tämä moduuli toteuttaa:
-//! - [`redact_value`] — rekursiivinen redaktoija, joka korvaa salaisuudelta
-//!   näyttävät merkkijonot merkinnällä `[REDACTED]`,
-//! - [`RedactionReport`] — yhteenveto siitä, montako arvoa redaktoitiin ja
-//!   millä **kuvioiden nimillä** (ei arvoilla),
-//! - [`VerificationResult`] — jälkiehtotarkistuksen tulos,
-//! - [`ProofBundle`] — koottu todistepaketti, jossa syöte tiivistetään
-//!   ([`sha2::Sha256`]) eikä koskaan tallenneta raakana,
-//! - [`build_proof`] — apuri joka koostaa todistepaketin pyynnöstä,
-//!   tuloksesta, audit-tunnisteista ja verifioinnista, ajaen redaktoinnin.
+//! This module implements:
+//! - [`redact_value`] — a recursive redactor that replaces strings that look
+//!   like secrets with the marker `[REDACTED]`,
+//! - [`RedactionReport`] — a summary of how many values were redacted and
+//!   under which **pattern names** (not values),
+//! - [`VerificationResult`] — the result of a postcondition check,
+//! - [`ProofBundle`] — the assembled proof bundle, in which the input is
+//!   hashed ([`sha2::Sha256`]) and never stored raw,
+//! - [`build_proof`] — a helper that assembles a proof bundle from the
+//!   request, the result, audit identifiers, and verification, running redaction.
 //!
-//! ## OSS-raja
-//! Todistepaketti ei koskaan sisällä raakaa tokenia, API-avainta tai muuta
-//! salaisuutta: syöte tallennetaan vain SHA-256-tiivisteenä, ja sekä syöte-
-//! että tulostekentät redaktoidaan ennen pakettiin liittämistä.
+//! ## OSS boundary
+//! A proof bundle never contains a raw token, API key, or other secret: the
+//! input is stored only as a SHA-256 hash, and both the input and output
+//! fields are redacted before being attached to the bundle.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,14 +26,14 @@ use familyclaw_core::time::Timestamp;
 use crate::executor::{ActionRequest, ActionResult, ActionStatus};
 use crate::ids::{ActionId, ActionTaskId, AuditEventId, ProofBundleId, SkillId};
 
-/// Moduulin valmiusaste — säilytetään, jotta [`crate::all_modules_scaffolded`]
-/// kääntyy edelleen muiden moduulien rinnalla.
+/// Module readiness flag — kept so that [`crate::all_modules_scaffolded`]
+/// still compiles alongside the other modules.
 pub(crate) const SCAFFOLDED: bool = true;
 
-/// Korvausmerkki redaktoidulle arvolle.
+/// Replacement marker for a redacted value.
 const REDACTED: &str = "[REDACTED]";
 
-/// Avainnimien (case-insensitive) joukko, joiden **arvo** redaktoidaan aina.
+/// The set of key names (case-insensitive) whose **value** is always redacted.
 const SECRET_KEY_NAMES: &[&str] = &[
     "api_key",
     "apikey",
@@ -43,47 +43,48 @@ const SECRET_KEY_NAMES: &[&str] = &[
     "authorization",
 ];
 
-/// Yhteenveto suoritetusta redaktoinnista.
+/// A summary of a completed redaction.
 ///
-/// Sisältää redaktoitujen arvojen lukumäärän ja löydettyjen kuvioiden
-/// **nimet** (esim. `"sk-key"`, `"bearer"`, `"secret-key-name"`) — **ei
-/// koskaan arvoja**. Näin raportti itse on turvallinen tallentaa.
+/// Contains the count of redacted values and the **names** of the patterns
+/// found (e.g. `"sk-key"`, `"bearer"`, `"secret-key-name"`) — **never
+/// values**. This makes the report itself safe to store.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedactionReport {
-    /// Montako arvoa redaktoitiin.
+    /// How many values were redacted.
     pub redacted_count: usize,
-    /// Löydettyjen kuvioiden nimet (ei arvoja), aakkostettu ja uniikki.
+    /// The names of the patterns found (not values), sorted and deduplicated.
     pub patterns_found: Vec<String>,
 }
 
 impl RedactionReport {
-    /// Redaktoitiinko vähintään yksi arvo.
+    /// Whether at least one value was redacted.
     #[must_use]
     pub fn any_redacted(&self) -> bool {
         self.redacted_count > 0
     }
 }
 
-/// Tunnistaa salaisuudelta näyttävän merkkijonon ja palauttaa osuneen kuvion
-/// **nimen** (ei arvoa). `None` jos arvo ei näytä salaisuudelta.
+/// Detects a string that looks like a secret and returns the matched
+/// pattern's **name** (not the value). `None` if the value does not look
+/// like a secret.
 ///
-/// Tunnistetut kuviot:
-/// - `sk-[A-Za-z0-9]{8,}` (OpenAI-tyylinen avain) → `"sk-key"`,
-/// - `AKIA[0-9A-Z]{12,}` (AWS-tyylinen access key) → `"aws-access-key"`,
+/// Recognized patterns:
+/// - `sk-[A-Za-z0-9]{8,}` (OpenAI-style key) → `"sk-key"`,
+/// - `AKIA[0-9A-Z]{12,}` (AWS-style access key) → `"aws-access-key"`,
 /// - `Bearer <token>` → `"bearer"`,
-/// - pitkä heksa (≥32 heksamerkkiä) → `"long-hex"`,
-/// - base64-tyylinen ajo (≥24 merkkiä, sisältää `+`/`/`/`=`) → `"base64-blob"`.
+/// - a long hex run (≥32 hex characters) → `"long-hex"`,
+/// - a base64-style run (≥24 characters, contains `+`/`/`/`=`) → `"base64-blob"`.
 fn match_secret_pattern(value: &str) -> Option<&'static str> {
     let trimmed = value.trim();
 
-    // Bearer-token: "Bearer " + ainakin yksi merkki.
+    // Bearer token: "Bearer " + at least one character.
     if let Some(rest) = trimmed.strip_prefix("Bearer ") {
         if !rest.trim().is_empty() {
             return Some("bearer");
         }
     }
 
-    // sk-XXXXXXXX (≥8 aakkosnumeerista skn jälkeen).
+    // sk-XXXXXXXX (≥8 alphanumeric characters after "sk-").
     if let Some(rest) = trimmed.strip_prefix("sk-") {
         let run = rest.chars().take_while(char::is_ascii_alphanumeric).count();
         if run >= 8 {
@@ -91,7 +92,7 @@ fn match_secret_pattern(value: &str) -> Option<&'static str> {
         }
     }
 
-    // AKIA + 12+ isoa kirjainta/numeroa.
+    // AKIA + 12+ uppercase letters/digits.
     if let Some(rest) = trimmed.strip_prefix("AKIA") {
         let run = rest
             .chars()
@@ -102,13 +103,13 @@ fn match_secret_pattern(value: &str) -> Option<&'static str> {
         }
     }
 
-    // Pitkä heksa: ≥32 merkkiä, kaikki heksaa.
+    // Long hex: ≥32 characters, all hex digits.
     if trimmed.len() >= 32 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
         return Some("long-hex");
     }
 
-    // Base64-tyylinen: ≥24 merkkiä, sallitut merkit ja vähintään yksi
-    // base64-erikoismerkki (+ / =), jotta tavalliset sanat eivät osu.
+    // Base64-style: ≥24 characters, allowed characters, and at least one
+    // base64 special character (+ / =), so that ordinary words don't match.
     if trimmed.len() >= 24
         && trimmed.contains(['+', '/', '='])
         && trimmed
@@ -121,46 +122,46 @@ fn match_secret_pattern(value: &str) -> Option<&'static str> {
     None
 }
 
-/// Onko avainnimi (case-insensitive) tunnettu salaisuusavain.
+/// Whether the key name (case-insensitive) is a known secret key.
 fn is_secret_key_name(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     SECRET_KEY_NAMES.iter().any(|name| *name == lower)
 }
 
-/// Redaktoi salaisuudelta näyttävät osajonot vapaamuotoisesta tekstistä.
+/// Redacts substrings that look like secrets from free-form text.
 ///
-/// Toisin kuin [`match_secret_pattern`] (joka tutkii koko merkkijonon),
-/// tämä pilkkoo tekstin tyhjämerkeillä ja redaktoi yksittäiset *sanat*,
-/// jotka näyttävät salaisuudelta. Näin esim. ylävirran virheselite
-/// `"auth rejected: sk-livelivelive"` ei vuoda raakaa tokenia todisteeseen.
+/// Unlike [`match_secret_pattern`] (which examines the whole string), this
+/// splits the text on whitespace and redacts individual *words* that look
+/// like secrets. This way, e.g. an upstream error message
+/// `"auth rejected: sk-livelivelive"` does not leak a raw token into the proof.
 ///
-/// Lisäksi tunnistetaan kaksisanainen `Bearer <token>` -muoto, jolloin
-/// koko `Bearer …` korvataan, sekä `avain=arvo`- ja `avain: arvo` -muodot,
-/// joissa avaimen nimi on tunnettu salaisuusavain.
+/// It also recognizes the two-word `Bearer <token>` form, in which case the
+/// whole `Bearer …` is replaced, as well as `key=value` and `key: value`
+/// forms where the key name is a known secret key.
 ///
-/// Palauttaa redaktoidun tekstin ja kasvattaa annettua raporttia jokaisesta
-/// osumasta (raporttiin kirjataan vain kuvion **nimi**, ei arvoa).
+/// Returns the redacted text and increments the given report for every match
+/// (only the pattern's **name** is recorded in the report, not the value).
 fn redact_text(text: &str, report: &mut RedactionReport) -> String {
-    // 1. Substring-pass: redaktoi `Bearer <token>` missä tahansa tekstissä
-    //    (myös upotettuna esim. muotoon `header=Bearer xyz`).
+    // 1. Substring pass: redact `Bearer <token>` anywhere in the text
+    //    (also when embedded, e.g. in the form `header=Bearer xyz`).
     let bearer_redacted = redact_bearer_substrings(text, report);
 
-    // 2. Sanapass: pilko säilyttäen tyhjämerkit ja redaktoi yksittäiset
-    //    sanat (arvopohjaisesti) sekä `avain=arvo`-muodot.
+    // 2. Word pass: split preserving whitespace and redact individual
+    //    words (value-based) as well as `key=value` forms.
     let mut out = String::with_capacity(bearer_redacted.len());
     for chunk in bearer_redacted.split_inclusive(char::is_whitespace) {
-        // Erota sana ja sitä seuraava tyhjämerkki (jos on).
+        // Separate the word from the trailing whitespace (if any).
         let trimmed_end = chunk.trim_end_matches(char::is_whitespace);
         let trailing = &chunk[trimmed_end.len()..];
 
-        // "key=value" / "key:value" -muoto, jossa avain on salaisuusavain.
+        // "key=value" / "key:value" form, where the key is a secret key.
         if let Some(redacted_kv) = redact_keyed_token(trimmed_end, report) {
             out.push_str(&redacted_kv);
             out.push_str(trailing);
             continue;
         }
 
-        // Arvopohjainen tunnistus yksittäiselle sanalle.
+        // Value-based detection for a single word.
         match match_secret_pattern(trimmed_end) {
             Some(pattern) => {
                 report.redacted_count += 1;
@@ -175,9 +176,9 @@ fn redact_text(text: &str, report: &mut RedactionReport) -> String {
     out
 }
 
-/// Redaktoi kaikki `Bearer <token>` -esiintymät tekstistä — myös upotetut,
-/// esim. `Authorization: Bearer abc` tai `header=Bearer abc`. Korvaa
-/// `Bearer`-sanan jälkeisen tyhjämerkein erotetun tokenin merkinnällä.
+/// Redacts every `Bearer <token>` occurrence from the text — including
+/// embedded ones, e.g. `Authorization: Bearer abc` or `header=Bearer abc`.
+/// Replaces the whitespace-delimited token following the word `Bearer` with the marker.
 fn redact_bearer_substrings(text: &str, report: &mut RedactionReport) -> String {
     const MARKER: &str = "Bearer ";
     let mut out = String::with_capacity(text.len());
@@ -185,13 +186,13 @@ fn redact_bearer_substrings(text: &str, report: &mut RedactionReport) -> String 
 
     while let Some(pos) = rest.find(MARKER) {
         let after = &rest[pos + MARKER.len()..];
-        // Token = "Bearer "-merkin jälkeiset ei-tyhjämerkit.
+        // Token = the non-whitespace characters after the "Bearer " marker.
         let token_len = after
             .char_indices()
             .find(|(_, c)| c.is_whitespace())
             .map_or(after.len(), |(i, _)| i);
         if token_len == 0 {
-            // "Bearer " ilman tokenia — kopioi sellaisenaan ja jatka.
+            // "Bearer " without a token — copy as-is and continue.
             out.push_str(&rest[..pos + MARKER.len()]);
             rest = after;
             continue;
@@ -206,9 +207,9 @@ fn redact_bearer_substrings(text: &str, report: &mut RedactionReport) -> String 
     out
 }
 
-/// Redaktoi `avain=arvo` / `avain: arvo` -muotoisen sanan arvon, jos avaimen
-/// nimi (ennen erotinta) on tunnettu salaisuusavain. Palauttaa `None`, jos sana
-/// ei ole tällainen muoto.
+/// Redacts the value of a `key=value` / `key: value` form word, if the key
+/// name (before the separator) is a known secret key. Returns `None` if the
+/// word is not in this form.
 fn redact_keyed_token(word: &str, report: &mut RedactionReport) -> Option<String> {
     let sep = word.find(['=', ':'])?;
     let key = word[..sep].trim();
@@ -227,18 +228,18 @@ fn redact_keyed_token(word: &str, report: &mut RedactionReport) -> Option<String
     Some(format!("{key}{separator}{REDACTED}"))
 }
 
-/// Redaktoi salaisuudelta näyttävät arvot rekursiivisesti annetusta
-/// [`serde_json::Value`]-rakenteesta.
+/// Recursively redacts values that look like secrets from the given
+/// [`serde_json::Value`] structure.
 ///
-/// Palauttaa redaktoidun kopion sekä [`RedactionReport`]-yhteenvedon. Korvataan
-/// merkinnällä `[REDACTED]` jos:
-/// - merkkijonon arvo itse näyttää salaisuudelta (kuviotunnistus), tai
-/// - arvo on objektin kentässä, jonka **nimi** on tunnettu salaisuusavain
+/// Returns a redacted copy plus a [`RedactionReport`] summary. Replaced with
+/// the marker `[REDACTED]` if:
+/// - the string value itself looks like a secret (pattern detection), or
+/// - the value is in an object field whose **name** is a known secret key
 ///   (`api_key`, `apikey`, `secret`, `password`, `token`, `authorization`) —
-///   riippumatta arvon muodosta.
+///   regardless of the value's shape.
 ///
-/// Alkuperäistä syötettä ei muteta. Tuloraporttiin ei koskaan päädy raakoja
-/// salaisia arvoja, vain kuvioiden nimet.
+/// The original input is not mutated. The resulting report never contains
+/// raw secret values, only pattern names.
 #[must_use]
 pub fn redact_value(value: &Value) -> (Value, RedactionReport) {
     let mut report = RedactionReport::default();
@@ -248,12 +249,12 @@ pub fn redact_value(value: &Value) -> (Value, RedactionReport) {
     (redacted, report)
 }
 
-/// Sisäinen rekursio: `parent_key` on objektin kentän nimi jossa `value`
-/// sijaitsee (jos sellainen on), jotta avainnimipohjainen redaktointi toimii.
+/// Internal recursion: `parent_key` is the name of the object field where
+/// `value` resides (if any), so key-name-based redaction works.
 fn redact_inner(value: &Value, parent_key: Option<&str>, report: &mut RedactionReport) -> Value {
     match value {
         Value::String(s) => {
-            // Avainnimipohjainen redaktointi: kentän nimi paljastaa salaisuuden.
+            // Key-name-based redaction: the field name reveals the secret.
             if let Some(key) = parent_key {
                 if is_secret_key_name(key) && !s.is_empty() {
                     report.redacted_count += 1;
@@ -263,7 +264,7 @@ fn redact_inner(value: &Value, parent_key: Option<&str>, report: &mut RedactionR
                     return Value::String(REDACTED.to_string());
                 }
             }
-            // Arvopohjainen redaktointi: merkkijono näyttää salaisuudelta.
+            // Value-based redaction: the string looks like a secret.
             if let Some(pattern) = match_secret_pattern(s) {
                 report.redacted_count += 1;
                 report.patterns_found.push(pattern.to_string());
@@ -284,30 +285,30 @@ fn redact_inner(value: &Value, parent_key: Option<&str>, report: &mut RedactionR
             }
             Value::Object(out)
         }
-        // Luvut, totuusarvot ja null eivät voi olla salaisuuksia.
+        // Numbers, booleans, and null cannot be secrets.
         other => other.clone(),
     }
 }
 
-/// Redaktoi salaisuudelta näyttävät arvot **syvällä** rekursiivisesti annetusta
-/// [`serde_json::Value`]-rakenteesta — myös vapaamuotoiseen tekstiin **upotetut**
-/// salaisuudet.
+/// Recursively redacts values that look like secrets, **deeply**, from the
+/// given [`serde_json::Value`] structure — including secrets **embedded**
+/// in free-form text.
 ///
-/// Ero [`redact_value`]:hin: siinä missä [`redact_value`] redaktoi merkkijonon
-/// vain jos (a) sen kentän nimi on tunnettu salaisuusavain tai (b) **koko**
-/// merkkijono näyttää salaisuudelta, tämä variantti ajaa lisäksi
-/// `redact_text`-osajono­pass:in jokaiselle merkkijonolehdelle, joka ei jo
-/// mennyt kokonaan redaktoiduksi. Näin esim. vapaamuotoinen työkaluargumentti
-/// `{"prompt":"deploy using sk-livelivelivelive then ..."}` ei vuoda raakaa
-/// tokenia levylle, vaikka kentän nimi (`prompt`) ei ole salaisuusavain eikä
-/// koko arvo ole pelkkä token.
+/// Difference from [`redact_value`]: whereas [`redact_value`] redacts a
+/// string only if (a) its field name is a known secret key or (b) the
+/// **whole** string looks like a secret, this variant additionally runs the
+/// `redact_text` substring pass on every string leaf that was not already
+/// fully redacted. This way, e.g. a free-form tool argument
+/// `{"prompt":"deploy using sk-livelivelivelive then ..."}` does not leak a
+/// raw token to disk, even though the field name (`prompt`) is not a secret
+/// key and the whole value is not just a token.
 ///
-/// Käytetään jatkettavan vuoron ([`crate::ApprovalId`]-avaimella tallennettava
-/// resumable-turn) **levylle persistoitavan** viestipinon työkaluargumenteille,
-/// joissa salaisuus voi piillä mallin tuottaman vapaatekstin sisällä.
+/// Used for the tool arguments of the message stack that gets persisted to
+/// disk for a resumable turn (stored under the [`crate::ApprovalId`] key),
+/// where a secret may be hiding inside model-generated free text.
 ///
-/// Palauttaa redaktoidun kopion sekä [`RedactionReport`]-yhteenvedon. Alkuperäistä
-/// syötettä ei muteta, eikä raportti koskaan kanna raakoja salaisia arvoja.
+/// Returns a redacted copy plus a [`RedactionReport`] summary. The original
+/// input is not mutated, and the report never carries raw secret values.
 #[must_use]
 pub fn redact_value_deep(value: &Value) -> (Value, RedactionReport) {
     let mut report = RedactionReport::default();
@@ -317,9 +318,9 @@ pub fn redact_value_deep(value: &Value) -> (Value, RedactionReport) {
     (redacted, report)
 }
 
-/// Kuten [`redact_inner`], mutta merkkijonolehdille ajetaan lisäksi
-/// [`redact_text`]-osajono­pass, jotta vapaamuotoiseen tekstiin upotetut
-/// salaisuudet (esim. `"deploy using sk-live..."`) eivät jää redaktoimatta.
+/// Like [`redact_inner`], but string leaves additionally get the
+/// [`redact_text`] substring pass, so that secrets embedded in free-form
+/// text (e.g. `"deploy using sk-live..."`) do not go un-redacted.
 fn redact_inner_deep(
     value: &Value,
     parent_key: Option<&str>,
@@ -327,7 +328,7 @@ fn redact_inner_deep(
 ) -> Value {
     match value {
         Value::String(s) => {
-            // 1. Avainnimipohjainen redaktointi: kentän nimi paljastaa salaisuuden.
+            // 1. Key-name-based redaction: the field name reveals the secret.
             if let Some(key) = parent_key {
                 if is_secret_key_name(key) && !s.is_empty() {
                     report.redacted_count += 1;
@@ -337,16 +338,16 @@ fn redact_inner_deep(
                     return Value::String(REDACTED.to_string());
                 }
             }
-            // 2. Arvopohjainen redaktointi: koko merkkijono näyttää salaisuudelta.
+            // 2. Value-based redaction: the whole string looks like a secret.
             if let Some(pattern) = match_secret_pattern(s) {
                 report.redacted_count += 1;
                 report.patterns_found.push(pattern.to_string());
                 return Value::String(REDACTED.to_string());
             }
-            // 3. Osajono­pass: salaisuus UPOTETTUNA vapaamuotoiseen tekstiin.
-            //    Pilkkoo tyhjämerkeillä ja redaktoi yksittäiset salaisuussanat +
-            //    `Bearer …`/`avain=arvo`-muodot. Jos mikään ei osu, teksti palautuu
-            //    sellaisenaan (ei turhaa kopiota merkitykseltään).
+            // 3. Substring pass: a secret EMBEDDED in free-form text.
+            //    Splits on whitespace and redacts individual secret words +
+            //    `Bearer …`/`key=value` forms. If nothing matches, the text
+            //    is returned as-is (no unnecessary copy semantically).
             Value::String(redact_text(s, report))
         }
         Value::Array(items) => Value::Array(
@@ -362,22 +363,23 @@ fn redact_inner_deep(
             }
             Value::Object(out)
         }
-        // Luvut, totuusarvot ja null eivät voi olla salaisuuksia.
+        // Numbers, booleans, and null cannot be secrets.
         other => other.clone(),
     }
 }
 
-/// Redaktoi salaisuudelta näyttävät osajonot vapaamuotoisesta **tekstistä**
-/// (ei JSON-rakenteesta).
+/// Redacts substrings that look like secrets from free-form **text** (not a
+/// JSON structure).
 ///
-/// Tämä on julkinen kääre `redact_text`-osajono­passille, jotta `familyclaw-agent`
-/// voi redaktoida jatkettavan vuoron viestipinon **tekstisisällön** (system-/user-/
-/// tool-viestien `content`) ennen levylle persistointia. Pilkkoo tekstin
-/// tyhjämerkeillä ja redaktoi yksittäiset salaisuussanat sekä `Bearer <token>`-
-/// ja `avain=arvo`-muodot, joissa avain on tunnettu salaisuusavain.
+/// This is a public wrapper around the `redact_text` substring pass, so that
+/// `familyclaw-agent` can redact the **text content** of a resumable turn's
+/// message stack (system/user/tool messages' `content`) before persisting to
+/// disk. Splits the text on whitespace and redacts individual secret words as
+/// well as `Bearer <token>` and `key=value` forms where the key is a known
+/// secret key.
 ///
-/// Palauttaa redaktoidun tekstin sekä [`RedactionReport`]-yhteenvedon. Raportti
-/// kantaa vain kuvioiden **nimet**, ei koskaan raakoja arvoja.
+/// Returns the redacted text plus a [`RedactionReport`] summary. The report
+/// carries only pattern **names**, never raw values.
 #[must_use]
 pub fn redact_free_text(text: &str) -> (String, RedactionReport) {
     let mut report = RedactionReport::default();
@@ -387,13 +389,14 @@ pub fn redact_free_text(text: &str) -> (String, RedactionReport) {
     (redacted, report)
 }
 
-/// Laskee syötteen SHA-256-tiivisteen heksamerkkijonona.
+/// Computes the input's SHA-256 hash as a hex string.
 ///
-/// Syöte sarjallistetaan ensin kanoniseen JSON-muotoon. Tiiviste tallennetaan
-/// todisteeseen raakapayloadin sijasta, jottei salaisuus koskaan päädy levylle.
+/// The input is first serialized into canonical JSON form. The hash is
+/// stored in the proof instead of the raw payload, so the secret never ends
+/// up on disk.
 ///
 /// # Errors
-/// Palauttaa [`crate::ActionError::Proof`] jos syötteen sarjallistus epäonnistuu.
+/// Returns [`crate::ActionError::Proof`] if serializing the input fails.
 pub fn sha256_hex(value: &Value) -> crate::Result<String> {
     let bytes = serde_json::to_vec(value)
         .map_err(|e| crate::ActionError::Proof(format!("input serialize failed: {e}")))?;
@@ -402,22 +405,22 @@ pub fn sha256_hex(value: &Value) -> crate::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Jälkiehtotarkistuksen (verify-vaihe) tulos.
+/// The result of a postcondition check (the verify phase).
 ///
-/// Kuvaa tarkistettiinko tulos ja mitkä tarkistukset ajettiin. `notes` on
-/// vapaamuotoinen ihmisluettava selite (EI salaisuuksia).
+/// Describes whether the result was verified and which checks ran. `notes`
+/// is a free-form human-readable explanation (NOT secrets).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationResult {
-    /// Läpäisikö tulos verifioinnin.
+    /// Whether the result passed verification.
     pub verified: bool,
-    /// Ajettujen tarkistusten nimet/kuvaukset.
+    /// The names/descriptions of the checks that ran.
     pub checks: Vec<String>,
-    /// Vapaamuotoinen selite (EI salaisuuksia).
+    /// A free-form explanation (NOT secrets).
     pub notes: String,
 }
 
 impl VerificationResult {
-    /// Onnistunut verifiointi annetuilla tarkistuksilla.
+    /// A successful verification with the given checks.
     #[must_use]
     pub fn passed(checks: Vec<String>, notes: impl Into<String>) -> Self {
         Self {
@@ -427,7 +430,7 @@ impl VerificationResult {
         }
     }
 
-    /// Epäonnistunut verifiointi annetuilla tarkistuksilla.
+    /// A failed verification with the given checks.
     #[must_use]
     pub fn failed(checks: Vec<String>, notes: impl Into<String>) -> Self {
         Self {
@@ -438,59 +441,59 @@ impl VerificationResult {
     }
 }
 
-/// Koottu todistepaketti yhdestä suoritetusta toiminnosta.
+/// An assembled proof bundle from one executed action.
 ///
-/// Sisältää tiivistetyn syötteen, redaktoidun tulosteen, suoritusajat,
-/// viittaukset audit-tapahtumiin sekä verifiointi- ja redaktointiyhteenvedot.
-/// Paketti on suunniteltu tallennettavaksi sellaisenaan: se ei koskaan sisällä
-/// raakaa salaisuutta.
+/// Contains the hashed input, the redacted output, execution times,
+/// references to audit events, and the verification and redaction summaries.
+/// The bundle is designed to be stored as-is: it never contains a raw secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofBundle {
-    /// Todistepaketin yksilöivä tunniste.
+    /// The proof bundle's unique identifier.
     pub id: ProofBundleId,
-    /// Tehtävä jonka osana toiminto suoritettiin.
+    /// The task this action was executed as part of.
     pub task_id: ActionTaskId,
-    /// Suoritetun taidon tunniste.
+    /// The identifier of the executed skill.
     pub skill_id: SkillId,
-    /// Suoritetun toiminnon tunniste.
+    /// The identifier of the executed action.
     pub action_id: ActionId,
-    /// Toiminnon lopputila.
+    /// The action's final state.
     pub status: ActionStatus,
-    /// Suorituksen alkuhetki (injektoitu).
+    /// The execution start time (injected).
     pub started_at: Timestamp,
-    /// Suorituksen päättymishetki (injektoitu).
+    /// The execution finish time (injected).
     pub finished_at: Timestamp,
-    /// Syötteen SHA-256-tiiviste (heksa) — EI raakaa payloadia.
+    /// The input's SHA-256 hash (hex) — NOT the raw payload.
     pub input_hash: String,
-    /// Lyhyt ihmisluettava yhteenveto tuloksesta.
+    /// A short human-readable summary of the result.
     pub output_summary: String,
-    /// Redaktoitu tuloste (raaka tuloste salaisuudet poistettuna).
+    /// The redacted output (raw output with secrets removed).
     pub redacted_output: Value,
-    /// Onko tuloste peräisin epäluotettavasta lähteestä (taint).
+    /// Whether the output originates from an untrusted source (taint).
     pub untrusted: bool,
-    /// Tähän toimintoon liittyvien audit-tapahtumien tunnisteet.
+    /// The identifiers of the audit events associated with this action.
     pub audit_event_ids: Vec<AuditEventId>,
-    /// Verifiointivaiheen tulos.
+    /// The result of the verification phase.
     pub verification: VerificationResult,
-    /// Redaktointiyhteenveto (syöte + tuloste yhdistettynä).
+    /// The redaction summary (input + output combined).
     pub redaction: RedactionReport,
 }
 
-/// Koostaa [`ProofBundle`]:n pyynnöstä, tuloksesta, audit-tunnisteista ja
-/// verifioinnista.
+/// Assembles a [`ProofBundle`] from the request, the result, audit
+/// identifiers, and verification.
 ///
-/// Vaiheet:
-/// 1. laskee syötteen SHA-256-tiivisteen (raakapayloadia ei tallenneta),
-/// 2. redaktoi sekä syötteen että tulosteen ([`redact_value`]),
-/// 3. yhdistää redaktointiraportit yhdeksi,
-/// 4. säilyttää tulosteen `untrusted`-leiman sellaisenaan tuloksesta — luotettu
-///    lähde voi nollata sen jo [`ActionResult`]-tasolla.
+/// Steps:
+/// 1. compute the input's SHA-256 hash (the raw payload is not stored),
+/// 2. redact both the input and the output ([`redact_value`]),
+/// 3. merge the redaction reports into one,
+/// 4. preserve the output's `untrusted` flag as-is from the result — a
+///    trusted source can already clear it at the [`ActionResult`] level.
 ///
-/// Syötettä redaktoidaan vain raportointia varten; pakettiin tallennetaan vain
-/// tiiviste, ei (edes redaktoitua) syötettä, jotta payload ei vuoda muodossakaan.
+/// The input is redacted only for reporting purposes; only the hash is
+/// stored in the bundle, not the input (not even redacted), so the payload
+/// cannot leak even in that form.
 ///
 /// # Errors
-/// Palauttaa [`crate::ActionError::Proof`] jos syötteen tiivistys epäonnistuu.
+/// Returns [`crate::ActionError::Proof`] if hashing the input fails.
 pub fn build_proof(
     request: &ActionRequest,
     result: &ActionResult,
@@ -499,21 +502,21 @@ pub fn build_proof(
 ) -> crate::Result<ProofBundle> {
     let input_hash = sha256_hex(&request.payload)?;
 
-    // Redaktoi syöte (vain raporttia varten) ja tuloste (talletettavaksi).
+    // Redact the input (only for reporting) and the output (to be stored).
     let (_redacted_input, input_report) = redact_value(&request.payload);
     let (redacted_output, output_report) = redact_value(&result.raw_output_redacted);
 
-    // Yhdistä redaktointiraportit.
+    // Merge the redaction reports.
     let mut combined = RedactionReport {
         redacted_count: input_report.redacted_count + output_report.redacted_count,
         patterns_found: input_report.patterns_found,
     };
     combined.patterns_found.extend(output_report.patterns_found);
 
-    // Redaktoi myös vapaatekstikentät, jotka kopioidaan todisteeseen
-    // sellaisenaan (output_summary, verification.notes/checks). Nämä eivät
-    // kulje redact_value:n läpi koska ne ovat String-kenttiä, ei JSON-arvoja,
-    // joten ylävirran virheselite voisi muuten vuotaa raakaa tokenia.
+    // Also redact the free-text fields that get copied into the proof
+    // as-is (output_summary, verification.notes/checks). These don't go
+    // through redact_value because they are String fields, not JSON values,
+    // so an upstream error message could otherwise leak a raw token.
     let output_summary = redact_text(&result.output_summary, &mut combined);
     let VerificationResult {
         verified,
@@ -561,9 +564,9 @@ mod tests {
         from_unix_secs(secs).expect("valid unix seconds")
     }
 
-    /// Rakentaa salaisuudelta näyttävän arvon ajonaikaisella konkatenoinnilla,
-    /// jottei lähdekoodissa ole >=10-merkkistä literaalia salaisuus-kentän
-    /// vieressä (Layer B -audit) eikä oikeaa avainta.
+    /// Builds a value that looks like a secret via runtime concatenation, so
+    /// there is no >=10-character literal in the source code next to a
+    /// secret-looking field (Layer B audit), and no real key.
     fn fake_secret() -> String {
         format!("sk-{}", "live".repeat(4))
     }
@@ -606,7 +609,7 @@ mod tests {
 
     #[test]
     fn redacts_value_by_key_name() {
-        // Lyhyt, vaaraton arvo mutta salaisuusavaimen alla → silti redaktoidaan.
+        // A short, innocuous value but under a secret key → still redacted.
         let input = json!({ "api_key": "x", "user": "agent_a" });
         let (out, report) = redact_value(&input);
         assert_eq!(out["api_key"], json!(REDACTED));
@@ -628,13 +631,13 @@ mod tests {
 
     #[test]
     fn redact_value_misses_secret_embedded_in_free_text_but_deep_catches_it() {
-        // Tämä on juuri se aukko jonka defect #2 raportoi: salaisuus piilee
-        // SUUREMMAN vapaatekstin sisällä, kentän nimi EI ole salaisuusavain,
-        // eikä koko arvo ole pelkkä token. `redact_value` jättää sen raakana.
+        // This is exactly the gap that defect #2 reported: the secret hides
+        // inside a LARGER piece of free text, the field name is NOT a secret
+        // key, and the whole value is not just a token. `redact_value` leaves it raw.
         let secret = fake_secret();
         let input = json!({ "prompt": format!("deploy using {secret} then ship") });
 
-        // Vanha (matala) redaktointi EI nappaa upotettua salaisuutta.
+        // The old (shallow) redaction does NOT catch the embedded secret.
         let (shallow, shallow_report) = redact_value(&input);
         let shallow_json = serde_json::to_string(&shallow).expect("serialize");
         assert!(
@@ -643,7 +646,7 @@ mod tests {
         );
         assert!(!shallow_report.any_redacted());
 
-        // Uusi (syvä) redaktointi nappaa sen.
+        // The new (deep) redaction catches it.
         let (deep, deep_report) = redact_value_deep(&input);
         let deep_json = serde_json::to_string(&deep).expect("serialize");
         assert!(
@@ -652,15 +655,15 @@ mod tests {
         );
         assert!(deep_json.contains(REDACTED));
         assert!(deep_report.any_redacted());
-        // Ympäröivä vaaraton teksti säilyy luettavana.
+        // The surrounding innocuous text remains readable.
         assert!(deep_json.contains("deploy using"));
         assert!(deep_json.contains("then ship"));
     }
 
     #[test]
     fn redact_value_deep_still_redacts_keyed_and_whole_value_secrets() {
-        // Syvä variantti EI saa heikentää matalan redaktoinnin takeita:
-        // avainnimi- ja koko-arvo-redaktointi toimivat edelleen.
+        // The deep variant must NOT weaken the shallow redaction's
+        // guarantees: key-name and whole-value redaction still work.
         let secret = fake_secret();
         let input = json!({ "api_key": "x", "note": secret.clone(), "ok": "general" });
         let (out, report) = redact_value_deep(&input);
@@ -672,7 +675,7 @@ mod tests {
 
     #[test]
     fn redact_free_text_masks_embedded_secret_in_message_content() {
-        // user/system-viestin sisältö voi kantaa salaisuuden vapaatekstinä.
+        // A user/system message's content can carry a secret as free text.
         let secret = fake_secret();
         let content = format!("here is my key {secret} please use it");
         let (redacted, report) = redact_free_text(&content);
@@ -682,7 +685,7 @@ mod tests {
         );
         assert!(redacted.contains(REDACTED));
         assert!(report.any_redacted());
-        // Vaaraton teksti säilyy.
+        // Innocuous text remains.
         assert!(redacted.contains("here is my key"));
     }
 
@@ -711,7 +714,7 @@ mod tests {
         assert!(!bad.verified);
     }
 
-    /// Apuri: rakentaa suorituspyynnön testikäyttöön.
+    /// Helper: builds an execution request for test use.
     fn request(payload: Value) -> ActionRequest {
         ActionRequest::new(
             ActionId::new(),
@@ -763,11 +766,11 @@ mod tests {
 
     #[tokio::test]
     async fn secret_looking_input_is_redacted_in_proof() {
-        // Salaisuus rakennetaan ajonaikaisella konkatenoinnilla — ei literaalia lähteessä.
+        // The secret is built via runtime concatenation — no literal in the source.
         let secret = fake_secret();
         let payload = json!({ "to": "general", "note": secret.clone() });
 
-        // Suoritus kaiuttaa syötteen tulosteeseen (taintattu lähde).
+        // Execution echoes the input into the output (a tainted source).
         let exec = crate::executor::MockActionExecutor::succeeding(payload.clone());
         let req = request(payload);
         let result = exec.execute(req.clone()).await.expect("execute");
@@ -780,13 +783,13 @@ mod tests {
         )
         .expect("build proof");
 
-        // Tuloste redaktoitu.
+        // The output is redacted.
         let out = serde_json::to_string(&proof.redacted_output).expect("serialize output");
         assert!(out.contains(REDACTED));
         assert!(!out.contains(&secret));
         assert!(proof.redaction.any_redacted());
 
-        // Koko todiste (sis. input_hash) ei sisällä raakaa salaisuutta.
+        // The whole proof (incl. input_hash) does not contain the raw secret.
         let whole = serde_json::to_string(&proof).expect("serialize proof");
         assert!(!whole.contains(&secret));
     }
@@ -807,7 +810,7 @@ mod tests {
         .expect("build proof");
         assert!(proof.untrusted);
 
-        // Eksplisiittisesti luotettu lähde nollaa leiman.
+        // An explicitly trusted source clears the flag.
         let trusted_exec =
             crate::executor::MockActionExecutor::succeeding(json!({ "ok": true })).trusted();
         let trusted_result = trusted_exec.execute(req.clone()).await.expect("execute");
@@ -823,9 +826,9 @@ mod tests {
 
     #[tokio::test]
     async fn output_summary_leaking_secret_is_redacted() {
-        // Hyökkäys: ylävirran virheselite vuotaa tokenin output_summaryyn,
-        // joka kopioidaan todisteeseen vapaatekstinä. Tämä kenttä EI kulje
-        // redact_value:n läpi (se redaktoi vain JSON-arvot, ei String-kenttiä).
+        // Attack: an upstream error message leaks a token into output_summary,
+        // which gets copied into the proof as free text. This field does NOT
+        // go through redact_value (which only redacts JSON values, not String fields).
         let sk = fake_secret();
         let leaky_summary = format!("upstream auth rejected: {sk}");
 
@@ -850,8 +853,8 @@ mod tests {
 
     #[tokio::test]
     async fn verification_notes_and_checks_leaking_secret_are_redacted() {
-        // Hyökkäys: verifiointivaiheen notes/checks vuotaa tokenin
-        // todisteeseen vapaatekstinä — myös nämä kentät pitää redaktoida.
+        // Attack: the verification phase's notes/checks leak a token into
+        // the proof as free text — these fields must be redacted too.
         let sk = fake_secret();
         let bearer = format!("Bearer {}", "abcd".repeat(3));
 
@@ -883,7 +886,7 @@ mod tests {
 
     #[tokio::test]
     async fn proof_never_contains_raw_secret_values() {
-        // Useita salaisuusmuotoja eri kentissä, mukaan lukien salaisuusavain.
+        // Several secret forms in different fields, including a secret key.
         let sk = fake_secret();
         let bearer = format!("Bearer {}", "abcd".repeat(3));
         let hex = "a".repeat(40);
@@ -909,14 +912,14 @@ mod tests {
 
         let whole = serde_json::to_string(&proof).expect("serialize proof");
 
-        // Sarjallistettu todiste ei sisällä yhtäkään raakaa salaista arvoa.
+        // The serialized proof does not contain a single raw secret value.
         for needle in [&sk, &bearer, &hex] {
             assert!(
                 !whole.contains(needle.as_str()),
                 "proof must not contain raw secret: {needle}"
             );
         }
-        // Mutta redaktointimerkki on läsnä.
+        // But the redaction marker is present.
         assert!(whole.contains(REDACTED));
     }
 }

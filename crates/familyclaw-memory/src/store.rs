@@ -1,21 +1,21 @@
-//! Muistin tallennus: [`MemoryStore`]-trait ja [`LocalJsonStore`].
+//! Memory storage: the [`MemoryStore`] trait and [`LocalJsonStore`].
 //!
-//! [`MemoryStore`] on Eternal Threadin tallennusabstraktio: lisää, hae,
-//! päivitä elinkaaritila, suorita haku ja aja vaimennus-läpikäynti.
-//! Oletustoteutus [`LocalJsonStore`] pitää muistot muistissa ja persistoi
-//! ne JSON-tiedostoon atomisella kirjoituksella (tmp + rename).
+//! [`MemoryStore`] is Eternal Thread's storage abstraction: add, get,
+//! update lifecycle state, run retrieval, and run a decay pass.
+//! The default implementation [`LocalJsonStore`] keeps memories in memory
+//! and persists them to a JSON file with an atomic write (tmp + rename).
 //!
-//! ## Tuleva: `Surreal<Any>` feature-flagin takana
-//! Design (§2.3, §5) valitsee tuotantotallennukseksi SurrealDB:n
-//! (`Surreal<Any>`: in-mem dev / `RocksDB` prod). Se lisätään myöhemmin
-//! omana toteutuksenaan `surreal`-feature-flagin taakse — sama
-//! [`MemoryStore`]-rajapinta, eri backend. [`LocalJsonStore`] säilyy
-//! kevyenä, riippuvuusvapaana oletuksena (KERROS A toimii ilman natiivia
-//! tietokantaa).
+//! ## Future: `Surreal<Any>` behind a feature flag
+//! The design (§2.3, §5) selects `SurrealDB` as the production storage
+//! (`Surreal<Any>`: in-mem dev / `RocksDB` prod). It will be added later as
+//! its own implementation behind the `surreal` feature flag — the same
+//! [`MemoryStore`] interface, a different backend. [`LocalJsonStore`] remains
+//! a lightweight, dependency-free default (Layer A works without a native
+//! database).
 //!
-//! Trait käyttää natiivia `async fn`-syntaksia (Rust ≥ 1.75). `Send`-rajat
-//! varmistetaan testeissä, jotta toteutukset toimivat
-//! monisäikeisessä tokio-ajossa.
+//! The trait uses native `async fn` syntax (Rust >= 1.75). `Send` bounds
+//! are verified in tests, so implementations work in
+//! a multithreaded tokio runtime.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -30,33 +30,33 @@ use tokio::sync::RwLock;
 use crate::memory::{Memory, MemoryStatus};
 use crate::retrieval::{retrieve, RetrievalContext, RetrievalResult};
 
-/// Yhteenveto vaimennus-läpikäynnistä ([`MemoryStore::run_decay`]).
+/// Summary of a decay pass ([`MemoryStore::run_decay`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DecayReport {
-    /// Aktiivisesta arkistoon siirrettyjen muistojen määrä.
+    /// Number of memories moved from active to archived.
     pub archived: usize,
-    /// Arkistosta haudattujen (tombstoned) muistojen määrä.
+    /// Number of memories tombstoned from archived.
     pub tombstoned: usize,
-    /// Läpikäytyjen muistojen kokonaismäärä.
+    /// Total number of memories scanned.
     pub scanned: usize,
 }
 
-/// Kynnysarvot vaimennus-läpikäynnille.
+/// Thresholds for a decay pass.
 ///
-/// Retention putoaa ajan myötä; kun se alittaa kynnyksen, muisto siirtyy
-/// elinkaaren seuraavaan vaiheeseen. Suojattua ydintä
-/// ([`crate::DecayPolicy::ProtectedCore`]) ei koskaan siirretä.
+/// Retention drops over time; when it falls below the threshold, the
+/// memory moves to the next lifecycle stage. A protected core
+/// ([`crate::DecayPolicy::ProtectedCore`]) is never moved.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DecayThresholds {
-    /// Retention alapuolella aktiivinen muisto arkistoidaan.
+    /// Below this retention, an active memory is archived.
     pub archive_below: f32,
-    /// Retention alapuolella arkistoitu muisto haudataan.
+    /// Below this retention, an archived memory is tombstoned.
     pub tombstone_below: f32,
 }
 
 impl DecayThresholds {
-    /// Rakentaa kynnykset puristaen molemmat välille `0.0..=1.0` ja
-    /// varmistaen `tombstone_below <= archive_below`.
+    /// Builds the thresholds, clamping both to `0.0..=1.0` and
+    /// ensuring `tombstone_below <= archive_below`.
     #[must_use]
     pub fn new(archive_below: f32, tombstone_below: f32) -> Self {
         let archive = clamp_unit(archive_below, 0.4);
@@ -69,13 +69,13 @@ impl DecayThresholds {
 }
 
 impl Default for DecayThresholds {
-    /// Oletus: arkistoi alle `0.4`, hautaa alle `0.1`.
+    /// Default: archive below `0.4`, tombstone below `0.1`.
     fn default() -> Self {
         Self::new(0.4, 0.1)
     }
 }
 
-/// Puristaa arvon välille `0.0..=1.0`; kelvoton → `fallback`.
+/// Clamps a value to `0.0..=1.0`; invalid → `fallback`.
 fn clamp_unit(x: f32, fallback: f32) -> f32 {
     if x.is_finite() {
         x.clamp(0.0, 1.0)
@@ -88,77 +88,77 @@ fn clamp_unit(x: f32, fallback: f32) -> f32 {
 /// Lifetime `'a` captures the borrow of `&self` so returned futures can reference `self`.
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Muistin tallennusabstraktio.
+/// Memory storage abstraction.
 ///
-/// Toteutukset vastaavat persistoinnista ja samanaikaisuudesta. Kaikki
-/// metodit ovat asynkronisia, jotta tietokantapohjaiset backendit
-/// (`Surreal<Any>`) mahtuvat samaan rajapintaan.
+/// Implementations are responsible for persistence and concurrency. All
+/// methods are asynchronous, so database-backed backends
+/// (`Surreal<Any>`) fit the same interface.
 pub trait MemoryStore: Send + Sync {
-    /// Lisää muiston tallennukseen ja palauttaa sen tunnisteen.
+    /// Adds a memory to storage and returns its identifier.
     ///
     /// # Errors
-    /// [`FamilyClawError::Memory`] jos tallennus epäonnistuu.
+    /// [`FamilyClawError::Memory`] if the write fails.
     fn add(&self, memory: Memory) -> BoxFuture<'_, Result<MessageId>>;
 
-    /// Hakee muiston tunnisteella, tai `None` jos ei löydy.
+    /// Retrieves a memory by identifier, or `None` if not found.
     ///
     /// # Errors
-    /// [`FamilyClawError::Memory`] jos haku epäonnistuu.
+    /// [`FamilyClawError::Memory`] if the read fails.
     fn get(&self, id: MessageId) -> BoxFuture<'_, Result<Option<Memory>>>;
 
-    /// Korvaa olemassa olevan muiston (sama `id`).
+    /// Replaces an existing memory (same `id`).
     ///
     /// # Errors
-    /// [`FamilyClawError::NotFound`] jos tunnistetta ei ole, tai
-    /// [`FamilyClawError::Memory`] tallennusvirheestä.
+    /// [`FamilyClawError::NotFound`] if the identifier doesn't exist, or
+    /// [`FamilyClawError::Memory`] on a storage error.
     fn update(&self, memory: Memory) -> BoxFuture<'_, Result<()>>;
 
-    /// Vahvistaa muiston (nostaa retention + tärkeyttä) hetkeen `at`.
+    /// Reinforces a memory (raises retention + importance) at time `at`.
     ///
     /// # Errors
-    /// [`FamilyClawError::NotFound`] jos tunnistetta ei ole.
+    /// [`FamilyClawError::NotFound`] if the identifier doesn't exist.
     fn reinforce(&self, id: MessageId, at: Timestamp) -> BoxFuture<'_, Result<()>>;
 
-    /// Asettaa muiston elinkaaritilan suoraan.
+    /// Sets a memory's lifecycle state directly.
     ///
     /// # Errors
-    /// [`FamilyClawError::NotFound`] jos tunnistetta ei ole.
+    /// [`FamilyClawError::NotFound`] if the identifier doesn't exist.
     fn set_status(&self, id: MessageId, status: MemoryStatus) -> BoxFuture<'_, Result<()>>;
 
-    /// Palauttaa kaikki muistot (myös arkistoidut/haudatut).
+    /// Returns all memories (including archived/tombstoned).
     ///
     /// # Errors
-    /// [`FamilyClawError::Memory`] jos luku epäonnistuu.
+    /// [`FamilyClawError::Memory`] if the read fails.
     fn all(&self) -> BoxFuture<'_, Result<Vec<Memory>>>;
 
-    /// Muistojen kokonaismäärä.
+    /// Total number of memories.
     ///
     /// # Errors
-    /// [`FamilyClawError::Memory`] jos luku epäonnistuu.
+    /// [`FamilyClawError::Memory`] if the read fails.
     fn len(&self) -> BoxFuture<'_, Result<usize>>;
 
-    /// Onko tallennus tyhjä.
+    /// Whether storage is empty.
     ///
     /// # Errors
-    /// [`FamilyClawError::Memory`] jos luku epäonnistuu.
+    /// [`FamilyClawError::Memory`] if the read fails.
     fn is_empty(&self) -> BoxFuture<'_, Result<bool>>;
 
-    /// Suorittaa haun annetulla kontekstilla ajanhetkellä `at`.
+    /// Runs retrieval with the given context at time `at`.
     ///
     /// # Errors
-    /// [`FamilyClawError::Memory`] jos luku epäonnistuu.
+    /// [`FamilyClawError::Memory`] if the read fails.
     fn retrieve(
         &self,
         ctx: &RetrievalContext,
         at: Timestamp,
     ) -> BoxFuture<'_, Result<Vec<RetrievalResult>>>;
 
-    /// Ajaa vaimennus-läpikäynnin hetkeen `at`: siirtää alle kynnyksen
-    /// pudonneet muistot arkistoon ja haudattaviksi. Suojattua ydintä ei
-    /// koskaan siirretä.
+    /// Runs a decay pass at time `at`: moves memories that have fallen
+    /// below the threshold to archived and tombstoned. A protected core is
+    /// never moved.
     ///
     /// # Errors
-    /// [`FamilyClawError::Memory`] jos tallennus epäonnistuu.
+    /// [`FamilyClawError::Memory`] if the write fails.
     fn run_decay(
         &self,
         thresholds: DecayThresholds,
@@ -166,27 +166,27 @@ pub trait MemoryStore: Send + Sync {
     ) -> BoxFuture<'_, Result<DecayReport>>;
 }
 
-/// JSON-tiedostoon persistoiva muistitallennus.
+/// Memory storage persisted to a JSON file.
 ///
-/// Pitää muistot muistissa [`RwLock`]-suojattuna ja kirjoittaa ne levylle
-/// atomisesti (tmp-tiedosto + `rename`) jokaisen mutaation jälkeen. Tämä on
-/// KERROS A:n riippuvuusvapaa oletustoteutus — ei vaadi natiivia
-/// tietokantaa eikä C/C++-toolchainia (vrt. design §5: rajoitetulla
-/// kohdekoneella ei välttämättä ole RocksDB-toolchainia).
+/// Keeps memories in memory protected by an [`RwLock`] and writes them to
+/// disk atomically (tmp file + `rename`) after every mutation. This is
+/// Layer A's dependency-free default implementation — it requires no
+/// native database or C/C++ toolchain (cf. design §5: a constrained
+/// target machine may not have a `RocksDB` toolchain).
 #[derive(Debug)]
 pub struct LocalJsonStore {
-    /// Tiedoston polku, tai `None` jos puhtaasti muistinvarainen.
+    /// The file path, or `None` if purely in-memory.
     path: Option<PathBuf>,
-    /// Muistit tunnisteittain.
+    /// Memories by identifier.
     memories: RwLock<HashMap<MessageId, Memory>>,
 }
 
-/// JSON-tiedoston levymuoto (versioitu eteenpäinyhteensopivuutta varten).
+/// On-disk format of the JSON file (versioned for forward compatibility).
 #[derive(Debug, Serialize, Deserialize)]
 struct DiskFormat {
-    /// Tiedostoformaatin versio.
+    /// File format version.
     version: u32,
-    /// Tallennetut muistot.
+    /// Stored memories.
     memories: Vec<Memory>,
 }
 
@@ -195,7 +195,7 @@ impl DiskFormat {
 }
 
 impl LocalJsonStore {
-    /// Luo puhtaasti muistinvaraisen tallennuksen (ei levypersistointia).
+    /// Creates a purely in-memory storage (no disk persistence).
     #[must_use]
     pub fn in_memory() -> Self {
         Self {
@@ -204,14 +204,14 @@ impl LocalJsonStore {
         }
     }
 
-    /// Avaa (tai luo) JSON-tallennuksen annetusta polusta.
+    /// Opens (or creates) JSON storage at the given path.
     ///
-    /// Jos tiedosto on olemassa, sen muistot ladataan. Jos ei, tallennus
-    /// alkaa tyhjänä ja tiedosto luodaan ensimmäisellä kirjoituksella.
+    /// If the file exists, its memories are loaded. If not, storage
+    /// starts empty and the file is created on the first write.
     ///
     /// # Errors
-    /// [`FamilyClawError::Io`] jos olemassa olevaa tiedostoa ei voi lukea,
-    /// tai [`FamilyClawError::Serde`] jos sen sisältö on kelvotonta JSON:ia.
+    /// [`FamilyClawError::Io`] if an existing file cannot be read,
+    /// or [`FamilyClawError::Serde`] if its content is invalid JSON.
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let memories = if path.exists() {
@@ -227,15 +227,15 @@ impl LocalJsonStore {
         })
     }
 
-    /// Persistoi nykyisen tilan levylle atomisesti, jos polku on asetettu.
+    /// Persists the current state to disk atomically, if a path is set.
     ///
-    /// Kutsuja pitää lukon; tämä ottaa snapshotin annetusta kartasta.
+    /// The caller holds the lock; this takes a snapshot of the given map.
     async fn persist(&self, map: &HashMap<MessageId, Memory>) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
         let mut memories: Vec<Memory> = map.values().cloned().collect();
-        // Vakaa järjestys diffattavaa, deterministista tiedostoa varten.
+        // Stable order for a diffable, deterministic file.
         memories.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         let disk = DiskFormat {
             version: DiskFormat::CURRENT_VERSION,
@@ -243,18 +243,19 @@ impl LocalJsonStore {
         };
         let json = serde_json::to_string_pretty(&disk)?;
 
-        // Atominen kirjoitus: kirjoita tmp-tiedostoon, sitten rename.
+        // Atomic write: write to a tmp file, then rename.
         let tmp = tmp_path(path);
         tokio::fs::write(&tmp, json.as_bytes()).await?;
         tokio::fs::rename(&tmp, path).await?;
         Ok(())
     }
 
-    /// Lukee koko levytilan kartaksi. Olematon tiedosto → tyhjä kartta.
+    /// Reads the entire disk state into a map. A missing file → empty map.
     ///
-    /// Tämä on read-modify-write-syklin LUKU-vaihe: ennen jokaista mutaatiota
-    /// levyltä luetaan tuorein tila, jotta toisen kahvan kirjoitukset eivät
-    /// häviä (lost update). Kutsutaan vain kun lukko on hallussa.
+    /// This is the READ phase of the read-modify-write cycle: before every
+    /// mutation, the latest state is read from disk so that another
+    /// handle's writes are not lost (lost update). Called only while
+    /// holding the lock.
     async fn read_disk(path: &Path) -> Result<HashMap<MessageId, Memory>> {
         if !path.exists() {
             return Ok(HashMap::new());
@@ -267,118 +268,121 @@ impl LocalJsonStore {
         Ok(disk.memories.into_iter().map(|m| (m.id, m)).collect())
     }
 
-    /// Suorittaa mutaation prosessien-välisen lukon alla read-modify-write-
-    /// semantiikalla. Ratkaisee `concurrent-writers`-aukon: kaksi erillistä
-    /// kahvaa (tai prosessia) samaan polkuun eivät enää klobbaa toisiaan.
+    /// Runs a mutation under an inter-process lock with read-modify-write
+    /// semantics. Resolves the `concurrent-writers` gap: two separate
+    /// handles (or processes) pointed at the same path no longer clobber
+    /// each other.
     ///
-    /// Vaiheet (file-backed-tilassa):
-    /// 1. hanki yksinoikeuslukko (`<path>.lock`),
-    /// 2. lataa levyltä tuorein tila sisäiseen karttaan (näe toisten kirjoitukset),
-    /// 3. aja `mutate` joka muokkaa karttaa ja tuottaa tuloksen,
-    /// 4. persistoi koko kartta atomisesti (tmp + rename),
-    /// 5. vapauta lukko (Drop).
+    /// Steps (in file-backed mode):
+    /// 1. acquire the exclusive lock (`<path>.lock`),
+    /// 2. load the latest state from disk into the in-memory map (see other writes),
+    /// 3. run `mutate`, which modifies the map and produces a result,
+    /// 4. persist the entire map atomically (tmp + rename),
+    /// 5. release the lock (Drop).
     ///
-    /// Muistinvaraisessa tilassa (`path == None`) lukkoa/lataus ei tarvita:
-    /// yksi [`RwLock`]-suojattu kartta on jo ainoa totuus.
+    /// In in-memory mode (`path == None`), no lock/load is needed: the
+    /// single [`RwLock`]-protected map is already the sole source of truth.
     ///
     /// # Errors
-    /// Välittää `mutate`-virheen tai IO/serde-virheen lataus/persistointi-
-    /// vaiheesta. Lukko vapautuu virhetilanteessakin (RAII).
+    /// Propagates the `mutate` error or an IO/serde error from the
+    /// load/persist phase. The lock is released even on error (RAII).
     async fn with_write_lock<T, F>(&self, mutate: F) -> Result<T>
     where
         F: FnOnce(&mut HashMap<MessageId, Memory>) -> Result<T>,
     {
         let Some(path) = self.path.clone() else {
-            // Muistinvarainen: ei levyä koordinoitavaksi.
+            // In-memory: no disk to coordinate.
             let mut guard = self.memories.write().await;
             return mutate(&mut guard);
         };
 
-        // 1. yksinoikeuslukko koko mutaation ajaksi.
+        // 1. exclusive lock for the duration of the mutation.
         let _lock = FileLock::acquire(&path).await?;
 
-        // 2. lataa tuorein levytila (toisen kahvan kirjoitukset mukaan).
+        // 2. load the latest disk state (including other handles' writes).
         let disk = Self::read_disk(&path).await?;
         let mut guard = self.memories.write().await;
         *guard = disk;
 
-        // 3. aja mutaatio tuoreen tilan päällä.
+        // 3. run the mutation on top of the fresh state.
         let out = mutate(&mut guard)?;
 
-        // 4. persistoi koko kartta atomisesti.
+        // 4. persist the entire map atomically.
         self.persist(&guard).await?;
 
-        // 5. lukko vapautuu tässä (_lock Drop).
+        // 5. the lock is released here (_lock Drop).
         Ok(out)
     }
 
-    /// Palauttaa tallennustiedoston polun (tai `None` jos muistinvarainen).
+    /// Returns the storage file path (or `None` if in-memory).
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
 }
 
-/// Johtaa väliaikaistiedoston polun (`<path>.tmp`).
+/// Derives the temporary file path (`<path>.tmp`).
 fn tmp_path(path: &Path) -> PathBuf {
     let mut os = path.as_os_str().to_os_string();
     os.push(".tmp");
     PathBuf::from(os)
 }
 
-/// Johtaa lukkotiedoston polun (`<path>.lock`).
+/// Derives the lock file path (`<path>.lock`).
 fn lock_path(path: &Path) -> PathBuf {
     let mut os = path.as_os_str().to_os_string();
     os.push(".lock");
     PathBuf::from(os)
 }
 
-/// Prosessien-välinen yksinoikeuslukko luotuna `create_new`-lukkotiedostona.
+/// An inter-process exclusive lock implemented as a `create_new` lock file.
 ///
-/// Klassinen lockfile-mutex: lukon hankinta onnistuu vain jos lukkotiedostoa
-/// EI vielä ole (`OpenOptions::create_new` epäonnistuu
-/// [`io::ErrorKind::AlreadyExists`] jos toinen kahva/prosessi pitää lukkoa).
-/// Lukko vapautuu [`Drop`]issa poistamalla tiedosto. Tämä koordinoi
-/// *erillisiä* [`LocalJsonStore`]-kahvoja samaan polkuun — myös eri
-/// prosesseissa — ilman `unsafe`-FFI:tä (työtilan lint `unsafe_code = forbid`).
+/// A classic lockfile mutex: acquiring the lock succeeds only if the lock
+/// file does NOT already exist (`OpenOptions::create_new` fails with
+/// [`io::ErrorKind::AlreadyExists`] if another handle/process holds the
+/// lock). The lock is released in [`Drop`] by deleting the file. This
+/// coordinates *separate* [`LocalJsonStore`] handles pointed at the same
+/// path — including across processes — without `unsafe` FFI (workspace lint
+/// `unsafe_code = forbid`).
 ///
-/// Lukon hankinta on synkroninen ja nopea (tiedoston luonti), joten se
-/// suoritetaan blokkaavasti lyhyellä viiveellä uudelleenyrityksen välissä.
-/// Kuollut lukko (esim. kaatunut prosessi joka ei ehtinyt poistaa tiedostoa)
-/// purkautuu vanhenemis-ikkunan jälkeen: liian vanha lukkotiedosto otetaan
-/// haltuun. Tämä estää pysyvän deadlockin kaatumisen jälkeen.
+/// Acquiring the lock is synchronous and fast (file creation), so it is
+/// performed in a blocking manner with a short delay between retries. A
+/// dead lock (e.g. a crashed process that didn't get to delete the file)
+/// is broken after a staleness window: a lock file that is too old is
+/// taken over. This prevents a permanent deadlock after a crash.
 struct FileLock {
     lock_path: PathBuf,
 }
 
 impl FileLock {
-    /// Lukon vanhenemisaika: jos lukkotiedosto on tätä vanhempi, oletetaan
-    /// pitäjän kaatuneen ja otetaan lukko haltuun (steal). Mutaatiot ovat
-    /// alle millisekunteja, joten 30 s on reilusti turvallinen yläraja.
+    /// Lock staleness duration: if the lock file is older than this, its
+    /// holder is assumed to have crashed and the lock is taken over
+    /// (steal). Mutations take under a millisecond, so 30s is a comfortably
+    /// safe upper bound.
     const STALE_AFTER: Duration = Duration::from_secs(30);
 
-    /// Lukituksen uudelleenyritysväli odotettaessa toista pitäjää.
+    /// Retry delay while waiting for another holder to release the lock.
     const RETRY_DELAY: Duration = Duration::from_millis(2);
 
-    /// Hankkii yksinoikeuslukon `<data_path>`:lle. Blokkaa kunnes lukko on
-    /// vapaa (tai vanhentunut). Ajetaan blokkaavassa tokio-tehtävässä, jotta
-    /// async-suoritin ei jää jumiin.
+    /// Acquires the exclusive lock for `<data_path>`. Blocks until the lock
+    /// is free (or stale). Run in a blocking tokio task so the async
+    /// executor is not stalled.
     ///
     /// # Errors
-    /// [`FamilyClawError::Io`] jos lukkotiedoston luonti epäonnistuu muusta
-    /// syystä kuin "olemassa jo".
+    /// [`FamilyClawError::Io`] if creating the lock file fails for a reason
+    /// other than "already exists".
     async fn acquire(data_path: &Path) -> Result<Self> {
         let lock_path = lock_path(data_path);
         let probe = lock_path.clone();
-        // Lukon hankinta on synkronista tiedostotoimintaa → spawn_blocking,
-        // ettei estä async-suoritinta.
+        // Acquiring the lock is synchronous file I/O → spawn_blocking,
+        // so it doesn't block the async executor.
         tokio::task::spawn_blocking(move || Self::acquire_blocking(&probe))
             .await
             .map_err(|e| FamilyClawError::memory(format!("lock task join failed: {e}")))?
             .map(|()| Self { lock_path })
     }
 
-    /// Synkroninen lukituslogiikka (spin + steal-on-stale).
+    /// Synchronous locking logic (spin + steal-on-stale).
     fn acquire_blocking(lock_path: &Path) -> Result<()> {
         use std::io::ErrorKind;
         loop {
@@ -389,12 +393,12 @@ impl FileLock {
             {
                 Ok(_file) => return Ok(()),
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    // Joku pitää lukkoa. Tarkista vanheneminen: jos lukkotiedosto
-                    // on liian vanha, pitäjä on todennäköisesti kaatunut →
-                    // poista ja yritä uudelleen. Muuten odota lyhyesti.
+                    // Someone else holds the lock. Check staleness: if the
+                    // lock file is too old, its holder has likely crashed →
+                    // remove it and retry. Otherwise wait briefly.
                     if Self::is_stale(lock_path) {
-                        // Best-effort steal: ohitetaan virhe (toinen säie ehti
-                        // ehkä ottaa sen samaan aikaan) ja yritetään uudelleen.
+                        // Best-effort steal: ignore the error (another
+                        // thread may have taken it at the same time) and retry.
                         let _ = std::fs::remove_file(lock_path);
                     }
                     std::thread::sleep(Self::RETRY_DELAY);
@@ -404,7 +408,7 @@ impl FileLock {
         }
     }
 
-    /// Onko lukkotiedosto vanhentunut (pitäjä oletettavasti kaatunut)?
+    /// Is the lock file stale (its holder presumably crashed)?
     fn is_stale(lock_path: &Path) -> bool {
         std::fs::metadata(lock_path)
             .and_then(|m| m.modified())
@@ -414,8 +418,8 @@ impl FileLock {
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        // Vapauta lukko poistamalla tiedosto. Best-effort: jos poisto
-        // epäonnistuu, vanhenemis-ikkuna purkaa lukon myöhemmin.
+        // Release the lock by deleting the file. Best-effort: if deletion
+        // fails, the staleness window will break the lock later.
         let _ = std::fs::remove_file(&self.lock_path);
     }
 }
@@ -423,16 +427,16 @@ impl Drop for FileLock {
 impl MemoryStore for LocalJsonStore {
     fn add(&self, memory: Memory) -> BoxFuture<'_, Result<MessageId>> {
         let id = memory.id;
-        // Koko read-modify-write ajetaan prosessien-välisen lukon alla:
-        // levyltä ladataan tuorein tila ENNEN insertointia, joten toisen
-        // kahvan samanaikainen kirjoitus ei häviä (concurrent-writers-fix).
+        // The entire read-modify-write runs under the inter-process lock:
+        // the latest state is loaded from disk BEFORE inserting, so a
+        // concurrent write from another handle is not lost (concurrent-writers fix).
         let this = self;
         Box::pin(async move {
             this.with_write_lock(move |map| {
-                // Idempotentti kirjaus: jos samalla turn_key:llä on jo muisto
-                // (ladatussa tuoreessa tilassa), ohita (dual-write-suoja:
-                // durable.step voi onnistua vaikka memory_store.add ei ehdi
-                // ennen kaatumista).
+                // Idempotent write: if a memory with the same turn_key
+                // already exists (in the freshly loaded state), skip it
+                // (dual-write protection: durable.step may succeed even if
+                // memory_store.add doesn't complete before a crash).
                 if let Some(ref key) = memory.turn_key {
                     let exists = map.values().any(|m| m.turn_key.as_ref() == Some(key));
                     if exists {
@@ -442,9 +446,9 @@ impl MemoryStore for LocalJsonStore {
                 map.insert(id, memory);
 
                 // ── verification-gated: write-verify ────────────────────────────
-                // Varmista että muisto on varmasti kartassa. LocalJsonStoressa
-                // tämä on defensiivinen tarkistus (HashMap.insert epäonnistuu
-                // vain muistin loppuessa); SurrealDB-toteutuksessa kriittinen.
+                // Confirm the memory is actually in the map. In LocalJsonStore
+                // this is a defensive check (HashMap.insert fails
+                // only on out-of-memory); critical in a SurrealDB implementation.
                 if !map.contains_key(&id) {
                     return Err(FamilyClawError::Memory(
                         "write-verify failed: memory not found after insert".into(),
@@ -557,7 +561,7 @@ impl MemoryStore for LocalJsonStore {
                 let mut report = DecayReport::default();
                 for memory in map.values_mut() {
                     report.scanned += 1;
-                    // Suojattu ydin ohitetaan kokonaan.
+                    // A protected core is skipped entirely.
                     if memory.decay_policy.is_protected() {
                         continue;
                     }
@@ -585,35 +589,35 @@ impl MemoryStore for LocalJsonStore {
     }
 }
 
-/// Vektoritason laajennus [`MemoryStore`]-toteutuksille (Phase 3b).
+/// Vector-tier extension for [`MemoryStore`] implementations (Phase 3b).
 ///
-/// Tämä trait erottaa vektorien tallennuksen ja lähimmän naapurin haun
-/// [`MemoryStore`]-perusrajapinnasta, jotta semanttinen tier voidaan toteuttaa
-/// (esim. embedded-LanceDB) erillisessä cratessa ilman että `MemoryStore`-pohja
-/// muuttuu. Käytössä vain `vector-store`-feature päällä; oletuskäännös on
-/// tavu-identtinen tämän laajennuksen kanssa ja ilman.
+/// This trait separates vector storage and nearest-neighbor search from the
+/// [`MemoryStore`] base interface, so a semantic tier can be implemented
+/// (e.g. embedded LanceDB) in a separate crate without changing the
+/// `MemoryStore` foundation. Used only when the `vector-store` feature is
+/// enabled; the default build is byte-identical with and without this extension.
 ///
-/// Vektorit ovat [`crate::memory::Memory::embedding`]-kentän sisältöä, ja haun
-/// tulokset syöttävät [`crate::retrieval::RetrievalContext`]-cosine-polun.
+/// Vectors are the contents of the [`crate::memory::Memory::embedding`] field, and
+/// search results feed the [`crate::retrieval::RetrievalContext`] cosine path.
 #[cfg(feature = "vector-store")]
 pub trait VectorStore: Send + Sync {
-    /// Tallentaa tai päivittää annetun muistin id:n embedding-vektorin.
+    /// Stores or updates the embedding vector for the given memory id.
     ///
     /// # Errors
-    /// Palauttaa virheen jos vektorin kirjoitus epäonnistuu.
+    /// Returns an error if writing the vector fails.
     fn upsert_vector(&self, id: MessageId, embedding: Vec<f32>) -> BoxFuture<'_, Result<()>>;
 
-    /// Palauttaa `k` lähintä `(id, cosine-score)`-paria kyselyvektorille,
-    /// lasketaan suurimmasta similariteetista pienimpään.
+    /// Returns the `k` nearest `(id, cosine-score)` pairs for the query
+    /// vector, ordered from highest to lowest similarity.
     ///
     /// # Errors
-    /// Palauttaa virheen jos vektorihaku epäonnistuu.
+    /// Returns an error if the vector search fails.
     fn nearest(&self, query: &[f32], k: usize) -> BoxFuture<'_, Result<Vec<(MessageId, f32)>>>;
 }
 
 #[cfg(test)]
 mod tests {
-    // Testit vertaavat tarkasti esitettäviä f32-vakioita — tarkka vertailu ok.
+    // Tests compare exactly representable f32 constants — exact comparison is fine.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -631,7 +635,7 @@ mod tests {
 
     #[test]
     fn store_is_send() {
-        // Varmistaa että LocalJsonStore voi liikkua säikeiden välillä.
+        // Verifies that LocalJsonStore can move between threads.
         fn assert_send<T: Send>() {}
         assert_send::<LocalJsonStore>();
     }
@@ -662,7 +666,7 @@ mod tests {
         let got = store.get(id).await.expect("get").expect("present");
         assert_eq!(got.content, "edited");
 
-        // Tuntematon id → NotFound.
+        // Unknown id → NotFound.
         let ghost = mem("ghost");
         let err = store.update(ghost).await.expect_err("update missing fails");
         assert!(matches!(err, FamilyClawError::NotFound(_)));
@@ -715,7 +719,7 @@ mod tests {
     async fn run_decay_archives_then_tombstones() {
         let store = LocalJsonStore::in_memory();
         let created = time::now();
-        // Nopeasti vaimeneva, matala tärkeys.
+        // Fast decaying, low importance.
         let m = Memory::builder("ephemeral")
             .factors(ImportanceFactors::new(0.05, 0.0, 0.0, 0.0))
             .decay_policy(DecayPolicy::Fast)
@@ -723,7 +727,7 @@ mod tests {
             .build();
         let id = store.add(m).await.expect("add");
 
-        // Pitkän ajan kuluttua retention on hyvin matala → arkistoidaan.
+        // After a long time, retention is very low → archived.
         let later = created + Duration::days(30);
         let r1 = store
             .run_decay(DecayThresholds::default(), later)
@@ -736,7 +740,7 @@ mod tests {
             MemoryStatus::Archived
         );
 
-        // Toinen läpikäynti vielä myöhemmin → haudataan.
+        // A second pass even later → tombstoned.
         let much_later = created + Duration::days(120);
         let r2 = store
             .run_decay(DecayThresholds::default(), much_later)
@@ -791,7 +795,7 @@ mod tests {
             store.add(m).await.expect("add")
         };
 
-        // Avaa uudestaan → data säilyi.
+        // Reopen → data was preserved.
         let reopened = LocalJsonStore::open(&path).await.expect("reopen");
         assert_eq!(reopened.len().await.expect("len"), 1);
         let got = reopened.get(id).await.expect("g").expect("p");
@@ -809,7 +813,7 @@ mod tests {
             "familyclaw-memory-absent-{}.json",
             uuid::Uuid::new_v4()
         ));
-        // Varmista ettei ole.
+        // Ensure it doesn't exist.
         let _ = std::fs::remove_file(&path);
         let store = LocalJsonStore::open(&path).await.expect("open");
         assert!(store.is_empty().await.expect("empty"));
@@ -836,23 +840,23 @@ mod tests {
         let t = DecayThresholds::new(2.0, -1.0);
         assert_eq!(t.archive_below, 1.0);
         assert_eq!(t.tombstone_below, 0.0);
-        // tombstone ei voi ylittää archivea.
+        // tombstone cannot exceed archive.
         let t2 = DecayThresholds::new(0.3, 0.9);
         assert!(t2.tombstone_below <= t2.archive_below);
         assert_eq!(t2.tombstone_below, 0.3);
-        // Kelvoton → fallback.
+        // Invalid → fallback.
         let t3 = DecayThresholds::new(f32::NAN, f32::NAN);
         assert_eq!(t3.archive_below, 0.4);
         assert_eq!(t3.tombstone_below, 0.1);
     }
 
-    /// REGRESSIO — red-team `concurrent-writers`: kaksi erillistä
-    /// `LocalJsonStore`-kahvaa samaan polkuun ei saa klobata toistensa
-    /// kirjoituksia. Tämä on deterministinen "smoking gun": A kirjoittaa
-    /// ensin, B sen jälkeen — ennen korjausta B:n tyhjästä lähtötilasta
-    /// persistoima snapshot pyyhki A:n levyltä (lost update). Korjauksen
-    /// jälkeen molemmat säilyvät, koska mutaatio ajetaan prosessien-välisen
-    /// lukon alla read-modify-write-semantiikalla.
+    /// REGRESSION — red-team `concurrent-writers`: two separate
+    /// `LocalJsonStore` handles pointed at the same path must not clobber
+    /// each other's writes. This is a deterministic "smoking gun": A writes
+    /// first, then B — before the fix, the snapshot B persisted from its
+    /// empty starting state wiped A's data from disk (lost update). After
+    /// the fix both are preserved, because the mutation runs under the
+    /// inter-process lock with read-modify-write semantics.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_handles_same_path_no_lost_update() {
         let mut path = std::env::temp_dir();
@@ -876,12 +880,12 @@ mod tests {
         let id_a = mem_a.id;
         let id_b = mem_b.id;
 
-        // Deterministinen sekvenssi: A ensin, sitten B (sama kuvio kuin
-        // red-team-hyökkäyksen "smoking gun" -variantti).
+        // Deterministic sequence: A first, then B (the same pattern as the
+        // red-team attack's "smoking gun" variant).
         store_a.add(mem_a).await.expect("add a");
         store_b.add(mem_b).await.expect("add b");
 
-        // Avaa levyltä puhtaalla kahvalla: molempien pitää olla tallessa.
+        // Reopen from disk with a fresh handle: both must be present.
         let reopened = LocalJsonStore::open(&path).await.expect("reopen");
         let all = reopened.all().await.expect("all");
         assert_eq!(all.len(), 2, "LOST UPDATE regression: disk must hold both");
@@ -893,11 +897,11 @@ mod tests {
         let _ = std::fs::remove_file(lock_path(&path));
     }
 
-    /// REGRESSIO — lukko vapautuu (Drop) onnistuneen mutaation jälkeen, joten
-    /// peräkkäiset mutaatiot eivät jää jumiin omaan lukkoonsa. Jos lukkoa ei
-    /// vapautettaisi, toinen `add()` deadlockaisi (tässä: vanhenemis-ikkuna
-    /// olisi liian pitkä → testi jumahtaisi). Sarja onnistuu nopeasti ⇒ lukko
-    /// kiertää oikein.
+    /// REGRESSION — the lock is released (Drop) after a successful mutation,
+    /// so consecutive mutations do not get stuck on their own lock. If the
+    /// lock were not released, a subsequent `add()` would deadlock (here:
+    /// the staleness window would be too long → the test would hang). The
+    /// sequence succeeds quickly ⇒ the lock cycles correctly.
     #[tokio::test]
     async fn sequential_mutations_release_lock() {
         let mut path = std::env::temp_dir();
@@ -918,7 +922,7 @@ mod tests {
                 .expect("add must not block on stale lock");
         }
         assert_eq!(store.len().await.expect("len"), 5);
-        // Lukkotiedostoa ei saa jäädä roikkumaan onnistuneen sarjan jälkeen.
+        // The lock file must not remain after a successful sequence.
         assert!(
             !lock_path(&path).exists(),
             "lock file leaked after mutations"

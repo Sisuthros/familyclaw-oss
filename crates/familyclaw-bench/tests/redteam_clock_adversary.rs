@@ -1,27 +1,28 @@
-//! RED-TEAM: kello-adversaari unijaksoa ja vaimennusta vastaan.
+//! RED-TEAM: a clock adversary against the sleep cycle and decay.
 //!
-//! Hyökkäysväite jota yritetään RIKKOA:
+//! Attack claim we try to BREAK:
 //! > "Dream cleans memory without ever harming protected identity anchors,
 //! >  even when the injected wall clock runs BACKWARDS or repeats timestamps."
 //!
-//! Konkreettiset hyökkäykset (kaikki ajavat OIKEAA koodia, eivät mockeja):
+//! Concrete attacks (all run REAL code, not mocks):
 //!
-//! 1. `dream_with_backwards_clock_*` — syötä [`DreamCycle::run`]:lle `at` joka
-//!    on AIEMMIN kuin muistojen `created_at`. Tarkista ettei:
-//!      - paniikkia,
-//!      - haudattua (tombstoned) muistoa elvytetä,
-//!      - suojattua ydintä kosketa (status pysyy Active, importance ennallaan).
-//! 2. `dream_duplicate_timestamps_*` — kaksi lähes-identtistä muistoa joilla
-//!    on IDENTTINEN aikaleima JA importance → pakottaa deterministisen
-//!    tasapelin ratkaisun. Aja kahdesti samalla `at`:lla → sama lopputulos.
-//! 3. `decay_with_backwards_clock_*` — aja [`MemoryStore::run_decay`] kellolla
-//!    joka kelaa taaksepäin. Taaksepäin-kello tekee retentiosta 1.0 (tuore) →
-//!    tarkista ettei arkistoitua/haudattua elvytetä eikä ydintä kosketa.
-//! 4. `nonmonotonic_reinforce_then_dream_*` — vahvista hetkellä T+pitkä, sitten
-//!    unijakso hetkellä T (aiempi). `last_reinforced_at` "kelaa taaksepäin" —
-//!    tarkista ettei korruptoidu eikä ydin vahingoitu.
+//! 1. `dream_with_backwards_clock_*` — feed [`DreamCycle::run`] an `at` that
+//!    is EARLIER than the memories' `created_at`. Verify there is no:
+//!      - panic,
+//!      - resurrection of a tombstoned memory,
+//!      - touching of the protected core (status stays Active, importance unchanged).
+//! 2. `dream_duplicate_timestamps_*` — two near-identical memories with an
+//!    IDENTICAL timestamp AND importance → forces a deterministic tie-break.
+//!    Run twice with the same `at` → same result.
+//! 3. `decay_with_backwards_clock_*` — run [`MemoryStore::run_decay`] with a
+//!    clock that rewinds. A backwards clock makes retention 1.0 (fresh) →
+//!    verify that archived/tombstoned memories are not resurrected and the
+//!    core is not touched.
+//! 4. `nonmonotonic_reinforce_then_dream_*` — reinforce at instant T+far,
+//!    then run the sleep cycle at instant T (earlier). `last_reinforced_at`
+//!    "rewinds" — verify no corruption and no harm to the core.
 //!
-//! Jokainen assert on hyökkäys: jos se laukeaa, väite on RIKKI.
+//! Every assert is an attack: if it fires, the claim is BROKEN.
 
 use chrono::{Duration, TimeZone, Utc};
 use familyclaw_core::Timestamp;
@@ -32,14 +33,14 @@ use familyclaw_memory::{
     MemoryStore,
 };
 
-/// Kiinteä viitehetki: 2026-06-04 12:00 UTC. Tämä on muistojen "nyt".
+/// Fixed reference instant: 2026-06-04 12:00 UTC. This is the memories' "now".
 fn t0() -> Timestamp {
     Utc.with_ymd_and_hms(2026, 6, 4, 12, 0, 0)
         .single()
         .expect("valid instant")
 }
 
-/// Tavallinen muisto annetulla sisällöllä, tärkeydellä ja luontihetkellä.
+/// An ordinary memory with the given content, importance, and creation instant.
 fn mem_at(content: &str, importance: f32, created: Timestamp) -> Memory {
     Memory::builder(content)
         .factors(ImportanceFactors::new(importance, 0.0, 0.0, 0.0))
@@ -47,7 +48,7 @@ fn mem_at(content: &str, importance: f32, created: Timestamp) -> Memory {
         .build()
 }
 
-/// Suojattu identiteetti-ankkuri.
+/// A protected identity anchor.
 fn anchor_at(content: &str, created: Timestamp) -> Memory {
     Memory::builder(content)
         .factors(ImportanceFactors::new(1.0, 1.0, 0.0, 0.0))
@@ -57,16 +58,16 @@ fn anchor_at(content: &str, created: Timestamp) -> Memory {
 }
 
 // =========================================================================
-// HYÖKKÄYS 1: unijakso taaksepäin kelaavalla kellolla.
+// ATTACK 1: the sleep cycle with a backwards-rewinding clock.
 // =========================================================================
 
-/// Kello kelaa kauas menneisyyteen (1 vuosi ennen muistoja). Mikään vaihe ei
-/// saa paniikata eikä elvyttää haudattua eikä koskea ydintä.
+/// The clock rewinds far into the past (1 year before the memories). No
+/// phase may panic, resurrect a tombstoned memory, or touch the core.
 #[tokio::test]
 async fn dream_with_backwards_clock_does_not_resurrect_or_corrupt() {
     let store = LocalJsonStore::in_memory();
 
-    // Haudattu muisto — EI saa palata henkiin.
+    // A tombstoned memory — must NOT come back to life.
     let tomb = store
         .add(mem_at("a buried observation", 0.5, t0()))
         .await
@@ -76,7 +77,7 @@ async fn dream_with_backwards_clock_does_not_resurrect_or_corrupt() {
         .await
         .expect("tomb status");
 
-    // Arkistoitu muisto.
+    // An archived memory.
     let arch = store
         .add(mem_at("an archived note", 0.5, t0()))
         .await
@@ -86,14 +87,14 @@ async fn dream_with_backwards_clock_does_not_resurrect_or_corrupt() {
         .await
         .expect("arch status");
 
-    // Suojattu ydin — pyhä.
+    // Protected core — sacred.
     let anchor = store
         .add(anchor_at("i am part of this family", t0()))
         .await
         .expect("anchor add");
     let anchor_before = store.get(anchor).await.expect("g").expect("p");
 
-    // Kaksi lähes-identtistä aktiivista → mergeable, sisältää suhteellisen päivän.
+    // Two near-identical active memories → mergeable, containing a relative date.
     store
         .add(mem_at("we shipped the bridge eilen", 0.3, t0()))
         .await
@@ -103,30 +104,30 @@ async fn dream_with_backwards_clock_does_not_resurrect_or_corrupt() {
         .await
         .expect("dup2");
 
-    // Merkitse arkistoitu ristiriitaiseksi journaaliin (drop_contradicted-vaihe).
+    // Mark the archived one contradicted in the journal (drop_contradicted phase).
     let mut journal = InMemoryJournal::new();
     mark_contradicted(&mut journal, arch).expect("mark");
 
-    // KELLO TAAKSEPÄIN: 365 päivää ENNEN muistojen luontia.
+    // CLOCK BACKWARDS: 365 days BEFORE the memories were created.
     let backwards = t0() - Duration::days(365);
 
-    // Kaikki vaiheet päällä, korkea merge-kynnys.
+    // All phases enabled, high merge threshold.
     let cycle = DreamCycle::with_config(&store, DreamConfig::default().with_merge_similarity(0.6));
 
-    // Hyökkäys: tämä EI saa paniikata.
+    // Attack: this must NOT panic.
     let report = cycle
         .run(&journal, backwards)
         .await
         .expect("dream must not panic/error on backwards clock");
 
-    // (a) Haudattua ei elvytetty.
+    // (a) The tombstoned memory was not resurrected.
     assert_eq!(
         store.get(tomb).await.expect("g").expect("p").status,
         MemoryStatus::Tombstoned,
         "ATTACK BROKE CLAIM: backwards clock resurrected a tombstoned memory"
     );
 
-    // (b) Suojattu ydin koskematon: status + importance + factors + policy.
+    // (b) Protected core untouched: status + importance + factors + policy.
     let anchor_after = store.get(anchor).await.expect("g").expect("p");
     assert_eq!(
         anchor_after.status,
@@ -153,7 +154,7 @@ async fn dream_with_backwards_clock_does_not_resurrect_or_corrupt() {
         "ATTACK BROKE CLAIM: protected anchor was reinforced under backwards clock"
     );
 
-    // (c) Retentio pysyy laillisena (0..=1), ei NaN/ääretön.
+    // (c) Retention stays legal (0..=1), not NaN/infinite.
     for m in store.all().await.expect("all") {
         let r = m.retention(backwards);
         assert!(
@@ -162,11 +163,11 @@ async fn dream_with_backwards_clock_does_not_resurrect_or_corrupt() {
         );
     }
 
-    // Raportti on koherentti (reflektioiden summa == laskureiden summa).
+    // The report is coherent (sum of reflections == sum of counters).
     assert_eq!(report.reflections.len(), report.total_actions());
 }
 
-/// Toistettavuus: sama taaksepäin-kello tuottaa saman raportin kahdesti.
+/// Reproducibility: the same backwards clock produces the same report twice.
 #[tokio::test]
 async fn dream_backwards_clock_is_deterministic() {
     async fn run_once() -> (usize, usize, usize) {
@@ -209,18 +210,18 @@ async fn dream_backwards_clock_is_deterministic() {
 }
 
 // =========================================================================
-// HYÖKKÄYS 2: identtiset (duplicate) aikaleimat.
+// ATTACK 2: identical (duplicate) timestamps.
 // =========================================================================
 
-/// Kaksi lähes-identtistä muistoa, joilla IDENTTINEN aikaleima JA importance.
-/// Tasapeli ratkaistaan deterministisesti (id) → tasan yksi selviää, sama joka
-/// ajolla. Ei paniikkia.
+/// Two near-identical memories with an IDENTICAL timestamp AND importance.
+/// The tie is resolved deterministically (by id) → exactly one survives, the
+/// same one on every run. No panic.
 #[tokio::test]
 async fn dream_duplicate_timestamps_resolve_deterministically() {
     async fn run_once() -> (usize, usize) {
         let store = LocalJsonStore::in_memory();
-        // Sama created_at, sama importance → kaikki tasapelikentät yhtä suuret
-        // paitsi id. Pakottaa representative_order id-tasapeliin.
+        // Same created_at, same importance → all tie-break fields equal
+        // except id. Forces representative_order into an id tie-break.
         let same = t0();
         store
             .add(mem_at("the family shipped the release", 0.5, same))
@@ -252,14 +253,14 @@ async fn dream_duplicate_timestamps_resolve_deterministically() {
     }
 
     let (merged, active) = run_once().await;
-    // Kolmesta identtisestä jää tasan yksi aktiivinen.
+    // Of the three identical memories, exactly one remains active.
     assert_eq!(
         active, 1,
         "ATTACK BROKE CLAIM: duplicate-timestamp merge left {active} survivors (expected 1)"
     );
-    assert_eq!(merged, 2, "kolmesta duplikaatista kaksi yhdistyy");
+    assert_eq!(merged, 2, "two of the three duplicates merge");
 
-    // Toistettavuus: sama tulos toisella ajolla.
+    // Reproducibility: same result on a second run.
     let (merged2, active2) = run_once().await;
     assert_eq!(
         (merged, active),
@@ -269,19 +270,19 @@ async fn dream_duplicate_timestamps_resolve_deterministically() {
 }
 
 // =========================================================================
-// HYÖKKÄYS 3: vaimennus (run_decay) taaksepäin kelaavalla kellolla.
+// ATTACK 3: decay (run_decay) with a backwards-rewinding clock.
 // =========================================================================
 
-/// Aja decay ensin eteenpäin (muisto arkistoituu), sitten TAAKSEPÄIN kelatulla
-/// kellolla. Taaksepäin-kello → retentio 1.0 (tuore). Tämä EI saa elvyttää
-/// arkistoitua takaisin aktiiviseksi (status-kone on yksisuuntainen), eikä
-/// haudattua, eikä koskea suojattua ydintä.
+/// Run decay forward first (the memory archives), then with a REWOUND clock.
+/// A backwards clock → retention 1.0 (fresh). This must NOT resurrect the
+/// archived memory back to active (the status machine is one-directional),
+/// nor the tombstoned one, nor touch the protected core.
 #[tokio::test]
 async fn decay_with_backwards_clock_does_not_revive() {
     let store = LocalJsonStore::in_memory();
     let created = t0();
 
-    // Nopeasti vaimeneva, matala tärkeys → arkistoituu helposti.
+    // Fast-decaying, low importance → archives easily.
     let m = store
         .add(
             Memory::builder("ephemeral trivia")
@@ -293,7 +294,7 @@ async fn decay_with_backwards_clock_does_not_revive() {
         .await
         .expect("add m");
 
-    // Haudattu muisto erikseen.
+    // A tombstoned memory, separately.
     let tomb = store
         .add(mem_at("already buried", 0.5, created))
         .await
@@ -303,13 +304,13 @@ async fn decay_with_backwards_clock_does_not_revive() {
         .await
         .expect("tomb status");
 
-    // Suojattu ydin.
+    // The protected core.
     let anchor = store
         .add(anchor_at("the core value", created))
         .await
         .expect("anchor");
 
-    // 1) Eteenpäin 60 päivää → m arkistoituu.
+    // 1) Forward 60 days → m archives.
     let later = created + Duration::days(60);
     store
         .run_decay(DecayThresholds::default(), later)
@@ -321,49 +322,50 @@ async fn decay_with_backwards_clock_does_not_revive() {
         "esiehto: m piti arkistoitua eteenpäin-kellolla"
     );
 
-    // 2) KELLO TAAKSEPÄIN: 365 päivää ENNEN luontia. Retentio = 1.0 (tuore).
+    // 2) CLOCK BACKWARDS: 365 days BEFORE creation. Retention = 1.0 (fresh).
     let backwards = created - Duration::days(365);
     let report = store
         .run_decay(DecayThresholds::default(), backwards)
         .await
         .expect("backwards decay must not panic");
 
-    // Arkistoitua EI elvytetty takaisin aktiiviseksi.
+    // The archived memory was NOT resurrected to active.
     assert_eq!(
         store.get(m).await.expect("g").expect("p").status,
         MemoryStatus::Archived,
         "ATTACK BROKE CLAIM: backwards-clock decay revived an archived memory to active"
     );
-    // Haudattua EI elvytetty.
+    // The tombstoned memory was NOT resurrected.
     assert_eq!(
         store.get(tomb).await.expect("g").expect("p").status,
         MemoryStatus::Tombstoned,
         "ATTACK BROKE CLAIM: backwards-clock decay revived a tombstoned memory"
     );
-    // Suojattu ydin koskematon.
+    // The protected core is untouched.
     assert_eq!(
         store.get(anchor).await.expect("g").expect("p").status,
         MemoryStatus::Active,
         "ATTACK BROKE CLAIM: backwards-clock decay touched protected core"
     );
-    // run_decay ei lisää tilamuutoksia taaksepäin-kellolla (mikään ei pudonnut).
+    // run_decay does not add state transitions under a backwards clock
+    // (nothing decayed further).
     assert_eq!(report.archived, 0);
     assert_eq!(report.tombstoned, 0);
 }
 
 // =========================================================================
-// HYÖKKÄYS 4: ei-monotoninen reinforce → unijakso aiemmalla kellolla.
+// ATTACK 4: non-monotonic reinforce → sleep cycle at an earlier clock.
 // =========================================================================
 
-/// Vahvista muisto kaukana tulevaisuudessa (`last_reinforced_at` = T+100d),
-/// sitten aja unijakso hetkellä T (aiempi). `last_reinforced_at` "kelaa
-/// taaksepäin" suhteessa `at`:iin. Ei saa korruptoida eikä vahingoittaa ydintä.
+/// Reinforce a memory far in the future (`last_reinforced_at` = T+100d), then
+/// run the sleep cycle at instant T (earlier). `last_reinforced_at` "rewinds"
+/// relative to `at`. Must not corrupt or harm the core.
 #[tokio::test]
 async fn nonmonotonic_reinforce_then_backwards_dream_keeps_anchor_safe() {
     let store = LocalJsonStore::in_memory();
     let created = t0();
 
-    // Aktiivinen muisto vahvistetaan kaukana tulevaisuudessa.
+    // An active memory is reinforced far in the future.
     let future = created + Duration::days(100);
     let normal = store
         .add(mem_at("a normal memory", 0.5, created))
@@ -373,11 +375,11 @@ async fn nonmonotonic_reinforce_then_backwards_dream_keeps_anchor_safe() {
         .reinforce(normal, future)
         .await
         .expect("reinforce in future");
-    // Nyt last_reinforced_at on TULEVAISUUDESSA suhteessa luontiin.
+    // Now last_reinforced_at is in the FUTURE relative to creation.
     let after_reinforce = store.get(normal).await.expect("g").expect("p");
     assert_eq!(after_reinforce.last_reinforced_at, future);
 
-    // Suojattu ydin jota ristiriita-marker yrittää pudottaa.
+    // A protected core that the conflict marker tries to drop.
     let anchor = store
         .add(anchor_at("identity anchor never dies", created))
         .await
@@ -387,7 +389,7 @@ async fn nonmonotonic_reinforce_then_backwards_dream_keeps_anchor_safe() {
     let mut journal = InMemoryJournal::new();
     mark_contradicted(&mut journal, anchor).expect("mark anchor");
 
-    // Aja unijakso AIEMMALLA hetkellä kuin reinforce (epämonotoninen kello).
+    // Run the sleep cycle at an EARLIER instant than the reinforcement (non-monotonic clock).
     let earlier = created - Duration::days(10);
     let cycle = DreamCycle::with_config(&store, DreamConfig::default());
     cycle
@@ -395,7 +397,7 @@ async fn nonmonotonic_reinforce_then_backwards_dream_keeps_anchor_safe() {
         .await
         .expect("dream must not panic on non-monotonic clock");
 
-    // Suojattua ydintä ei pudoteta eikä muuteta.
+    // The protected core is not dropped or changed.
     let anchor_after = store.get(anchor).await.expect("g").expect("p");
     assert_eq!(
         anchor_after.status,
@@ -407,7 +409,7 @@ async fn nonmonotonic_reinforce_then_backwards_dream_keeps_anchor_safe() {
         "ATTACK BROKE CLAIM: anchor importance mutated under non-monotonic clock"
     );
 
-    // Normaalin muiston retentio pysyy laillisena vaikka last_reinforced_at > at.
+    // The normal memory's retention stays legal even though last_reinforced_at > at.
     let normal_after = store.get(normal).await.expect("g").expect("p");
     let r = normal_after.retention(earlier);
     assert!(

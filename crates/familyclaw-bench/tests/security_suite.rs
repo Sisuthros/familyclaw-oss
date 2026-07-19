@@ -1,22 +1,23 @@
-//! Integraatiotesti: turvabenchin sarja läpäisee ja kunkin skenaarion
-//! turvatavoite pitää (0 pakoa, 0 hyväksymätöntä sivuvaikutusta).
+//! Integration test: the security bench suite passes, and each scenario's
+//! security goal holds (0 escapes, 0 unapproved side effects).
 //!
-//! Tämä ajaa saman julkisen rajapinnan (`run_security_suite`) jonka
-//! `cargo run -p familyclaw-bench --bin bench -- security` ajaa, ja lukitsee
-//! kunkin skenaarion **läpäisyehdon** mittareista. Aja `--features wasmtime`
-//! todentaaksesi SEC1/SEC2:n oikealla sandbox-backendilla (fuel-portti +
-//! host-import-esto); ilman featurea ne todentavat kyvykkyysmallin ja
-//! rakenteellisen kelvollisuuden ja merkitsevät oikean WASM-ajon skipatuksi.
+//! This runs the same public interface (`run_security_suite`) that
+//! `cargo run -p familyclaw-bench --bin bench -- security` runs, and locks in
+//! each scenario's **pass condition** from its metrics. Run with
+//! `--features wasmtime` to verify SEC1/SEC2 with the real sandbox backend
+//! (fuel gate + host-import denial); without the feature they verify the
+//! capability model and structural validity and mark the real WASM run as
+//! skipped.
 
 use familyclaw_bench::{run_security_suite, to_security_markdown};
 use familyclaw_core::time::from_unix_secs;
 
-/// Kiinteä injektoitu referenssikello (reprodusoitavuus).
+/// Fixed injected reference clock (reproducibility).
 fn clock() -> familyclaw_core::Timestamp {
     from_unix_secs(1_717_000_000).expect("valid clock")
 }
 
-/// Etsii skenaarion mittarin arvon tunnisteen ja avaimen mukaan.
+/// Looks up a scenario's metric value by scenario id and key.
 fn metric(card: &familyclaw_bench::Scorecard, scenario_id: &str, key: &str) -> Option<f64> {
     card.scenarios
         .iter()
@@ -26,7 +27,7 @@ fn metric(card: &familyclaw_bench::Scorecard, scenario_id: &str, key: &str) -> O
         .copied()
 }
 
-/// Koko sarja läpäisee: jokainen skenaario `passed`, ja artefakti renderöityy.
+/// The whole suite passes: every scenario `passed`, and the artifact renders.
 #[tokio::test]
 async fn security_suite_all_scenarios_pass() {
     let card = run_security_suite(clock()).await.expect("suite runs");
@@ -46,14 +47,14 @@ async fn security_suite_all_scenarios_pass() {
     assert!(md.contains("**Overall:** PASS"));
 }
 
-/// SEC1: infinite-loop-taito ei tuota yhtään pakoa (fuel-portti tai skip).
+/// SEC1: the infinite-loop skill produces zero escapes (fuel gate or skip).
 #[tokio::test]
 async fn sec1_zero_escapes() {
     let card = run_security_suite(clock()).await.expect("suite runs");
     assert_eq!(metric(&card, "sec1_fuel_exhaustion", "escapes"), Some(0.0));
 }
 
-/// SEC2: deny-by-default evää kaikki tarkistetut kyvyt (denied == checked).
+/// SEC2: deny-by-default denies every checked capability (denied == checked).
 #[tokio::test]
 async fn sec2_denies_all_capabilities() {
     let card = run_security_suite(clock()).await.expect("suite runs");
@@ -66,7 +67,7 @@ async fn sec2_denies_all_capabilities() {
     assert_eq!(denied, checked, "every requested capability must be denied");
 }
 
-/// SEC3: jokainen SSRF/prompt-injektio-payload torjutaan (blocked == payloads).
+/// SEC3: every SSRF/prompt-injection payload is blocked (blocked == payloads).
 #[tokio::test]
 async fn sec3_blocks_every_payload() {
     let card = run_security_suite(clock()).await.expect("suite runs");
@@ -79,7 +80,7 @@ async fn sec3_blocks_every_payload() {
     assert_eq!(blocked, payloads, "every payload must be blocked");
 }
 
-/// SEC4: 0 suoritusta ilman hyväksyntää, täsmälleen 1 hyväksynnällä.
+/// SEC4: 0 executions without approval, exactly 1 with approval.
 #[tokio::test]
 async fn sec4_gates_side_effect_exactly_once() {
     let card = run_security_suite(clock()).await.expect("suite runs");
@@ -105,7 +106,7 @@ async fn sec4_gates_side_effect_exactly_once() {
     );
 }
 
-/// Reprodusoitavuus: sama injektoitu kello → identtiset mittarit ja läpäisytila.
+/// Reproducibility: the same injected clock → identical metrics and pass state.
 #[tokio::test]
 async fn security_suite_is_deterministic() {
     let a = run_security_suite(clock()).await.expect("run a");

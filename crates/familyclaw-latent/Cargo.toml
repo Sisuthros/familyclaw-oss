@@ -1,12 +1,16 @@
 [package]
 name = "familyclaw-latent"
-description = "Latent telepathy — hidden-state transfer + RecursiveLink + text fallback"
+description = "Experimental hidden-state transfer between agents (research track), with a linear dimension-bridging link and automatic text fallback"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
+readme = "README.md"
+keywords = ["agent", "research", "experimental", "communication"]
+categories = ["science"]
 
 [lints]
 workspace = true

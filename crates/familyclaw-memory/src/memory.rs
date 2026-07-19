@@ -1,9 +1,9 @@
-//! Yksittäinen muisto ([`Memory`]) ja sen elinkaaritila ([`MemoryStatus`]).
+//! A single memory ([`Memory`]) and its lifecycle state ([`MemoryStatus`]).
 //!
-//! `Memory` on Eternal Threadin perusyksikkö: sisältö, tunnemerkintä
-//! ([`Vad`] + nimetyt [`Dimension`]-tunteet), tärkeys, vaimennuspolitiikka
-//! ja elinkaaritila. Muistot luodaan [`MemoryBuilder`]-rakentajalla ja
-//! tallennetaan [`crate::MemoryStore`]-toteutukseen.
+//! `Memory` is Eternal Thread's basic unit: content, emotional annotation
+//! ([`Vad`] + named [`Dimension`] emotions), importance, decay policy,
+//! and lifecycle state. Memories are created with the [`MemoryBuilder`]
+//! builder and stored in a [`crate::MemoryStore`] implementation.
 
 use familyclaw_core::{time, MessageId, Timestamp};
 use familyclaw_emotion::{emotional_salience, Dimension, EmotionState, Vad};
@@ -13,41 +13,42 @@ use crate::decay::DecayPolicy;
 use crate::importance::ImportanceFactors;
 use crate::provenance::Provenance;
 
-/// Muistin vahvuuden (`S`) ala- ja yläraja, kun se johdetaan tärkeydestä.
+/// The lower and upper bound of memory stability (`S`) when derived from
+/// importance.
 ///
-/// Neutraalikin muisto saa perussäilyvyyden ([`STABILITY_MIN`]); maksimi-
-/// tärkeä muisto venyy [`STABILITY_MAX`]:iin. Arvot ovat
-/// [`crate::decay`]-moduulin aikaskaalan (1.0 ≈ vuorokausi) yksiköissä.
+/// Even a neutral memory gets baseline persistence ([`STABILITY_MIN`]); a
+/// maximally important memory stretches to [`STABILITY_MAX`]. Values are in
+/// the units of the [`crate::decay`] module's time scale (1.0 ≈ one day).
 pub const STABILITY_MIN: f32 = 0.5;
-/// Muistin vahvuuden yläraja (kts. [`STABILITY_MIN`]).
+/// Upper bound of memory stability (see [`STABILITY_MIN`]).
 pub const STABILITY_MAX: f32 = 8.0;
 
-/// Muiston elinkaaritila.
+/// A memory's lifecycle state.
 ///
-/// Tila siirtyy yksisuuntaisesti: `Active → Archived → Tombstoned`.
-/// Arkistoitu muisto on yhä haettavissa (heikennettynä), mutta haudattu
-/// (tombstoned) on poistettu aktiivisesta haetusta ja odottaa lopullista
-/// siivousta (design §5: status-elinkaari Active/Archived/Tombstoned).
+/// The state transitions in one direction: `Active → Archived → Tombstoned`.
+/// An archived memory is still retrievable (weakened), but a tombstoned one
+/// is removed from active retrieval and awaits final
+/// cleanup (design §5: status lifecycle Active/Archived/Tombstoned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryStatus {
-    /// Aktiivinen — täysipainoinen muisto, mukana haussa. (Oletustila.)
+    /// Active — full-weight memory, included in retrieval. (Default state.)
     #[default]
     Active,
-    /// Arkistoitu — vaimentunut mutta yhä haettavissa heikennettynä.
+    /// Archived — decayed but still retrievable, weakened.
     Archived,
-    /// Haudattu — poistettu aktiivisesta haetusta, odottaa siivousta.
+    /// Tombstoned — removed from active retrieval, awaiting cleanup.
     Tombstoned,
 }
 
 impl MemoryStatus {
-    /// Onko muisto vielä haettavissa (aktiivinen tai arkistoitu).
+    /// Is the memory still retrievable (active or archived)?
     #[must_use]
     pub const fn is_retrievable(self) -> bool {
         matches!(self, MemoryStatus::Active | MemoryStatus::Archived)
     }
 
-    /// Vakaa, kone-luettava nimi (`snake_case`).
+    /// Stable, machine-readable name (`snake_case`).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -68,30 +69,30 @@ impl std::fmt::Display for MemoryStatus {
 // verification-gated verification-gated memory
 // ---------------------------------------------------------------------------
 
-/// Muiston varmennustila: kuinka luotettava tämä tieto on.
+/// A memory's verification status: how trustworthy this information is.
 ///
-/// Uusi muisto on aina `Claim` — väite ilman todisteita. Kun todisteita
-/// kertyy, se nousee `Evidence`-tasolle ja lopulta `Confirmed`-tasolle
-/// (jossa sillä on vähintään kaksi eri todistetyyppiä).
+/// A new memory is always `Claim` — an assertion without evidence. As
+/// evidence accumulates, it rises to the `Evidence` level and eventually to
+/// the `Confirmed` level (where it has at least two distinct evidence types).
 ///
-/// Tämä on ortogonaalinen elinkaaritilaan (`MemoryStatus`) nähden: muisto
-/// voi olla `Active` ja `Claim` yhtä aikaa. Confirmed-muisto unohtuu
-/// hitaammin retrieval-painotuksessa (confidence × retention), mutta
-/// elinkaaritila (`Active → Archived → Tombstoned`) toimii samoin.
+/// This is orthogonal to the lifecycle state (`MemoryStatus`): a memory can
+/// be `Active` and `Claim` at the same time. A confirmed memory is forgotten
+/// more slowly in retrieval weighting (confidence × retention), but the
+/// lifecycle state (`Active → Archived → Tombstoned`) works the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationStatus {
-    /// Väite — ei vahvistettu, voi olla väärä. (Oletustila uusille muistoille.)
+    /// Claim — unverified, may be false. (Default state for new memories.)
     #[default]
     Claim,
-    /// Todisteita on olemassa (vähintään yksi), mutta ei vielä varmistettu.
+    /// Evidence exists (at least one), but not yet confirmed.
     Evidence,
-    /// Vahvistettu vähintään kahdella eri todistetyypillä.
+    /// Confirmed by at least two distinct evidence types.
     Confirmed,
 }
 
 impl VerificationStatus {
-    /// Palauttaa painon (0.0–1.0) Oracle-scoringia ja retrieval-painotusta varten.
+    /// Returns the weight (0.0-1.0) for Oracle scoring and retrieval weighting.
     #[must_use]
     pub const fn weight(self) -> f32 {
         match self {
@@ -112,21 +113,21 @@ impl std::fmt::Display for VerificationStatus {
     }
 }
 
-/// Todistetyyppi muiston varmennukseen.
+/// Evidence type for memory verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceType {
-    /// Build meni läpi.
+    /// Build passed.
     BuildPassed,
-    /// Testit meni läpi.
+    /// Tests passed.
     TestPassed,
-    /// Käyttäjä vahvisti.
+    /// User confirmed.
     UserConfirmation,
-    /// Riippumaton havainto (toinen agentti vahvisti).
+    /// Independent observation (confirmed by another agent).
     IndependentObservation,
-    /// Ulkoinen dokumentaatio vahvistaa.
+    /// Confirmed by external documentation.
     ExternalDoc,
-    /// Tuotantometriikka vahvistaa.
+    /// Confirmed by a production metric.
     ProductionMetric,
 }
 
@@ -143,20 +144,20 @@ impl std::fmt::Display for EvidenceType {
     }
 }
 
-/// Yksittäinen todiste muiston tueksi.
+/// A single piece of evidence supporting a memory.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evidence {
-    /// Todistetyyppi.
+    /// Evidence type.
     pub evidence_type: EvidenceType,
-    /// Linkki todisteeseen (commit SHA, testinimi, keskustelu-id tms.).
+    /// Link to the evidence (commit SHA, test name, conversation ID, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
-    /// Aikaleima.
+    /// Timestamp.
     pub recorded_at: Timestamp,
 }
 
 impl Evidence {
-    /// Luo uuden todisteen.
+    /// Creates new evidence.
     #[must_use]
     pub fn new(evidence_type: EvidenceType, link: Option<String>) -> Self {
         Self {
@@ -167,123 +168,124 @@ impl Evidence {
     }
 }
 
-/// Yksittäinen Eternal Thread -muisto.
+/// A single Eternal Thread memory.
 ///
-/// Luo muisto [`Memory::builder`]-rakentajalla. Kentät ovat julkisia
-/// lukemista varten, mutta käytä mutaatiometodeja
+/// Create a memory with the [`Memory::builder`] builder. Fields are public
+/// for reading, but use the mutation methods
 /// ([`reinforce`](Memory::reinforce), [`archive`](Memory::archive),
-/// [`tombstone`](Memory::tombstone)) jotta johdetut arvot (tärkeys,
-/// vahvistuslaskuri) pysyvät johdonmukaisina.
+/// [`tombstone`](Memory::tombstone)) so that derived values (importance,
+/// reinforcement counter) remain consistent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Memory {
-    /// Muiston yksilöivä tunniste.
+    /// The memory's unique identifier.
     pub id: MessageId,
 
-    /// Muiston tekstisisältö.
+    /// The memory's text content.
     pub content: String,
 
-    /// Matala-ulotteinen VAD-yhteenveto muiston tunnesävystä.
+    /// A low-dimensional VAD summary of the memory's emotional tone.
     pub vad: Vad,
 
-    /// Nimetyt tunnedimensiot jotka muisto aktivoi (esim. `Gratitude`).
+    /// Named emotion dimensions activated by the memory (e.g. `Gratitude`).
     #[serde(default)]
     pub emotions: Vec<Dimension>,
 
-    /// Luontihetki (UTC).
+    /// Creation time (UTC).
     pub created_at: Timestamp,
 
-    /// Viimeisin aktivointi/vahvistus (UTC) — käytetään retentiolaskennan
-    /// aikaperustana. Alussa sama kuin [`created_at`](Memory::created_at).
+    /// Most recent activation/reinforcement (UTC) — used as the time base
+    /// for retention computation. Initially the same as [`created_at`](Memory::created_at).
     pub last_reinforced_at: Timestamp,
 
-    /// Esilaskettu yhdistelmätärkeys, `0.0..=1.0`.
+    /// Precomputed composite importance, `0.0..=1.0`.
     pub importance: f32,
 
-    /// Tärkeyden osatekijät, joista [`importance`](Memory::importance)
-    /// johdetaan (säilytetään uudelleenlaskentaa ja diagnostiikkaa varten).
+    /// The importance factors from which [`importance`](Memory::importance)
+    /// is derived (retained for recomputation and diagnostics).
     pub factors: ImportanceFactors,
 
-    /// Vaimennuspolitiikka (Ebbinghaus λ).
+    /// Decay policy (Ebbinghaus λ).
     pub decay_policy: DecayPolicy,
 
-    /// Kuinka monta kertaa muisto on vahvistettu (luonti = 0).
+    /// How many times the memory has been reinforced (creation = 0).
     #[serde(default)]
     pub reinforcement_count: u32,
 
-    /// Vapaamuotoiset luokittelutägit (geneerisiä — ei kovakoodattua
-    /// perhe-/avain-/polkutietoa).
+    /// Free-form classification tags (generic — no hardcoded
+    /// family/key/path information).
     #[serde(default)]
     pub tags: Vec<String>,
 
-    /// Muiston lähde (esim. `"chat"`, `"reflection"`).
+    /// The memory's source (e.g. `"chat"`, `"reflection"`).
     #[serde(default)]
     pub source: String,
 
-    /// Elinkaaritila.
+    /// Lifecycle state.
     #[serde(default)]
     pub status: MemoryStatus,
 
-    /// Deterministinen dedupointiavain (agentin turn-numero + tunniste).
-    /// Jos asetettu, `MemoryStore::add` ohittaa jo kirjatun saman avaimen
-    /// muiston, jolloin muistikirjaus on idempotentti replayssa
-    /// (ratkaisee dual-write-ongelman: durable.step onnistuu mutta
-    /// `memory_store.add` ei ehdi ennen kaatumista).
+    /// Deterministic dedup key (agent turn number + identifier).
+    /// If set, `MemoryStore::add` skips a memory that was already recorded
+    /// with the same key, making memory recording idempotent under replay
+    /// (resolves the dual-write problem: durable.step succeeds but
+    /// `memory_store.add` doesn't complete before a crash).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_key: Option<String>,
 
-    /// Valinnainen upotusvektori semanttista haun varten.
-    /// Jos asetettu, haku voi käyttää cosine-similarityä avainsanan sijaan.
+    /// Optional embedding vector for semantic retrieval.
+    /// If set, retrieval can use cosine similarity instead of keyword matching.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
 
-    // ── verification-gated -kentät ──────────────────────────────────────────
-    // Kaikki #[serde(default)] — taaksepäin yhteensopiva olemassaolevien
-    // persistoitujen muistojen kanssa (vanha JSON ilman näitä kenttiä
-    // deserialisoituu oikein oletusarvoilla).
-    /// Varmennustila — kuinka luotettava tämä muisto on.
-    /// Uusi muisto on aina `Claim` (varmistamaton väite).
+    // ── verification-gated fields ───────────────────────────────────────────
+    // All #[serde(default)] — backward compatible with existing
+    // persisted memories (old JSON without these fields
+    // deserializes correctly with default values).
+    /// Verification status — how trustworthy this memory is.
+    /// A new memory is always `Claim` (unverified assertion).
     #[serde(default)]
     pub verification_status: VerificationStatus,
 
-    /// Luottamustaso 0.0–1.0, johdettu varmennustilasta ja evidenceistä.
-    /// Käytetään Oracle-scoringissa ja retrieval-painotuksessa.
+    /// Confidence level 0.0-1.0, derived from verification status and evidence.
+    /// Used in Oracle scoring and retrieval weighting.
     #[serde(default)]
     pub confidence: f32,
 
-    /// Todisteet jotka tukevat tätä muistoa.
-    /// Tyhjä = ei todisteita (Claim-tason muisto).
+    /// Evidence supporting this memory.
+    /// Empty = no evidence (a Claim-level memory).
     #[serde(default)]
     pub evidence: Vec<Evidence>,
 
-    /// Ryhmittelyavain samankaltaisille muistoille (esim. `"db-valinta"`,
-    /// `"provider-prefix-bug"`). Käytetään Oracle-preflightissa
-    /// frekvenssilaskentaan.
+    /// Grouping key for similar memories (e.g. `"db-choice"`,
+    /// `"provider-prefix-bug"`). Used in Oracle preflight for
+    /// frequency counting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern_key: Option<String>,
 
-    /// Muiston alkuperä — mistä tämä tieto on peräisin ja kuinka luotettava
-    /// se on (Sleeper Memory Poisoning -suoja, kts. [`crate::provenance`]).
+    /// The memory's provenance — where this information comes from and how
+    /// trustworthy it is (Sleeper Memory Poisoning protection, see
+    /// [`crate::provenance`]).
     ///
-    /// `#[serde(default)]` → vanhat, ennen alkuperätietoa persistoidut
-    /// muistot deserialisoituvat [`Provenance::DirectExperience`]ksi
-    /// (taaksepäin-yhteensopiva).
+    /// `#[serde(default)]` → old memories persisted before provenance
+    /// tracking existed deserialize as [`Provenance::DirectExperience`]
+    /// (backward compatible).
     #[serde(default)]
     pub provenance: Provenance,
 }
 
 impl Memory {
-    /// Aloittaa uuden muiston rakentamisen annetulla sisällöllä.
+    /// Starts building a new memory with the given content.
     #[must_use]
     pub fn builder(content: impl Into<String>) -> MemoryBuilder {
         MemoryBuilder::new(content)
     }
 
-    /// Muiston ikä sekunteina suhteessa annettuun hetkeen, viimeisestä
-    /// vahvistuksesta laskettuna. Negatiivinen erotus (kello taaksepäin)
-    /// palautetaan nollana.
+    /// The memory's age in seconds relative to the given time, computed
+    /// from the last reinforcement. A negative difference (clock moved
+    /// backward) is returned as zero.
     ///
-    /// Tarkkuus on sekunnin luokkaa: alle-sekunnin osa pyöristyy pois, mikä
-    /// riittää eksponentiaaliseen unohtamiskäyrään.
+    /// Precision is at the second level: sub-second fractions are rounded
+    /// away, which is sufficient for the exponential forgetting curve.
     #[must_use]
     pub fn age_secs(&self, at: Timestamp) -> f32 {
         let delta = at.signed_duration_since(self.last_reinforced_at);
@@ -291,45 +293,46 @@ impl Memory {
         if secs <= 0 {
             return 0.0;
         }
-        // i64-sekunnit → f32: tarkkuushäviö on hyväksyttävää (retentio on jo
-        // approksimaatio, eikä sekuntitason heitto vuosien skaalalla muuta
-        // unohtamiskäyrää). i64-arvo ei vuoda mantissan rajojen yli
-        // realistisilla aikaväleillä.
+        // i64 seconds → f32: the precision loss is acceptable (retention is
+        // already an approximation, and second-level jitter at a scale of
+        // years does not change the forgetting curve). The i64 value does
+        // not overflow the mantissa bounds at realistic time spans.
         #[allow(clippy::cast_precision_loss)]
         let result = secs as f32;
         result
     }
 
-    /// Muiston nykyinen retentio (`0.0..=1.0`) ajanhetkellä `at`.
+    /// The memory's current retention (`0.0..=1.0`) at time `at`.
     ///
-    /// Yhdistää vaimennuspolitiikan ([`decay_policy`](Memory::decay_policy))
-    /// ja tärkeydestä johdetun vahvuuden ([`stability`](Memory::stability)).
-    /// Suojattu ydin palauttaa aina `1.0`.
+    /// Combines the decay policy ([`decay_policy`](Memory::decay_policy))
+    /// and the stability derived from importance ([`stability`](Memory::stability)).
+    /// A protected core always returns `1.0`.
     #[must_use]
     pub fn retention(&self, at: Timestamp) -> f32 {
         self.decay_policy
             .retention(self.age_secs(at), self.stability())
     }
 
-    /// Muiston vahvuus `S` Ebbinghaus-kaavaan, johdettuna tärkeydestä.
+    /// The memory's stability `S` for the Ebbinghaus formula, derived from importance.
     #[must_use]
     pub fn stability(&self) -> f32 {
         self.factors.stability(STABILITY_MIN, STABILITY_MAX)
     }
 
-    /// Onko muisto vielä haettavissa (tila aktiivinen/arkistoitu).
+    /// Is the memory still retrievable (status active/archived)?
     #[must_use]
     pub fn is_retrievable(&self) -> bool {
         self.status.is_retrievable()
     }
 
-    /// Vahvistaa muiston: nostaa vahvistuslaskuria, päivittää
-    /// aikaperustan hetkeen `at` ja laskee tärkeyden uudelleen
-    /// päivitetyllä reinforcement-osatekijällä.
+    /// Reinforces the memory: increments the reinforcement counter, updates
+    /// the time base to `at`, and recomputes importance with the
+    /// updated reinforcement factor.
     ///
-    /// Vahvistusosatekijä kasvaa kyllästyvästi (`1 - e^(-count/3)`), joten
-    /// toistuva aktivointi nostaa säilyvyyttä mutta kyllästyy — yksi muisto
-    /// ei voi kaapata koko tärkeysasteikkoa pelkällä toistolla.
+    /// The reinforcement factor grows with saturation (`1 - e^(-count/3)`),
+    /// so repeated activation increases persistence but saturates — a
+    /// single memory cannot capture the entire importance scale through
+    /// repetition alone.
     pub fn reinforce(&mut self, at: Timestamp) {
         self.reinforcement_count = self.reinforcement_count.saturating_add(1);
         self.last_reinforced_at = at;
@@ -338,16 +341,16 @@ impl Memory {
         let reinforcement = 1.0 - (-count / 3.0).exp();
         self.factors.reinforcement = reinforcement.clamp(0.0, 1.0);
         self.importance = self.factors.composite();
-        // Vahvistus voi elvyttää arkistoidun takaisin aktiiviseksi.
+        // Reinforcement can revive an archived memory back to active.
         if self.status == MemoryStatus::Archived {
             self.status = MemoryStatus::Active;
         }
     }
 
-    /// Siirtää muiston arkistoon (jos se ei ole jo haudattu).
+    /// Moves the memory to archived (if not already tombstoned).
     ///
-    /// Palauttaa `true` jos tila muuttui. Haudattua muistoa ei voi
-    /// arkistoida takaisin.
+    /// Returns `true` if the state changed. A tombstoned memory cannot be
+    /// archived back.
     pub fn archive(&mut self) -> bool {
         if self.status == MemoryStatus::Active {
             self.status = MemoryStatus::Archived;
@@ -357,11 +360,11 @@ impl Memory {
         }
     }
 
-    /// Hautaa muiston (tombstone) — poistaa sen aktiivisesta haetusta.
+    /// Tombstones the memory — removes it from active retrieval.
     ///
-    /// Suojattua ydintä ([`DecayPolicy::ProtectedCore`]) **ei voi haudata**:
-    /// metodi palauttaa silloin `false` eikä muuta tilaa. Muutoin palauttaa
-    /// `true` jos tila muuttui.
+    /// A protected core ([`DecayPolicy::ProtectedCore`]) **cannot be
+    /// tombstoned**: the method then returns `false` and does not change
+    /// the state. Otherwise returns `true` if the state changed.
     pub fn tombstone(&mut self) -> bool {
         if self.decay_policy.is_protected() {
             return false;
@@ -374,19 +377,19 @@ impl Memory {
         }
     }
 
-    // ── verification-gated varmennusmetodit ───────────────────────────────
+    // ── verification-gated verification methods ────────────────────────────
 
-    /// Lisää todisteen ja päivittää varmennustilan automaattisesti.
+    /// Adds evidence and automatically updates the verification status.
     ///
-    /// # Promote-säännöt
-    /// - `Claim` + 1 evidence (mikä tahansa) → `Evidence` (confidence 0.7)
+    /// # Promotion rules
+    /// - `Claim` + 1 evidence (of any kind) → `Evidence` (confidence 0.7)
     /// - `Evidence` + `UserConfirmation` → `Confirmed` (confidence 1.0)
     /// - `Claim` + 2 distinct evidence types → `Confirmed` (confidence 1.0)
-    /// - `Confirmed` pysyy `Confirmed` — confidence ei laske koskaan.
+    /// - `Confirmed` stays `Confirmed` — confidence never decreases.
     pub fn add_evidence(&mut self, evidence: Evidence) {
         self.evidence.push(evidence);
 
-        // Kerää uniikit todistetyypit
+        // Collect unique evidence types
         let mut types: Vec<EvidenceType> = self.evidence.iter().map(|e| e.evidence_type).collect();
         types.sort();
         types.dedup();
@@ -406,27 +409,27 @@ impl Memory {
                     self.verification_status = VerificationStatus::Confirmed;
                     self.confidence = 1.0;
                 }
-                // Muuten pysyy Evidencenä — yksi todiste ei riitä
+                // Otherwise stays Evidence — one piece of evidence is not enough
             }
             VerificationStatus::Confirmed => {
-                // Confirmed pysyy confirmed — confidence voi nousta, muttei laske
+                // Confirmed stays confirmed — confidence can rise, but never drops
                 self.confidence = self.confidence.max(1.0);
             }
         }
     }
 
-    /// Onko muisto vahvistettu (luotettava)?
+    /// Is the memory confirmed (trustworthy)?
     #[must_use]
     pub const fn is_confirmed(&self) -> bool {
         matches!(self.verification_status, VerificationStatus::Confirmed)
     }
 }
 
-/// [`Memory`]-rakentaja, joka asettaa johdetut kentät (tärkeys, aikaleimat,
-/// vahvuus) johdonmukaisesti.
+/// A [`Memory`] builder that sets derived fields (importance, timestamps,
+/// stability) consistently.
 ///
-/// Hanki rakentaja [`Memory::builder`]-metodilla, säädä kentät builder-
-/// tyylillä ja viimeistele [`MemoryBuilder::build`]-metodilla.
+/// Obtain the builder with [`Memory::builder`], set fields in builder
+/// style, and finalize with [`MemoryBuilder::build`].
 #[derive(Debug, Clone)]
 pub struct MemoryBuilder {
     content: String,
@@ -439,7 +442,7 @@ pub struct MemoryBuilder {
     source: String,
     turn_key: Option<String>,
     embedding: Option<Vec<f32>>,
-    // verification-gated -kentät
+    // verification-gated fields
     verification_status: VerificationStatus,
     evidence: Vec<Evidence>,
     pattern_key: Option<String>,
@@ -447,7 +450,7 @@ pub struct MemoryBuilder {
 }
 
 impl MemoryBuilder {
-    /// Luo rakentajan sisällöllä; muut kentät saavat neutraalit oletukset.
+    /// Creates the builder with content; other fields get neutral defaults.
     #[must_use]
     pub fn new(content: impl Into<String>) -> Self {
         Self {
@@ -460,113 +463,113 @@ impl MemoryBuilder {
             tags: Vec::new(),
             source: String::new(),
             turn_key: None,
-            // verification-gated -oletukset: uusi muisto alkaa varmistamattomana väitteenä
+            // verification-gated defaults: a new memory starts as an unverified claim
             verification_status: VerificationStatus::Claim,
             embedding: None,
             evidence: Vec::new(),
             pattern_key: None,
-            // Oletus: suora kokemus (sama kuin Provenance::default()).
+            // Default: direct experience (same as Provenance::default()).
             provenance: Provenance::DirectExperience,
         }
     }
 
-    /// Asettaa VAD-yhteenvedon.
+    /// Sets the VAD summary.
     #[must_use]
     pub fn vad(mut self, vad: Vad) -> Self {
         self.vad = vad;
         self
     }
 
-    /// Asettaa nimetyt tunnedimensiot.
+    /// Sets the named emotion dimensions.
     #[must_use]
     pub fn emotions(mut self, emotions: impl IntoIterator<Item = Dimension>) -> Self {
         self.emotions = emotions.into_iter().collect();
         self
     }
 
-    /// Asettaa tärkeyden osatekijät.
+    /// Sets the importance factors.
     #[must_use]
     pub fn factors(mut self, factors: ImportanceFactors) -> Self {
         self.factors = factors;
         self
     }
 
-    /// Johtaa tärkeyden `emotion`-osatekijän annetusta tunnetilasta
-    /// ([`emotional_salience`]) ja päivittää sen rakentajan osatekijöihin.
+    /// Derives the importance `emotion` factor from the given emotional
+    /// state ([`emotional_salience`]) and updates it in the builder's factors.
     ///
-    /// Tämä on ohut PKG-B-mukavuusmetodi: se ei kosketa muita osatekijöitä
-    /// (`identity`, `novelty`, `reinforcement`), joten sen voi ketjuttaa
-    /// [`factors`](MemoryBuilder::factors)-kutsun jälkeen pelkän tunnelatauksen
-    /// asettamiseksi tilasta. Voimakkaasti latautunut hetki → korkeampi
-    /// emotion-osatekijä → vahvempi, hitaammin unohtuva muisto.
+    /// This is a thin PKG-B convenience method: it does not touch the other
+    /// factors (`identity`, `novelty`, `reinforcement`), so it can be
+    /// chained after a [`factors`](MemoryBuilder::factors) call to set just
+    /// the emotional charge from state. A strongly charged moment → higher
+    /// emotion factor → a stronger, more slowly forgotten memory.
     ///
-    /// Salience puristetaan välille `0.0..=1.0` ([`ImportanceFactors`] pysyy
-    /// litteänä — koko [`EmotionState`]:ä ei upoteta).
+    /// Salience is clamped to `0.0..=1.0` ([`ImportanceFactors`] remains
+    /// flat — the whole [`EmotionState`] is not embedded).
     #[must_use]
     pub fn emotion_state(mut self, state: &EmotionState) -> Self {
         self.factors.emotion = emotional_salience(state).clamp(0.0, 1.0);
         self
     }
 
-    /// Asettaa vaimennuspolitiikan.
+    /// Sets the decay policy.
     #[must_use]
     pub fn decay_policy(mut self, policy: DecayPolicy) -> Self {
         self.decay_policy = policy;
         self
     }
 
-    /// Ohittaa luontihetken (oletus: nyt). Käytännöllinen testeissä ja
-    /// datan migraatiossa.
+    /// Overrides the creation time (default: now). Useful in tests and
+    /// data migration.
     #[must_use]
     pub fn created_at(mut self, at: Timestamp) -> Self {
         self.created_at = at;
         self
     }
 
-    /// Asettaa luokittelutägit.
+    /// Sets the classification tags.
     #[must_use]
     pub fn tags(mut self, tags: impl IntoIterator<Item = String>) -> Self {
         self.tags = tags.into_iter().collect();
         self
     }
 
-    /// Asettaa lähteen.
+    /// Sets the source.
     #[must_use]
     pub fn source(mut self, source: impl Into<String>) -> Self {
         self.source = source.into();
         self
     }
 
-    /// Asettaa varmennustilan (oletus: `Claim`).
+    /// Sets the verification status (default: `Claim`).
     #[must_use]
     pub fn verification_status(mut self, status: VerificationStatus) -> Self {
         self.verification_status = status;
         self
     }
 
-    /// Asettaa ryhmittelyavaimen (`pattern_key`) oraclen frekvenssilaskentaa varten.
+    /// Sets the grouping key (`pattern_key`) for Oracle frequency counting.
     #[must_use]
     pub fn pattern_key(mut self, key: impl Into<String>) -> Self {
         self.pattern_key = Some(key.into());
         self
     }
 
-    /// Asettaa muiston alkuperän (oletus: [`Provenance::DirectExperience`]).
+    /// Sets the memory's provenance (default: [`Provenance::DirectExperience`]).
     #[must_use]
     pub fn provenance(mut self, provenance: Provenance) -> Self {
         self.provenance = provenance;
         self
     }
 
-    /// Asettaa upotusvektorin semanttista haun varten.
+    /// Sets the embedding vector for semantic retrieval.
     #[must_use]
     pub fn embedding(mut self, embedding: impl Into<Vec<f32>>) -> Self {
         self.embedding = Some(embedding.into());
         self
     }
 
-    /// Viimeistelee muiston: generoi tunnisteen, asettaa aikaleimat ja
-    /// laskee tärkeyden osatekijöistä. Tila on aina [`MemoryStatus::Active`].
+    /// Finalizes the memory: generates the identifier, sets timestamps, and
+    /// computes importance from the factors. The status is always [`MemoryStatus::Active`].
     #[must_use]
     pub fn build(self) -> Memory {
         let importance = self.factors.composite();
@@ -587,7 +590,7 @@ impl MemoryBuilder {
             turn_key: self.turn_key,
             embedding: self.embedding,
             verification_status: self.verification_status,
-            confidence: 0.0, // Asetetaan promote-logiikalla add_evidence()-kutsujen kautta
+            confidence: 0.0, // Set by the promotion logic via add_evidence() calls
             evidence: self.evidence,
             pattern_key: self.pattern_key,
             provenance: self.provenance,
@@ -597,7 +600,7 @@ impl MemoryBuilder {
 
 #[cfg(test)]
 mod tests {
-    // Testit vertaavat tarkasti esitettäviä f32-vakioita — tarkka vertailu ok.
+    // Tests compare exactly representable f32 constants — exact comparison is fine.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -626,7 +629,7 @@ mod tests {
         assert_eq!(m.reinforcement_count, 0);
         assert_eq!(m.source, "chat");
         assert!((m.importance - warm_factors().composite()).abs() < 1e-6);
-        // Luonnissa aikaleimat ovat samat.
+        // At creation, the timestamps are identical.
         assert_eq!(m.created_at, m.last_reinforced_at);
         assert!(!m.id.is_nil());
     }
@@ -683,10 +686,10 @@ mod tests {
     fn age_secs_never_negative() {
         let created = time::now();
         let m = Memory::builder("x").created_at(created).build();
-        // Kello taaksepäin → 0.
+        // Clock moved backward → 0.
         let earlier = created - Duration::hours(1);
         assert_eq!(m.age_secs(earlier), 0.0);
-        // Eteenpäin → positiivinen.
+        // Forward → positive.
         let later = created + Duration::seconds(3600);
         assert!((m.age_secs(later) - 3600.0).abs() < 1.0);
     }
@@ -703,9 +706,12 @@ mod tests {
 
         m.reinforce(created + Duration::hours(1));
         assert_eq!(m.reinforcement_count, count_before + 1);
-        assert!(m.importance > before, "vahvistus ei nostanut tärkeyttä");
+        assert!(
+            m.importance > before,
+            "reinforcement did not raise importance"
+        );
         assert!(m.factors.reinforcement > 0.0);
-        // Aikaperusta päivittyi → muisto on jälleen tuore.
+        // The time base was updated → the memory is fresh again.
         assert!((m.retention(m.last_reinforced_at) - 1.0).abs() < 1e-6);
     }
 
@@ -716,7 +722,7 @@ mod tests {
         for _ in 0..100 {
             m.reinforce(created);
         }
-        // Kyllästyy 1.0:aan, ei ylitä.
+        // Saturates at 1.0, never exceeds.
         assert!(m.factors.reinforcement <= 1.0);
         assert!(m.factors.reinforcement > 0.99);
     }
@@ -726,7 +732,7 @@ mod tests {
         let mut m = Memory::builder("a").build();
         assert!(m.archive());
         assert_eq!(m.status, MemoryStatus::Archived);
-        // Toistuva arkistointi ei tee mitään.
+        // Repeated archiving does nothing.
         assert!(!m.archive());
         assert!(m.is_retrievable());
     }
@@ -748,10 +754,10 @@ mod tests {
         assert!(m.tombstone());
         assert_eq!(m.status, MemoryStatus::Tombstoned);
         assert!(!m.is_retrievable());
-        // Toistuva hautaus ei muuta tilaa.
+        // Repeated tombstoning does not change the state.
         assert!(!m.tombstone());
 
-        // Suojattua ydintä ei voi haudata.
+        // A protected core cannot be tombstoned.
         let mut core = Memory::builder("ydin")
             .decay_policy(DecayPolicy::ProtectedCore)
             .build();
@@ -789,7 +795,7 @@ mod tests {
         assert_eq!(json, "\"tombstoned\"");
     }
 
-    // ── PKG-B: MemoryBuilder::emotion_state ────────────────────────────────
+    // ── PKG-B: MemoryBuilder::emotion_state ─────────────────────────────────
 
     #[test]
     fn builder_emotion_state_sets_emotion_factor() {
@@ -801,7 +807,7 @@ mod tests {
             .emotion_state(&state)
             .build();
         assert!((m.factors.emotion - salience).abs() < 1e-6);
-        // Tärkeys johdetaan osatekijöistä build()-vaiheessa.
+        // Importance is derived from the factors at build() time.
         assert!((m.importance - m.factors.composite()).abs() < 1e-6);
     }
 
@@ -817,13 +823,13 @@ mod tests {
         assert!(m_charged.factors.emotion > m_neutral.factors.emotion);
         assert!(
             m_charged.importance > m_neutral.importance,
-            "latautuneen muiston tärkeyden pitäisi ylittää neutraali"
+            "the charged memory's importance should exceed the neutral one"
         );
     }
 
     #[test]
     fn builder_emotion_state_preserves_other_factors() {
-        // emotion_state EI saa pyyhkiä muita osatekijöitä — vain emotion.
+        // emotion_state must NOT wipe the other factors — only emotion.
         let mut state = EmotionState::neutral();
         state.set(Dimension::Joy, 90.0);
 
@@ -836,7 +842,7 @@ mod tests {
         assert_eq!(m.factors.reinforcement, 0.4);
         assert!(
             m.factors.emotion > 0.0,
-            "emotion-osatekijä päivittyi tilasta"
+            "emotion factor was updated from state"
         );
     }
 }

@@ -1,104 +1,104 @@
-//! Toimintopinon crate-paikallinen virhetyyppi [`ActionError`].
+//! The action stack's crate-local error type [`ActionError`].
 //!
-//! `familyclaw-core` tarjoaa keskitetyn [`FamilyClawError`]-tyypin koko
-//! alustalle. Tämä crate määrittelee oman, hienojakoisemman virhetyyppinsä
-//! toimintopinon (observe→plan→approve→execute→verify→prove→remember→report)
-//! erityistilanteille, ja muuntaa sen tarvittaessa keskitettyyn tyyppiin
-//! [`From`]-toteutuksilla molempiin suuntiin.
+//! `familyclaw-core` provides a centralized [`FamilyClawError`] type for the
+//! whole platform. This crate defines its own, more fine-grained error type
+//! for the action stack's (observe→plan→approve→execute→verify→prove→remember→report)
+//! special cases, and converts it to the centralized type when needed via
+//! [`From`] implementations in both directions.
 //!
-//! Tuotantopolulla EI käytetä `unwrap()`/`expect()`/`panic!()` — kaikki
-//! virheet kulkevat [`Result`]-tyypin kautta.
+//! The production path does NOT use `unwrap()`/`expect()`/`panic!()` — all
+//! errors flow through the [`Result`] type.
 
 use familyclaw_core::FamilyClawError;
 use thiserror::Error;
 
-/// Toimintopinon virhetyyppi.
+/// The action stack's error type.
 ///
-/// `#[non_exhaustive]` jotta uusia variantteja voi lisätä myöhemmin
-/// rikkomatta downstream-koodia.
+/// `#[non_exhaustive]` so that new variants can be added later without
+/// breaking downstream code.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ActionError {
-    /// Skill-manifestin jäsennys epäonnistui (esim. kelvoton JSON).
+    /// Skill manifest parsing failed (e.g. invalid JSON).
     #[error("manifest parse error: {0}")]
     ManifestParse(String),
 
-    /// Skill-manifestin validointi epäonnistui (puuttuva kenttä, virheellinen arvo).
+    /// Skill manifest validation failed (missing field, invalid value).
     #[error("manifest validation error: {0}")]
     ManifestValidation(String),
 
-    /// Manifestissa havaittiin salaisuudelta näyttävä arvo (ei sallittu).
+    /// A value that looks like a secret was detected in the manifest (not allowed).
     #[error("secret detected in manifest: {0}")]
     SecretInManifest(String),
 
-    /// Ulkoisen taidon Ed25519-allekirjoituksen verifiointi epäonnistui.
+    /// Verification of an external skill's Ed25519 signature failed.
     #[error("skill signature invalid: {0}")]
     SignatureInvalid(String),
 
-    /// Viitattua taitoa ei löytynyt rekisteristä.
+    /// The referenced skill was not found in the registry.
     #[error("unknown skill: {0}")]
     UnknownSkill(String),
 
-    /// Viitattua entiteettiä (esim. tehtävää) ei löytynyt.
+    /// The referenced entity (e.g. a task) was not found.
     #[error("not found: {0}")]
     NotFound(String),
 
-    /// Tilakoneen siirtymä ei ollut laillinen.
+    /// The state machine transition was not legal.
     #[error("illegal transition: {0}")]
     IllegalTransition(String),
 
-    /// Vaadittu hyväksyntä puuttuu kokonaan.
+    /// The required approval is missing entirely.
     #[error("approval missing: {0}")]
     ApprovalMissing(String),
 
-    /// Hyväksyntä on vanhentunut (TTL ylittynyt).
+    /// The approval has expired (TTL exceeded).
     #[error("approval expired: {0}")]
     ApprovalExpired(String),
 
-    /// Hyväksyntää on jo käytetty (toistokäyttö estetty, nonce kulutettu).
+    /// The approval has already been used (replay prevented, nonce consumed).
     #[error("approval reused: {0}")]
     ApprovalReused(String),
 
-    /// Hyväksynnän payload-tiiviste ei vastaa suoritettavaa payloadia.
+    /// The approval's payload hash does not match the payload to be executed.
     #[error("approval payload mismatch: {0}")]
     ApprovalPayloadMismatch(String),
 
-    /// Käytäntö (policy) esti toiminnon.
+    /// Policy blocked the action.
     #[error("policy denied: {0}")]
     PolicyDenied(String),
 
-    /// Toiminnon suoritus epäonnistui.
+    /// Execution of the action failed.
     #[error("execution failed: {0}")]
     ExecutionFailed(String),
 
-    /// Todistepaketin rakentaminen tai validointi epäonnistui.
+    /// Building or validating the proof bundle failed.
     #[error("proof error: {0}")]
     Proof(String),
 
-    /// MCP-työkalua ei löytynyt.
+    /// The MCP tool was not found.
     #[error("mcp unknown tool: {0}")]
     McpUnknownTool(String),
 
-    /// MCP-työkalun käyttö estettiin (esim. capability puuttuu).
+    /// Use of the MCP tool was denied (e.g. missing capability).
     #[error("mcp denied: {0}")]
     McpDenied(String),
 
-    /// Käärii alla olevan keskitetyn [`FamilyClawError`]-virheen
-    /// (esim. IO, serde, config) ilman tiedonhukkaa.
+    /// Wraps the underlying centralized [`FamilyClawError`] error
+    /// (e.g. IO, serde, config) without loss of information.
     #[error(transparent)]
     Core(#[from] FamilyClawError),
 }
 
-/// Toimintopinon vakiotulostyyppi: [`std::result::Result`] jonka virhe on
-/// aina [`ActionError`].
+/// The action stack's standard result type: [`std::result::Result`] whose
+/// error is always [`ActionError`].
 pub type Result<T> = std::result::Result<T, ActionError>;
 
 impl From<ActionError> for FamilyClawError {
-    /// Muuntaa toimintopinon virheen takaisin keskitettyyn tyyppiin.
+    /// Converts the action stack's error back into the centralized type.
     ///
-    /// Jo keskitetystä tyypistä käärityt virheet ([`ActionError::Core`])
-    /// puretaan sellaisinaan; muut variantit kartoitetaan
-    /// [`FamilyClawError::InvalidInput`]-variantiksi säilyttäen viesti.
+    /// Errors already wrapped from the centralized type ([`ActionError::Core`])
+    /// are unwrapped as-is; other variants are mapped to the
+    /// [`FamilyClawError::InvalidInput`] variant, preserving the message.
     fn from(err: ActionError) -> Self {
         match err {
             ActionError::Core(inner) => inner,

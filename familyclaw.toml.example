@@ -1,4 +1,4 @@
-# FamilyClaw gateway configuration — OSS skeleton (KERROS A / Layer A).
+# FamilyClaw gateway configuration — OSS skeleton (Layer A).
 #
 # Copy this file to your private config location and fill in the blanked-out
 # secret fields. The gateway looks for the live file (in priority order):

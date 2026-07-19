@@ -1,75 +1,75 @@
-//! Narratiiviset langat — tapahtumien ajalliset ketjut.
+//! Narrative threads — temporal chains of events.
 //!
-//! [`NarrativeThread`] sitoo yhteen tapahtumat jotka liittyvät toisiinsa
-//! ajallisesti, temaattisesti tai kausaalisesti. Jokainen [`ThreadEvent`]
-//! on yksittäinen solmu langassa, ja [`Link`] yhdistää tapahtumia
-//! eri langoista (ristiviittaus).
+//! [`NarrativeThread`] ties together events that relate to one another
+//! temporally, thematically, or causally. Each [`ThreadEvent`] is a
+//! single node in the thread, and [`Link`] connects events across
+//! different threads (a cross-reference).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
 
-/// Tapahtuman tyyppi narratiivisessa langassa.
+/// The type of an event in a narrative thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EventType {
-    /// Uusi muisto luotu.
+    /// A new memory was created.
     MemoryCreated,
-    /// Emotionaalinen muutos.
+    /// An emotional shift.
     EmotionalShift,
-    /// Päätös tehty.
+    /// A decision was made.
     Decision,
-    /// Oppiminen tai oivallus.
+    /// Learning or an insight.
     Learning,
-    /// Ihmisen tekemä korjaus.
+    /// A human-made correction.
     Correction,
 }
 
-/// Yhteystyypit narratiivisten lankojen välillä.
+/// Relation types between narrative threads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RelationType {
-    /// Jatkaa edellisen langan tarinaa.
+    /// Continues the story of a previous thread.
     Continues,
-    /// On ristiriidassa toisen tapahtuman kanssa.
+    /// Contradicts another event.
     Contradicts,
-    /// Laajentaa aiempaa tapahtumaa.
+    /// Expands on an earlier event.
     Expands,
-    /// Toimii emotionaalisena laukaisimena.
+    /// Acts as an emotional trigger.
     EmotionalTrigger,
 }
 
-/// Linkki kahden tapahtuman välillä (mahdollisesti eri langoissa).
+/// A link between two events (possibly in different threads).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
-    /// Lähdetapahtuman ID.
+    /// The source event's ID.
     pub source: Uuid,
-    /// Kohdetapahtuman ID.
+    /// The target event's ID.
     pub target: Uuid,
-    /// Linkin tyyppi.
+    /// The link's type.
     pub relation: RelationType,
 }
 
-/// Yksittäinen tapahtuma narratiivisessa langassa.
+/// A single event in a narrative thread.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadEvent {
-    /// Tapahtuman uniikki tunniste.
+    /// The event's unique identifier.
     pub id: Uuid,
-    /// Langan ID johon tapahtuma kuuluu.
+    /// The ID of the thread this event belongs to.
     pub thread_id: Uuid,
-    /// Tapahtuman tyyppi.
+    /// The event's type.
     pub event_type: EventType,
-    /// Tapahtuman sisältö.
+    /// The event's content.
     pub content: String,
-    /// Agentti joka loi tapahtuman.
+    /// The agent that created the event.
     pub agent_id: String,
-    /// Aikaleima.
+    /// Timestamp.
     pub timestamp: DateTime<Utc>,
-    /// Linkit muihin tapahtumiin (ristiviittaukset).
+    /// Links to other events (cross-references).
     pub linked_to: Vec<Uuid>,
 }
 
 impl ThreadEvent {
-    /// Luo uuden tapahtuman.
+    /// Creates a new event.
     #[must_use]
     pub fn new(
         thread_id: Uuid,
@@ -88,39 +88,39 @@ impl ThreadEvent {
         }
     }
 
-    /// Lisää linkin toiseen tapahtumaan.
+    /// Adds a link to another event.
     pub fn link_to(&mut self, target_event_id: Uuid) {
         if !self.linked_to.contains(&target_event_id) {
             self.linked_to.push(target_event_id);
         }
     }
 
-    /// Onko tällä tapahtumalla linkkejä.
+    /// Whether this event has any links.
     #[must_use]
     pub fn has_links(&self) -> bool {
         !self.linked_to.is_empty()
     }
 }
 
-/// Narratiivinen lanka — tapahtumien ajallinen ketju.
+/// A narrative thread — a temporal chain of events.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NarrativeThread {
-    /// Langan uniikki tunniste.
+    /// The thread's unique identifier.
     pub id: Uuid,
-    /// Langan otsikko.
+    /// The thread's title.
     pub title: String,
-    /// Osallistuvat agentit (nimet).
+    /// Participating agents (names).
     pub participants: Vec<String>,
-    /// Langan tapahtumat aikajärjestyksessä.
+    /// The thread's events in chronological order.
     pub events: Vec<ThreadEvent>,
-    /// Luontiaika.
+    /// Creation time.
     pub created_at: DateTime<Utc>,
-    /// Viimeisin päivitysaika.
+    /// Most recent update time.
     pub updated_at: DateTime<Utc>,
 }
 
 impl NarrativeThread {
-    /// Luo uuden narratiivisen langan.
+    /// Creates a new narrative thread.
     #[must_use]
     pub fn new(title: impl Into<String>, participants: Vec<String>) -> Self {
         let now = Utc::now();
@@ -134,13 +134,13 @@ impl NarrativeThread {
         }
     }
 
-    /// Lisää tapahtuman lankaan ja päivittää aikaleiman.
+    /// Adds an event to the thread and updates the timestamp.
     pub fn add_event(&mut self, event: ThreadEvent) {
         self.events.push(event);
         self.updated_at = Utc::now();
     }
 
-    /// Etsii kaikki linkit tämän langan tapahtumista toisiin lankoihin.
+    /// Finds all links from this thread's events to other threads.
     #[must_use]
     pub fn find_cross_references(&self) -> Vec<(Uuid, Uuid)> {
         let own_ids: HashSet<Uuid> = self.events.iter().map(|e| e.id).collect();
@@ -155,14 +155,14 @@ impl NarrativeThread {
         refs
     }
 
-    /// Palauttaa tapahtumat kronologisessa järjestyksessä.
+    /// Returns the events in chronological order.
     #[must_use]
     pub fn timeline(&self) -> &[ThreadEvent] {
-        // Oletetaan että events on jo aikajärjestyksessä (lisäysjärjestys)
+        // Assumes events are already in chronological (insertion) order
         &self.events
     }
 
-    /// Langan tapahtumien lukumäärä.
+    /// The number of events in the thread.
     #[must_use]
     pub fn event_count(&self) -> usize {
         self.events.len()
@@ -219,7 +219,7 @@ mod tests {
 
         let timeline = thread.timeline();
         assert_eq!(timeline.len(), 3);
-        // Verifioidaan järjestys (ei tarkkaa aikaleimaa koska testi on nopea)
+        // Verify the order (not the exact timestamp, since the test runs fast)
     }
 
     #[test]

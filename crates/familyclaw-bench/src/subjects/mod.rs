@@ -1,14 +1,14 @@
-//! Konkreettiset [`Subject`](crate::Subject)-toteutukset.
+//! Concrete [`Subject`](crate::Subject) implementations.
 //!
-//! - [`FamilyClawSubject`] — ajaa `continuity_daemon`-binääriä mustana laatikkona
-//!   lapsiprosessina (design §2.1).
-//! - [`MarkdownFileSubject`] — rehellinen kilpailija-perustaso joka mallintaa
-//!   tiedosto-pohjaisen `MEMORY.md`-muistin dokumentoidun käyttäytymisen
-//!   (puhdas in-process). Tekee benchmarkista vertailun kasvotusten.
+//! - [`FamilyClawSubject`] — runs the `continuity_daemon` binary as a black
+//!   box child process (design §2.1).
+//! - [`MarkdownFileSubject`] — an honest competitor baseline that models the
+//!   documented behavior of file-based `MEMORY.md` memory (pure in-process).
+//!   Makes the benchmark a head-to-head comparison.
 //!
-//! Lisää kilpailija-adapterit (Letta, OpenClaw, Hermes Agent) tulevat saman
-//! [`Subject`](crate::Subject)-rajapinnan taakse uusina moduuleina ilman
-//! harness-uudelleensuunnittelua.
+//! Further competitor adapters (Letta, OpenClaw, Hermes Agent) come in
+//! behind the same [`Subject`](crate::Subject) interface as new modules,
+//! without requiring a harness redesign.
 
 pub mod familyclaw;
 pub mod markdown_file;

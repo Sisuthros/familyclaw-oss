@@ -1,16 +1,16 @@
-//! Busin viestityypit: [`BusMessage`] (hyötykuorma) ja [`ResonanceMessage`]
-//! (kirjekuori metatietoineen).
+//! The bus's message types: [`BusMessage`] (payload) and [`ResonanceMessage`]
+//! (envelope with metadata).
 //!
-//! Resonance Bus on **affektiivinen hermosto** (design §2.2): jokaisen olennon
-//! tunnetila voi *vuotaa* busiin, ja muut olennot aistivat sen
-//! ([`BusMessage::EmotionPulse`]). Viestit kantavat aina tiedon lähettäjästä
-//! ([`ResonanceMessage::from`]), jotta vastaanottaja tietää **kuka** resonoi.
+//! The Resonance Bus is an **affective nervous system** (design §2.2): each
+//! being's emotion state can *leak* into the bus, and other beings sense it
+//! ([`BusMessage::EmotionPulse`]). Messages always carry the sender's identity
+//! ([`ResonanceMessage::from`]), so the receiver knows **who** is resonating.
 //!
-//! ## OSS-raja (KERROS A)
-//! Mikään tässä moduulissa ei kovakoodaa perheenjäsenten sieluja, mallinimiä,
-//! avaimia eikä polkuja. Olentojen tunnisteet ([`BeingId`]) ja mallitunnisteet
-//! annetaan aina ajonaikaisesti; esimerkit käyttävät geneerisiä nimiä
-//! (`agent_a`, `agent_b`).
+//! ## OSS boundary (Layer A)
+//! Nothing in this module hardcodes family members' souls, model names,
+//! keys, or paths. Being identifiers ([`BeingId`]) and model identifiers are
+//! always supplied at runtime; examples use generic names (`agent_a`,
+//! `agent_b`).
 
 use std::fmt;
 
@@ -20,30 +20,30 @@ use familyclaw_emotion::EmotionState;
 use familyclaw_latent::LatentVector;
 use serde::{Deserialize, Serialize};
 
-/// Busiin liittyneen olennon (agentin) tunniste.
+/// Identifier for a being (agent) joined to the bus.
 ///
-/// Tämä on ohut newtype [`AgentId`]:n ympärillä: bus puhuu *olennoista*
-/// (beings) eikä pelkistä agenttitunnisteista, mutta identiteetti on sama.
-/// Erillinen tyyppi tekee bus-rajapinnasta itsedokumentoivan ja estää
-/// sekoittamasta busin osallistujaa muihin tunnisteisiin.
+/// This is a thin newtype around [`AgentId`]: the bus talks about *beings*
+/// rather than plain agent identifiers, but the identity is the same. A
+/// distinct type makes the bus interface self-documenting and prevents
+/// confusing a bus participant with other identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct BeingId(AgentId);
 
 impl BeingId {
-    /// Luo uuden satunnaisen olennotunnisteen.
+    /// Creates a new random being identifier.
     #[must_use]
     pub fn new() -> Self {
         Self(AgentId::new())
     }
 
-    /// Kääri olemassa olevan [`AgentId`]:n olennotunnisteeksi.
+    /// Wraps an existing [`AgentId`] as a being identifier.
     #[must_use]
     pub const fn from_agent_id(id: AgentId) -> Self {
         Self(id)
     }
 
-    /// Palauttaa sisällä olevan [`AgentId`]:n.
+    /// Returns the wrapped [`AgentId`].
     #[must_use]
     pub const fn agent_id(&self) -> AgentId {
         self.0
@@ -74,32 +74,32 @@ impl From<BeingId> for AgentId {
     }
 }
 
-/// Tehtäväelinkaaren tapahtumalaji, jonka olento voi julkaista busiin.
+/// The kind of task-lifecycle event a being can publish to the bus.
 ///
-/// Tämä on tarkoituksella *kevyt ja geneerinen* — varsinainen tehtävämalli
-/// elää siltakerroksessa (`familyclaw-bridge`). Bus välittää vain signaalin,
-/// jotta sisarukset voivat reagoida toistensa työn etenemiseen.
+/// This is deliberately *lightweight and generic* — the actual task model
+/// lives in the bridge layer (`familyclaw-bridge`). The bus only relays the
+/// signal, so siblings can react to each other's work progress.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskEventKind {
-    /// Tehtävä luotiin.
+    /// The task was created.
     Created,
-    /// Tehtävä aloitettiin (siirtyi työn alle).
+    /// The task was started (moved into progress).
     Started,
-    /// Tehtävän edistymistä päivitettiin.
+    /// The task's progress was updated.
     Progress,
-    /// Tehtävä valmistui onnistuneesti.
+    /// The task completed successfully.
     Completed,
-    /// Tehtävä epäonnistui.
+    /// The task failed.
     Failed,
-    /// Tehtävä luovutettiin toiselle olennolle.
+    /// The task was handed off to another being.
     HandedOff,
-    /// Sovelluskohtainen tapahtumalaji vapaalla nimellä.
+    /// An application-specific event kind with a free-form name.
     Custom(String),
 }
 
 impl TaskEventKind {
-    /// Palauttaa lajin vakaan tunnisteen merkkijonona (lokitukseen, reititykseen).
+    /// Returns the kind's stable identifier as a string (for logging, routing).
     #[must_use]
     pub fn as_label(&self) -> &str {
         match self {
@@ -114,89 +114,92 @@ impl TaskEventKind {
     }
 }
 
-/// Busissa kulkevan viestin hyötykuorma.
+/// The payload of a message traveling on the bus.
 ///
-/// Tämä on Resonance Busin "kieli". Variantit kattavat sekä tavanomaisen
-/// teksti-/tehtäväviestinnän että affektiivisen hermoston ydinviestit
+/// This is the Resonance Bus's "language". The variants cover both ordinary
+/// text/task communication and the affective nervous system's core messages
 /// ([`EmotionPulse`](BusMessage::EmotionPulse), [`Latent`](BusMessage::Latent)).
 ///
-/// `#[non_exhaustive]` jotta uusia viestityyppejä voi lisätä rikkomatta
-/// downstream-koodia.
+/// `#[non_exhaustive]` so new message types can be added without breaking
+/// downstream code.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BusMessage {
-    /// Tavallinen tekstiviesti olentojen välillä.
+    /// A plain text message between beings.
     Text {
-        /// Viestin tekstisisältö.
+        /// The message's text content.
         body: String,
     },
 
-    /// Latent-telepatia: olennon piilotila ([`LatentVector`]) sekä aina mukana
-    /// kulkeva tekstivarjo. Teksti on totuuden lähde — latent on optimointi
-    /// (design §2.4, ks. `familyclaw-latent`).
+    /// Latent telepathy: a being's hidden state ([`LatentVector`]) along with
+    /// a text shadow that always travels with it. Text is the source of
+    /// truth — latent is an optimization (design §2.4, see `familyclaw-latent`).
     Latent {
-        /// Lähettävän mallin hidden-state-vektori.
+        /// The sending model's hidden-state vector.
         vector: LatentVector,
-        /// Tekstivarjo, johon vastaanottaja palaa jos latent ei sovellu.
+        /// The text shadow the receiver falls back to if the latent does
+        /// not apply.
         text_shadow: String,
     },
 
-    /// **Affektiivinen pulssi:** olennon tunnetila vuotaa busiin. Tämä on
-    /// affective contagion -mekanismin perusviesti — kun yksi sisarus on
-    /// esim. luovassa virtauksessa, muut aistivat sen.
+    /// **Affective pulse:** a being's emotion state leaks into the bus. This
+    /// is the base message of the affective-contagion mechanism — when one
+    /// sibling is, say, in a creative flow, the others sense it.
     EmotionPulse {
-        /// Lähettävän olennon hetkellinen tunnetila.
+        /// The sending being's momentary emotion state.
         state: EmotionState,
     },
 
-    /// Tehtäväelinkaaren tapahtuma (kevyt signaali; täysi malli siltakerroksessa).
+    /// A task-lifecycle event (a lightweight signal; the full model lives in
+    /// the bridge layer).
     TaskEvent {
-        /// Tapahtuman laji.
+        /// The event's kind.
         event: TaskEventKind,
-        /// Tehtävän tunniste (vapaamuotoinen, esim. siltakerroksen id).
+        /// The task's identifier (free-form, e.g. the bridge layer's id).
         task_id: String,
-        /// Vapaaehtoinen ihmisluettava kuvaus.
+        /// An optional human-readable description.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
 
-    /// Operaattorin myöntämä hyväksyntä: pyytää vastaanottavaa agenttia jatkamaan
-    /// keskeytetyn vuoron (suspend/resume-silta). Kantaa vain hyväksynnän tunnisteen
-    /// (merkkijonona) — ei payloadia, ei salaisuuksia.
+    /// An operator-granted approval: asks the receiving agent to resume a
+    /// suspended turn (the suspend/resume bridge). Carries only the approval
+    /// identifier (as a string) — no payload, no secrets.
     ///
-    /// Tämä on **ohjaussignaali, ei sisältö**: se EI mene mallin
-    /// keskusteluputkeen eikä käynnistä uutta LLM-vuoroa, vaan ohjataan suoraan
-    /// agentin resume-polulle. Vastaanottaja jäsentää tunnisteen ja jatkaa
-    /// hyväksynnän odotuksessa olleen tool-loopin loppuun.
+    /// This is a **control signal, not content**: it does NOT go into the
+    /// model's conversation pipeline and does not start a new LLM turn;
+    /// instead it is routed directly to the agent's resume path. The
+    /// receiver parses the identifier and continues the tool loop that was
+    /// waiting for approval.
     ResumeApproval {
-        /// Myönnetyn hyväksynnän tunniste (UUID-merkkijonona). Ei salaisuus.
+        /// The granted approval's identifier (as a UUID string). Not a secret.
         approval_id: String,
     },
 
-    /// Sovellus-/adapterikohtainen viesti vapaalla JSON-hyötykuormalla.
-    /// Mahdollistaa laajennukset ilman ydintyypin muuttamista.
+    /// An application-/adapter-specific message with a free-form JSON payload.
+    /// Allows extensions without changing the core type.
     Custom {
-        /// Viestin laji (vapaa nimi).
+        /// The message's kind (free-form name).
         name: String,
-        /// JSON-hyötykuorma.
+        /// JSON payload.
         payload: serde_json::Value,
     },
 }
 
 impl BusMessage {
-    /// Rakentaa tekstiviestin.
+    /// Builds a text message.
     pub fn text(body: impl Into<String>) -> Self {
         BusMessage::Text { body: body.into() }
     }
 
-    /// Rakentaa affektiivisen pulssin annetusta tunnetilasta.
+    /// Builds an affective pulse from the given emotion state.
     #[must_use]
     pub fn emotion_pulse(state: EmotionState) -> Self {
         BusMessage::EmotionPulse { state }
     }
 
-    /// Rakentaa latent-viestin piilotilasta ja tekstivarjosta.
+    /// Builds a latent message from a hidden state and a text shadow.
     pub fn latent(vector: LatentVector, text_shadow: impl Into<String>) -> Self {
         BusMessage::Latent {
             vector,
@@ -204,7 +207,7 @@ impl BusMessage {
         }
     }
 
-    /// Rakentaa tehtävätapahtuman.
+    /// Builds a task event.
     pub fn task_event(event: TaskEventKind, task_id: impl Into<String>) -> Self {
         BusMessage::TaskEvent {
             event,
@@ -213,13 +216,13 @@ impl BusMessage {
         }
     }
 
-    /// Onko tämä affektiivinen pulssi (contagion-reititys nojaa tähän).
+    /// Is this an affective pulse (contagion routing relies on this)?
     #[must_use]
     pub fn is_emotion_pulse(&self) -> bool {
         matches!(self, BusMessage::EmotionPulse { .. })
     }
 
-    /// Lyhyt lajitunniste lokitusta ja metriikkaa varten.
+    /// A short kind identifier for logging and metrics.
     #[must_use]
     pub fn kind_label(&self) -> &'static str {
         match self {
@@ -233,43 +236,46 @@ impl BusMessage {
     }
 }
 
-/// Busin läpi kulkeva viesti **kirjekuoressa**: hyötykuorma + lähettäjä +
-/// tunniste + aikaleima.
+/// A message traveling through the bus **in an envelope**: payload + sender +
+/// identifier + timestamp.
 ///
-/// Bus rikastaa jokaisen julkaisun tähän muotoon, jotta vastaanottajat
-/// tietävät kuka resonoi ja milloin. Kuori on `Clone`, koska sama viesti
-/// monistetaan jokaiselle vastaanottavalle olennolle (broadcast).
-/// Yhden saapuvan viestin **alkuperae** bus-kirjekuoressa (F2-origin-sopimus):
-/// mistae kanavasta, mistae keskustelusta ja keneltae viesti tuli.
+/// The bus enriches every publish into this shape, so receivers know who is
+/// resonating and when. The envelope is `Clone`, since the same message is
+/// duplicated for each receiving being (broadcast).
+/// The **origin** of a single incoming message in the bus envelope (the F2
+/// origin contract): which channel, which conversation, and from whom the
+/// message came.
 ///
-/// Tama on **kevyt, riippumaton** tyyppi busin matalimmassa kerroksessa: vain
-/// kolme [`String`]-kenttaa, jotta bus ei joudu riippumaan kanava- tai
-/// agenttikerroksesta (kerrossuunta on yksisuuntainen — ne riippuvat busista,
-/// ei toisin pain). Agenttikerroksen `MessageOrigin` kuvautuu suoraan tahan ja
-/// takaisin (`channel_id`/`conversation`/`sender` tasmaavat kenttae kentaelta).
+/// This is a **lightweight, independent** type at the bus's lowest layer:
+/// just three [`String`] fields, so the bus does not have to depend on the
+/// channel or agent layer (the layering direction is one-way — they depend
+/// on the bus, not the other way around). The agent layer's `MessageOrigin`
+/// maps directly to and from this one (`channel_id`/`conversation`/`sender`
+/// match field for field).
 ///
-/// ## Miksi origin kuuluu kirjekuoreen, ei hyotykuormaan
-/// [`BusMessage`] on *sisaeltoe* (teksti/tunnepulssi/latent). Alkuperae on
-/// *metatietoa* siitae mistae sisaeltoe saapui — sama tieto kuin laehettaejae
-/// ([`ResonanceMessage::from`]) ja aikaleima. Origin kirjekuoressa antaa
-/// vastaanottajalle (agentille) keinon johtaa **vastauksen kohde** per viesti
-/// (`conversation`), niin etta useampi keskustelu ei reitity vaerin.
+/// ## Why origin belongs in the envelope, not the payload
+/// [`BusMessage`] is *content* (text/emotion pulse/latent). Origin is
+/// *metadata* about where the content arrived from — the same kind of
+/// information as the sender ([`ResonanceMessage::from`]) and the timestamp.
+/// Origin in the envelope gives the receiver (the agent) a way to derive the
+/// **reply target** per message (`conversation`), so multiple conversations
+/// don't get routed incorrectly.
 ///
-/// ## OSS-raja (KERROS A)
-/// Ei kovakoodattuja kanavanimiae, keskusteluja eikae avaimia — kaikki tulee
-/// ajonaikaisesti saapuvasta viestistae.
+/// ## OSS boundary (Layer A)
+/// No hardcoded channel names, conversations, or keys — everything comes
+/// from the message arriving at runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageOrigin {
-    /// Kanavainstanssin tunniste (esim. `"discord-main"`).
+    /// The channel instance's identifier (e.g. `"discord-main"`).
     pub channel_id: String,
-    /// Keskustelun/ryhmaen tunniste (vastausosoite).
+    /// The conversation/group identifier (reply address).
     pub conversation: String,
-    /// Kanavakohtainen laehettaejaen tunniste (auditointi).
+    /// The channel-specific sender identifier (for auditing).
     pub sender: String,
 }
 
 impl MessageOrigin {
-    /// Rakentaa alkuperaen paljaista osista.
+    /// Builds an origin from its bare parts.
     #[must_use]
     pub fn new(
         channel_id: impl Into<String>,
@@ -283,49 +289,50 @@ impl MessageOrigin {
         }
     }
 
-    /// Reply-kohde taelle alkuperaelle: keskustelu, josta viesti tuli.
+    /// The reply target for this origin: the conversation the message came from.
     #[must_use]
     pub fn reply_target(&self) -> &str {
         &self.conversation
     }
 }
 
-/// Busin läpi kulkeva viesti **kirjekuoressa**: hyötykuorma + lähettäjä +
-/// tunniste + aikaleima + valinnainen per-viesti-alkuperä ([`origin`]).
+/// A message traveling through the bus **in an envelope**: payload + sender +
+/// identifier + timestamp + optional per-message origin ([`origin`]).
 ///
-/// Bus rikastaa jokaisen julkaisun tähän muotoon, jotta vastaanottajat
-/// tietävät kuka resonoi ja milloin. Kuori on `Clone`, koska sama viesti
-/// monistetaan jokaiselle vastaanottavalle olennolle (broadcast).
+/// The bus enriches every publish into this shape, so receivers know who is
+/// resonating and when. The envelope is `Clone`, since the same message is
+/// duplicated for each receiving being (broadcast).
 ///
-/// [`origin`] (F2-origin-sopimus) kantaa ulkomaailman alkuperän
-/// ([`MessageOrigin`]: kanava + keskustelu + lähettäjä) silloin kun viesti tuli
-/// kanavakerroksen kautta. Vastaanottava agentti johtaa siitä vastauksen
-/// kohteen per viesti; `None`-tapauksessa palataan staattiseen reply-kohteeseen.
+/// [`origin`] (the F2 origin contract) carries the outside-world origin
+/// ([`MessageOrigin`]: channel + conversation + sender) when the message came
+/// in through the channel layer. The receiving agent derives the reply
+/// target per message from it; in the `None` case it falls back to the
+/// static reply target.
 ///
 /// [`origin`]: ResonanceMessage::origin
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResonanceMessage {
-    /// Viestin yksilöivä tunniste.
+    /// The message's unique identifier.
     pub id: MessageId,
-    /// Viestin lähettänyt olento.
+    /// The being that sent the message.
     pub from: BeingId,
-    /// Lähetyshetken UTC-aikaleima.
+    /// The UTC timestamp of when it was sent.
     pub at: Timestamp,
-    /// Varsinainen hyötykuorma.
+    /// The actual payload.
     pub payload: BusMessage,
-    /// Per-viesti-alkuperä (kanava/keskustelu/lähettäjä), jos viesti tuli
-    /// ulkomaailmasta kanavakerroksen kautta. Sisäisesti syntyneet viestit
-    /// (olentojen väliset pulssit, say/announce) jättävät sen `None`:ksi.
-    /// `#[serde(default)]` → vanhat (origin-ttömät) durable-replayt
-    /// deserialisoituvat `None`:ksi (taaksepäin-yhteensopiva).
+    /// Per-message origin (channel/conversation/sender), if the message came
+    /// in from the outside world through the channel layer. Internally
+    /// generated messages (pulses between beings, say/announce) leave this
+    /// as `None`. `#[serde(default)]` → old (origin-less) durable replays
+    /// deserialize to `None` (backward-compatible).
     #[serde(default)]
     pub origin: Option<MessageOrigin>,
 }
 
 impl ResonanceMessage {
-    /// Rakentaa kirjekuoren tuoreella tunnisteella ja nykyhetken aikaleimalla.
-    /// Origin on `None` (sisäinen viesti); ulkomaailman alkuperä liitetään
-    /// [`with_origin`](Self::with_origin):llä.
+    /// Builds an envelope with a fresh identifier and the current timestamp.
+    /// Origin is `None` (an internal message); an outside-world origin is
+    /// attached with [`with_origin`](Self::with_origin).
     #[must_use]
     pub fn new(from: BeingId, payload: BusMessage) -> Self {
         Self {
@@ -337,21 +344,21 @@ impl ResonanceMessage {
         }
     }
 
-    /// Liittää per-viesti-alkuperän kirjekuoreen (F2). Palauttaa `self`
-    /// ketjutusta varten.
+    /// Attaches a per-message origin to the envelope (F2). Returns `self`
+    /// for chaining.
     #[must_use]
     pub fn with_origin(mut self, origin: MessageOrigin) -> Self {
         self.origin = Some(origin);
         self
     }
 
-    /// Per-viesti-alkuperä, jos asetettu.
+    /// The per-message origin, if set.
     #[must_use]
     pub fn origin(&self) -> Option<&MessageOrigin> {
         self.origin.as_ref()
     }
 
-    /// Onko tämän kirjekuoren hyötykuorma affektiivinen pulssi.
+    /// Whether this envelope's payload is an affective pulse.
     #[must_use]
     pub fn is_emotion_pulse(&self) -> bool {
         self.payload.is_emotion_pulse()
@@ -369,7 +376,7 @@ mod tests {
         let being = BeingId::from_agent_id(agent);
         assert_eq!(being.agent_id(), agent);
 
-        // serde on transparentti: olennotunniste sarjallistuu kuin agentti.
+        // serde is transparent: the being identifier serializes like an agent.
         let being_json = serde_json::to_string(&being).expect("ser being");
         let agent_json = serde_json::to_string(&agent).expect("ser agent");
         assert_eq!(being_json, agent_json);
@@ -427,7 +434,7 @@ mod tests {
             approval_id: "11111111-2222-4333-8444-555555555555".into(),
         };
         let json = serde_json::to_string(&msg).expect("serialize");
-        // Vain tunniste + laji — ei payloadia, ei salaisuuksia.
+        // Only the identifier + kind — no payload, no secrets.
         assert!(json.contains("resume_approval"));
         assert!(json.contains("11111111-2222-4333-8444-555555555555"));
         let back: BusMessage = serde_json::from_str(&json).expect("deserialize");
@@ -487,19 +494,19 @@ mod tests {
         assert_eq!(env, back);
     }
 
-    // ---- F2 per-viesti-alkuperä (origin) -------------------------------
+    // ---- F2 per-message origin ------------------------------------------
 
     #[test]
     fn new_message_has_no_origin_by_default() {
-        // Sisäisesti syntyneet viestit (say/pulse) eivät kanna alkuperää.
-        let env = ResonanceMessage::new(BeingId::new(), BusMessage::text("sisäinen"));
+        // Internally generated messages (say/pulse) do not carry an origin.
+        let env = ResonanceMessage::new(BeingId::new(), BusMessage::text("internal"));
         assert!(env.origin().is_none());
     }
 
     #[test]
     fn with_origin_attaches_per_message_origin() {
         let origin = MessageOrigin::new("discord-main", "general", "user-42");
-        let env = ResonanceMessage::new(BeingId::new(), BusMessage::text("ulkoa"))
+        let env = ResonanceMessage::new(BeingId::new(), BusMessage::text("from outside"))
             .with_origin(origin.clone());
         assert_eq!(env.origin(), Some(&origin));
         assert_eq!(env.origin().expect("origin").reply_target(), "general");
@@ -525,28 +532,29 @@ mod tests {
 
     #[test]
     fn legacy_envelope_without_origin_field_deserializes_to_none() {
-        // Taaksepäin-yhteensopivuus: vanha durable-replay-rivi EI sisällä
-        // `origin`-kenttää. `#[serde(default)]` → None, ei deserialisointivirhe.
-        // Rakennetaan "vanha" muoto serialisoimalla nykyinen ja poistamalla
-        // origin-avain JSON-objektista (faithfulimpi kuin käsin koodattu rivi:
-        // id/timestamp-muodot pysyvät oikeina riippumatta sisäisestä esityksestä).
-        let env = ResonanceMessage::new(BeingId::new(), BusMessage::text("vanha"));
+        // Backward compatibility: an old durable-replay row does NOT contain
+        // the `origin` field. `#[serde(default)]` → None, no deserialization
+        // error. We build the "old" shape by serializing the current one and
+        // removing the origin key from the JSON object (more faithful than a
+        // hand-coded row: the id/timestamp formats stay correct regardless
+        // of the internal representation).
+        let env = ResonanceMessage::new(BeingId::new(), BusMessage::text("old"));
         let mut value: serde_json::Value = serde_json::to_value(&env).expect("to value");
         value
             .as_object_mut()
             .expect("object")
             .remove("origin")
-            .expect("nykyinen muoto sisältää origin-avaimen");
+            .expect("current shape contains the origin key");
         assert!(
             value.get("origin").is_none(),
-            "origin-avain poistettu (simuloi vanhaa riviä)"
+            "origin key removed (simulates an old row)"
         );
 
         let back: ResonanceMessage =
             serde_json::from_value(value).expect("legacy envelope deserializes");
-        assert!(back.origin().is_none(), "puuttuva origin-kenttä → None");
+        assert!(back.origin().is_none(), "missing origin field → None");
         match back.payload {
-            BusMessage::Text { body } => assert_eq!(body, "vanha"),
+            BusMessage::Text { body } => assert_eq!(body, "old"),
             other => panic!("expected Text, got {other:?}"),
         }
     }

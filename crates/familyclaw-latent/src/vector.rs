@@ -1,44 +1,47 @@
-//! Latent-vektorit — agentin hidden-state-representaatio.
+//! Latent vectors — an agent's hidden-state representation.
 //!
-//! [`LatentVector`] kapseloi yhden agentin *piilotilan* (hidden state):
-//! mallin viimeisen kerroksen aktivaatiot kelluvina lukuina, sekä tiedon
-//! siitä **mikä malli** sen tuotti ([`LatentVector::model_id`]). Mallitunniste
-//! on kriittinen, koska eri mallien latent-avaruudet eivät ole keskenään
-//! vertailukelpoisia ilman projektiota (ks. [`crate::link`]).
+//! [`LatentVector`] encapsulates one agent's *hidden state*: the final
+//! layer's activations as floating-point numbers, along with a record of
+//! **which model** produced it ([`LatentVector::model_id`]). The model
+//! identifier is critical because different models' latent spaces are not
+//! directly comparable without a projection (see [`crate::link`]).
 //!
-//! ## Tutkimuskonteksti
-//! Tämä on rehellinen *luuranko* LatentMAS-tyyppiselle (ICML 2026)
-//! sisarusviestinnälle. Vektori itsessään on pelkkä numeerinen kantaja —
-//! se ei väitä ymmärtävänsä, mitä piilotila merkitsee. Todellinen oppiva
-//! tulkinta/projektio tulee myöhemmin; tässä vaiheessa pidämme rakenteen
-//! yksinkertaisena ja todennettavissa olevana.
+//! ## Research context
+//! This is an honest *skeleton* for LatentMAS-style (ICML 2026) sibling
+//! communication. The vector itself is just a numeric carrier — it does not
+//! claim to understand what the hidden state means. A real learned
+//! interpretation/projection comes later; for now we keep the structure
+//! simple and verifiable.
 
 use serde::{Deserialize, Serialize};
 
-/// Agentin hidden-state-representaatio: kelluvien lukujen vektori sekä
-/// sen tuottaneen mallin tunniste.
+/// An agent's hidden-state representation: a vector of floating-point
+/// numbers plus the identifier of the model that produced it.
 ///
-/// `model_id` on vapaamuotoinen mallitunniste muodossa `"provider/model"`
-/// (esim. `"agent-a-model/v1"`). Sitä käytetään tarkistamaan, voiko kaksi
-/// vektoria yhdistää suoraan vai tarvitaanko [`crate::link::RecursiveLink`].
+/// `model_id` is a free-form model identifier in the form `"provider/model"`
+/// (e.g. `"agent-a-model/v1"`). It is used to check whether two vectors can
+/// be combined directly or whether a [`crate::link::RecursiveLink`] is
+/// needed.
 ///
-/// # OSS-raja (KERROS A)
-/// Tämä tyyppi ei kovakoodaa todellisia mallinimiä eikä perheenjäsenten
-/// tietoja — `model_id` annetaan aina ajonaikaisesti.
+/// # OSS boundary (Layer A)
+/// This type never hardcodes real model names or family member data —
+/// `model_id` is always supplied at runtime.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LatentVector {
-    /// Piilotilan numeeriset komponentit (mallin viimeisen kerroksen
-    /// aktivaatiot tai vastaava tiivistetty edustus).
+    /// The hidden state's numeric components (the model's final layer
+    /// activations, or an equivalent condensed representation).
     pub dims: Vec<f32>,
-    /// Vektorin tuottaneen mallin tunniste, muodossa `"provider/model"`.
+    /// The identifier of the model that produced this vector, in
+    /// `"provider/model"` form.
     pub model_id: String,
 }
 
 impl LatentVector {
-    /// Luo uuden latent-vektorin annetuista komponenteista ja mallitunnisteesta.
+    /// Creates a new latent vector from the given components and model
+    /// identifier.
     ///
-    /// Tyhjä `dims` on sallittu (edustaa "ei piilotilaa") — yhteensopivuus-
-    /// ja fallback-logiikka käsittelevät sen turvallisesti.
+    /// An empty `dims` is allowed (representing "no hidden state") —
+    /// compatibility and fallback logic handle it safely.
     #[must_use]
     pub fn new(dims: Vec<f32>, model_id: impl Into<String>) -> Self {
         Self {
@@ -47,62 +50,63 @@ impl LatentVector {
         }
     }
 
-    /// Vektorin dimensioluku (komponenttien määrä).
+    /// The vector's dimensionality (number of components).
     #[must_use]
     pub fn len(&self) -> usize {
         self.dims.len()
     }
 
-    /// Onko vektori tyhjä (ei yhtään komponenttia).
+    /// Whether the vector is empty (no components at all).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.dims.is_empty()
     }
 
-    /// Onko vektorin tuottanut malli sama kuin `other`-mallitunniste.
+    /// Whether the model that produced this vector matches the `other`
+    /// model identifier.
     ///
-    /// Tämä on nopea ennakkotarkistus: jos mallit ovat samat, vektorit
-    /// elävät samassa latent-avaruudessa eikä projektiota tarvita.
+    /// This is a fast pre-check: if the models are the same, the vectors
+    /// live in the same latent space and no projection is needed.
     #[must_use]
     pub fn same_model(&self, other_model_id: &str) -> bool {
         self.model_id == other_model_id
     }
 
-    /// Onko vektori numeerisesti terve: kaikki komponentit ovat äärellisiä
-    /// (ei `NaN`, ei ääretön).
+    /// Whether the vector is numerically sound: all components are finite
+    /// (no `NaN`, no infinity).
     ///
-    /// Epäterve piilotila on signaali siitä, että latent-siirto kannattaa
-    /// hylätä ja palata teksti-fallbackiin (ks. [`crate::channel`]).
+    /// An unsound hidden state is a signal that the latent transfer should
+    /// be rejected and fall back to text (see [`crate::channel`]).
     #[must_use]
     pub fn is_finite(&self) -> bool {
         self.dims.iter().all(|x| x.is_finite())
     }
 
-    /// L2-normi (euklidinen pituus). Hyödyllinen sanity-tarkistuksiin ja
-    /// projektion vaikutuksen mittaamiseen.
+    /// The L2 norm (Euclidean length). Useful for sanity checks and for
+    /// measuring the effect of a projection.
     #[must_use]
     pub fn l2_norm(&self) -> f32 {
         self.dims.iter().map(|x| x * x).sum::<f32>().sqrt()
     }
 }
 
-/// Kosinisimilariteetti kahden komponenttijonon välillä.
+/// Cosine similarity between two component sequences.
 ///
-/// Palauttaa arvon välillä `[-1.0, 1.0]`, missä `1.0` tarkoittaa identtistä
-/// suuntaa (käytetään testeissä mittaamaan, säilyttääkö projektio/sekoitus
-/// merkityksen suunnan). Mittaa **suuntaa**, ei pituutta.
+/// Returns a value in `[-1.0, 1.0]`, where `1.0` means identical direction
+/// (used in tests to measure whether a projection/blend preserves the
+/// direction of meaning). Measures **direction**, not length.
 ///
-/// Reunaehdot (palautetaan `0.0`, ei `NaN` — soveltuu pisteytykseen):
-/// - eri pituiset jonot (vertailukelvottomat),
-/// - tyhjät jonot,
-/// - jompikumpi jono on nollavektori (suunta ei määritelty),
-/// - ei-äärelliset arvot (`NaN`/`inf`) syötteessä.
+/// Edge cases (return `0.0`, never `NaN` — suitable for scoring):
+/// - sequences of different length (not comparable),
+/// - empty sequences,
+/// - either sequence is a zero vector (direction undefined),
+/// - non-finite values (`NaN`/`inf`) in the input.
 ///
-/// # Esimerkki
+/// # Example
 /// ```
 /// use familyclaw_latent::vector::cosine;
 /// assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
-/// assert!(cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6); // ortogonaaliset
+/// assert!(cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6); // orthogonal
 /// ```
 #[must_use]
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -127,25 +131,25 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
 
-    // Numeerinen kiinnitys [-1, 1]:een (liukulukuvirheet voivat ylittää rajan).
+    // Numerically clamp to [-1, 1] (floating-point error can exceed the bound).
     (dot / denom).clamp(-1.0, 1.0)
 }
 
-/// Sekoittaa kaksi samanmittaista vektoria lineaarisesti annetulla
-/// sekoitusvoimalla (Direct Semantic Communication -tyylinen ~30 % blend).
+/// Linearly blends two equal-length vectors by the given blend strength
+/// (Direct Semantic Communication-style ~30% blend).
 ///
-/// Tulos on komponenteittain `original * (1 - strength) + other * strength`.
-/// `strength` kiinnitetään välille `[0.0, 1.0]`:
-/// - `0.0` → palauttaa `original`:n muuttumattomana,
-/// - `1.0` → palauttaa `other`:n (kunhan pituudet täsmäävät),
-/// - `0.3` → Direct Semantic -paperin oletussekoitus.
+/// The result is, component-wise, `original * (1 - strength) + other * strength`.
+/// `strength` is clamped to `[0.0, 1.0]`:
+/// - `0.0` -> returns `original` unchanged,
+/// - `1.0` -> returns `other` (as long as the lengths match),
+/// - `0.3` -> the Direct Semantic paper's default blend.
 ///
-/// Tuloksen `model_id` peritään `original`:lta — sekoitus elää lähettäjän
-/// avaruudessa, eikä väitä vaihtaneensa mallia.
+/// The result's `model_id` is inherited from `original` — the blend lives in
+/// the sender's space and does not claim to have switched models.
 ///
 /// # Errors
-/// Palauttaa [`crate::FamilyClawError::InvalidInput`] jos vektorit ovat eri
-/// mittaiset (sekoitus vaatii kohdistetut, samandimensioiset komponentit).
+/// Returns [`crate::FamilyClawError::InvalidInput`] if the vectors have
+/// different lengths (blending requires aligned, equal-dimension components).
 pub fn blend(
     original: &LatentVector,
     other: &LatentVector,
@@ -207,8 +211,8 @@ mod tests {
 
     #[test]
     fn empty_vector_is_finite() {
-        // Tyhjä vektori on vacuously finite — kaikki nollasta komponentista
-        // ovat äärellisiä.
+        // An empty vector is vacuously finite — all zero components are
+        // finite.
         assert!(LatentVector::new(vec![], "m").is_finite());
     }
 
@@ -249,7 +253,7 @@ mod tests {
 
     #[test]
     fn cosine_handles_edge_cases_without_nan() {
-        // Eri pituus, tyhjä, nollavektori, ei-äärellinen → 0.0 (ei NaN).
+        // Different length, empty, zero vector, non-finite -> 0.0 (never NaN).
         assert!(cosine(&[1.0, 2.0], &[1.0]).abs() < f32::EPSILON);
         assert!(cosine(&[], &[]).abs() < f32::EPSILON);
         assert!(cosine(&[0.0, 0.0], &[1.0, 1.0]).abs() < f32::EPSILON);
@@ -259,7 +263,7 @@ mod tests {
 
     #[test]
     fn cosine_is_scale_invariant() {
-        // Kosini mittaa suuntaa, ei pituutta: skaalaus ei muuta tulosta.
+        // Cosine measures direction, not length: scaling doesn't change the result.
         let base = cosine(&[1.0, 2.0, 3.0], &[2.0, 1.0, 0.0]);
         let scaled = cosine(&[10.0, 20.0, 30.0], &[2.0, 1.0, 0.0]);
         assert!((base - scaled).abs() < 1e-6);
@@ -271,7 +275,7 @@ mod tests {
         let b = LatentVector::new(vec![9.0, 9.0, 9.0], "agent_b/v1");
         let blended = blend(&a, &b, 0.0).expect("equal dims");
         assert_eq!(blended.dims, vec![1.0, 2.0, 3.0]);
-        // model_id peritään originalilta.
+        // model_id is inherited from the original.
         assert_eq!(blended.model_id, "agent_a/v1");
     }
 
@@ -281,13 +285,13 @@ mod tests {
         let b = LatentVector::new(vec![9.0, 8.0], "agent_b/v1");
         let blended = blend(&a, &b, 1.0).expect("equal dims");
         assert_eq!(blended.dims, vec![9.0, 8.0]);
-        // model_id pysyy yhä originalin avaruudessa.
+        // model_id still stays in the original's space.
         assert_eq!(blended.model_id, "agent_a/v1");
     }
 
     #[test]
     fn blend_at_thirty_percent_is_weighted_mix() {
-        // Direct Semantic -paperin oletus: 30 % sekoitus.
+        // Direct Semantic paper's default: 30% blend.
         let a = LatentVector::new(vec![0.0, 0.0], "agent_a/v1");
         let b = LatentVector::new(vec![10.0, 100.0], "agent_b/v1");
         let blended = blend(&a, &b, 0.3).expect("equal dims");
@@ -299,7 +303,7 @@ mod tests {
     fn blend_clamps_out_of_range_strength() {
         let a = LatentVector::new(vec![1.0], "agent_a/v1");
         let b = LatentVector::new(vec![5.0], "agent_b/v1");
-        // < 0 kiinnittyy 0:aan (original), > 1 kiinnittyy 1:een (other).
+        // < 0 clamps to 0 (original), > 1 clamps to 1 (other).
         assert_eq!(blend(&a, &b, -2.0).expect("ok").dims, vec![1.0]);
         assert_eq!(blend(&a, &b, 7.0).expect("ok").dims, vec![5.0]);
     }

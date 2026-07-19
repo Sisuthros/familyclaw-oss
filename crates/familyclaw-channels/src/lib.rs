@@ -1,35 +1,38 @@
 //! # familyclaw-channels
 //!
-//! FamilyClaw-alustan **kanavakerros** (KERROS A / OSS, design §3): yhtenäinen
-//! [`Channel`]-rajapinta saapuville ja lähteville viesteille sekä silta
-//! Resonance Busiin ([`InboundEnvelope`]).
+//! The **channel layer** of the `FamilyClaw` platform (Layer A / OSS, design
+//! §3): a unified [`Channel`] interface for inbound and outbound messages,
+//! and a bridge to the Resonance Bus ([`InboundEnvelope`]).
 //!
-//! ## Mitä tämä crate tarjoaa
-//! - [`Channel`] — kaksisuuntaisen kanavan rajapinta: [`Channel::send`],
-//!   [`Channel::receive`] ([`MessageStream`]), [`Channel::channel_id`],
-//!   [`Channel::kind`]. Dyn-yhteensopiva (`Box<dyn Channel>`).
-//! - [`InboundEnvelope`] — kanonisoitu, alkuperätietoinen kirjekuore.
+//! ## What this crate provides
+//! - [`Channel`] — the interface for a bidirectional channel:
+//!   [`Channel::send`], [`Channel::receive`] ([`MessageStream`]),
+//!   [`Channel::channel_id`], [`Channel::kind`]. Dyn-compatible
+//!   (`Box<dyn Channel>`).
+//! - [`InboundEnvelope`] — a canonicalized, origin-aware envelope.
 //! - [`ChannelKind`] — Discord / Telegram / `WhatsApp` / Signal / Mock.
 //! - [`OutboundMessage`] / [`InboundMessage`] / [`InboundEnvelope`] —
-//!   viestityypit ja kanonisointi (`saapuva viesti → InboundEnvelope`).
-//! - [`MockChannel`] — in-memory testikanava ilman ulkoista SDK:ta.
-//! - [`pump_to`] — integraatiosauma: kanavan virta → Resonance Bus.
+//!   message types and canonicalization (`inbound message → InboundEnvelope`).
+//! - [`MockChannel`] — an in-memory test channel with no external SDK.
+//! - [`pump_to`] — the integration seam: channel stream → Resonance Bus.
 //!
-//! ## Kanava-adapterit ovat feature-flagien takana
-//! Oikeat adapterit (esim. **serenity** Discordille, **teloxide** Telegramille)
-//! vetävät sisään raskaita kanava-SDK:ita. Siksi ne ovat craten feature-
-//! flagien (`discord`, `telegram`, `whatsapp`, `signal`) takana, eivät
-//! pakollisia riippuvuuksia. Oletuskäännös sisältää **vain** rungon +
-//! [`MockChannel`], joten alusta kääntyy ja testautuu ilman verkkoa tai
-//! raskaita SDK:ita. Adapterien konkreettiset SDK-riippuvuudet lisätään
-//! kunkin featuren `[dependencies]`-osioon vasta kun adapteri toteutetaan.
+//! ## Channel adapters are behind feature flags
+//! Real adapters (e.g. **serenity** for Discord, **teloxide** for Telegram)
+//! pull in heavy channel SDKs. That's why they sit behind the crate's
+//! feature flags (`discord`, `telegram`, `whatsapp`, `signal`) rather than
+//! being mandatory dependencies. The default build contains **only** the
+//! core + [`MockChannel`], so the platform builds and tests without
+//! network access or heavy SDKs. Each adapter's concrete SDK dependencies
+//! are added to that feature's `[dependencies]` section only once the
+//! adapter is implemented.
 //!
-//! ## OSS-raja (KERROS A)
-//! Tämä crate ei kovakoodaa kanavatokeneita, Discord-/Telegram-tunnisteita,
-//! palvelin-IP:itä tai henkilökohtaisia polkuja. Tunnukset ja kohteet ovat
-//! ajonaikaista konfiguraatiota; tyypit kantavat vain geneerisen rakenteen.
+//! ## OSS boundary (Layer A)
+//! This crate does not hardcode channel tokens, Discord/Telegram
+//! identifiers, server IPs, or personal paths. Credentials and
+//! destinations are runtime configuration; the types carry only the
+//! generic structure.
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! # use familyclaw_channels::{Channel, ChannelKind, InboundMessage, MockChannel, OutboundMessage};
 //! # #[tokio::main]
@@ -37,13 +40,13 @@
 //! let channel = MockChannel::new("agent-a-mock")?;
 //! let mut inbound = channel.receive()?;
 //!
-//! // Ulkomaailma syöttää saapuvan viestin → se kanonisoituu InboundEnvelopeksi.
+//! // The outside world feeds in an inbound message → it is canonicalized into an InboundEnvelope.
 //! channel.inject(InboundMessage::new("user-1", "general", "moi")?)?;
 //! let bus_msg = inbound.recv().await.expect("one message");
 //! assert_eq!(bus_msg.kind, ChannelKind::Mock);
 //! assert_eq!(bus_msg.body, "moi");
 //!
-//! // Vastataan samaan keskusteluun.
+//! // Reply to the same conversation.
 //! channel.send(bus_msg.reply("hei takaisin")?).await?;
 //! assert_eq!(channel.sent()[0].body, "hei takaisin");
 //! # Ok(())
@@ -81,7 +84,7 @@ pub use discord_interactions::{
 #[cfg(feature = "telegram")]
 pub use telegram::TelegramChannel;
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -98,7 +101,7 @@ mod tests {
 
     #[test]
     fn public_api_is_reexported() {
-        // Jos jokin re-export poistetaan, tämä testi ei käänny.
+        // If any re-export is removed, this test will fail to compile.
         let kind = ChannelKind::Mock;
         assert_eq!(kind, ChannelKind::Mock);
         let out = OutboundMessage::new("c", "b").expect("outbound");

@@ -1,26 +1,26 @@
-//! Automaattinen upotus kirjoitettaessa ([`EmbeddingMemoryStore`]).
+//! Automatic embedding on write ([`EmbeddingMemoryStore`]).
 //!
-//! Tämä on **kääre** ([decorator]) minkä tahansa [`MemoryStore`]:n ympärille
-//! (kuten [`GatedMemoryStore`](crate::GatedMemoryStore)). Se täyttää muiston
-//! [`embedding`](crate::Memory::embedding)-kentän
-//! [`EmbeddingProvider`]:lla **ennen** delegointia sisempään tallennukseen, jos
-//! kentät on vielä tyhjä. Näin vektorihaku (cosine-similarity
-//! [`crate::retrieval`]ssä) saa upotukset automaattisesti — kutsujan ei tarvitse
-//! upottaa käsin.
+//! This is a **wrapper** ([decorator]) around any [`MemoryStore`]
+//! (such as [`GatedMemoryStore`](crate::GatedMemoryStore)). It fills the memory's
+//! [`embedding`](crate::Memory::embedding) field
+//! using an [`EmbeddingProvider`] **before** delegating to the inner storage, if
+//! the field is still empty. This way vector search (cosine similarity
+//! in [`crate::retrieval`]) gets embeddings automatically — the caller does not
+//! need to embed manually.
 //!
-//! ## Miksi kääre, ei sisäänrakennettu
-//! Sama syy kuin [`GatedMemoryStore`](crate::GatedMemoryStore)lla: upotus on
-//! **valinnainen, lisättävä kerros**. Köyhyys-rajoitteen oletustarjoaja
-//! ([`DeterministicEmbedder`](familyclaw_embeddings::DeterministicEmbedder)) on
-//! riippuvuudeton, mutta raskaammat (feature-gated) tarjoajat eivät saa pakottua
-//! jokaiseen tallennukseen. Kääre antaa kutsujan valita: ei käärettä = ei
-//! upotusta (nykyinen avainsanapohjainen haku), kääre = automaattinen upotus.
+//! ## Why a wrapper, not built-in
+//! Same reason as [`GatedMemoryStore`](crate::GatedMemoryStore): embedding is
+//! an **optional, additive layer**. The default provider under the
+//! zero-dependency constraint ([`DeterministicEmbedder`](familyclaw_embeddings::DeterministicEmbedder)) has
+//! no dependencies, but heavier (feature-gated) providers must not be forced onto
+//! every storage. The wrapper lets the caller choose: no wrapper = no
+//! embedding (current keyword-based retrieval), wrapper = automatic embedding.
 //!
-//! ## Idempotenssi + olemassa olevat upotukset
-//! Jos muistolla on jo `embedding`, sitä EI ylikirjoiteta (kunnioitetaan
-//! kutsujan antamaa tai eri tarjoajan tuottamaa vektoria). Tyhjästä sisällöstä
-//! tuleva nollavektori jätetään asettamatta (nollanormi ei auta cosinea), jotta
-//! tallennettu data pysyy siistinä.
+//! ## Idempotence + existing embeddings
+//! If a memory already has an `embedding`, it is NOT overwritten (the vector
+//! provided by the caller or produced by a different provider is respected). A
+//! zero vector resulting from empty content is left unset (a zero norm doesn't
+//! help cosine similarity), so the stored data stays clean.
 //!
 //! [decorator]: https://en.wikipedia.org/wiki/Decorator_pattern
 
@@ -35,48 +35,48 @@ use crate::memory::{Memory, MemoryStatus};
 use crate::retrieval::{RetrievalContext, RetrievalResult};
 use crate::store::{DecayReport, DecayThresholds, MemoryStore};
 
-/// Tyyppi-pyyhitty future dyn-yhteensopivalle traitille (sama muoto kuin
-/// [`MemoryStore`]:n metodeissa). `'a` vangitsee `&self`-lainan.
+/// Type-erased future for a dyn-compatible trait (same shape as used in
+/// [`MemoryStore`]'s methods). `'a` captures the `&self` borrow.
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// [`MemoryStore`]-kääre joka upottaa muistot automaattisesti kirjoitettaessa.
+/// A [`MemoryStore`] wrapper that embeds memories automatically on write.
 ///
-/// Delegoi kaikki operaatiot sisempään tallennukseen `S`, mutta
-/// [`add`](MemoryStore::add) ja [`update`](MemoryStore::update) täyttävät
-/// puuttuvan [`embedding`](Memory::embedding)-kentän ennen delegointia.
+/// Delegates all operations to the inner storage `S`, but
+/// [`add`](MemoryStore::add) and [`update`](MemoryStore::update) fill in the
+/// missing [`embedding`](Memory::embedding) field before delegating.
 pub struct EmbeddingMemoryStore<S> {
     inner: S,
     embedder: Arc<dyn EmbeddingProvider + Send + Sync>,
 }
 
 impl<S> EmbeddingMemoryStore<S> {
-    /// Kääräisee sisemmän tallennuksen annetulla upotustarjoajalla.
+    /// Wraps the inner storage with the given embedding provider.
     pub fn new(inner: S, embedder: Arc<dyn EmbeddingProvider + Send + Sync>) -> Self {
         Self { inner, embedder }
     }
 
-    /// Kääritty sisempi tallennus (lukuoikeus).
+    /// The wrapped inner storage (read access).
     pub const fn inner(&self) -> &S {
         &self.inner
     }
 
-    /// Purkaa kääreen ja palauttaa sisemmän tallennuksen.
+    /// Unwraps the wrapper and returns the inner storage.
     pub fn into_inner(self) -> S {
         self.inner
     }
 
-    /// Tarjoajan vakaa tunniste (esim. raportointiin `status`/`doctor`).
+    /// The provider's stable identifier (e.g. for `status`/`doctor` reporting).
     pub fn embedder_id(&self) -> &str {
         self.embedder.id()
     }
 
-    /// Täyttää muiston `embedding`-kentän jos se on tyhjä ja sisällöstä syntyy
-    /// ei-nollavektori. Palauttaa muiston (mahdollisesti rikastettuna).
+    /// Fills the memory's `embedding` field if it is empty and the content
+    /// yields a non-zero vector. Returns the memory (possibly enriched).
     fn enrich(&self, mut memory: Memory) -> Memory {
         if memory.embedding.is_none() && !memory.content.trim().is_empty() {
             let vec = self.embedder.embed(&memory.content);
-            // Nollavektoria (esim. pelkkiä erottimia) ei tallenneta: se ei auta
-            // cosinea ja vain paisuttaa tallennettua dataa.
+            // A zero vector (e.g. from separators only) is not stored: it
+            // doesn't help cosine similarity and only bloats stored data.
             if vec.iter().any(|&x| x != 0.0) {
                 memory.embedding = Some(vec);
             }
@@ -125,9 +125,9 @@ impl<S: MemoryStore> MemoryStore for EmbeddingMemoryStore<S> {
         ctx: &RetrievalContext,
         at: Timestamp,
     ) -> BoxFuture<'_, Result<Vec<RetrievalResult>>> {
-        // Haku delegoidaan sellaisenaan. (Tämä kääre rikastaa vain kirjoitusta;
-        // kysely-embeddingin asettaa kutsuja `RetrievalContext`:iin.) `ctx`
-        // kloonataan, jotta palautettu future ei lainaa lyhytikäistä viittausta.
+        // Retrieval is delegated as-is. (This wrapper only enriches writes;
+        // the query embedding is set by the caller on `RetrievalContext`.)
+        // `ctx` is cloned so the returned future does not borrow a short-lived reference.
         let ctx = ctx.clone();
         Box::pin(async move { self.inner.retrieve(&ctx, at).await })
     }
@@ -165,7 +165,7 @@ mod tests {
             .await
             .expect("add");
         let stored = store.get(id).await.expect("get").expect("present");
-        let emb = stored.embedding.expect("embedding täytetty");
+        let emb = stored.embedding.expect("embedding filled");
         assert_eq!(emb.len(), DeterministicEmbedder::DEFAULT_DIMENSIONS);
         assert!(emb.iter().any(|&x| x != 0.0));
     }
@@ -180,20 +180,20 @@ mod tests {
         assert_eq!(
             stored.embedding,
             Some(preset),
-            "olemassa olevaa ei ylikirjoiteta"
+            "existing embedding must not be overwritten"
         );
     }
 
     #[tokio::test]
     async fn empty_content_gets_no_embedding() {
         let store = EmbeddingMemoryStore::new(LocalJsonStore::in_memory(), embedder());
-        // Pelkkiä erottimia → nollavektori → ei tallenneta.
+        // Separators only → zero vector → not stored.
         let id = store
             .add(Memory::builder("   ").build())
             .await
             .expect("add");
         let stored = store.get(id).await.expect("get").expect("present");
-        assert!(stored.embedding.is_none(), "nollavektoria ei tallenneta");
+        assert!(stored.embedding.is_none(), "zero vector must not be stored");
     }
 
     #[tokio::test]

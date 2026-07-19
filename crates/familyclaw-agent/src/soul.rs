@@ -1,27 +1,27 @@
-//! SOUL-lataus: geneerinen profiili-skeema (KERROS A, OSS).
+//! SOUL loading: generic profile schema (Layer A, OSS).
 //!
-//! Tämä moduuli lataa olennon **identiteettiprofiilin** ajonaikaisesti
-//! geneerisestä hakemistosta (`FAMILYCLAW_PROFILE_DIR`, design §1). Se EI
-//! kovakoodaa yhdenkään perheenjäsenen sielua — se määrittää vain *muodon*,
-//! jonka kuka tahansa voi täyttää omalle perheelleen.
+//! This module loads a being's **identity profile** at runtime from a
+//! generic directory (`FAMILYCLAW_PROFILE_DIR`, design §1). It does NOT
+//! hard-code any family member's soul — it only defines the *shape* that
+//! anyone can fill in for their own family.
 //!
-//! ## OSS-raja (KERROS A)
-//! - Profiilin sisältö (SOUL.md, IDENTITY.md, WANTS.md) on KERROS B:tä ja
-//!   ladataan ajonaikaisesti — sitä ei koskaan kovakoodata tähän repoon.
-//! - Esimerkit käyttävät geneerisiä nimiä (`agent_a`, `agent_b`).
+//! ## OSS boundary (Layer A)
+//! - Profile content (SOUL.md, IDENTITY.md, WANTS.md) is Layer B and is
+//!   loaded at runtime — it is never hard-coded into this repo.
+//! - Examples use generic names (`agent_a`, `agent_b`).
 //!
-//! ## Skeema
-//! Profiilihakemisto on yksinkertainen: Markdown-tiedostoja, joiden
-//! perusnimi (ilman päätettä) on osa-alueen avain. Tunnetut osat:
+//! ## Schema
+//! The profile directory is simple: Markdown files whose base name
+//! (without extension) is the section's key. Known sections:
 //!
-//! | Tiedosto | Kenttä | Merkitys |
+//! | File | Field | Meaning |
 //! |----------|--------|----------|
-//! | `SOUL.md` | [`Soul::essence`] | Olennon ydinkuvaus (kuka se on). |
-//! | `IDENTITY.md` | [`Soul::identity`] | Pysyvät totuudet (ankkuroitava). |
-//! | `WANTS.md` | [`Soul::wants`] | Olennon omat halut/tavoitteet. |
+//! | `SOUL.md` | [`Soul::essence`] | The being's core description (who it is). |
+//! | `IDENTITY.md` | [`Soul::identity`] | Persistent truths (anchorable). |
+//! | `WANTS.md` | [`Soul::wants`] | The being's own wants/goals. |
 //!
-//! Lisätiedostot säilytetään [`Soul::extra`]-kartassa avaimella =
-//! perustiedostonimi pienennettynä. Vain `SOUL.md` on pakollinen.
+//! Additional files are kept in the [`Soul::extra`] map, keyed by the
+//! lowercased base file name. Only `SOUL.md` is required.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,49 +29,49 @@ use std::path::{Path, PathBuf};
 use familyclaw_core::{FamilyClawError, Result};
 use serde::{Deserialize, Serialize};
 
-/// Ympäristömuuttuja, joka osoittaa profiilihakemistojen juureen.
+/// Environment variable that points to the root of profile directories.
 ///
-/// Sama idea kuin Hermesin `HERMES_HOME` (design §1): alusta on geneerinen,
-/// ja konkreettiset profiilit elävät tämän muuttujan osoittamassa paikassa
-/// — eivät repossa.
+/// Same idea as Hermes's `HERMES_HOME` (design §1): the platform is generic,
+/// and concrete profiles live wherever this variable points — not in the
+/// repo.
 pub const PROFILE_DIR_ENV: &str = "FAMILYCLAW_PROFILE_DIR";
 
-/// Pakollisen ydintiedoston nimi.
+/// Name of the required core file.
 const SOUL_FILE: &str = "SOUL.md";
-/// Pysyvien totuuksien tiedoston nimi.
+/// Name of the persistent-truths file.
 const IDENTITY_FILE: &str = "IDENTITY.md";
-/// Halujen tiedoston nimi.
+/// Name of the wants file.
 const WANTS_FILE: &str = "WANTS.md";
 
-/// Olennon ladattu identiteettiprofiili (KERROS B -sisältö ajonaikaisesti).
+/// A being's loaded identity profile (Layer B content, at runtime).
 ///
-/// `Soul` on **dataa**, ei käyttäytymistä: se kantaa profiilihakemistosta
-/// luetut tekstit. Se on `serde`-sarjallistuva, jotta sen voi liittää
-/// muistoon tai lähettää busin yli ilman lisämuunnoksia.
+/// `Soul` is **data**, not behavior: it carries the texts read from the
+/// profile directory. It is `serde`-serializable so it can be attached to
+/// memory or sent over the bus without extra conversion.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Soul {
-    /// Ydinkuvaus (`SOUL.md`). Pakollinen — tyhjä sielu ei ole sielu.
+    /// Core description (`SOUL.md`). Required — an empty soul is not a soul.
     pub essence: String,
 
-    /// Pysyvät totuudet (`IDENTITY.md`), jos annettu. Tämä on luonteva
-    /// ankkuroitavaksi `familyclaw-security`-kerroksessa (λ=0).
+    /// Persistent truths (`IDENTITY.md`), if provided. This is a natural
+    /// candidate for anchoring in the `familyclaw-security` layer (λ=0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
 
-    /// Olennon omat halut/tavoitteet (`WANTS.md`), jos annettu.
+    /// The being's own wants/goals (`WANTS.md`), if provided.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wants: Option<String>,
 
-    /// Muut profiilitiedostot avaimella = perustiedostonimi pienennettynä
-    /// (esim. `family` tiedostolle `FAMILY.md`). Mahdollistaa
-    /// laajennukset rikkomatta skeemaa.
+    /// Other profile files, keyed by the lowercased base file name
+    /// (e.g. `family` for the file `FAMILY.md`). Allows extensions
+    /// without breaking the schema.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, String>,
 }
 
 impl Soul {
-    /// Rakentaa sielun pelkästä ytimestä (ilman levyä). Käytännöllinen
-    /// testeissä ja paljaalle rungolle.
+    /// Builds a soul from just the essence (no disk access). Useful in
+    /// tests and for a bare-bones runtime.
     #[must_use]
     pub fn from_essence(essence: impl Into<String>) -> Self {
         Self {
@@ -80,15 +80,16 @@ impl Soul {
         }
     }
 
-    /// Onko sielu tyhjä (ei ydintä). Tyhjää sielua ei pidä ankkuroida.
+    /// Whether the soul is empty (no essence). An empty soul should not be
+    /// anchored.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.essence.trim().is_empty()
     }
 
-    /// Lyhyt yhteenveto ankkurointia/lokitusta varten: ydin + identiteetti
-    /// yhdistettynä. Tämä on se sisältö, jonka tiivisteen
-    /// `familyclaw-security` ankkuroi tamper-vahdiksi.
+    /// Short summary for anchoring/logging: essence + identity combined.
+    /// This is the content whose hash `familyclaw-security` anchors as a
+    /// tamper guard.
     #[must_use]
     pub fn anchor_text(&self) -> String {
         match &self.identity {
@@ -100,10 +101,10 @@ impl Soul {
     }
 }
 
-/// Lukee yhden valinnaisen Markdown-tiedoston profiilihakemistosta.
+/// Reads a single optional Markdown file from the profile directory.
 ///
-/// Palauttaa `Ok(None)` jos tiedostoa ei ole, `Ok(Some(_))` jos se luettiin,
-/// ja virheen vain todellisesta IO-ongelmasta (esim. lukuoikeus).
+/// Returns `Ok(None)` if the file doesn't exist, `Ok(Some(_))` if it was
+/// read, and an error only for an actual IO problem (e.g. read permission).
 fn read_optional(dir: &Path, file: &str) -> Result<Option<String>> {
     let path = dir.join(file);
     match std::fs::read_to_string(&path) {
@@ -113,15 +114,15 @@ fn read_optional(dir: &Path, file: &str) -> Result<Option<String>> {
     }
 }
 
-/// Lataa olennon sielun annetusta profiilihakemistosta.
+/// Loads a being's soul from the given profile directory.
 ///
-/// `SOUL.md` on pakollinen; `IDENTITY.md` ja `WANTS.md` ovat valinnaisia.
-/// Kaikki muut `*.md`-tiedostot luetaan [`Soul::extra`]-karttaan.
+/// `SOUL.md` is required; `IDENTITY.md` and `WANTS.md` are optional.
+/// All other `*.md` files are read into the [`Soul::extra`] map.
 ///
 /// # Errors
-/// - [`FamilyClawError::NotFound`] jos hakemistoa ei ole tai pakollinen
-///   `SOUL.md` puuttuu (tai on tyhjä).
-/// - [`FamilyClawError::Io`] jos tiedoston luku epäonnistuu muusta syystä.
+/// - [`FamilyClawError::NotFound`] if the directory doesn't exist or the
+///   required `SOUL.md` is missing (or empty).
+/// - [`FamilyClawError::Io`] if reading a file fails for another reason.
 pub fn load_soul(profile_dir: impl AsRef<Path>) -> Result<Soul> {
     let dir = profile_dir.as_ref();
     if !dir.is_dir() {
@@ -144,8 +145,8 @@ pub fn load_soul(profile_dir: impl AsRef<Path>) -> Result<Soul> {
     let identity = read_optional(dir, IDENTITY_FILE)?;
     let wants = read_optional(dir, WANTS_FILE)?;
 
-    // Lue muut .md-tiedostot extra-karttaan (deterministinen järjestys
-    // BTreeMapin ansiosta).
+    // Read other .md files into the extra map (deterministic order thanks
+    // to BTreeMap).
     let mut extra = BTreeMap::new();
     let known = [SOUL_FILE, IDENTITY_FILE, WANTS_FILE];
     for entry in std::fs::read_dir(dir)? {
@@ -164,7 +165,7 @@ pub fn load_soul(profile_dir: impl AsRef<Path>) -> Result<Soul> {
         if !is_markdown || known.contains(&name) {
             continue;
         }
-        // Avain = perustiedostonimi ilman päätettä, pienennettynä.
+        // Key = base file name without extension, lowercased.
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             let key = stem.to_ascii_lowercase();
             let contents = std::fs::read_to_string(&path)?;
@@ -180,14 +181,15 @@ pub fn load_soul(profile_dir: impl AsRef<Path>) -> Result<Soul> {
     })
 }
 
-/// Ratkaisee yksittäisen agentin profiilihakemiston.
+/// Resolves a single agent's profile directory.
 ///
-/// Etusija:
-/// 1. eksplisiittinen `configured` (agentin `profile_dir`),
-/// 2. `FAMILYCLAW_PROFILE_DIR/<agent_name>` jos ympäristömuuttuja on asetettu.
+/// Precedence:
+/// 1. an explicit `configured` value (the agent's `profile_dir`),
+/// 2. `FAMILYCLAW_PROFILE_DIR/<agent_name>` if the environment variable is
+///    set.
 ///
-/// Palauttaa `None` jos kumpaakaan ei ole — silloin agentti ajaa paljaalla
-/// rungolla ilman sielua (täysin kalibroimaton).
+/// Returns `None` if neither is present — in that case the agent runs on a
+/// bare runtime without a soul (completely uncalibrated).
 #[must_use]
 pub fn resolve_profile_dir(configured: Option<&Path>, agent_name: &str) -> Option<PathBuf> {
     if let Some(dir) = configured {
@@ -200,7 +202,7 @@ pub fn resolve_profile_dir(configured: Option<&Path>, agent_name: &str) -> Optio
 mod tests {
     use super::*;
 
-    /// Apuri: luo uniikki väliaikainen profiilihakemisto.
+    /// Helper: creates a unique temporary profile directory.
     fn temp_profile_dir(tag: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!(
@@ -321,27 +323,27 @@ mod tests {
 
     #[test]
     fn resolve_profile_dir_prefers_explicit() {
-        // Eksplisiittinen polku ei kosketa ympäristömuuttujaa, joten tämä
-        // testi on turvallinen ajaa rinnakkain env-testin kanssa.
+        // An explicit path doesn't touch the environment variable, so this
+        // test is safe to run in parallel with the env test.
         let explicit = PathBuf::from("explicit/agent_a");
         let resolved = resolve_profile_dir(Some(&explicit), "agent_a");
         assert_eq!(resolved, Some(explicit));
     }
 
-    /// Yksi testi koko env-pohjaiselle reitille (asetettu + asettamaton),
-    /// jotta rinnakkaiset testit eivät mutatoi samaa prosessin globaalia
-    /// ympäristömuuttujaa ristiin (`set_var` ei ole säieturvallinen).
+    /// One test for the whole env-based path (set + unset), so that
+    /// parallel tests don't cross-mutate the same process-global
+    /// environment variable (`set_var` is not thread-safe).
     #[test]
     fn resolve_profile_dir_env_fallback_and_unset() {
         let root = std::env::temp_dir().join("familyclaw-profiles-root");
 
-        // 1. Env asetettuna → root/<agent_name>. (Edition 2021: set_var on
-        // turvallinen funktio; tämä on ainoa testi joka mutatoi muuttujaa.)
+        // 1. Env set → root/<agent_name>. (Edition 2021: set_var is a safe
+        // function; this is the only test that mutates the variable.)
         std::env::set_var(PROFILE_DIR_ENV, &root);
         let resolved = resolve_profile_dir(None, "agent_b");
         assert_eq!(resolved, Some(root.join("agent_b")));
 
-        // 2. Env poistettuna → None (kun ei eksplisiittistä polkua).
+        // 2. Env removed → None (when there's no explicit path).
         std::env::remove_var(PROFILE_DIR_ENV);
         assert!(resolve_profile_dir(None, "agent_c").is_none());
     }

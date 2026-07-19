@@ -1,9 +1,9 @@
-//! [`Scorecard`]: kaikkien skenaariotulosten aggregaatti (JSON + markdown).
+//! [`Scorecard`]: the aggregate of all scenario results (JSON + markdown).
 //!
-//! Scorecard on harnessin **julkinen artefakti** (design §4, §6): skeptikko
-//! ajaa benchmarkin ja saa tavu-tavulta saman raportin. Siksi `clock` on
-//! **injektoitu referenssihetki** — järjestelmäkelloa ei lueta koskaan, jotta
-//! tuloste pysyy reprodusoitavana.
+//! The scorecard is the harness's **public artifact** (design §4, §6): a
+//! skeptic runs the benchmark and gets the byte-for-byte same report.
+//! That's why `clock` is an **injected reference instant** — the system
+//! clock is never read, so the output stays reproducible.
 
 use serde::{Deserialize, Serialize};
 
@@ -12,23 +12,23 @@ use familyclaw_core::{time, Timestamp};
 use crate::error::Result;
 use crate::scenario::ScenarioResult;
 
-/// Aggregoitu tuloskortti: subjektin nimi, skenaariotulokset ja referenssikello.
+/// An aggregated scorecard: subject name, scenario results, and reference clock.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scorecard {
-    /// Benchmarkatun subjektin nimi (esim. `"familyclaw"`).
+    /// The benchmarked subject's name (e.g. `"familyclaw"`).
     pub subject: String,
-    /// Yksittäisten skenaarioiden tulokset ajojärjestyksessä.
+    /// Individual scenario results in run order.
     pub scenarios: Vec<ScenarioResult>,
-    /// Injektoitu referenssihetki — EI järjestelmäkello (reprodusoitavuus).
+    /// The injected reference instant — NOT the system clock (reproducibility).
     pub clock: Timestamp,
 }
 
 impl Scorecard {
-    /// Rakentaa scorecardin subjektista, tuloksista ja injektoidusta kellosta.
+    /// Builds a scorecard from a subject, results, and an injected clock.
     ///
-    /// Skenaariotulokset **lajitellaan tunnisteen mukaan** (`id`), jotta
-    /// tuloste on tavu-tavulta deterministinen riippumatta siitä missä
-    /// järjestyksessä harness ajoi skenaariot (design §2.2, §6).
+    /// Scenario results are **sorted by ID**, so the output is
+    /// byte-for-byte deterministic regardless of the order the harness ran
+    /// the scenarios in (design §2.2, §6).
     #[must_use]
     pub fn new(
         subject: impl Into<String>,
@@ -44,32 +44,32 @@ impl Scorecard {
         }
     }
 
-    /// Läpäisikö jokainen skenaario tavoitteensa.
+    /// Whether every scenario met its goal.
     #[must_use]
     pub fn all_passed(&self) -> bool {
         self.scenarios.iter().all(|s| s.passed)
     }
 
-    /// Sarjallistaa scorecardin sisennettyyn JSON-muotoon.
+    /// Serializes the scorecard to indented JSON.
     ///
     /// # Errors
-    /// Palauttaa [`BenchError::Serde`](crate::BenchError::Serde) jos
-    /// sarjallistus epäonnistuu.
+    /// Returns [`BenchError::Serde`](crate::BenchError::Serde) if
+    /// serialization fails.
     pub fn to_json(&self) -> Result<String> {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
-    /// Renderöi scorecardin ihmisluettavaksi markdowniksi (`SCORECARD.md`).
+    /// Renders the scorecard as human-readable markdown (`SCORECARD.md`).
     ///
-    /// Tuloste on deterministinen: kentät ja avaimet kiinteässä järjestyksessä,
-    /// kello injektoidusta arvosta (RFC 3339).
+    /// The output is deterministic: fields and keys in a fixed order, clock
+    /// from the injected value (RFC 3339).
     #[must_use]
     pub fn to_markdown(&self) -> String {
         use std::fmt::Write as _;
 
         let mut out = String::new();
         out.push_str("# FamilyClaw Continuity Scorecard\n\n");
-        // `write!` Stringiin ei voi epäonnistua, joten tulos ohitetaan turvallisesti.
+        // `write!` to a String cannot fail, so the result is safely ignored.
         let _ = writeln!(out, "- **Subject:** {}", self.subject);
         let _ = writeln!(
             out,
@@ -91,7 +91,7 @@ impl Scorecard {
             );
             if !scenario.metrics.is_empty() {
                 out.push_str("| Metric | Value |\n|--------|-------|\n");
-                // BTreeMap → deterministinen avainjärjestys.
+                // BTreeMap → deterministic key order.
                 for (key, value) in &scenario.metrics {
                     let _ = writeln!(out, "| {key} | {value:.4} |");
                 }

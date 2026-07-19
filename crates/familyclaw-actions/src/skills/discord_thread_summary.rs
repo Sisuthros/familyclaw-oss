@@ -1,13 +1,14 @@
-//! Esimerkkimalli (reference pattern): Discord-keskusteluketjun tiivistys (KERROS A).
+//! Reference pattern: Discord thread summarization (Layer A).
 //!
-//! [`DiscordThreadSummaryMock`] lukee keskusteluketjun viestit ([`ThreadMessage`])
-//! ja tuottaa lyhyen tiivistelmän sekä poimitut toimenpide-ehdotukset. Taito on
-//! **vain luku** ([`crate::policy::ActionRisk::ReadOnly`]) — se ei lähetä eikä
-//! muokkaa mitään. Tämä on **referenssimalli joka näyttää taidon sopimuksen**:
-//! suorituslogiikka on deterministinen ja muistinvarainen, ja käytetyt nimet
-//! ovat geneerisiä placeholder-merkkejä (`agent_a`, `agent_b`, kanava
-//! `general`). Kytke oma Discord-API-tarjoajasi tähän suoritusrunkoon, kun
-//! haluat lukea oikean ketjun — manifesti ja putki pysyvät ennallaan.
+//! [`DiscordThreadSummaryMock`] reads the messages of a thread ([`ThreadMessage`])
+//! and produces a short summary along with extracted action item suggestions.
+//! The skill is **read-only** ([`crate::policy::ActionRisk::ReadOnly`]) — it
+//! neither sends nor modifies anything. This is a **reference pattern that
+//! demonstrates the skill contract**: the execution logic is deterministic and
+//! in-memory, and the names used are generic placeholders (`agent_a`,
+//! `agent_b`, channel `general`). Wire up your own Discord API provider into
+//! this execution scaffold when you want to read a real thread — the manifest
+//! and pipeline remain unchanged.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -21,62 +22,62 @@ use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 
 use super::Skill;
 
-/// Geneerinen kanava (KERROS A — ei oikea kanava).
+/// Generic channel (Layer A — not a real channel).
 pub const CHANNEL: &str = "general";
 
-/// Taidon kiinteä tunniste, jotta rekisteröinti ja haku ovat toistettavia.
+/// Fixed identifier for the skill, so registration and lookup are reproducible.
 const SKILL_UUID: uuid::Uuid = uuid::uuid!("33333333-3333-4333-8333-333333333333");
 
-/// Yksittäinen viesti keskusteluketjussa.
+/// A single message in a thread.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadMessage {
-    /// Viestin kirjoittaja (geneerinen, esim. `agent_a`).
+    /// The message author (generic, e.g. `agent_a`).
     pub author: String,
-    /// Viestin tekstisisältö.
+    /// The text content of the message.
     pub text: String,
 }
 
-/// Taidon syöte: keskusteluketjun viestit.
+/// Skill input: the thread's messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscordThreadSummaryInput {
-    /// Tiivistettävän ketjun viestit järjestyksessä.
+    /// The messages of the thread to summarize, in order.
     pub thread: Vec<ThreadMessage>,
 }
 
-/// Taidon tulos: tiivistelmä + toimenpide-ehdotukset.
+/// Skill output: summary + action item suggestions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscordThreadSummaryOutput {
-    /// Lyhyt tiivistelmä ketjusta.
+    /// A short summary of the thread.
     pub summary: String,
-    /// Poimitut toimenpide-ehdotukset.
+    /// Extracted action item suggestions.
     pub action_items: Vec<String>,
 }
 
-/// Mock-taito Discord-ketjun tiivistykselle (vain luku).
+/// Mock skill for Discord thread summarization (read-only).
 ///
-/// Riskiluokka on [`ActionRisk::ReadOnly`] ja käytäntö
-/// [`ApprovalPolicy::AutoIfReadOnly`], joten suoritus ajaa automaattisesti.
+/// The risk class is [`ActionRisk::ReadOnly`] and the policy is
+/// [`ApprovalPolicy::AutoIfReadOnly`], so execution runs automatically.
 #[derive(Debug, Clone, Default)]
 pub struct DiscordThreadSummaryMock;
 
 impl DiscordThreadSummaryMock {
-    /// Luo uuden taidon.
+    /// Creates a new skill instance.
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 
-    /// Taidon kiinteä tunniste.
+    /// The skill's fixed identifier.
     #[must_use]
     pub fn skill_id() -> SkillId {
         SkillId::from_uuid(SKILL_UUID)
     }
 
-    /// Tiivistää ketjun deterministisesti (puhdas logiikka).
+    /// Summarizes the thread deterministically (pure logic).
     ///
-    /// Tiivistelmä kertoo osallistujamäärän ja viestien lukumäärän; toimenpide-
-    /// ehdotuksiksi poimitaan viestit, jotka sisältävät sanan `todo`/`action`/
-    /// `pitää`/`should`.
+    /// The summary states the participant count and message count; action
+    /// item suggestions are extracted from messages that contain the word
+    /// `todo`/`action`/`pitää`/`should`.
     #[must_use]
     pub fn summarize(input: &DiscordThreadSummaryInput) -> DiscordThreadSummaryOutput {
         let msg_count = input.thread.len();
@@ -144,7 +145,7 @@ impl Skill for DiscordThreadSummaryMock {
             id: Self::skill_id(),
             name: "discord_thread_summary_mock".to_string(),
             version: "1.0.0".to_string(),
-            description: "Tiivistää Discord-keskusteluketjun ja poimii toimenpiteet (vain luku)."
+            description: "Summarizes a Discord thread and extracts action items (read-only)."
                 .to_string(),
             permissions: vec![SkillPermission::NetworkRead],
             risk: ActionRisk::ReadOnly,
@@ -156,17 +157,17 @@ impl Skill for DiscordThreadSummaryMock {
                 "properties": {
                     "thread": {
                         "type": "array",
-                        "description": "Tiivistettävän ketjun viestit järjestyksessä.",
+                        "description": "The messages of the thread to summarize, in order.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "author": {
                                     "type": "string",
-                                    "description": "Viestin kirjoittaja."
+                                    "description": "The message author."
                                 },
                                 "text": {
                                     "type": "string",
-                                    "description": "Viestin tekstisisältö."
+                                    "description": "The text content of the message."
                                 }
                             },
                             "required": ["author", "text"],
@@ -218,7 +219,7 @@ mod tests {
         m.validate().expect("manifest validates");
         assert_eq!(m.name, "discord_thread_summary_mock");
         assert_eq!(m.risk, ActionRisk::ReadOnly);
-        // Syöteskeema on aito JSON-objekti jossa `thread`-taulukko.
+        // The input schema is a proper JSON object with a `thread` array.
         assert_eq!(m.input_schema["type"], "object");
         assert!(m.input_schema["properties"]["thread"].is_object());
     }

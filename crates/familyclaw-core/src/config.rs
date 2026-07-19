@@ -1,11 +1,11 @@
-//! Konfiguraatiotyypit perheelle ja agenteille.
+//! Configuration types for families and agents.
 //!
-//! Konfiguraatio ladataan JSON:sta (tiedostosta tai merkkijonosta) ja
-//! validoidaan. **KERROS A / OSS-raja:** profiilit (SOUL, kalibrointi,
-//! avaimet) EIVÄT ole osa tätä rakennetta — agentit viittaavat
-//! [`AgentConfig::profile_dir`]-kentällä ulkoiseen hakemistoon
-//! (vrt. `FAMILYCLAW_PROFILE_DIR`). Tämä tiedosto sisältää vain geneerisen
-//! rakenteen, ei kovakoodattua perhe-/avain-/polkutietoa.
+//! Configuration is loaded from JSON (from a file or a string) and
+//! validated. **Layer A / OSS boundary:** profiles (SOUL, calibration,
+//! keys) are NOT part of this structure — agents reference an external
+//! directory via the [`AgentConfig::profile_dir`] field (cf.
+//! `FAMILYCLAW_PROFILE_DIR`). This file contains only the generic
+//! structure, no hardcoded family/key/path data.
 
 use std::path::{Path, PathBuf};
 
@@ -14,24 +14,24 @@ use serde::{Deserialize, Serialize};
 use crate::error::{FamilyClawError, Result};
 use crate::ids::{AgentId, FamilyId};
 
-/// Yksittäisen agentin LLM-mallikonfiguraatio.
+/// LLM model configuration for a single agent.
 ///
-/// Per-agentti-malli + globaali fallback-ketju (design §2.1, CORRECTIONS #5).
-/// `primary` on ensisijainen malli ja `fallbacks` järjestyksessä kokeiltavat
-/// varamallit. Mickey-Mouse-mallien (liian pieni TPM) suodatus on ajonaikaisen
-/// kerroksen vastuulla — tämä tyyppi vain kantaa tiedon.
+/// Per-agent model plus global fallback chain (design §2.1, CORRECTIONS #5).
+/// `primary` is the preferred model and `fallbacks` are backup models tried
+/// in order. Filtering out underpowered models (too low TPM) is the
+/// responsibility of the runtime layer — this type only carries the data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelConfig {
-    /// Ensisijainen malli (esim. `"provider/model-name"`).
+    /// The preferred model (e.g. `"provider/model-name"`).
     pub primary: String,
 
-    /// Varamallit järjestyksessä, kokeillaan jos `primary` epäonnistuu.
+    /// Backup models in order, tried if `primary` fails.
     #[serde(default)]
     pub fallbacks: Vec<String>,
 }
 
 impl ModelConfig {
-    /// Rakentaa mallikonfiguraation ilman varamalleja.
+    /// Builds a model configuration with no fallbacks.
     pub fn new(primary: impl Into<String>) -> Self {
         Self {
             primary: primary.into(),
@@ -39,23 +39,24 @@ impl ModelConfig {
         }
     }
 
-    /// Lisää varamallin ketjun loppuun (builder-tyyli).
+    /// Appends a fallback model to the end of the chain (builder style).
     #[must_use]
     pub fn with_fallback(mut self, model: impl Into<String>) -> Self {
         self.fallbacks.push(model.into());
         self
     }
 
-    /// Iteroi koko mallipreferenssin: ensin `primary`, sitten `fallbacks`.
+    /// Iterates the full model preference order: `primary` first, then
+    /// `fallbacks`.
     pub fn preference_order(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.primary.as_str()).chain(self.fallbacks.iter().map(String::as_str))
     }
 
-    /// Validoi mallikonfiguraation.
+    /// Validates the model configuration.
     ///
     /// # Errors
-    /// [`FamilyClawError::Config`] jos `primary` on tyhjä tai jokin fallback
-    /// on tyhjä merkkijono.
+    /// [`FamilyClawError::Config`] if `primary` is empty or any fallback
+    /// is an empty string.
     pub fn validate(&self) -> Result<()> {
         if self.primary.trim().is_empty() {
             return Err(FamilyClawError::config("model primary must not be empty"));
@@ -69,31 +70,34 @@ impl ModelConfig {
     }
 }
 
-/// Yhden agentin (perheenjäsenen) konfiguraatio.
+/// Configuration for a single agent (family member).
 ///
-/// Sisältää vain geneerisen, julkaistavan rakenteen. Sielu/persoona ladataan
-/// ajonaikaisesti [`profile_dir`](AgentConfig::profile_dir)-hakemistosta.
+/// Contains only the generic, publishable structure. The soul/persona is
+/// loaded at runtime from the [`profile_dir`](AgentConfig::profile_dir)
+/// directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentConfig {
-    /// Agentin vakaa tunniste. Oletuksena uusi satunnainen jos puuttuu.
+    /// The agent's stable identifier. Defaults to a new random one if
+    /// missing.
     #[serde(default)]
     pub id: AgentId,
 
-    /// Agentin näyttönimi (geneerinen, esim. `"agent_a"`).
+    /// The agent's display name (generic, e.g. `"agent_a"`).
     pub name: String,
 
-    /// Mallikonfiguraatio (primary + fallbacks).
+    /// Model configuration (primary + fallbacks).
     pub model: ModelConfig,
 
-    /// Hakemisto josta agentin profiili (SOUL, kalibrointi) ladataan.
-    /// `None` = ei profiilia (paljas runko). Profiilin sisältö ei koskaan
-    /// kuulu KERROS A:n repoon.
+    /// Directory from which the agent's profile (SOUL, calibration) is
+    /// loaded. `None` means no profile (bare runtime). Profile contents
+    /// never belong in the Layer A repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_dir: Option<PathBuf>,
 }
 
 impl AgentConfig {
-    /// Rakentaa agenttikonfiguraation nimellä ja mallilla, uusi satunnainen id.
+    /// Builds an agent configuration with a name and model, using a new
+    /// random id.
     pub fn new(name: impl Into<String>, model: ModelConfig) -> Self {
         Self {
             id: AgentId::new(),
@@ -103,16 +107,17 @@ impl AgentConfig {
         }
     }
 
-    /// Rakentaa agenttikonfiguraation **vakaalla** (nimestä johdetulla)
-    /// tunnisteella mallilla `model`.
+    /// Builds an agent configuration with a **stable** (name-derived)
+    /// identifier and the given `model`.
     ///
-    /// Toisin kuin [`new`](Self::new), tämä EI arvo satunnaista id:tä vaan johtaa
-    /// sen deterministisesti nimestä ([`AgentId::from_name`]). Tämä on
-    /// **tuotannon** oikea konstruktori silloin kun olennon identiteetin (ja
-    /// siitä johdetun `being_id`:n) on pysyttävä vakaana yli prosessin
-    /// uudelleenkäynnistyksen — esimerkiksi jotta kaatumiskestävälle pinnalle
-    /// tallennettu jatkettava vuoro täsmää heränneen agentin omistajuus­
-    /// tarkistukseen eikä jää ikuisesti jatkamatta.
+    /// Unlike [`new`](Self::new), this does NOT assign a random id but
+    /// derives it deterministically from the name ([`AgentId::from_name`]).
+    /// This is the correct constructor for **production** use whenever the
+    /// being's identity (and the `being_id` derived from it) must remain
+    /// stable across process restarts — for example so that a resumable
+    /// turn persisted on the crash-durable substrate matches the ownership
+    /// check of the woken-up agent instead of being stuck unresumed
+    /// forever.
     pub fn new_with_stable_id(name: impl Into<String>, model: ModelConfig) -> Self {
         let name = name.into();
         let id = AgentId::from_name(&name);
@@ -124,28 +129,29 @@ impl AgentConfig {
         }
     }
 
-    /// Asettaa vakaan tunnisteen eksplisiittisesti (builder-tyyli).
+    /// Sets the stable identifier explicitly (builder style).
     ///
-    /// Käytetään kun tunniste johdetaan ulkoisesti (esim. profiilista) tai kun
-    /// se halutaan kiinnittää testeissä. Säilyttää muut kentät ennallaan.
+    /// Used when the identifier is derived externally (e.g. from a
+    /// profile) or needs to be pinned in tests. Leaves other fields
+    /// unchanged.
     #[must_use]
     pub fn with_id(mut self, id: AgentId) -> Self {
         self.id = id;
         self
     }
 
-    /// Asettaa profiilihakemiston (builder-tyyli).
+    /// Sets the profile directory (builder style).
     #[must_use]
     pub fn with_profile_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.profile_dir = Some(dir.into());
         self
     }
 
-    /// Validoi agenttikonfiguraation.
+    /// Validates the agent configuration.
     ///
     /// # Errors
-    /// [`FamilyClawError::Config`] jos nimi on tyhjä, malli kelvoton tai
-    /// asetettu profiilipolku on tyhjä.
+    /// [`FamilyClawError::Config`] if the name is empty, the model is
+    /// invalid, or a set profile path is empty.
     pub fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             return Err(FamilyClawError::config("agent name must not be empty"));
@@ -162,31 +168,32 @@ impl AgentConfig {
     }
 }
 
-/// Koko perheen (agenttiryhmän) konfiguraatio.
+/// Configuration for the whole family (agent group).
 ///
-/// Tämä on alustan juurikonfiguraatio: ryhmän identiteetti, jäsenet ja
-/// globaali fallback-ketju jota agentit voivat periä.
+/// This is the platform's root configuration: the group's identity, its
+/// members, and a global fallback chain that agents can inherit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FamilyConfig {
-    /// Perheen vakaa tunniste. Oletuksena uusi satunnainen jos puuttuu.
+    /// The family's stable identifier. Defaults to a new random one if
+    /// missing.
     #[serde(default)]
     pub id: FamilyId,
 
-    /// Perheen näyttönimi (geneerinen).
+    /// The family's display name (generic).
     pub name: String,
 
-    /// Perheen jäsenet.
+    /// The family's members.
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
 
-    /// Globaali fallback-malliketju jota agentit voivat käyttää viimeisenä
-    /// oljenkortena oman ketjunsa jälkeen.
+    /// Global fallback model chain that agents can use as a last resort
+    /// after their own chain.
     #[serde(default)]
     pub global_fallbacks: Vec<String>,
 }
 
 impl FamilyConfig {
-    /// Rakentaa tyhjän perhekonfiguraation annetulla nimellä.
+    /// Builds an empty family configuration with the given name.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             id: FamilyId::new(),
@@ -196,62 +203,62 @@ impl FamilyConfig {
         }
     }
 
-    /// Lisää agentin perheeseen (builder-tyyli).
+    /// Adds an agent to the family (builder style).
     #[must_use]
     pub fn with_agent(mut self, agent: AgentConfig) -> Self {
         self.agents.push(agent);
         self
     }
 
-    /// Lataa perhekonfiguraation JSON-merkkijonosta ja validoi sen.
+    /// Loads a family configuration from a JSON string and validates it.
     ///
     /// # Errors
-    /// [`FamilyClawError::Serde`] jos JSON on kelvotonta, tai
-    /// [`FamilyClawError::Config`] jos validointi epäonnistuu.
+    /// [`FamilyClawError::Serde`] if the JSON is invalid, or
+    /// [`FamilyClawError::Config`] if validation fails.
     pub fn from_json_str(json: &str) -> Result<Self> {
         let config: Self = serde_json::from_str(json)?;
         config.validate()?;
         Ok(config)
     }
 
-    /// Lataa perhekonfiguraation JSON-tiedostosta ja validoi sen.
+    /// Loads a family configuration from a JSON file and validates it.
     ///
     /// # Errors
-    /// [`FamilyClawError::Io`] jos tiedostoa ei voi lukea,
-    /// [`FamilyClawError::Serde`] jos JSON on kelvotonta, tai
-    /// [`FamilyClawError::Config`] jos validointi epäonnistuu.
+    /// [`FamilyClawError::Io`] if the file cannot be read,
+    /// [`FamilyClawError::Serde`] if the JSON is invalid, or
+    /// [`FamilyClawError::Config`] if validation fails.
     pub fn from_json_file(path: impl AsRef<Path>) -> Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         Self::from_json_str(&contents)
     }
 
-    /// Sarjallistaa konfiguraation siistiksi (pretty) JSON-merkkijonoksi.
+    /// Serializes the configuration to a pretty-printed JSON string.
     ///
     /// # Errors
-    /// [`FamilyClawError::Serde`] jos sarjallistus epäonnistuu.
+    /// [`FamilyClawError::Serde`] if serialization fails.
     pub fn to_json_string(&self) -> Result<String> {
         serde_json::to_string_pretty(self).map_err(FamilyClawError::from)
     }
 
-    /// Etsii agentin tunnisteen perusteella.
+    /// Looks up an agent by its identifier.
     #[must_use]
     pub fn agent_by_id(&self, id: AgentId) -> Option<&AgentConfig> {
         self.agents.iter().find(|a| a.id == id)
     }
 
-    /// Etsii agentin nimen perusteella.
+    /// Looks up an agent by its name.
     #[must_use]
     pub fn agent_by_name(&self, name: &str) -> Option<&AgentConfig> {
         self.agents.iter().find(|a| a.name == name)
     }
 
-    /// Validoi koko perhekonfiguraation rekursiivisesti.
+    /// Recursively validates the whole family configuration.
     ///
-    /// Tarkistaa: nimi ei tyhjä, kaikki agentit validit, agenttinimet ja
-    /// -tunnisteet uniikkeja, globaalit fallbackit ei tyhjiä.
+    /// Checks: name not empty, all agents valid, agent names and
+    /// identifiers unique, global fallbacks not empty.
     ///
     /// # Errors
-    /// [`FamilyClawError::Config`] kaikista validointivirheistä.
+    /// [`FamilyClawError::Config`] for any validation error.
     pub fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             return Err(FamilyClawError::config("family name must not be empty"));
@@ -259,7 +266,7 @@ impl FamilyConfig {
         for agent in &self.agents {
             agent.validate()?;
         }
-        // Uniikit nimet.
+        // Unique names.
         for (i, a) in self.agents.iter().enumerate() {
             if self.agents[i + 1..].iter().any(|b| b.name == a.name) {
                 return Err(FamilyClawError::config(format!(
@@ -268,8 +275,8 @@ impl FamilyConfig {
                 )));
             }
         }
-        // Uniikit tunnisteet (paitsi nil-tunnisteet jätetään ajonaikaisen
-        // täydennyksen varaan — kaksi nilliä ei silti sallita).
+        // Unique identifiers (nil identifiers are left to be filled in at
+        // runtime — two nils are still not allowed).
         for (i, a) in self.agents.iter().enumerate() {
             if self.agents[i + 1..].iter().any(|b| b.id == a.id) {
                 return Err(FamilyClawError::config(format!(
@@ -329,12 +336,12 @@ mod tests {
 
     #[test]
     fn new_with_stable_id_is_deterministic_and_distinct() {
-        // VAKAUS: kahdesti rakennettu sama nimi → sama id (simuloi restartia).
+        // STABILITY: building the same name twice → same id (simulates a restart).
         let a = AgentConfig::new_with_stable_id("agent_a", ModelConfig::new("provider/model"));
         let b = AgentConfig::new_with_stable_id("agent_a", ModelConfig::new("provider/model"));
-        assert_eq!(a.id, b.id, "vakaa id säilyy yli restartin (sama nimi)");
+        assert_eq!(a.id, b.id, "stable id survives a restart (same name)");
         assert_eq!(a.id, AgentId::from_name("agent_a"));
-        // Eri nimi → eri id, jotta sisarukset eivät jaa identiteettiä.
+        // Different name → different id, so siblings don't share an identity.
         let other = AgentConfig::new_with_stable_id("operator", ModelConfig::new("provider/model"));
         assert_ne!(a.id, other.id);
         assert!(a.validate().is_ok());
@@ -412,16 +419,16 @@ mod tests {
         let agent = &family.agents[0];
         assert_eq!(agent.name, "agent_a");
         assert!(agent.model.fallbacks.is_empty());
-        // Oletukset täytettiin: id ei nil, ei profiilia.
+        // Defaults were filled in: id not nil, no profile.
         assert!(!agent.id.is_nil());
         assert!(agent.profile_dir.is_none());
-        // Perheelle generoitui id.
+        // An id was generated for the family.
         assert!(!family.id.is_nil());
     }
 
     #[test]
     fn from_json_str_rejects_invalid_config() {
-        // Tyhjä primary → validointi kaatuu (ei serde).
+        // Empty primary → validation fails (not serde).
         let json = r#"{
             "name": "f",
             "agents": [ { "name": "agent_a", "model": { "primary": "" } } ]
@@ -460,7 +467,7 @@ mod tests {
         let loaded = FamilyConfig::from_json_file(&path).expect("load from file");
         assert_eq!(loaded, family);
 
-        // Siivoa väliaikaistiedosto.
+        // Clean up the temp file.
         let _ = std::fs::remove_file(&path);
     }
 

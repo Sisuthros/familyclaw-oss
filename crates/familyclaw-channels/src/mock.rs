@@ -1,22 +1,22 @@
-//! [`MockChannel`] — in-memory testikanava ja bus-integraation referenssi.
+//! [`MockChannel`] — an in-memory test channel and bus integration reference.
 //!
-//! `MockChannel` toteuttaa [`Channel`]-rajapinnan kahdella in-memory-jonolla:
-//! - **outbox** — kaikki [`Channel::send`]-kutsut tallentuvat tänne, jotta
-//!   testit voivat tarkistaa mitä alusta lähetti,
-//! - **inbox** — testi voi syöttää saapuvia viestejä
-//!   [`MockChannel::inject`]-metodilla; ne virtaavat [`Channel::receive`]-
-//!   virtaan jo kanonisoituina [`InboundEnvelope`]-kirjekuorina.
+//! `MockChannel` implements the [`Channel`] interface with two in-memory queues:
+//! - **outbox** — every [`Channel::send`] call is recorded here so tests can
+//!   check what the platform sent,
+//! - **inbox** — a test can feed inbound messages via the
+//!   [`MockChannel::inject`] method; they flow into the [`Channel::receive`]
+//!   stream already canonicalized as [`InboundEnvelope`] envelopes.
 //!
-//! `MockChannel` ei vedä sisään yhtään ulkoista kanava-SDK:ta — se on koko
-//! kanavakerroksen testattava ydin ilman verkkoa.
+//! `MockChannel` does not pull in any external channel SDK — it is the
+//! testable core of the entire channel layer without any network access.
 //!
-//! ## Bus-integraatio
-//! [`pump_to`] yhdistää kanavan ja Resonance Busin: se kuluttaa
-//! [`MessageStream`]-virran ja antaa jokaisen [`InboundEnvelope`]-kirjekuoren
-//! annetulle julkaisijalle (`publish`-sulkeumalle). Varsinainen envelope →
-//! `familyclaw_bus::BusMessage` -muunnos ja julkaisu busiin elävät
-//! agent-kerroksessa (joka riippuu molemmista crateista); tämä sulkeuma pitää
-//! kanavakerroksen riippumattomana busin sisäisestä Ractor-toteutuksesta.
+//! ## Bus integration
+//! [`pump_to`] connects the channel to the Resonance Bus: it drains the
+//! [`MessageStream`] and hands each [`InboundEnvelope`] to the given
+//! publisher (the `publish` closure). The actual envelope →
+//! `familyclaw_bus::BusMessage` conversion and publishing to the bus live in
+//! the agent layer (which depends on both crates); this closure keeps the
+//! channel layer independent of the bus's internal Ractor implementation.
 
 use std::sync::{Arc, Mutex};
 
@@ -24,10 +24,10 @@ use crate::channel::{Channel, MessageStream, SendFuture};
 use crate::error::{ChannelError, ChannelResult};
 use crate::message::{ChannelKind, InboundEnvelope, InboundMessage, OutboundMessage};
 
-/// In-memory kanava testaukseen.
+/// An in-memory channel for testing.
 ///
-/// Klonattavissa: kloonit jakavat saman tilan (outbox + lähetin), jotta
-/// taustatehtävä voi pitää klonin ja testi tarkistaa toisen klonin kautta.
+/// Cloneable: clones share the same state (outbox + sender), so a
+/// background task can hold a clone while the test checks it through another clone.
 #[derive(Clone)]
 pub struct MockChannel {
     inner: Arc<Inner>,
@@ -36,32 +36,32 @@ pub struct MockChannel {
 struct Inner {
     channel_id: String,
     kind: ChannelKind,
-    /// Kaikki lähetetyt viestit, vanhimmasta uusimpaan.
+    /// All sent messages, oldest to newest.
     outbox: Mutex<Vec<OutboundMessage>>,
-    /// Lähetin saapuville viesteille; `None` kun virta on jo otettu.
+    /// Sender for inbound messages; `None` once the stream has been taken.
     inbound_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<InboundEnvelope>>>,
-    /// Vastaanotin, joka luovutetaan [`Channel::receive`]-kutsussa kerran.
+    /// Receiver, handed out once in the [`Channel::receive`] call.
     inbound_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<InboundEnvelope>>>,
 }
 
 impl MockChannel {
-    /// Rakentaa uuden mock-kanavan annetulla tunnisteella.
+    /// Builds a new mock channel with the given identifier.
     ///
-    /// Kanavatyyppi on [`ChannelKind::Mock`].
+    /// The channel type is [`ChannelKind::Mock`].
     ///
     /// # Errors
-    /// [`ChannelError::InvalidInput`] jos tunniste on tyhjä.
+    /// [`ChannelError::InvalidInput`] if the identifier is empty.
     pub fn new(channel_id: impl Into<String>) -> ChannelResult<Self> {
         Self::with_kind(channel_id, ChannelKind::Mock)
     }
 
-    /// Rakentaa mock-kanavan, joka esiintyy annettuna [`ChannelKind`]-tyyppinä.
+    /// Builds a mock channel that presents itself as the given [`ChannelKind`].
     ///
-    /// Hyödyllinen, kun testataan tyyppikohtaista reititystä ilman oikeaa
-    /// kanava-SDK:ta (esim. teeskennellään Discord-kanavaa).
+    /// Useful for testing type-specific routing without a real channel SDK
+    /// (e.g. impersonating a Discord channel).
     ///
     /// # Errors
-    /// [`ChannelError::InvalidInput`] jos tunniste on tyhjä.
+    /// [`ChannelError::InvalidInput`] if the identifier is empty.
     pub fn with_kind(channel_id: impl Into<String>, kind: ChannelKind) -> ChannelResult<Self> {
         let channel_id = channel_id.into();
         if channel_id.trim().is_empty() {
@@ -79,22 +79,21 @@ impl MockChannel {
         })
     }
 
-    /// Syöttää saapuvan raakaviestin. Se kanonisoidaan [`InboundEnvelope`]:ksi
-    /// tämän kanavan tyypillä ja tunnisteella, ja työnnetään
-    /// [`Channel::receive`]-virtaan.
+    /// Injects a raw inbound message. It is canonicalized into an
+    /// [`InboundEnvelope`] with this channel's type and identifier, and
+    /// pushed into the [`Channel::receive`] stream.
     ///
     /// # Errors
-    /// [`ChannelError::Closed`] jos virta on jo suljettu (vastaanotin
-    /// pudotettu).
+    /// [`ChannelError::Closed`] if the stream is already closed (receiver dropped).
     pub fn inject(&self, message: InboundMessage) -> ChannelResult<InboundEnvelope> {
         let env = message.into_envelope(self.inner.kind, self.inner.channel_id.clone());
         self.push_envelope(env)
     }
 
-    /// Työntää valmiin [`InboundEnvelope`]:n virtaan sellaisenaan.
+    /// Pushes a completed [`InboundEnvelope`] into the stream as-is.
     ///
     /// # Errors
-    /// [`ChannelError::Closed`] jos virta on jo suljettu.
+    /// [`ChannelError::Closed`] if the stream is already closed.
     pub fn push_envelope(&self, env: InboundEnvelope) -> ChannelResult<InboundEnvelope> {
         let guard = self
             .inner
@@ -109,7 +108,7 @@ impl MockChannel {
         Ok(env)
     }
 
-    /// Palauttaa kopion tähän mennessä lähetetyistä viesteistä.
+    /// Returns a copy of the messages sent so far.
     #[must_use]
     pub fn sent(&self) -> Vec<OutboundMessage> {
         self.inner
@@ -119,15 +118,16 @@ impl MockChannel {
             .unwrap_or_default()
     }
 
-    /// Montako viestiä on lähetetty.
+    /// How many messages have been sent.
     #[must_use]
     pub fn sent_count(&self) -> usize {
         self.inner.outbox.lock().map_or(0, |v| v.len())
     }
 
-    /// Sulkee saapuvan virran: ei enää [`inject`](MockChannel::inject)-
-    /// kutsuja onnistu. Aiheuttaa [`MessageStream::recv`]-palautukseksi `None`
-    /// kun jäljellä olevat viestit on kulutettu.
+    /// Closes the inbound stream: no further
+    /// [`inject`](MockChannel::inject) calls will succeed. Causes
+    /// [`MessageStream::recv`] to return `None` once any remaining messages
+    /// have been drained.
     pub fn close_inbound(&self) {
         if let Ok(mut guard) = self.inner.inbound_tx.lock() {
             *guard = None;
@@ -178,20 +178,21 @@ impl Channel for MockChannel {
     }
 }
 
-/// Pumppaa kanavan saapuvan virran kohti Resonance Busia.
+/// Pumps a channel's inbound stream toward the Resonance Bus.
 ///
-/// Kuluttaa [`MessageStream`]-virran loppuun ja kutsuu `publish`-sulkeumaa
-/// jokaiselle [`InboundEnvelope`]:lle. Tämä on kanavakerroksen ja busin
-/// **integraatiosauma**: agent-kerros antaa tähän sulkeuman joka muuntaa
-/// envelopen `familyclaw_bus::BusMessage`:ksi ja julkaisee sen busiin
-/// (ks. agent-craten adapteri). Kanavakerros itse pysyy bus-riippumattomana.
+/// Drains the [`MessageStream`] to completion and calls the `publish`
+/// closure for each [`InboundEnvelope`]. This is the **integration seam**
+/// between the channel layer and the bus: the agent layer supplies this
+/// closure, which converts the envelope into a `familyclaw_bus::BusMessage`
+/// and publishes it to the bus (see the agent crate's adapter). The channel
+/// layer itself remains bus-independent.
 ///
-/// Funktio palaa, kun virta sulkeutuu (`recv` palauttaa `None`) tai kun
-/// `publish` palauttaa virheen — jälkimmäinen propagoidaan kutsujalle.
-/// Palautusarvona on käsiteltyjen viestien määrä.
+/// The function returns once the stream closes (`recv` returns `None`) or
+/// once `publish` returns an error — the latter is propagated to the
+/// caller. The return value is the number of messages processed.
 ///
 /// # Errors
-/// Propagoi ensimmäisen `publish`-sulkeuman palauttaman virheen.
+/// Propagates the first error returned by the `publish` closure.
 pub async fn pump_to<F>(mut stream: MessageStream, mut publish: F) -> ChannelResult<usize>
 where
     F: FnMut(InboundEnvelope) -> ChannelResult<()>,
@@ -277,10 +278,10 @@ mod tests {
         ch.inject(InboundMessage::new("u", "c", "a").expect("inbound"))
             .expect("inject");
         ch.close_inbound();
-        // Jäljellä oleva viesti tulee vielä, sitten None.
+        // The remaining message still arrives, then None.
         assert_eq!(stream.recv().await.expect("buffered").body, "a");
         assert!(stream.recv().await.is_none());
-        // Sulkemisen jälkeen inject epäonnistuu.
+        // After closing, inject fails.
         assert!(ch
             .inject(InboundMessage::new("u", "c", "b").expect("inbound"))
             .is_err());
@@ -294,7 +295,7 @@ mod tests {
             .send(OutboundMessage::new("r", "from clone").expect("msg"))
             .await
             .expect("send");
-        // Alkuperäinen näkee klonin lähetyksen (jaettu outbox).
+        // The original sees the clone's send (shared outbox).
         assert_eq!(ch.sent_count(), 1);
         assert_eq!(ch.sent()[0].body, "from clone");
     }
@@ -310,7 +311,7 @@ mod tests {
         }
         ch.close_inbound();
 
-        // "Busi" — kerää julkaistut kirjekuoret talteen.
+        // The "bus" — collects the published envelopes.
         let collected = Arc::new(Mutex::new(Vec::<InboundEnvelope>::new()));
         let sink = Arc::clone(&collected);
         let count = pump_to(stream, move |env| {
@@ -327,7 +328,7 @@ mod tests {
         assert_eq!(published.len(), 3);
         assert_eq!(published[0].body, "msg0");
         assert_eq!(published[2].body, "msg2");
-        // Kaikki kantavat oikean alkuperän.
+        // All of them carry the correct origin.
         assert!(published.iter().all(|m| m.channel_id == "m1"));
     }
 
@@ -354,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn works_through_dyn_channel() {
-        // Varmistaa että trait on dyn-yhteensopiva.
+        // Verifies that the trait is dyn-compatible.
         let ch = MockChannel::new("dynm").expect("channel");
         let boxed: Box<dyn Channel> = Box::new(ch.clone());
         assert_eq!(boxed.channel_id(), "dynm");

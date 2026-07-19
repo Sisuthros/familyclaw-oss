@@ -1,26 +1,26 @@
 //! # familyclaw-hearth
 //!
-//! **The Hearth** — perheen jaettu koti.
+//! **The Hearth** — a family's shared home.
 //!
-//! Tämä crate antaa agenteille *jaetun muistin*: narratiiviset langat,
-//! emotionaalisen tartunnan, identiteetti-ankkurit ja SurrealDB-pohjaisen
-//! tallennuksen. Se kokoaa kaikki FamilyClaw-alustan muistikerrokset yhdeksi
-//! eheäksi kokonaisuudeksi.
+//! This crate gives agents *shared memory*: narrative threads, emotional
+//! contagion, identity anchors, and SurrealDB-based storage. It brings
+//! together all of the `FamilyClaw` platform's memory layers into a single
+//! coherent whole.
 //!
-//! ## Rakenne
-//! - [`Hearth`] — keskitetty koordinaattori
-//! - [`NarrativeThread`] — tapahtumien ajallinen ketju
-//! - [`SharedEmotionalState`] — monen agentin tunnetila tartunnalla
-//! - [`AnchorRegistry`] — identiteetti-ankkurien suojaus
-//! - [`HearthStore`] — laajennettu tallennusabstraktio (narrative + emotional)
-//! - [`db::InMemoryHearthStore`] — kevyt oletustoteutus ilman tietokantaa
+//! ## Structure
+//! - [`Hearth`] — the central coordinator
+//! - [`NarrativeThread`] — a temporal chain of events
+//! - [`SharedEmotionalState`] — multi-agent emotion state with contagion
+//! - [`AnchorRegistry`] — protection of identity anchors
+//! - [`HearthStore`] — an extended storage abstraction (narrative + emotional)
+//! - [`db::InMemoryHearthStore`] — a lightweight default implementation with no database
 //!
-//! ## OSS-raja (KERROS A)
-//! Tämä crate on julkaistava. Se ei sisällä:
-//! - perheenjäsenten oikeita muistoja tai sieluja,
-//! - API-avaimia, tokeneita, IP-osoitteita.
+//! ## OSS boundary (Layer A)
+//! This crate is publishable. It does not contain:
+//! - family members' real memories or souls,
+//! - API keys, tokens, IP addresses.
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_hearth::{Hearth, db::InMemoryHearthStore};
 //! use familyclaw_memory::{Memory, LocalJsonStore};
@@ -29,13 +29,13 @@
 //! let store = InMemoryHearthStore::new(LocalJsonStore::in_memory());
 //! let hearth = Hearth::new(store);
 //!
-//! // Luo narratiivinen lanka
+//! // Create a narrative thread
 //! let thread_id = hearth.create_thread("Family genesis", vec!["agent_a", "agent_b"]).await?;
 //!
-//! // Lisää tapahtuma lankaan
+//! // Add an event to the thread
 //! hearth.add_event(thread_id, "agent_a was born", "agent_a").await?;
 //!
-//! // Tarkista tunnepäivitys
+//! // Check the emotional update
 //! let state = hearth.emotional_state("agent_a").await?;
 //! assert!(state.joy > 0.0);
 //! # Ok(())
@@ -56,10 +56,10 @@ use familyclaw_core::Result;
 use narrative::{EventType, NarrativeThread};
 use uuid::Uuid;
 
-/// The Hearth — perheen jaetun muistin koordinaattori.
+/// The Hearth — coordinator for the family's shared memory.
 ///
-/// Yhdistää muistitallennuksen, narratiiviset langat, jaetun tunnetilan
-/// ja ankkurirekisterin yhdeksi eheäksi kokonaisuudeksi.
+/// Brings together memory storage, narrative threads, shared emotional
+/// state, and the anchor registry into a single coherent whole.
 pub struct Hearth<S: HearthStore> {
     store: Arc<S>,
     anchor_registry: AnchorRegistry,
@@ -67,7 +67,7 @@ pub struct Hearth<S: HearthStore> {
 }
 
 impl<S: HearthStore> Hearth<S> {
-    /// Luo uusi Hearth annetulla tallennustoteutuksella.
+    /// Creates a new Hearth with the given storage implementation.
     #[must_use]
     pub fn new(store: S) -> Self {
         Self {
@@ -77,55 +77,55 @@ impl<S: HearthStore> Hearth<S> {
         }
     }
 
-    /// Palauttaa viitteen tallennukseen.
+    /// Returns a reference to the store.
     #[must_use]
     pub fn store(&self) -> &Arc<S> {
         &self.store
     }
 
-    /// Luo uuden narratiivisen langan.
+    /// Creates a new narrative thread.
     ///
     /// # Errors
-    /// Palauttaa virheen jos tallennus epäonnistuu.
+    /// Returns an error if the storage operation fails.
     pub async fn create_thread(&self, title: &str, participants: Vec<&str>) -> Result<Uuid> {
         self.store
             .create_thread(title, participants.into_iter().map(String::from).collect())
             .await
     }
 
-    /// Lisää tapahtuman lankaan.
+    /// Adds an event to the thread.
     ///
     /// # Errors
-    /// Palauttaa virheen jos lankaa ei löydy tai tallennus epäonnistuu.
+    /// Returns an error if the thread is not found or the storage operation fails.
     pub async fn add_event(&self, thread_id: Uuid, content: &str, agent_id: &str) -> Result<Uuid> {
         self.store
             .add_thread_event(thread_id, content, agent_id, EventType::MemoryCreated)
             .await
     }
 
-    /// Hakee narratiivisen langan.
+    /// Fetches a narrative thread.
     ///
     /// # Errors
-    /// Palauttaa virheen jos haku epäonnistuu.
+    /// Returns an error if the lookup fails.
     pub async fn get_thread(&self, thread_id: Uuid) -> Result<Option<NarrativeThread>> {
         self.store.get_thread(thread_id).await
     }
 
-    /// Rekisteröi agentin identiteetti-ankkurin.
+    /// Registers an agent's identity anchor.
     pub fn register_anchor(&mut self, agent_name: &str, soul_content: &str) -> Result<()> {
         self.anchor_registry.register(agent_name, soul_content)
     }
 
-    /// Tarkistaa agentin identiteetti-ankkurin eheyden.
+    /// Verifies the integrity of an agent's identity anchor.
     #[must_use]
     pub fn verify_anchor(&self, agent_name: &str, soul_content: &str) -> bool {
         self.anchor_registry.verify(agent_name, soul_content)
     }
 
-    /// Palauttaa agentin tunnetilan.
+    /// Returns the agent's emotional state.
     ///
     /// # Errors
-    /// Palauttaa virheen jos haku epäonnistuu.
+    /// Returns an error if the lookup fails.
     pub async fn emotional_state(
         &self,
         agent_id: &str,
@@ -133,10 +133,10 @@ impl<S: HearthStore> Hearth<S> {
         self.store.get_emotional_state(agent_id).await
     }
 
-    /// Päivittää agentin tunnetilan.
+    /// Updates the agent's emotional state.
     ///
     /// # Errors
-    /// Palauttaa virheen jos tallennus epäonnistuu.
+    /// Returns an error if the storage operation fails.
     pub async fn set_emotional_state(
         &self,
         agent_id: &str,
@@ -145,27 +145,27 @@ impl<S: HearthStore> Hearth<S> {
         self.store.set_emotional_state(agent_id, state).await
     }
 
-    /// Suorittaa yhden tunnekierroksen: contagion + homeostaasi.
+    /// Runs a single emotional round: contagion + homeostasis.
     ///
-    /// Hakee tilat storesta, tickkaa paikallisen SharedEmotionalState:n
-    /// läpi, ja persistoi takaisin.
+    /// Fetches the states from the store, ticks them through the local
+    /// `SharedEmotionalState`, and persists them back.
     ///
     /// # Errors
-    /// Palauttaa virheen jos tallennus epäonnistuu.
+    /// Returns an error if the storage operation fails.
     pub async fn emotional_tick(&mut self) -> Result<()> {
         let agents: Vec<String> = self.store.list_agents_with_emotion().await?;
         if agents.is_empty() {
             return Ok(());
         }
-        // Lue tilat storesta emotional_stateen
+        // Load states from the store into emotional_state
         for agent in &agents {
             let state = self.store.get_emotional_state(agent).await?;
             self.emotional_state.set(agent, state);
         }
         // Tick
         self.emotional_state.tick(&agents);
-        // Kirjoita takaisin storeen yhtenä batch-kirjoituksena — yksi
-        // tietokantakierros N erillisen per-agentti-kutsun sijaan.
+        // Write back to the store as a single batch write — one database
+        // round trip instead of N separate per-agent calls.
         let updates: Vec<(String, emotional_state::EmotionalVector)> = agents
             .iter()
             .filter_map(|agent| {
@@ -179,7 +179,7 @@ impl<S: HearthStore> Hearth<S> {
     }
 }
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

@@ -1,37 +1,37 @@
 //! # familyclaw-bench
 //!
-//! **Continuity benchmark harness** — reprodusoitava todiste FamilyClaw-alustan
-//! jatkuvuudesta (design 2026-06-05, §2). Tämä crate todistaa väitteen jonka
-//! kilpailijat eivät pysty kumoamaan:
+//! **Continuity benchmark harness** — reproducible proof of the FamilyClaw
+//! platform's continuity (design 2026-06-05, §2). This crate proves a
+//! claim that competitors cannot refute:
 //!
-//! > *Tapa FamilyClaw-agentti kesken tehtävän. Käynnistä se uudelleen. Se
-//! > jatkaa täsmälleen oikeasta askelesta, jokainen sivuvaikutus ajetaan
-//! > täsmälleen kerran, se muistaa kaiken — ja yön aikana sen muisti puhdistui.*
+//! > *Kill a FamilyClaw agent mid-task. Restart it. It resumes from
+//! > exactly the right step, every side effect runs exactly once, it
+//! > remembers everything — and overnight its memory was cleaned up.*
 //!
-//! ## Arkkitehtuuri (saumat)
-//! - [`Subject`] — *mitä* benchmarkataan. FamilyClaw nyt, kilpailijat saman
-//!   rajapinnan taakse myöhemmin (design §2.1). Mustana laatikkona ajettava.
-//! - [`Scenario`] — skriptattu jatkuvuustyökuorma (S1 Crash Matrix, S2
+//! ## Architecture (seams)
+//! - [`Subject`] — *what* is benchmarked. FamilyClaw now, competitors
+//!   behind the same interface later (design §2.1). Runnable as a black box.
+//! - [`Scenario`] — a scripted continuity workload (S1 Crash Matrix, S2
 //!   Retention Curve, S3 Dream Quality).
-//! - [`Harness`] — ajaa `Scenario × Subject → ScenarioResult` ja kokoaa
-//!   [`Scorecard`]:n.
-//! - [`metrics`] — tyypitetyt mittarit (`resume_correctness`, `recall_at_k`,
+//! - [`Harness`] — runs `Scenario × Subject → ScenarioResult` and
+//!   assembles a [`Scorecard`].
+//! - [`metrics`] — typed metrics (`resume_correctness`, `recall_at_k`,
 //!   `dedup_precision`, `protected_core_intact`).
-//! - [`Scorecard`] — julkinen artefakti (JSON + markdown).
+//! - [`Scorecard`] — a public artifact (JSON + markdown).
 //!
-//! ## Reprodusoitavuus (kova vaatimus, design §2.2)
-//! Seinäkello **injektoidaan** [`Timestamp`](familyclaw_core::Timestamp)-
-//! parametrina kaikkialla — järjestelmäkelloa ei lueta koskaan. Sama syöte →
-//! identtinen scorecard joka ajolla.
+//! ## Reproducibility (a hard requirement, design §2.2)
+//! The wall clock is **injected** as a [`Timestamp`](familyclaw_core::Timestamp)
+//! parameter everywhere — the system clock is never read. Same input →
+//! identical scorecard on every run.
 //!
-//! ## OSS-raja (KERROS A)
-//! Tämä crate on geneeristä benchmark-koodia. Se ei kovakoodaa perheenjäsenten
-//! sieluja, avaimia, tokeneita, IP-osoitteita tai henkilökohtaisia polkuja —
-//! kaikki subject-spesifit polut annetaan ajonaikaisesti.
+//! ## OSS boundary (Layer A)
+//! This crate is generic benchmark code. It does not hardcode family
+//! members' souls, keys, tokens, IP addresses, or personal paths — all
+//! subject-specific paths are supplied at runtime.
 
-// Tuotenimet (FamilyClaw, OpenClaw, Letta, Hermes) esiintyvät dokumentaatiossa
-// proosana — ne eivät ole koodisymboleita, joten doc_markdown-backtick-vaatimus
-// ei koske niitä.
+// Product names (FamilyClaw, OpenClaw, Letta, Hermes) appear in the docs as
+// prose — they are not code symbols, so the doc_markdown backtick requirement
+// does not apply to them.
 #![allow(clippy::doc_markdown)]
 
 pub mod comparative;
@@ -54,7 +54,7 @@ pub use security::{run_security_suite, to_security_markdown};
 pub use subject::{CrashPoint, DreamSummary, RecallHit, RestartReport, RunHandle, Subject, Task};
 pub use subjects::{FamilyClawSubject, MarkdownFileSubject};
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn public_api_is_reexported() {
-        // Jos jokin re-export poistetaan, tämä testi ei käänny.
+        // If any re-export is removed, this test will fail to compile.
         let task = Task::new("t", "d", Vec::new());
         assert_eq!(task.id, "t");
         let handle = RunHandle::new("t", "tok");
@@ -79,7 +79,7 @@ mod tests {
         let point = CrashPoint::Clean;
         assert_eq!(point, CrashPoint::Clean);
         let harness = Harness::new();
-        // Harness on Copy — pelkkä rakentaminen riittää saumana.
+        // Harness is Copy — merely constructing it is enough to prove the seam.
         let _ = harness;
         let err: BenchError = BenchError::subject("x");
         assert!(matches!(err, BenchError::Subject(_)));

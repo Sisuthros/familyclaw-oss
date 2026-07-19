@@ -1,17 +1,18 @@
-//! Integraatiotesti: Telegram `sendMessage`-adapterin HTTP-**virhepolut**.
+//! Integration test: the Telegram `sendMessage` adapter's HTTP **error paths**.
 //!
-//! Kartoitus paljasti aukon: `send`-onnistumispolku oli katettu (puhtaat
-//! parsinta-testit + rakenne), mutta ei-2xx-vastaukset (429 rate-limit, 5xx
-//! palvelinvirhe) ja verkkovirhe (yhteys torjuttu / timeout) olivat
-//! **testaamattomia**. Tämä tiedosto ajaa oikean `reqwest`-kuljetuksen
-//! mock-HTTP-palvelinta vasten ja todistaa että jokainen virhepolku palauttaa
-//! selkeän [`ChannelError::Send`]:n — **ei paniikkia, ei valheellista `Ok`:ta**.
+//! Coverage analysis revealed a gap: the `send` success path was covered
+//! (pure parsing tests + structure), but non-2xx responses (429 rate limit,
+//! 5xx server error) and network errors (connection refused / timeout) were
+//! **untested**. This file runs a real `reqwest` transport against a mock
+//! HTTP server and proves that every error path returns a clear
+//! [`ChannelError::Send`] — **no panic, no false `Ok`**.
 //!
-//! Mock on pelkkä `std::net::TcpListener` (ei `wiremock`/`httpmock`-dependencyä),
-//! joten tämä ei lisää yhtään dev-dependencyä eikä riko `cargo-deny`-gatea —
-//! sama linja kuin `familyclaw-agent/tests/live_executor_http.rs`:llä. URL
-//! injektoidaan valmiin [`TelegramChannel::with_api_base`]-konstruktorin kautta
-//! (ei lähdekoodin refaktorointia).
+//! The mock is just a `std::net::TcpListener` (no `wiremock`/`httpmock`
+//! dependency), so this adds no new dev dependency and does not break the
+//! `cargo-deny` gate — same approach as
+//! `familyclaw-agent/tests/live_executor_http.rs`. The URL is injected via
+//! the existing [`TelegramChannel::with_api_base`] constructor (no source
+//! refactoring).
 
 #![cfg(feature = "telegram")]
 
@@ -22,17 +23,17 @@ use std::sync::Arc;
 
 use familyclaw_channels::{Channel, ChannelError, OutboundMessage, TelegramChannel};
 
-/// Minimaalinen HTTP/1.1-mock ilman axumia: hyväksyy yhteyden, lukee pyynnön ja
-/// vastaa annetulla statuksella + pienellä JSON-rungolla. Laskee saadut pyynnöt,
-/// jotta voimme todentaa että adapteri tosiaan otti yhteyden. Palauttaa
-/// `base_url`:n jonka `with_api_base` ottaa vastaan.
+/// A minimal HTTP/1.1 mock without axum: accepts a connection, reads the
+/// request, and responds with the given status + a small JSON body. Counts
+/// received requests so we can verify the adapter actually made contact.
+/// Returns the `base_url` that `with_api_base` accepts.
 struct MockTelegram {
     base_url: String,
     calls: Arc<AtomicUsize>,
 }
 
 impl MockTelegram {
-    /// Käynnistää mockin joka vastaa `status`-koodilla jokaiseen pyyntöön.
+    /// Starts the mock that responds with `status` to every request.
     fn spawn(status: u16) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind to ephemeral port");
         let addr = listener.local_addr().expect("mock local_addr");
@@ -45,8 +46,9 @@ impl MockTelegram {
                 let Ok(mut stream) = stream else { continue };
                 calls_t.fetch_add(1, Ordering::SeqCst);
 
-                // Lue pyyntö (headerit + osa bodya) — sisältöä ei tarvita, vain
-                // se että pyyntö kulutetaan ennen vastausta.
+                // Read the request (headers + part of the body) — the
+                // content isn't needed, just that the request is consumed
+                // before responding.
                 let mut buf = [0_u8; 2048];
                 let _ = stream.read(&mut buf).unwrap_or(0);
 
@@ -57,8 +59,9 @@ impl MockTelegram {
                     503 => "Service Unavailable",
                     _ => "Error",
                 };
-                // Telegram-tyylinen virherunko; adapteri ei jäsennä tätä
-                // ei-2xx-polulla vaan palauttaa statuksen + rungon virheeseen.
+                // A Telegram-style error body; the adapter does not parse
+                // this on the non-2xx path, it just returns the status +
+                // body in the error.
                 let body =
                     format!(r#"{{"ok":false,"error_code":{status},"description":"{reason}"}}"#);
                 let response = format!(
@@ -78,20 +81,20 @@ impl MockTelegram {
     }
 }
 
-/// Rakentaa mockiin osoittavan Telegram-kanavan.
+/// Builds a Telegram channel pointing at the mock.
 fn channel_pointing_at(base_url: &str) -> TelegramChannel {
     TelegramChannel::with_api_base("test-token", "tg-test", base_url).expect("channel builds")
 }
 
-/// Apuri: yksi lähetettävä viesti.
+/// Helper: a single message to send.
 fn outbound() -> OutboundMessage {
     OutboundMessage::new("123456", "hei maailma").expect("valid outbound")
 }
 
 #[tokio::test]
 async fn send_message_429_rate_limit_is_send_error_not_panic() {
-    // 429 Too Many Requests → adapteri EI panikoi, palauttaa ChannelError::Send
-    // jonka teksti sisältää statuksen (uudelleenyritettävä virhe).
+    // 429 Too Many Requests → the adapter does NOT panic, it returns
+    // ChannelError::Send whose text contains the status (a retryable error).
     let mock = MockTelegram::spawn(429);
     let ch = channel_pointing_at(&mock.base_url);
 
@@ -118,7 +121,7 @@ async fn send_message_429_rate_limit_is_send_error_not_panic() {
 
 #[tokio::test]
 async fn send_message_500_server_error_is_send_error_not_panic() {
-    // 5xx palvelinvirhe → ChannelError::Send (ei paniikki, ei valheellinen Ok).
+    // 5xx server error → ChannelError::Send (no panic, no false Ok).
     let mock = MockTelegram::spawn(500);
     let ch = channel_pointing_at(&mock.base_url);
 
@@ -139,7 +142,7 @@ async fn send_message_500_server_error_is_send_error_not_panic() {
 
 #[tokio::test]
 async fn send_message_503_service_unavailable_is_send_error() {
-    // 503 (yleinen ylikuormatilanne) → ChannelError::Send.
+    // 503 (a common overload scenario) → ChannelError::Send.
     let mock = MockTelegram::spawn(503);
     let ch = channel_pointing_at(&mock.base_url);
 
@@ -156,13 +159,14 @@ async fn send_message_503_service_unavailable_is_send_error() {
 
 #[tokio::test]
 async fn send_message_network_error_is_send_error_not_panic() {
-    // Verkkovirhe: sidotaan portti, luetaan osoite ja SULJETAAN listener heti,
-    // jolloin yhteys torjutaan (connection refused). Tämä on deterministinen
-    // korvike timeoutille — sama koodipolku (`reqwest::send` -> Err) tuottaa
-    // ChannelError::Send:n ilman että testi joutuu odottamaan HTTP-timeouttia.
+    // Network error: bind a port, read its address, and CLOSE the listener
+    // immediately, so the connection is refused. This is a deterministic
+    // substitute for a timeout — the same code path (`reqwest::send` -> Err)
+    // produces a ChannelError::Send without the test having to wait for an
+    // HTTP timeout.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
-    drop(listener); // portti vapautuu → seuraava yhteys torjutaan
+    drop(listener); // the port is freed → the next connection is refused
     let base_url = format!("http://{addr}");
 
     let ch = channel_pointing_at(&base_url);

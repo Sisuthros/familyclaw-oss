@@ -1,60 +1,61 @@
-//! Unijakson säätöparametrit ([`DreamConfig`]).
+//! Dream cycle tuning parameters ([`DreamConfig`]).
 //!
-//! Konfiguraatio kerää yhteen kaikki konsolidaation kynnysarvot. Oletukset
-//! on johdettu `FamilyClaw` v2 -designista (§2.3, §5) ja
-//! `familyclaw-memory`-craten Ebbinghaus-malliasta, ei arvattu. Kaikki kentät
-//! puristetaan rakennettaessa järkeviin rajoihin, joten kelvoton syöte ei voi
-//! tuottaa rikkinäistä unijaksoa.
+//! The configuration collects all consolidation thresholds in one place.
+//! The defaults are derived from the `FamilyClaw` v2 design (§2.3, §5) and
+//! the `familyclaw-memory` crate's Ebbinghaus model, not guessed. All
+//! fields are clamped to sensible bounds when constructed, so invalid
+//! input can never produce a broken dream cycle.
 
 use serde::{Deserialize, Serialize};
 
-/// Unijakson kynnysarvot ja kytkimet.
+/// Thresholds and toggles for a dream cycle.
 ///
-/// Rakenna [`DreamConfig::default`]:lla (suositeltu) tai
-/// [`DreamConfig::new`]:llä ja säädä builder-tyylillä. Arvot ovat puhtaita
-/// liukulukukynnyksiä — ei perhe-/kalibrointitietoa (KERROS A, OSS).
+/// Construct with [`DreamConfig::default`] (recommended) or
+/// [`DreamConfig::new`] and adjust builder-style. The values are pure
+/// floating-point thresholds — no family-specific/calibration data (Layer
+/// A, OSS).
 ///
-/// Neljä `bool`-kytkintä ovat tarkoituksella itsenäisiä vaihe-lippuja (kukin
-/// kytkee yhden konsolidaatiovaiheen päälle/pois), ei tilakone — siksi
-/// `struct_excessive_bools` sallitaan tässä.
+/// The four `bool` toggles are intentionally independent phase flags (each
+/// switches one consolidation phase on/off), not a state machine — that's
+/// why `struct_excessive_bools` is allowed here.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DreamConfig {
-    /// Jaccard-kynnys jolla kaksi muistoa katsotaan duplikaateiksi
-    /// (`0.0..=1.0`). Korkeampi = tiukempi (vaatii enemmän päällekkäisyyttä).
+    /// Jaccard threshold at which two memories are considered duplicates
+    /// (`0.0..=1.0`). Higher = stricter (requires more overlap).
     pub merge_similarity: f32,
 
-    /// Retention-kynnys jonka alittavat muistot arkistoidaan unessa
-    /// (`0.0..=1.0`). Design §2.3: matalan tärkeyden muistot (R < 0.05)
-    /// arkistoituvat.
+    /// Retention threshold below which memories are archived during sleep
+    /// (`0.0..=1.0`). Design §2.3: low-importance memories (R < 0.05) get
+    /// archived.
     pub archive_below_retention: f32,
 
-    /// Tärkeyskynnys jonka ylittävät muistot vahvistetaan unessa
-    /// (`0.0..=1.0`). Design §2.3: korkean importancen muistot vahvistuvat.
+    /// Importance threshold above which memories are strengthened during
+    /// sleep (`0.0..=1.0`). Design §2.3: high-importance memories are strengthened.
     pub strengthen_above_importance: f32,
 
-    /// Suoritetaanko duplikaattien yhdistäminen.
+    /// Whether to run duplicate merging.
     pub merge_duplicates: bool,
-    /// Suoritetaanko ristiriitaisten/vanhentuneiden pudottaminen.
+    /// Whether to run dropping of contradicted/outdated memories.
     pub drop_contradicted: bool,
-    /// Suoritetaanko suhteellisten päiväysten absolutisointi.
+    /// Whether to run absolutization of relative dates.
     pub absolutize_dates: bool,
-    /// Suoritetaanko tärkeiden vahvistus ja matalien arkistointi.
+    /// Whether to run strengthening of important memories and archiving of low ones.
     pub consolidate: bool,
 }
 
 impl DreamConfig {
-    /// Oletus duplikaattikynnykselle (vahva, mutta ei identtisyysvaatimus).
+    /// Default duplicate threshold (strong, but not requiring identity).
     pub const DEFAULT_MERGE_SIMILARITY: f32 = 0.85;
-    /// Oletus arkistointiretentiolle (design §2.3: R < 0.05).
+    /// Default archiving retention (design §2.3: R < 0.05).
     pub const DEFAULT_ARCHIVE_BELOW_RETENTION: f32 = 0.05;
-    /// Oletus vahvistuskynnykselle (tärkeät muistot).
+    /// Default strengthening threshold (important memories).
     pub const DEFAULT_STRENGTHEN_ABOVE_IMPORTANCE: f32 = 0.6;
 
-    /// Rakentaa konfiguraation kolmesta kynnyksestä, kaikki vaiheet päällä.
+    /// Builds a configuration from three thresholds, with all phases enabled.
     ///
-    /// Kentät puristetaan välille `0.0..=1.0`; kelvoton (NaN/ääretön) korvataan
-    /// vastaavalla oletuksella.
+    /// Fields are clamped to `0.0..=1.0`; invalid (NaN/infinite) values are
+    /// replaced with the corresponding default.
     #[must_use]
     pub fn new(
         merge_similarity: f32,
@@ -78,49 +79,49 @@ impl DreamConfig {
         }
     }
 
-    /// Asettaa duplikaattikynnyksen (puristetaan `0.0..=1.0`).
+    /// Sets the duplicate threshold (clamped to `0.0..=1.0`).
     #[must_use]
     pub fn with_merge_similarity(mut self, v: f32) -> Self {
         self.merge_similarity = clamp_unit(v, Self::DEFAULT_MERGE_SIMILARITY);
         self
     }
 
-    /// Asettaa arkistointiretention kynnyksen (puristetaan `0.0..=1.0`).
+    /// Sets the archiving retention threshold (clamped to `0.0..=1.0`).
     #[must_use]
     pub fn with_archive_below_retention(mut self, v: f32) -> Self {
         self.archive_below_retention = clamp_unit(v, Self::DEFAULT_ARCHIVE_BELOW_RETENTION);
         self
     }
 
-    /// Asettaa vahvistuskynnyksen (puristetaan `0.0..=1.0`).
+    /// Sets the strengthening threshold (clamped to `0.0..=1.0`).
     #[must_use]
     pub fn with_strengthen_above_importance(mut self, v: f32) -> Self {
         self.strengthen_above_importance = clamp_unit(v, Self::DEFAULT_STRENGTHEN_ABOVE_IMPORTANCE);
         self
     }
 
-    /// Kytkee duplikaattien yhdistämisen päälle/pois.
+    /// Toggles duplicate merging on/off.
     #[must_use]
     pub const fn merging(mut self, on: bool) -> Self {
         self.merge_duplicates = on;
         self
     }
 
-    /// Kytkee ristiriitaisten pudottamisen päälle/pois.
+    /// Toggles dropping of contradicted memories on/off.
     #[must_use]
     pub const fn dropping_contradicted(mut self, on: bool) -> Self {
         self.drop_contradicted = on;
         self
     }
 
-    /// Kytkee päiväysten absolutisoinnin päälle/pois.
+    /// Toggles absolutization of dates on/off.
     #[must_use]
     pub const fn absolutizing_dates(mut self, on: bool) -> Self {
         self.absolutize_dates = on;
         self
     }
 
-    /// Kytkee konsolidaation (vahvistus + arkistointi) päälle/pois.
+    /// Toggles consolidation (strengthening + archiving) on/off.
     #[must_use]
     pub const fn consolidating(mut self, on: bool) -> Self {
         self.consolidate = on;
@@ -129,7 +130,7 @@ impl DreamConfig {
 }
 
 impl Default for DreamConfig {
-    /// Designin mukaiset oletukset, kaikki vaiheet päällä.
+    /// Design-mandated defaults, with all phases enabled.
     fn default() -> Self {
         Self::new(
             Self::DEFAULT_MERGE_SIMILARITY,
@@ -139,7 +140,7 @@ impl Default for DreamConfig {
     }
 }
 
-/// Puristaa arvon välille `0.0..=1.0`; kelvoton (NaN/ääretön) → `fallback`.
+/// Clamps a value to `0.0..=1.0`; invalid (NaN/infinite) → `fallback`.
 fn clamp_unit(x: f32, fallback: f32) -> f32 {
     if x.is_finite() {
         x.clamp(0.0, 1.0)
@@ -150,7 +151,7 @@ fn clamp_unit(x: f32, fallback: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    // Tarkka f32-vertailu sallittu — vakioidut kynnykset.
+    // Exact f32 comparison allowed — fixed thresholds.
     #![allow(clippy::float_cmp)]
 
     use super::*;

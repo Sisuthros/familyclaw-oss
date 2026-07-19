@@ -1,56 +1,56 @@
-//! `familyclaw replay` — Time Machine -CLI durable-journalien tarkasteluun.
+//! `familyclaw replay` — Time Machine CLI for inspecting durable journals.
 //!
-//! Tämä moduuli tarjoaa `familyclaw`-binäärin `replay`-alikomennon:
-//! olemassa oleva [`FileJournal`](familyclaw_durable::FileJournal) avataan
-//! **vain luettavaksi** ja sen aikajana esitetään ihmisluettavana
-//! markdownina tai koneluettavana JSON:na. Toteutus rakentuu
-//! [`TimeMachine`](familyclaw_durable::TimeMachine)-fasadin päälle, joten
-//! lähdejournal ei koskaan muutu (append-only-invariantti säilyy).
+//! This module provides the `replay` subcommand of the `familyclaw` binary:
+//! an existing [`FileJournal`](familyclaw_durable::FileJournal) is opened
+//! **read-only** and its timeline is rendered as human-readable markdown
+//! or machine-readable JSON. The implementation is built on top of the
+//! [`TimeMachine`](familyclaw_durable::TimeMachine) facade, so the source
+//! journal never changes (the append-only invariant is preserved).
 //!
-//! Neljä alikomentoa:
+//! Four subcommands:
 //!
-//! 1. `replay inspect --journal <path> [--json]` — lue journal ja tulosta
-//!    [`Timeline`](familyclaw_durable::Timeline).
-//! 2. `replay fork --journal <path> --keep <N> --out <path>` — haarauta
-//!    aikajana uuteen journaliin. **Fail-closed:** kieltäytyy jos `--out` on jo
-//!    olemassa, jottei olemassa olevaa lokia koskaan ylikirjoiteta.
-//! 3. `replay diff --before <path> --after <path> [--json]` — vertaa kahta
-//!    aikajanaa ja tulosta [`TimelineDiff`](familyclaw_durable::TimelineDiff).
-//! 4. `replay demo [--dir <path>]` — itsenäinen Time Machine -esittely: rakentaa
-//!    "alkuperäisen" journalin (jossa on politiikkabugi), näyttää sen aikajanan,
-//!    haarauttaa ennen bugia, ajaa korjatun politiikan `DryRunRecorder`illa
-//!    (ei mitään oikeaa sivuvaikutusta) ja todistaa alkuperäisen journalin
-//!    koskemattomuuden. Katso [`run_demo`].
+//! 1. `replay inspect --journal <path> [--json]` — read a journal and print
+//!    its [`Timeline`](familyclaw_durable::Timeline).
+//! 2. `replay fork --journal <path> --keep <N> --out <path>` — fork the
+//!    timeline into a new journal. **Fail-closed:** refuses if `--out`
+//!    already exists, so an existing log is never overwritten.
+//! 3. `replay diff --before <path> --after <path> [--json]` — compare two
+//!    timelines and print a [`TimelineDiff`](familyclaw_durable::TimelineDiff).
+//! 4. `replay demo [--dir <path>]` — self-contained Time Machine showcase:
+//!    builds an "original" journal (containing a policy bug), shows its
+//!    timeline, forks before the bug, runs the fixed policy with a
+//!    `DryRunRecorder` (no real side effect whatsoever), and proves the
+//!    original journal's integrity. See [`run_demo`].
 //!
-//! ## Suunnittelu (testattavuus)
-//! Komentokäsittelijät ([`run_inspect`], [`run_fork`], [`run_diff`]) ovat
-//! puhtaita funktioita jotka palauttavat `Result<String, ReplayError>` —
-//! ne eivät tulosta itse eivätkä kutsu `process::exit`:iä. Näin niitä voi
-//! kutsua suoraan yksikkötesteistä ja tarkistaa palautettu merkkijono/virhe.
-//! Argumenttien jäsennys ([`parse`]) on nekin puhdas ja testattava.
+//! ## Design (testability)
+//! The command handlers ([`run_inspect`], [`run_fork`], [`run_diff`]) are
+//! pure functions that return `Result<String, ReplayError>` — they never
+//! print anything themselves nor call `process::exit`. This lets them be
+//! called directly from unit tests and their returned string/error checked.
+//! Argument parsing ([`parse`]) is likewise pure and testable.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use familyclaw_durable::{DryRunRecorder, DurableContext, FileJournal, Journal, TimeMachine};
 
-/// `replay`-CLI:n virhetyyppi.
+/// Error type for the `replay` CLI.
 ///
-/// Kaikki virheet ovat **paniikittomia**: virheellinen syöte (puuttuva
-/// argumentti, tuntematon lippu, olematon polku, jo olemassa oleva
-/// `--out`) palautuu tämän tyypin kautta, ja binääri kuvaa sen selkeäksi
-/// virheviestiksi + nollasta poikkeavaksi paluukoodiksi.
+/// All errors are **panic-free**: invalid input (missing argument, unknown
+/// flag, nonexistent path, an already-existing `--out`) is returned through
+/// this type, and the binary maps it to a clear error message plus a
+/// nonzero return code.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ReplayError {
-    /// Argumenttien jäsennys epäonnistui (puuttuva/tuntematon lippu tai arvo).
-    /// Sisältää ihmisluettavan syyn.
+    /// Argument parsing failed (missing/unknown flag or value).
+    /// Contains a human-readable reason.
     Usage(String),
-    /// Durable-substraatin virhe (journalin avaus/luku/kirjoitus tai fork).
+    /// Durable-substrate error (journal open/read/write or fork).
     Durable(familyclaw_durable::DurableError),
-    /// Tuloksen JSON-sarjallistus epäonnistui.
+    /// Result JSON serialization failed.
     Serde(serde_json::Error),
-    /// Tiedostojärjestelmävirhe (`replay demo`: temp-hakemiston luonti/siivous).
+    /// Filesystem error (`replay demo`: temp directory creation/cleanup).
     Io(std::io::Error),
 }
 
@@ -85,47 +85,47 @@ impl From<std::io::Error> for ReplayError {
     }
 }
 
-/// Jäsennetty `replay`-alikomento valmiina suoritettavaksi.
+/// A parsed `replay` subcommand, ready to be executed.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReplayCommand {
-    /// `replay inspect` — lue ja tulosta yhden journalin aikajana.
+    /// `replay inspect` — read and print the timeline of a single journal.
     Inspect {
-        /// Luettavan journalin polku.
+        /// Path of the journal to read.
         journal: PathBuf,
-        /// Tulostetaanko JSON (`true`) vai markdown (`false`).
+        /// Whether to print JSON (`true`) or markdown (`false`).
         json: bool,
     },
-    /// `replay fork` — haarauta aikajana uuteen journaliin.
+    /// `replay fork` — fork the timeline into a new journal.
     Fork {
-        /// Lähdejournalin polku (ei muutu).
+        /// Path of the source journal (unchanged).
         journal: PathBuf,
-        /// Montako **workflow-askelta** prefiksistä säilytetään.
+        /// How many **workflow steps** of the prefix to keep.
         keep: usize,
-        /// Kohdejournalin polku. **Ei saa olla olemassa** (fail-closed).
+        /// Path of the destination journal. **Must not exist** (fail-closed).
         out: PathBuf,
     },
-    /// `replay diff` — vertaa kahta aikajanaa.
+    /// `replay diff` — compare two timelines.
     Diff {
-        /// Vasemman (alkuperäisen) aikajanan journalin polku.
+        /// Path of the journal for the left (original) timeline.
         before: PathBuf,
-        /// Oikean (vertailtavan) aikajanan journalin polku.
+        /// Path of the journal for the right (compared) timeline.
         after: PathBuf,
-        /// Tulostetaanko JSON (`true`) vai markdown (`false`).
+        /// Whether to print JSON (`true`) or markdown (`false`).
         json: bool,
     },
-    /// `replay demo` — itsenäinen Time Machine -esittely (ks. [`run_demo`]).
+    /// `replay demo` — self-contained Time Machine showcase (see [`run_demo`]).
     Demo {
-        /// Hakemisto jonne esittelyn journalit kirjoitetaan.
-        /// `None` tarkoittaa: käytä tuoretta temp-hakemistoa ja siivoa se
-        /// pois ennen paluuta (ei jätä levylle mitään).
+        /// Directory the demo journals are written to.
+        /// `None` means: use a fresh temp directory and clean it up before
+        /// returning (leaves nothing on disk).
         dir: Option<PathBuf>,
     },
 }
 
-/// `replay`-alikomennon käyttöohje (usage-teksti).
+/// Usage text for the `replay` subcommand.
 ///
-/// Palautetaan sellaisenaan virheviestin yhteydessä ja `--help`-pyynnöstä.
+/// Returned as-is alongside error messages and on `--help` requests.
 #[must_use]
 pub fn usage() -> &'static str {
     "familyclaw replay — Time Machine (durable journal inspection)\n\
@@ -152,14 +152,14 @@ pub fn usage() -> &'static str {
      --json              Emit JSON instead of Markdown (inspect, diff)"
 }
 
-/// Jäsentää `replay`-alikomennon argumentit (ilman `familyclaw replay`
-/// -prefiksiä).
+/// Parses the arguments of the `replay` subcommand (without the
+/// `familyclaw replay` prefix).
 ///
-/// `args` on esim. `["inspect", "--journal", "run.jsonl"]`.
+/// `args` is e.g. `["inspect", "--journal", "run.jsonl"]`.
 ///
 /// # Errors
-/// [`ReplayError::Usage`] jos alikomento puuttuu tai on tuntematon, jos
-/// pakollinen lippu/arvo puuttuu, tai jos lippu on tuntematon.
+/// [`ReplayError::Usage`] if the subcommand is missing or unknown, if a
+/// required flag/value is missing, or if a flag is unknown.
 pub fn parse<I, S>(args: I) -> Result<ReplayCommand, ReplayError>
 where
     I: IntoIterator<Item = S>,
@@ -181,7 +181,7 @@ where
     }
 }
 
-/// Jäsentää `replay inspect` -argumentit.
+/// Parses the `replay inspect` arguments.
 fn parse_inspect<I: Iterator<Item = String>>(args: I) -> Result<ReplayCommand, ReplayError> {
     let mut journal: Option<PathBuf> = None;
     let mut json = false;
@@ -201,7 +201,7 @@ fn parse_inspect<I: Iterator<Item = String>>(args: I) -> Result<ReplayCommand, R
     })
 }
 
-/// Jäsentää `replay fork` -argumentit.
+/// Parses the `replay fork` arguments.
 fn parse_fork<I: Iterator<Item = String>>(args: I) -> Result<ReplayCommand, ReplayError> {
     let mut journal: Option<PathBuf> = None;
     let mut keep: Option<usize> = None;
@@ -232,7 +232,7 @@ fn parse_fork<I: Iterator<Item = String>>(args: I) -> Result<ReplayCommand, Repl
     })
 }
 
-/// Jäsentää `replay diff` -argumentit.
+/// Parses the `replay diff` arguments.
 fn parse_diff<I: Iterator<Item = String>>(args: I) -> Result<ReplayCommand, ReplayError> {
     let mut before: Option<PathBuf> = None;
     let mut after: Option<PathBuf> = None;
@@ -255,7 +255,7 @@ fn parse_diff<I: Iterator<Item = String>>(args: I) -> Result<ReplayCommand, Repl
     })
 }
 
-/// Jäsentää `replay demo` -argumentit.
+/// Parses the `replay demo` arguments.
 fn parse_demo<I: Iterator<Item = String>>(args: I) -> Result<ReplayCommand, ReplayError> {
     let mut dir: Option<PathBuf> = None;
 
@@ -270,7 +270,7 @@ fn parse_demo<I: Iterator<Item = String>>(args: I) -> Result<ReplayCommand, Repl
     Ok(ReplayCommand::Demo { dir })
 }
 
-/// Ottaa lipun arvon iteraattorista tai palauttaa selkeän usage-virheen.
+/// Takes a flag's value from the iterator, or returns a clear usage error.
 fn take_value<I: Iterator<Item = String>>(args: &mut I, flag: &str) -> Result<String, ReplayError> {
     args.next()
         .ok_or_else(|| ReplayError::Usage(format!("flag `{flag}` requires a value")))
@@ -286,12 +286,12 @@ fn unknown_flag(sub: &str, flag: &str) -> ReplayError {
     ReplayError::Usage(format!("`replay {sub}`: unknown flag `{flag}`"))
 }
 
-/// Suorittaa jäsennetyn [`ReplayCommand`]:n ja palauttaa tulostettavan
-/// merkkijonon.
+/// Executes a parsed [`ReplayCommand`] and returns the printable
+/// string.
 ///
 /// # Errors
-/// Palauttaa [`ReplayError`]:n jos journalin avaus/luku/kirjoitus, fork tai
-/// JSON-sarjallistus epäonnistuu. Ei koskaan paniikkia.
+/// Returns a [`ReplayError`] if opening/reading/writing the journal, the
+/// fork, or JSON serialization fails. Ei koskaan paniikkia.
 pub fn execute(command: ReplayCommand) -> Result<String, ReplayError> {
     match command {
         ReplayCommand::Inspect { journal, json } => run_inspect(&journal, json),
@@ -305,13 +305,13 @@ pub fn execute(command: ReplayCommand) -> Result<String, ReplayError> {
     }
 }
 
-/// Avaa journalin ja tuottaa sen aikajanan markdownina tai JSON:na.
+/// Opens a journal and renders its timeline as markdown or JSON.
 ///
-/// Journal avataan vain luettavaksi (append-only-invariantti säilyy).
+/// The journal is opened read-only (the append-only invariant is preserved).
 ///
 /// # Errors
-/// [`ReplayError::Durable`] jos journalia ei voi avata/lukea,
-/// [`ReplayError::Serde`] jos JSON-sarjallistus epäonnistuu.
+/// [`ReplayError::Durable`] if the journal cannot be opened/read,
+/// [`ReplayError::Serde`] if JSON serialization fails.
 pub fn run_inspect(journal: &Path, json: bool) -> Result<String, ReplayError> {
     let journal = FileJournal::open(journal)?;
     let timeline = TimeMachine::inspect(&journal)?;
@@ -322,17 +322,17 @@ pub fn run_inspect(journal: &Path, json: bool) -> Result<String, ReplayError> {
     }
 }
 
-/// Haarauttaa lähdejournalin aikajanan uuteen journaliin `keep`-askeleen
-/// leikkauspisteestä.
+/// Forks the source journal's timeline into a new journal at the cut point
+/// of `keep` steps.
 ///
-/// **Fail-closed:** jos `out` on jo olemassa, funktio kieltäytyy sen sijaan
-/// että ylikirjoittaisi tai jatkaisi olemassa olevaan lokiin — muuten haaran
-/// tyhjä-kohdejournal-invariantti rikkoutuisi hiljaa.
+/// **Fail-closed:** if `out` already exists, the function refuses instead
+/// of overwriting it or appending to the existing log — otherwise the
+/// fork's empty-destination-journal invariant would be silently broken.
 ///
 /// # Errors
-/// [`ReplayError::Usage`] jos `out` on jo olemassa; [`ReplayError::Durable`]
-/// jos lähdejournalin luku, kohdejournalin avaus tai itse fork epäonnistuu
-/// (esim. `keep` ylittää askelmäärän).
+/// [`ReplayError::Usage`] if `out` already exists; [`ReplayError::Durable`]
+/// if reading the source journal, opening the destination journal, or the
+/// fork itself fails (e.g. `keep` exceeds the step count).
 pub fn run_fork(journal: &Path, keep: usize, out: &Path) -> Result<String, ReplayError> {
     if out.exists() {
         return Err(ReplayError::Usage(format!(
@@ -351,11 +351,11 @@ pub fn run_fork(journal: &Path, keep: usize, out: &Path) -> Result<String, Repla
     ))
 }
 
-/// Avaa kaksi journalia ja tuottaa niiden vertailun markdownina tai JSON:na.
+/// Opens two journals and renders their comparison as markdown or JSON.
 ///
 /// # Errors
-/// [`ReplayError::Durable`] jos kumpaakaan journalia ei voi avata/lukea,
-/// [`ReplayError::Serde`] jos JSON-sarjallistus epäonnistuu.
+/// [`ReplayError::Durable`] if either journal cannot be opened/read,
+/// [`ReplayError::Serde`] if JSON serialization fails.
 pub fn run_diff(before: &Path, after: &Path, json: bool) -> Result<String, ReplayError> {
     let before = FileJournal::open(before)?;
     let after = FileJournal::open(after)?;
@@ -367,35 +367,35 @@ pub fn run_diff(before: &Path, after: &Path, json: bool) -> Result<String, Repla
     }
 }
 
-/// `familyclaw replay demo` — itsenäinen Time Machine -tarina yhdessä
-/// prosessissa: rakenna bugillinen ajo, näytä sen aikajana, haaraudu ennen
-/// bugia, aja korjattu politiikka dry-run-kaappauksella, ja todista ettei
-/// alkuperäinen journal muuttunut.
+/// `familyclaw replay demo` — a self-contained Time Machine story in a
+/// single process: build a buggy run, show its timeline, fork before the
+/// bug, run the fixed policy under a dry-run capture, and prove the
+/// original journal was left unchanged.
 ///
-/// Tarina (design §2.1, "Time Machine" -esittely):
-/// 1. **`load_request`** — pyyntö saapuu, summa 100.
-/// 2. **`decide_policy`** — BUGI: hyväksyy `amount * 2` = 200.
-/// 3. **`dispatch_refund`** — lähettää (kirjaa) `"sent:200"`.
+/// Story (design §2.1, "Time Machine" showcase):
+/// 1. **`load_request`** — a request arrives, amount 100.
+/// 2. **`decide_policy`** — BUG: approves `amount * 2` = 200.
+/// 3. **`dispatch_refund`** — sends (records) `"sent:200"`.
 ///
-/// Sen jälkeen aikajana haarautetaan **ennen** `decide_policy`-askelta:
-/// `load_request` toistuu lokista (ei sivuvaikutusta), ja jatko ajetaan
-/// **korjatulla** politiikalla `min(amount, 100)` = 100. `dispatch_refund`
-/// korvataan dry-run-versiolla joka kirjaa aiotun intentin
-/// [`DryRunRecorder`]:iin — **mitään ei koskaan lähetetä oikeasti**, koska
-/// kaappaustyypillä ei ole rakenteellisesti mitään dispatch-polkua.
+/// The timeline is then forked **before** the `decide_policy` step:
+/// `load_request` is replayed from the log (no side effect), and the
+/// continuation runs under the **fixed** policy `min(amount, 100)` = 100.
+/// `dispatch_refund` is replaced with a dry-run version that records the
+/// intended intent into [`DryRunRecorder`] — **nothing is ever actually
+/// sent**, because the capture type structurally has no dispatch path at
+/// all.
 ///
-/// Jos `dir` on `None`, esittely käyttää tuoretta temp-hakemistoa ja siivoaa
-/// sen pois ennen paluuta (ei jätä levylle mitään). Jos `dir` on annettu,
-/// hakemisto luodaan tarvittaessa eikä sitä siivota — journalit jäävät
-/// tarkasteltavaksi (esim. `replay inspect --journal <dir>/original.jsonl`).
+/// If `dir` is `None`, the showcase uses a fresh temp directory and cleans
+/// it up before returning (leaves nothing on disk). If `dir` is given, the
+/// directory is created as needed and is not cleaned up — the journals are
+/// left for inspection (e.g. `replay inspect --journal <dir>/original.jsonl`).
 ///
-/// Palauttaa englanninkielisen, kompaktin kertomuksen joka soveltuu
-/// README-kuvakaappaukseen.
+/// Returns an English, compact narrative suitable for a README screenshot.
 ///
 /// # Errors
-/// [`ReplayError::Io`] jos temp-/kohdehakemiston luonti tai siivous
-/// epäonnistuu; [`ReplayError::Durable`] jos journalin luku/kirjoitus/fork
-/// epäonnistuu. Ei koskaan paniikkia.
+/// [`ReplayError::Io`] if creating or cleaning up the temp/destination
+/// directory fails; [`ReplayError::Durable`] if reading/writing/forking the
+/// journal fails. Never panics.
 #[allow(clippy::too_many_lines)]
 pub fn run_demo(dir: Option<&Path>) -> Result<String, ReplayError> {
     let (demo_dir, cleanup_on_exit) = if let Some(path) = dir {
@@ -423,11 +423,11 @@ pub fn run_demo(dir: Option<&Path>) -> Result<String, ReplayError> {
     result
 }
 
-/// Suorittaa esittelyn annetussa (jo olemassa olevassa) hakemistossa.
+/// Runs the showcase in the given (already existing) directory.
 ///
-/// Erotettu [`run_demo`]:sta jotta temp-siivous ([`run_demo`]) tapahtuu myös
-/// virhepolulla (`?`-operaattori tässä funktiossa ei ohita siivousta,
-/// koska kutsuja hoitaa sen `result`-arvon kautta).
+/// Separated from [`run_demo`] so that the temp cleanup ([`run_demo`])
+/// happens on the error path too (the `?` operator in this function does
+/// not bypass cleanup, since the caller handles it via the `result` value).
 fn run_demo_in(demo_dir: &Path) -> Result<String, ReplayError> {
     let mut out = String::new();
     let _ = writeln!(
@@ -536,12 +536,12 @@ fn run_demo_in(demo_dir: &Path) -> Result<String, ReplayError> {
     Ok(out)
 }
 
-/// Yksi kutsu koko `replay`-alikomennolle: jäsennä + suorita.
+/// A single call for the whole `replay` subcommand: parse + execute.
 ///
-/// `args` on `familyclaw replay`-prefiksin jälkeiset argumentit.
+/// `args` are the arguments following the `familyclaw replay` prefix.
 ///
 /// # Errors
-/// Vie [`parse`]:n ja [`execute`]:n virheet läpi.
+/// Propagates errors from [`parse`] and [`execute`].
 pub fn run<I, S>(args: I) -> Result<String, ReplayError>
 where
     I: IntoIterator<Item = S>,
@@ -555,8 +555,8 @@ mod tests {
     use super::*;
     use familyclaw_durable::{DurableContext, Journal};
 
-    /// Pieni RAII-temp-tiedosto ilman ulkoisia crateja (sama kuvio kuin
-    /// `familyclaw-durable/src/context.rs`-testeissä).
+    /// Small RAII temp file without external crates (same pattern as in
+    /// the `familyclaw-durable/src/context.rs` tests).
     struct TempPath(PathBuf);
 
     impl TempPath {
@@ -584,8 +584,8 @@ mod tests {
         }
     }
 
-    /// Apuri: kirjoita kolmiaskelinen ajo (load → decide → act) annettuun
-    /// polkuun ja sulje kahva (fsync).
+    /// Helper: write a three-step run (load → decide → act) to the given
+    /// path and close the handle (fsync).
     fn write_three_step_journal(path: &Path) {
         let journal = FileJournal::open(path).expect("open");
         let mut ctx = DurableContext::new(journal).expect("ctx");
@@ -595,7 +595,7 @@ mod tests {
             .step("act", || Ok(format!("sent:{approved}")))
             .expect("act");
         let journal = ctx.finish();
-        // Varmista että kaikki kolme riviä ovat levyllä.
+        // Make sure all three rows are on disk.
         assert_eq!(journal.len().expect("len"), 3);
     }
 
@@ -738,8 +738,8 @@ mod tests {
 
     #[test]
     fn run_inspect_missing_journal_is_durable_io_error() {
-        // Olematon polku → FileJournal::open luo tyhjän tiedoston, joten sen
-        // sijaan varmistetaan että tyhjä journal antaa tyhjän aikajanan.
+        // Nonexistent path → FileJournal::open creates an empty file, so
+        // instead we verify that an empty journal yields an empty timeline.
         let tmp = TempPath::new("inspect-empty");
         let out = run_inspect(tmp.path(), false).expect("empty inspect");
         assert!(out.contains("0 step(s)"));
@@ -758,7 +758,7 @@ mod tests {
         let msg = run_fork(src.path(), 2, dst.path()).expect("fork");
         assert!(msg.contains("kept 2 step(s)"));
 
-        // Haara sisältää kaksi askelta + auditmarkerin.
+        // The fork contains two steps + the audit marker.
         let forked = FileJournal::open(dst.path()).expect("reopen fork");
         let timeline = TimeMachine::inspect(&forked).expect("inspect fork");
         assert_eq!(timeline.len(), 2);
@@ -766,7 +766,7 @@ mod tests {
         assert_eq!(timeline.steps[1].name, "decide");
         assert_eq!(timeline.marker_count, 1, "audit marker present");
 
-        // Lähdejournal ei muuttunut.
+        // The source journal did not change.
         let source = FileJournal::open(src.path()).expect("reopen source");
         assert_eq!(TimeMachine::inspect(&source).expect("inspect src").len(), 3);
     }
@@ -905,8 +905,8 @@ mod tests {
 
     // ---------- run_demo ----------
 
-    /// Apuri: uniikki temp-hakemistopolku joka poistetaan Dropissa (jos
-    /// vielä olemassa) — käytetään `--dir`-testeissä.
+    /// Helper: unique temp directory path removed on Drop (if it still
+    /// exists) — used in the `--dir` tests.
     struct TempDir(PathBuf);
 
     impl TempDir {

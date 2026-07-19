@@ -1,23 +1,24 @@
-//! Muistihaku: relevanssin laskenta ([`RetrievalContext`], [`RetrievalResult`]).
+//! Memory retrieval: relevance computation ([`RetrievalContext`], [`RetrievalResult`]).
 //!
-//! Tämä on Eternal Threadin haun **v1-runko**: yksinkertainen relevanssi
-//! joka yhdistää avainsanaosuman, tunnesävyn osuman ja muistin nykyisen
-//! retention (Ebbinghaus). Vektorihaku (cosine-similarity, HNSW) tulee
-//! myöhemmin feature-flagin taakse — kts. [`crate`]-tason dokumentaatio.
+//! This is Eternal Thread's **v1 skeleton** for retrieval: a simple
+//! relevance function that combines keyword matching, emotional tone
+//! matching, and the memory's current retention (Ebbinghaus). Vector
+//! search (cosine similarity, HNSW) will come later behind a feature flag
+//! — see the [`crate`]-level documentation.
 //!
-//! ## Relevanssin koostumus
+//! ## Relevance composition
 //! ```text
 //! relevance = (keyword · 0.55 + emotion · 0.25 + importance · 0.20) · retention
 //! ```
-//! - `keyword` — kyselyn ja sisällön/tägien sanaosumasuhde,
-//! - `emotion` — jaettujen tunnedimensioiden suhde (Eternal Thread
+//! - `keyword` — the word-match ratio between the query and the content/tags,
+//! - `emotion` — the ratio of shared emotion dimensions (Eternal Thread
 //!   "emotional boost"),
-//! - `importance` — muistin esilaskettu tärkeys,
-//! - `retention` — Ebbinghaus-retentio hakuhetkellä (unohtunut muisto saa
-//!   matalan painon vaikka osuisi sanoihin).
+//! - `importance` — the memory's precomputed importance,
+//! - `retention` — Ebbinghaus retention at retrieval time (a forgotten
+//!   memory gets low weight even if it matches the words).
 //!
-//! Haudattuja (tombstoned) muistoja ei koskaan palauteta; arkistoidut
-//! palautetaan vaimennettuna.
+//! Tombstoned memories are never returned; archived ones are returned
+//! weakened.
 
 use serde::{Deserialize, Serialize};
 
@@ -26,76 +27,76 @@ use familyclaw_emotion::Dimension;
 
 use crate::memory::Memory;
 
-/// Avainsanaosuman paino relevanssissa.
+/// Weight of keyword matching in relevance.
 const W_KEYWORD: f32 = 0.55;
-/// Tunneosuman paino relevanssissa.
+/// Weight of emotion matching in relevance.
 const W_EMOTION: f32 = 0.25;
-/// Tärkeyden paino relevanssissa.
+/// Weight of importance in relevance.
 const W_IMPORTANCE: f32 = 0.20;
 
-/// Arkistoidun muiston relevanssikerroin (vaimennus haussa).
+/// Relevance factor for an archived memory (decay in retrieval).
 const ARCHIVED_PENALTY: f32 = 0.5;
 
-/// Cosine-similarity vektorihaku painon raja-arvo.
-/// Jos `semantic_weight` > tämä ja molemmilla on embedding, käytetään cosine:a.
+/// Threshold for the cosine-similarity vector search weight.
+/// If `semantic_weight` > this and both have an embedding, cosine is used.
 const VECTOR_SIMILARITY_THRESHOLD: f32 = 0.01;
 
-/// Hakukysely ja sen rajaukset.
+/// A retrieval query and its constraints.
 ///
-/// Rakenna [`RetrievalContext::new`]-metodilla ja säädä builder-tyylillä.
-/// Konteksti on puhtaasti dataa — varsinaisen haun tekee
+/// Build with [`RetrievalContext::new`] and adjust in builder style. The
+/// context is pure data — the actual retrieval is done by
 /// [`crate::MemoryStore::retrieve`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalContext {
-    /// Tekstihaku (avainsanat). Tyhjä = ei tekstirajausta.
+    /// Text query (keywords). Empty = no text constraint.
     pub query: String,
 
-    /// Tunnedimensiot joita painotetaan (Eternal Thread emotion boost).
+    /// Emotion dimensions to weight (Eternal Thread emotion boost).
     #[serde(default)]
     pub emotions: Vec<Dimension>,
 
-    /// Tägit joiden tulee osua (kaikki annetut vaaditaan). Tyhjä = ei
-    /// tägirajausta.
+    /// Tags that must match (all given ones are required). Empty = no tag
+    /// constraint.
     #[serde(default)]
     pub required_tags: Vec<String>,
 
-    /// Palautettavien tulosten enimmäismäärä.
+    /// Maximum number of results to return.
     pub limit: usize,
 
-    /// Pienin hyväksyttävä relevanssi (`0.0..=1.0`). Tämän alittavat
-    /// tulokset karsitaan.
+    /// Minimum acceptable relevance (`0.0..=1.0`). Results below this are
+    /// filtered out.
     #[serde(default)]
     pub min_relevance: f32,
 
-    /// Sisällytetäänkö arkistoidut muistot (vaimennettuna). Oletus `true`.
+    /// Whether to include archived memories (weakened). Default `true`.
     #[serde(default = "default_true")]
     pub include_archived: bool,
 
-    /// Semanttisen haun paino (`0.0..=1.0`).
-    /// 0 = pelkkä avainsanaosuma (oletus, taaksepäin yhteensopiva),
-    /// 1 = pelkkä semanttinen samankaltaisuus (bigram Dice).
-    /// > 0 ja embedding asetettu → cosine-similarity vektorihaku.
+    /// Weight of semantic search (`0.0..=1.0`).
+    /// 0 = pure keyword matching (default, backward compatible),
+    /// 1 = pure semantic similarity (bigram Dice).
+    /// > 0 with an embedding set → cosine-similarity vector search.
     #[serde(default)]
     pub semantic_weight: f32,
 
-    /// Kyselyn upotusvektori vektorihakua varten.
-    /// Jos asetettu ja `semantic_weight > VECTOR_SIMILARITY_THRESHOLD`,
-    /// haku laskee cosine-similarityn muistojen embeddingien kanssa.
+    /// Query embedding vector for vector search.
+    /// If set and `semantic_weight > VECTOR_SIMILARITY_THRESHOLD`, retrieval
+    /// computes cosine similarity against memories' embeddings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_embedding: Option<Vec<f32>>,
 }
 
-/// serde-oletus `true`-kentille.
+/// serde default for `true` fields.
 const fn default_true() -> bool {
     true
 }
 
 impl RetrievalContext {
-    /// Oletusraja palautettaville tuloksille.
+    /// Default limit for returned results.
     pub const DEFAULT_LIMIT: usize = 10;
 
-    /// Luo hakukontekstin tekstikyselyllä; muut kentät saavat oletukset
-    /// (`limit = 10`, arkistoidut mukana, ei muita rajauksia).
+    /// Creates a retrieval context with a text query; other fields get
+    /// defaults (`limit = 10`, archived included, no other constraints).
     #[must_use]
     pub fn new(query: impl Into<String>) -> Self {
         Self {
@@ -110,28 +111,28 @@ impl RetrievalContext {
         }
     }
 
-    /// Asettaa painotettavat tunnedimensiot.
+    /// Sets the emotion dimensions to weight.
     #[must_use]
     pub fn with_emotions(mut self, emotions: impl IntoIterator<Item = Dimension>) -> Self {
         self.emotions = emotions.into_iter().collect();
         self
     }
 
-    /// Asettaa vaaditut tägit.
+    /// Sets the required tags.
     #[must_use]
     pub fn with_required_tags(mut self, tags: impl IntoIterator<Item = String>) -> Self {
         self.required_tags = tags.into_iter().collect();
         self
     }
 
-    /// Asettaa tulosrajan (vähintään 1).
+    /// Sets the result limit (at least 1).
     #[must_use]
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = limit.max(1);
         self
     }
 
-    /// Asettaa relevanssikynnyksen (`0.0..=1.0`, puristetaan).
+    /// Sets the relevance threshold (`0.0..=1.0`, clamped).
     #[must_use]
     pub fn with_min_relevance(mut self, min: f32) -> Self {
         self.min_relevance = if min.is_finite() {
@@ -142,30 +143,30 @@ impl RetrievalContext {
         self
     }
 
-    /// Asettaa sisällytetäänkö arkistoidut muistot.
+    /// Sets whether to include archived memories.
     #[must_use]
     pub fn including_archived(mut self, include: bool) -> Self {
         self.include_archived = include;
         self
     }
 
-    /// Asettaa semanttisen haun painon (`0.0..=1.0`, puristetaan).
-    /// 0 = pelkkä avainsana (oletus), 1 = pelkkä bigram-semantiikka.
+    /// Sets the weight of semantic search (`0.0..=1.0`, clamped).
+    /// 0 = pure keyword (default), 1 = pure bigram semantics.
     #[must_use]
     pub fn with_semantic_weight(mut self, weight: f32) -> Self {
         self.semantic_weight = weight.clamp(0.0, 1.0);
         self
     }
-    /// Asettaa kyselyn upotusvektorin vektorihakua varten.
-    /// Jos asetettu ja `semantic_weight > VECTOR_SIMILARITY_THRESHOLD`,
-    /// haku laskee cosine-similarityn muistojen embeddingien kanssa.
+    /// Sets the query embedding vector for vector search.
+    /// If set and `semantic_weight > VECTOR_SIMILARITY_THRESHOLD`, retrieval
+    /// computes cosine similarity against memories' embeddings.
     #[must_use]
     pub fn with_query_embedding(mut self, embedding: impl Into<Vec<f32>>) -> Self {
         self.query_embedding = Some(embedding.into());
         self
     }
 
-    /// Onko muiston tägit kontekstin vaatimusten mukaiset.
+    /// Whether the memory's tags satisfy the context's requirements.
     fn tags_match(&self, memory: &Memory) -> bool {
         self.required_tags
             .iter()
@@ -179,31 +180,31 @@ impl Default for RetrievalContext {
     }
 }
 
-/// Yksittäinen hakutulos: muisto ja sille laskettu relevanssi.
+/// A single retrieval result: a memory and its computed relevance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalResult {
-    /// Osunut muisto.
+    /// The matched memory.
     pub memory: Memory,
-    /// Lopullinen relevanssipistemäärä (`0.0..=1.0`).
+    /// Final relevance score (`0.0..=1.0`).
     pub relevance: f32,
 }
 
-/// Laskee yksittäisen muiston relevanssin hakukontekstiin nähden
-/// ajanhetkellä `at`.
+/// Computes the relevance of a single memory against the retrieval context
+/// at time `at`.
 ///
-/// Palauttaa `None` jos muisto ei kelpaa hakuun (haudattu, arkistoitu kun
-/// niitä ei haluta, tai vaaditut tägit eivät osu). Muutoin palauttaa
-/// relevanssin `0.0..=1.0`.
+/// Returns `None` if the memory does not qualify for retrieval (tombstoned,
+/// archived when not wanted, or required tags don't match). Otherwise
+/// returns relevance `0.0..=1.0`.
 ///
-/// Relevanssi = (keyword·0.55 + emotion·0.25 + importance·0.20) · retention,
-/// arkistoiduille lisäksi `× ARCHIVED_PENALTY`.
-/// Jos `semantic_weight > VECTOR_SIMILARITY_THRESHOLD` ja molemmilla on
-/// `embedding`, korvaa `semantic`-osion cosine-similarity:llä.
+/// Relevance = (keyword·0.55 + emotion·0.25 + importance·0.20) · retention,
+/// with an additional `× ARCHIVED_PENALTY` for archived memories.
+/// If `semantic_weight > VECTOR_SIMILARITY_THRESHOLD` and both have an
+/// `embedding`, the `semantic` component is replaced by cosine similarity.
 #[must_use]
 pub fn score(memory: &Memory, ctx: &RetrievalContext, at: Timestamp) -> Option<f32> {
     use crate::memory::MemoryStatus;
 
-    // Haudattuja ei koskaan palauteta.
+    // Tombstoned memories are never returned.
     if memory.status == MemoryStatus::Tombstoned {
         return None;
     }
@@ -217,8 +218,9 @@ pub fn score(memory: &Memory, ctx: &RetrievalContext, at: Timestamp) -> Option<f
     let keyword = keyword_score(&ctx.query, memory);
     let semantic = semantic_score(&ctx.query, memory);
 
-    // Vektorihaku: jos semantic_weight > threshold JA molemmilla on embedding,
-    // korvaa semantic-osio cosine-similarity:llä (0.0..=1.0 skaalaan).
+    // Vector search: if semantic_weight > threshold AND both have an
+    // embedding, replace the semantic component with cosine similarity
+    // (scaled to 0.0..=1.0).
     let semantic_for_text = if ctx.semantic_weight > VECTOR_SIMILARITY_THRESHOLD {
         match (&ctx.query_embedding, &memory.embedding) {
             (Some(query_emb), Some(mem_emb)) if ctx.semantic_weight > 0.0 => {
@@ -232,7 +234,7 @@ pub fn score(memory: &Memory, ctx: &RetrievalContext, at: Timestamp) -> Option<f
         semantic
     };
 
-    // Yhdistetty tekstiosuma: keyword × (1-w) + semantic × w
+    // Combined text match: keyword × (1-w) + semantic × w
     let text_score = keyword.mul_add(
         1.0 - ctx.semantic_weight,
         semantic_for_text * ctx.semantic_weight,
@@ -251,24 +253,25 @@ pub fn score(memory: &Memory, ctx: &RetrievalContext, at: Timestamp) -> Option<f
     Some(relevance.clamp(0.0, 1.0))
 }
 
-/// Pienin alkuperä-luottamuskerroin jonka matala-trust ulkoinen lähde voi
-/// saada retrieval-painotuksessa. Estää että myrkytetty (mutta portin läpi
-/// vuotanut tai porttia käyttämättä lisätty) ulkoinen muisto häviää täysin
-/// — se vain painuu pohjalle, jolloin audit voi yhä löytää sen.
+/// The minimum provenance trust factor a low-trust external source can get
+/// in retrieval weighting. Prevents a poisoned (but leaked past the gate,
+/// or added without going through the gate) external memory from
+/// disappearing entirely — it just sinks to the bottom, so an audit can
+/// still find it.
 const PROVENANCE_TRUST_FLOOR: f32 = 0.1;
 
-/// Kuten [`score`], mutta painottaa lopputuloksen muiston alkuperän
-/// ([`Provenance`](crate::Provenance)) luottamuksella.
+/// Like [`score`], but weights the result by the memory's provenance
+/// ([`Provenance`](crate::Provenance)) trust.
 ///
-/// Suora kokemus ja johdetut muistot (`trust = 1.0`) säilyttävät
-/// pisteensä ennallaan. Matalan luottamuksen ulkoinen lähde laskee
-/// sijoitustaan kertoimella `0.1 + 0.9 · trust` (kts.
-/// `PROVENANCE_TRUST_FLOOR`): epäluotettava ulkoinen väite painuu
-/// hakutulosten pohjalle (Sleeper Memory Poisoning -suoja jälkikäteen,
-/// myös niille muistoille jotka eivät kulkeneet [`ProvenanceGate`](crate::ProvenanceGate)in läpi).
+/// Direct experience and derived memories (`trust = 1.0`) keep their score
+/// unchanged. A low-trust external source lowers its ranking by a factor of
+/// `0.1 + 0.9 · trust` (see `PROVENANCE_TRUST_FLOOR`): an untrusted external
+/// claim sinks to the bottom of retrieval results (a retroactive Sleeper
+/// Memory Poisoning protection, also for memories that did not pass through
+/// the [`ProvenanceGate`](crate::ProvenanceGate)).
 ///
-/// Palauttaa `None` samoissa tapauksissa kuin [`score`] (haudattu,
-/// poissuljettu arkistoitu, tägi-suodatus).
+/// Returns `None` in the same cases as [`score`] (tombstoned, excluded
+/// archived, tag filtering).
 #[must_use]
 pub fn score_with_provenance(
     memory: &Memory,
@@ -281,32 +284,32 @@ pub fn score_with_provenance(
     Some((base * factor).clamp(0.0, 1.0))
 }
 
-/// Confidence-painotettu retention retrievalia varten.
+/// Confidence-weighted retention for retrieval.
 ///
-/// Confirmed-muistot (confidence=1.0) säilyttävät täyden retentionin.
-/// Claim-muistot (confidence=0.0) saavat vain murto-osan — niitä ei ole
-/// vahvistettu, joten niiden ei pitäisi nousta hakutuloksissa.
+/// Confirmed memories (confidence=1.0) retain full retention.
+/// Claim memories (confidence=0.0) get only a fraction — they have not
+/// been verified, so they should not rise in retrieval results.
 ///
 /// Formula: `adjusted = retention · (0.2 + 0.8 · confidence)`
-/// - Claim (0.0) → 20% retentionista
-/// - Evidence (0.7) → 76% retentionista
-/// - Confirmed (1.0) → 100% retentionista
+/// - Claim (0.0) → 20% of retention
+/// - Evidence (0.7) → 76% of retention
+/// - Confirmed (1.0) → 100% of retention
 fn adjusted_retention(memory: &Memory, at: Timestamp) -> f32 {
     let base = memory.retention(at).clamp(0.0, 1.0);
     let confidence = memory.confidence.clamp(0.0, 1.0);
     base * (0.2 + 0.8 * confidence)
 }
 
-/// Suorittaa haun annetuille muistoille: pisteyttää, suodattaa kynnyksellä
-/// ja palauttaa parhaat [`RetrievalContext::limit`] tulosta laskevassa
-/// relevanssijärjestyksessä.
+/// Runs retrieval over the given memories: scores, filters by threshold,
+/// and returns the top [`RetrievalContext::limit`] results in descending
+/// relevance order.
 ///
-/// Tasapelit ratkaistaan tuoreuden hyväksi (uudempi
-/// [`last_reinforced_at`](Memory::last_reinforced_at) ensin), mikä tekee
-/// järjestyksestä deterministisen.
+/// Ties are broken in favor of freshness (more recent
+/// [`last_reinforced_at`](Memory::last_reinforced_at) first), which makes
+/// the ordering deterministic.
 ///
-/// `at` on hakuhetki (retentiolaskentaa varten). Käytä
-/// [`retrieve_now`]-kuorta nykyhetkellä.
+/// `at` is the retrieval time (for retention computation). Use the
+/// [`retrieve_now`] wrapper for the current time.
 #[must_use]
 pub fn retrieve<'a, I>(memories: I, ctx: &RetrievalContext, at: Timestamp) -> Vec<RetrievalResult>
 where
@@ -342,7 +345,7 @@ where
     scored
 }
 
-/// Kuten [`retrieve`], mutta käyttää nykyhetkeä retentiolaskentaan.
+/// Like [`retrieve`], but uses the current time for retention computation.
 #[must_use]
 pub fn retrieve_now<'a, I>(memories: I, ctx: &RetrievalContext) -> Vec<RetrievalResult>
 where
@@ -351,16 +354,16 @@ where
     retrieve(memories, ctx, time::now())
 }
 
-/// Semanttinen samankaltaisuus: osittaisosuma unigrammeilla.
+/// Semantic similarity: partial matching with unigrams.
 ///
-/// Laskee kuinka moni kyselyn sana esiintyy *osittain* muiston
-/// sanoissa (substring-match). Tämä tavoittaa "ship" ↔ "shipped",
-/// "bridge" ↔ "bridges" jne.
+/// Computes how many query words appear *partially* within the memory's
+/// words (substring match). This captures "ship" ↔ "shipped",
+/// "bridge" ↔ "bridges", etc.
 ///
-/// Suodatetaan pois yleiset englannin täytesanat (≤ 2 merkkiä
-/// tai stoplistalla). Normalisoidaan kyselyn sanojen määrällä.
+/// Common English filler words are filtered out (≤ 2 characters
+/// or on the stoplist). Normalized by the number of query words.
 ///
-/// Tyhjä kysely tai sisältö → 0.0.
+/// Empty query or content → 0.0.
 fn semantic_score(query: &str, memory: &Memory) -> f32 {
     let query_words: Vec<String> = meaningful_words(query);
     let content_lower = memory.content.to_lowercase();
@@ -384,7 +387,7 @@ fn semantic_score(query: &str, memory: &Memory) -> f32 {
     ratio
 }
 
-/// Poimii merkitykselliset sanat: lowercase, suodattaa lyhyet ja stop-sanat.
+/// Extracts meaningful words: lowercase, filters short words and stopwords.
 fn meaningful_words(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|w| {
@@ -395,7 +398,7 @@ fn meaningful_words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Yleiset englannin stop-sanat jotka eivät kanna semanttista merkitystä.
+/// Common English stopwords that carry no semantic meaning.
 fn is_stopword(word: &str) -> bool {
     matches!(
         word,
@@ -438,11 +441,11 @@ fn is_stopword(word: &str) -> bool {
     )
 }
 
-/// Avainsanaosuma: osuneiden kyselysanojen suhde kaikkiin kyselysanoihin.
+/// Keyword match: the ratio of matched query words to all query words.
 ///
-/// Vertailu on case-insensitive ja kohdistuu sekä muiston sisältöön että
-/// tägeihin. Tyhjä kysely → neutraali `0.5` (ei tekstirajausta, ei suosi
-/// eikä rankaise).
+/// The comparison is case-insensitive and applies to both the memory's
+/// content and its tags. An empty query → neutral `0.5` (no text
+/// constraint, neither favors nor penalizes).
 fn keyword_score(query: &str, memory: &Memory) -> f32 {
     let terms: Vec<String> = tokenize(query);
     if terms.is_empty() {
@@ -464,10 +467,10 @@ fn keyword_score(query: &str, memory: &Memory) -> f32 {
     ratio
 }
 
-/// Tunneosuma: jaettujen tunnedimensioiden suhde kyselyn tunteisiin.
+/// Emotion match: the ratio of shared emotion dimensions to the query's emotions.
 ///
-/// Jos kyselyssä ei ole tunteita → neutraali `0.0` (ei tunneboostia).
-/// Muutoin osuus kyselyn tunteista jotka muisto myös aktivoi.
+/// If the query has no emotions → neutral `0.0` (no emotion boost).
+/// Otherwise the share of the query's emotions that the memory also activates.
 fn emotion_score(query_emotions: &[Dimension], memory_emotions: &[Dimension]) -> f32 {
     if query_emotions.is_empty() {
         return 0.0;
@@ -483,8 +486,8 @@ fn emotion_score(query_emotions: &[Dimension], memory_emotions: &[Dimension]) ->
     ratio
 }
 
-/// Pilkkoo tekstin pieniksi (lowercase) sanoiksi; jättää pois lyhyet
-/// täytesanat (≤ 1 merkki) ja ei-aakkosnumeeriset erottimet.
+/// Splits text into lowercase words; drops short
+/// filler words (≤ 1 character) and non-alphanumeric separators.
 fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.chars().count() > 1)
@@ -492,8 +495,8 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Cosine-similarity kahden vektorin välillä.
-/// Palauttaa 0.0 jos jompikumpi puuttuu tai dimensoit eivät täsmää.
+/// Cosine similarity between two vectors.
+/// Returns 0.0 if either is missing or dimensions do not match.
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -516,7 +519,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    // Testit vertaavat tarkasti esitettäviä f32-vakioita — tarkka vertailu ok.
+    // Tests compare exactly representable f32 constants — exact comparison is fine.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -586,7 +589,7 @@ mod tests {
         let s_miss = score(&m, &miss, now).expect("scored");
         assert!(
             s_hit > s_miss,
-            "osuva {s_hit} ei suurempi kuin osumaton {s_miss}"
+            "matching {s_hit} not greater than non-matching {s_miss}"
         );
     }
 
@@ -608,7 +611,7 @@ mod tests {
         let m = mem("anything at all");
         let now = time::now();
         let s = score(&m, &RetrievalContext::new(""), now).expect("scored");
-        // keyword 0.5, emotion 0.0, importance 0.5·0.45=0.225 → relevanssi > 0.
+        // keyword 0.5, emotion 0.0, importance 0.5·0.45=0.225 → relevance > 0.
         assert!(s > 0.0);
     }
 
@@ -625,7 +628,7 @@ mod tests {
         let s_plain = score(&m, &without, now).expect("p");
         assert!(
             s_emo > s_plain,
-            "tunneosuma {s_emo} ei boostaa yli {s_plain}"
+            "emotion match {s_emo} does not boost above {s_plain}"
         );
     }
 
@@ -646,9 +649,9 @@ mod tests {
             score(&m, &RetrievalContext::new("report"), time::now()).expect("archived scored");
         assert!(
             archived < baseline,
-            "arkistoitu {archived} ei vaimennettu alle {baseline}"
+            "archived {archived} not decayed below {baseline}"
         );
-        // Poissuljettaessa arkistoidut → None.
+        // When archived memories are excluded → None.
         let excluded = RetrievalContext::new("report").including_archived(false);
         assert!(score(&m, &excluded, time::now()).is_none());
     }
@@ -677,7 +680,7 @@ mod tests {
         let ctx = RetrievalContext::new("decaying");
         let fresh = score(&m, &ctx, created).expect("fresh");
         let stale = score(&m, &ctx, created + Duration::days(30)).expect("stale");
-        assert!(stale < fresh, "vanhentunut {stale} ei alle tuoreen {fresh}");
+        assert!(stale < fresh, "stale {stale} not below fresh {fresh}");
     }
 
     #[test]
@@ -691,7 +694,7 @@ mod tests {
         let ctx = RetrievalContext::new("anchor");
         let fresh = score(&m, &ctx, created).expect("fresh");
         let later = score(&m, &ctx, created + Duration::days(1000)).expect("later");
-        assert!((fresh - later).abs() < 1e-6, "suojattu ankkuri vaimeni");
+        assert!((fresh - later).abs() < 1e-6, "protected anchor decayed");
     }
 
     #[test]
@@ -703,11 +706,11 @@ mod tests {
         let ctx = RetrievalContext::new("rust memory").with_limit(2);
         let results = retrieve_now(&pool, &ctx);
         assert_eq!(results.len(), 2);
-        // "rust memory model" osuu molempiin → kärki.
+        // "rust memory model" matches both → top result.
         assert!(results[0].memory.content.contains("memory"));
-        // Laskeva relevanssi.
+        // Descending relevance.
         assert!(results[0].relevance >= results[1].relevance);
-        // python-muisto ei mahdu top-2:een (matala osuma).
+        // The python memory doesn't make it into the top 2 (low match).
         assert!(!results.iter().any(|r| r.memory.content.contains("python")));
     }
 
@@ -736,7 +739,7 @@ mod tests {
         assert!(toks.contains(&"hello".to_string()));
         assert!(toks.contains(&"world".to_string()));
         assert!(toks.contains(&"42".to_string()));
-        // Yhden merkin "a" ja "x" karsiutuvat.
+        // Single-character "a" and "x" are filtered out.
         assert!(!toks.contains(&"a".to_string()));
         assert!(!toks.contains(&"x".to_string()));
     }
@@ -759,9 +762,9 @@ mod tests {
         let s_external = score_with_provenance(&external, &ctx, now).expect("external scored");
         assert!(
             s_external < s_direct,
-            "matala-trust ulkoinen {s_external} ei painunut alle suoran {s_direct}"
+            "low-trust external {s_external} did not sink below direct {s_direct}"
         );
-        // Mutta ei nollaan — audit löytää sen yhä (trust floor).
+        // But not to zero — an audit can still find it (trust floor).
         assert!(s_external > 0.0);
     }
 
@@ -772,7 +775,7 @@ mod tests {
         let m = Memory::builder("the report content")
             .factors(ImportanceFactors::new(0.5, 0.0, 0.0, 0.0))
             .build();
-        // DirectExperience (trust 1.0) → sama pistemäärä kuin paljas score.
+        // DirectExperience (trust 1.0) → same score as plain score.
         let plain = score(&m, &ctx, now).expect("plain");
         let weighted = score_with_provenance(&m, &ctx, now).expect("weighted");
         assert!((plain - weighted).abs() < 1e-6);

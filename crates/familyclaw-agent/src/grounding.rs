@@ -1,6 +1,6 @@
-//! Hallusinaatiovartija ja työkalueskalaatio (Layer A).
+//! Hallucination guard and tool escalation (Layer A).
 
-/// `true` kun viesti odottaa konkreettista toimintaa / tilatarkistusta eikä small talkia.
+/// `true` when the message expects concrete action / a status check rather than small talk.
 #[must_use]
 pub fn looks_like_action_request(query: &str) -> bool {
     let q = query.trim().to_lowercase();
@@ -47,7 +47,7 @@ pub fn looks_like_action_request(query: &str) -> bool {
     .any(|needle| q.contains(needle))
 }
 
-/// `true` kun vastaus väittää työkalutyötä ilman journal-todistetta.
+/// `true` when the response claims tool activity without journal proof.
 #[must_use]
 pub fn response_claims_tool_use(text: &str) -> bool {
     let lower = text.to_lowercase();
@@ -78,11 +78,11 @@ pub fn response_claims_tool_use(text: &str) -> bool {
     if !claim_markers.iter().any(|m| lower.contains(m)) {
         return false;
     }
-    // Polku + teko-väite yhdessä on vahva signaali.
+    // A path combined with an action claim together is a strong signal.
     lower.contains(":\\") || lower.contains("e:/") || lower.contains("e:\\\\")
 }
 
-/// Lisää varoitus jos vastaus väittää työtä mutta dispatch-count on nolla.
+/// Adds a warning if the response claims work was done but the dispatch count is zero.
 #[must_use]
 pub fn apply_grounding_guard(answer: &str, dispatch_count: u32) -> String {
     if dispatch_count > 0 || !response_claims_tool_use(answer) {
@@ -94,7 +94,7 @@ pub fn apply_grounding_guard(answer: &str, dispatch_count: u32) -> String {
     )
 }
 
-/// Muistimerkinnät joissa on todennäköisiä aiempia teko-väitteitä (RAG-suodatin).
+/// Memory entries that likely contain prior action claims (RAG filter).
 #[must_use]
 pub fn memory_is_unverified_tool_claim(content: &str) -> bool {
     let lower = content.to_lowercase();

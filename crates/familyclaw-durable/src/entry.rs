@@ -1,45 +1,44 @@
-//! Journal-rivit: [`JournalEntry`], [`StepId`] ja [`EntryKind`].
+//! Journal rows: [`JournalEntry`], [`StepId`], and [`EntryKind`].
 //!
-//! Journal on durable-substraatin **ainoa totuuden lähde**. Jokainen rivi
-//! tallentaa yhden deterministisesti toistettavan tapahtuman: askeleen
-//! valmistumisen, askeleen epäonnistumisen tai snapshotin. Replay lukee
-//! rivit järjestyksessä ja palauttaa cachetut tulokset ajamatta sivuvaikutuksia
-//! uudelleen.
+//! The journal is the durable substrate's **sole source of truth**. Every
+//! row records one deterministically replayable event: a step completing, a
+//! step failing, or a snapshot. Replay reads the rows in order and returns
+//! the cached results without re-running side effects.
 
 use serde::{Deserialize, Serialize};
 
 use familyclaw_core::time::{self, Timestamp};
 
-/// Askeleen sekvenssipaikan tunniste journalissa.
+/// Identifier for a step's sequence position in the journal.
 ///
-/// Yksinkertainen 0-pohjainen monotoninen indeksi. Determinismi vaatii että
-/// sama koodi tuottaa askeleet samassa järjestyksessä — `StepId` koodaa tämän
-/// järjestyksen, joten replay voi verrata odotettua ja löydettyä askelta
-/// paikka paikalta.
+/// A simple 0-based monotonic index. Determinism requires that the same
+/// code produce steps in the same order — `StepId` encodes this order, so
+/// replay can compare the expected and found step position by position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StepId(u64);
 
 impl StepId {
-    /// Ensimmäinen askel (indeksi 0).
+    /// The first step (index 0).
     pub const ZERO: StepId = StepId(0);
 
-    /// Rakentaa askel-tunnisteen raa'asta indeksistä.
+    /// Builds a step identifier from a raw index.
     #[must_use]
     pub const fn new(index: u64) -> Self {
         Self(index)
     }
 
-    /// Palauttaa sisällä olevan indeksin.
+    /// Returns the contained index.
     #[must_use]
     pub const fn index(self) -> u64 {
         self.0
     }
 
-    /// Palauttaa seuraavan askeleen tunnisteen.
+    /// Returns the identifier for the next step.
     ///
-    /// Saturoituu [`u64::MAX`]:iin ylivuodon sijaan — durable-loki ei käytännössä
-    /// koskaan saavuta tätä, mutta saturointi pitää funktion paniikittomana.
+    /// Saturates at [`u64::MAX`] instead of overflowing — a durable log
+    /// practically never reaches this, but saturation keeps the function
+    /// panic-free.
     #[must_use]
     pub const fn next(self) -> Self {
         Self(self.0.saturating_add(1))
@@ -52,78 +51,78 @@ impl std::fmt::Display for StepId {
     }
 }
 
-/// Journal-rivin laji ja siihen liittyvä hyötykuorma.
+/// The kind of a journal row and its associated payload.
 ///
-/// `#[non_exhaustive]` jotta uusia rivilajeja (esim. timer, side-effect-marker)
-/// voi lisätä myöhemmin rikkomatta lukijoita.
+/// `#[non_exhaustive]` so new row kinds (e.g. timer, side-effect marker) can
+/// be added later without breaking readers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EntryKind {
-    /// Askel suoritettiin onnistuneesti ja sen tulos on tallennettu.
+    /// The step ran successfully and its result has been recorded.
     ///
-    /// Replayssä tätä riviä vastaava suljin **ei aja uudelleen** — `output`
-    /// palautetaan suoraan, joten sivuvaikutukset eivät toistu.
+    /// During replay, the closure corresponding to this row is **not
+    /// re-run** — `output` is returned directly, so side effects do not recur.
     StepCompleted {
-        /// Askeleen looginen nimi (sama joka ajolla, deterministinen).
+        /// The step's logical name (the same on every run, deterministic).
         name: String,
-        /// Askeleen palauttama tulos JSON-arvona.
+        /// The step's returned result as a JSON value.
         output: serde_json::Value,
     },
 
-    /// Askel epäonnistui. Virhe tallennetaan jotta replay voi palauttaa
-    /// saman virheen ajamatta sulkimellista logiikkaa uudelleen.
+    /// The step failed. The error is recorded so replay can return the same
+    /// error without re-running the closure's logic.
     StepFailed {
-        /// Askeleen looginen nimi.
+        /// The step's logical name.
         name: String,
-        /// Tallennettu virheviesti.
+        /// The recorded error message.
         error: String,
     },
 
-    /// Tilan tilannekuva (snapshot). Tiivistää aiemmat rivit yhdeksi
-    /// pisteeksi josta replay voi alkaa nopeasti.
+    /// A state snapshot. Condenses earlier rows into a single point from
+    /// which replay can start quickly.
     Snapshot {
-        /// Snapshotin sisältämä sovellustila JSON-arvona.
+        /// The application state contained in the snapshot, as a JSON value.
         state: serde_json::Value,
     },
 
-    /// Lisäannotaatio lokiin, joka **ei ole workflow-askel**.
+    /// An additional annotation in the log that **is not a workflow step**.
     ///
-    /// Markerit kantavat sivutietoa samassa append-only-lokissa (design §1:
-    /// *"durable carries everything"*) ajamatta osaa
-    /// [`DurableContext`](crate::DurableContext)-replayn askelkursorista.
-    /// Esimerkki: dreaming-vaiheen ristiriitamerkinnät
+    /// Markers carry side information in the same append-only log (design
+    /// §1: *"durable carries everything"*) without consuming any part of
+    /// [`DurableContext`](crate::DurableContext) replay's step cursor.
+    /// Example: dreaming-phase contradiction annotations
     /// (`familyclaw-dream`). [`DurableContext::new`](crate::DurableContext::new)
-    /// suodattaa markerit pois täsmälleen kuten snapshotit, joten ne eivät voi
-    /// sekoittua workflow-askeliin ([`DurableError::NondeterministicReplay`]).
+    /// filters markers out exactly like snapshots, so they cannot be
+    /// confused with workflow steps ([`DurableError::NondeterministicReplay`]).
     ///
     /// [`DurableError::NondeterministicReplay`]: crate::DurableError::NondeterministicReplay
     Marker {
-        /// Markerin looginen nimi (esim. "`memory_contradicted`").
+        /// The marker's logical name (e.g. "`memory_contradicted`").
         name: String,
-        /// Vapaamuotoinen JSON-hyötykuorma.
+        /// A free-form JSON payload.
         payload: serde_json::Value,
     },
 
-    /// Sessiotilan tallennus (session persistence) - marker-tietue joka
-    /// tallentaa viestin alkup. (`MessageOrigin`) jotta sessio voidaan
-    /// palauttaa replayssa/startupissa.
+    /// Session state persistence — a marker record that stores the
+    /// message's origin (`MessageOrigin`) so the session can be restored
+    /// during replay/startup.
     SessionState {
-        /// Kanavainstanssin tunniste.
+        /// The channel instance identifier.
         channel_id: String,
-        /// Keskustelun/ryhmän tunniste.
+        /// The conversation/group identifier.
         conversation: String,
-        /// Kanavakohtainen lähettäjän tunniste (auditointi).
+        /// The channel-specific sender identifier (for auditing).
         sender: String,
     },
 }
 
 impl EntryKind {
-    /// Palauttaa askeleen nimen jos rivi liittyy nimettyyn **workflow-askeleeseen**.
+    /// Returns the step name if the row is tied to a named **workflow step**.
     ///
-    /// Markerit ([`EntryKind::Marker`]) kantavat oman nimensä mutta **eivät**
-    /// ole askelia, joten ne palauttavat `None` — näin ne eivät voi vahingossa
-    /// osua replayn askel-nimivertailuun.
+    /// Markers ([`EntryKind::Marker`]) carry their own name but **are not**
+    /// steps, so they return `None` — this way they cannot accidentally hit
+    /// replay's step-name comparison.
     #[must_use]
     pub fn step_name(&self) -> Option<&str> {
         match self {
@@ -136,17 +135,17 @@ impl EntryKind {
         }
     }
 
-    /// Onko rivi snapshot.
+    /// Whether the row is a snapshot.
     #[must_use]
     pub const fn is_snapshot(&self) -> bool {
         matches!(self, EntryKind::Snapshot { .. })
     }
 
-    /// Onko rivi marker (workflow-askeleen ulkopuolinen annotaatio).
+    /// Whether the row is a marker (an annotation outside the workflow step sequence).
     ///
-    /// `SessionState` tallennetaan muistinvaraisesti marker-kategorian alla
-    /// jotta se suodatetaan replay-kursorista pois, mutta säilyy journalissa
-    /// startup-kirjoittamiseen.
+    /// `SessionState` is stored under the marker category so it is filtered
+    /// out of the replay cursor, while still being preserved in the journal
+    /// for startup to read.
     #[must_use]
     pub const fn is_marker(&self) -> bool {
         matches!(
@@ -155,11 +154,11 @@ impl EntryKind {
         )
     }
 
-    /// Onko rivi **workflow-askel** (valmistunut tai epäonnistunut).
+    /// Whether the row is a **workflow step** (completed or failed).
     ///
-    /// `true` vain [`StepCompleted`](EntryKind::StepCompleted) /
-    /// [`StepFailed`](EntryKind::StepFailed)-riveille. Snapshotit ja markerit
-    /// EIVÄT ole askelia, joten ne suodatetaan replay-kursorista pois.
+    /// `true` only for [`StepCompleted`](EntryKind::StepCompleted) /
+    /// [`StepFailed`](EntryKind::StepFailed) rows. Snapshots and markers are
+    /// NOT steps, so they are filtered out of the replay cursor.
     #[must_use]
     pub const fn is_step(&self) -> bool {
         matches!(
@@ -169,25 +168,25 @@ impl EntryKind {
     }
 }
 
-/// Yksi durable-journalin rivi.
+/// A single row of the durable journal.
 ///
-/// Rivit ovat append-only: kun rivi on kirjoitettu, sitä ei koskaan muuteta.
-/// Tämä on koko mallin perusta — historia on muuttumaton, joten replay on
-/// deterministinen.
+/// Rows are append-only: once a row is written, it is never modified. This
+/// is the foundation of the whole model — history is immutable, so replay
+/// is deterministic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalEntry {
-    /// Askeleen sekvenssipaikka journalissa.
+    /// The step's sequence position in the journal.
     pub step_id: StepId,
-    /// Rivin kirjoitushetki (UTC) — vain auditointia/diagnostiikkaa varten,
-    /// EI vaikuta replay-determinismiin.
+    /// The row's write timestamp (UTC) — for auditing/diagnostics only,
+    /// does NOT affect replay determinism.
     pub timestamp: Timestamp,
-    /// Rivin laji ja hyötykuorma.
+    /// The row's kind and payload.
     pub kind: EntryKind,
 }
 
 impl JournalEntry {
-    /// Rakentaa rivin annetulla sekvenssipaikalla ja lajilla, leimaten sen
-    /// nykyhetkellä.
+    /// Builds a row with the given sequence position and kind, stamping it
+    /// with the current time.
     #[must_use]
     pub fn new(step_id: StepId, kind: EntryKind) -> Self {
         Self {
@@ -197,7 +196,7 @@ impl JournalEntry {
         }
     }
 
-    /// Rakentaa onnistuneen askeleen rivin.
+    /// Builds a row for a successful step.
     #[must_use]
     pub fn completed(step_id: StepId, name: impl Into<String>, output: serde_json::Value) -> Self {
         Self::new(
@@ -209,7 +208,7 @@ impl JournalEntry {
         )
     }
 
-    /// Rakentaa epäonnistuneen askeleen rivin.
+    /// Builds a row for a failed step.
     #[must_use]
     pub fn failed(step_id: StepId, name: impl Into<String>, error: impl Into<String>) -> Self {
         Self::new(
@@ -221,17 +220,17 @@ impl JournalEntry {
         )
     }
 
-    /// Rakentaa snapshot-rivin.
+    /// Builds a snapshot row.
     #[must_use]
     pub fn snapshot(step_id: StepId, state: serde_json::Value) -> Self {
         Self::new(step_id, EntryKind::Snapshot { state })
     }
 
-    /// Rakentaa marker-rivin (workflow-askeleen ulkopuolinen annotaatio).
+    /// Builds a marker row (an annotation outside the workflow step sequence).
     ///
-    /// Markerit kantavat sivutietoa samassa lokissa kuin workflowit, mutta
-    /// [`DurableContext`](crate::DurableContext) suodattaa ne replay-kursorista
-    /// pois kuten snapshotit.
+    /// Markers carry side information in the same log as workflows, but
+    /// [`DurableContext`](crate::DurableContext) filters them out of the
+    /// replay cursor just like snapshots.
     #[must_use]
     pub fn marker(step_id: StepId, name: impl Into<String>, payload: serde_json::Value) -> Self {
         Self::new(
@@ -243,11 +242,11 @@ impl JournalEntry {
         )
     }
 
-    /// Rakentaa sessiotilan tallennusrivin.
+    /// Builds a session-state persistence row.
     ///
-    /// `SessionState` on marker-tietue (ei workflow-askel) jotta se ei häiritse
-    /// replay-kursoria. Tallentaa MessageOrigin-tiedot jotta sessio voidaan
-    /// palauttaa startupissa tai replayssa.
+    /// `SessionState` is a marker record (not a workflow step) so it does not
+    /// interfere with the replay cursor. Stores the `MessageOrigin` data so the
+    /// session can be restored at startup or during replay.
     #[must_use]
     pub fn session_state_entry(
         step_id: StepId,
@@ -265,13 +264,13 @@ impl JournalEntry {
         )
     }
 
-    /// Palauttaa rivin askeleen nimen jos sellainen on.
+    /// Returns the row's step name if it has one.
     #[must_use]
     pub fn step_name(&self) -> Option<&str> {
         self.kind.step_name()
     }
 
-    /// Hakee `SessionState` jos rivin laji on `SessionState`.
+    /// Retrieves the `SessionState` if the row's kind is `SessionState`.
     #[must_use]
     pub fn session_state(&self) -> Option<(&str, &str, &str)> {
         match &self.kind {
@@ -325,7 +324,7 @@ mod tests {
     #[test]
     fn marker_is_not_a_step_and_has_no_step_name() {
         let marker = JournalEntry::marker(StepId::new(3), "memory_contradicted", json!({"x": 1}));
-        // Markerin nimi EI näy `step_name`:nä — näin se ei osu replay-vertailuun.
+        // The marker's name does NOT show up as `step_name` — this way it does not hit replay's comparison.
         assert_eq!(marker.step_name(), None);
         assert!(marker.kind.is_marker());
         assert!(!marker.kind.is_step());

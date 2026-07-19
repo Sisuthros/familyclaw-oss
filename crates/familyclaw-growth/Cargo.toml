@@ -1,12 +1,14 @@
 [package]
 name = "familyclaw-growth"
-description = "Kasvusilmukan ehdotuspino (Proposal/ProposalStore) — approval-gated, EI koskaan auto-sovella (KERROS A, OSS)"
+description = "Approval-gated proposal store for agent self-improvement loops: records and tracks proposals, never applies them automatically"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+keywords = ["agent", "approval", "proposal", "governance", "audit"]
+categories = ["development-tools"]
 
 [lints]
 workspace = true

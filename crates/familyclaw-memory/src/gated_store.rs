@@ -1,29 +1,29 @@
-//! Provenance-vahdittu muistitallennus ([`GatedMemoryStore`]).
+//! Provenance-gated memory storage ([`GatedMemoryStore`]).
 //!
-//! [`GatedMemoryStore`] kietoo minkä tahansa [`MemoryStore`]-toteutuksen ja
-//! pakottaa [`ProvenanceGate`]-myrkytyssuojan **kirjoitushetkellä**: ennen kuin
-//! muisto pääsee sisempään tallennukseen, sen alkuperä punnitaan portilla.
-//! Matalan luottamuksen ulkoinen lähde ([`Provenance::External`](crate::Provenance::External) jonka `trust`
-//! alittaa portin kynnyksen) hylätään, jolloin se ei pääse saastuttamaan
-//! myöhempää haetua (*Sleeper Memory Poisoning* -suoja, kts.
+//! [`GatedMemoryStore`] wraps any [`MemoryStore`] implementation and
+//! enforces the [`ProvenanceGate`] poisoning protection **at write time**:
+//! before a memory enters the inner storage, its provenance is weighed by
+//! the gate. A low-trust external source ([`Provenance::External`](crate::Provenance::External) whose
+//! `trust` falls below the gate's threshold) is rejected, so it cannot
+//! contaminate later retrieval (*Sleeper Memory Poisoning* protection, see
 //! [`crate::provenance`]).
 //!
-//! Suora kokemus ([`Provenance::DirectExperience`](crate::Provenance::DirectExperience)) ja johdetut muistot
-//! ([`Provenance::Derived`](crate::Provenance::Derived)) pääsevät aina läpi — vain ulkoiset väitteet
-//! punnitaan.
+//! Direct experience ([`Provenance::DirectExperience`](crate::Provenance::DirectExperience)) and derived memories
+//! ([`Provenance::Derived`](crate::Provenance::Derived)) always pass through — only external claims
+//! are weighed.
 //!
-//! ## Suunnittelu
-//! - **Additiivinen:** ei muuta [`MemoryStore`]-traitia eikä
-//!   [`LocalJsonStore`](crate::LocalJsonStore)-toteutusta. Vahti on uusi, valinnainen kerros.
-//! - **Läpinäkyvä:** kaikki muut metodit ([`get`](MemoryStore::get),
+//! ## Design
+//! - **Additive:** does not change the [`MemoryStore`] trait or the
+//!   [`LocalJsonStore`](crate::LocalJsonStore) implementation. The gate is a new, optional layer.
+//! - **Transparent:** all other methods ([`get`](MemoryStore::get),
 //!   [`retrieve`](MemoryStore::retrieve), [`run_decay`](MemoryStore::run_decay)
-//!   jne.) delegoidaan sellaisenaan sisempään tallennukseen.
-//! - **Kirjoitusportti:** vain [`add`](MemoryStore::add) ja
-//!   [`update`](MemoryStore::update) punnitaan. Olemassa olevan muiston tilan
-//!   vahvistus/elinkaarisiirto ei tuo uutta alkuperää, joten niitä ei punnita
-//!   uudelleen.
+//!   etc.) are delegated as-is to the inner storage.
+//! - **Write gate:** only [`add`](MemoryStore::add) and
+//!   [`update`](MemoryStore::update) are weighed. Confirming or transitioning
+//!   the lifecycle state of an existing memory does not introduce new
+//!   provenance, so those are not re-weighed.
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_memory::{
 //!     GatedMemoryStore, LocalJsonStore, Memory, MemoryStore, Provenance, ProvenanceGate,
@@ -32,13 +32,13 @@
 //! # async fn demo() -> familyclaw_core::Result<()> {
 //! let store = GatedMemoryStore::new(LocalJsonStore::in_memory(), ProvenanceGate::new(0.6));
 //!
-//! // Suora kokemus pääsee aina.
+//! // Direct experience always passes.
 //! let trusted = Memory::builder("I saw this myself")
 //!     .provenance(Provenance::DirectExperience)
 //!     .build();
 //! store.add(trusted).await?;
 //!
-//! // Matalan luottamuksen ulkoinen väite hylätään.
+//! // A low-trust external claim is rejected.
 //! let poisoned = Memory::builder("an untrusted claim")
 //!     .provenance(Provenance::external("web", 0.1))
 //!     .build();
@@ -57,34 +57,34 @@ use crate::provenance::ProvenanceGate;
 use crate::retrieval::{RetrievalContext, RetrievalResult};
 use crate::store::{DecayReport, DecayThresholds, MemoryStore};
 
-/// Type-erased future, sama muoto kuin [`MemoryStore`]-traitin metodeilla.
-/// Elinaika `'a` kaappaa `&self`-lainan, jotta palautettu future voi viitata
-/// `self`:iin (ja siten sisempään tallennukseen).
+/// Type-erased future, matching the shape used by the [`MemoryStore`]
+/// trait's methods. The lifetime `'a` captures the `&self` borrow, so the
+/// returned future can reference `self` (and thus the inner storage).
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Provenance-vahdittu kääre [`MemoryStore`]-toteutuksen ympärille.
+/// A provenance-gated wrapper around a [`MemoryStore`] implementation.
 ///
-/// Pakottaa [`ProvenanceGate`]-myrkytyssuojan kirjoitushetkellä ja delegoi
-/// kaiken muun sisempään tallennukseen. Luo joko eksplisiittisellä portilla
-/// ([`new`](GatedMemoryStore::new)) tai oletusportilla
+/// Enforces the [`ProvenanceGate`] poisoning protection at write time and
+/// delegates everything else to the inner storage. Created either with an
+/// explicit gate ([`new`](GatedMemoryStore::new)) or the default gate
 /// ([`with_default_gate`](GatedMemoryStore::with_default_gate)).
 #[derive(Debug)]
 pub struct GatedMemoryStore<S: MemoryStore> {
-    /// Kääritty sisempi tallennus johon hyväksytyt kirjoitukset delegoidaan.
+    /// The wrapped inner storage to which accepted writes are delegated.
     inner: S,
-    /// Alkuperä-portti joka punnitsee jokaisen kirjoituksen alkuperän.
+    /// The provenance gate that weighs the provenance of every write.
     gate: ProvenanceGate,
 }
 
 impl<S: MemoryStore> GatedMemoryStore<S> {
-    /// Kietoo `inner`-tallennuksen annetulla portilla.
+    /// Wraps `inner` storage with the given gate.
     #[must_use]
     pub fn new(inner: S, gate: ProvenanceGate) -> Self {
         Self { inner, gate }
     }
 
-    /// Kietoo `inner`-tallennuksen oletusportilla
-    /// ([`ProvenanceGate::default`], kynnys `0.5`).
+    /// Wraps `inner` storage with the default gate
+    /// ([`ProvenanceGate::default`], threshold `0.5`).
     #[must_use]
     pub fn with_default_gate(inner: S) -> Self {
         Self {
@@ -93,25 +93,25 @@ impl<S: MemoryStore> GatedMemoryStore<S> {
         }
     }
 
-    /// Portti joka punnitsee kirjoitusten alkuperän.
+    /// The gate that weighs the provenance of writes.
     #[must_use]
     pub const fn gate(&self) -> &ProvenanceGate {
         &self.gate
     }
 
-    /// Kääritty sisempi tallennus (lukuoikeus).
+    /// The wrapped inner storage (read access).
     #[must_use]
     pub const fn inner(&self) -> &S {
         &self.inner
     }
 
-    /// Purkaa kääreen ja palauttaa sisemmän tallennuksen.
+    /// Unwraps the wrapper and returns the inner storage.
     #[must_use]
     pub fn into_inner(self) -> S {
         self.inner
     }
 
-    /// Rakentaa hylkäysvirheen kun alkuperä ei läpäise porttia.
+    /// Builds a rejection error when provenance fails to pass the gate.
     fn rejected(&self) -> FamilyClawError {
         FamilyClawError::invalid_input(format!(
             "provenance rejected: source trust below gate threshold {}",
@@ -122,8 +122,8 @@ impl<S: MemoryStore> GatedMemoryStore<S> {
 
 impl<S: MemoryStore> MemoryStore for GatedMemoryStore<S> {
     fn add(&self, memory: Memory) -> BoxFuture<'_, Result<MessageId>> {
-        // Punnitse alkuperä ENNEN delegointia: matalan luottamuksen ulkoinen
-        // lähde ei saa edes yrittää kirjoittaa sisempään tallennukseen.
+        // Weigh provenance BEFORE delegating: a low-trust external
+        // source must not even attempt to write to the inner storage.
         if !self.gate.admit(&memory.provenance) {
             let err = self.rejected();
             return Box::pin(async move { Err(err) });
@@ -136,7 +136,7 @@ impl<S: MemoryStore> MemoryStore for GatedMemoryStore<S> {
     }
 
     fn update(&self, memory: Memory) -> BoxFuture<'_, Result<()>> {
-        // Päivitys voi tuoda uuden alkuperän → punnitaan samoin kuin add.
+        // An update may introduce new provenance → weighed the same as add.
         if !self.gate.admit(&memory.provenance) {
             let err = self.rejected();
             return Box::pin(async move { Err(err) });
@@ -184,8 +184,8 @@ impl<S: MemoryStore> MemoryStore for GatedMemoryStore<S> {
 
 #[cfg(test)]
 mod tests {
-    // Osa testeistä vertaa tarkkoja f32-vakioita (portin kynnys) — tarkka
-    // vertailu on tässä tarkoituksellista ja turvallista.
+    // Some tests compare exact f32 constants (the gate threshold) — exact
+    // comparison is intentional and safe here.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -203,8 +203,8 @@ mod tests {
 
     #[test]
     fn gated_store_is_send_sync() {
-        // Kääreen pitää säilyttää Send + Sync, jotta se kelpaa monisäikeiseen
-        // tokio-ajoon siinä missä sisempi tallennuskin.
+        // The wrapper must preserve Send + Sync, so it remains usable in
+        // multithreaded tokio execution just like the inner storage.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<GatedMemoryStore<LocalJsonStore>>();
     }
@@ -217,7 +217,7 @@ mod tests {
             .add(m)
             .await
             .expect("direct experience must be admitted");
-        // Kirjoitus päätyi sisempään tallennukseen.
+        // The write ended up in the inner storage.
         assert_eq!(store.len().await.expect("len"), 1);
         assert!(store.get(id).await.expect("get").is_some());
     }
@@ -231,9 +231,9 @@ mod tests {
             .await
             .expect_err("low-trust external must be rejected");
         assert!(matches!(err, FamilyClawError::InvalidInput(_)));
-        // Mikään ei päätynyt sisempään tallennukseen.
+        // Nothing ended up in the inner storage.
         assert!(store.is_empty().await.expect("empty"));
-        // Virheviesti mainitsee kynnyksen.
+        // The error message mentions the threshold.
         assert!(err.to_string().contains("provenance rejected"));
         assert!(err.to_string().contains("0.6"));
     }
@@ -257,7 +257,7 @@ mod tests {
         let store = GatedMemoryStore::new(LocalJsonStore::in_memory(), ProvenanceGate::new(0.99));
         let sources = vec![MessageId::new(), MessageId::new()];
         let m = mem_with("a reflection", Provenance::derived(sources));
-        // Johdettu pääsee vaikka kynnys on hyvin korkea.
+        // Derived passes even when the threshold is very high.
         store.add(m).await.expect("derived must be admitted");
         assert_eq!(store.len().await.expect("len"), 1);
     }
@@ -265,17 +265,17 @@ mod tests {
     #[tokio::test]
     async fn update_rejects_low_trust_external() {
         let store = GatedMemoryStore::new(LocalJsonStore::in_memory(), ProvenanceGate::new(0.6));
-        // Kirjoita ensin luotettu muisto sisään.
+        // First write a trusted memory.
         let mut m = mem_with("originally trusted", Provenance::DirectExperience);
         let id = store.add(m.clone()).await.expect("add");
-        // Yritä päivittää se matalan luottamuksen ulkoiseksi → hylätään.
+        // Try to update it to a low-trust external → rejected.
         m.provenance = Provenance::external("web", 0.05);
         let err = store
             .update(m)
             .await
             .expect_err("update to low-trust external must be rejected");
         assert!(matches!(err, FamilyClawError::InvalidInput(_)));
-        // Alkuperäinen säilyi koskemattomana.
+        // The original remained unchanged.
         let got = store.get(id).await.expect("get").expect("present");
         assert_eq!(got.provenance, Provenance::DirectExperience);
     }
@@ -294,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn passthrough_methods_delegate() {
         let store = GatedMemoryStore::with_default_gate(LocalJsonStore::in_memory());
-        // add (luotettu) → get → reinforce → set_status → retrieve → run_decay
+        // add (trusted) → get → reinforce → set_status → retrieve → run_decay
         let m = mem_with("rust memory engine", Provenance::DirectExperience);
         let id = store.add(m).await.expect("add");
 
@@ -322,7 +322,7 @@ mod tests {
             .expect("run_decay");
         assert_eq!(report.scanned, 1);
 
-        // all + len + is_empty delegoituvat.
+        // all + len + is_empty are delegated.
         assert_eq!(store.all().await.expect("all").len(), 1);
         assert_eq!(store.len().await.expect("len"), 1);
         assert!(!store.is_empty().await.expect("is_empty"));
@@ -332,10 +332,10 @@ mod tests {
     async fn with_default_gate_uses_half_threshold() {
         let store = GatedMemoryStore::with_default_gate(LocalJsonStore::in_memory());
         assert_eq!(store.gate().min_trust(), 0.5);
-        // Täsmälleen kynnyksellä → hyväksytään (>=).
+        // Exactly at the threshold → admitted (>=).
         let m = mem_with("on the boundary", Provenance::external("tool", 0.5));
         store.add(m).await.expect("boundary trust admitted");
-        // Aavistuksen alle → hylätään.
+        // Just below → rejected.
         let low = mem_with("just below", Provenance::external("tool", 0.49));
         assert!(store.add(low).await.is_err());
     }
@@ -348,7 +348,7 @@ mod tests {
             .await
             .expect("add");
         let inner = store.into_inner();
-        // Sisempi tallennus säilytti kirjoitetun muiston.
+        // The inner storage retained the written memory.
         assert_eq!(inner.len().await.expect("len"), 1);
     }
 }

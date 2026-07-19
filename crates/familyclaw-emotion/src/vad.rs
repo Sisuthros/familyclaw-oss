@@ -1,44 +1,44 @@
-//! VAD-koordinaatti (valence–arousal–dominance) ja sen rajat.
+//! The VAD coordinate (valence–arousal–dominance) and its bounds.
 //!
-//! VAD on dimensioista riippumaton, matala-ulotteinen *yhteenveto*
-//! tunnetilasta. Se on kätevä lähtö busiin (affektiivinen hermosto) ja
-//! lokeihin, koska se on vakio kolme lukua riippumatta dimensioiden
-//! kalibroinnista.
+//! VAD is a dimension-independent, low-dimensional *summary* of an
+//! emotional state. It's a convenient output for buses (the affective
+//! nervous system) and logs, since it's always a fixed three numbers
+//! regardless of how the dimensions are calibrated.
 //!
-//! - `valence` ∈ `-1.0..=1.0` — epämiellyttävä → miellyttävä.
-//! - `arousal` ∈ `0.0..=1.0` — rauhallinen → kiihtynyt.
-//! - `dominance` ∈ `0.0..=1.0` — alistunut → hallitseva.
+//! - `valence` ∈ `-1.0..=1.0` — unpleasant → pleasant.
+//! - `arousal` ∈ `0.0..=1.0` — calm → excited.
+//! - `dominance` ∈ `0.0..=1.0` — submissive → dominant.
 
 use serde::{Deserialize, Serialize};
 
-/// Kolmiulotteinen tunteen yhteenvetokoordinaatti.
+/// A three-dimensional summary coordinate for emotion.
 ///
-/// Käytä [`Vad::new`]-konstruktoria saadaksesi takuun rajojen sisällä
-/// olevista arvoista (kentät puristetaan rajoihin).
+/// Use the [`Vad::new`] constructor to guarantee values stay within
+/// bounds (fields are clamped to their ranges).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Vad {
-    /// Miellyttävyys, `-1.0..=1.0`.
+    /// Pleasantness, `-1.0..=1.0`.
     pub valence: f32,
-    /// Viritys, `0.0..=1.0`.
+    /// Arousal, `0.0..=1.0`.
     pub arousal: f32,
-    /// Hallinnan tunne, `0.0..=1.0`.
+    /// Sense of control, `0.0..=1.0`.
     pub dominance: f32,
 }
 
 impl Vad {
-    /// Neutraali tunnetila: nolla-valence, matala viritys, keskidominanssi.
+    /// The neutral emotional state: zero valence, low arousal, mid dominance.
     pub const NEUTRAL: Vad = Vad {
         valence: 0.0,
         arousal: 0.0,
         dominance: 0.5,
     };
 
-    /// Rakentaa VAD-koordinaatin ja puristaa kentät kelvollisiin rajoihin.
+    /// Builds a VAD coordinate and clamps the fields to valid bounds.
     ///
-    /// `valence` rajataan välille `-1.0..=1.0`, `arousal` ja `dominance`
-    /// välille `0.0..=1.0`. NaN-syöte muunnetaan turvalliseksi nollaksi
-    /// (valence/arousal) tai keskiarvoksi (dominance), jottei kelvoton
-    /// liukuluku vuoda eteenpäin.
+    /// `valence` is bounded to `-1.0..=1.0`, `arousal` and `dominance` to
+    /// `0.0..=1.0`. NaN input is converted to a safe zero (valence/arousal)
+    /// or the midpoint (dominance), so an invalid float never propagates
+    /// forward.
     #[must_use]
     pub fn new(valence: f32, arousal: f32, dominance: f32) -> Self {
         Self {
@@ -48,9 +48,9 @@ impl Vad {
         }
     }
 
-    /// Euklidinen etäisyys toiseen VAD-pisteeseen.
+    /// The Euclidean distance to another VAD point.
     ///
-    /// Käyttökelpoinen blendien ja samankaltaisuuden mittaamiseen.
+    /// Useful for measuring blends and similarity.
     #[must_use]
     pub fn distance(self, other: Vad) -> f32 {
         let dv = self.valence - other.valence;
@@ -66,7 +66,7 @@ impl Default for Vad {
     }
 }
 
-/// Puristaa arvon välille `-1.0..=1.0`; NaN → 0.0.
+/// Clamps a value to `-1.0..=1.0`; NaN → 0.0.
 fn clamp_signed(x: f32) -> f32 {
     if x.is_nan() {
         0.0
@@ -75,7 +75,7 @@ fn clamp_signed(x: f32) -> f32 {
     }
 }
 
-/// Puristaa arvon välille `0.0..=1.0`; NaN → 0.0.
+/// Clamps a value to `0.0..=1.0`; NaN → 0.0.
 fn clamp_unit(x: f32) -> f32 {
     if x.is_nan() {
         0.0
@@ -84,7 +84,7 @@ fn clamp_unit(x: f32) -> f32 {
     }
 }
 
-/// Puristaa arvon välille `0.0..=1.0`; NaN → 0.5 (neutraali keskidominanssi).
+/// Clamps a value to `0.0..=1.0`; NaN → 0.5 (neutral mid-dominance).
 fn clamp_unit_default_mid(x: f32) -> f32 {
     if x.is_nan() {
         0.5
@@ -95,7 +95,7 @@ fn clamp_unit_default_mid(x: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    // Testit vertaavat tarkasti esitettäviä f32-vakioita — tarkka vertailu ok.
+    // Tests compare exactly representable f32 constants — exact comparison is fine.
     #![allow(clippy::float_cmp)]
 
     use super::*;

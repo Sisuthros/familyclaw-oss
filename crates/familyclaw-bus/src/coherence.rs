@@ -1,50 +1,51 @@
-//! Token Coherence — **MESI**-koherenssitilakone jaetulle artefaktille.
+//! Token Coherence — a **MESI** coherence state machine for a shared artifact.
 //!
-//! Tausta (design §2, Token Coherence): kun monta agenttia jakaa saman tilan
-//! (esim. jaettu muisti-artefakti), broadcast jokaisesta muutoksesta on
-//! tuhlaavaa. Klassinen suoritin-välimuistien **MESI**-protokolla (Modified,
-//! Exclusive, Shared, Invalid) antaa tähän valmiin, todistetun mallin: kukin
-//! agentti pitää omaa kopiotaan ja vaihtaa tilaa luku-/kirjoitus-/mitätöinti-
-//! tapahtumissa, jolloin broadcastia tarvitaan vain todellisten muutosten
-//! kohdalla (90–95 % token-säästö vs. naivi broadcast).
+//! Background (design §2, Token Coherence): when many agents share the same
+//! state (e.g. a shared memory artifact), broadcasting every change is
+//! wasteful. The classic CPU-cache **MESI** protocol (Modified, Exclusive,
+//! Shared, Invalid) provides a ready-made, proven model for this: each agent
+//! keeps its own copy and transitions state on read/write/invalidate events,
+//! so broadcasting is only needed for actual changes (90-95% token savings vs.
+//! naive broadcast).
 //!
-//! Tämä on **puhdas kirjastotilakone** — ei verkkoa, ei actoreita, ei I/O:ta.
-//! [`CoherenceTracker`] mallintaa **yhden agentin näkymän** yhteen jaettuun
-//! artefaktiin. Verkkokerros (kuka kuuntelee ketä) rakennetaan tämän päälle
-//! erikseen; tilakone on testattavissa täysin deterministisesti.
+//! This is a **pure library state machine** — no network, no actors, no I/O.
+//! [`CoherenceTracker`] models **a single agent's view** of one shared
+//! artifact. The network layer (who listens to whom) is built on top of this
+//! separately; the state machine is fully deterministically testable.
 //!
-//! ## MESI-invariantit
-//! - **Modified (M):** Tällä agentilla on ainoa, *muokattu* kopio (likainen).
-//!   Muiden kopiot ovat Invalid.
-//! - **Exclusive (E):** Tällä agentilla on ainoa kopio, joka on *puhdas*
-//!   (sama kuin "totuus"). Muiden kopiot ovat Invalid.
-//! - **Shared (S):** Useammalla agentilla voi olla puhdas kopio yhtä aikaa.
-//! - **Invalid (I):** Tällä agentilla ei ole kelvollista kopiota.
+//! ## MESI invariants
+//! - **Modified (M):** This agent holds the only, *modified* copy (dirty).
+//!   All other copies are Invalid.
+//! - **Exclusive (E):** This agent holds the only copy, and it is *clean*
+//!   (matches the "truth"). All other copies are Invalid.
+//! - **Shared (S):** Multiple agents may hold a clean copy at the same time.
+//! - **Invalid (I):** This agent does not have a valid copy.
 //!
-//! Ydininvariantti: M ja E ovat **yksinomistajia** — korkeintaan yksi agentti
-//! voi olla M- tai E-tilassa artefaktia kohden samanaikaisesti.
+//! Core invariant: M and E are **exclusive-owner** states — at most one agent
+//! may be in the M or E state for a given artifact at any time.
 //!
-//! ## OSS-raja (KERROS A)
-//! Ei kovakoodattuja perheen nimiä, ID:itä eikä avaimia.
+//! ## OSS boundary (Layer A)
+//! No hardcoded family names, IDs, or keys.
 
 use serde::{Deserialize, Serialize};
 
-/// MESI-koherenssitila yhden agentin näkymälle jaettuun artefaktiin.
+/// MESI coherence state for one agent's view of a shared artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MesiState {
-    /// Ainoa kopio, muokattu (likainen). Muiden kopiot ovat Invalid.
+    /// Sole copy, modified (dirty). All other copies are Invalid.
     Modified,
-    /// Ainoa kopio, puhdas (sama kuin totuus). Muiden kopiot ovat Invalid.
+    /// Sole copy, clean (matches the truth). All other copies are Invalid.
     Exclusive,
-    /// Jaettu, puhdas kopio — useammalla agentilla voi olla samaan aikaan.
+    /// Shared, clean copy — multiple agents may hold one at the same time.
     Shared,
-    /// Ei kelvollista kopiota.
+    /// No valid copy.
     Invalid,
 }
 
 impl MesiState {
-    /// Lyhyt vakaa kirjaintunniste (`M`/`E`/`S`/`I`) lokitukseen ja metriikkaan.
+    /// A short, stable single-letter identifier (`M`/`E`/`S`/`I`) for logging
+    /// and metrics.
     #[must_use]
     pub const fn as_char(&self) -> char {
         match self {
@@ -55,44 +56,44 @@ impl MesiState {
         }
     }
 
-    /// Onko tässä tilassa kelvollinen (luettavissa oleva) kopio?
-    /// Tosi kaikille paitsi [`Invalid`](MesiState::Invalid).
+    /// Does this state hold a valid (readable) copy?
+    /// True for all states except [`Invalid`](MesiState::Invalid).
     #[must_use]
     pub const fn is_valid(&self) -> bool {
         !matches!(self, MesiState::Invalid)
     }
 
-    /// Onko kopio likainen (muutoksia, jotka pitää kirjoittaa takaisin
-    /// totuuteen ennen mitätöintiä)? Tosi vain [`Modified`](MesiState::Modified).
+    /// Is the copy dirty (has changes that must be written back to the truth
+    /// before invalidation)? True only for [`Modified`](MesiState::Modified).
     #[must_use]
     pub const fn is_dirty(&self) -> bool {
         matches!(self, MesiState::Modified)
     }
 
-    /// Onko tämä **yksinomistaja**-tila (M tai E)? Korkeintaan yksi agentti
-    /// voi olla tällaisessa tilassa artefaktia kohden.
+    /// Is this an **exclusive-owner** state (M or E)? At most one agent may
+    /// be in such a state for a given artifact.
     #[must_use]
     pub const fn is_exclusive_owner(&self) -> bool {
         matches!(self, MesiState::Modified | MesiState::Exclusive)
     }
 }
 
-/// Yhden agentin MESI-tilaseuranta yhteen jaettuun artefaktiin.
+/// One agent's MESI state tracking for a single shared artifact.
 ///
-/// Siirtymät ([`local_read`](CoherenceTracker::local_read),
+/// Transitions ([`local_read`](CoherenceTracker::local_read),
 /// [`local_write`](CoherenceTracker::local_write),
 /// [`remote_read`](CoherenceTracker::remote_read),
 /// [`remote_write`](CoherenceTracker::remote_write),
-/// [`invalidate`](CoherenceTracker::invalidate)) noudattavat MESI-sääntöjä.
-/// Tracker alkaa [`Invalid`](MesiState::Invalid)-tilassa (agentilla ei vielä
-/// kopiota).
+/// [`invalidate`](CoherenceTracker::invalidate)) follow the MESI rules.
+/// The tracker starts in the [`Invalid`](MesiState::Invalid) state (the agent
+/// does not yet have a copy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoherenceTracker {
     state: MesiState,
 }
 
 impl CoherenceTracker {
-    /// Luo trackerin alkutilassa [`Invalid`](MesiState::Invalid).
+    /// Creates a tracker in the initial [`Invalid`](MesiState::Invalid) state.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -100,28 +101,29 @@ impl CoherenceTracker {
         }
     }
 
-    /// Luo trackerin annetussa alkutilassa (esim. ladatun tilannekuvan
-    /// palautukseen).
+    /// Creates a tracker in the given initial state (e.g. to restore a
+    /// loaded snapshot).
     #[must_use]
     pub const fn with_state(state: MesiState) -> Self {
         Self { state }
     }
 
-    /// Nykyinen MESI-tila.
+    /// The current MESI state.
     #[must_use]
     pub const fn state(&self) -> MesiState {
         self.state
     }
 
-    /// **Paikallinen luku** tältä agentilta.
+    /// **Local read** by this agent.
     ///
-    /// - **Invalid → Shared:** luku-miss; kopio haetaan ja jaetaan. (Yksin-
-    ///   kertaistus: emme erottele E:tä S:stä lukumissin yhteydessä, koska se
-    ///   vaatisi tiedon "olenko ainoa hakija". Konservatiivinen S on aina
-    ///   turvallinen — kirjoitus nostaa M:ään.)
-    /// - **Shared/Exclusive/Modified → ennallaan:** osuma; tila ei muutu.
+    /// - **Invalid → Shared:** read miss; the copy is fetched and shared.
+    ///   (Simplification: we do not distinguish E from S on a read miss,
+    ///   since that would require knowing "am I the only fetcher". A
+    ///   conservative S is always safe — a write promotes to M.)
+    /// - **Shared/Exclusive/Modified → unchanged:** hit; the state does not
+    ///   change.
     ///
-    /// Palauttaa tilan luvun jälkeen.
+    /// Returns the state after the read.
     pub fn local_read(&mut self) -> MesiState {
         if self.state == MesiState::Invalid {
             self.state = MesiState::Shared;
@@ -129,37 +131,36 @@ impl CoherenceTracker {
         self.state
     }
 
-    /// **Paikallinen kirjoitus** tältä agentilta.
+    /// **Local write** by this agent.
     ///
-    /// Kirjoitus vaatii **yksinomistajuuden**: tila siirtyy aina
-    /// [`Modified`](MesiState::Modified):iin. Kaikkien muiden agenttien
-    /// kopiot on tämän seurauksena mitätöitävä (kutsuja vastaa broadcastista;
-    /// muiden trackerien tulee saada [`remote_write`](Self::remote_write) tai
-    /// [`invalidate`](Self::invalidate)).
+    /// A write requires **exclusive ownership**: the state always transitions
+    /// to [`Modified`](MesiState::Modified). As a consequence, all other
+    /// agents' copies must be invalidated (the caller is responsible for the
+    /// broadcast; other trackers must receive
+    /// [`remote_write`](Self::remote_write) or [`invalidate`](Self::invalidate)).
     ///
-    /// Sallittu kaikista lähtötiloista:
-    /// - Invalid/Shared → Modified (vaatii muiden mitätöinnin)
-    /// - Exclusive → Modified (ei tarvitse muiden mitätöintiä; oli jo ainoa)
-    /// - Modified → Modified (ei muutosta)
+    /// Allowed from any starting state:
+    /// - Invalid/Shared → Modified (requires invalidating others)
+    /// - Exclusive → Modified (no need to invalidate others; was already sole owner)
+    /// - Modified → Modified (no change)
     ///
-    /// Palauttaa tilan kirjoituksen jälkeen ([`Modified`](MesiState::Modified)).
+    /// Returns the state after the write ([`Modified`](MesiState::Modified)).
     pub fn local_write(&mut self) -> MesiState {
         self.state = MesiState::Modified;
         self.state
     }
 
-    /// **Toisen agentin luku** samasta artefaktista (snoop: `BusRd`).
+    /// **Another agent's read** of the same artifact (snoop: `BusRd`).
     ///
-    /// Yksinomistajan on tiputtava jaetuksi, jotta lukija saa puhtaan kopion:
-    /// - **Modified → Shared:** likainen data kirjoitetaan takaisin (write-back)
-    ///   ja jaetaan. [`needs_writeback`](RemoteReadOutcome::needs_writeback)
-    ///   on tosi.
-    /// - **Exclusive → Shared:** jaetaan ilman write-backia.
-    /// - **Shared → Shared:** ennallaan.
-    /// - **Invalid → Invalid:** ei vaikutusta (meillä ei ollut kopiota).
+    /// The exclusive owner must drop to shared so the reader gets a clean copy:
+    /// - **Modified → Shared:** dirty data is written back (write-back) and
+    ///   shared. [`needs_writeback`](RemoteReadOutcome::needs_writeback) is true.
+    /// - **Exclusive → Shared:** shared without a write-back.
+    /// - **Shared → Shared:** unchanged.
+    /// - **Invalid → Invalid:** no effect (we did not have a copy).
     ///
-    /// Palauttaa [`RemoteReadOutcome`]:n, joka kertoo uuden tilan ja
-    /// tarvitseeko likainen data kirjoittaa takaisin.
+    /// Returns a [`RemoteReadOutcome`] reporting the new state and whether
+    /// dirty data needs to be written back.
     pub fn remote_read(&mut self) -> RemoteReadOutcome {
         let needs_writeback = self.state == MesiState::Modified;
         if self.state.is_valid() {
@@ -171,15 +172,16 @@ impl CoherenceTracker {
         }
     }
 
-    /// **Toisen agentin kirjoitus** samaan artefaktiin (snoop: `BusRdX`).
+    /// **Another agent's write** to the same artifact (snoop: `BusRdX`).
     ///
-    /// Tämän agentin kopio on aina mitätöitävä — toinen ottaa yksinomistajuuden:
-    /// - **Modified → Invalid:** vaatii write-backin ennen mitätöintiä.
-    ///   [`needs_writeback`](RemoteWriteOutcome::needs_writeback) on tosi.
-    /// - **Exclusive/Shared → Invalid:** mitätöinti ilman write-backia.
-    /// - **Invalid → Invalid:** ei vaikutusta.
+    /// This agent's copy must always be invalidated — the other agent takes
+    /// exclusive ownership:
+    /// - **Modified → Invalid:** requires a write-back before invalidation.
+    ///   [`needs_writeback`](RemoteWriteOutcome::needs_writeback) is true.
+    /// - **Exclusive/Shared → Invalid:** invalidated without a write-back.
+    /// - **Invalid → Invalid:** no effect.
     ///
-    /// Palauttaa [`RemoteWriteOutcome`]:n.
+    /// Returns a [`RemoteWriteOutcome`].
     pub fn remote_write(&mut self) -> RemoteWriteOutcome {
         let needs_writeback = self.state == MesiState::Modified;
         self.state = MesiState::Invalid;
@@ -189,11 +191,11 @@ impl CoherenceTracker {
         }
     }
 
-    /// Pakottaa tämän agentin kopion [`Invalid`](MesiState::Invalid)-tilaan
-    /// (esim. eksplisiittinen mitätöintikäsky). Tilakone-mielessä sama kuin
-    /// [`remote_write`](Self::remote_write):n tilavaikutus, mutta ilman
-    /// write-back-signaalia — käytä `remote_write`:ä jos likainen data pitää
-    /// säilyttää.
+    /// Forces this agent's copy into the [`Invalid`](MesiState::Invalid)
+    /// state (e.g. an explicit invalidation command). In state-machine terms
+    /// this has the same state effect as
+    /// [`remote_write`](Self::remote_write), but without the write-back
+    /// signal — use `remote_write` if dirty data must be preserved.
     pub fn invalidate(&mut self) -> MesiState {
         self.state = MesiState::Invalid;
         self.state
@@ -206,21 +208,21 @@ impl Default for CoherenceTracker {
     }
 }
 
-/// Toisen agentin luvun ([`CoherenceTracker::remote_read`]) lopputulos.
+/// The outcome of another agent's read ([`CoherenceTracker::remote_read`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoteReadOutcome {
-    /// Tämän agentin tila luvun jälkeen.
+    /// This agent's state after the read.
     pub state: MesiState,
-    /// Pitikö likainen (Modified) data kirjoittaa takaisin totuuteen?
+    /// Did dirty (Modified) data need to be written back to the truth?
     pub needs_writeback: bool,
 }
 
-/// Toisen agentin kirjoituksen ([`CoherenceTracker::remote_write`]) lopputulos.
+/// The outcome of another agent's write ([`CoherenceTracker::remote_write`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoteWriteOutcome {
-    /// Tämän agentin tila kirjoituksen jälkeen (aina [`MesiState::Invalid`]).
+    /// This agent's state after the write (always [`MesiState::Invalid`]).
     pub state: MesiState,
-    /// Pitikö likainen (Modified) data kirjoittaa takaisin ennen mitätöintiä?
+    /// Did dirty (Modified) data need to be written back before invalidation?
     pub needs_writeback: bool,
 }
 
@@ -239,9 +241,9 @@ mod tests {
     #[test]
     fn local_read_miss_loads_shared_then_hit_is_stable() {
         let mut t = CoherenceTracker::new();
-        // Invalid → Shared (luku-miss).
+        // Invalid → Shared (read miss).
         assert_eq!(t.local_read(), MesiState::Shared);
-        // Shared → Shared (osuma, ei muutosta).
+        // Shared → Shared (hit, no change).
         assert_eq!(t.local_read(), MesiState::Shared);
         assert!(t.state().is_valid());
         assert!(!t.state().is_dirty());
@@ -264,11 +266,11 @@ mod tests {
 
     #[test]
     fn modified_plus_remote_read_becomes_shared_with_writeback() {
-        // Ydin-MESI-sääntö: Modified + toisen read → Shared (write-back).
+        // Core MESI rule: Modified + another agent's read → Shared (write-back).
         let mut t = CoherenceTracker::with_state(MesiState::Modified);
         let out = t.remote_read();
         assert_eq!(out.state, MesiState::Shared);
-        assert!(out.needs_writeback, "likainen data kirjoitetaan takaisin");
+        assert!(out.needs_writeback, "dirty data is written back");
         assert_eq!(t.state(), MesiState::Shared);
     }
 
@@ -277,7 +279,10 @@ mod tests {
         let mut t = CoherenceTracker::with_state(MesiState::Exclusive);
         let out = t.remote_read();
         assert_eq!(out.state, MesiState::Shared);
-        assert!(!out.needs_writeback, "puhdasta ei tarvitse kirjoittaa");
+        assert!(
+            !out.needs_writeback,
+            "a clean copy does not need to be written back"
+        );
     }
 
     #[test]
@@ -290,16 +295,16 @@ mod tests {
 
     #[test]
     fn local_write_then_others_invalidated_via_remote_write() {
-        // Ydin-MESI-sääntö: write → muut Invalid.
-        // Agentti A kirjoittaa (M); agentti B:n näkymä saa remote_write → Invalid.
+        // Core MESI rule: write → others become Invalid.
+        // Agent A writes (M); agent B's view receives remote_write → Invalid.
         let mut a = CoherenceTracker::with_state(MesiState::Shared);
         let mut b = CoherenceTracker::with_state(MesiState::Shared);
 
         assert_eq!(a.local_write(), MesiState::Modified);
-        // B snooppaa A:n kirjoituksen → mitätöityy.
+        // B snoops A's write → is invalidated.
         let out = b.remote_write();
         assert_eq!(out.state, MesiState::Invalid);
-        assert!(!out.needs_writeback, "B oli vain Shared, ei likainen");
+        assert!(!out.needs_writeback, "B was only Shared, not dirty");
         assert!(!b.state().is_valid());
     }
 
@@ -310,7 +315,7 @@ mod tests {
         assert_eq!(out.state, MesiState::Invalid);
         assert!(
             out.needs_writeback,
-            "likainen M kirjoitetaan takaisin ennen I"
+            "dirty M is written back before becoming I"
         );
     }
 
@@ -353,29 +358,29 @@ mod tests {
 
     #[test]
     fn full_coherence_scenario_two_agents() {
-        // Realistinen MESI-tarina kahdelle agentille saman artefaktin ympärillä.
+        // A realistic MESI scenario for two agents around the same artifact.
         let mut a = CoherenceTracker::new();
         let mut b = CoherenceTracker::new();
 
-        // A lukee ensin: Invalid → Shared.
+        // A reads first: Invalid → Shared.
         assert_eq!(a.local_read(), MesiState::Shared);
-        // A kirjoittaa: Shared → Modified (B pitäisi mitätöidä, mutta B oli I).
+        // A writes: Shared → Modified (B should be invalidated, but B was I).
         assert_eq!(a.local_write(), MesiState::Modified);
         assert_eq!(b.state(), MesiState::Invalid);
 
-        // B lukee → snooppaa A:n: A Modified → Shared (write-back), B → Shared.
+        // B reads → snoops A: A Modified → Shared (write-back), B → Shared.
         let a_out = a.remote_read();
         assert!(a_out.needs_writeback);
         assert_eq!(a.state(), MesiState::Shared);
         assert_eq!(b.local_read(), MesiState::Shared);
 
-        // B kirjoittaa: B → Modified, A snooppaa → Invalid.
+        // B writes: B → Modified, A snoops → Invalid.
         assert_eq!(b.local_write(), MesiState::Modified);
         let a_out = a.remote_write();
         assert_eq!(a.state(), MesiState::Invalid);
         assert!(
             !a_out.needs_writeback,
-            "A oli Shared (puhdas), ei write-backia"
+            "A was Shared (clean), no write-back needed"
         );
     }
 }

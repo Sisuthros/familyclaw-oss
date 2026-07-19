@@ -1,22 +1,22 @@
-//! Skill-manifestit: taidon kuvaus, vaaditut oikeudet, riskiluokka,
-//! hyväksyntäkäytäntö sekä syöte-/tulosvihjeet (KERROS A, geneerinen — ei
-//! oikeita providereita, sieluja eikä avaimia).
+//! Skill manifests: skill description, required permissions, risk class,
+//! approval policy, and input/output hints (Layer A, generic — no
+//! real providers, personas, or keys).
 //!
-//! Manifesti voidaan jäsentää sekä TOML- ([`SkillManifest::from_toml`]) että
-//! JSON-muodosta ([`SkillManifest::from_json`]). Validointi
-//! ([`SkillManifest::validate`]) torjuu:
-//! - tyhjän tai `nil`-tunnisteen,
-//! - tyhjän nimen tai version,
-//! - salaisuudelta näyttävät arvot missä tahansa tekstikentässä (myös
-//!   [`SkillManifest::input_schema`]-skeeman tekstiarvoissa),
-//! - [`SkillManifest::input_schema`]-skeeman jonka juuri ei ole JSON-objekti,
-//! - ulkoisen kirjoituksen ([`SkillPermission::WriteExternal`]) ilman
-//!   hyväksyntää aidosti vaativaa käytäntöä,
-//! - ulkoisen taidon ([`SkillManifest::is_external`]) virheellisen tai
-//!   puuttuvan Ed25519-allekirjoituksen (fail-closed;
+//! A manifest can be parsed from both TOML ([`SkillManifest::from_toml`]) and
+//! JSON ([`SkillManifest::from_json`]) format. Validation
+//! ([`SkillManifest::validate`]) rejects:
+//! - an empty or `nil` id,
+//! - an empty name or version,
+//! - values that look like secrets in any text field (including
+//!   text values within the [`SkillManifest::input_schema`] schema),
+//! - an [`SkillManifest::input_schema`] schema whose root is not a JSON object,
+//! - external writes ([`SkillPermission::WriteExternal`]) without a policy
+//!   that can genuinely require approval,
+//! - an external skill's ([`SkillManifest::is_external`]) invalid or
+//!   missing Ed25519 signature (fail-closed;
 //!   [`SkillManifest::verify_external_signature`]).
 //!
-//! Tuntemattomat riskiluokat hylkää jo serde (enum-validointi).
+//! Unknown risk classes are already rejected by serde (enum validation).
 
 use std::collections::HashMap;
 use std::fs;
@@ -30,86 +30,86 @@ use crate::error::{ActionError, Result};
 use crate::ids::SkillId;
 use crate::policy::{detect_secret_like, ActionRisk, ApprovalPolicy, SkillPermission};
 
-/// Moduulin valmiusaste (luuranko-yhteensopivuus).
+/// Module readiness state (scaffold compatibility).
 ///
-/// Säilytetään, jotta [`crate::all_modules_scaffolded`] kääntyy edelleen.
+/// Kept so that [`crate::all_modules_scaffolded`] keeps compiling.
 pub(crate) const SCAFFOLDED: bool = true;
 
-/// Manifestin oletusarvoinen syöteskeema: tyhjä JSON-objekti `{"type":"object"}`.
+/// The manifest's default input schema: an empty JSON object `{"type":"object"}`.
 ///
-/// Käytetään kahdessa paikassa: serde-deserialisoinnin oletuksena (vanhat
-/// tallennetut manifestit ilman `input_schema`-kenttää latautuvat tällä) sekä
-/// [`SkillManifest`]-rakentajien lähtöarvona. Juuri on AINA objekti, jotta
-/// skeema kelpaa LLM:lle työkalun `parameters`-kentäksi sellaisenaan.
+/// Used in two places: as the serde deserialization default (older
+/// stored manifests without an `input_schema` field load with this), and
+/// as the starting value for [`SkillManifest`] builders. The root is ALWAYS
+/// an object, so the schema is valid as-is for an LLM tool's `parameters` field.
 #[must_use]
 pub fn default_input_schema() -> Value {
     serde_json::json!({ "type": "object" })
 }
 
-/// Yhden taidon manifesti: kaikki tieto jonka rekisteri ja käytäntökerros
-/// tarvitsevat ennen kuin taitoa voidaan suunnitella tai suorittaa.
+/// A single skill's manifest: all the information the registry and policy
+/// layer need before a skill can be planned or executed.
 ///
-/// Manifesti on puhtaasti dataa (ei suoritettavaa logiikkaa) ja sarjallistuu
-/// TOML- ja JSON-muotoon ilman muunnoksia.
+/// The manifest is pure data (no executable logic) and serializes
+/// to TOML and JSON format without transformation.
 ///
-/// `PartialEq` (ei `Eq`) johtuu [`SkillManifest::input_schema`]-kentästä:
-/// `serde_json::Value` toteuttaa vain `PartialEq`:n (liukulukujen vuoksi).
+/// `PartialEq` (not `Eq`) is due to the [`SkillManifest::input_schema`] field:
+/// `serde_json::Value` implements only `PartialEq` (because of floating-point numbers).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillManifest {
-    /// Taidon yksilöivä tunniste rekisterissä.
+    /// The skill's unique identifier in the registry.
     pub id: SkillId,
-    /// Ihmisluettava nimi (esim. `send-greeting`).
+    /// Human-readable name (e.g. `send-greeting`).
     pub name: String,
-    /// Versiomerkkijono (esim. `1.0.0`); ei pakoteta semverin muotoon.
+    /// Version string (e.g. `1.0.0`); not enforced to follow semver format.
     pub version: String,
-    /// Lyhyt kuvaus mitä taito tekee.
+    /// Short description of what the skill does.
     pub description: String,
-    /// Taidon tarvitsemat oikeudet (capabilityt).
+    /// Permissions (capabilities) the skill needs.
     pub permissions: Vec<SkillPermission>,
-    /// Toiminnon riskiluokka.
+    /// The action's risk class.
     pub risk: ActionRisk,
-    /// Hyväksyntäkäytäntö (vaaditaanko ihmisen hyväksyntä).
+    /// Approval policy (whether human approval is required).
     pub approval_policy: ApprovalPolicy,
-    /// Vapaamuotoinen vihje odotetusta syötteen muodosta (esim. skeema-nimi).
+    /// Free-form hint about the expected input shape (e.g. a schema name).
     ///
-    /// Tarkoitettu ihmisluettavaksi näytöksi; rakenteellisen, koneluettavan
-    /// version tarjoaa [`SkillManifest::input_schema`].
+    /// Intended for human-readable display; the structured, machine-readable
+    /// version is provided by [`SkillManifest::input_schema`].
     #[serde(default)]
     pub input_hint: Option<String>,
-    /// Vapaamuotoinen vihje odotetusta tuloksen muodosta.
+    /// Free-form hint about the expected output shape.
     #[serde(default)]
     pub output_hint: Option<String>,
-    /// Koneluettava JSON Schema -kuvaus taidon syötteestä.
+    /// Machine-readable JSON Schema description of the skill's input.
     ///
-    /// Tällä taito voidaan mainostaa LLM:lle aitona työkaluna: skeema siirtyy
-    /// sellaisenaan työkalun `parameters`-kentäksi. Juuren TÄYTYY olla
-    /// JSON-objekti (skalaari/taulukko ei kelpaa); validointi
-    /// ([`SkillManifest::validate`]) torjuu muut. Kun arvoa ei anneta, serde
-    /// täyttää sen [`default_input_schema`]-funktiolla (`{"type":"object"}`),
-    /// jotta vanhat ilman tätä kenttää tallennetut manifestit latautuvat yhä.
+    /// This lets the skill be advertised to an LLM as a genuine tool: the schema
+    /// passes through as-is into the tool's `parameters` field. The root MUST be
+    /// a JSON object (a scalar/array is not valid); validation
+    /// ([`SkillManifest::validate`]) rejects anything else. When no value is given, serde
+    /// fills it with the [`default_input_schema`] function (`{"type":"object"}`),
+    /// so that older manifests stored without this field still load.
     #[serde(default = "default_input_schema")]
     pub input_schema: Value,
-    /// Ulkoisen julkaisijan tunniste (esim. `mock_provider`). Kun asetettu,
-    /// taito on **ulkoinen** ja vaatii Ed25519-allekirjoituksen
-    /// ([`SkillManifest::signature`]) sekä luotetun avaimen
+    /// Identifier of the external publisher (e.g. `mock_provider`). When set,
+    /// the skill is **external** and requires an Ed25519 signature
+    /// ([`SkillManifest::signature`]) and a trusted key
     /// (`FAMILYCLAW_SKILL_REGISTRY`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher: Option<String>,
-    /// Ed25519-allekirjoitus (hex, 64 tavua) manifestin allekirjoituskuormasta.
-    /// Pakollinen ulkoisille taidoille; sisäänrakennetut Layer A -taidot jättävät
-    /// kentän tyhjäksi.
+    /// Ed25519 signature (hex, 64 bytes) over the manifest's signing payload.
+    /// Required for external skills; built-in Layer A skills leave
+    /// this field empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
 }
 
 impl SkillManifest {
-    /// Asettaa koneluettavan syöteskeeman ja palauttaa muokatun manifestin
-    /// (rakentaja-tyylinen ketjutus).
+    /// Sets the machine-readable input schema and returns the modified manifest
+    /// (builder-style chaining).
     ///
-    /// Skeema ei korvaa [`SkillManifest::input_hint`]-vihjettä — molemmat
-    /// säilyvät: `input_hint` ihmisnäyttöä, `input_schema` LLM:lle. Arvoa EI
-    /// validoida tässä; juuren objektivaatimus ja salaisuustarkistus tehdään
-    /// vasta [`SkillManifest::validate`]-kutsussa.
+    /// The schema does not replace the [`SkillManifest::input_hint`] hint — both
+    /// are kept: `input_hint` for human display, `input_schema` for the LLM. The value is NOT
+    /// validated here; the root object requirement and the secret check are done
+    /// only when [`SkillManifest::validate`] is called.
     ///
     /// # Examples
     /// ```
@@ -143,82 +143,82 @@ impl SkillManifest {
         self
     }
 
-    /// Jäsentää manifestin TOML-merkkijonosta.
+    /// Parses the manifest from a TOML string.
     ///
     /// # Errors
-    /// Palauttaa [`ActionError::ManifestParse`] jos TOML on virheellinen tai
-    /// ei vastaa manifestin rakennetta (esim. tuntematon riskiluokka).
+    /// Returns [`ActionError::ManifestParse`] if the TOML is invalid or
+    /// does not match the manifest's structure (e.g. an unknown risk class).
     pub fn from_toml(input: &str) -> Result<Self> {
         toml::from_str(input).map_err(|e| ActionError::ManifestParse(e.to_string()))
     }
 
-    /// Jäsentää manifestin JSON-merkkijonosta.
+    /// Parses the manifest from a JSON string.
     ///
     /// # Errors
-    /// Palauttaa [`ActionError::ManifestParse`] jos JSON on virheellinen tai
-    /// ei vastaa manifestin rakennetta (esim. tuntematon riskiluokka).
+    /// Returns [`ActionError::ManifestParse`] if the JSON is invalid or
+    /// does not match the manifest's structure (e.g. an unknown risk class).
     pub fn from_json(input: &str) -> Result<Self> {
         serde_json::from_str(input).map_err(|e| ActionError::ManifestParse(e.to_string()))
     }
 
-    /// Sarjallistaa manifestin JSON-merkkijonoksi.
+    /// Serializes the manifest to a JSON string.
     ///
     /// # Errors
-    /// Palauttaa [`ActionError::ManifestParse`] jos sarjallistus epäonnistuu.
+    /// Returns [`ActionError::ManifestParse`] if serialization fails.
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string(self).map_err(|e| ActionError::ManifestParse(e.to_string()))
     }
 
-    /// Validoi manifestin sisäisen eheyden ja turvallisuussäännöt.
+    /// Validates the manifest's internal integrity and security rules.
     ///
     /// # Errors
-    /// - [`ActionError::ManifestValidation`] jos tunniste on `nil`, tai nimi/
-    ///   versio on tyhjä, tai [`SkillManifest::input_schema`]-skeeman juuri ei
-    ///   ole JSON-objekti, tai ulkoinen kirjoitus on ilman hyväksyntää vaativaa
-    ///   käytäntöä.
-    /// - [`ActionError::SecretInManifest`] jos jokin tekstikenttä tai
-    ///   syöteskeeman tekstiarvo sisältää salaisuudelta näyttävän arvon.
+    /// - [`ActionError::ManifestValidation`] if the id is `nil`, or the name/
+    ///   version is empty, or the [`SkillManifest::input_schema`] schema's root is not
+    ///   a JSON object, or an external write has a policy that does not
+    ///   require approval.
+    /// - [`ActionError::SecretInManifest`] if any text field or
+    ///   the input schema's text value contains a value that looks like a secret.
     pub fn validate(&self) -> Result<()> {
         if self.id.is_nil() {
             return Err(ActionError::ManifestValidation(
-                "skill id puuttuu (nil)".to_string(),
+                "skill id missing (nil)".to_string(),
             ));
         }
         if self.name.trim().is_empty() {
-            return Err(ActionError::ManifestValidation("name on tyhjä".to_string()));
+            return Err(ActionError::ManifestValidation("name is empty".to_string()));
         }
         if self.version.trim().is_empty() {
             return Err(ActionError::ManifestValidation(
-                "version on tyhjä".to_string(),
+                "version is empty".to_string(),
             ));
         }
 
-        // Syöteskeeman juuren on oltava JSON-objekti, jotta se kelpaa LLM:n
-        // työkalun `parameters`-kentäksi sellaisenaan (skalaari/taulukko ei).
+        // The input schema's root must be a JSON object for it to be valid as an LLM
+        // tool's `parameters` field as-is (a scalar/array is not).
         if !self.input_schema.is_object() {
             return Err(ActionError::ManifestValidation(
-                "input_schema juuren on oltava JSON-objekti".to_string(),
+                "input_schema root must be a JSON object".to_string(),
             ));
         }
 
-        // Turvatarkistus: mikään tekstikenttä ei saa sisältää salaisuutta.
+        // Security check: no text field may contain a secret.
         for (field, value) in self.text_fields() {
             if detect_secret_like(value) {
                 return Err(ActionError::SecretInManifest(format!(
-                    "kenttä '{field}' näyttää sisältävän salaisuuden"
+                    "field '{field}' appears to contain a secret"
                 )));
             }
         }
 
-        // Sama turvatarkistus syöteskeemalle: skeema on rakenteinen, joten
-        // läpikäydään sen kaikki merkkijonosolmut (avaimet ja arvot).
+        // Same security check for the input schema: the schema is structured, so
+        // all of its string nodes (keys and values) are walked.
         if let Some(secret_path) = first_secret_in_json(&self.input_schema, "input_schema") {
             return Err(ActionError::SecretInManifest(format!(
-                "input_schema-polku '{secret_path}' näyttää sisältävän salaisuuden"
+                "input_schema path '{secret_path}' appears to contain a secret"
             )));
         }
 
-        // Ulkoinen kirjoitus vaatii käytännön joka aidosti voi vaatia hyväksynnän.
+        // External writes require a policy that can genuinely require approval.
         if self.permissions.contains(&SkillPermission::WriteExternal)
             && !self.approval_policy.can_require_approval()
         {
@@ -229,29 +229,29 @@ impl SkillManifest {
             ));
         }
 
-        // Oikeus ↔ riskiluokka -ristiintarkistus (defense in depth).
+        // Permission <-> risk class cross-check (defense in depth).
         //
-        // Putki johtaa hyväksyntävaatimuksen riskiluokasta
-        // ([`crate::policy::required_approval`]). Jos korkean riskin oikeus
-        // (esim. rahankäyttö) merkittäisiin auto-ajettavaan riskiluokkaan
-        // (read_only / write_local), putki ajaisi sen ILMAN hyväksyntää.
-        // Estetään se täällä: invariantti "spend_money ja irreversible vaativat
-        // aina hyväksynnän, vaikka manifesti yrittäisi auto-runia".
+        // The pipeline derives the approval requirement from the risk class
+        // ([`crate::policy::required_approval`]). If a high-risk permission
+        // (e.g. spending money) were labeled with an auto-runnable risk class
+        // (read_only / write_local), the pipeline would run it WITHOUT approval.
+        // This is prevented here: the invariant is "spend_money and irreversible always
+        // require approval, even if the manifest tries to auto-run".
         for perm in &self.permissions {
-            // Rahankäyttö ei saa naamioitua lievemmäksi riskiksi.
+            // Spending money must not be disguised as a lighter risk.
             if perm.requires_spend_money_risk() && self.risk != ActionRisk::SpendMoney {
                 return Err(ActionError::ManifestValidation(format!(
-                    "oikeus 'spend_money' vaatii risk = spend_money (oli {:?}) — \
-                     rahankäyttö ei saa ohittaa hyväksyntää väärällä riskiluokalla",
+                    "permission 'spend_money' requires risk = spend_money (was {:?}) — \
+                     spending money must not bypass approval via the wrong risk class",
                     self.risk
                 )));
             }
-            // Sivuvaikutukselliset oikeudet eivät saa olla auto-ajettavassa
-            // riskiluokassa (read_only / write_local).
+            // Permissions with side effects must not be in an auto-runnable
+            // risk class (read_only / write_local).
             if perm.forbids_auto_run_risk() && self.risk.is_auto_runnable_class() {
                 return Err(ActionError::ManifestValidation(format!(
-                    "oikeus {perm:?} ei saa olla auto-ajettavassa riskiluokassa {:?} — \
-                     se ohittaisi vaaditun hyväksynnän",
+                    "permission {perm:?} must not be in the auto-runnable risk class {:?} — \
+                     it would bypass the required approval",
                     self.risk
                 )));
             }
@@ -262,10 +262,10 @@ impl SkillManifest {
         Ok(())
     }
 
-    /// Onko manifesti **ulkoinen** (kolmannen osapuolen taito)?
+    /// Is the manifest **external** (a third-party skill)?
     ///
-    /// Ulkoinen = `publisher` on asetettu ja ei-tyhjä. Sisäänrakennetut Layer A
-    /// -taidot eivät aseta julkaisijaa eivätkä vaadi allekirjoitusta.
+    /// External = `publisher` is set and non-empty. Built-in Layer A
+    /// skills do not set a publisher and do not require a signature.
     #[must_use]
     pub fn is_external(&self) -> bool {
         self.publisher
@@ -273,16 +273,16 @@ impl SkillManifest {
             .is_some_and(|publisher| !publisher.trim().is_empty())
     }
 
-    /// Verifioi ulkoisen taidon Ed25519-allekirjoituksen luotettujen avainten
-    /// rekisteristä (`FAMILYCLAW_SKILL_REGISTRY`).
+    /// Verifies an external skill's Ed25519 signature against the trusted key
+    /// registry (`FAMILYCLAW_SKILL_REGISTRY`).
     ///
-    /// Sisäänrakennetut taidot (ei `publisher`-kenttää) ohitetaan. Ulkoisille
-    /// taidoille virheellinen tai puuttuva allekirjoitus on **fail-closed**
+    /// Built-in skills (no `publisher` field) are skipped. For external
+    /// skills, an invalid or missing signature is **fail-closed**
     /// ([`ActionError::SignatureInvalid`]).
     ///
     /// # Errors
-    /// [`ActionError::SignatureInvalid`] jos allekirjoitus puuttuu, rekisteriä
-    /// ei löydy, julkaisijaa ei luoteta, tai verifiointi epäonnistuu.
+    /// [`ActionError::SignatureInvalid`] if the signature is missing, the registry
+    /// is not found, the publisher is not trusted, or verification fails.
     pub fn verify_external_signature(&self) -> Result<()> {
         if !self.is_external() {
             return Ok(());
@@ -318,7 +318,7 @@ impl SkillManifest {
         Ok(())
     }
 
-    /// Palauttaa manifestin allekirjoituskuorman (JSON ilman `signature`-kenttää).
+    /// Returns the manifest's signing payload (JSON without the `signature` field).
     fn signing_payload(&self) -> Result<Vec<u8>> {
         let mut unsigned = self.clone();
         unsigned.signature = None;
@@ -326,7 +326,7 @@ impl SkillManifest {
             .map_err(|e| ActionError::SignatureInvalid(format!("signing payload encode: {e}")))
     }
 
-    /// Palauttaa validoitavat tekstikentät (kenttänimi, arvo) -pareina.
+    /// Returns the text fields to validate as (field name, value) pairs.
     fn text_fields(&self) -> Vec<(&'static str, &str)> {
         let mut fields = vec![
             ("name", self.name.as_str()),
@@ -342,19 +342,19 @@ impl SkillManifest {
         if let Some(publisher) = &self.publisher {
             fields.push(("publisher", publisher.as_str()));
         }
-        // `signature` jätetään pois: hex-allekirjoitus voi näyttää
-        // salaisuudelta `detect_secret_like`:lle, mutta se verifioidaan
-        // erikseen [`SkillManifest::verify_external_signature`]:lla.
+        // `signature` is left out: a hex signature can look
+        // like a secret to `detect_secret_like`, but it is verified
+        // separately by [`SkillManifest::verify_external_signature`].
         fields
     }
 }
 
-/// Luotettujen julkaisijoiden Ed25519-julkiset avaimet (hex, 32 tavua).
+/// Trusted publishers' Ed25519 public keys (hex, 32 bytes).
 ///
-/// JSON-muoto: tasainen objekti `{ "publisher_id": "hex_pubkey", ... }`.
+/// JSON format: a flat object `{ "publisher_id": "hex_pubkey", ... }`.
 type TrustedSkillKeys = HashMap<String, String>;
 
-/// Lukee luotetut skill-avaimet `FAMILYCLAW_SKILL_REGISTRY`-polusta.
+/// Reads the trusted skill keys from the `FAMILYCLAW_SKILL_REGISTRY` path.
 fn load_trusted_skill_keys(path: &Path) -> Result<TrustedSkillKeys> {
     let raw = fs::read_to_string(path).map_err(|e| {
         ActionError::SignatureInvalid(format!(
@@ -370,7 +370,7 @@ fn load_trusted_skill_keys(path: &Path) -> Result<TrustedSkillKeys> {
     })
 }
 
-/// Verifioi Ed25519-allekirjoituksen hex-avaimella ja -allekirjoituksella.
+/// Verifies an Ed25519 signature using a hex key and hex signature.
 fn verify_ed25519_signature(
     public_key_hex: &str,
     signature_hex: &str,
@@ -400,7 +400,7 @@ fn verify_ed25519_signature(
         })
 }
 
-/// Dekoodaa hex-merkkijonon tavuiksi (sallii valinnaisen `0x`-etuliitteen).
+/// Decodes a hex string into bytes (allows an optional `0x` prefix).
 fn decode_hex(input: &str) -> std::result::Result<Vec<u8>, String> {
     let trimmed = input
         .trim()
@@ -418,17 +418,17 @@ fn decode_hex(input: &str) -> std::result::Result<Vec<u8>, String> {
         .collect()
 }
 
-/// Etsii ensimmäisen salaisuudelta näyttävän merkkijonon JSON-arvosta.
+/// Finds the first secret-looking string in a JSON value.
 ///
-/// Käy rekursiivisesti läpi objektien avaimet ja arvot sekä taulukoiden alkiot,
-/// ja palauttaa [`Some`]-polun (esim. `input_schema.properties.token`)
-/// ensimmäiseen solmuun, jonka tekstiarvo läpäisee
-/// [`detect_secret_like`]-tarkistuksen. Palauttaa [`None`], jos salaisuuksia ei
-/// löydy. `path` on kutsujan antama juuriprefiksi (esim. `"input_schema"`).
+/// Recursively walks objects' keys and values as well as arrays' elements,
+/// and returns the [`Some`] path (e.g. `input_schema.properties.token`)
+/// to the first node whose text value passes the
+/// [`detect_secret_like`] check. Returns [`None`] if no secrets are
+/// found. `path` is the root prefix supplied by the caller (e.g. `"input_schema"`).
 ///
-/// Tämä laajentaa manifestin salaisuusvapaus-takuun kattamaan myös
-/// rakenteisen [`SkillManifest::input_schema`]-skeeman, ei vain tasaisia
-/// tekstikenttiä.
+/// This extends the manifest's secret-free guarantee to also cover the
+/// structured [`SkillManifest::input_schema`] schema, not just flat
+/// text fields.
 fn first_secret_in_json(value: &Value, path: &str) -> Option<String> {
     match value {
         Value::String(s) => {
@@ -448,7 +448,7 @@ fn first_secret_in_json(value: &Value, path: &str) -> Option<String> {
             .iter()
             .enumerate()
             .find_map(|(idx, child)| first_secret_in_json(child, &format!("{path}[{idx}]"))),
-        // Numerot, boolit ja null eivät voi olla salaisuuksia.
+        // Numbers, booleans, and null cannot be secrets.
         Value::Number(_) | Value::Bool(_) | Value::Null => None,
     }
 }
@@ -457,13 +457,13 @@ fn first_secret_in_json(value: &Value, path: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    // TESTIKORJAUS 2026-07-09 (audit): FAMILYCLAW_SKILL_REGISTRY on prosessin-
-    // globaali env-var. Kaksi testiä set_var/remove_var:aavat sitä → rinnakkain
-    // ajettuna toisen remove_var pyyhkii toisen set_var:in ja validaatio failaa
-    // satunnaisesti (flaky CI). Serialisoidaan ne tällä lukolla.
+    // TEST FIX 2026-07-09 (audit): FAMILYCLAW_SKILL_REGISTRY is a process-
+    // global env var. Two tests set_var/remove_var it -> when run in parallel,
+    // one test's remove_var wipes out the other's set_var and validation fails
+    // intermittently (flaky CI). Serialized with this lock.
     static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Apuri: rakentaa kelvollisen perusmanifestin annetulla tunnisteella.
+    /// Helper: builds a valid base manifest with the given id.
     fn valid_manifest() -> SkillManifest {
         SkillManifest {
             id: SkillId::new(),
@@ -499,7 +499,7 @@ approval_policy = "auto_if_read_only"
         assert_eq!(manifest.id, id);
         assert_eq!(manifest.name, "read-doc");
         assert_eq!(manifest.risk, ActionRisk::ReadOnly);
-        // input_schema puuttui lähteestä → serde-oletus täyttää sen.
+        // input_schema was missing from the source -> the serde default fills it in.
         assert_eq!(manifest.input_schema, default_input_schema());
         manifest.validate().expect("valid manifest validates");
     }
@@ -521,7 +521,7 @@ approval_policy = "auto_if_read_only"
         let manifest = SkillManifest::from_json(&json_src).expect("json parses");
         assert_eq!(manifest.id, id);
         assert_eq!(manifest.approval_policy, ApprovalPolicy::AutoIfReadOnly);
-        // Vanha serialisoitu manifesti ilman input_schemaa latautuu yhä.
+        // An old serialized manifest without input_schema still loads.
         assert_eq!(manifest.input_schema, default_input_schema());
         manifest.validate().expect("valid manifest validates");
     }
@@ -573,17 +573,17 @@ approval_policy = "auto_if_read_only"
             .expect_err("write_external without approval rejected");
         assert!(matches!(err, ActionError::ManifestValidation(_)));
 
-        // Sama manifesti hyväksyttävällä käytännöllä menee läpi.
+        // The same manifest with an approval-requiring policy passes.
         m.approval_policy = ApprovalPolicy::RequireApproval;
         m.validate()
             .expect("write_external with approval validates");
     }
 
-    /// INVARIANT (adversarial): manifesti EI saa ilmoittaa rahankäyttö-oikeutta
-    /// ([`SkillPermission::SpendMoney`]) mutta merkitä riskiluokaksi jotain
-    /// hyväksynnän ohittavaa (esim. [`ActionRisk::ReadOnly`]). Muuten putki
-    /// johtaisi `required_approval(ReadOnly, AutoIfReadOnly) == AutoRun` ja
-    /// rahaa käyttävä taito ajaisi ilman hyväksyntää.
+    /// INVARIANT (adversarial): a manifest must NOT declare the spend-money permission
+    /// ([`SkillPermission::SpendMoney`]) while labeling the risk class as something
+    /// that bypasses approval (e.g. [`ActionRisk::ReadOnly`]). Otherwise the pipeline
+    /// would derive `required_approval(ReadOnly, AutoIfReadOnly) == AutoRun` and
+    /// a money-spending skill would run without approval.
     #[test]
     fn spend_money_permission_mislabeled_as_low_risk_rejected() {
         let mut m = valid_manifest();
@@ -595,24 +595,24 @@ approval_policy = "auto_if_read_only"
             .expect_err("spend_money mislabeled as read_only must be rejected");
         assert!(matches!(err, ActionError::ManifestValidation(_)));
 
-        // Oikein merkittynä (risk = SpendMoney) sama oikeus validoituu.
+        // Correctly labeled (risk = SpendMoney), the same permission validates.
         m.risk = ActionRisk::SpendMoney;
         m.validate()
             .expect("spend_money with matching risk validates");
     }
 
-    /// INVARIANT (adversarial): ulkoinen kirjoitus -oikeus
-    /// ([`SkillPermission::WriteExternal`]) merkittynä peruuttamattoman sijaan
-    /// luku-riskiksi ei saa läpäistä — peruuttamaton/ulkoinen sivuvaikutus ei
-    /// saa ajaa automaattisesti.
+    /// INVARIANT (adversarial): the write-external permission
+    /// ([`SkillPermission::WriteExternal`]) labeled as a read risk instead of
+    /// an irreversible one must not pass — an irreversible/external side effect must
+    /// not auto-run.
     #[test]
     fn write_external_permission_mislabeled_as_read_only_rejected() {
         let mut m = valid_manifest();
         m.permissions = vec![SkillPermission::WriteExternal];
         m.risk = ActionRisk::ReadOnly;
-        // Käytäntö joka aidosti voi vaatia hyväksynnän, jotta aiempi
-        // write_external-tarkistus EI ole se mikä hylkää — todistetaan että
-        // nimenomaan risk-luokan ristiintarkistus puree.
+        // A policy that can genuinely require approval, so that the earlier
+        // write_external check is NOT what rejects it — proving that
+        // specifically the risk-class cross-check is what bites.
         m.approval_policy = ApprovalPolicy::RequireApproval;
         let err = m
             .validate()
@@ -623,7 +623,7 @@ approval_policy = "auto_if_read_only"
     #[test]
     fn manifest_with_secret_value_rejected() {
         let mut m = valid_manifest();
-        // Rakennetaan salaisuus ajonaikana ettei lähteessä ole pitkää literaalia.
+        // The secret is built at runtime so there's no long literal in the source.
         let fake = format!("sk-{}", "live".repeat(4));
         m.description = format!("Käyttää avainta {fake}");
         let err = m.validate().expect_err("secret-looking value rejected");
@@ -665,7 +665,7 @@ approval_policy = "auto_if_read_only"
     #[test]
     fn with_input_schema_keeps_input_hint() {
         let m = valid_manifest().with_input_schema(serde_json::json!({ "type": "object" }));
-        // input_hint säilyy ihmisnäyttöä varten skeeman rinnalla.
+        // input_hint is kept for human display alongside the schema.
         assert_eq!(m.input_hint.as_deref(), Some("text"));
     }
 
@@ -688,7 +688,7 @@ approval_policy = "auto_if_read_only"
     #[test]
     fn secret_in_input_schema_value_rejected() {
         let mut m = valid_manifest();
-        // Salaisuus rakennetaan ajonaikana (ei pitkää literaalia lähteessä).
+        // The secret is built at runtime (no long literal in the source).
         let fake = format!("sk-{}", "live".repeat(4));
         m.input_schema = serde_json::json!({
             "type": "object",
@@ -716,7 +716,7 @@ approval_policy = "auto_if_read_only"
     fn external_skill_with_valid_signature_accepted() {
         use ed25519_dalek::{Signer, SigningKey};
         use std::io::Write;
-        // Serialisoi globaalin REGISTRY-env-varin muutokset (flaky-race-korjaus).
+        // Serializes changes to the global REGISTRY env var (flaky-race fix).
         let _env_guard = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -754,7 +754,7 @@ approval_policy = "auto_if_read_only"
     fn external_skill_with_tampered_signature_rejected() {
         use ed25519_dalek::SigningKey;
         use std::io::Write;
-        // Serialisoi globaalin REGISTRY-env-varin muutokset (flaky-race-korjaus).
+        // Serializes changes to the global REGISTRY env var (flaky-race fix).
         let _env_guard = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

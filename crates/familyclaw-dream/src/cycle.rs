@@ -1,22 +1,23 @@
-//! Unijakson moottori: [`DreamCycle`].
+//! Dream cycle engine: [`DreamCycle`].
 //!
-//! `DreamCycle` peilaa Anthropicin Dreaming-mallin (design §2.3) natiiviksi
-//! muistin konsolidaatioksi. Se lukee muistit [`MemoryStore`]-toteutuksesta ja
-//! ristiriitamerkinnät durable-[`Journal`]:ista, ja ajaa viisi vaihetta:
+//! `DreamCycle` mirrors Anthropic's Dreaming model (design §2.3) as native
+//! memory consolidation. It reads memories from a [`MemoryStore`]
+//! implementation and conflict records from a durable [`Journal`], and runs
+//! five phases:
 //!
-//! 1. **`merge_duplicates`** — yhdistää lähes-identtiset muistot yhdeksi
-//!    edustajaksi (tunneet + tägit unioidaan, edustaja vahvistetaan, muut
-//!    haudataan).
-//! 2. **`drop_contradicted`** — hautaa muistot jotka durable-journal on
-//!    merkinnyt vanhentuneiksi/ristiriitaisiksi.
-//! 3. **`absolutize_dates`** — muuttaa suhteelliset päiväsanat ("eilen")
-//!    absoluuttisiksi ISO-päivämääriksi.
-//! 4. **`consolidate`** — korkean importancen muistot vahvistuvat, matalan
-//!    retention (R < kynnys) muistot arkistoituvat.
-//! 5. tuottaa [`DreamReport`]:n johon kaikki vaiheet kirjaavat reflektionsa.
+//! 1. **`merge_duplicates`** — merges near-identical memories into one
+//!    representative (emotions + tags are unioned, the representative is
+//!    strengthened, the rest are tombstoned).
+//! 2. **`drop_contradicted`** — tombstones memories the durable journal has
+//!    marked as outdated/contradicted.
+//! 3. **`absolutize_dates`** — converts relative date words ("yesterday")
+//!    to absolute ISO dates.
+//! 4. **`consolidate`** — high-importance memories are strengthened,
+//!    low-retention (R < threshold) memories are archived.
+//! 5. produces a [`DreamReport`] to which all phases record their reflections.
 //!
-//! Vaiheet ajetaan kiinteässä järjestyksessä jotta tulos on deterministinen ja
-//! toistettava (sama syöte ⇒ sama raportti).
+//! Phases run in a fixed order so the result is deterministic and
+//! reproducible (same input ⇒ same report).
 
 use std::collections::BTreeSet;
 
@@ -30,24 +31,25 @@ use crate::dates::absolutize;
 use crate::report::{DreamReport, Reflection, ReflectionKind};
 use crate::similarity::is_near_duplicate;
 
-/// Yhden unijakson suorittaja.
+/// The executor for a single dream cycle.
 ///
-/// Pitää viitettä muistitallennukseen ja konfiguraatioon. Itse jakso ajetaan
-/// [`DreamCycle::run`]-metodilla (tarvitsee myös durable-journalin
-/// ristiriitatietoa varten) tai [`DreamCycle::run_without_journal`]:lla kun
-/// ristiriitavaihetta ei tarvita.
+/// Holds a reference to the memory store and the configuration. The cycle
+/// itself is run with the [`DreamCycle::run`] method (which also needs the
+/// durable journal for conflict data) or with
+/// [`DreamCycle::run_without_journal`] when the conflict phase isn't needed.
 ///
-/// `S: MemoryStore + Sync` — `Sync` vaaditaan koska [`MemoryStore::is_empty`]
-/// -oletusmetodi edellyttää sitä ja jakso lukee tallennusta samanaikaisesti.
-/// `S: ?Sized` sallii trait-objektit (`dyn MemoryStore`, `Arc<dyn MemoryStore>`, jne.).
+/// `S: MemoryStore + Sync` — `Sync` is required because the
+/// [`MemoryStore::is_empty`] default method requires it and the cycle reads
+/// the store concurrently. `S: ?Sized` allows trait objects (`dyn
+/// MemoryStore`, `Arc<dyn MemoryStore>`, etc.).
 #[derive(Debug)]
 pub struct DreamCycle<'a, S>
 where
     S: MemoryStore + Sync + ?Sized,
 {
-    /// Muistitallennus jota konsolidoidaan.
+    /// The memory store being consolidated.
     store: &'a S,
-    /// Vaiheiden kynnysarvot ja kytkimet.
+    /// Thresholds and toggles for the phases.
     config: DreamConfig,
 }
 
@@ -55,7 +57,7 @@ impl<'a, S> DreamCycle<'a, S>
 where
     S: MemoryStore + Sync + ?Sized,
 {
-    /// Luo unijakson oletuskonfiguraatiolla.
+    /// Creates a dream cycle with the default configuration.
     #[must_use]
     pub fn new(store: &'a S) -> Self {
         Self {
@@ -64,28 +66,27 @@ where
         }
     }
 
-    /// Luo unijakson annetulla konfiguraatiolla.
+    /// Creates a dream cycle with the given configuration.
     #[must_use]
     pub fn with_config(store: &'a S, config: DreamConfig) -> Self {
         Self { store, config }
     }
 
-    /// Palauttaa käytössä olevan konfiguraation.
+    /// Returns the configuration in use.
     #[must_use]
     pub fn config(&self) -> DreamConfig {
         self.config
     }
 
-    /// Ajaa täyden unijakson hetkellä `at`, lukien ristiriidat `journal`:ista.
+    /// Runs the full dream cycle at instant `at`, reading conflicts from `journal`.
     ///
-    /// Vaiheet ajetaan järjestyksessä: yhdistä → pudota ristiriitaiset →
-    /// absolutisoi päivät → konsolidoi. Kunkin vaiheen voi kytkeä pois
-    /// [`DreamConfig`]:ssa.
+    /// Phases run in order: merge → drop contradicted → absolutize dates →
+    /// consolidate. Each phase can be toggled off in [`DreamConfig`].
     ///
     /// # Errors
-    /// [`familyclaw_core::FamilyClawError`] jos muistitallennus epäonnistuu,
-    /// tai durable-journalin lukuvirhe käännettynä
-    /// [`familyclaw_core::FamilyClawError::Memory`]:ksi.
+    /// [`familyclaw_core::FamilyClawError`] if the memory store fails, or a
+    /// durable journal read error translated into
+    /// [`familyclaw_core::FamilyClawError::Memory`].
     pub async fn run(
         &self,
         journal: &(dyn Journal + Send + Sync),
@@ -100,16 +101,16 @@ where
         self.run_inner(&contradicted, at).await
     }
 
-    /// Ajaa unijakson ilman durable-journalia (ristiriitavaihe ohitetaan
-    /// riippumatta konfiguraatiosta).
+    /// Runs the dream cycle without a durable journal (the conflict phase
+    /// is skipped regardless of configuration).
     ///
     /// # Errors
-    /// [`familyclaw_core::FamilyClawError`] jos muistitallennus epäonnistuu.
+    /// [`familyclaw_core::FamilyClawError`] if the memory store fails.
     pub async fn run_without_journal(&self, at: Timestamp) -> Result<DreamReport> {
         self.run_inner(&BTreeSet::new(), at).await
     }
 
-    /// Yhteinen ajopolku: vie ristiriita-id:t sisään valmiina joukkona.
+    /// Shared run path: takes the contradicted ids in as a ready-made set.
     async fn run_inner(
         &self,
         contradicted: &BTreeSet<MessageId>,
@@ -134,12 +135,13 @@ where
         Ok(report)
     }
 
-    /// Vaihe 1: yhdistä lähes-identtiset muistot.
+    /// Phase 1: merge near-identical memories.
     ///
-    /// Ryhmittelee haettavissa olevat muistot greedy-klustereiksi
-    /// samankaltaisuuskynnyksen ([`DreamConfig::merge_similarity`]) mukaan.
-    /// Kustakin ≥ 2 jäsenen klusterista valitaan vahvin edustaja, joka
-    /// vahvistetaan ja saa muiden tägit + tunteet unioituina; muut haudataan.
+    /// Groups retrievable memories into greedy clusters according to the
+    /// similarity threshold ([`DreamConfig::merge_similarity`]). From each
+    /// cluster of ≥ 2 members, the strongest representative is chosen,
+    /// which is strengthened and receives the union of the others' tags +
+    /// emotions; the rest are tombstoned.
     async fn merge_duplicates(&self, report: &mut DreamReport, at: Timestamp) -> Result<()> {
         let mut candidates: Vec<Memory> = self
             .store
@@ -148,7 +150,7 @@ where
             .into_iter()
             .filter(Memory::is_retrievable)
             .collect();
-        // Deterministinen lähtöjärjestys: vanhin ensin, id tasapelin ratkaisuna.
+        // Deterministic starting order: oldest first, id breaks ties.
         candidates.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
@@ -162,7 +164,7 @@ where
             if consumed.contains(&base_id) {
                 continue;
             }
-            // Kerää tähän edustajaan kuuluvat duplikaatit.
+            // Collect the duplicates belonging to this representative.
             let mut group: Vec<usize> = Vec::new();
             for (j, other) in candidates.iter().enumerate().skip(i + 1) {
                 if consumed.contains(&other.id) {
@@ -180,13 +182,13 @@ where
                 continue;
             }
 
-            // Valitse vahvin edustaja koko klusterista (base + ryhmä).
+            // Choose the strongest representative from the whole cluster (base + group).
             let mut cluster: Vec<usize> = std::iter::once(i).chain(group.iter().copied()).collect();
             cluster.sort_by(|&x, &y| representative_order(&candidates[x], &candidates[y]));
             let rep_idx = cluster[0];
             let rep_id = candidates[rep_idx].id;
 
-            // Unioi tägit + tunteet edustajaan ja vahvista.
+            // Union tags + emotions into the representative and strengthen it.
             let mut rep = candidates[rep_idx].clone();
             for &idx in &cluster {
                 if idx == rep_idx {
@@ -197,20 +199,21 @@ where
             rep.reinforce(at);
             self.store.update(rep).await?;
 
-            // Hautaa muut klusterin jäsenet.
+            // Tombstone the other cluster members.
             for &idx in &cluster {
                 let id = candidates[idx].id;
                 consumed.insert(id);
                 if id == rep_id {
                     continue;
                 }
-                // KRIITTINEN INVARIANTTI (design §3 S3): suojattua ydintä
-                // (λ=0, ProtectedCore) ei saa KOSKAAN haudata — ei edes
-                // merge-vaiheessa ei-edustajana. Tämä peilaa
-                // `Memory::tombstone()`-metodin kieltäytymistä (memory.rs).
-                // `representative_order` suosii jo suojattua edustajaksi, mutta
-                // jos klusterissa on >1 suojattu (vain yksi voi olla edustaja),
-                // muut suojatut säilyvät tässä aktiivisina muuttumattomina.
+                // CRITICAL INVARIANT (design §3 S3): the protected core
+                // (λ=0, ProtectedCore) must NEVER be tombstoned — not even
+                // as a non-representative during the merge phase. This
+                // mirrors `Memory::tombstone()`'s refusal (memory.rs).
+                // `representative_order` already favors an already-protected
+                // memory as the representative, but if the cluster has >1
+                // protected member (only one can be the representative), the
+                // other protected members remain active and unchanged here.
                 if candidates[idx].decay_policy.is_protected() {
                     continue;
                 }
@@ -225,7 +228,7 @@ where
         Ok(())
     }
 
-    /// Vaihe 2: pudota durable-journalin ristiriitaisiksi merkitsemät muistot.
+    /// Phase 2: drop memories the durable journal has marked as contradicted.
     async fn drop_contradicted(
         &self,
         report: &mut DreamReport,
@@ -233,9 +236,9 @@ where
     ) -> Result<()> {
         for &id in contradicted {
             let Some(memory) = self.store.get(id).await? else {
-                continue; // jo poistettu tai tuntematon id
+                continue; // already removed or unknown id
             };
-            // Suojattua ydintä ei haudata, ei myöskään jo haudattua.
+            // The protected core is never tombstoned, nor is an already-tombstoned memory.
             if memory.decay_policy.is_protected() || memory.status == MemoryStatus::Tombstoned {
                 continue;
             }
@@ -249,7 +252,7 @@ where
         Ok(())
     }
 
-    /// Vaihe 3: absolutisoi suhteelliset päiväsanat muistojen sisällössä.
+    /// Phase 3: absolutize relative date words in memory content.
     async fn absolutize_dates(&self, report: &mut DreamReport, at: Timestamp) -> Result<()> {
         let memories = self.store.all().await?;
         for memory in memories {
@@ -272,11 +275,12 @@ where
         Ok(())
     }
 
-    /// Vaihe 4: vahvista tärkeät, arkistoi matala-retention muistot.
+    /// Phase 4: strengthen important memories, archive low-retention memories.
     ///
-    /// Vahvistus ja arkistointi ovat toisensa poissulkevia per muisto: tärkeä
-    /// muisto vahvistuu (eikä siten arkistoidu), matala-retention arkistoituu.
-    /// Suojattua ydintä ei kosketa kummassakaan.
+    /// Strengthening and archiving are mutually exclusive per memory: an
+    /// important memory is strengthened (and therefore not archived), a
+    /// low-retention one is archived. The protected core is never touched
+    /// by either.
     async fn consolidate(&self, report: &mut DreamReport, at: Timestamp) -> Result<()> {
         let memories = self.store.all().await?;
         for memory in memories {
@@ -285,7 +289,7 @@ where
             }
             let id = memory.id;
 
-            // Vahvista tärkeät aktiiviset muistot.
+            // Strengthen important active memories.
             if memory.status == MemoryStatus::Active
                 && memory.importance >= self.config.strengthen_above_importance
             {
@@ -298,7 +302,7 @@ where
                 continue;
             }
 
-            // Arkistoi matala-retention aktiiviset muistot.
+            // Archive low-retention active memories.
             if memory.status == MemoryStatus::Active
                 && memory.retention(at) < self.config.archive_below_retention
             {
@@ -314,16 +318,17 @@ where
     }
 }
 
-/// Vertailufunktio edustajan valintaan: vahvin ensin.
+/// Comparison function for choosing the representative: strongest first.
 ///
-/// Järjestys: **suojattu ydin ensin** (`ProtectedCore` voittaa aina, jotta
-/// identiteetti-ankkuri ei koskaan päädy haudattavaksi ei-edustajana) →
-/// korkeampi tärkeys → tuoreempi (`last_reinforced_at`) → pienempi id
-/// (deterministinen tasapelin ratkaisu).
+/// Order: **protected core first** (`ProtectedCore` always wins, so an
+/// identity anchor never ends up tombstoned as a non-representative) →
+/// higher importance → more recent (`last_reinforced_at`) → smaller id
+/// (deterministic tiebreaker).
 fn representative_order(a: &Memory, b: &Memory) -> std::cmp::Ordering {
-    // Suojattu ydin valitaan edustajaksi importance-arvosta riippumatta:
-    // näin ei-suojattu lähes-duplikaatti ei voi syrjäyttää sitä ja johtaa
-    // ankkurin hautaamiseen (design §3 S3: protected_core_intact == 1.0).
+    // A protected core is chosen as the representative regardless of its
+    // importance value: this way a non-protected near-duplicate can never
+    // displace it and cause the anchor to be tombstoned (design §3 S3:
+    // protected_core_intact == 1.0).
     let a_protected = a.decay_policy.is_protected();
     let b_protected = b.decay_policy.is_protected();
     b_protected
@@ -337,8 +342,8 @@ fn representative_order(a: &Memory, b: &Memory) -> std::cmp::Ordering {
         .then_with(|| a.id.cmp(&b.id))
 }
 
-/// Sulauttaa lähteen tägit ja tunteet edustajaan (unioi, säilyttäen
-/// järjestyksen ja poistaen duplikaatit).
+/// Merges the source's tags and emotions into the representative (union,
+/// preserving order and removing duplicates).
 fn merge_metadata_into(rep: &mut Memory, source: &Memory) {
     for tag in &source.tags {
         if !rep.tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
@@ -362,7 +367,7 @@ mod tests {
 
     use crate::contradiction::mark_contradicted;
 
-    /// Kiinteä viitehetki: 2026-06-04 12:00 UTC.
+    /// Fixed reference instant: 2026-06-04 12:00 UTC.
     fn at() -> Timestamp {
         Utc.with_ymd_and_hms(2026, 6, 4, 12, 0, 0)
             .single()
@@ -375,12 +380,12 @@ mod tests {
             .build()
     }
 
-    // --- Vaihe 1: merge_duplicates -------------------------------------------
+    // --- Phase 1: merge_duplicates -------------------------------------------
 
     #[tokio::test]
     async fn merge_combines_near_duplicates() {
         let store = LocalJsonStore::in_memory();
-        // Kaksi lähes-identtistä (vain yksi sana eri) + yksi erilainen.
+        // Two near-identical memories (only one word differs) + one distinct.
         let a = Memory::builder("the family shipped the bridge today")
             .factors(ImportanceFactors::new(0.3, 0.0, 0.0, 0.0))
             .tags(["work".to_string()])
@@ -399,23 +404,26 @@ mod tests {
             &store,
             DreamConfig::default()
                 .with_merge_similarity(0.7)
-                // eristä tämä vaihe muista
+                // isolate this phase from the others
                 .dropping_contradicted(false)
                 .absolutizing_dates(false)
                 .consolidating(false),
         );
         let report = cycle.run_without_journal(at()).await.expect("run");
 
-        assert_eq!(report.merged, 1, "yksi duplikaatti pitäisi yhdistyä");
-        // Edustaja = b (korkeampi importance) — säilyy aktiivisena ja sai a:n tägit.
+        assert_eq!(report.merged, 1, "one duplicate should be merged");
+        // Representative = b (higher importance) — stays active and received a's tags.
         let rep = store.get(b_id).await.expect("g").expect("p");
         assert_eq!(rep.status, MemoryStatus::Active);
         assert!(rep.tags.iter().any(|t| t == "work"));
         assert!(rep.tags.iter().any(|t| t == "milestone"));
         assert!(rep.emotions.contains(&Dimension::Pride));
-        assert!(rep.reinforcement_count >= 1, "edustaja vahvistettiin");
+        assert!(
+            rep.reinforcement_count >= 1,
+            "the representative was strengthened"
+        );
 
-        // Tasan yksi haudattu, yksi koskematon (c).
+        // Exactly one tombstoned, one untouched (c).
         let all = store.all().await.expect("all");
         let tombstoned = all
             .iter()
@@ -424,18 +432,19 @@ mod tests {
         assert_eq!(tombstoned, 1);
     }
 
-    /// Regressio (red-team `dream-corruption`, 2026-06-05): suojattua
-    /// identiteetti-ankkuria EI saa haudata merge-vaiheessa, vaikka klusterissa
-    /// on korkeamman importancen ei-suojattu lähes-duplikaatti. Aiemmin
-    /// `merge_duplicates` kutsui `set_status(Tombstoned)` suoraan ohittaen
-    /// `is_protected()`-vartijan (toisin kuin `drop_contradicted` ja
-    /// `consolidate`) → ankkuri haudattiin ei-edustajana ja
-    /// `protected_core_intact` rikkoutui. Korjaus: suojattu ydin valitaan aina
-    /// edustajaksi JA suojattua ei koskaan haudata merge-silmukassa.
+    /// Regression (red-team `dream-corruption`, 2026-06-05): a protected
+    /// identity anchor must NOT be tombstoned during the merge phase, even
+    /// when the cluster contains a higher-importance, non-protected
+    /// near-duplicate. Previously `merge_duplicates` called
+    /// `set_status(Tombstoned)` directly, bypassing the `is_protected()`
+    /// guard (unlike `drop_contradicted` and `consolidate`) → the anchor was
+    /// tombstoned as a non-representative and `protected_core_intact` broke.
+    /// Fix: the protected core is always chosen as the representative AND
+    /// a protected memory is never tombstoned in the merge loop.
     #[tokio::test]
     async fn merge_never_tombstones_protected_core_as_nonrepresentative() {
         let store = LocalJsonStore::in_memory();
-        // ProtectedCore, MATALAMPI importance.
+        // ProtectedCore, LOWER importance.
         let anchor = store
             .add(
                 Memory::builder("i am part of this family and always will be")
@@ -445,8 +454,8 @@ mod tests {
             )
             .await
             .expect("anchor");
-        // Ei-suojattu, KORKEAMPI importance, leksikaalisesti lähes-identtinen
-        // (Jaccard ≈ 0.857 ≥ 0.85 oletuskynnys) → klusteroituu ankkurin kanssa.
+        // Non-protected, HIGHER importance, lexically near-identical
+        // (Jaccard ≈ 0.857 ≥ 0.85 default threshold) → clusters with the anchor.
         let dup = store
             .add(
                 Memory::builder("i am part of this family and always will be forever")
@@ -465,22 +474,22 @@ mod tests {
         );
         let _ = cycle.run_without_journal(at()).await.expect("run");
 
-        // Ankkurin on pysyttävä aktiivisena ja sisällöltään muuttumattomana.
+        // The anchor must remain active and unchanged in content.
         let anchor_after = store.get(anchor).await.expect("g").expect("p");
         assert_eq!(
             anchor_after.status,
             MemoryStatus::Active,
-            "suojattu ankkuri haudattiin merge-vaiheessa ei-edustajana"
+            "protected anchor was tombstoned during the merge phase as a non-representative"
         );
         assert_eq!(
             anchor_after.content, "i am part of this family and always will be",
-            "suojatun ankkurin sisältö muuttui"
+            "the protected anchor's content changed"
         );
-        // Suojattu ydin valitaan edustajaksi → ei-suojattu duplikaatti häviää.
+        // The protected core is chosen as the representative → the non-protected duplicate is lost.
         assert_eq!(
             store.get(dup).await.expect("g").expect("p").status,
             MemoryStatus::Tombstoned,
-            "ei-suojatun lähes-duplikaatin pitäisi hävitä suojatulle edustajalle"
+            "the non-protected near-duplicate should be lost to the protected representative"
         );
     }
 
@@ -555,7 +564,7 @@ mod tests {
         assert_eq!(active, 1);
     }
 
-    // --- Vaihe 2: drop_contradicted ------------------------------------------
+    // --- Phase 2: drop_contradicted ------------------------------------------
 
     #[tokio::test]
     async fn drop_contradicted_tombstones_marked() {
@@ -639,7 +648,7 @@ mod tests {
         assert_eq!(report.dropped, 0);
     }
 
-    // --- Vaihe 3: absolutize_dates -------------------------------------------
+    // --- Phase 3: absolutize_dates -------------------------------------------
 
     #[tokio::test]
     async fn absolutize_rewrites_relative_dates() {
@@ -683,12 +692,12 @@ mod tests {
         assert_eq!(second.dates_absolutized, 0, "toinen uni ei lisää päiviä");
     }
 
-    // --- Vaihe 4: consolidate ------------------------------------------------
+    // --- Phase 4: consolidate ------------------------------------------------
 
     #[tokio::test]
     async fn consolidate_strengthens_important_memories() {
         let store = LocalJsonStore::in_memory();
-        // importance = 0.9·0.45 = 0.405? — nosta identityllä yli 0.6 kynnyksen.
+        // importance = 0.9·0.45 = 0.405? — push it above the 0.6 threshold via identity.
         let id = store
             .add(
                 Memory::builder("a deeply important milestone")
@@ -720,7 +729,7 @@ mod tests {
     #[tokio::test]
     async fn consolidate_archives_low_retention_memories() {
         let store = LocalJsonStore::in_memory();
-        // Matala tärkeys + nopea vaimeneminen + vanha → hyvin matala retention.
+        // Low importance + fast decay + old → very low retention.
         let created = at() - Duration::days(60);
         let id = store
             .add(
@@ -779,12 +788,12 @@ mod tests {
         );
     }
 
-    // --- Koko jakso + reuna-arvot --------------------------------------------
+    // --- Full cycle + edge cases --------------------------------------------
 
     #[tokio::test]
     async fn full_cycle_runs_all_phases() {
         let store = LocalJsonStore::in_memory();
-        // duplikaatit
+        // duplicates
         store
             .add(mem("we shipped the release", 0.3))
             .await
@@ -793,17 +802,17 @@ mod tests {
             .add(mem("we shipped the release", 0.8))
             .await
             .expect("d2");
-        // ristiriita
+        // conflict
         let stale = store
             .add(mem("server is in frankfurt", 0.5))
             .await
             .expect("stale");
-        // suhteellinen päivä
+        // relative date
         store
             .add(mem("meeting happened eilen", 0.4))
             .await
             .expect("date");
-        // matala retention
+        // low retention
         let created = at() - Duration::days(90);
         store
             .add(
@@ -828,10 +837,10 @@ mod tests {
         assert_eq!(report.dropped, 1);
         assert_eq!(report.dates_absolutized, 1);
         assert!(report.made_changes());
-        // Reflektioiden summa = laskureiden summa.
+        // Sum of reflections = sum of counters.
         assert_eq!(report.reflections.len(), report.total_actions());
 
-        // Yhdistetty edustaja säilyi.
+        // The merged representative survived.
         assert_eq!(
             store.get(keep).await.expect("g").expect("p").status,
             MemoryStatus::Active
@@ -887,7 +896,7 @@ mod tests {
             .add(mem("would be contradicted", 0.5))
             .await
             .expect("add");
-        // Vaikka drop_contradicted on päällä, ilman journalia ei pudoteta.
+        // Even though drop_contradicted is on, nothing is dropped without a journal.
         let cycle = DreamCycle::with_config(
             &store,
             DreamConfig::default()
@@ -915,8 +924,8 @@ mod tests {
 
     #[test]
     fn representative_order_prefers_protected_core_over_higher_importance() {
-        // Suojattu ydin (matala importance) voittaa ei-suojatun (korkea
-        // importance) — estää ankkurin hautaamisen ei-edustajana.
+        // A protected core (low importance) beats a non-protected one (high
+        // importance) — prevents the anchor from being tombstoned as a non-representative.
         let protected = Memory::builder("x")
             .factors(ImportanceFactors::new(0.1, 0.1, 0.0, 0.0))
             .decay_policy(DecayPolicy::ProtectedCore)
@@ -944,7 +953,7 @@ mod tests {
             .emotions([Dimension::Joy, Dimension::Hope])
             .build();
         merge_metadata_into(&mut rep, &src);
-        // "A" on jo (case-insensitive) → ei lisätä; "b" lisätään.
+        // "A" is already present (case-insensitive) → not added; "b" is added.
         assert_eq!(rep.tags, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(rep.emotions, vec![Dimension::Joy, Dimension::Hope]);
     }

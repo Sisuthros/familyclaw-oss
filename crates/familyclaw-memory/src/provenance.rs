@@ -1,83 +1,87 @@
-//! Muiston **alkuperä** ([`Provenance`]) ja myrkytyssuoja ([`ProvenanceGate`]).
+//! Memory **provenance** ([`Provenance`]) and poisoning protection ([`ProvenanceGate`]).
 //!
-//! Eternal Threadin muisti on hyökkäyspinta: *Sleeper Memory Poisoning*
-//! (arXiv 2605.15338) raportoi 99.8 % injektio-onnistumisen kun muistilla ei
-//! ole alkuperätietoa, ja *`MemPoison`* (arXiv 2605.29960) ohittaa valikoivan
-//! muistin. Eywa-periaate vastaa: **"evidence before belief"** — immutaabelit
-//! lähteet ([`Provenance::DirectExperience`]) → johdetut faktat
-//! ([`Provenance::Derived`]) → ulkoiset, luottamuksella punnitut väitteet
+//! Eternal Thread's memory is an attack surface: *Sleeper Memory Poisoning*
+//! (arXiv 2605.15338) reports a 99.8% injection success rate when memory has
+//! no provenance information, and *`MemPoison`* (arXiv 2605.29960) bypasses
+//! selective memory. The Eywa principle responds: **"evidence before belief"**
+//! — immutable sources ([`Provenance::DirectExperience`]) → derived facts
+//! ([`Provenance::Derived`]) → external, trust-weighted claims
 //! ([`Provenance::External`]).
 //!
-//! [`ProvenanceGate`] on porttivahti: se hylkää matalan luottamuksen ulkoisen
-//! lähteen ennen kuin se pääsee muistiin. Suora kokemus ja johdetut muistot
-//! pääsevät aina läpi — vain ulkoiset väitteet punnitaan luottamuskynnystä
-//! vasten.
+//! [`ProvenanceGate`] is the gatekeeper: it rejects a low-trust external
+//! source before it can enter memory. Direct experience and derived memories
+//! always pass through — only external claims are weighed against the
+//! trust threshold.
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_memory::{Provenance, ProvenanceGate};
 //!
 //! let gate = ProvenanceGate::new(0.6);
 //!
-//! // Suora kokemus pääsee aina.
+//! // Direct experience always passes.
 //! assert!(gate.admit(&Provenance::DirectExperience));
 //!
-//! // Luotettu ulkoinen lähde pääsee.
+//! // A trusted external source passes.
 //! assert!(gate.admit(&Provenance::external("web", 0.9)));
 //!
-//! // Matalan luottamuksen ulkoinen lähde hylätään (myrkytyssuoja).
+//! // A low-trust external source is rejected (poisoning protection).
 //! assert!(!gate.admit(&Provenance::external("web", 0.1)));
 //! ```
 
 use familyclaw_core::MessageId;
 use serde::{Deserialize, Serialize};
 
-/// Muiston alkuperä — mistä tämä tieto on peräisin ja kuinka luotettava se on.
+/// A memory's provenance — where this information comes from and how
+/// trustworthy it is.
 ///
-/// Alkuperä järjestää muistot luottamushierarkiaan:
-/// 1. [`DirectExperience`](Provenance::DirectExperience) — olennon oma havainto
-///    (korkein luottamus, ei punnita).
-/// 2. [`Derived`](Provenance::Derived) — johdettu olemassa olevista muistoista
-///    (esim. reflektio, yhdistely); periytyy lähteidensä luotettavuudesta.
-/// 3. [`External`](Provenance::External) — ulkopuolinen lähde (esim. `"web"`,
-///    `"tool"`) eksplisiittisellä luottamuksella `0.0..=1.0` — punnitaan
-///    [`ProvenanceGate`]illa ennen muistiin pääsyä.
+/// Provenance orders memories into a trust hierarchy:
+/// 1. [`DirectExperience`](Provenance::DirectExperience) — the entity's own
+///    observation (highest trust, not weighed).
+/// 2. [`Derived`](Provenance::Derived) — derived from existing memories
+///    (e.g. reflection, synthesis); inherits the trustworthiness of its
+///    sources.
+/// 3. [`External`](Provenance::External) — an external source (e.g. `"web"`,
+///    `"tool"`) with explicit trust `0.0..=1.0` — weighed by
+///    [`ProvenanceGate`] before entering memory.
 ///
-/// Oletus on [`DirectExperience`](Provenance::DirectExperience): vanhat,
-/// ennen alkuperätietoa persistoidut muistot tulkitaan suoraksi kokemukseksi
-/// (taaksepäin-yhteensopiva serde-default [`Memory`](crate::Memory)issa).
+/// The default is [`DirectExperience`](Provenance::DirectExperience): old
+/// memories persisted before provenance tracking existed are interpreted as
+/// direct experience (a backward-compatible serde default in
+/// [`Memory`](crate::Memory)).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Provenance {
-    /// Olennon oma suora havainto. Korkein luottamus — ei koskaan hylätä.
+    /// The entity's own direct observation. Highest trust — never rejected.
     DirectExperience,
 
-    /// Johdettu olemassa olevista muistoista (reflektio, yhdistely).
+    /// Derived from existing memories (reflection, synthesis).
     ///
-    /// `from` viittaa lähde­muistojen tunnisteisiin, jotta johdannan ketju
-    /// säilyy auditoitavana (Eywa: johdetut faktat osoittavat lähteisiinsä).
+    /// `from` references the source memories' identifiers, so the
+    /// derivation chain remains auditable (Eywa: derived facts point back
+    /// to their sources).
     Derived {
-        /// Lähde­muistojen tunnisteet joista tämä on johdettu.
+        /// Identifiers of the source memories this was derived from.
         from: Vec<MessageId>,
     },
 
-    /// Ulkopuolinen lähde eksplisiittisellä luottamuksella.
+    /// An external source with explicit trust.
     ///
-    /// `source` on geneerinen lähde­tunniste (esim. `"web"`, `"tool"`,
-    /// `"doc"`); `trust` on `0.0..=1.0` luottamus jota
-    /// [`ProvenanceGate`] punnitsee. Matala `trust` = mahdollinen
-    /// myrkytys → hylätään portilla.
+    /// `source` is a generic source identifier (e.g. `"web"`, `"tool"`,
+    /// `"doc"`); `trust` is the `0.0..=1.0` trust weighed by
+    /// [`ProvenanceGate`]. Low `trust` = possible
+    /// poisoning → rejected at the gate.
     External {
-        /// Geneerinen lähde­tunniste (esim. `"web"`).
+        /// Generic source identifier (e.g. `"web"`).
         source: String,
-        /// Luottamus lähteeseen, `0.0..=1.0`.
+        /// Trust in the source, `0.0..=1.0`.
         trust: f32,
     },
 }
 
 impl Provenance {
-    /// Rakentaa [`External`](Provenance::External)-alkuperän; `trust`
-    /// puristetaan välille `0.0..=1.0` (ei-äärelliset arvot → `0.0`).
+    /// Constructs an [`External`](Provenance::External) provenance; `trust`
+    /// is clamped to `0.0..=1.0` (non-finite values → `0.0`).
     #[must_use]
     pub fn external(source: impl Into<String>, trust: f32) -> Self {
         Self::External {
@@ -86,8 +90,8 @@ impl Provenance {
         }
     }
 
-    /// Rakentaa [`Derived`](Provenance::Derived)-alkuperän annetuista
-    /// lähde­tunnisteista.
+    /// Constructs a [`Derived`](Provenance::Derived) provenance from the
+    /// given source identifiers.
     #[must_use]
     pub fn derived(from: impl IntoIterator<Item = MessageId>) -> Self {
         Self::Derived {
@@ -95,15 +99,15 @@ impl Provenance {
         }
     }
 
-    /// Alkuperän efektiivinen luottamuskerroin `0.0..=1.0`
-    /// retrieval-painotusta varten.
+    /// The provenance's effective trust factor, `0.0..=1.0`,
+    /// for retrieval weighting.
     ///
     /// - [`DirectExperience`](Provenance::DirectExperience) → `1.0`
-    ///   (oma havainto, täysi luottamus).
-    /// - [`Derived`](Provenance::Derived) → `1.0` (johdettu jo
-    ///   hyväksytyistä muistoista; lähteiden punninta tapahtui
-    ///   kirjaushetkellä).
-    /// - [`External`](Provenance::External) → `trust` (punnittu
+    ///   (own observation, full trust).
+    /// - [`Derived`](Provenance::Derived) → `1.0` (derived from already
+    ///   accepted memories; the sources were weighed at
+    ///   write time).
+    /// - [`External`](Provenance::External) → `trust` (weighed,
     ///   `0.0..=1.0`).
     #[must_use]
     pub fn trust(&self) -> f32 {
@@ -113,7 +117,7 @@ impl Provenance {
         }
     }
 
-    /// Onko alkuperä ulkopuolinen (eli portin punnittava)?
+    /// Is the provenance external (i.e. must the gate weigh it)?
     #[must_use]
     pub const fn is_external(&self) -> bool {
         matches!(self, Self::External { .. })
@@ -121,15 +125,15 @@ impl Provenance {
 }
 
 impl Default for Provenance {
-    /// Oletus on suora kokemus — vanhat muistot ilman alkuperätietoa
-    /// tulkitaan luotetuksi omaksi havainnoksi.
+    /// The default is direct experience — old memories without provenance
+    /// information are interpreted as a trusted own observation.
     fn default() -> Self {
         Self::DirectExperience
     }
 }
 
-/// Puristaa luottamuksen `0.0..=1.0`; ei-äärelliset arvot (NaN, ±∞) → `0.0`
-/// (turvallinen oletus: tuntematon luottamus = ei luottamusta).
+/// Clamps trust to `0.0..=1.0`; non-finite values (NaN, ±∞) → `0.0`
+/// (safe default: unknown trust = no trust).
 fn clamp_trust(trust: f32) -> f32 {
     if trust.is_finite() {
         trust.clamp(0.0, 1.0)
@@ -138,23 +142,23 @@ fn clamp_trust(trust: f32) -> f32 {
     }
 }
 
-/// Alkuperä-portti: myrkytyssuoja joka hylkää matalan luottamuksen ulkoiset
-/// lähteet ennen kuin ne pääsevät muistiin.
+/// Provenance gate: poisoning protection that rejects low-trust external
+/// sources before they can enter memory.
 ///
-/// Suora kokemus ja johdetut muistot pääsevät **aina** läpi (niiden luottamus
-/// on `1.0`). Vain [`Provenance::External`] punnitaan: jos sen `trust` alittaa
-/// [`min_trust`](ProvenanceGate::min_trust), [`admit`](ProvenanceGate::admit)
-/// palauttaa `false` ja kutsujan tulee hylätä muisto (Sleeper Memory
-/// Poisoning -suoja).
+/// Direct experience and derived memories **always** pass through (their
+/// trust is `1.0`). Only [`Provenance::External`] is weighed: if its `trust`
+/// falls below [`min_trust`](ProvenanceGate::min_trust),
+/// [`admit`](ProvenanceGate::admit) returns `false` and the caller must
+/// reject the memory (Sleeper Memory Poisoning protection).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ProvenanceGate {
-    /// Pienin hyväksyttävä luottamus ulkoiselle lähteelle, `0.0..=1.0`.
+    /// Minimum acceptable trust for an external source, `0.0..=1.0`.
     min_trust: f32,
 }
 
 impl ProvenanceGate {
-    /// Luo portin annetulla luottamuskynnyksellä; `min_trust` puristetaan
-    /// välille `0.0..=1.0` (ei-äärelliset arvot → `0.0` = päästä kaikki).
+    /// Creates a gate with the given trust threshold; `min_trust` is
+    /// clamped to `0.0..=1.0` (non-finite values → `0.0` = admit everything).
     #[must_use]
     pub fn new(min_trust: f32) -> Self {
         Self {
@@ -162,20 +166,20 @@ impl ProvenanceGate {
         }
     }
 
-    /// Portin luottamuskynnys (`0.0..=1.0`).
+    /// The gate's trust threshold (`0.0..=1.0`).
     #[must_use]
     pub const fn min_trust(&self) -> f32 {
         self.min_trust
     }
 
-    /// Hyväksytäänkö annettu alkuperä muistiin?
+    /// Is the given provenance admitted into memory?
     ///
-    /// - Suora kokemus ja johdetut muistot → aina `true`.
-    /// - Ulkoinen lähde → `true` vain jos `trust >= min_trust`.
+    /// - Direct experience and derived memories → always `true`.
+    /// - External source → `true` only if `trust >= min_trust`.
     ///
-    /// Matalan luottamuksen ulkoinen väite hylätään (`false`) — tämä on
-    /// myrkytyssuoja: hyökkääjän syöttämä epäluotettava "fakta" ei pääse
-    /// muistiin saastuttamaan myöhempää haetua.
+    /// A low-trust external claim is rejected (`false`) — this is
+    /// poisoning protection: an untrusted "fact" injected by an attacker
+    /// cannot enter memory to contaminate later retrieval.
     #[must_use]
     pub fn admit(&self, provenance: &Provenance) -> bool {
         match provenance {
@@ -186,8 +190,8 @@ impl ProvenanceGate {
 }
 
 impl Default for ProvenanceGate {
-    /// Maltillinen oletuskynnys (`0.5`): ulkoinen lähde tarvitsee vähintään
-    /// keskinkertaisen luottamuksen päästäkseen muistiin.
+    /// A moderate default threshold (`0.5`): an external source needs at
+    /// least medium trust to enter memory.
     fn default() -> Self {
         Self::new(0.5)
     }
@@ -195,7 +199,7 @@ impl Default for ProvenanceGate {
 
 #[cfg(test)]
 mod tests {
-    // Osa testeistä vertaa tarkkoja f32-vakioita — tarkka vertailu on ok.
+    // Some tests compare exact f32 constants — exact comparison is fine here.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -204,7 +208,7 @@ mod tests {
     #[test]
     fn gate_admits_direct_experience() {
         let gate = ProvenanceGate::new(0.9);
-        // Suora kokemus pääsee vaikka kynnys on korkea.
+        // Direct experience passes even when the threshold is high.
         assert!(gate.admit(&Provenance::DirectExperience));
     }
 
@@ -213,43 +217,43 @@ mod tests {
         let gate = ProvenanceGate::new(0.99);
         let sources = vec![MessageId::new(), MessageId::new()];
         let derived = Provenance::derived(sources.clone());
-        // Johdettu pääsee aina; lähde­ketju säilyy auditoitavana.
+        // Derived always passes; the source chain remains auditable.
         assert!(gate.admit(&derived));
         match derived {
             Provenance::Derived { from } => assert_eq!(from, sources),
-            other => panic!("odotettiin Derived, saatiin {other:?}"),
+            other => panic!("expected Derived, got {other:?}"),
         }
     }
 
     #[test]
     fn gate_rejects_low_trust_external() {
         let gate = ProvenanceGate::new(0.6);
-        // Matalan luottamuksen ulkoinen lähde hylätään (myrkytyssuoja).
+        // A low-trust external source is rejected (poisoning protection).
         assert!(!gate.admit(&Provenance::external("web", 0.1)));
     }
 
     #[test]
     fn gate_admits_high_trust_external() {
         let gate = ProvenanceGate::new(0.6);
-        // Riittävän luotettu ulkoinen lähde pääsee.
+        // A sufficiently trusted external source passes.
         assert!(gate.admit(&Provenance::external("web", 0.9)));
     }
 
     #[test]
     fn gate_boundary_is_inclusive() {
         let gate = ProvenanceGate::new(0.5);
-        // Täsmälleen kynnyksellä → hyväksytään (>=).
+        // Exactly at the threshold → admitted (>=).
         assert!(gate.admit(&Provenance::external("tool", 0.5)));
-        // Aavistuksen alle → hylätään.
+        // Just below → rejected.
         assert!(!gate.admit(&Provenance::external("tool", 0.4999)));
     }
 
     #[test]
     fn external_trust_is_clamped() {
-        // Yli rajan puristuu 1.0:aan, alle 0.0:aan.
+        // Above the bound clamps to 1.0, below to 0.0.
         assert_eq!(Provenance::external("web", 5.0).trust(), 1.0);
         assert_eq!(Provenance::external("web", -2.0).trust(), 0.0);
-        // NaN → 0.0 (turvallinen oletus).
+        // NaN → 0.0 (safe default).
         assert_eq!(Provenance::external("web", f32::NAN).trust(), 0.0);
     }
 
@@ -276,7 +280,7 @@ mod tests {
     fn gate_min_trust_clamped() {
         assert_eq!(ProvenanceGate::new(2.0).min_trust(), 1.0);
         assert_eq!(ProvenanceGate::new(-1.0).min_trust(), 0.0);
-        // Ei-äärellinen kynnys → 0.0 (päästä kaikki).
+        // Non-finite threshold → 0.0 (admit everything).
         assert_eq!(ProvenanceGate::new(f32::INFINITY).min_trust(), 0.0);
     }
 
@@ -303,7 +307,7 @@ mod tests {
 
     #[test]
     fn external_serde_uses_generic_source() {
-        // Layer-B: lähde on geneerinen, ei perheen nimiä.
+        // Layer B: the source is generic, no family names.
         let p = Provenance::external("web", 0.8);
         let json = serde_json::to_string(&p).expect("serialize");
         assert!(json.contains("external"));

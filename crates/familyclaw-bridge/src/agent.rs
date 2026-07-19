@@ -1,14 +1,14 @@
-//! Agenttirekisteri: agenttien tiedot, rekisteröinti, liveness ja heartbeatit.
+//! Agent registry: agent metadata, registration, liveness, and heartbeats.
 //!
-//! Tämä moduuli tarjoaa [`AgentRegistry`]:n — säieturvallisen rekisterin
-//! perheen agenteista. Jokainen agentti kuvataan [`AgentInfo`]-rakenteella,
-//! ja sen "elossaolo" johdetaan viimeisimmästä heartbeatista suhteessa
-//! konfiguroituun aikakatkaisuun ([`Liveness`]).
+//! This module provides [`AgentRegistry`] — a thread-safe registry of the
+//! family's agents. Each agent is described by an [`AgentInfo`] struct, and
+//! its "liveness" is derived from its most recent heartbeat relative to a
+//! configured timeout ([`Liveness`]).
 //!
-//! Rekisteri on tarkoituksella riippumaton kuljetuskerroksesta (ei MCP-
-//! eikä HTTP-sidontaa) — adapterit kytketään myöhemmin. Sisäinen tila on suojattu
-//! [`tokio::sync::RwLock`]illa, joten useat tehtävät voivat lukea
-//! samanaikaisesti ja kirjoitukset sarjallistuvat.
+//! The registry is intentionally decoupled from the transport layer (no MCP
+//! or HTTP bindings) — adapters are wired in later. Internal state is
+//! protected by a [`tokio::sync::RwLock`], so multiple tasks can read
+//! concurrently while writes are serialized.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,91 +21,91 @@ use familyclaw_core::ids::AgentId;
 use familyclaw_core::time::{self, Timestamp};
 use familyclaw_core::{FamilyClawError, Result};
 
-/// Agentin rooli perheen työnjaossa.
+/// An agent's role in the family's division of labor.
 ///
-/// Vastaa olemassa olevan family-bridge-rajapinnan roolijoukkoa, mutta
-/// geneerisenä (ei sidottu yksittäisiin perheenjäseniin).
+/// Mirrors the role set of the existing family-bridge interface, but made
+/// generic (not tied to individual family members).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
-    /// Strategia ja koordinointi (esim. syvät analyysit).
+    /// Strategy and coordination (e.g. deep analyses).
     Strategy,
-    /// Tehtävien suorittaja (koodi, toteutus).
+    /// Task executor (code, implementation).
     Executor,
-    /// Tiedustelija (kevyt, utelias läsnäolo).
+    /// Scout (lightweight, inquisitive presence).
     Scout,
-    /// Kenttäoperaattori (työpöytä-/laiteautomaatio).
+    /// Field operator (desktop/device automation).
     FieldOperator,
 }
 
-/// Agentin ajoympäristön tyyppi (host).
+/// The kind of runtime environment (host) an agent runs on.
 ///
-/// Geneerinen — ei viittaa todellisiin koneisiin tai polkuihin.
+/// Generic — does not refer to actual machines or paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostKind {
-    /// Paikallinen natiiviprosessi.
+    /// Local native process.
     Local,
-    /// WSL2-ympäristö.
+    /// WSL2 environment.
     Wsl,
-    /// Erillinen laitteisto (hardware node).
+    /// Separate hardware node.
     Hardware,
-    /// "Body side" — kehollinen/perifeerinen ajoympäristö.
+    /// "Body side" — embodied/peripheral runtime environment.
     BodySide,
 }
 
-/// Agentin elossaolotila johdettuna viimeisimmästä heartbeatista.
+/// An agent's liveness state derived from its most recent heartbeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Liveness {
-    /// Heartbeat on tuoreempi kuin aikakatkaisu → agentti on tavoitettavissa.
+    /// The heartbeat is more recent than the timeout → the agent is reachable.
     Online,
-    /// Viimeisin heartbeat on aikakatkaisua vanhempi → ei tavoitettavissa.
+    /// The most recent heartbeat is older than the timeout → unreachable.
     Offline,
-    /// Agentilta ei ole koskaan saatu heartbeatia rekisteröinnin jälkeen.
+    /// No heartbeat has ever been received from this agent since registration.
     Unknown,
 }
 
-/// Yhden agentin (perheenjäsenen) kuvaus rekisterissä.
+/// Description of a single agent (family member) in the registry.
 ///
-/// **OSS-raja:** kentät ovat geneerisiä. Sielu/persoona/avaimet eivät kuulu
-/// tähän — `preferred_model` on vain mallin nimi (esim. `"provider/model"`),
-/// ei avain.
+/// **OSS boundary:** fields are generic. Soul/persona/keys have no place
+/// here — `preferred_model` is just a model name (e.g. `"provider/model"`),
+/// never a key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
-    /// Agentin vakaa tunniste.
+    /// The agent's stable identifier.
     pub id: AgentId,
 
-    /// Näyttönimi (geneerinen, esim. `"agent_a"`).
+    /// Display name (generic, e.g. `"agent_a"`).
     pub display_name: String,
 
-    /// Rooli työnjaossa.
+    /// Role in the division of labor.
     pub role: AgentRole,
 
-    /// Ajoympäristön tyyppi.
+    /// Runtime environment type.
     pub host_kind: HostKind,
 
-    /// Kyvykkyydet (geneeriset tunnisteet, esim. `"browser"`, `"system.run"`).
+    /// Capabilities (generic identifiers, e.g. `"browser"`, `"system.run"`).
     #[serde(default)]
     pub capabilities: Vec<String>,
 
-    /// Ensisijaisen mallin nimi, jos asetettu (ei avain).
+    /// Preferred model name, if set (not a key).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_model: Option<String>,
 
-    /// Rekisteröintihetki (UTC).
+    /// Registration time (UTC).
     pub registered_at: Timestamp,
 
-    /// Viimeisimmän heartbeatin hetki (UTC), tai `None` jos ei vielä saatu.
+    /// Time of the most recent heartbeat (UTC), or `None` if none received yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_heartbeat: Option<Timestamp>,
 }
 
 impl AgentInfo {
-    /// Rakentaa uuden agenttikuvauksen pakollisilla kentillä.
+    /// Builds a new agent description with the required fields.
     ///
-    /// `registered_at` asetetaan nykyhetkeen ja `last_heartbeat` on aluksi
-    /// `None` (tila [`Liveness::Unknown`] kunnes ensimmäinen heartbeat saapuu).
+    /// `registered_at` is set to the current time, and `last_heartbeat` starts
+    /// out as `None` (state [`Liveness::Unknown`] until the first heartbeat arrives).
     pub fn new(
         id: AgentId,
         display_name: impl Into<String>,
@@ -124,7 +124,7 @@ impl AgentInfo {
         }
     }
 
-    /// Asettaa kyvykkyydet (builder-tyyli).
+    /// Sets the capabilities (builder style).
     #[must_use]
     pub fn with_capabilities<I, S>(mut self, capabilities: I) -> Self
     where
@@ -135,18 +135,18 @@ impl AgentInfo {
         self
     }
 
-    /// Asettaa ensisijaisen mallin nimen (builder-tyyli).
+    /// Sets the preferred model name (builder style).
     #[must_use]
     pub fn with_preferred_model(mut self, model: impl Into<String>) -> Self {
         self.preferred_model = Some(model.into());
         self
     }
 
-    /// Validoi agenttikuvauksen.
+    /// Validates the agent description.
     ///
     /// # Errors
-    /// [`FamilyClawError::InvalidInput`] jos näyttönimi on tyhjä tai jokin
-    /// kyvykkyys on tyhjä merkkijono.
+    /// [`FamilyClawError::InvalidInput`] if the display name is empty or any
+    /// capability is an empty string.
     pub fn validate(&self) -> Result<()> {
         if self.display_name.trim().is_empty() {
             return Err(FamilyClawError::invalid_input(
@@ -161,11 +161,11 @@ impl AgentInfo {
         Ok(())
     }
 
-    /// Laskee agentin elossaolotilan annetulla aikakatkaisulla ja
-    /// nykyhetkellä `now`.
+    /// Computes the agent's liveness state given the timeout and the current
+    /// time `now`.
     ///
-    /// `now` annetaan parametrina determinismin vuoksi (helpottaa testausta
-    /// ja durable-replayta).
+    /// `now` is passed as a parameter for determinism (makes testing and
+    /// durable replay easier).
     #[must_use]
     pub fn liveness_at(&self, now: Timestamp, timeout: Duration) -> Liveness {
         match self.last_heartbeat {
@@ -181,11 +181,11 @@ impl AgentInfo {
     }
 }
 
-/// Säieturvallinen rekisteri perheen agenteista.
+/// A thread-safe registry of the family's agents.
 ///
-/// Sisältää agenttien [`AgentInfo`]-tiedot, hoitaa rekisteröinnin, haun,
-/// heartbeatit ja livenessin laskennan. Aikakatkaisu ([`heartbeat_timeout`])
-/// määrää milloin agentti katsotaan offline-tilaan.
+/// Holds each agent's [`AgentInfo`] and handles registration, lookup,
+/// heartbeats, and liveness computation. The timeout ([`heartbeat_timeout`])
+/// determines when an agent is considered offline.
 ///
 /// [`heartbeat_timeout`]: AgentRegistry::heartbeat_timeout
 #[derive(Debug, Clone)]
@@ -194,7 +194,7 @@ pub struct AgentRegistry {
     heartbeat_timeout: Duration,
 }
 
-/// Liveness-aikakatkaisun oletusarvo (sekunteina): 30 s.
+/// Default liveness timeout (seconds): 30 s.
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 30;
 
 impl Default for AgentRegistry {
@@ -204,16 +204,16 @@ impl Default for AgentRegistry {
 }
 
 impl AgentRegistry {
-    /// Luo tyhjän rekisterin oletusaikakatkaisulla (30 s).
+    /// Creates an empty registry with the default timeout (30 s).
     #[must_use]
     pub fn new() -> Self {
         Self::with_timeout(Duration::seconds(DEFAULT_HEARTBEAT_TIMEOUT_SECS))
     }
 
-    /// Luo tyhjän rekisterin annetulla heartbeat-aikakatkaisulla.
+    /// Creates an empty registry with the given heartbeat timeout.
     ///
-    /// Ei-positiivinen kesto normalisoidaan nollaan, jolloin agentit jotka
-    /// eivät ole lähettäneet heartbeatia *tasan nyt* näkyvät offline-tilassa.
+    /// A non-positive duration is normalized to zero, so agents that have not
+    /// sent a heartbeat *at exactly now* show up as offline.
     #[must_use]
     pub fn with_timeout(heartbeat_timeout: Duration) -> Self {
         let heartbeat_timeout = if heartbeat_timeout < Duration::zero() {
@@ -227,17 +227,17 @@ impl AgentRegistry {
         }
     }
 
-    /// Palauttaa rekisterin heartbeat-aikakatkaisun.
+    /// Returns the registry's heartbeat timeout.
     #[must_use]
     pub fn heartbeat_timeout(&self) -> Duration {
         self.heartbeat_timeout
     }
 
-    /// Rekisteröi agentin. Jos sama tunniste on jo rekisterissä, kuvaus
-    /// korvataan (idempotentti uudelleenrekisteröinti).
+    /// Registers an agent. If the same identifier is already in the registry,
+    /// the description is replaced (idempotent re-registration).
     ///
     /// # Errors
-    /// [`FamilyClawError::InvalidInput`] jos [`AgentInfo::validate`] epäonnistuu.
+    /// [`FamilyClawError::InvalidInput`] if [`AgentInfo::validate`] fails.
     pub async fn register(&self, info: AgentInfo) -> Result<()> {
         info.validate()?;
         let mut guard = self.inner.write().await;
@@ -245,39 +245,39 @@ impl AgentRegistry {
         Ok(())
     }
 
-    /// Poistaa agentin rekisteristä. Palauttaa poistetun kuvauksen jos se oli
-    /// olemassa.
+    /// Removes an agent from the registry. Returns the removed description if
+    /// it existed.
     pub async fn deregister(&self, id: AgentId) -> Option<AgentInfo> {
         let mut guard = self.inner.write().await;
         guard.remove(&id)
     }
 
-    /// Hakee agentin kuvauksen tunnisteen perusteella.
+    /// Looks up an agent's description by identifier.
     pub async fn get(&self, id: AgentId) -> Option<AgentInfo> {
         let guard = self.inner.read().await;
         guard.get(&id).cloned()
     }
 
-    /// Onko annettu agentti rekisteröity.
+    /// Whether the given agent is registered.
     pub async fn contains(&self, id: AgentId) -> bool {
         let guard = self.inner.read().await;
         guard.contains_key(&id)
     }
 
-    /// Rekisteröityjen agenttien määrä.
+    /// Number of registered agents.
     pub async fn len(&self) -> usize {
         let guard = self.inner.read().await;
         guard.len()
     }
 
-    /// Onko rekisteri tyhjä.
+    /// Whether the registry is empty.
     pub async fn is_empty(&self) -> bool {
         let guard = self.inner.read().await;
         guard.is_empty()
     }
 
-    /// Palauttaa kaikkien agenttien kuvaukset tunnisteen mukaan järjestettynä
-    /// (deterministinen järjestys).
+    /// Returns all agents' descriptions, ordered by identifier
+    /// (deterministic order).
     pub async fn list(&self) -> Vec<AgentInfo> {
         let guard = self.inner.read().await;
         let mut out: Vec<AgentInfo> = guard.values().cloned().collect();
@@ -285,10 +285,10 @@ impl AgentRegistry {
         out
     }
 
-    /// Kirjaa heartbeatin agentille hetkellä `at`.
+    /// Records a heartbeat for the agent at time `at`.
     ///
     /// # Errors
-    /// [`FamilyClawError::NotFound`] jos agenttia ei ole rekisteröity.
+    /// [`FamilyClawError::NotFound`] if the agent is not registered.
     pub async fn heartbeat(&self, id: AgentId, at: Timestamp) -> Result<()> {
         let mut guard = self.inner.write().await;
         match guard.get_mut(&id) {
@@ -300,18 +300,18 @@ impl AgentRegistry {
         }
     }
 
-    /// Kirjaa heartbeatin nykyhetkellä.
+    /// Records a heartbeat at the current time.
     ///
     /// # Errors
-    /// [`FamilyClawError::NotFound`] jos agenttia ei ole rekisteröity.
+    /// [`FamilyClawError::NotFound`] if the agent is not registered.
     pub async fn heartbeat_now(&self, id: AgentId) -> Result<()> {
         self.heartbeat(id, time::now()).await
     }
 
-    /// Palauttaa agentin elossaolotilan suhteessa hetkeen `now`.
+    /// Returns the agent's liveness state relative to time `now`.
     ///
     /// # Errors
-    /// [`FamilyClawError::NotFound`] jos agenttia ei ole rekisteröity.
+    /// [`FamilyClawError::NotFound`] if the agent is not registered.
     pub async fn liveness_at(&self, id: AgentId, now: Timestamp) -> Result<Liveness> {
         let guard = self.inner.read().await;
         match guard.get(&id) {
@@ -320,16 +320,16 @@ impl AgentRegistry {
         }
     }
 
-    /// Palauttaa agentin elossaolotilan nykyhetkellä.
+    /// Returns the agent's liveness state at the current time.
     ///
     /// # Errors
-    /// [`FamilyClawError::NotFound`] jos agenttia ei ole rekisteröity.
+    /// [`FamilyClawError::NotFound`] if the agent is not registered.
     pub async fn liveness(&self, id: AgentId) -> Result<Liveness> {
         self.liveness_at(id, time::now()).await
     }
 
-    /// Palauttaa kaikki agentit jotka ovat online-tilassa hetkellä `now`,
-    /// tunnisteen mukaan järjestettynä.
+    /// Returns all agents that are online at time `now`, ordered by
+    /// identifier.
     pub async fn online_at(&self, now: Timestamp) -> Vec<AgentInfo> {
         let guard = self.inner.read().await;
         let mut out: Vec<AgentInfo> = guard
@@ -389,17 +389,17 @@ mod tests {
         let mut info = sample(id, "agent_a");
         let timeout = Duration::seconds(30);
 
-        // Ei heartbeatia → Unknown.
+        // No heartbeat → Unknown.
         assert_eq!(info.liveness_at(ts(100), timeout), Liveness::Unknown);
 
-        // Heartbeat juuri nyt → Online.
+        // Heartbeat right now → Online.
         info.last_heartbeat = Some(ts(100));
         assert_eq!(info.liveness_at(ts(100), timeout), Liveness::Online);
 
-        // 30 s myöhemmin, rajalla → Online (<=).
+        // 30 s later, at the boundary → Online (<=).
         assert_eq!(info.liveness_at(ts(130), timeout), Liveness::Online);
 
-        // 31 s myöhemmin → Offline.
+        // 31 s later → Offline.
         assert_eq!(info.liveness_at(ts(131), timeout), Liveness::Offline);
     }
 
@@ -427,7 +427,7 @@ mod tests {
             Some("agent_a".to_string())
         );
 
-        // Uudelleenrekisteröinti samalla id:llä korvaa, ei kasvata määrää.
+        // Re-registering with the same id replaces the entry, without growing the count.
         reg.register(sample(id, "agent_a_renamed"))
             .await
             .expect("re-register");
@@ -467,7 +467,7 @@ mod tests {
         let reg = AgentRegistry::new();
         let lo = AgentId::from_uuid(uuid::Uuid::from_u128(1));
         let hi = AgentId::from_uuid(uuid::Uuid::from_u128(2));
-        // Rekisteröi käänteisessä järjestyksessä.
+        // Register in reverse order.
         reg.register(sample(hi, "agent_hi")).await.expect("reg hi");
         reg.register(sample(lo, "agent_lo")).await.expect("reg lo");
 
@@ -493,7 +493,7 @@ mod tests {
         let id = AgentId::new();
         reg.register(sample(id, "agent_a")).await.expect("register");
 
-        // Ennen heartbeatia → Unknown.
+        // Before the heartbeat → Unknown.
         assert_eq!(
             reg.liveness_at(id, ts(100)).await.expect("liveness"),
             Liveness::Unknown
@@ -501,12 +501,12 @@ mod tests {
 
         reg.heartbeat(id, ts(100)).await.expect("heartbeat");
 
-        // Tuore → Online.
+        // Fresh → Online.
         assert_eq!(
             reg.liveness_at(id, ts(120)).await.expect("liveness"),
             Liveness::Online
         );
-        // Vanhentunut → Offline.
+        // Stale → Offline.
         assert_eq!(
             reg.liveness_at(id, ts(200)).await.expect("liveness"),
             Liveness::Offline
@@ -535,7 +535,7 @@ mod tests {
 
         reg.heartbeat(a, ts(100)).await.expect("hb a"); // online @120
         reg.heartbeat(b, ts(50)).await.expect("hb b"); // offline @120 (70s old)
-                                                       // c: ei heartbeatia → Unknown, ei online.
+                                                       // c: no heartbeat → Unknown, not online.
 
         let online = reg.online_at(ts(120)).await;
         assert_eq!(online.len(), 1);
@@ -549,12 +549,12 @@ mod tests {
         let id = AgentId::new();
         reg.register(sample(id, "agent_a")).await.expect("register");
         reg.heartbeat(id, ts(100)).await.expect("heartbeat");
-        // Tasan nyt → Online (<= 0).
+        // Exactly now → Online (<= 0).
         assert_eq!(
             reg.liveness_at(id, ts(100)).await.expect("liveness"),
             Liveness::Online
         );
-        // 1 s myöhemmin → Offline.
+        // 1 s later → Offline.
         assert_eq!(
             reg.liveness_at(id, ts(101)).await.expect("liveness"),
             Liveness::Offline
@@ -567,7 +567,7 @@ mod tests {
         let clone = reg.clone();
         let id = AgentId::new();
         reg.register(sample(id, "agent_a")).await.expect("register");
-        // Klooni näkee saman tilan (jaettu Arc).
+        // The clone sees the same state (shared Arc).
         assert!(clone.contains(id).await);
     }
 }

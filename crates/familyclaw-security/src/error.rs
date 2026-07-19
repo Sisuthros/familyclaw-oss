@@ -1,43 +1,44 @@
-//! Turvakerroksen virhetyypit.
+//! Error types for the security layer.
 //!
-//! Kaikki tämän craten epäonnistumiset kulkevat [`SecurityError`]-tyypin
-//! kautta — **ei** `unwrap()`/`expect()`/`panic!()` tuotantopolulla. Tyyppi
-//! muuntuu [`familyclaw_core::FamilyClawError`]:ksi [`From`]-toteutuksella,
-//! jotta turvavirheet voivat kulkea alustan keskitetyn virhetyypin läpi.
+//! All failures in this crate flow through the [`SecurityError`] type —
+//! **no** `unwrap()`/`expect()`/`panic!()` on the production path. The type
+//! converts into [`familyclaw_core::FamilyClawError`] via a [`From`]
+//! implementation, so security errors can flow through the platform's
+//! centralized error type.
 
 use thiserror::Error;
 
 use familyclaw_core::FamilyClawError;
 
-/// Turvakerroksen virhetyyppi.
+/// The security layer's error type.
 ///
-/// Kattaa identity-anchorien, tamper-tunnistuksen ja [`crate::HumanCorrection`]:n
-/// virheluokat. `#[non_exhaustive]` jotta uusia variantteja voi lisätä
-/// rikkomatta downstream-koodia.
+/// Covers the error classes for identity anchors, tamper detection, and
+/// [`crate::HumanCorrection`]. `#[non_exhaustive]` so new variants can be
+/// added without breaking downstream code.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SecurityError {
-    /// Annettu sisältö oli kelvoton (esim. tyhjä SOUL-sisältö ankkurille).
+    /// The given content was invalid (e.g. empty SOUL content for an anchor).
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
-    /// Annettu hash-merkkijono ei ollut kelvollinen heksadesimaalinen
-    /// SHA-256-tiiviste (väärä pituus tai ei-heksamerkkejä).
+    /// The given hash string was not a valid hexadecimal SHA-256 digest
+    /// (wrong length or non-hex characters).
     #[error("invalid hash: {0}")]
     InvalidHash(String),
 
-    /// JSON-sarjallistus tai -jäsennys epäonnistui.
+    /// JSON serialization or parsing failed.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
 }
 
 impl SecurityError {
-    /// Rakentaa [`SecurityError::InvalidInput`]-variantin.
+    /// Constructs a [`SecurityError::InvalidInput`] variant.
     pub fn invalid_input(msg: impl Into<String>) -> Self {
         Self::InvalidInput(msg.into())
     }
 
-    /// Rakentaa [`SecurityError::InvalidHash`]-variantin.
+    /// Constructs a [`SecurityError::InvalidHash`] variant.
     pub fn invalid_hash(msg: impl Into<String>) -> Self {
         Self::InvalidHash(msg.into())
     }
@@ -46,15 +47,15 @@ impl SecurityError {
 impl From<SecurityError> for FamilyClawError {
     fn from(err: SecurityError) -> Self {
         match err {
-            // Säilytä serde luonnollisena alustan varianttina.
+            // Keep serde as the platform's natural variant for it.
             SecurityError::Serde(serde) => FamilyClawError::Serde(serde),
-            // Loput ovat syöte-/validointivirheitä.
+            // The rest are input/validation errors.
             other => FamilyClawError::invalid_input(other.to_string()),
         }
     }
 }
 
-/// Turvacraten vakiotulostyyppi.
+/// The security crate's standard result type.
 pub type Result<T> = std::result::Result<T, SecurityError>;
 
 #[cfg(test)]

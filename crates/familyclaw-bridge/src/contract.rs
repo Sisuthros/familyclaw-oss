@@ -1,22 +1,22 @@
-//! Agenttien väliset sopimukset: tyypitetty FIPA-ContractNet-toteutus.
+//! Contracts between agents: a typed FIPA `ContractNet` implementation.
 //!
-//! Tämä moduuli antaa agenteille **todennettavan** tavan sopia työstä:
-//! palveluntarjoaja mainostaa [`Capability`]-kyvyn (jolla on tyypitetty
-//! syöte-/tulosskeema ja esi-/jälkiehdot), pyytäjä tekee sopimusehdotuksen
-//! ([`ContractBoard::propose`]) joka validoidaan syöteskeemaa vasten, ja
-//! sopimus täytetään ([`ContractBoard::fulfill`]) vasta kun toimite läpäisee
-//! tulosskeeman ja **jokaisen** jälkiehdon.
+//! This module gives agents a **verifiable** way to agree on work: a provider
+//! advertises a [`Capability`] (which has a typed input/output schema and
+//! pre-/postconditions), a requester makes a contract proposal
+//! ([`ContractBoard::propose`]) which is validated against the input schema,
+//! and the contract is fulfilled ([`ContractBoard::fulfill`]) only once the
+//! deliverable passes the output schema and **every** postcondition.
 //!
-//! ## Miksi tyypitetty?
-//! Pelkkä "tee tämä" ei riitä luotettavaan moniagenttityöhön: tarvitaan
-//! koneellisesti tarkistettava lupaus. [`Schema`] tarkistaa rakenteen,
-//! [`Clause`] tarkistaa väitteet ("kenttä X on olemassa", "lista ei ole
-//! tyhjä", "arvo ≥ N"). Jälkiehtojen rikkominen siirtää sopimuksen tilaan
-//! [`ContractStatus::Failed`] virheen kanssa — ei hiljaista hyväksyntää.
+//! ## Why typed?
+//! A plain "do this" is not enough for reliable multi-agent work: a
+//! machine-checkable promise is needed. [`Schema`] checks structure,
+//! [`Clause`] checks assertions ("field X exists", "the list is not empty",
+//! "the value is ≥ N"). Breaching a postcondition moves the contract to
+//! [`ContractStatus::Failed`] with an error — never silent acceptance.
 //!
-//! ## OSS-raja
-//! Geneerinen: ei kovakoodattuja kykyjä, sieluja eikä avaimia. Hyötykuormat
-//! ovat `serde_json::Value`.
+//! ## OSS boundary
+//! Generic: no hardcoded capabilities, souls, or keys. Payloads are
+//! `serde_json::Value`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,32 +32,32 @@ use familyclaw_core::FamilyClawError;
 use crate::task::TaskId;
 
 // ===========================================================================
-// Skeema ja kentät
+// Schema and fields
 // ===========================================================================
 
-/// Yksittäisen kentän odotettu tyyppi skeemassa.
+/// The expected type of a single field in a schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FieldType {
-    /// Merkkijono (`string`).
+    /// String (`string`).
     Str,
-    /// Kokonais- tai liukuluku (`number`).
+    /// Integer or floating-point number (`number`).
     Int,
-    /// Totuusarvo (`bool`).
+    /// Boolean (`bool`).
     Bool,
-    /// Lista (`array`).
+    /// List (`array`).
     Arr,
-    /// Objekti (`object`).
+    /// Object (`object`).
     Obj,
 }
 
 impl FieldType {
-    /// Täsmääkö annettu JSON-arvo tähän tyyppiin.
+    /// Whether the given JSON value matches this type.
     #[must_use]
     pub fn matches(self, value: &Value) -> bool {
         match self {
             FieldType::Str => value.is_string(),
-            // `Int` hyväksyy minkä tahansa JSON-numeron (kokonais/liuku).
+            // `Int` accepts any JSON number (integer or floating-point).
             FieldType::Int => value.is_number(),
             FieldType::Bool => value.is_boolean(),
             FieldType::Arr => value.is_array(),
@@ -65,7 +65,7 @@ impl FieldType {
         }
     }
 
-    /// Tyypin vakaa nimi virheviesteihin.
+    /// The type's stable name for error messages.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -78,29 +78,29 @@ impl FieldType {
     }
 }
 
-/// Yksittäinen kenttäkuvaus skeemassa.
+/// A single field description in a schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Field {
-    /// Kentän nimi (avain objektissa).
+    /// The field's name (key in the object).
     pub name: String,
 
-    /// Kentän odotettu tyyppi.
+    /// The field's expected type.
     pub ty: FieldType,
 
-    /// Onko kenttä pakollinen. Pakollinen puuttuva kenttä on rikkomus;
-    /// valinnaisen puuttuminen on sallittua, mutta jos arvo on annettu, sen
-    /// tyypin on täsmättävä.
+    /// Whether the field is required. A missing required field is a
+    /// violation; a missing optional field is allowed, but if a value is
+    /// present, its type must match.
     #[serde(default = "default_true")]
     pub required: bool,
 }
 
-/// Serde-oletus `required`-kentälle (`true`).
+/// Serde default for the `required` field (`true`).
 const fn default_true() -> bool {
     true
 }
 
 impl Field {
-    /// Pakollinen kenttä.
+    /// A required field.
     pub fn required(name: impl Into<String>, ty: FieldType) -> Self {
         Self {
             name: name.into(),
@@ -109,7 +109,7 @@ impl Field {
         }
     }
 
-    /// Valinnainen kenttä.
+    /// An optional field.
     pub fn optional(name: impl Into<String>, ty: FieldType) -> Self {
         Self {
             name: name.into(),
@@ -119,40 +119,40 @@ impl Field {
     }
 }
 
-/// Yhden skeemarikkomuksen kuvaus.
+/// A description of a single schema violation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaViolation {
-    /// Kentän nimi johon rikkomus liittyy.
+    /// The name of the field the violation concerns.
     pub field: String,
 
-    /// Ihmisluettava syy (esim. "missing required field", "expected number").
+    /// A human-readable reason (e.g. "missing required field", "expected number").
     pub reason: String,
 }
 
-/// Tyypitetty objektiskeema: joukko nimettyjä kenttiä.
+/// A typed object schema: a set of named fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schema {
-    /// Skeeman kentät.
+    /// The schema's fields.
     pub fields: Vec<Field>,
 }
 
 impl Schema {
-    /// Rakentaa skeeman kenttälistasta.
+    /// Builds a schema from a list of fields.
     #[must_use]
     pub fn new(fields: Vec<Field>) -> Self {
         Self { fields }
     }
 
-    /// Tyhjä skeema (hyväksyy minkä tahansa objektin).
+    /// An empty schema (accepts any object).
     #[must_use]
     pub fn empty() -> Self {
         Self { fields: Vec::new() }
     }
 
-    /// Tarkistaa arvon skeemaa vasten ja palauttaa kaikki rikkomukset.
+    /// Checks a value against the schema and returns all violations.
     ///
-    /// Tyhjä palautus tarkoittaa että arvo läpäisi. Jos arvo ei ole objekti
-    /// lainkaan, palautetaan yksi rikkomus pseudokentälle `"$root"`.
+    /// An empty return means the value passed. If the value is not an object
+    /// at all, a single violation is returned for the pseudo-field `"$root"`.
     #[must_use]
     pub fn check(&self, value: &Value) -> Vec<SchemaViolation> {
         let mut out = Vec::new();
@@ -192,7 +192,7 @@ impl Schema {
         out
     }
 
-    /// Onko arvo skeeman mukainen (ei rikkomuksia).
+    /// Whether the value conforms to the schema (no violations).
     #[must_use]
     pub fn is_valid(&self, value: &Value) -> bool {
         self.check(value).is_empty()
@@ -200,46 +200,46 @@ impl Schema {
 }
 
 // ===========================================================================
-// Ehtolauseet (Clause)
+// Clauses
 // ===========================================================================
 
-/// Ehtolauseen operaattori.
+/// A clause's operator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClauseOp {
-    /// Kenttä on olemassa eikä ole `null`.
+    /// The field exists and is not `null`.
     Present,
-    /// Kenttä on olemassa eikä ole tyhjä (merkkijono/lista/objekti).
+    /// The field exists and is not empty (string/list/object).
     NonEmpty,
-    /// Kentän arvo on yhtä suuri kuin vertailuarvo.
+    /// The field's value equals the comparison value.
     Eq,
-    /// Kentän numeerinen arvo on ≥ vertailuarvo.
+    /// The field's numeric value is ≥ the comparison value.
     Gte,
-    /// Kentän numeerinen arvo on ≤ vertailuarvo.
+    /// The field's numeric value is ≤ the comparison value.
     Lte,
-    /// Kentän pituus (merkkijono/lista/objekti) on ≥ vertailuarvo.
+    /// The field's length (string/list/object) is ≥ the comparison value.
     MinLen,
-    /// Kentän pituus (merkkijono/lista/objekti) on ≤ vertailuarvo.
+    /// The field's length (string/list/object) is ≤ the comparison value.
     MaxLen,
 }
 
-/// Yksittäinen ehtolause: väite kentästä toimitteessa/syötteessä.
+/// A single clause: an assertion about a field in a deliverable/input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Clause {
-    /// Tarkistettavan kentän nimi.
+    /// The name of the field being checked.
     pub field: String,
 
-    /// Operaattori.
+    /// The operator.
     pub op: ClauseOp,
 
-    /// Vertailuarvo (operaattorista riippuen luku, merkkijono jne.).
-    /// `Present`/`NonEmpty` jättävät tämän huomiotta.
+    /// The comparison value (a number, string, etc. depending on the
+    /// operator). `Present`/`NonEmpty` ignore this.
     #[serde(default)]
     pub value: Value,
 }
 
 impl Clause {
-    /// `field` on olemassa eikä `null`.
+    /// `field` exists and is not `null`.
     pub fn present(field: impl Into<String>) -> Self {
         Self {
             field: field.into(),
@@ -248,7 +248,7 @@ impl Clause {
         }
     }
 
-    /// `field` ei ole tyhjä.
+    /// `field` is not empty.
     pub fn non_empty(field: impl Into<String>) -> Self {
         Self {
             field: field.into(),
@@ -266,7 +266,7 @@ impl Clause {
         }
     }
 
-    /// `field >= value` (numeerinen).
+    /// `field >= value` (numeric).
     pub fn gte(field: impl Into<String>, value: Value) -> Self {
         Self {
             field: field.into(),
@@ -275,7 +275,7 @@ impl Clause {
         }
     }
 
-    /// `field <= value` (numeerinen).
+    /// `field <= value` (numeric).
     pub fn lte(field: impl Into<String>, value: Value) -> Self {
         Self {
             field: field.into(),
@@ -302,7 +302,7 @@ impl Clause {
         }
     }
 
-    /// Ihmisluettava kuvaus ehdosta (lokiin ja virheviesteihin).
+    /// A human-readable description of the clause (for logs and error messages).
     #[must_use]
     pub fn describe(&self) -> String {
         match self.op {
@@ -316,10 +316,10 @@ impl Clause {
         }
     }
 
-    /// Arvioi ehdon annettua (objekti)arvoa vasten.
+    /// Evaluates the clause against the given (object) value.
     ///
-    /// Palauttaa `false` jos kenttää ei ole, tyyppi ei sovi operaattorille,
-    /// tai väite ei pidä paikkaansa.
+    /// Returns `false` if the field is missing, the type does not fit the
+    /// operator, or the assertion does not hold.
     #[must_use]
     pub fn eval(&self, value: &Value) -> bool {
         let field = value.get(&self.field);
@@ -352,12 +352,12 @@ impl Clause {
     }
 }
 
-/// Poimii numeerisen arvon (f64) JSON-arvosta, jos se on numero.
+/// Extracts a numeric value (f64) from a JSON value, if it is a number.
 fn number(value: Option<&Value>) -> Option<f64> {
     value.and_then(Value::as_f64)
 }
 
-/// Palauttaa kentän pituuden (merkkijono/lista/objekti), jos sovellettavissa.
+/// Returns the field's length (string/list/object), if applicable.
 fn length(value: Option<&Value>) -> Option<u64> {
     match value {
         Some(Value::String(s)) => Some(s.chars().count() as u64),
@@ -368,38 +368,39 @@ fn length(value: Option<&Value>) -> Option<u64> {
 }
 
 // ===========================================================================
-// Kyvykkyys ja sen rekisteri
+// Capability and its registry
 // ===========================================================================
 
-/// Tyypitetty kyvykkyys jonka palveluntarjoaja voi mainostaa.
+/// A typed capability that a provider can advertise.
 ///
-/// Sisältää syöte-/tulosskeeman sekä esi- ja jälkiehdot. Esiehdot tarkistetaan
-/// kun sopimus hyväksytään; jälkiehdot kun se täytetään.
+/// Contains an input/output schema plus pre- and postconditions.
+/// Preconditions are checked when the contract is accepted; postconditions
+/// when it is fulfilled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capability {
-    /// Kyvyn vakaa tunniste.
+    /// The capability's stable identifier.
     pub id: MessageId,
 
-    /// Kyvyn nimi (esim. `"render_video"`).
+    /// The capability's name (e.g. `"render_video"`).
     pub name: String,
 
-    /// Syötteen skeema.
+    /// The input schema.
     pub input: Schema,
 
-    /// Tuloksen skeema.
+    /// The output schema.
     pub output: Schema,
 
-    /// Esiehdot (tarkistetaan hyväksynnässä, syötettä vasten).
+    /// Preconditions (checked on acceptance, against the input).
     #[serde(default)]
     pub preconditions: Vec<Clause>,
 
-    /// Jälkiehdot (tarkistetaan täyttämisessä, toimitetta vasten).
+    /// Postconditions (checked on fulfillment, against the deliverable).
     #[serde(default)]
     pub postconditions: Vec<Clause>,
 }
 
 impl Capability {
-    /// Rakentaa kyvyn nimellä ja skeemoilla, ilman ehtoja.
+    /// Builds a capability with a name and schemas, without conditions.
     pub fn new(name: impl Into<String>, input: Schema, output: Schema) -> Self {
         Self {
             id: MessageId::new(),
@@ -411,14 +412,14 @@ impl Capability {
         }
     }
 
-    /// Asettaa esiehdot (builder-tyyli).
+    /// Sets the preconditions (builder style).
     #[must_use]
     pub fn with_preconditions(mut self, clauses: Vec<Clause>) -> Self {
         self.preconditions = clauses;
         self
     }
 
-    /// Asettaa jälkiehdot (builder-tyyli).
+    /// Sets the postconditions (builder style).
     #[must_use]
     pub fn with_postconditions(mut self, clauses: Vec<Clause>) -> Self {
         self.postconditions = clauses;
@@ -426,14 +427,14 @@ impl Capability {
     }
 }
 
-/// Säieturvallinen rekisteri mainostetuista kyvyistä.
+/// A thread-safe registry of advertised capabilities.
 #[derive(Debug, Clone, Default)]
 pub struct CapabilityRegistry {
     inner: Arc<RwLock<HashMap<MessageId, Capability>>>,
 }
 
 impl CapabilityRegistry {
-    /// Luo tyhjän rekisterin.
+    /// Creates an empty registry.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -441,7 +442,7 @@ impl CapabilityRegistry {
         }
     }
 
-    /// Mainostaa (lisää tai korvaa) kyvyn ja palauttaa sen tunnisteen.
+    /// Advertises (adds or replaces) a capability and returns its identifier.
     pub async fn advertise(&self, capability: Capability) -> MessageId {
         let id = capability.id;
         let mut guard = self.inner.write().await;
@@ -449,13 +450,13 @@ impl CapabilityRegistry {
         id
     }
 
-    /// Hakee kyvyn tunnisteen perusteella.
+    /// Looks up a capability by identifier.
     pub async fn get(&self, id: MessageId) -> Option<Capability> {
         let guard = self.inner.read().await;
         guard.get(&id).cloned()
     }
 
-    /// Palauttaa kaikki annetun nimiset kyvyt (tunnisteen mukaan järjestettynä).
+    /// Returns all capabilities with the given name, ordered by identifier.
     pub async fn find_by_name(&self, name: &str) -> Vec<Capability> {
         let guard = self.inner.read().await;
         let mut out: Vec<Capability> = guard.values().filter(|c| c.name == name).cloned().collect();
@@ -463,13 +464,13 @@ impl CapabilityRegistry {
         out
     }
 
-    /// Rekisteröityjen kykyjen määrä.
+    /// Number of registered capabilities.
     pub async fn len(&self) -> usize {
         let guard = self.inner.read().await;
         guard.len()
     }
 
-    /// Onko rekisteri tyhjä.
+    /// Whether the registry is empty.
     pub async fn is_empty(&self) -> bool {
         let guard = self.inner.read().await;
         guard.is_empty()
@@ -477,34 +478,35 @@ impl CapabilityRegistry {
 }
 
 // ===========================================================================
-// Sopimuksen tila ja toimite
+// Contract status and deliverable
 // ===========================================================================
 
-/// Sopimuksen tila (tilakone).
+/// A contract's status (state machine).
 ///
-/// Sallitut siirtymät:
+/// Allowed transitions:
 /// - `Proposed → Accepted`, `Proposed → Rejected`
 /// - `Accepted → Fulfilled`, `Accepted → Failed`
 ///
-/// `Rejected`, `Fulfilled` ja `Failed` ovat terminaalisia.
+/// `Rejected`, `Fulfilled`, and `Failed` are terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContractStatus {
-    /// Ehdotettu, odottaa hyväksyntää/hylkäystä.
+    /// Proposed, awaiting acceptance/rejection.
     Proposed,
-    /// Hyväksytty, työ menossa.
+    /// Accepted, work in progress.
     Accepted,
-    /// Hylätty ehdotusvaiheessa (terminaalinen).
+    /// Rejected at the proposal stage (terminal).
     Rejected,
-    /// Täytetty: toimite läpäisi tulosskeeman ja jälkiehdot (terminaalinen).
+    /// Fulfilled: the deliverable passed the output schema and postconditions
+    /// (terminal).
     Fulfilled,
-    /// Epäonnistui: toimite rikkoi jälkiehdon tai tarjoaja ilmoitti virheen
-    /// (terminaalinen).
+    /// Failed: the deliverable breached a postcondition, or the provider
+    /// reported an error (terminal).
     Failed,
 }
 
 impl ContractStatus {
-    /// Onko tila terminaalinen.
+    /// Whether the status is terminal.
     #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(
@@ -513,7 +515,7 @@ impl ContractStatus {
         )
     }
 
-    /// Onko siirtymä `self → next` sallittu.
+    /// Whether the transition `self → next` is allowed.
     #[must_use]
     pub fn can_transition_to(self, next: ContractStatus) -> bool {
         use ContractStatus::{Accepted, Failed, Fulfilled, Proposed, Rejected};
@@ -524,71 +526,77 @@ impl ContractStatus {
     }
 }
 
-/// Sopimuksen toimite (tarjoajan tuotos).
+/// A contract's deliverable (the provider's output).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deliverable {
-    /// Toimitteen tuottanut agentti.
+    /// The agent that produced the deliverable.
     pub from: AgentId,
 
-    /// Toimitteen hyötykuorma (tarkistetaan tulosskeemaa + jälkiehtoja vasten).
+    /// The deliverable's payload (checked against the output schema +
+    /// postconditions).
     pub payload: Value,
 
-    /// Toimitushetki (UTC, injektoitu).
+    /// The delivery time (UTC, injected).
     pub at: Timestamp,
 }
 
 impl Deliverable {
-    /// Rakentaa toimitteen.
+    /// Builds a deliverable.
     #[must_use]
     pub fn new(from: AgentId, payload: Value, at: Timestamp) -> Self {
         Self { from, payload, at }
     }
 }
 
-/// Yksittäinen sopimus pyytäjän ja tarjoajan välillä.
+/// A single contract between a requester and a provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Contract {
-    /// Sopimuksen vakaa tunniste.
+    /// The contract's stable identifier.
     pub id: MessageId,
 
-    /// Sopimuksen pohjana oleva kyky (kopio mainostushetkeltä).
+    /// The capability underlying the contract (a copy from the time it was
+    /// advertised).
     pub capability: Capability,
 
-    /// Työn pyytäjä.
+    /// The requester of the work.
     pub requester: AgentId,
 
-    /// Työn tarjoaja.
+    /// The provider of the work.
     pub provider: AgentId,
 
-    /// Sopimuksen syöte (validoitiin kyvyn syöteskeemaa vasten).
+    /// The contract's input (validated against the capability's input
+    /// schema).
     pub input: Value,
 
-    /// Tulosskeema jota toimitteen on noudatettava (kopio kyvystä).
+    /// The output schema the deliverable must conform to (a copy from the
+    /// capability).
     pub output_schema: Schema,
 
-    /// Jälkiehdot jotka toimitteen on täytettävä (kopio kyvystä).
+    /// The postconditions the deliverable must satisfy (a copy from the
+    /// capability).
     pub postconditions: Vec<Clause>,
 
-    /// Sopimuksen nykyinen tila.
+    /// The contract's current status.
     pub status: ContractStatus,
 
-    /// Toimite, kun täytetty.
+    /// The deliverable, once fulfilled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deliverable: Option<Deliverable>,
 
-    /// Linkki orkesteroinnin tehtävään, jos sopimus syntyi työnkulusta.
+    /// A link to the orchestration task, if the contract originated from a
+    /// workflow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<TaskId>,
 
-    /// Luontihetki (UTC, injektoitu).
+    /// Creation time (UTC, injected).
     pub created_at: Timestamp,
 
-    /// Viimeisimmän muutoksen hetki (UTC, injektoitu).
+    /// Time of the most recent change (UTC, injected).
     pub updated_at: Timestamp,
 }
 
 impl Contract {
-    /// Liittää sopimuksen orkesteroinnin tehtävään (builder-tyyli).
+    /// Links the contract to an orchestration task (builder style).
     #[must_use]
     pub fn with_link(mut self, task: TaskId) -> Self {
         self.link = Some(task);
@@ -597,36 +605,36 @@ impl Contract {
 }
 
 // ===========================================================================
-// Virheet
+// Errors
 // ===========================================================================
 
-/// Sopimustoiminnon virhe.
+/// A contract operation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContractError {
-    /// Syöte ei läpäissyt kyvyn syöteskeemaa.
+    /// The input did not pass the capability's input schema.
     InputSchemaViolation(Vec<SchemaViolation>),
 
-    /// Esiehto ei toteutunut hyväksyttäessä.
+    /// A precondition was not satisfied on acceptance.
     PreconditionFailed(String),
 
-    /// Toimite ei läpäissyt tulosskeemaa.
+    /// The deliverable did not pass the output schema.
     OutputSchemaViolation(Vec<SchemaViolation>),
 
-    /// Toimite rikkoi jälkiehdon.
+    /// The deliverable breached a postcondition.
     PostconditionBreach(String),
 
-    /// Yritetty laiton tilasiirtymä.
+    /// An illegal state transition was attempted.
     IllegalTransition {
-        /// Lähtötila.
+        /// The source state.
         from: ContractStatus,
-        /// Yritetty kohdetila.
+        /// The attempted target state.
         to: ContractStatus,
     },
 
-    /// Sopimusta/kykyä ei löytynyt.
+    /// The contract/capability was not found.
     NotFound(String),
 
-    /// Sopimus hylättiin annetulla syyllä.
+    /// The contract was rejected with the given reason.
     Rejected(String),
 }
 
@@ -652,7 +660,7 @@ impl std::fmt::Display for ContractError {
 
 impl std::error::Error for ContractError {}
 
-/// Yhdistää rikkomukset luettavaksi merkkijonoksi.
+/// Joins violations into a readable string.
 fn join_violations(v: &[SchemaViolation]) -> String {
     v.iter()
         .map(|x| format!("{}: {}", x.field, x.reason))
@@ -661,11 +669,11 @@ fn join_violations(v: &[SchemaViolation]) -> String {
 }
 
 impl From<ContractError> for FamilyClawError {
-    /// Muuntaa sopimusvirheen alustan keskitettyyn virhetyyppiin.
+    /// Converts a contract error into the platform's centralized error type.
     ///
-    /// `NotFound` kuvautuu [`FamilyClawError::NotFound`]:iin; kaikki muut
-    /// (validointi-, ehto- ja siirtymävirheet) [`FamilyClawError::InvalidInput`]:iin,
-    /// koska ne ovat syöte-/tilavirheitä.
+    /// `NotFound` maps to [`FamilyClawError::NotFound`]; all others
+    /// (validation, condition, and transition errors) map to
+    /// [`FamilyClawError::InvalidInput`], since they are input/state errors.
     fn from(err: ContractError) -> Self {
         match err {
             ContractError::NotFound(what) => FamilyClawError::not_found(what),
@@ -674,26 +682,26 @@ impl From<ContractError> for FamilyClawError {
     }
 }
 
-/// Sopimustoiminnon tulostyyppi.
+/// The result type for a contract operation.
 pub type ContractResult<T> = std::result::Result<T, ContractError>;
 
 // ===========================================================================
-// Sopimustaulu
+// Contract board
 // ===========================================================================
 
-/// Säieturvallinen sopimustaulu.
+/// A thread-safe contract board.
 ///
-/// Hoitaa sopimusten elinkaaren: ehdota → hyväksy/hylkää → täytä/epäonnistu.
-/// [`fulfill`](Self::fulfill) on **todentava** metodi: se ajaa tulosskeeman ja
-/// jokaisen jälkiehdon toimitetta vasten, ja vain täysi läpäisy siirtää
-/// sopimuksen tilaan [`ContractStatus::Fulfilled`].
+/// Handles the contract lifecycle: propose → accept/reject →
+/// fulfill/fail. [`fulfill`](Self::fulfill) is a **verifying** method: it runs
+/// the output schema and every postcondition against the deliverable, and
+/// only a full pass moves the contract to [`ContractStatus::Fulfilled`].
 #[derive(Debug, Clone, Default)]
 pub struct ContractBoard {
     inner: Arc<RwLock<HashMap<MessageId, Contract>>>,
 }
 
 impl ContractBoard {
-    /// Luo tyhjän taulun.
+    /// Creates an empty board.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -701,13 +709,15 @@ impl ContractBoard {
         }
     }
 
-    /// Ehdottaa sopimusta kyvylle. Validoi `input` kyvyn syöteskeemaa vasten.
+    /// Proposes a contract for a capability. Validates `input` against the
+    /// capability's input schema.
     ///
-    /// Onnistuessa luo sopimuksen tilaan [`ContractStatus::Proposed`].
+    /// On success, creates a contract in the [`ContractStatus::Proposed`]
+    /// state.
     ///
     /// # Errors
-    /// [`ContractError::InputSchemaViolation`] jos syöte ei läpäise
-    /// kyvyn syöteskeemaa.
+    /// [`ContractError::InputSchemaViolation`] if the input does not pass the
+    /// capability's input schema.
     pub async fn propose(
         &self,
         capability: &Capability,
@@ -739,24 +749,25 @@ impl ContractBoard {
         Ok(contract)
     }
 
-    /// Lisää valmiiksi rakennetun sopimuksen tauluun (esim. linkitetty
-    /// orkesterointiin). Ohittaa skeematarkistuksen — kutsujan vastuulla.
+    /// Inserts an already-built contract onto the board (e.g. one linked to
+    /// orchestration). Skips schema validation — the caller's responsibility.
     ///
     /// # Errors
-    /// [`ContractError::NotFound`] ei koskaan; mutta jos sama tunniste on jo
-    /// taululla, vanha korvataan (idempotentti).
+    /// Never [`ContractError::NotFound`]; but if the same identifier is
+    /// already on the board, the old entry is replaced (idempotent).
     pub async fn insert(&self, contract: Contract) {
         let mut guard = self.inner.write().await;
         guard.insert(contract.id, contract);
     }
 
-    /// Hyväksyy ehdotetun sopimuksen. Tarkistaa esiehdot uudelleen syötettä
-    /// vasten.
+    /// Accepts a proposed contract. Rechecks preconditions against the input.
     ///
     /// # Errors
-    /// - [`ContractError::NotFound`] jos sopimusta ei ole.
-    /// - [`ContractError::IllegalTransition`] jos sopimus ei ole `Proposed`.
-    /// - [`ContractError::PreconditionFailed`] jos jokin esiehto ei toteudu.
+    /// - [`ContractError::NotFound`] if the contract does not exist.
+    /// - [`ContractError::IllegalTransition`] if the contract is not
+    ///   `Proposed`.
+    /// - [`ContractError::PreconditionFailed`] if a precondition is not
+    ///   satisfied.
     pub async fn accept(&self, id: MessageId, now: Timestamp) -> ContractResult<Contract> {
         let mut guard = self.inner.write().await;
         let contract = guard
@@ -769,7 +780,7 @@ impl ContractBoard {
                 to: ContractStatus::Accepted,
             });
         }
-        // Esiehdot syötettä vasten.
+        // Preconditions against the input.
         for clause in &contract.capability.preconditions {
             if !clause.eval(&contract.input) {
                 return Err(ContractError::PreconditionFailed(clause.describe()));
@@ -780,11 +791,12 @@ impl ContractBoard {
         Ok(contract.clone())
     }
 
-    /// Hylkää ehdotetun sopimuksen annetulla syyllä.
+    /// Rejects a proposed contract with the given reason.
     ///
     /// # Errors
-    /// - [`ContractError::NotFound`] jos sopimusta ei ole.
-    /// - [`ContractError::IllegalTransition`] jos sopimus ei ole `Proposed`.
+    /// - [`ContractError::NotFound`] if the contract does not exist.
+    /// - [`ContractError::IllegalTransition`] if the contract is not
+    ///   `Proposed`.
     pub async fn reject(
         &self,
         id: MessageId,
@@ -803,21 +815,23 @@ impl ContractBoard {
         }
         contract.status = ContractStatus::Rejected;
         contract.updated_at = now;
-        let _ = reason; // syy talletetaan tapahtumaan/lokiin, ei kenttään
+        let _ = reason; // the reason is recorded in the event/log, not in a field
         Ok(contract.clone())
     }
 
-    /// **Todentava täyttö.** Ajaa toimitteen tulosskeeman ja jokaisen
-    /// jälkiehdon läpi. Mikä tahansa rikkomus → `Accepted → Failed` ja
-    /// kuvaava virhe. Täysi läpäisy → `Accepted → Fulfilled`.
+    /// **Verifying fulfillment.** Runs the output schema and every
+    /// postcondition against the deliverable. Any violation → `Accepted →
+    /// Failed` with a descriptive error. A full pass → `Accepted →
+    /// Fulfilled`.
     ///
     /// # Errors
-    /// - [`ContractError::NotFound`] jos sopimusta ei ole.
-    /// - [`ContractError::IllegalTransition`] jos sopimus ei ole `Accepted`.
-    /// - [`ContractError::OutputSchemaViolation`] jos toimite rikkoo
-    ///   tulosskeeman (sopimus siirtyy `Failed`-tilaan).
-    /// - [`ContractError::PostconditionBreach`] jos jokin jälkiehto ei toteudu
-    ///   (sopimus siirtyy `Failed`-tilaan).
+    /// - [`ContractError::NotFound`] if the contract does not exist.
+    /// - [`ContractError::IllegalTransition`] if the contract is not
+    ///   `Accepted`.
+    /// - [`ContractError::OutputSchemaViolation`] if the deliverable breaches
+    ///   the output schema (the contract moves to the `Failed` state).
+    /// - [`ContractError::PostconditionBreach`] if a postcondition is not
+    ///   satisfied (the contract moves to the `Failed` state).
     pub async fn fulfill(
         &self,
         id: MessageId,
@@ -836,7 +850,7 @@ impl ContractBoard {
             });
         }
 
-        // 1) Tulosskeema.
+        // 1) Output schema.
         let violations = contract.output_schema.check(&deliverable.payload);
         if !violations.is_empty() {
             contract.status = ContractStatus::Failed;
@@ -845,7 +859,7 @@ impl ContractBoard {
             return Err(ContractError::OutputSchemaViolation(violations));
         }
 
-        // 2) Jokainen jälkiehto.
+        // 2) Every postcondition.
         for clause in &contract.postconditions {
             if !clause.eval(&deliverable.payload) {
                 contract.status = ContractStatus::Failed;
@@ -855,19 +869,20 @@ impl ContractBoard {
             }
         }
 
-        // Täysi läpäisy.
+        // Full pass.
         contract.status = ContractStatus::Fulfilled;
         contract.deliverable = Some(deliverable);
         contract.updated_at = now;
         Ok(contract.clone())
     }
 
-    /// Merkitsee hyväksytyn sopimuksen epäonnistuneeksi (tarjoaja ei pysty
-    /// toimittamaan) annetulla syyllä.
+    /// Marks an accepted contract as failed (the provider cannot deliver)
+    /// with the given reason.
     ///
     /// # Errors
-    /// - [`ContractError::NotFound`] jos sopimusta ei ole.
-    /// - [`ContractError::IllegalTransition`] jos sopimus ei ole `Accepted`.
+    /// - [`ContractError::NotFound`] if the contract does not exist.
+    /// - [`ContractError::IllegalTransition`] if the contract is not
+    ///   `Accepted`.
     pub async fn fail(
         &self,
         id: MessageId,
@@ -890,13 +905,13 @@ impl ContractBoard {
         Ok(contract.clone())
     }
 
-    /// Hakee sopimuksen tunnisteen perusteella.
+    /// Looks up a contract by identifier.
     pub async fn get(&self, id: MessageId) -> Option<Contract> {
         let guard = self.inner.read().await;
         guard.get(&id).cloned()
     }
 
-    /// Listaa kaikki sopimukset (tunnisteen mukaan järjestettynä).
+    /// Lists all contracts, ordered by identifier.
     pub async fn list(&self) -> Vec<Contract> {
         let guard = self.inner.read().await;
         let mut out: Vec<Contract> = guard.values().cloned().collect();
@@ -904,7 +919,7 @@ impl ContractBoard {
         out
     }
 
-    /// Listaa tietyn tarjoajan sopimukset.
+    /// Lists a given provider's contracts.
     pub async fn list_for_provider(&self, provider: AgentId) -> Vec<Contract> {
         let guard = self.inner.read().await;
         let mut out: Vec<Contract> = guard
@@ -916,7 +931,7 @@ impl ContractBoard {
         out
     }
 
-    /// Listaa tietyssä tilassa olevat sopimukset.
+    /// Lists contracts in a given status.
     pub async fn list_by_status(&self, status: ContractStatus) -> Vec<Contract> {
         let guard = self.inner.read().await;
         let mut out: Vec<Contract> = guard
@@ -928,7 +943,7 @@ impl ContractBoard {
         out
     }
 
-    /// Listaa tiettyyn orkesterointitehtävään linkitetyt sopimukset.
+    /// Lists contracts linked to a given orchestration task.
     pub async fn list_for_task(&self, task: TaskId) -> Vec<Contract> {
         let guard = self.inner.read().await;
         let mut out: Vec<Contract> = guard
@@ -940,13 +955,13 @@ impl ContractBoard {
         out
     }
 
-    /// Sopimusten määrä taululla.
+    /// Number of contracts on the board.
     pub async fn len(&self) -> usize {
         let guard = self.inner.read().await;
         guard.len()
     }
 
-    /// Onko taulu tyhjä.
+    /// Whether the board is empty.
     pub async fn is_empty(&self) -> bool {
         let guard = self.inner.read().await;
         guard.is_empty()
@@ -1040,7 +1055,7 @@ mod tests {
         assert!(c.eval(&json!({ "x": { "k": 1 } })));
         assert!(!c.eval(&json!({ "x": "" })));
         assert!(!c.eval(&json!({ "x": [] })));
-        assert!(!c.eval(&json!({ "x": 5 }))); // numero ei ole "tyhjennettävä"
+        assert!(!c.eval(&json!({ "x": 5 }))); // a number has no notion of "emptiness"
     }
 
     #[test]
@@ -1209,8 +1224,8 @@ mod tests {
             .expect("propose");
         board.accept(c.id, ts(2)).await.expect("accept");
 
-        // Skeema OK (url on merkkijono, frames on numero) mutta jälkiehto
-        // `non_empty(url)` rikkoutuu (tyhjä) ja `frames >= 1` rikkoutuu (0).
+        // Schema OK (url is a string, frames is a number) but the postcondition
+        // `non_empty(url)` is breached (empty) and `frames >= 1` is breached (0).
         let bad = Deliverable::new(provider, json!({ "url": "", "frames": 0 }), ts(3));
         let err = board
             .fulfill(c.id, bad, ts(3))
@@ -1223,9 +1238,9 @@ mod tests {
 
     #[tokio::test]
     async fn accept_rechecks_preconditions() {
-        // Esiehto duration>=1 ei toteudu jos input ohitti skeematarkistuksen
-        // toista reittiä. Tässä propose hyväksyy duration=0 (skeema vain vaatii
-        // numeron), mutta accept torjuu esiehdon.
+        // The precondition duration>=1 is not satisfied if the input bypassed
+        // schema validation via another path. Here propose accepts duration=0
+        // (the schema only requires a number), but accept rejects the precondition.
         let board = ContractBoard::new();
         let cap = render_capability();
         let c = board
@@ -1259,7 +1274,7 @@ mod tests {
         let rejected = board.reject(c.id, "too busy", ts(2)).await.expect("reject");
         assert_eq!(rejected.status, ContractStatus::Rejected);
 
-        // Toinen reject → laiton siirtymä.
+        // A second reject → illegal transition.
         let err = board
             .reject(c.id, "again", ts(3))
             .await
@@ -1282,7 +1297,7 @@ mod tests {
             )
             .await
             .expect("propose");
-        // Yritä täyttää suoraan Proposed-tilasta → laiton.
+        // Try to fulfill directly from the Proposed state → illegal.
         let d = Deliverable::new(provider, json!({ "url": "u", "frames": 1 }), ts(2));
         let err = board
             .fulfill(c.id, d, ts(2))

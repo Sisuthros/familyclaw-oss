@@ -1,18 +1,18 @@
-//! S5 Semantic Retrieval — osittaisosuman semanttinen haku.
+//! S5 Semantic Retrieval — semantic search via partial matches.
 //!
-//! Tämä skenaario todistaa että Eternal Thread löytää oikeat muistit
-//! **merkityksen perusteella**, ei pelkästään tarkoilla avainsanoilla.
+//! This scenario proves that Eternal Thread finds the right memories **based
+//! on meaning**, not just exact keywords.
 //!
-//! ## Mitä testataan
-//! Kylvetään kolme muistoa:
-//! - "shipped the continuity bridge" (sisältää "ship" osamerkkijonona)
-//! - "deploying the system update" (eri sanat)
-//! - "ocean waves and songs" (täysin eri aihe)
+//! ## What is tested
+//! Three memories are seeded:
+//! - "shipped the continuity bridge" (contains "ship" as a substring)
+//! - "deploying the system update" (different words)
+//! - "ocean waves and songs" (completely different topic)
 //!
-//! Kysely: "did we ship it?"
-//! Odotettu: semanttinen haku (substring-match) nostaa "shipped"-muistin
-//! relevantimmaksi kuin pelkkä keyword-haku, koska "ship" löytyy
-//! osamerkkijonona sanasta "shipped".
+//! Query: "did we ship it?"
+//! Expected: semantic search (substring match) ranks the "shipped" memory as
+//! more relevant than plain keyword search, because "ship" is found as a
+//! substring of "shipped".
 
 use async_trait::async_trait;
 use familyclaw_core::Timestamp;
@@ -22,15 +22,15 @@ use crate::error::Result;
 use crate::scenario::{Scenario, ScenarioResult};
 use crate::subject::Subject;
 
-/// S5 Semantic Retrieval — osittaisosuman semanttinen haku.
+/// S5 Semantic Retrieval — semantic search via partial matches.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SemanticRetrieval;
 
 impl SemanticRetrieval {
-    /// Skenaarion yksilöivä tunniste.
+    /// The scenario's unique identifier.
     pub const ID: &'static str = "s5_semantic_retrieval";
 
-    /// Luo uuden SemanticRetrieval-skenaarion.
+    /// Creates a new SemanticRetrieval scenario.
     #[must_use]
     pub fn new() -> Self {
         Self
@@ -69,13 +69,13 @@ impl Scenario for SemanticRetrieval {
             .build();
         let _id_ocean = store.add(mem_ocean).await?;
 
-        // Hae ilman semantiikkaa
+        // Retrieve without semantics
         let ctx_kw = RetrievalContext::new(QUERY)
             .with_limit(3)
             .with_semantic_weight(0.0);
         let hits_kw = store.retrieve(&ctx_kw, clock).await?;
 
-        // Hae semantiikalla (substring-match)
+        // Retrieve with semantics (substring match)
         let ctx_sem = RetrievalContext::new(QUERY)
             .with_limit(3)
             .with_semantic_weight(0.7);
@@ -91,7 +91,7 @@ impl Scenario for SemanticRetrieval {
             .map_or(0.0, |h| h.relevance);
         let boost = (sem_relevance - kw_relevance).max(0.0);
 
-        // Ocean-muisti EI saa nousta kärkeen kummallakaan haulla
+        // The ocean memory must NOT reach the top under either search
         let kw_top_is_ocean = hits_kw
             .first()
             .is_some_and(|h| h.memory.content.contains("ocean"));

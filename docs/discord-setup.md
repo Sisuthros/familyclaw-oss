@@ -1,81 +1,90 @@
-# Discord-botin käyttöönotto-ohje
+# Discord Bot Setup Guide
 
-Tämä ohje neuvoo, kuinka luot Discord-botin ja konfiguroit sen FamilyClaw-järjestelmää varten.
+This guide walks you through creating a Discord bot and configuring it for the
+FamilyClaw system.
 
-## 1. Botin luonti Discord Developer Portalissa
-1. Kirjaudu sisään [Discord Developer Portaliin](https://discord.com/developers/applications).
-2. Napsauta oikeasta yläkulmasta **New Application**.
-3. Anna sovellukselle nimi (esim. FamilyClaw) ja hyväksy ehdot. Napsauta **Create**.
-4. Valitse vasemman reunan valikosta **Bot**.
+## 1. Create the bot in the Discord Developer Portal
+1. Sign in to the [Discord Developer Portal](https://discord.com/developers/applications).
+2. Click **New Application** in the top-right corner.
+3. Give the application a name (e.g. FamilyClaw) and accept the terms. Click **Create**.
+4. Select **Bot** from the left-hand menu.
 
-## 2. Privileged Intents (Erityisluvat)
-Jotta botti voi lukea viestien sisältöjä, sinun on kytkettävä päälle `MESSAGE_CONTENT`-intent. Ilman tätä luvallista ominaisuutta viestien sisältö on tyhjä, eikä botti pysty reagoimaan kanavan tapahtumiin.
+## 2. Privileged Intents
+For the bot to be able to read message content, you must enable the
+`MESSAGE_CONTENT` intent. Without this privileged feature, message content is
+empty and the bot cannot react to channel events.
 
-1. Etsi Bot-sivulta osio **Privileged Gateway Intents**.
-2. Kytke päälle **Message Content Intent**.
-3. Tallenna muutokset (Save Changes).
+1. On the Bot page, find the **Privileged Gateway Intents** section.
+2. Enable **Message Content Intent**.
+3. Save your changes (Save Changes).
 
-*Huom: Yli 100 palvelimen botit vaativat Discordin erillisen tarkistuksen ja hyväksynnän tälle intentille.*
+*Note: Bots present in more than 100 servers require a separate Discord review
+and approval for this intent.*
 
-## 3. Botin kutsuminen palvelimelle
-1. Siirry vasemman reunan valikosta kohtaan **OAuth2** -> **URL Generator**.
-2. Valitse **Scopes**-kohdasta `bot`.
-3. Valitse **Bot Permissions** -kohdasta:
+## 3. Inviting the bot to a server
+1. From the left-hand menu, go to **OAuth2** -> **URL Generator**.
+2. Under **Scopes**, select `bot`.
+3. Under **Bot Permissions**, select:
    - `View Channels`
    - `Send Messages`
    - `Read Message History`
-4. Kopioi sivun alareunaan generoitu URL-osoite (permissions-arvo on mukana bittimaskina, esim. `permissions=68608`).
-5. Avaa kopioitu linkki selaimessa ja valitse palvelin, jolle haluat botin lisätä.
+4. Copy the generated URL at the bottom of the page (the permissions value is
+   included as a bitmask, e.g. `permissions=68608`).
+5. Open the copied link in a browser and choose the server you want to add the
+   bot to.
 
-## 4. Kanava-ID:n selvittäminen
-1. Avaa Discord-sovellus.
-2. Siirry asetuksiin: **User Settings** -> **Advanced**.
-3. Kytke päälle **Developer Mode**.
-4. Napsauta hiiren oikealla painikkeella sitä tekstikanavaa, jota haluat botin käyttävän, ja valitse **Copy Channel ID** (Kopioi kanavan tunnus).
+## 4. Finding the Channel ID
+1. Open the Discord app.
+2. Go to settings: **User Settings** -> **Advanced**.
+3. Enable **Developer Mode**.
+4. Right-click the text channel you want the bot to use and select **Copy
+   Channel ID**.
 
-## 5. Konfigurointi
-**TÄRKEÄÄ:** Älä koskaan commitoi botin tokenia versionhallintaan! Lisää tiedosto `.env` `.gitignore`-tiedostoon.
+## 5. Configuration
+**IMPORTANT:** Never commit the bot token to version control! Add the `.env`
+file to `.gitignore`.
 
-Luo projektin juureen tiedosto nimeltä `.env` ja lisää sinne seuraavat rivit:
+Create a file named `.env` in the project root and add the following lines:
 ```env
-DISCORD_BOT_TOKEN="Kopioi_botin_token_Bot_sivulta_tähän"
-DISCORD_CHANNEL_ID="Kopioi_kanava_ID_tähän"
+DISCORD_BOT_TOKEN="Copy_the_bot_token_from_the_Bot_page_here"
+DISCORD_CHANNEL_ID="Copy_the_channel_ID_here"
 ```
 
-### Kaksisuuntainen bot-moodi vs. webhook-postaus
-- **`DISCORD_BOT_TOKEN` asetettu** → gateway käynnistää serenity-gateway-yhteyden:
-  botti **kuuntelee JA postaa** (kaksisuuntainen). Tämä on suositeltu moodi.
-- **Vain `DISCORD_WEBHOOK_URL` asetettu** (ei bot-tokenia) → botti on **send-only**
-  (postaa webhookilla, ei kuuntele viestejä).
+### Bidirectional bot mode vs. webhook posting
+- **`DISCORD_BOT_TOKEN` set** → the gateway starts a serenity gateway
+  connection: the bot **listens AND posts** (bidirectional). This is the
+  recommended mode.
+- **Only `DISCORD_WEBHOOK_URL` set** (no bot token) → the bot is **send-only**
+  (posts via webhook, does not listen for messages).
 
-### Valinnainen: kahdenkeskinen DM huoltajan kanssa
-Huoltajan id voidaan asettaa kahdella tavalla. **Env-arvo ylikirjoittaa
-TOML-arvon.**
+### Optional: one-on-one DM with the owner
+The owner ID can be set in two ways. **The env value overrides the TOML
+value.**
 
-Env-muuttujana:
+As an env variable:
 ```env
-FAMILYCLAW_OWNER_ID="Discord-user-id-numerosi"
+FAMILYCLAW_OWNER_ID="Your-Discord-user-id"
 ```
 
-Tai `familyclaw.toml`-tiedostossa:
+Or in `familyclaw.toml`:
 ```toml
 [channel.discord]
 owner_id = 123456789012345678
 ```
 
-Jos asetettu, vain tämä käyttäjä voi keskustella botin kanssa **yksityisviestillä**
-(DM); vastaus reititetään takaisin DM-kanavalle. Ilman tätä (puuttuva, `0` tai
-virheellinen arvo) DM:t pudotetaan — koskaan ei "kaikki DM:t sallittu" — ja vain
-ryhmäkanava `DISCORD_CHANNEL_ID` on aktiivinen. Virheellinen `FAMILYCLAW_OWNER_ID`
-(ei numero) jätetään huomiotta varoituksella, ja TOML-/oletusarvo säilyy.
-Ryhmäkanavalla ihmiset menevät läpi suoraan; toiset botit kuullaan vain kun ne
-@-mainitsevat botin (estää botti-botti-silmukan).
+If set, only this user can converse with the bot via **direct message** (DM);
+the reply is routed back to the DM channel. Without this (missing, `0`, or an
+invalid value), DMs are dropped — it is never "all DMs allowed" — and only the
+group channel `DISCORD_CHANNEL_ID` is active. An invalid `FAMILYCLAW_OWNER_ID`
+(not a number) is ignored with a warning, and the TOML/default value is kept.
+In the group channel, humans pass straight through; other bots are only heard
+when they @-mention the bot (this prevents a bot-to-bot loop).
 
-## 6. Vianetsintä
+## 6. Troubleshooting
 
-| Ongelma / Oire | Syy ja ratkaisu |
+| Problem / Symptom | Cause and solution |
 |----------------|-----------------|
-| Tyhjät viestisisällöt | `MESSAGE_CONTENT`-intent puuttuu. Kytke se päälle Discord Developer Portalissa. |
-| HTTP 401 Unauthorized | Väärä tai vanhentunut token. Tarkista `DISCORD_BOT_TOKEN`. |
-| "Missing Access" tai HTTP 403 | Botti ei ole kyseisellä kanavalla tai siltä puuttuu luku-/kirjoitusoikeudet. |
-| Ei tapahtumia (hiljaista) | Väärä kanava-ID muuttujassa `DISCORD_CHANNEL_ID`, tai botti on yhdistynyt mutta ei vastaanota guild-viestejä (botti tarvitsee `GUILDS`-intentin — ilman sitä guild jää pysyvästi *unavailable* eikä yksikään `MESSAGE_CREATE` saavu; tämä on sisäänrakennettu, ei käyttäjän säädettävä). |
+| Empty message content | The `MESSAGE_CONTENT` intent is missing. Enable it in the Discord Developer Portal. |
+| HTTP 401 Unauthorized | Wrong or expired token. Check `DISCORD_BOT_TOKEN`. |
+| "Missing Access" or HTTP 403 | The bot is not in that channel, or it lacks read/write permissions. |
+| No events (silence) | Wrong channel ID in the `DISCORD_CHANNEL_ID` variable, or the bot is connected but not receiving guild messages (the bot needs the `GUILDS` intent — without it the guild stays permanently *unavailable* and no `MESSAGE_CREATE` ever arrives; this is built-in, not user-configurable). |

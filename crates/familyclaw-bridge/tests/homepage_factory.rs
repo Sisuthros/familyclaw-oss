@@ -1,37 +1,39 @@
-//! Integraatiotesti: **HOMEPAGE FACTORY** — moniagenttiyhteistyö todennetuin
-//! sopimuksin, ajettuna hermeettistä [`MockTurnExecutor`]-suorittajaa vasten.
+//! Integration test: **HOMEPAGE FACTORY** — multi-agent collaboration with
+//! verified contracts, run against the hermetic [`MockTurnExecutor`].
 //!
-//! Tämä testi todistaa luotettavuustakuun jonka varaan koko silta rakentuu:
-//! **sama suunnitelma joka ajetaan tässä mock-suorittajalla ajaa myöhemmin
-//! **Layer B `LiveTurnExecutor`:lla oikealla LLM:llä — ilman yhtäkään muutosta
-//! orkesteriin.** Orkesteri riippuu vain [`TurnExecutor`]-saumasta, ei
-//! konkreettisesta suorittajasta (ks. [`docs/HOMEPAGE_FACTORY.md`]).
+//! This test proves the reliability guarantee the entire bridge is built on:
+//! **the same plan run here with the mock executor later runs with the
+//! Layer B `LiveTurnExecutor` and a real LLM — without a single change to the
+//! orchestrator.** The orchestrator depends only on the [`TurnExecutor`]
+//! seam, never on a concrete executor (see [`docs/HOMEPAGE_FACTORY.md`]).
 //!
-//! ## Skenaario
-//! Kolme agenttia tekevät yhteistyötä etusivun rakentamiseksi:
-//! - **`agent_alpha`** ([`AgentRole::Strategy`]) — suunnittelija, mainostaa kykyä
-//!   `homepage_design`.
-//! - **`agent_beta`** ([`AgentRole::Scout`]) — orkesteroija/katselmoija.
-//! - **`agent_gamma`** ([`AgentRole::Executor`]) — julkaisija, kyky `deploy`.
+//! ## Scenario
+//! Three agents collaborate to build a homepage:
+//! - **`agent_alpha`** ([`AgentRole::Strategy`]) — the designer, advertises
+//!   the `homepage_design` capability.
+//! - **`agent_beta`** ([`AgentRole::Scout`]) — orchestrator/reviewer.
+//! - **`agent_gamma`** ([`AgentRole::Executor`]) — the publisher, `deploy`
+//!   capability.
 //!
-//! Suunnitelma on DAG: `design → review → deploy`. `design`-solmu kantaa
-//! `homepage_design`-kyvyn, jonka **tulosskeema** (`headline`, `sections`,
-//! `cta`) ja **jälkiehdot** (`non_empty(headline)`, `min_len(sections, 1)`)
-//! todennetaan toimitteesta sopimusrajalla ennen kuin solmu pääsee
-//! `Done`-tilaan.
+//! The plan is a DAG: `design → review → deploy`. The `design` node carries
+//! the `homepage_design` capability, whose **output schema** (`headline`,
+//! `sections`, `cta`) and **postconditions** (`non_empty(headline)`,
+//! `min_len(sections, 1)`) are verified against the deliverable at the
+//! contract boundary before the node reaches the `Done` state.
 //!
-//! ## Kaksi todistusta
-//! 1. **Onnistunut tehdas** ([`homepage_factory_runs_end_to_end`]): kaikki
-//!    kolme solmua etenevät `Done`-tilaan riippuvuusjärjestyksessä
-//!    (design → review → deploy), `design`-toimite läpäisee
-//!    `homepage_design`-sopimuksen ([`ContractStatus::Fulfilled`]), ja
-//!    `orchestration.step_assigned`-tapahtumat julkaistaan järjestyksessä.
-//! 2. **Rikkomus pysäyttää tehtaan**
-//!    ([`malformed_design_halts_factory_at_contract_boundary`]): viallinen
-//!    toimite (puuttuva `headline`, tyhjä `sections`) saa `design`-sopimuksen
-//!    `fulfill`-todennuksen kaatumaan, `design`-solmu **ei** pääse
-//!    `Done`-tilaan, eikä `review`- tai `deploy`-solmua koskaan osoiteta —
-//!    DAG pysähtyy rikkomukseen, toimite ei vuoda eteenpäin hiljaa.
+//! ## Two proofs
+//! 1. **Successful factory** ([`homepage_factory_runs_end_to_end`]): all
+//!    three nodes advance to the `Done` state in dependency order
+//!    (design → review → deploy), the `design` deliverable passes the
+//!    `homepage_design` contract ([`ContractStatus::Fulfilled`]), and
+//!    `orchestration.step_assigned` events are published in order.
+//! 2. **A violation halts the factory**
+//!    ([`malformed_design_halts_factory_at_contract_boundary`]): a malformed
+//!    deliverable (missing `headline`, empty `sections`) makes the `design`
+//!    contract's `fulfill` verification fail, the `design` node does **not**
+//!    reach the `Done` state, and the `review` or `deploy` node is never
+//!    assigned — the DAG halts on the violation, the deliverable does not
+//!    silently flow onward.
 
 use familyclaw_bridge::{
     AgentInfo, AgentRole, Capability, CapabilityRegistry, Clause, ContractBoard, ContractStatus,
@@ -42,12 +44,12 @@ use familyclaw_bridge::{
 use familyclaw_core::ids::AgentId;
 use familyclaw_core::time::{self, Timestamp};
 
-/// Vakaa aikaleima injektoitavaksi (kelloa ei koskaan lueta testissä).
+/// A stable timestamp to inject (the clock is never read in the test).
 fn ts(secs: i64) -> Timestamp {
     time::from_unix_secs(secs).expect("valid unix seconds")
 }
 
-/// Rakentaa ja rekisteröi online-agentin annetuilla kyvyillä hetkellä `now`.
+/// Builds and registers an online agent with the given capabilities at time `now`.
 async fn online_agent(
     bridge: &FamilyBridge,
     id: AgentId,
@@ -62,7 +64,7 @@ async fn online_agent(
     bridge.heartbeat(id, now).await.expect("heartbeat");
 }
 
-/// `HomepageDesign`-tulosskeema: `{ headline:Str, sections:Arr, cta:Str }`.
+/// `HomepageDesign` output schema: `{ headline:Str, sections:Arr, cta:Str }`.
 fn homepage_design_output() -> Schema {
     Schema::new(vec![
         Field::required("headline", FieldType::Str),
@@ -71,7 +73,7 @@ fn homepage_design_output() -> Schema {
     ])
 }
 
-/// `HomepageDesign`-jälkiehdot: `non_empty(headline)` + `min_len(sections, 1)`.
+/// `HomepageDesign` postconditions: `non_empty(headline)` + `min_len(sections, 1)`.
 fn homepage_design_postconditions() -> Vec<Clause> {
     vec![
         Clause::non_empty("headline"),
@@ -79,9 +81,9 @@ fn homepage_design_postconditions() -> Vec<Clause> {
     ]
 }
 
-/// `homepage_design`-kyky **täydellä** `BrandBrief { brand, audience }`-
-/// syöteskeemalla. Käytetään eksplisiittisessä sopimustodistuksessa, jossa
-/// `propose` ajetaan oikealla briefillä syötteenä.
+/// The `homepage_design` capability with the **full** `BrandBrief { brand,
+/// audience }` input schema. Used in the explicit contract proof, where
+/// `propose` is run with a real brief as input.
 fn homepage_design_capability() -> Capability {
     Capability::new(
         "homepage_design",
@@ -95,19 +97,20 @@ fn homepage_design_capability() -> Capability {
     .with_postconditions(homepage_design_postconditions())
 }
 
-/// `homepage_design`-kyky **tyhjällä** syöteskeemalla. Tämä on solmuun
-/// kiinnitettävä variantti: orkesterin sisäinen sopimusrata ([`Orchestrator::
-/// run_with`] → [`ContractBoard::propose`]) ehdottaa kyvyn tyhjällä `{}`-
-/// syötteellä, joten solmun kyvyn syöteskeeman on hyväksyttävä tyhjä objekti.
-/// Tulosskeema ja jälkiehdot ovat identtiset täyden variantin kanssa, joten
-/// toimitteen todennus (`headline`, `sections`, `cta` + jälkiehdot) on sama.
+/// The `homepage_design` capability with an **empty** input schema. This is
+/// the variant attached to a node: the orchestrator's internal contract path
+/// ([`Orchestrator::run_with`] → [`ContractBoard::propose`]) proposes the
+/// capability with an empty `{}` input, so the node's capability input schema
+/// must accept an empty object. The output schema and postconditions are
+/// identical to the full variant, so the deliverable verification
+/// (`headline`, `sections`, `cta` + postconditions) is the same.
 fn homepage_design_node_capability() -> Capability {
     Capability::new("homepage_design", Schema::empty(), homepage_design_output())
         .with_postconditions(homepage_design_postconditions())
 }
 
-/// `deploy`-kyky: tulos jolla on vähintään `url`-kenttä, jälkiehto
-/// `non_empty(url)`. (Käytetään `agent_gamma`-julkaisijan kykynä.)
+/// The `deploy` capability: an output with at least a `url` field, with the
+/// postcondition `non_empty(url)`. (Used as `agent_gamma`'s publisher capability.)
 fn deploy_capability() -> Capability {
     Capability::new(
         "deploy",
@@ -116,17 +119,18 @@ fn deploy_capability() -> Capability {
     )
 }
 
-/// Kolmen solmun etusivutehtaan suunnitelma: `design → review → deploy`.
+/// The three-node homepage factory plan: `design → review → deploy`.
 ///
-/// - `design` vaatii kyvyn `homepage_design`, ei riippuvuuksia, ja **kantaa**
-///   `homepage_design`-sopimuksen (toimite todennetaan sopimusrajalla).
-/// - `review` riippuu `design`:sta (katselmointivaihe).
-/// - `deploy` vaatii kyvyn `deploy`, riippuu `review`:sta.
+/// - `design` requires the `homepage_design` capability, has no
+///   dependencies, and **carries** the `homepage_design` contract (the
+///   deliverable is verified at the contract boundary).
+/// - `review` depends on `design` (the review stage).
+/// - `deploy` requires the `deploy` capability, depends on `review`.
 fn factory_plan() -> OrchestrationPlan {
     OrchestrationPlan::new(
         "homepage_factory",
         vec![
-            // design: BrandBrief kuvauksena → mock tuottaa HomepageDesignin.
+            // design: BrandBrief as the description → the mock produces a HomepageDesign.
             TaskNode::new(
                 "design",
                 "design the homepage",
@@ -135,13 +139,14 @@ fn factory_plan() -> OrchestrationPlan {
             .with_role(AgentRole::Strategy)
             .with_capabilities(["homepage_design"])
             .with_capability(homepage_design_node_capability()),
-            // review: ei kyvyn vaatimusta, riippuu designista.
+            // review: no capability requirement, depends on design.
             TaskNode::new("review", "review the design", "approve or request changes")
                 .with_role(AgentRole::Scout)
                 .with_deps(["design"]),
-            // deploy: vaatii deploy-kyvyn, riippuu reviewista, ja kantaa
-            // deploy-sopimuksen (tulos `result: object`). Mockin ei-homepage-
-            // toimite `{ "result": ..., "assignee": ... }` täyttää skeeman.
+            // deploy: requires the deploy capability, depends on review, and
+            // carries the deploy contract (output `result: object`). The
+            // mock's non-homepage deliverable `{ "result": ..., "assignee": ... }`
+            // satisfies the schema.
             TaskNode::new("deploy", "deploy the homepage", "ship to production")
                 .with_role(AgentRole::Executor)
                 .with_capabilities(["deploy"])
@@ -151,17 +156,17 @@ fn factory_plan() -> OrchestrationPlan {
     )
 }
 
-/// Rekisteröi tehtaan kolme agenttia (`agent_alpha`/`agent_beta`/`agent_gamma`) onlineksi.
+/// Registers the factory's three agents (`agent_alpha`/`agent_beta`/`agent_gamma`) as online.
 async fn register_factory_agents(
     bridge: &FamilyBridge,
     now: Timestamp,
 ) -> (AgentId, AgentId, AgentId) {
-    // Kiinteät id:t determinismin vuoksi.
+    // Fixed ids for determinism.
     let agent_alpha = AgentId::from_uuid(uuid::Uuid::from_u128(0xA0));
     let agent_beta = AgentId::from_uuid(uuid::Uuid::from_u128(0x10));
     let agent_gamma = AgentId::from_uuid(uuid::Uuid::from_u128(0xB0));
 
-    // agent_alpha — suunnittelija (Strategy), mainostaa homepage_design-kyvyn.
+    // agent_alpha — the designer (Strategy), advertises the homepage_design capability.
     online_agent(
         bridge,
         agent_alpha,
@@ -171,7 +176,7 @@ async fn register_factory_agents(
         now,
     )
     .await;
-    // agent_beta — orkesteroija/katselmoija (Scout).
+    // agent_beta — orchestrator/reviewer (Scout).
     online_agent(
         bridge,
         agent_beta,
@@ -181,7 +186,7 @@ async fn register_factory_agents(
         now,
     )
     .await;
-    // agent_gamma — julkaisija (Executor), kyky deploy.
+    // agent_gamma — publisher (Executor), deploy capability.
     online_agent(
         bridge,
         agent_gamma,
@@ -192,9 +197,10 @@ async fn register_factory_agents(
     )
     .await;
 
-    // agent_alpha mainostaa kykynsä kykyrekisteriin (CapabilityRegistry.advertise).
-    // FamilyBridge (KERROS A) ei vielä omista kykyrekisteriä, joten käytämme
-    // erillistä rekisteriä todistaaksemme advertise-reitin toimivuuden.
+    // agent_alpha advertises its capability to the capability registry
+    // (CapabilityRegistry.advertise). FamilyBridge (Layer A) does not yet own
+    // a capability registry, so we use a separate registry to prove the
+    // advertise path works.
     let registry = CapabilityRegistry::new();
     registry.advertise(homepage_design_capability()).await;
     registry.advertise(deploy_capability()).await;
@@ -218,20 +224,20 @@ async fn homepage_factory_runs_end_to_end() {
     let now = ts(1_700_000_000);
     let (agent_alpha, _agent_beta, _agent_gamma) = register_factory_agents(&bridge, now).await;
 
-    // Tilaa tapahtumaväylä ENNEN ajoa nähdäksemme step_assigned-järjestyksen.
+    // Subscribe to the event bus BEFORE running, to observe the step_assigned order.
     let mut events = bridge.subscribe();
 
     let plan = factory_plan();
     let orch = Orchestrator::new(bridge.clone());
 
-    // Sama kutsu jolla LiveTurnExecutor ajetaan myöhemmin — vain suoritin vaihtuu.
+    // The same call used to run LiveTurnExecutor later — only the executor changes.
     let executor = MockTurnExecutor::new();
     let report = orch
         .run_with(&plan, now, &executor)
         .await
         .expect("homepage factory run");
 
-    // --- Kaikki kolme solmua valmistuivat riippuvuusjärjestyksessä. ---------
+    // --- All three nodes completed in dependency order. ---------
     assert_eq!(report.completed.len(), 3, "all three nodes must complete");
     let order: Vec<NodeId> = report.completed.iter().map(|(n, _)| n.clone()).collect();
     assert_eq!(
@@ -244,7 +250,7 @@ async fn homepage_factory_runs_end_to_end() {
         "design before review before deploy (dependency order)"
     );
 
-    // Jokainen solmun tehtävä on Done-tilassa.
+    // Each node's task is in the Done state.
     for (node, task_id) in &report.completed {
         let task = bridge.board().get(*task_id).await.expect("task exists");
         assert_eq!(
@@ -254,11 +260,12 @@ async fn homepage_factory_runs_end_to_end() {
         );
     }
 
-    // --- design-toimite läpäisee homepage_design-sopimuksen (Fulfilled). ----
-    // Toistamme orkesterin sopimusrajan eksplisiittisesti: agent_alpha suorittaa
-    // saman vuoron, ja toimite ajetaan linkitetyn sopimuksen `fulfill`-
-    // todennuksen läpi (tulosskeema + jälkiehdot). Linkki sopimuksesta
-    // design-tehtävään asetetaan (Contract.link = Some(task_id)).
+    // --- The design deliverable passes the homepage_design contract (Fulfilled). ----
+    // We repeat the orchestrator's contract boundary explicitly: agent_alpha
+    // performs the same turn, and the deliverable is run through the linked
+    // contract's `fulfill` verification (output schema + postconditions).
+    // The link from the contract to the design task is set
+    // (Contract.link = Some(task_id)).
     let (design_node, design_task) = report
         .completed
         .iter()
@@ -270,18 +277,18 @@ async fn homepage_factory_runs_end_to_end() {
     let brief = serde_json::json!({ "brand": "DuckUps", "audience": "founders" });
     let board = ContractBoard::new();
 
-    // propose validoi BrandBrief-syöteskeemaa vasten.
+    // propose validates against the BrandBrief input schema.
     let contract = board
         .propose(&cap, agent_alpha, agent_alpha, brief.clone(), now)
         .await
         .expect("propose homepage_design contract");
-    // Linkitä sopimus design-tehtävään.
+    // Link the contract to the design task.
     let mut linked = contract.clone();
     linked.link = Some(*design_task);
     board.insert(linked).await;
     board.accept(contract.id, now).await.expect("accept");
 
-    // agent_alpha suorittaa vuoron mock-saumalla → HomepageDesign-toimite.
+    // agent_alpha performs the turn via the mock seam → a HomepageDesign deliverable.
     let turn = OrchestratedTurn::new(
         plan.id.clone(),
         NodeId::new("design"),
@@ -294,7 +301,7 @@ async fn homepage_factory_runs_end_to_end() {
     );
     let deliverable = executor.execute(turn).await.expect("execute design turn");
 
-    // fulfill todentaa tulosskeeman + jälkiehdot → Fulfilled.
+    // fulfill verifies the output schema + postconditions → Fulfilled.
     let fulfilled = board
         .fulfill(contract.id, deliverable.clone(), now)
         .await
@@ -304,13 +311,13 @@ async fn homepage_factory_runs_end_to_end() {
         ContractStatus::Fulfilled,
         "design deliverable must pass output schema + postconditions"
     );
-    // Sopimus on linkitetty design-tehtävään.
+    // The contract is linked to the design task.
     assert_eq!(
         fulfilled.link,
         Some(*design_task),
         "contract links to design task"
     );
-    // Toimitteen muoto: headline ei-tyhjä, sections >= 1, cta läsnä.
+    // Deliverable shape: headline non-empty, sections >= 1, cta present.
     let payload = &deliverable.payload;
     assert!(
         payload["headline"].as_str().is_some_and(|h| !h.is_empty()),
@@ -324,7 +331,7 @@ async fn homepage_factory_runs_end_to_end() {
     );
     assert!(payload["cta"].as_str().is_some(), "cta present");
 
-    // --- step_assigned-tapahtumat järjestyksessä design → review → deploy. --
+    // --- step_assigned events in order design → review → deploy. --
     let mut assigned_nodes: Vec<String> = Vec::new();
     while let Ok(Some(ev)) = events.try_recv() {
         if let familyclaw_bridge::EventKind::Custom(name) = &ev.kind {
@@ -347,7 +354,7 @@ async fn homepage_factory_runs_end_to_end() {
 }
 
 // =============================================================================
-// TESTI 2 — rikkomus pysäyttää tehtaan sopimusrajalla.
+// TEST 2 — a violation halts the factory at the contract boundary.
 // =============================================================================
 
 #[tokio::test]
@@ -361,21 +368,21 @@ async fn malformed_design_halts_factory_at_contract_boundary() {
     let plan = factory_plan();
     let orch = Orchestrator::new(bridge.clone());
 
-    // failing() tuottaa toimitteen ILMAN headlinea ja TYHJÄLLÄ sections-listalla
-    // → tulosskeema + jälkiehdot rikkoutuvat sopimusrajalla.
+    // failing() produces a deliverable WITHOUT a headline and with an EMPTY
+    // sections list → the output schema + postconditions are breached at the contract boundary.
     let executor = MockTurnExecutor::failing();
     let report = orch
         .run_with(&plan, now, &executor)
         .await
         .expect("run returns Ok report even when a node fails");
 
-    // --- Yksikään solmu ei valmistunut: tehdas pysähtyi heti designiin. -----
+    // --- Not a single node completed: the factory halted right at design. -----
     assert!(
         report.completed.is_empty(),
         "no node completes when design breaches its contract"
     );
 
-    // --- design-tehtävä luotiin mutta EI ole Done (jäi Active-tilaan). ------
+    // --- The design task was created but is NOT Done (stayed in the Active state). ------
     let design_tasks: Vec<_> = bridge
         .board()
         .list_for_assignee(agent_alpha)
@@ -395,7 +402,7 @@ async fn malformed_design_halts_factory_at_contract_boundary() {
         "design halts in Active (caught at the contract boundary)"
     );
 
-    // --- review ja deploy EIVÄT koskaan osoittuneet (DAG pysähtyi). ---------
+    // --- review and deploy were NEVER assigned (the DAG halted). ---------
     let all_tasks = bridge.board().list().await;
     assert!(
         !all_tasks.iter().any(|t| t.title == "review the design"),
@@ -406,8 +413,8 @@ async fn malformed_design_halts_factory_at_contract_boundary() {
         "deploy must not be scheduled after design breach"
     );
 
-    // --- design-sopimus menee Failed-tilaan fulfill():ssä (eksplisiittinen
-    //     todistus samalla viallisella toimitteella). ------------------------
+    // --- The design contract moves to the Failed state in fulfill() (an
+    //     explicit proof with the same malformed deliverable). ------------------------
     prove_malformed_design_fails_contract(agent_alpha, &plan, design_tasks[0].id, &executor, now)
         .await;
 
@@ -433,14 +440,15 @@ async fn malformed_design_halts_factory_at_contract_boundary() {
     assert_eq!(step_failed, 1, "design emits exactly one step_failed");
 }
 
-/// Eksplisiittinen todistus että viallinen `design`-toimite kaataa
-/// `homepage_design`-sopimuksen `fulfill`-todennuksessa.
+/// An explicit proof that a malformed `design` deliverable fails the
+/// `homepage_design` contract's `fulfill` verification.
 ///
-/// Ehdottaa kyvyn täydellä `BrandBrief`-syötteellä, hyväksyy sopimuksen, ajaa
-/// `failing()`-suorittimen tuottaman saman viallisen toimitteen `fulfill`:n
-/// läpi ja varmistaa: (1) virhe on tulosskeeman rikkomus (puuttuva `headline`),
-/// (2) sopimus päätyy [`ContractStatus::Failed`]-tilaan, (3) sama viallinen
-/// hyötykuorma ei läpäise tulosskeemaa erilliselläkään `is_valid`-tarkistuksella.
+/// Proposes the capability with the full `BrandBrief` input, accepts the
+/// contract, runs the same malformed deliverable produced by the
+/// `failing()` executor through `fulfill`, and verifies: (1) the error is an
+/// output schema violation (missing `headline`), (2) the contract ends up in
+/// the [`ContractStatus::Failed`] state, (3) the same malformed payload does
+/// not pass the output schema even under a separate `is_valid` check.
 async fn prove_malformed_design_fails_contract(
     agent_alpha: AgentId,
     plan: &OrchestrationPlan,
@@ -477,7 +485,7 @@ async fn prove_malformed_design_fails_contract(
         .fulfill(contract.id, bad, now)
         .await
         .expect_err("malformed deliverable must fail fulfillment");
-    // Tulosskeeman rikkomus (puuttuva headline) on ensimmäinen joka osuu.
+    // The output schema violation (missing headline) is the first to hit.
     assert!(
         matches!(
             err,
@@ -492,7 +500,7 @@ async fn prove_malformed_design_fails_contract(
         "design contract goes Failed at fulfill()"
     );
 
-    // Lisätodiste: sama viallinen hyötykuorma ei ole tulosskeeman mukainen.
+    // Additional proof: the same malformed payload does not conform to the output schema.
     let bad_deliverable = Deliverable::new(agent_alpha, bad_payload, now);
     assert!(
         !cap.output.is_valid(&bad_deliverable.payload),

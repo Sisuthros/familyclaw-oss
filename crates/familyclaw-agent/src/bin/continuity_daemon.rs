@@ -1,33 +1,35 @@
-//! `continuity_daemon` — musta laatikko jota `familyclaw-bench` ajaa lapsiprosessina.
+//! `continuity_daemon` — a black box run by `familyclaw-bench` as a child
+//! process.
 //!
-//! Tämä binääri laajentaa todistetun cross-process `crash_replay`-mallin
-//! ([`crash_replay`](crate)) benchmark-ajettavaksi mustaksi laatikoksi (design
-//! §4): bench-harness käynnistää sen `start`-, `resume`-, `recall`- ja
-//! `sleep`-alikomennoilla, ja `--crash-at <point>` pakottaa `start`:in
-//! poistumaan tahallaan kaatumispisteessä (`before_write` / `mid_write` /
-//! `mid_replay`) jotta jatkuvuus voidaan todistaa aidon prosessirajan yli.
+//! This binary extends the proven cross-process `crash_replay` pattern
+//! ([`crash_replay`](crate)) into a benchmark-runnable black box (design
+//! §4): the bench harness launches it with `start`, `resume`, `recall`,
+//! and `sleep` subcommands, and `--crash-at <point>` forces `start` to
+//! exit deliberately at a crash point (`before_write` / `mid_write` /
+//! `mid_replay`) so continuity can be proven across a genuine process
+//! boundary.
 //!
-//! ## Reprodusoitavuus (design §2.2)
-//! Seinäkello **injektoidaan** `--clock <iso8601>` -argumentilla — binääri ei
-//! lue järjestelmäkelloa koskaan. Sama syöte (`--journal` + `--store` + `--task`
-//! + `--clock`) tuottaa identtisen lopputilan joka ajolla.
+//! ## Reproducibility (design §2.2)
+//! The wall clock is **injected** via the `--clock <iso8601>` argument —
+//! the binary never reads the system clock. The same input (`--journal` +
+//! `--store` + `--task` + `--clock`) produces an identical end state on
+//! every run.
 //!
-//! ## Alikomennot
+//! ## Subcommands
 //! - `start --journal P --store P --task ID --steps N [--crash-at POINT] --clock TS`
-//!   — ajaa `N` durable-askelta tehtävälle `ID`, kirjaa jokaisesta muiston, ja
-//!   joko valmistuu puhtaasti tai poistuu kaatumispisteessä.
-//! - `resume --journal P --store P --task ID --steps N --clock TS` — rakentaa
-//!   `DurableContext`:n samasta journalista, toistaa valmistuneet askeleet
-//!   ajamatta sivuvaikutuksia uudelleen, ajaa loput tuoreena ja tulostaa
-//!   [`ResumeOutput`]-JSON:n.
-//! - `recall --store P --query Q [--limit K] --clock TS` — hakee persistoidusta
-//!   tallennuksesta ja tulostaa [`RecallOutput`]-JSON:n.
-//! - `sleep --journal P --store P --clock TS` — ajaa yhden [`DreamCycle`]:n
-//!   persistoidun tallennuksen + journalin yli ja tulostaa
-//!   [`SleepOutput`]-JSON:n.
+//!   — runs `N` durable steps for task `ID`, records a memory for each,
+//!   and either finishes cleanly or exits at the crash point.
+//! - `resume --journal P --store P --task ID --steps N --clock TS` —
+//!   builds a `DurableContext` from the same journal, replays completed
+//!   steps without re-executing side effects, runs the rest fresh, and
+//!   prints [`ResumeOutput`] JSON.
+//! - `recall --store P --query Q [--limit K] --clock TS` — queries the
+//!   persisted store and prints [`RecallOutput`] JSON.
+//! - `sleep --journal P --store P --clock TS` — runs one [`DreamCycle`]
+//!   over the persisted store + journal and prints [`SleepOutput`] JSON.
 //!
-//! Kaikki onnistuneet komennot tulostavat **yhden rivin JSON:ia** stdoutiin
-//! (`RESULT <json>`), jonka harness jäsentää. Diagnostiikka menee stderriin.
+//! All successful commands print **one line of JSON** to stdout
+//! (`RESULT <json>`), which the harness parses. Diagnostics go to stderr.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -43,194 +45,196 @@ use familyclaw_memory::{
 };
 use serde::{Deserialize, Serialize};
 
-/// JSON-tuloksen etuliite stdoutilla — harness lukee tämän jälkeisen rivin.
+/// JSON result prefix on stdout — the harness reads the line after this.
 const RESULT_PREFIX: &str = "RESULT ";
 
-/// `continuity_daemon` -komentorivirajapinta.
+/// `continuity_daemon` command-line interface.
 #[derive(Parser)]
 #[command(
     name = "continuity_daemon",
     about = "FamilyClaw continuity black box — driven by familyclaw-bench"
 )]
 struct Cli {
-    /// Ajettava alikomento.
+    /// The subcommand to run.
     #[command(subcommand)]
     command: Command,
 }
 
-/// Daemonin alikomennot.
+/// The daemon's subcommands.
 #[derive(Subcommand)]
 enum Command {
-    /// Käynnistä tehtävä: aja durable-askeleet, kirjaa muistot, mahd. kaadu.
+    /// Start a task: run durable steps, record memories, possibly crash.
     Start(StartArgs),
-    /// Jatka: rakenna konteksti journalista, toista + viimeistele, raportoi.
+    /// Resume: build context from the journal, replay + finish, report.
     Resume(ResumeArgs),
-    /// Hae persistoidusta tallennuksesta.
+    /// Query the persisted store.
     Recall(RecallArgs),
-    /// Aja yksi unijakso (muistikonsolidaatio).
+    /// Run a single sleep cycle (memory consolidation).
     Sleep(SleepArgs),
 }
 
-/// Mihin kohtaan `start` poistuu tahallaan (kaatumisen simulointi).
+/// The point at which `start` deliberately exits (crash simulation).
 ///
-/// `--crash-at` ottaa nämä. `Clean` (oletus ilman lippua) ajaa loppuun.
+/// `--crash-at` takes these. `Clean` (the default without the flag) runs
+/// to completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "snake_case")]
 enum CrashAt {
-    /// Poistu ENNEN ensimmäistä journal-kirjoitusta (mitään ei levyllä).
+    /// Exit BEFORE the first journal write (nothing on disk).
     BeforeWrite,
-    /// Poistu KESKEN journal-kirjoituksen — jätä revitty (torn) viimeinen rivi.
+    /// Exit DURING a journal write — leave a torn last line.
     MidWrite,
-    /// Poistu KESKEN replayn — vain osa askeleista ehti uudelleen.
+    /// Exit DURING replay — only some of the steps got replayed.
     MidReplay,
-    /// Puhdas valmistuminen — ei kaatumista.
+    /// Clean completion — no crash.
     Clean,
 }
 
-/// `start`-alikomennon argumentit.
+/// Arguments for the `start` subcommand.
 #[derive(Parser)]
 struct StartArgs {
-    /// Journal-tiedoston polku (append-only JSONL).
+    /// Path to the journal file (append-only JSONL).
     #[arg(long)]
     journal: PathBuf,
-    /// Muistitallennuksen polku (JSON).
+    /// Path to the memory store (JSON).
     #[arg(long)]
     store: PathBuf,
-    /// Tehtävän vakaa tunniste (deterministinen).
+    /// The task's stable identifier (deterministic).
     #[arg(long)]
     task: String,
-    /// Suoritettavien askelten määrä.
+    /// Number of steps to run.
     #[arg(long, default_value_t = 3)]
     steps: usize,
-    /// Pakotettu kaatumispiste (oletus: ei kaatumista).
+    /// Forced crash point (default: no crash).
     #[arg(long, value_enum, default_value_t = CrashAt::Clean)]
     crash_at: CrashAt,
-    /// Injektoitu seinäkello (ISO 8601 / RFC 3339).
+    /// Injected wall clock (ISO 8601 / RFC 3339).
     #[arg(long)]
     clock: String,
 }
 
-/// `resume`-alikomennon argumentit.
+/// Arguments for the `resume` subcommand.
 #[derive(Parser)]
 struct ResumeArgs {
-    /// Journal-tiedoston polku.
+    /// Path to the journal file.
     #[arg(long)]
     journal: PathBuf,
-    /// Muistitallennuksen polku.
+    /// Path to the memory store.
     #[arg(long)]
     store: PathBuf,
-    /// Tehtävän tunniste (sama kuin `start`:ssa).
+    /// The task's identifier (same as in `start`).
     #[arg(long)]
     task: String,
-    /// Askelten kokonaismäärä (sama kuin `start`:ssa).
+    /// Total number of steps (same as in `start`).
     #[arg(long, default_value_t = 3)]
     steps: usize,
-    /// Injektoitu seinäkello.
+    /// Injected wall clock.
     #[arg(long)]
     clock: String,
 }
 
-/// `recall`-alikomennon argumentit.
+/// Arguments for the `recall` subcommand.
 #[derive(Parser)]
 struct RecallArgs {
-    /// Muistitallennuksen polku.
+    /// Path to the memory store.
     #[arg(long)]
     store: PathBuf,
-    /// Hakukysely.
+    /// The search query.
     #[arg(long)]
     query: String,
-    /// Palautettavien osumien yläraja.
+    /// Upper bound on the number of hits returned.
     #[arg(long, default_value_t = 10)]
     limit: usize,
-    /// Injektoitu seinäkello.
+    /// Injected wall clock.
     #[arg(long)]
     clock: String,
 }
 
-/// `sleep`-alikomennon argumentit.
+/// Arguments for the `sleep` subcommand.
 #[derive(Parser)]
 struct SleepArgs {
-    /// Journal-tiedoston polku (ristiriitamerkintöjä varten).
+    /// Path to the journal file (for conflicting entries).
     #[arg(long)]
     journal: PathBuf,
-    /// Muistitallennuksen polku.
+    /// Path to the memory store.
     #[arg(long)]
     store: PathBuf,
-    /// Injektoitu seinäkello.
+    /// Injected wall clock.
     #[arg(long)]
     clock: String,
 }
 
-/// `resume`-komennon JSON-tuloste jonka harness jäsentää.
+/// JSON output of the `resume` command, parsed by the harness.
 #[derive(Debug, Serialize, Deserialize)]
 struct ResumeOutput {
-    /// Lokista toistettujen valmistuneiden askelten määrä.
+    /// Number of completed steps replayed from the log.
     steps_replayed: usize,
-    /// Oliko konteksti replay-tilassa heti restartin jälkeen.
+    /// Whether the context was in replay mode right after restart.
     was_replaying: bool,
-    /// Tuoreena (replayn jälkeen) ajettujen askelten määrä.
+    /// Number of steps run fresh (after replay).
     fresh_steps: usize,
-    /// Saavutettiinko sama lopputila kuin kaatumattomalla ajolla.
+    /// Whether the same end state was reached as in a crash-free run.
     resumed_clean: bool,
 }
 
-/// Yksittäinen recall-osuma JSON:ssa.
+/// A single recall hit in the JSON output.
 #[derive(Debug, Serialize, Deserialize)]
 struct RecallHitOutput {
-    /// Muiston sisältö.
+    /// The memory's content.
     content: String,
-    /// Relevanssipistemäärä.
+    /// Relevance score.
     relevance: f32,
 }
 
-/// `recall`-komennon JSON-tuloste.
+/// JSON output of the `recall` command.
 #[derive(Debug, Serialize, Deserialize)]
 struct RecallOutput {
-    /// Osumat relevanssijärjestyksessä.
+    /// Hits in relevance order.
     hits: Vec<RecallHitOutput>,
 }
 
-/// `sleep`-komennon JSON-tuloste — peilaa [`DreamReport`](familyclaw_dream::DreamReport):n harnessille.
+/// JSON output of the `sleep` command — mirrors
+/// [`DreamReport`](familyclaw_dream::DreamReport) for the harness.
 #[derive(Debug, Serialize, Deserialize)]
 struct SleepOutput {
-    /// Skannattujen muistojen määrä.
+    /// Number of memories scanned.
     scanned: usize,
-    /// Yhdistettyjen duplikaattien määrä.
+    /// Number of duplicates merged.
     merged: usize,
-    /// Pudotettujen ristiriitaisten määrä.
+    /// Number of conflicting memories dropped.
     dropped: usize,
-    /// Absolutisoitujen päiväysten määrä.
+    /// Number of dates absolutized.
     dates_absolutized: usize,
-    /// Vahvistettujen muistojen määrä.
+    /// Number of memories strengthened.
     strengthened: usize,
-    /// Arkistoitujen muistojen määrä.
+    /// Number of memories archived.
     archived: usize,
-    /// Säilyivätkö suojatut identiteetti-ankkurit koskemattomina.
+    /// Whether protected identity anchors remained intact.
     protected_core_intact: bool,
 }
 
-/// Daemonin sisäinen virhetyyppi.
+/// The daemon's internal error type.
 ///
-/// Kaikki epäonnistumiset kulkevat tämän kautta — tuotantopolulla ei käytetä
-/// `unwrap()`/`expect()`/`panic!()`. `main` muuntaa tämän stderr-viestiksi +
-/// nollasta poikkeavaksi exit-koodiksi.
+/// All failures flow through this — the production path never uses
+/// `unwrap()`/`expect()`/`panic!()`. `main` converts this into a stderr
+/// message + a non-zero exit code.
 #[derive(Debug, thiserror::Error)]
 enum DaemonError {
-    /// Ydinalustan virhe (config, IO, muisti).
+    /// Core platform error (config, IO, memory).
     #[error("core error: {0}")]
     Core(#[from] familyclaw_core::FamilyClawError),
-    /// Durable-substraatin virhe (journal, replay).
+    /// Durable substrate error (journal, replay).
     #[error("durable error: {0}")]
     Durable(#[from] familyclaw_durable::DurableError),
-    /// JSON-sarjallistus epäonnistui.
+    /// JSON serialization failed.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
-    /// Tiedosto-IO epäonnistui.
+    /// File IO failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
 
-/// Daemonin vakiotulostyyppi.
+/// The daemon's standard result type.
 type DaemonResult<T> = std::result::Result<T, DaemonError>;
 
 #[tokio::main]
@@ -239,14 +243,14 @@ async fn main() -> ExitCode {
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            // Diagnostiikka stderriin; stdout varataan RESULT-riville.
+            // Diagnostics to stderr; stdout is reserved for the RESULT line.
             let _ = writeln!(std::io::stderr(), "continuity_daemon error: {err}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// Kytkee alikomennon oikeaan käsittelijään.
+/// Dispatches the subcommand to its handler.
 async fn run(cli: Cli) -> DaemonResult<()> {
     match cli.command {
         Command::Start(args) => run_start(args).await,
@@ -256,25 +260,26 @@ async fn run(cli: Cli) -> DaemonResult<()> {
     }
 }
 
-/// Jäsentää injektoidun kellon RFC 3339 -muodosta.
+/// Parses the injected clock from RFC 3339 format.
 fn parse_clock(raw: &str) -> DaemonResult<Timestamp> {
     Ok(time::parse_rfc3339(raw)?)
 }
 
-/// Tehtävän askeleen vakaa nimi (deterministinen replay-avain).
+/// The task step's stable name (a deterministic replay key).
 fn step_name(task: &str, index: usize) -> String {
     format!("{task}-step-{index}")
 }
 
-/// Askeleen tuottama deterministinen tulos (sivuvaikutuksen "hyötykuorma").
+/// The deterministic result produced by a step (the side effect's
+/// "payload").
 ///
-/// Sama indeksi → sama arvo joka ajolla, joten replay palauttaa identtisen
-/// tuloksen ajamatta suljinta uudelleen.
+/// Same index → same value on every run, so replay returns an identical
+/// result without re-running the closure.
 fn step_payload(task: &str, index: usize) -> String {
     format!("{task} completed step {index}")
 }
 
-/// Kirjoittaa RESULT-rivin stdoutiin.
+/// Writes the RESULT line to stdout.
 fn emit<T: Serialize>(value: &T) -> DaemonResult<()> {
     let json = serde_json::to_string(value)?;
     let mut stdout = std::io::stdout();
@@ -283,26 +288,27 @@ fn emit<T: Serialize>(value: &T) -> DaemonResult<()> {
     Ok(())
 }
 
-/// Käsittelee `start`: ajaa askeleet ja joko valmistuu tai kaatuu pisteessä.
+/// Handles `start`: runs the steps and either finishes or crashes at the
+/// point.
 async fn run_start(args: StartArgs) -> DaemonResult<()> {
     let clock = parse_clock(&args.clock)?;
 
-    // BeforeWrite: poistu ennen kuin mitään kirjoitetaan journaliin.
+    // BeforeWrite: exit before anything is written to the journal.
     if args.crash_at == CrashAt::BeforeWrite {
         eprintln!("crash injected: before_write (nothing persisted)");
-        std::process::exit(137); // SIGKILL-tyylinen exit-koodi
+        std::process::exit(137); // SIGKILL-style exit code
     }
 
     let store = Arc::new(LocalJsonStore::open(&args.store).await?);
 
-    // MidReplay: journalissa on jo valmistuneita askelia (aiemmasta ajosta).
-    // Re-enteröidään replay ja poistutaan KESKEN sen — todistaa että replayn
-    // keskeyttävä kaatuminen on toivuttava (resume-the-resume).
+    // MidReplay: the journal already has completed steps (from an earlier
+    // run). Re-enter replay and exit MID-replay — this proves that a
+    // crash interrupting replay is itself recoverable (resume-the-resume).
     if args.crash_at == CrashAt::MidReplay {
         let logged = count_completed_steps(&args.journal)?;
         let journal = FileJournal::open(&args.journal)?;
         let mut ctx = DurableContext::new(journal)?;
-        // Toista vain puolet lokitetuista askelista, sitten poistu.
+        // Replay only half of the logged steps, then exit.
         let replay_until = logged / 2;
         for index in 0..replay_until {
             let name = step_name(&args.task, index);
@@ -315,7 +321,7 @@ async fn run_start(args: StartArgs) -> DaemonResult<()> {
         std::process::exit(137);
     }
 
-    // MidWrite: kaada viimeisen askeleen kirjoituksen "keskelle".
+    // MidWrite: crash "in the middle" of writing the last step.
     let crash_step = if args.crash_at == CrashAt::MidWrite {
         Some(args.steps.saturating_sub(1))
     } else {
@@ -328,9 +334,10 @@ async fn run_start(args: StartArgs) -> DaemonResult<()> {
 
         for index in 0..args.steps {
             if Some(index) == crash_step {
-                // MidWrite: kirjoita revitty viimeinen rivi ja poistu.
-                // Ensin valmistuneet askeleet ovat jo levyllä (ehjiä rivejä);
-                // lisätään aito torn-rivi suoraan tiedostoon.
+                // MidWrite: write a torn last line and exit.
+                // The previously completed steps are already on disk
+                // (intact lines); a genuine torn line is appended
+                // directly to the file.
                 drop(ctx);
                 write_torn_line(&args.journal, &step_name(&args.task, index))?;
                 eprintln!("crash injected: mid_write (torn last line at step {index})");
@@ -339,14 +346,15 @@ async fn run_start(args: StartArgs) -> DaemonResult<()> {
 
             let name = step_name(&args.task, index);
             let payload = step_payload(&args.task, index);
-            // Durable-askel: tuoreessa ajossa suljin ajetaan ja tulos kirjataan.
+            // Durable step: on a fresh run, the closure runs and the
+            // result is recorded.
             let recorded: String = ctx.step(&name, move || Ok(payload))?;
 
-            // Sivuvaikutus (muistikirjaus) ajetaan vain tuoreessa ajossa —
-            // turn_key tekee siitä idempotentin replayn yli.
+            // The side effect (memory write) only runs on a fresh run —
+            // turn_key makes it idempotent across replay.
             persist_step_memory(&store, &args.task, index, &recorded, clock).await?;
         }
-        // ctx droppautuu tässä; journal on jo flushattu joka askeleella.
+        // ctx drops here; the journal has already been flushed on every step.
     }
 
     eprintln!(
@@ -356,16 +364,18 @@ async fn run_start(args: StartArgs) -> DaemonResult<()> {
     Ok(())
 }
 
-/// Kirjoittaa aidon revityn (torn) viimeisen rivin journal-tiedostoon.
+/// Writes a genuinely torn last line to the journal file.
 ///
-/// Tämä tuottaa klassisen "kaatuminen kesken kirjoituksen" -tilan: rivinvaihdoton
-/// vajaa JSON-objekti tiedoston loppuun. [`DurableContext::new`] ohittaa tämän
-/// (rivi ei jäsenny `StepCompleted`:ksi), joten resume jatkaa oikealta askelelta.
+/// This produces the classic "crash mid-write" state: an incomplete JSON
+/// object with no trailing newline at the end of the file.
+/// [`DurableContext::new`] skips this (the line doesn't parse as
+/// `StepCompleted`), so resume continues from the correct step.
 fn write_torn_line(journal: &PathBuf, step: &str) -> DaemonResult<()> {
     use std::fs::OpenOptions;
     let mut f = OpenOptions::new().append(true).create(true).open(journal)?;
-    // Vajaa rivi: alkaa kuin oikea entry mutta katkeaa kesken — EI rivinvaihtoa.
-    // (EntryKind serde-tagi on "kind"=snake_case; rivi katkeaa ennen sulkua.)
+    // Incomplete line: starts like a real entry but breaks off mid-way —
+    // NO trailing newline. (The EntryKind serde tag is "kind"=snake_case;
+    // the line breaks before the closing brace.)
     write!(
         f,
         "{{\"step_id\":999,\"timestamp\":\"2026\",\"kind\":\"step_completed\",\"name\":\"{step}\",\"out"
@@ -374,7 +384,7 @@ fn write_torn_line(journal: &PathBuf, step: &str) -> DaemonResult<()> {
     Ok(())
 }
 
-/// Käsittelee `resume`: replay journalista + tuoreet askeleet, raportoi.
+/// Handles `resume`: replay from the journal + fresh steps, report.
 async fn run_resume(args: ResumeArgs) -> DaemonResult<()> {
     let clock = parse_clock(&args.clock)?;
     let store = Arc::new(LocalJsonStore::open(&args.store).await?);
@@ -383,7 +393,8 @@ async fn run_resume(args: ResumeArgs) -> DaemonResult<()> {
     let mut ctx = DurableContext::new(journal)?;
     let was_replaying = ctx.is_replaying();
     let replayed_before = ctx.steps_taken();
-    // Replay-vektorin koko = montako askelta lokissa oli ennen tuoretta ajoa.
+    // Size of the replay vector = how many steps were in the log before
+    // the fresh run.
     let steps_in_log = count_completed_steps(&args.journal)?;
 
     let mut fresh_steps = 0usize;
@@ -402,12 +413,12 @@ async fn run_resume(args: ResumeArgs) -> DaemonResult<()> {
         }
     }
 
-    // Lopputila on "puhdas" jos kaikki askeleet on nyt suoritettu ja
-    // muistitallennuksessa on tasan `steps` muistoa tälle tehtävälle.
+    // The end state is "clean" if all steps have now run and the memory
+    // store has exactly `steps` memories for this task.
     let task_memories = count_task_memories(&store, &args.task).await?;
     let resumed_clean = ctx.steps_taken() == args.steps && task_memories == args.steps;
 
-    let _ = replayed_before; // aina 0 (kursori alkaa nollasta)
+    let _ = replayed_before; // always 0 (the cursor starts at zero)
     let output = ResumeOutput {
         steps_replayed: steps_in_log.min(args.steps),
         was_replaying,
@@ -417,7 +428,7 @@ async fn run_resume(args: ResumeArgs) -> DaemonResult<()> {
     emit(&output)
 }
 
-/// Käsittelee `recall`: hakee tallennuksesta ja tulostaa osumat.
+/// Handles `recall`: queries the store and prints the hits.
 async fn run_recall(args: RecallArgs) -> DaemonResult<()> {
     let clock = parse_clock(&args.clock)?;
     let store = LocalJsonStore::open(&args.store).await?;
@@ -435,12 +446,12 @@ async fn run_recall(args: RecallArgs) -> DaemonResult<()> {
     emit(&RecallOutput { hits })
 }
 
-/// Käsittelee `sleep`: ajaa yhden unijakson ja tulostaa tiivistelmän.
+/// Handles `sleep`: runs a single sleep cycle and prints the summary.
 async fn run_sleep(args: SleepArgs) -> DaemonResult<()> {
     let clock = parse_clock(&args.clock)?;
     let store = LocalJsonStore::open(&args.store).await?;
 
-    // Suojattujen ankkureiden tila ennen unta (eheyden todistamiseksi).
+    // State of the protected anchors before sleep (to prove integrity).
     let anchors_before = count_protected_active(&store).await?;
 
     let journal = FileJournal::open(&args.journal)?;
@@ -462,7 +473,7 @@ async fn run_sleep(args: SleepArgs) -> DaemonResult<()> {
     emit(&output)
 }
 
-/// Kirjaa yhden askeleen muiston tallennukseen idempotentisti (`turn_key`).
+/// Records one step's memory in the store idempotently (`turn_key`).
 async fn persist_step_memory(
     store: &Arc<LocalJsonStore>,
     task: &str,
@@ -477,13 +488,13 @@ async fn persist_step_memory(
         .source("continuity_daemon")
         .tags([format!("task:{task}")])
         .build();
-    // Idempotenssi: sama tehtävä+askel → sama avain → ei duplikaattia replayssa.
+    // Idempotence: same task+step → same key → no duplicate on replay.
     memory.turn_key = Some(format!("{task}:step-{index}"));
     store.add(memory).await?;
     Ok(())
 }
 
-/// Laskee tietylle tehtävälle kuuluvat (tag:llä merkityt) aktiiviset muistot.
+/// Counts the active memories belonging to a given task (marked by tag).
 async fn count_task_memories(store: &Arc<LocalJsonStore>, task: &str) -> DaemonResult<usize> {
     let tag = format!("task:{task}");
     let all = store.all().await?;
@@ -493,7 +504,7 @@ async fn count_task_memories(store: &Arc<LocalJsonStore>, task: &str) -> DaemonR
         .count())
 }
 
-/// Laskee aktiiviset suojatun ytimen (`ProtectedCore`) muistot.
+/// Counts active protected-core (`ProtectedCore`) memories.
 async fn count_protected_active(store: &LocalJsonStore) -> DaemonResult<usize> {
     use familyclaw_memory::MemoryStatus;
     let all = store.all().await?;
@@ -503,7 +514,8 @@ async fn count_protected_active(store: &LocalJsonStore) -> DaemonResult<usize> {
         .count())
 }
 
-/// Laskee journalin `StepCompleted`-rivit (revityt vajaat rivit eivät jäsenny).
+/// Counts the journal's `StepCompleted` lines (torn incomplete lines
+/// don't parse).
 fn count_completed_steps(journal: &PathBuf) -> DaemonResult<usize> {
     if !journal.exists() {
         return Ok(0);

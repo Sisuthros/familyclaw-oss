@@ -1,12 +1,14 @@
 [package]
 name = "familyclaw-embeddings"
-description = "Embedding-tarjoajat (EmbeddingProvider) — deterministinen zero-dep oletus, pure-Rust mallit feature-gateina (KERROS A, OSS)"
+description = "Text embedding providers for agent memory: a deterministic zero-dependency default, with optional Ollama-backed semantic embedding via a feature flag"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+keywords = ["embeddings", "vector", "nlp", "agent", "memory"]
+categories = ["science", "text-processing"]
 
 [lints]
 workspace = true

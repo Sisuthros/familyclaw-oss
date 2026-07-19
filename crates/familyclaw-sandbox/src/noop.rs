@@ -1,28 +1,29 @@
-//! Oletustoteutus [`NoopSandbox`] joka ei aja koodia.
+//! Default implementation [`NoopSandbox`] which does not execute code.
 //!
-//! Tämä on turvallinen oletus kun `wasmtime`-featurea ei ole käännetty:
-//! mikään koodi ei aja, joten mitään hyökkäyspintaa ei ole. Suoritusyritys
-//! palauttaa [`SandboxError::NotImplemented`]:n selkeällä viestillä joka
-//! ohjaa kytkemään `wasmtime`-featuren oikeaa suoritusta varten.
+//! This is a safe default when the `wasmtime` feature is not compiled in:
+//! no code runs, so there is no attack surface. An execution attempt
+//! returns [`SandboxError::NotImplemented`] with a clear message directing
+//! the caller to enable the `wasmtime` feature for real execution.
 //!
-//! `NoopSandbox` **validoi silti pyynnön** (koodi ei tyhjä, kyvykkyydet
-//! hyvinmuodostetut) ennen kuin palauttaa `NotImplemented`. Näin kutsujan
-//! pyyntövirheet löytyvät myös ilman wasmtime-backendia.
+//! `NoopSandbox` **still validates the request** (code not empty,
+//! capabilities well-formed) before returning `NotImplemented`. This way
+//! the caller's request errors are surfaced even without the wasmtime
+//! backend.
 
 use crate::error::SandboxError;
 use crate::sandbox::{CodeSandbox, SandboxRequest, SandboxResult};
 
-/// Sandbox-toteutus joka ei suorita mitään koodia.
+/// A sandbox implementation that does not execute any code.
 ///
-/// Käytä kun:
-/// - `wasmtime`-featurea ei ole päällä, tai
-/// - halutaan eksplisiittisesti kieltää kaikki koodisuoritus.
+/// Use when:
+/// - the `wasmtime` feature is not enabled, or
+/// - all code execution should be explicitly denied.
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct NoopSandbox;
 
 impl NoopSandbox {
-    /// Luo uuden [`NoopSandbox`]-instanssin.
+    /// Creates a new [`NoopSandbox`] instance.
     #[must_use]
     pub const fn new() -> Self {
         Self
@@ -31,7 +32,7 @@ impl NoopSandbox {
 
 impl CodeSandbox for NoopSandbox {
     fn execute(&self, request: &SandboxRequest) -> SandboxResult {
-        // Validoi pyyntö ensin: kutsujan virheet löytyvät myös ilman backendia.
+        // Validate the request first: caller errors surface even without a backend.
         request.validate()?;
         Err(SandboxError::not_implemented(
             "NoopSandbox does not execute code; enable the `wasmtime` feature \
@@ -73,7 +74,7 @@ mod tests {
     #[test]
     fn execute_validates_before_reporting_not_implemented() {
         let sandbox = NoopSandbox::new();
-        // Tyhjä koodi → setup-virhe, EI NotImplemented.
+        // Empty code -> a setup error, NOT NotImplemented.
         let req = SandboxRequest::new(Vec::<u8>::new());
         let err = sandbox.execute(&req).expect_err("empty code rejected");
         assert!(!err.is_not_implemented());

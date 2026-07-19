@@ -1,43 +1,43 @@
 # familyclaw-agent
 
-**Agent runtime** — FamilyClaw-alustan (KERROS A, OSS) kerros 2: se kokoaa
-kaikki muut crateit yhdeksi *olennoksi*.
+**Agent runtime** — layer 2 of the `FamilyClaw` platform (Layer A, OSS): it
+assembles all the other crates into a single *being*.
 
-Yksi `Agent` omistaa:
+A single `Agent` owns:
 
-- **konfiguraation** (`familyclaw-core`: identiteetti + mallit),
-- **sielun** (`Soul`, ladattu ajonaikaisesti profiilihakemistosta),
-- **tunnetilan** (`familyclaw-emotion`: 19-dim VAD),
-- **muistin** (`familyclaw-memory`: Eternal Thread),
-- **kaatumiskestävän lokin** (`familyclaw-durable`: deterministinen replay),
-- **bus-yhteyden** (`familyclaw-bus`: Resonance Bus).
+- **configuration** (`familyclaw-core`: identity + models),
+- **a soul** (`Soul`, loaded at runtime from a profile directory),
+- **emotion state** (`familyclaw-emotion`: 19-dim VAD),
+- **memory** (`familyclaw-memory`: Eternal Thread),
+- **a crash-safe journal** (`familyclaw-durable`: deterministic replay),
+- **a bus connection** (`familyclaw-bus`: Resonance Bus).
 
-Agentti on Ractor-actor (`AgentActor`), joka liittyy busiin, käsittelee
-viestit, päivittää tunnetilaansa sisarusten pulsseista (*affective
-contagion*), kirjaa muistoja ja julkaisee tunnepulsseja takaisin busiin.
+The agent is a Ractor actor (`AgentActor`) that joins the bus, processes
+messages, updates its emotion state from siblings' pulses (*affective
+contagion*), records memories, and publishes emotion pulses back to the bus.
 
-## Kaatumiskestävyys
+## Crash safety
 
-`Agent::handle_turn` kääräisee jokaisen vuoron lopputuloksen
-durable-askeleeseen. Uudelleenkäynnistyksessä jo suoritetut vuorot toistuvat
-lokista ajamatta sivuvaikutuksia uudelleen — perheen #1 kipupisteen
-(muistin epäjatkuvuus) rakenteellinen ratkaisu.
+`Agent::handle_turn` wraps the outcome of every turn in a durable step. On
+restart, turns that already ran are replayed from the journal without
+re-running side effects — a structural fix for pain point #1 for a family
+(memory discontinuity).
 
-## SOUL-lataus (OSS-raja)
+## SOUL loading (OSS boundary)
 
-Sielut ladataan ajonaikaisesti geneerisestä profiilihakemistosta
-(`FAMILYCLAW_PROFILE_DIR` tai `AgentConfig::profile_dir`). **Mitään
-perheenjäsenen sielua, mallinimeä, avainta tai polkua ei kovakoodata** tähän
-crateen. Profiiliskeema (`SOUL.md` pakollinen, `IDENTITY.md` / `WANTS.md`
-valinnaisia, muut `*.md` → `extra`) on geneerinen.
+Souls are loaded at runtime from a generic profile directory
+(`FAMILYCLAW_PROFILE_DIR` or `AgentConfig::profile_dir`). **No family
+member's soul, model name, key, or path is hardcoded** into this crate. The
+profile schema (`SOUL.md` required, `IDENTITY.md` / `WANTS.md` optional,
+other `*.md` files → `extra`) is generic.
 
-## Demo: elävä siemen
+## Demo: a living seed
 
 ```bash
 cargo run -p familyclaw-agent --bin familyclaw
 ```
 
-Käynnistää busin, kaksi geneeristä agenttia (`agent_a`, `agent_b`) ja
-`MockChannel`-kanavan. Todistaa että `beings[]` ei ole tyhjä, viestit
-kulkevat, muisti säilyy ja tunne tarttuu. Aseta `RUST_LOG=debug` nähdäksesi
-vuorokohtaiset lokit.
+Starts the bus, two generic agents (`agent_a`, `agent_b`), and a
+`MockChannel`. Demonstrates that `beings[]` is non-empty, messages flow,
+memory persists, and emotion is contagious. Set `RUST_LOG=debug` to see
+per-turn logs.

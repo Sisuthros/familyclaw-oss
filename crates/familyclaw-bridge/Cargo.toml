@@ -1,12 +1,15 @@
 [package]
 name = "familyclaw-bridge"
-description = "Agent registry / task / handoff (adapted from existing family-bridge)"
+description = "Transport-agnostic agent registry, task board, and event bus for multi-agent handoff and orchestration"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["agent", "orchestration", "registry", "task", "eventbus"]
+categories = ["asynchronous", "development-tools"]
 
 [lints]
 workspace = true

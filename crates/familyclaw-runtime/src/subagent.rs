@@ -1,4 +1,4 @@
-//! Väliaikaisen apuagentin spawneri jaettuun resonance-busiin.
+//! Spawner for a temporary helper agent on the shared resonance bus.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,8 +15,8 @@ use familyclaw_embeddings::DeterministicEmbedder;
 use familyclaw_memory::{EmbeddingMemoryStore, LocalJsonStore};
 use tokio::time::timeout;
 
-/// Runtime-toteutus: spawnaa kevyen apuagentin busille, lähettää tehtävän ja
-/// odottaa vastauksen reply-sinkistä.
+/// Runtime implementation: spawns a lightweight helper agent onto the bus,
+/// sends it the task, and awaits the response from the reply sink.
 pub struct BusSubagentSpawner {
     bus: BusHandle,
     model: ModelConfig,
@@ -25,8 +25,8 @@ pub struct BusSubagentSpawner {
 }
 
 impl BusSubagentSpawner {
-    /// Luo spawnerin, joka delegoi apuagentit busille annetulla mallilla,
-    /// LLM-resolverilla ja oletus-reply-kohteella.
+    /// Creates a spawner that delegates helper agents to the bus using the
+    /// given model, LLM resolver, and default reply target.
     #[must_use]
     pub fn new(
         bus: BusHandle,
@@ -97,7 +97,7 @@ impl SubagentSpawner for BusSubagentSpawner {
     }
 }
 
-/// Rekisteröi [`SpawnSubagentSkill`] annettuun toimintoajoympäristöön.
+/// Registers [`SpawnSubagentSkill`] with the given action runtime.
 pub fn register_spawn_subagent_skill(
     runtime: &mut familyclaw_actions::ActionRuntime,
     spawner: Arc<dyn SubagentSpawner>,

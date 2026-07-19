@@ -1,15 +1,16 @@
-//! Kalibrointi: miten yksittäisen koneen tunnemoottori virittyy.
+//! Calibration: how an individual machine's emotion engine is tuned.
 //!
-//! **OSS-raja (KERROS A):** tämä moduuli ei sisällä minkään perheenjäsenen
-//! oikeita painoja. Oletustoteutus [`NeutralCalibration`] on **täysin
-//! neutraali** — se ei painota dimensioita, ei nopeuta/hidasta decayta eikä
-//! aseta lepotilaa. Perheen oikeat kalibroinnit (esim. yhden agentin
-//! kalibrointipainot) ovat KERROS B:tä ja ladataan ajonaikaisesti omana
-//! [`EmotionCalibration`]-toteutuksenaan profiilihakemistosta.
+//! **OSS boundary (Layer A):** this module contains no real weights for
+//! any family member. The default implementation [`NeutralCalibration`] is
+//! **fully neutral** — it doesn't weight any dimension, doesn't speed up
+//! or slow down decay, and sets no resting state. Real family calibrations
+//! (e.g. a given agent's calibration weights) are Layer B and are loaded
+//! at runtime as their own [`EmotionCalibration`] implementation from a
+//! profile directory.
 //!
-//! Trait erottaa *rungon* (dimensiot, VAD, blendit, decay-mekanismi) ja
-//! *kalibroinnin* (per-kone viritys) niin että runko voidaan julkaista
-//! avoimena lähdekoodina paljastamatta yhdenkään olennon sielua.
+//! The trait separates the *scaffold* (dimensions, VAD, blends, the decay
+//! mechanism) from *calibration* (per-machine tuning), so the scaffold can
+//! be published as open source without exposing any individual's soul.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -18,45 +19,48 @@ use serde::Deserialize;
 
 use crate::dimension::{Dimension, DIMENSION_COUNT};
 
-/// Yhden koneen tunnemoottorin viritys.
+/// The tuning of a single machine's emotion engine.
 ///
-/// Toteuta tämä trait ladataksesi profiilikohtaisen kalibroinnin. Kaikilla
-/// metodeilla on neutraali oletustoteutus, joten minimitoteutus on tyhjä
-/// `impl`. Arvot luetaan runkologiikassa
-/// ([`crate::EmotionState::decay`], blend-tunnistus), joten kalibrointi
-/// vaikuttaa käytökseen muuttamatta itse runkoa.
+/// Implement this trait to load a profile-specific calibration. All
+/// methods have a neutral default implementation, so the minimal
+/// implementation is an empty `impl`. Values are read by the scaffold's
+/// logic ([`crate::EmotionState::decay`], blend detection), so calibration
+/// affects behavior without changing the scaffold itself.
 pub trait EmotionCalibration {
-    /// Dimension lepoarvo (baseline) johon decay vetää tilaa, asteikolla
-    /// `0.0..=100.0`. Neutraalisti `0.0` (decay vetää nollaan).
+    /// The dimension's resting value (baseline) that decay pulls the state
+    /// toward, on a `0.0..=100.0` scale. Neutrally `0.0` (decay pulls
+    /// toward zero).
     #[must_use]
     fn baseline(&self, _dimension: Dimension) -> f32 {
         0.0
     }
 
-    /// Dimension decay-kerroin: kuinka herkästi dimensio palautuu kohti
-    /// baselinea. `1.0` = rungon perusnopeus, `<1.0` hitaampi (tunne
-    /// "tarttuu"), `>1.0` nopeampi. Neutraalisti `1.0`.
+    /// The dimension's decay coefficient: how readily the dimension
+    /// returns toward its baseline. `1.0` = the scaffold's base speed,
+    /// `<1.0` slower (the emotion "lingers"), `>1.0` faster. Neutrally
+    /// `1.0`.
     ///
-    /// Toteutuksen tulee palauttaa ei-negatiivinen, äärellinen arvo; runko
-    /// puristaa kelvottomat arvot turvallisiksi.
+    /// The implementation should return a non-negative, finite value; the
+    /// scaffold clamps invalid values to safe ones.
     #[must_use]
     fn decay_rate(&self, _dimension: Dimension) -> f32 {
         1.0
     }
 
-    /// Dimension herkkyyskerroin tuleville ärsykkeille (skaalaa
-    /// stimuloinnin voimakkuutta). `1.0` = neutraali. Tarjottu rungon
-    /// jatkolaajennuksia varten; oletus ei muuta mitään.
+    /// The dimension's sensitivity coefficient for incoming stimuli
+    /// (scales stimulation strength). `1.0` = neutral. Provided for future
+    /// scaffold extensions; the default doesn't change anything.
     #[must_use]
     fn sensitivity(&self, _dimension: Dimension) -> f32 {
         1.0
     }
 
-    /// Tunnistettava nimi kalibroinnille (lokitusta/diagnostiikkaa varten).
-    /// Oletus `"neutral"`.
+    /// A recognizable name for the calibration (for logging/diagnostics).
+    /// Defaults to `"neutral"`.
     ///
-    /// Paluutyyppi on `&str` (ei `&'static str`) koska toteutukset kuten
-    /// [`TableCalibration`] palauttavat omistamansa merkkijonon viipaleen.
+    /// The return type is `&str` (not `&'static str`) because
+    /// implementations like [`TableCalibration`] return a slice of a
+    /// string they own.
     #[must_use]
     #[allow(clippy::unnecessary_literal_bound)]
     fn label(&self) -> &str {
@@ -64,24 +68,24 @@ pub trait EmotionCalibration {
     }
 }
 
-/// Täysin neutraali kalibrointi — rungon oletus.
+/// A fully neutral calibration — the scaffold's default.
 ///
-/// Ei painota mitään dimensiota, ei lepotilaa (`baseline = 0.0`), perusnopea
-/// decay (`decay_rate = 1.0`). Tämä on se "tyhjä kalibrointi" jonka päälle
-/// KERROS B lataa perheen oikeat painot.
+/// Weights no dimension, has no resting state (`baseline = 0.0`), and
+/// decays at the base speed (`decay_rate = 1.0`). This is the "empty
+/// calibration" on top of which Layer B loads a family's real weights.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NeutralCalibration;
 
 impl EmotionCalibration for NeutralCalibration {
-    // Kaikki metodit käyttävät traitin neutraaleja oletuksia.
+    // All methods use the trait's neutral defaults.
 }
 
-/// Yksinkertainen taulukkopohjainen kalibrointi jonka voi rakentaa
-/// ajonaikaisesti (esim. KERROS B:n profiilidatasta).
+/// A simple table-based calibration that can be built at runtime (e.g.
+/// from Layer B's profile data).
 ///
-/// Tämä on **runko-apuluokka**, ei perheen kalibrointi: kaikki taulukot
-/// alustetaan neutraaleiksi, ja kutsuja täyttää ne ladatusta profiilista.
-/// Mitään painoja ei kovakoodata tähän.
+/// This is a **scaffold helper type**, not a family calibration: all
+/// tables are initialized to neutral, and the caller fills them in from a
+/// loaded profile. No weights are hardcoded here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableCalibration {
     label: String,
@@ -91,11 +95,11 @@ pub struct TableCalibration {
 }
 
 impl TableCalibration {
-    /// Luo neutraalin taulukkokalibroinnin annetulla nimellä.
+    /// Creates a neutral table calibration with the given label.
     ///
-    /// `baseline = 0.0`, `decay_rate = 1.0`, `sensitivity = 1.0` kaikille
-    /// dimensioille. Käytä `with_*`-metodeja virittääksesi yksittäisiä
-    /// dimensioita ladatusta profiilista.
+    /// `baseline = 0.0`, `decay_rate = 1.0`, `sensitivity = 1.0` for all
+    /// dimensions. Use the `with_*` methods to tune individual dimensions
+    /// from a loaded profile.
     #[must_use]
     pub fn new(label: impl Into<String>) -> Self {
         Self {
@@ -106,31 +110,31 @@ impl TableCalibration {
         }
     }
 
-    /// Asettaa dimension lepoarvon (`0.0..=100.0`, puristetaan).
+    /// Sets the dimension's resting value (`0.0..=100.0`, clamped).
     #[must_use]
     pub fn with_baseline(mut self, dimension: Dimension, value: f32) -> Self {
         self.baseline[dimension.index()] = sanitize(value, 0.0).clamp(0.0, 100.0);
         self
     }
 
-    /// Asettaa dimension decay-kertoimen (ei-negatiivinen, puristetaan).
+    /// Sets the dimension's decay coefficient (non-negative, clamped).
     #[must_use]
     pub fn with_decay_rate(mut self, dimension: Dimension, value: f32) -> Self {
         self.decay_rate[dimension.index()] = sanitize(value, 1.0).max(0.0);
         self
     }
 
-    /// Asettaa dimension herkkyyskertoimen (ei-negatiivinen, puristetaan).
+    /// Sets the dimension's sensitivity coefficient (non-negative, clamped).
     #[must_use]
     pub fn with_sensitivity(mut self, dimension: Dimension, value: f32) -> Self {
         self.sensitivity[dimension.index()] = sanitize(value, 1.0).max(0.0);
         self
     }
 
-    /// Rakentaa kalibroinnin `calibration.json`-muotoisesta JSON-merkkijonosta
-    /// (KERROS B -profiilidata, ladataan ajonaikaisesti).
+    /// Builds a calibration from a `calibration.json`-shaped JSON string
+    /// (Layer B profile data, loaded at runtime).
     ///
-    /// Skeema:
+    /// Schema:
     /// ```json
     /// {
     ///   "label": "agent_a",
@@ -139,14 +143,14 @@ impl TableCalibration {
     ///   }
     /// }
     /// ```
-    /// Kaikki kentät ovat valinnaisia: tuntemattomat avaimet ohitetaan,
-    /// puuttuvat dimensiot jäävät neutraaleiksi (`baseline=0`, `decay_rate=1`,
-    /// `sensitivity=1`), ja arvot puristetaan turvallisiin rajoihin samalla
-    /// tavalla kuin `with_*`-metodeissa. Mitään painoja ei kovakoodata — tämä
-    /// vain *lukee* sen, mitä kutsuja antaa.
+    /// All fields are optional: unknown keys are ignored, dimensions not
+    /// mentioned stay neutral (`baseline=0`, `decay_rate=1`,
+    /// `sensitivity=1`), and values are clamped to safe bounds the same
+    /// way as in the `with_*` methods. No weights are hardcoded here —
+    /// this only *reads* whatever the caller provides.
     ///
     /// # Errors
-    /// Palauttaa [`serde_json::Error`]:n jos JSON on syntaktisesti kelvoton.
+    /// Returns a [`serde_json::Error`] if the JSON is syntactically invalid.
     pub fn from_json_str(json: &str) -> Result<Self, serde_json::Error> {
         let file: CalibrationFile = serde_json::from_str(json)?;
         let label = file.label.unwrap_or_else(|| "loaded".to_string());
@@ -165,11 +169,11 @@ impl TableCalibration {
         Ok(cal)
     }
 
-    /// Lataa kalibroinnin `calibration.json`-tiedostosta levyltä.
+    /// Loads a calibration from a `calibration.json` file on disk.
     ///
     /// # Errors
-    /// - IO-virhe jos tiedostoa ei voi lukea.
-    /// - JSON-jäsennysvirhe jos sisältö on kelvoton (`InvalidData`).
+    /// - An IO error if the file can't be read.
+    /// - A JSON parse error if the content is invalid (`InvalidData`).
     pub fn from_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         Self::from_json_str(&contents)
@@ -177,11 +181,11 @@ impl TableCalibration {
     }
 }
 
-/// `calibration.json`-tiedoston deserialisointiskeema (sisäinen).
+/// The deserialization schema for a `calibration.json` file (internal).
 ///
-/// Tuntemattomat ylätason kentät (esim. `version`, `notes`) ohitetaan.
-/// `dimensions` käyttää [`Dimension`]:n `snake_case`-serde-nimiä avaimina,
-/// joten tuntematon dimensionimi tuottaa selkeän jäsennysvirheen.
+/// Unknown top-level fields (e.g. `version`, `notes`) are ignored.
+/// `dimensions` uses [`Dimension`]'s `snake_case` serde names as keys, so
+/// an unknown dimension name produces a clear parse error.
 #[derive(Debug, Deserialize)]
 struct CalibrationFile {
     #[serde(default)]
@@ -190,7 +194,7 @@ struct CalibrationFile {
     dimensions: BTreeMap<Dimension, DimensionWeights>,
 }
 
-/// Yhden dimension painot tiedostossa — kaikki valinnaisia.
+/// A single dimension's weights in the file — all optional.
 #[derive(Debug, Deserialize)]
 struct DimensionWeights {
     #[serde(default)]
@@ -219,7 +223,7 @@ impl EmotionCalibration for TableCalibration {
     }
 }
 
-/// Korvaa NaN/ääretön arvon turvallisella oletuksella.
+/// Replaces a NaN/infinite value with a safe fallback.
 fn sanitize(x: f32, fallback: f32) -> f32 {
     if x.is_finite() {
         x
@@ -230,7 +234,7 @@ fn sanitize(x: f32, fallback: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    // Testit vertaavat tarkasti esitettäviä f32-vakioita — tarkka vertailu ok.
+    // Tests compare exactly representable f32 constants — exact comparison is fine.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -266,7 +270,7 @@ mod tests {
         assert_eq!(c.baseline(Dimension::Love), 20.0);
         assert_eq!(c.decay_rate(Dimension::Love), 0.5);
         assert_eq!(c.sensitivity(Dimension::Curiosity), 1.5);
-        // Muut dimensiot pysyvät neutraaleina.
+        // Other dimensions stay neutral.
         assert_eq!(c.baseline(Dimension::Anger), 0.0);
         assert_eq!(c.decay_rate(Dimension::Anger), 1.0);
     }
@@ -279,7 +283,7 @@ mod tests {
             .with_sensitivity(Dimension::Joy, f32::NAN);
         assert_eq!(c.baseline(Dimension::Joy), 100.0);
         assert_eq!(c.decay_rate(Dimension::Joy), 0.0);
-        // NaN-herkkyys palautuu oletukseen 1.0.
+        // NaN sensitivity falls back to the default of 1.0.
         assert_eq!(c.sensitivity(Dimension::Joy), 1.0);
     }
 
@@ -292,8 +296,8 @@ mod tests {
 
     #[test]
     fn from_json_str_parses_calibration_file_schema() {
-        // Sama muoto kuin perheen profiilien calibration.json (version/notes
-        // ohitetaan, dimensions luetaan snake_case-nimillä).
+        // Same shape as a family profile's calibration.json (version/notes
+        // are ignored, dimensions are read by their snake_case names).
         let json = r#"{
             "version": 1,
             "label": "agent_a",
@@ -308,20 +312,20 @@ mod tests {
         assert_eq!(c.baseline(Dimension::Curiosity), 30.0);
         assert_eq!(c.decay_rate(Dimension::Curiosity), 0.5);
         assert_eq!(c.sensitivity(Dimension::Curiosity), 1.5);
-        // Dimensiot joita ei mainita pysyvät neutraaleina.
+        // Dimensions not mentioned stay neutral.
         assert_eq!(c.baseline(Dimension::Joy), 0.0);
         assert_eq!(c.decay_rate(Dimension::Joy), 1.0);
     }
 
     #[test]
     fn from_json_str_clamps_and_defaults_partial_fields() {
-        // Puuttuvat kentät → neutraali oletus; ylisuuret arvot puristetaan.
+        // Missing fields → neutral default; oversized values are clamped.
         let json = r#"{ "dimensions": { "love": { "baseline": 500.0 } } }"#;
         let c = TableCalibration::from_json_str(json).expect("parse");
         assert_eq!(c.label(), "loaded");
-        assert_eq!(c.baseline(Dimension::Love), 100.0); // puristettu
-        assert_eq!(c.decay_rate(Dimension::Love), 1.0); // oletus
-        assert_eq!(c.sensitivity(Dimension::Love), 1.0); // oletus
+        assert_eq!(c.baseline(Dimension::Love), 100.0); // clamped
+        assert_eq!(c.decay_rate(Dimension::Love), 1.0); // default
+        assert_eq!(c.sensitivity(Dimension::Love), 1.0); // default
     }
 
     #[test]

@@ -1,14 +1,15 @@
 # FamilyClaw — Project Status
 
 > **This file is the single source of truth for what FamilyClaw is, what works
-> today, what is deferred, and where it stands on release.** Strategy and priorities
-> live in **[MASTERPLAN.md](MASTERPLAN.md)**. Older plan documents are archived in
-> [docs/archive/](docs/archive/) (see [Detailed design docs](#detailed-design-docs)).
+> today, what is deferred, and where it stands on release.** Strategy and
+> priorities live in internal planning, outside this public repo. Older plan
+> documents are archived in [docs/archive/](docs/archive/) (see
+> [Detailed design docs](#detailed-design-docs)).
 
 - **Version:** `v1.2.0` (workspace `Cargo.toml` `version = "1.2.0"`)
 - **License:** MIT
 - **Language:** Rust 2021, MSRV 1.88, `unsafe` forbidden workspace-wide
-- **Workspace:** 23 crates (`crates/*`) + `examples/minimal-gateway`
+- **Workspace:** 23 public crates (`crates/*`) + `examples/minimal-gateway`
 - **Last verified:** 2026-07-12
 
 > **Hygiene sprint (2026-07-12):** Untracked root-level internal blueprint document (containing non-generic identifiers) removed from the working tree. All public-facing docs and code remain strictly generic Layer A only. Boundary continues to be enforced by `.gitignore` (quarantine list) + `scripts/audit-layer-b.sh`. No changes to tracked files or published content.
@@ -131,17 +132,12 @@ claimed as working today.
 - **Publish gate:** `scripts/pre-publish-scan.sh` scans git history *and* commit
   messages for leaked names before any public push (Layer B protection).
 
-> **Note on the README `--all-features` caveat:** an older paragraph in the README
-> Verification section says `--all-features` is "intentionally NOT used" because the
-> `surreal` feature was broken. That caveat is **stale as of v1.2.0** — the surreal
-> feature was repaired and an `all-features` CI job now runs. `STATUS.md` is
-> authoritative here; the README paragraph is being reconciled.
-
 ---
 
 ## Detailed design docs
 
-**Strategy:** [MASTERPLAN.md](MASTERPLAN.md) · **Technical status:** this file.
+**Strategy and priorities:** internal planning (not part of this public repo).
+**Technical status:** this file.
 
 Archived superseded plans: [docs/archive/](docs/archive/). The following remain as
 detailed design and evidence records:
@@ -159,7 +155,7 @@ detailed design and evidence records:
 - Release notes: [v1.0.0](docs/RELEASE_NOTES_v1.0.0.md) · [v1.0.1](docs/RELEASE_NOTES_v1.0.1.md) · [v1.2.0](docs/RELEASE_NOTES_v1.2.0.md).
 
 > Older phase / demo / release-checklist documents in `docs/` or `docs/archive/` are
-> historical evidence. **When in doubt: MASTERPLAN for strategy, STATUS for what ships.**
+> historical evidence. **When in doubt: STATUS.md is authoritative for what ships.**
 
 ---
 

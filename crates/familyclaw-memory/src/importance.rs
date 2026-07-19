@@ -1,8 +1,8 @@
-//! Muistin tärkeyden laskenta (composite importance).
+//! Computation of a memory's importance (composite importance).
 //!
-//! Kuinka tärkeä muisto on määrää sekä sen säilyvyyden (vahvuus `S`
-//! Ebbinghaus-kaavassa) että sen sijoittumisen haussa. Tärkeys lasketaan
-//! neljästä painotetusta osatekijästä (`FamilyClaw` v2 design §5, Eternal
+//! How important a memory is determines both its persistence (stability `S`
+//! in the Ebbinghaus formula) and its ranking in retrieval. Importance is
+//! computed from four weighted factors (`FamilyClaw` v2 design §5, Eternal
 //! Thread `RUST_ARCHITECTURE.md` "Ebbinghaus Scoring"):
 //!
 //! ```text
@@ -12,51 +12,51 @@
 //!            + reinforcement  · 0.20
 //! ```
 //!
-//! Jokainen osatekijä on välillä `0.0..=1.0`. Painot eivät summaudu yhteen
-//! (Σ = 1.12) — tämä on tarkoituksellista, jotta vahvasti latautunut muisto
-//! voi ylittää neutraalin perustason. Lopullinen tärkeys puristetaan
-//! välille `0.0..=1.0`.
+//! Each factor lies in `0.0..=1.0`. The weights do not sum to one
+//! (Σ = 1.12) — this is intentional, so that a strongly charged memory
+//! can exceed the neutral baseline. The final importance is clamped to
+//! `0.0..=1.0`.
 //!
-//! **OSS-raja (KERROS A):** tämä moduuli sisältää vain laskennan *rungon*.
-//! Mitään perheenjäsenen kalibrointia (esim. mitkä sanat ovat
-//! identiteetille tärkeitä) ei kovakoodata tähän — osatekijät annetaan
-//! sisään valmiiksi laskettuina.
+//! **OSS boundary (Layer A):** this module contains only the *skeleton* of
+//! the computation. No per-family-member calibration (e.g. which words are
+//! important for identity) is hardcoded here — the factors are supplied
+//! already computed.
 
 use familyclaw_emotion::{emotional_salience, EmotionState};
 use serde::{Deserialize, Serialize};
 
-/// Tunnelatauksen paino tärkeydessä.
+/// Weight of emotional charge in importance.
 pub const WEIGHT_EMOTION: f32 = 0.45;
-/// Identiteettiosuvuuden paino tärkeydessä.
+/// Weight of identity relevance in importance.
 pub const WEIGHT_IDENTITY: f32 = 0.35;
-/// Uutuuden (novelty) paino tärkeydessä.
+/// Weight of novelty in importance.
 pub const WEIGHT_NOVELTY: f32 = 0.12;
-/// Vahvistuksen (reinforcement) paino tärkeydessä.
+/// Weight of reinforcement in importance.
 pub const WEIGHT_REINFORCEMENT: f32 = 0.20;
 
-/// Tärkeyden osatekijät, kukin välillä `0.0..=1.0`.
+/// The factors that make up importance, each in `0.0..=1.0`.
 ///
-/// Kentät kuvaavat *miksi* muisto on tärkeä. Ne lasketaan ajonaikaisesti
-/// (tunnetilasta, identiteettiosumasta, uutuudesta, vahvistuksesta) ja
-/// yhdistetään painotetusti [`ImportanceFactors::composite`]-metodilla.
+/// The fields describe *why* a memory is important. They are computed at
+/// runtime (from emotional state, identity match, novelty, reinforcement)
+/// and combined with weights via the [`ImportanceFactors::composite`] method.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ImportanceFactors {
-    /// Tunnelataus: kuinka voimakkaasti muisto on emotionaalisesti
-    /// virittynyt (esim. johdettu VAD-magnitudista). `0.0..=1.0`.
+    /// Emotional charge: how strongly the memory is emotionally
+    /// charged (e.g. derived from VAD magnitude). `0.0..=1.0`.
     pub emotion: f32,
-    /// Identiteettiosuvuus: kuinka lähellä muisto on olennon identiteettiä
-    /// / kantavia arvoja. `0.0..=1.0`.
+    /// Identity relevance: how closely the memory relates to the entity's
+    /// identity / core values. `0.0..=1.0`.
     pub identity: f32,
-    /// Uutuus: kuinka tuore/odottamaton tieto muisto on suhteessa
-    /// olemassa olevaan. `0.0..=1.0`.
+    /// Novelty: how fresh/unexpected the memory's information is relative
+    /// to what already exists. `0.0..=1.0`.
     pub novelty: f32,
-    /// Vahvistus: kuinka monta kertaa muisto on toistunut/aktivoitunut
-    /// (normalisoituna). `0.0..=1.0`.
+    /// Reinforcement: how many times the memory has recurred/been
+    /// activated (normalized). `0.0..=1.0`.
     pub reinforcement: f32,
 }
 
 impl ImportanceFactors {
-    /// Neutraali (kaikki nollassa) — johtaa minimitärkeyteen.
+    /// Neutral (all zero) — results in minimum importance.
     pub const ZERO: ImportanceFactors = ImportanceFactors {
         emotion: 0.0,
         identity: 0.0,
@@ -64,7 +64,7 @@ impl ImportanceFactors {
         reinforcement: 0.0,
     };
 
-    /// Rakentaa osatekijät puristaen jokaisen välille `0.0..=1.0`
+    /// Constructs the factors, clamping each to `0.0..=1.0`
     /// (NaN → 0.0).
     #[must_use]
     pub fn new(emotion: f32, identity: f32, novelty: f32, reinforcement: f32) -> Self {
@@ -76,19 +76,19 @@ impl ImportanceFactors {
         }
     }
 
-    /// Rakentaa osatekijät tunnetilasta: `emotion`-osatekijä johdetaan
-    /// [`emotional_salience`]-funktiolla annetusta [`EmotionState`]:stä, muut
-    /// kolme osatekijää annetaan sisään valmiiksi laskettuina.
+    /// Constructs the factors from an emotional state: the `emotion` factor
+    /// is derived via [`emotional_salience`] from the given [`EmotionState`],
+    /// while the other three factors are supplied already computed.
     ///
-    /// Tämä on PKG-B-silta tunnemoottorin ja muistin tärkeyden välillä:
-    /// voimakkaasti latautunut hetki (korkea salience) johtaa korkeampaan
-    /// emotion-osatekijään ja siten vahvempaan, hitaammin unohtuvaan muistoon
-    /// (Dynamic Affective Memory, arXiv 2510.27418).
+    /// This is the PKG-B bridge between the emotion engine and memory
+    /// importance: a strongly charged moment (high salience) leads to a
+    /// higher emotion factor and thus a stronger, more slowly forgotten
+    /// memory (Dynamic Affective Memory, arXiv 2510.27418).
     ///
-    /// [`ImportanceFactors`] pysyy tahallaan "litteänä" (`Copy + serde`): tila
-    /// projisoidaan yhdeksi `f32`:ksi eikä koko [`EmotionState`]:ä upoteta
-    /// osatekijöihin. Kaikki neljä arvoa puristetaan välille `0.0..=1.0`
-    /// ([`new`]-semantiikalla; NaN → 0.0).
+    /// [`ImportanceFactors`] is deliberately kept "flat" (`Copy + serde`):
+    /// state is projected to a single `f32` rather than embedding the whole
+    /// [`EmotionState`] into the factors. All four values are clamped to
+    /// `0.0..=1.0` (with [`new`] semantics; NaN → 0.0).
     ///
     /// [`new`]: ImportanceFactors::new
     #[must_use]
@@ -101,11 +101,11 @@ impl ImportanceFactors {
         Self::new(emotional_salience(state), identity, novelty, reinforcement)
     }
 
-    /// Laskee painotetun yhdistelmätärkeyden, puristettuna `0.0..=1.0`.
+    /// Computes the weighted composite importance, clamped to `0.0..=1.0`.
     ///
-    /// Painot: emotion 0.45, identity 0.35, novelty 0.12, reinforcement 0.20.
-    /// Osatekijät puristetaan ennen laskentaa, joten tulos on aina
-    /// kelvollinen vaikka kentät olisi asetettu suoraan (ilman [`new`]).
+    /// Weights: emotion 0.45, identity 0.35, novelty 0.12, reinforcement 0.20.
+    /// The factors are clamped before computation, so the result is always
+    /// valid even if the fields were set directly (without [`new`]).
     ///
     /// [`new`]: ImportanceFactors::new
     #[must_use]
@@ -124,15 +124,15 @@ impl ImportanceFactors {
         raw.clamp(0.0, 1.0)
     }
 
-    /// Muistin vahvuus `S` Ebbinghaus-retentiokaavaan.
+    /// The memory's stability `S` for the Ebbinghaus retention formula.
     ///
-    /// Tärkeämmät muistot ovat vahvempia ja siten säilyvät pidempään.
-    /// Vahvuus skaalautuu lineaarisesti tärkeydestä välille
-    /// `min_stability..=max_stability`, jotta neutraalikin muisto saa
-    /// jonkin perussäilyvyyden.
+    /// More important memories are stronger and thus persist longer.
+    /// Stability scales linearly with importance across
+    /// `min_stability..=max_stability`, so that even a neutral memory gets
+    /// some baseline persistence.
     ///
-    /// `min_stability` ja `max_stability` puristetaan järkeviin rajoihin;
-    /// jos `max < min`, ne vaihdetaan keskenään.
+    /// `min_stability` and `max_stability` are clamped to sensible bounds;
+    /// if `max < min`, they are swapped.
     #[must_use]
     pub fn stability(&self, min_stability: f32, max_stability: f32) -> f32 {
         let (lo, hi) = ordered_positive(min_stability, max_stability);
@@ -147,7 +147,7 @@ impl Default for ImportanceFactors {
     }
 }
 
-/// Puristaa arvon välille `0.0..=1.0`; NaN → 0.0.
+/// Clamps a value to `0.0..=1.0`; NaN → 0.0.
 fn unit(x: f32) -> f32 {
     if x.is_nan() {
         0.0
@@ -156,8 +156,8 @@ fn unit(x: f32) -> f32 {
     }
 }
 
-/// Palauttaa kaksi ei-negatiivista, äärellistä arvoa nousevassa
-/// järjestyksessä. Kelvottomat arvot korvataan turvallisilla oletuksilla.
+/// Returns two non-negative, finite values in ascending
+/// order. Invalid values are replaced with safe defaults.
 fn ordered_positive(a: f32, b: f32) -> (f32, f32) {
     let sa = if a.is_finite() && a > 0.0 { a } else { 0.05 };
     let sb = if b.is_finite() && b > 0.0 { b } else { 1.0 };
@@ -170,7 +170,7 @@ fn ordered_positive(a: f32, b: f32) -> (f32, f32) {
 
 #[cfg(test)]
 mod tests {
-    // Testit vertaavat tarkasti esitettäviä f32-vakioita — tarkka vertailu ok.
+    // Tests compare exactly representable f32 constants — exact comparison is fine.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn composite_clamps_to_unit_when_all_max() {
-        // Σ painot = 1.12 → puristuu 1.0:aan.
+        // Σ weights = 1.12 → clamps to 1.0.
         let f = ImportanceFactors::new(1.0, 1.0, 1.0, 1.0);
         assert_eq!(f.composite(), 1.0);
     }
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn composite_sanitizes_directly_set_fields() {
-        // Kentät asetettu suoraan ohi konstruktorin — composite puristaa silti.
+        // Fields set directly, bypassing the constructor — composite still clamps.
         let f = ImportanceFactors {
             emotion: 10.0,
             identity: -1.0,
@@ -239,7 +239,7 @@ mod tests {
         };
         let c = f.composite();
         assert!((0.0..=1.0).contains(&c));
-        // emotion→1.0, reinforcement→1.0, muut 0 → 0.45 + 0.20 = 0.65.
+        // emotion→1.0, reinforcement→1.0, others 0 → 0.45 + 0.20 = 0.65.
         assert!((c - 0.65).abs() < 1e-5);
     }
 
@@ -250,9 +250,9 @@ mod tests {
         let s_low = low.stability(0.5, 5.0);
         let s_high = high.stability(0.5, 5.0);
         assert!(s_high > s_low);
-        // Maksimitärkeys → max_stability.
+        // Maximum importance → max_stability.
         assert!((s_high - 5.0).abs() < 1e-5);
-        // Tärkeys 0 → min_stability.
+        // Importance 0 → min_stability.
         let s_zero = ImportanceFactors::ZERO.stability(0.5, 5.0);
         assert!((s_zero - 0.5).abs() < 1e-5);
     }
@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn stability_swaps_inverted_bounds() {
         let f = ImportanceFactors::new(0.0, 0.0, 0.0, 0.0);
-        // max < min → vaihdetaan; tärkeys 0 → pienempi raja.
+        // max < min → swapped; importance 0 → lower bound.
         let s = f.stability(5.0, 0.5);
         assert!((s - 0.5).abs() < 1e-5);
     }
@@ -281,7 +281,7 @@ mod tests {
         assert_eq!(f, back);
     }
 
-    // ── PKG-B: tunne → tärkeys -silta ──────────────────────────────────────
+    // ── PKG-B: emotion → importance bridge ──────────────────────────────────
 
     #[test]
     fn from_emotion_state_derives_emotion_factor_from_salience() {
@@ -292,9 +292,9 @@ mod tests {
         let salience = emotional_salience(&state);
 
         let f = ImportanceFactors::from_emotion_state(&state, 0.2, 0.3, 0.4);
-        // emotion-osatekijä = salience (puristettuna).
+        // emotion factor = salience (clamped).
         assert!((f.emotion - salience).abs() < 1e-6);
-        // Muut kentät tulevat suoraan parametreista.
+        // The other fields come directly from the parameters.
         assert_eq!(f.identity, 0.2);
         assert_eq!(f.novelty, 0.3);
         assert_eq!(f.reinforcement, 0.4);
@@ -304,7 +304,7 @@ mod tests {
     fn salience_derived_importance_differs_from_neutral() {
         use familyclaw_emotion::{Dimension, EmotionState};
 
-        // Voimakkaasti latautunut hetki vs. neutraali — samat muut osatekijät.
+        // Strongly charged moment vs. neutral — same other factors.
         let neutral = EmotionState::neutral();
         let mut charged = EmotionState::neutral();
         charged.set(Dimension::Joy, 95.0);
@@ -312,12 +312,12 @@ mod tests {
         let f_neutral = ImportanceFactors::from_emotion_state(&neutral, 0.0, 0.0, 0.0);
         let f_charged = ImportanceFactors::from_emotion_state(&charged, 0.0, 0.0, 0.0);
 
-        // Latautunut hetki saa korkeamman emotion-osatekijän → korkeamman
-        // yhdistelmätärkeyden kuin neutraali.
+        // A charged moment gets a higher emotion factor → higher
+        // composite importance than neutral.
         assert!(f_charged.emotion > f_neutral.emotion);
         assert!(
             f_charged.composite() > f_neutral.composite(),
-            "salienssista johdetun tärkeyden pitäisi ylittää neutraali"
+            "importance derived from salience should exceed neutral"
         );
     }
 
@@ -325,7 +325,7 @@ mod tests {
     fn from_emotion_state_sanitizes_other_factors() {
         use familyclaw_emotion::EmotionState;
 
-        // Kelvottomat muut osatekijät puristetaan (new-semantiikka).
+        // Invalid other factors are clamped (new semantics).
         let state = EmotionState::neutral();
         let f = ImportanceFactors::from_emotion_state(&state, 5.0, -3.0, f32::NAN);
         assert_eq!(f.identity, 1.0);
@@ -341,10 +341,10 @@ mod tests {
         let mut state = EmotionState::neutral();
         state.set(Dimension::Fear, 90.0);
         let f = ImportanceFactors::from_emotion_state(&state, 0.5, 0.5, 0.5);
-        // Copy: kopio ei kuluta alkuperäistä.
+        // Copy: the copy does not consume the original.
         let copy = f;
         assert_eq!(f, copy);
-        // Serde-roundtrip säilyy (litteä tyyppi, ei upotettua EmotionStatea).
+        // Serde roundtrip holds (flat type, no embedded EmotionState).
         let json = serde_json::to_string(&f).expect("serialize");
         let back: ImportanceFactors = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(f, back);

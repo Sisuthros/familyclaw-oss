@@ -1,24 +1,24 @@
-//! Hyväksyntäkerros (human-in-the-loop): hyväksyntäpyynnöt, niiden TTL,
-//! kertakäyttöisyys (nonce) ja payload-tiivisteen sidonta (KERROS A).
+//! Approval layer (human-in-the-loop): approval requests, their TTL,
+//! single-use enforcement (nonce), and payload-hash binding (Layer A).
 //!
-//! Tämä moduuli toteuttaa toimintopinon `request approval` -vaiheen:
-//! - [`Approval`] — yksittäinen myönnetty hyväksyntä (TTL + payload-sidonta),
-//! - [`ApprovalLedger`] — in-memory-rekisteri joka myöntää, kuluttaa ja evää
-//!   hyväksyntöjä sekä kirjaa jokaisen tapahtuman audit-lokiin ([`crate::audit`]).
+//! This module implements the action pipeline's `request approval` stage:
+//! - [`Approval`] — a single granted approval (TTL + payload binding),
+//! - [`ApprovalLedger`] — an in-memory registry that grants, consumes, and
+//!   denies approvals and logs every event to the audit log ([`crate::audit`]).
 //!
-//! ## Turvallisuusperiaatteet
-//! - **Fail-closed:** kulutus epäonnistuu jos hyväksyntää ei löydy, se on
-//!   vanhentunut, jo kulutettu tai payload-tiiviste ei täsmää.
-//! - **Kertakäyttö (nonce):** hyväksynnän voi kuluttaa täsmälleen kerran.
-//! - **Payload-sidonta:** hyväksyntä sidotaan toiminnon payloadin
-//!   SHA-256-tiivisteeseen; esitetty payload tiivistetään uudelleen ja
-//!   verrataan tallennettuun **vakioaikaisella** vertailulla (timing-side-channel
-//!   estetään).
+//! ## Safety principles
+//! - **Fail-closed:** consumption fails if the approval cannot be found, has
+//!   expired, has already been consumed, or the payload hash does not match.
+//! - **Single use (nonce):** an approval can be consumed exactly once.
+//! - **Payload binding:** an approval is bound to the SHA-256 hash of the
+//!   action's payload; the presented payload is re-hashed and compared
+//!   against the stored value using a **constant-time** comparison (to
+//!   prevent timing side-channels).
 //!
-//! ## Determinismi
-//! Logiikka ottaa aikaleiman injektoituna
-//! ([`familyclaw_core::time::Timestamp`]) — kelloa ei lueta tämän moduulin
-//! sisällä, jotta testit ja replay pysyvät deterministisinä.
+//! ## Determinism
+//! The logic takes the timestamp as an injected value
+//! ([`familyclaw_core::time::Timestamp`]) — the clock is never read inside
+//! this module, so that tests and replay stay deterministic.
 
 use std::collections::HashMap;
 
@@ -32,14 +32,14 @@ use crate::audit::{ActionAuditEvent, AuditAction, AuditLog};
 use crate::error::{ActionError, Result};
 use crate::ids::{ActionId, ApprovalId};
 
-/// Moduulin valmiusaste — säilytetään, jotta [`crate::all_modules_scaffolded`]
-/// kääntyy edelleen muiden vielä luurankovaiheessa olevien moduulien rinnalla.
+/// Module readiness flag — kept so that [`crate::all_modules_scaffolded`]
+/// still compiles alongside other modules that are still in the scaffolding stage.
 pub(crate) const SCAFFOLDED: bool = true;
 
-/// Laskee annetun payloadin SHA-256-tiivisteen heksamerkkijonona.
+/// Computes the SHA-256 hash of the given payload as a hex string.
 ///
-/// Käytetään hyväksynnän sitomiseen tiettyyn payloadiin: hyväksyntä koskee vain
-/// täsmälleen sitä payloadia jonka tiiviste tallennettiin myöntöhetkellä.
+/// Used to bind an approval to a specific payload: an approval covers only
+/// the exact payload whose hash was stored at grant time.
 #[must_use]
 pub fn sha256_hex(payload: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -48,42 +48,42 @@ pub fn sha256_hex(payload: &[u8]) -> String {
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write as _;
-        // write! Stringiin ei voi epäonnistua → virhe poltetaan tarkoituksella.
+        // write! into a String cannot fail → the error is deliberately discarded.
         let _ = write!(hex, "{byte:02x}");
     }
     hex
 }
 
-/// Laskee vanhentumishetken `now + ttl` **kyllästyen** (saturating) ylivuodon
-/// yli, jottei myöntö koskaan panikoi äärimmäisellä TTL:llä.
+/// Computes the expiry instant `now + ttl` **saturating** on overflow, so that
+/// a grant never panics on an extreme TTL.
 ///
-/// `chrono`-kirjaston `DateTime + Duration` panikoi jos tulos ylittää
-/// edustettavan aika-alueen ([`DateTime::<Utc>::MAX_UTC`] /
-/// [`DateTime::<Utc>::MIN_UTC`]). Tämä funktio käyttää tarkistettua
-/// yhteenlaskua ja kyllästää rajalle:
-/// - **Positiivinen ylivuoto** (valtava positiivinen TTL) → [`DateTime::<Utc>::MAX_UTC`]
-///   (kutsujan tarkoitus "ei käytännössä koskaan vanhene" säilyy ilman kaatumista).
-/// - **Negatiivinen alivuoto** (valtava negatiivinen TTL) → [`DateTime::<Utc>::MIN_UTC`]
-///   (jo vanhentunut — kulutus epäonnistuu fail-closed, kuten negatiivisella
-///   TTL:llä kuuluukin).
+/// The `chrono` crate's `DateTime + Duration` panics if the result exceeds the
+/// representable time range ([`DateTime::<Utc>::MAX_UTC`] /
+/// [`DateTime::<Utc>::MIN_UTC`]). This function uses checked addition and
+/// saturates at the boundary:
+/// - **Positive overflow** (a huge positive TTL) → [`DateTime::<Utc>::MAX_UTC`]
+///   (the caller's intent of "practically never expires" is preserved without crashing).
+/// - **Negative underflow** (a huge negative TTL) → [`DateTime::<Utc>::MIN_UTC`]
+///   (already expired — consumption fails fail-closed, as is appropriate for a
+///   negative TTL).
 ///
-/// Näin vanhentumislogiikka pysyy **fail-closed** myös ääritilanteissa: kyllästys
-/// ei koskaan tee jo vanhentuneesta hyväksynnästä elävää.
+/// This way the expiry logic stays **fail-closed** even in extreme cases:
+/// saturation never turns an already-expired approval into a live one.
 #[must_use]
 fn saturating_expiry(now: Timestamp, ttl: Duration) -> Timestamp {
     match now.checked_add_signed(ttl) {
         Some(ts) => ts,
-        // None = ylivuoto. Suunta päätellään TTL:n etumerkistä.
+        // None = overflow. The direction is inferred from the TTL's sign.
         None if ttl < Duration::zero() => DateTime::<Utc>::MIN_UTC,
         None => DateTime::<Utc>::MAX_UTC,
     }
 }
 
-/// Vertaa kahta heksatiivistettä vakioaikaisesti (timing-side-channel suoja).
+/// Compares two hex hashes in constant time (protection against timing side-channels).
 ///
-/// Eripituiset syötteet eivät koskaan täsmää, ja vertailu käy aina kaikki
-/// tavut läpi pituuden salliessa, jotta vertailuun kuluva aika ei vuoda tietoa
-/// siitä, kuinka monta etumerkkiä täsmäsi.
+/// Inputs of different lengths never match, and the comparison always walks
+/// through all bytes for as long as the length allows, so that the time taken
+/// does not leak information about how many leading characters matched.
 #[must_use]
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
@@ -98,39 +98,39 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// Yksittäinen myönnetty hyväksyntä (human-in-the-loop).
+/// A single granted approval (human-in-the-loop).
 ///
-/// Hyväksyntä on TTL-rajattu, kertakäyttöinen ([`Approval::consumed`]) ja sidottu
-/// toiminnon payloadin SHA-256-tiivisteeseen ([`Approval::payload_hash`]).
+/// An approval is TTL-bounded, single-use ([`Approval::consumed`]), and bound
+/// to the SHA-256 hash of the action's payload ([`Approval::payload_hash`]).
 ///
-/// ## Salaisuusinvariantti (durable-persistointi)
-/// Tämä tyyppi toteuttaa [`Serialize`]/[`Deserialize`]:n, jotta odottava
-/// hyväksyntä voidaan kirjata kaatumiskestävään journaliin
-/// ([`crate::pending_store`]). **Yksikään kenttä ei ole raaka salaisuus eikä
-/// KERROS B -dataa:** [`Approval::payload_hash`] on payloadin SHA-256-tiiviste
-/// (ei itse payload), ja loput kentät ovat tunnisteita, aikaleimoja ja
-/// boolean-lippu. Näin hyväksynnän voi tallentaa levylle rikkomatta
-/// "ei salaisuuksia levylle" -periaatetta.
+/// ## Secrecy invariant (durable persistence)
+/// This type implements [`Serialize`]/[`Deserialize`] so that a pending
+/// approval can be recorded to a crash-durable journal
+/// ([`crate::pending_store`]). **No field is a raw secret or
+/// Layer B data:** [`Approval::payload_hash`] is the SHA-256 hash of the
+/// payload (not the payload itself), and the remaining fields are
+/// identifiers, timestamps, and a boolean flag. This means the approval can
+/// be persisted to disk without violating the "no secrets on disk" principle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Approval {
-    /// Hyväksynnän yksilöivä tunniste.
+    /// The approval's unique identifier.
     pub id: ApprovalId,
-    /// Toiminto jonka tämä hyväksyntä valtuuttaa.
+    /// The action that this approval authorizes.
     pub action_id: ActionId,
-    /// Valtuutetun payloadin SHA-256-tiiviste heksamuodossa.
+    /// SHA-256 hash of the authorized payload, in hex form.
     pub payload_hash: String,
-    /// Hetki jolloin hyväksyntä myönnettiin.
+    /// The instant at which the approval was granted.
     pub granted_at: Timestamp,
-    /// Hetki jonka jälkeen hyväksyntä on vanhentunut (`granted_at + ttl`).
+    /// The instant after which the approval is expired (`granted_at + ttl`).
     pub expires_at: Timestamp,
-    /// Onko hyväksyntä jo kulutettu (kertakäyttö — `true` estää uudelleenkäytön).
+    /// Whether the approval has already been consumed (single-use — `true` prevents reuse).
     pub consumed: bool,
 }
 
 impl Approval {
-    /// Onko hyväksyntä vanhentunut annettuun hetkeen `now` nähden.
+    /// Whether the approval is expired relative to the given instant `now`.
     ///
-    /// Vanhentunut tarkoittaa, että `now` on aidosti myöhäisempi kuin
+    /// Expired means that `now` is strictly later than
     /// [`Approval::expires_at`].
     #[must_use]
     pub fn is_expired(&self, now: Timestamp) -> bool {
@@ -138,40 +138,40 @@ impl Approval {
     }
 }
 
-/// In-memory-rekisteri hyväksynnöille (KERROS A).
+/// In-memory registry for approvals (Layer A).
 ///
-/// Säilyttää hyväksynnät tunnisteen mukaan ja kytkee oman audit-lokin
-/// ([`AuditLog`]) johon jokainen myöntö, kulutus, eväys ja vanhentuminen
-/// kirjataan. Pysyvä tallennus on substraattikerroksen vastuulla.
+/// Stores approvals keyed by identifier and holds its own audit log
+/// ([`AuditLog`]) to which every grant, consumption, denial, and expiry
+/// is logged. Durable storage is the responsibility of the substrate layer.
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalLedger {
-    /// Tunniste → hyväksyntä -kartta.
+    /// Map from identifier to approval.
     approvals: HashMap<ApprovalId, Approval>,
-    /// Audit-loki johon hyväksyntätapahtumat kirjataan.
+    /// Audit log to which approval events are recorded.
     audit: AuditLog,
 }
 
 impl ApprovalLedger {
-    /// Luo uuden tyhjän hyväksyntärekisterin.
+    /// Creates a new, empty approval registry.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Myöntää hyväksynnän toiminnolle ja sitoo sen payload-tiivisteeseen.
+    /// Grants an approval for an action and binds it to the payload hash.
     ///
-    /// Hyväksyntä vanhenee `now + ttl` -hetkellä. Myönnöstä kirjataan
-    /// [`AuditAction::ApprovalGranted`]-tapahtuma audit-lokiin. Palauttaa
-    /// myönnetyn hyväksynnän kopion.
+    /// The approval expires at `now + ttl`. The grant is logged as an
+    /// [`AuditAction::ApprovalGranted`] event to the audit log. Returns a
+    /// copy of the granted approval.
     ///
-    /// `ttl` saa olla nolla (hyväksyntä vanhenee heti seuraavalla hetkellä) tai
-    /// negatiivinen (jo valmiiksi vanhentunut); kumpaakaan ei pidetä virheenä —
-    /// fail-closed-logiikka hoitaa kulutuksen eston.
+    /// `ttl` may be zero (the approval expires at the very next instant) or
+    /// negative (already expired); neither is treated as an error —
+    /// the fail-closed logic handles blocking consumption.
     ///
-    /// Vanhentumishetki lasketaan **kyllästyen** (saturating): äärimmäinen
-    /// TTL ei koskaan panikoi (toisin kuin suora `now + ttl`). Ylivuoto kyllästyy
-    /// [`DateTime::<Utc>::MAX_UTC`]:hin ja alivuoto [`DateTime::<Utc>::MIN_UTC`]:hin,
-    /// joten vanhentumislogiikka pysyy fail-closed myös rajatapauksissa.
+    /// The expiry instant is computed **saturating**: an extreme
+    /// TTL never panics (unlike a direct `now + ttl`). Overflow saturates to
+    /// [`DateTime::<Utc>::MAX_UTC`] and underflow to [`DateTime::<Utc>::MIN_UTC`],
+    /// so the expiry logic stays fail-closed even in edge cases.
     pub fn grant(
         &mut self,
         action_id: ActionId,
@@ -198,37 +198,37 @@ impl ApprovalLedger {
         approval
     }
 
-    /// Kuluttaa hyväksynnän esitettyä payloadia vasten (kertakäyttö).
+    /// Consumes an approval against the presented payload (single-use).
     ///
-    /// Vaiheet (fail-closed):
-    /// 1. Hyväksyntää ei löydy → [`ActionError::ApprovalMissing`].
-    /// 2. Hyväksyntä on vanhentunut (`now > expires_at`) →
+    /// Steps (fail-closed):
+    /// 1. The approval cannot be found → [`ActionError::ApprovalMissing`].
+    /// 2. The approval has expired (`now > expires_at`) →
     ///    [`ActionError::ApprovalExpired`].
-    /// 3. Hyväksyntä on jo kulutettu → [`ActionError::ApprovalReused`].
-    /// 4. Esitetyn payloadin SHA-256-tiiviste ei vastaa tallennettua
-    ///    (vakioaikainen vertailu) → [`ActionError::ApprovalPayloadMismatch`].
-    /// 5. Onnistuessa hyväksyntä merkitään kulutetuksi ([`Approval::consumed`])
-    ///    ja kirjataan [`AuditAction::ApprovalConsumed`].
+    /// 3. The approval has already been consumed → [`ActionError::ApprovalReused`].
+    /// 4. The SHA-256 hash of the presented payload does not match the stored
+    ///    value (constant-time comparison) → [`ActionError::ApprovalPayloadMismatch`].
+    /// 5. On success, the approval is marked consumed ([`Approval::consumed`])
+    ///    and an [`AuditAction::ApprovalConsumed`] event is logged.
     ///
-    /// Jokainen epäonnistuminen kirjataan myös audit-lokiin
-    /// ([`AuditAction::ApprovalExpired`] tai [`AuditAction::ApprovalRejected`]).
+    /// Every failure is also logged to the audit log
+    /// ([`AuditAction::ApprovalExpired`] or [`AuditAction::ApprovalRejected`]).
     ///
     /// # Errors
-    /// Palauttaa edellä kuvatun [`ActionError`]-variantin jos jokin tarkistus ei
-    /// läpäise.
+    /// Returns the [`ActionError`] variant described above if any check
+    /// fails.
     pub fn consume(
         &mut self,
         approval_id: ApprovalId,
         action_payload: &[u8],
         now: Timestamp,
     ) -> Result<()> {
-        // (a) Fail-closed: löytymätöntä hyväksyntää ei voi kuluttaa.
+        // (a) Fail-closed: an approval that cannot be found cannot be consumed.
         let Some(approval) = self.approvals.get(&approval_id) else {
             return Err(ActionError::ApprovalMissing(approval_id.to_string()));
         };
         let action_id = approval.action_id;
 
-        // (b) Vanhentunut?
+        // (b) Expired?
         if approval.is_expired(now) {
             self.audit.append(ActionAuditEvent::new(
                 AuditAction::ApprovalExpired,
@@ -240,7 +240,7 @@ impl ApprovalLedger {
             return Err(ActionError::ApprovalExpired(approval_id.to_string()));
         }
 
-        // (d) Jo kulutettu? (kertakäyttö)
+        // (d) Already consumed? (single-use)
         if approval.consumed {
             self.audit.append(ActionAuditEvent::new(
                 AuditAction::ApprovalRejected,
@@ -252,7 +252,7 @@ impl ApprovalLedger {
             return Err(ActionError::ApprovalReused(approval_id.to_string()));
         }
 
-        // (c) Payload-tiiviste täsmää? (vakioaikainen vertailu)
+        // (c) Does the payload hash match? (constant-time comparison)
         let presented_hash = sha256_hex(action_payload);
         if !constant_time_eq(&presented_hash, &approval.payload_hash) {
             self.audit.append(ActionAuditEvent::new(
@@ -260,14 +260,14 @@ impl ApprovalLedger {
                 action_id,
                 Some(approval_id),
                 now,
-                "payload-tiiviste ei vastaa hyväksyntää",
+                "payload-tiiviste ei täsmää hyväksyntään",
             ));
             return Err(ActionError::ApprovalPayloadMismatch(
                 approval_id.to_string(),
             ));
         }
 
-        // (e) Onnistuu → merkitse kulutetuksi (ONE-SHOT) ja kirjaa.
+        // (e) Success → mark consumed (ONE-SHOT) and log.
         if let Some(stored) = self.approvals.get_mut(&approval_id) {
             stored.consumed = true;
         }
@@ -281,11 +281,11 @@ impl ApprovalLedger {
         Ok(())
     }
 
-    /// Kirjaa eväyksen: ihminen kieltäytyi valtuuttamasta toimintoa.
+    /// Records a denial: a human declined to authorize the action.
     ///
-    /// Eväys ei vaadi olemassa olevaa hyväksyntää — se kirjaa pelkän
-    /// [`AuditAction::ApprovalDenied`]-tapahtuman annetulla syyllä. Palauttaa
-    /// kirjatun audit-tapahtuman.
+    /// A denial does not require an existing approval — it simply logs an
+    /// [`AuditAction::ApprovalDenied`] event with the given reason. Returns
+    /// the logged audit event.
     pub fn deny(
         &mut self,
         action_id: ActionId,
@@ -298,31 +298,31 @@ impl ApprovalLedger {
         event
     }
 
-    /// **Palauttaa olemassa olevan hyväksynnän rekisteriin** (kaatumiskestävyys).
+    /// **Restores an existing approval into the registry** (crash durability).
     ///
-    /// Uudelleenkäynnistyksessä in-memory-ledger on tyhjä, mutta odottava
-    /// hyväksyntä on säilynyt kaatumiskestävällä tallennuspinnalla
-    /// ([`crate::pending_store::JournalPendingStore`]) täydellisenä
-    /// [`Approval`]-arvona (payload-tiivisteineen ja `consumed`-lippuineen).
-    /// Tämä metodi rekisteröi sen takaisin, jotta [`ApprovalLedger::consume`]
-    /// löytää sen ja voi kuluttaa sen samalla payload-sidonnalla kuin ennen
-    /// kaatumista — ei uutta myöntöä (tunniste, TTL ja sidonta säilyvät
-    /// muuttumattomina).
+    /// After a restart, the in-memory ledger is empty, but a pending
+    /// approval has survived on the crash-durable storage substrate
+    /// ([`crate::pending_store::JournalPendingStore`]) as a complete
+    /// [`Approval`] value (including its payload hash and `consumed` flag).
+    /// This method re-registers it so that [`ApprovalLedger::consume`] can
+    /// find it and consume it with the same payload binding as before the
+    /// crash — this is not a new grant (the identifier, TTL, and binding
+    /// remain unchanged).
     ///
-    /// Idempotentti: saman tunnisteen uudelleenasetus korvaa aiemman kopion.
-    /// Ei kirjaa audit-tapahtumaa (kyseessä ei ole uusi myöntö vaan saman
-    /// myönnön palautus muistiin).
+    /// Idempotent: re-setting the same identifier replaces the previous
+    /// copy. Does not log an audit event (this is not a new grant but the
+    /// restoration of an existing grant into memory).
     pub fn reinstate(&mut self, approval: Approval) {
         self.approvals.insert(approval.id, approval);
     }
 
-    /// Hakee hyväksynnän tunnisteella (vain luku); `None` jos ei löydy.
+    /// Looks up an approval by identifier (read-only); `None` if not found.
     #[must_use]
     pub fn get(&self, approval_id: ApprovalId) -> Option<&Approval> {
         self.approvals.get(&approval_id)
     }
 
-    /// Pääsy audit-lokiin (vain luku).
+    /// Read-only access to the audit log.
     #[must_use]
     pub fn audit_log(&self) -> &AuditLog {
         &self.audit
@@ -361,29 +361,29 @@ mod tests {
         assert!(constant_time_eq("", ""));
     }
 
-    /// REQUIRED: `write_external` on estetty ilman hyväksyntää — käytäntö vaatii
-    /// hyväksynnän ja kulutus ilman myöntöä epäonnistuu fail-closed.
+    /// REQUIRED: `write_external` is blocked without approval — the policy
+    /// requires an approval and consumption without a grant fails fail-closed.
     #[test]
     fn write_external_blocked_without_approval() {
-        // Policy sanoo: hyväksyntä vaaditaan.
+        // The policy says: approval is required.
         let req = required_approval(ActionRisk::WriteExternal, ApprovalPolicy::AutoIfReadOnly);
         assert_eq!(req, ApprovalRequirement::RequireApproval);
 
-        // Yritetään kuluttaa hyväksyntä jota ei ole myönnetty → fail closed.
+        // Attempt to consume an approval that was never granted → fail closed.
         let mut ledger = ApprovalLedger::new();
         let phantom = ApprovalId::new();
         let err = ledger
             .consume(phantom, &payload("send to agent_b"), at(1_700_000_000))
             .expect_err("consume without grant must fail closed");
         assert!(matches!(err, ActionError::ApprovalMissing(_)));
-        // Audit-loki ei sisällä kulutusta.
+        // The audit log contains no consumption.
         assert!(!ledger
             .audit_log()
             .contains_action(AuditAction::ApprovalConsumed));
     }
 
-    /// REQUIRED: hyväksyntä sallii täsmälleen yhden suorituksen — toinen kulutus
-    /// epäonnistuu (jo kulutettu).
+    /// REQUIRED: an approval permits exactly one execution — the second
+    /// consumption fails (already consumed).
     #[test]
     fn approval_permits_exactly_one_execution() {
         let mut ledger = ApprovalLedger::new();
@@ -393,19 +393,19 @@ mod tests {
 
         let granted = ledger.grant(action_id, hash, at(1_700_000_000), Duration::minutes(5));
 
-        // Ensimmäinen kulutus onnistuu.
+        // The first consumption succeeds.
         ledger
             .consume(granted.id, &body, at(1_700_000_010))
             .expect("first consume succeeds");
         assert!(ledger.get(granted.id).expect("present").consumed);
 
-        // Toinen kulutus epäonnistuu — kertakäyttö.
+        // The second consumption fails — single use.
         let err = ledger
             .consume(granted.id, &body, at(1_700_000_020))
             .expect_err("second consume must fail");
         assert!(matches!(err, ActionError::ApprovalReused(_)));
 
-        // Tasan yksi onnistunut kulutus kirjattu.
+        // Exactly one successful consumption was logged.
         let consumed = ledger
             .audit_log()
             .events()
@@ -415,8 +415,8 @@ mod tests {
         assert_eq!(consumed, 1);
     }
 
-    /// REQUIRED: hyväksyntää ei voi käyttää uudelleen muutetulla payloadilla —
-    /// eri payload-tiiviste estää kulutuksen.
+    /// REQUIRED: an approval cannot be reused with a changed payload —
+    /// a different payload hash blocks consumption.
     #[test]
     fn approval_cannot_be_reused_with_changed_payload() {
         let mut ledger = ApprovalLedger::new();
@@ -426,21 +426,21 @@ mod tests {
 
         let granted = ledger.grant(action_id, hash, at(1_700_000_000), Duration::minutes(5));
 
-        // Esitetään ERI payload kuin hyväksytty.
+        // Present a DIFFERENT payload than the one approved.
         let tampered = payload("transfer to attacker");
         let err = ledger
             .consume(granted.id, &tampered, at(1_700_000_010))
             .expect_err("changed payload must fail");
         assert!(matches!(err, ActionError::ApprovalPayloadMismatch(_)));
 
-        // Hyväksyntä EI kulunut (alkuperäinen payload voi yhä onnistua).
+        // The approval was NOT consumed (the original payload can still succeed).
         assert!(!ledger.get(granted.id).expect("present").consumed);
         ledger
             .consume(granted.id, &original, at(1_700_000_020))
             .expect("original payload still consumes");
     }
 
-    /// REQUIRED: vanhentunut hyväksyntä estää suorituksen — kun `now` ylittää
+    /// REQUIRED: an expired approval blocks execution — when `now` exceeds
     /// `expires_at`.
     #[test]
     fn expired_approval_blocks_execution() {
@@ -449,10 +449,10 @@ mod tests {
         let body = payload("send to agent_b");
         let hash = sha256_hex(&body);
 
-        // TTL 60 sekuntia.
+        // TTL of 60 seconds.
         let granted = ledger.grant(action_id, hash, at(1_700_000_000), Duration::seconds(60));
 
-        // now = granted_at + 120s > expires_at → vanhentunut.
+        // now = granted_at + 120s > expires_at → expired.
         let err = ledger
             .consume(granted.id, &body, at(1_700_000_120))
             .expect_err("expired approval must block");
@@ -460,14 +460,14 @@ mod tests {
         assert!(ledger
             .audit_log()
             .contains_action(AuditAction::ApprovalExpired));
-        // Ei kulutettu.
+        // Not consumed.
         assert!(!ledger.get(granted.id).expect("present").consumed);
     }
 
-    /// INVARIANTTI (raja): hyväksyntä on voimassa TÄSMÄLLEEN `expires_at`-hetkellä
-    /// (`now == expires_at`, `>` on aito) mutta evätään heti pienimmän askeleen
-    /// jälkeen (`expires_at + 1s`). Lukitsee `fail-closed`-rajan vanhentumisen
-    /// jälkeen: yhtäsuuri kelpaa, aidosti myöhempi ei.
+    /// INVARIANT (boundary): an approval is valid EXACTLY at the
+    /// `expires_at` instant (`now == expires_at`, `>` is strict) but is denied
+    /// immediately after the smallest step (`expires_at + 1s`). Locks in the
+    /// `fail-closed` boundary after expiry: equal is fine, strictly later is not.
     #[test]
     fn expiry_boundary_exact_ok_then_one_step_after_blocks() {
         let mut ledger = ApprovalLedger::new();
@@ -487,7 +487,7 @@ mod tests {
             "rajan jälkeen vanhentunut"
         );
 
-        // Pienin askel rajan JÄLKEEN → kulutus evätään vaikka payload on oikea.
+        // Smallest step AFTER the boundary → consumption is denied even though the payload is correct.
         let err = ledger
             .consume(granted.id, &body, at(1_700_000_061))
             .expect_err("one second after expiry must fail closed even with correct payload");
@@ -495,10 +495,10 @@ mod tests {
         assert!(!ledger.get(granted.id).expect("present").consumed);
     }
 
-    /// INVARIANTTI (kulutusjärjestys): vanhentunut hyväksyntä evätään ENNEN
-    /// payload-tarkistusta — eli "oikea payload" ei voi koskaan ohittaa
-    /// vanhentumista. Lisäksi vanhentunutta hyväksyntää ei voi kuluttaa
-    /// myöhemmin oikealla payloadilla edes silloin kun se ei ole kulunut.
+    /// INVARIANT (consumption order): an expired approval is denied BEFORE
+    /// the payload check — i.e. a "correct payload" can never bypass
+    /// expiry. Also, an expired approval cannot later be consumed with the
+    /// correct payload even when it was not consumed before expiring.
     #[test]
     fn expired_blocks_even_with_correct_payload() {
         let mut ledger = ApprovalLedger::new();
@@ -508,8 +508,8 @@ mod tests {
 
         let granted = ledger.grant(action_id, hash, at(1_700_000_000), Duration::seconds(30));
 
-        // OIKEA payload, mutta now on rajan jälkeen → ApprovalExpired (ei
-        // PayloadMismatch eikä onnistuminen).
+        // CORRECT payload, but now is past the boundary → ApprovalExpired (not
+        // PayloadMismatch, and not success).
         let err = ledger
             .consume(granted.id, &body, at(1_700_000_031))
             .expect_err("expired must win over correct payload");
@@ -517,7 +517,7 @@ mod tests {
             matches!(err, ActionError::ApprovalExpired(_)),
             "expiry must be evaluated before payload; got {err:?}"
         );
-        // EI kulutettu — eikä koskaan voi kulua oikeallakaan payloadilla rajan jälkeen.
+        // NOT consumed — and can never be consumed with the correct payload after the boundary either.
         assert!(!ledger.get(granted.id).expect("present").consumed);
         let err2 = ledger
             .consume(granted.id, &body, at(1_700_000_999))
@@ -525,9 +525,10 @@ mod tests {
         assert!(matches!(err2, ActionError::ApprovalExpired(_)));
     }
 
-    /// INVARIANTTI (ylivuotosuoja): äärimmäinen TTL ei panikoi myöntövaiheessa.
-    /// Aiempi `now + ttl` panikoi `DateTime + TimeDelta overflowed` -virheeseen;
-    /// kyllästys palauttaa `MAX_UTC`:n (tuotantopolulla ei panic).
+    /// INVARIANT (overflow protection): an extreme TTL does not panic during
+    /// the grant phase. The previous `now + ttl` would panic with
+    /// `DateTime + TimeDelta overflowed`; saturation returns `MAX_UTC`
+    /// instead (no panic on the production path).
     #[test]
     fn grant_with_overflowing_ttl_saturates_instead_of_panicking() {
         let mut ledger = ApprovalLedger::new();
@@ -535,19 +536,19 @@ mod tests {
         let body = payload("huge ttl");
         let hash = sha256_hex(&body);
 
-        // Valtava positiivinen TTL → ennen korjausta tämä panikoi grant():ssa.
+        // A huge positive TTL → before the fix this would panic inside grant().
         let granted = ledger.grant(action_id, hash, at(1_700_000_000), Duration::MAX);
         assert_eq!(granted.expires_at, DateTime::<Utc>::MAX_UTC);
-        // Saturoitu MAX → ei vanhennu millään realistisella now-arvolla.
+        // Saturated to MAX → does not expire for any realistic now value.
         assert!(!granted.is_expired(at(1_700_000_010)));
         ledger
             .consume(granted.id, &body, at(1_700_000_010))
             .expect("non-expired saturated approval still consumable");
     }
 
-    /// INVARIANTTI (alivuoto fail-closed): äärimmäinen NEGATIIVINEN TTL
-    /// kyllästyy `MIN_UTC`:hin → hyväksyntä on jo vanhentunut → kulutus evätään.
-    /// Ylivuoto ei koskaan tee jo vanhentuneesta hyväksynnästä elävää.
+    /// INVARIANT (underflow fail-closed): an extreme NEGATIVE TTL saturates
+    /// to `MIN_UTC` → the approval is already expired → consumption is denied.
+    /// Overflow never turns an already-expired approval into a live one.
     #[test]
     fn grant_with_underflowing_negative_ttl_fails_closed() {
         let mut ledger = ApprovalLedger::new();
@@ -569,9 +570,9 @@ mod tests {
         assert!(!ledger.get(granted.id).expect("present").consumed);
     }
 
-    /// INVARIANTTI (nolla-TTL): `ttl = 0` → `expires_at == granted_at`.
-    /// Tasan myöntöhetkellä kulutus onnistuu (raja kelpaa), mutta yksikin sekunti
-    /// myöhemmin se evätään.
+    /// INVARIANT (zero TTL): `ttl = 0` → `expires_at == granted_at`.
+    /// Consumption succeeds exactly at the grant instant (the boundary is
+    /// valid), but even one second later it is denied.
     #[test]
     fn zero_ttl_consumable_at_grant_instant_but_not_after() {
         let mut ledger = ApprovalLedger::new();
@@ -582,14 +583,14 @@ mod tests {
         let granted = ledger.grant(action_id, hash, at(1_700_000_000), Duration::zero());
         assert_eq!(granted.expires_at, at(1_700_000_000));
 
-        // Yksi sekunti myöhemmin → vanhentunut, evätään oikeallakin payloadilla.
+        // One second later → expired, denied even with the correct payload.
         let err = ledger
             .consume(granted.id, &body, at(1_700_000_001))
             .expect_err("zero-ttl approval expires one step after grant");
         assert!(matches!(err, ActionError::ApprovalExpired(_)));
     }
 
-    /// REQUIRED: eväys kirjaa audit-tapahtuman.
+    /// REQUIRED: a denial logs an audit event.
     #[test]
     fn denial_records_audit_event() {
         let mut ledger = ApprovalLedger::new();

@@ -1,24 +1,24 @@
 //! # familyclaw-acp
 //!
-//! **ACP (Agent Communication Protocol) client** — spawnaa ja ohjaa CLI-agentteja
-//! (Claude, Gemini, Qoder) stdio-yhteyden yli.
+//! **ACP (Agent Communication Protocol) client** — spawns and drives CLI
+//! agents (Claude, Gemini, Qoder) over a stdio connection.
 //!
-//! ## Arkkitehtuuri
+//! ## Architecture
 //!
-//! [`AcpClient`] käynnistää CLI-agentin aliprosessina (`claude --acp`,
-//! `gemini --acp`, `qodercli --acp`), hallinnoi JSON-viestiliikennettä
-//! stdin/stdout:n yli, ja palauttaa vastaukset [`AcpResponse`]-olioina.
+//! [`AcpClient`] launches a CLI agent as a subprocess (`claude --acp`,
+//! `gemini --acp`, `qodercli --acp`), manages JSON message traffic over
+//! stdin/stdout, and returns responses as [`AcpResponse`] objects.
 //!
-//! ## Integraatio `familyclaw-agent`:in
+//! ## Integration with `familyclaw-agent`
 //!
-//! `AcpLlmClient` implementoi HTTP `familyclaw_agent::llm::LlmClient`:n
-//! kaltaisen rajapinnan, jolloin `FamilyClaw` voi käyttää CLI-agentteja
-//! pudotuskorvaavina LLM-asiakkaina.
+//! `AcpLlmClient` implements an interface similar to
+//! `familyclaw_agent::llm::LlmClient`'s HTTP client, letting `FamilyClaw`
+//! use CLI agents as drop-in replacement LLM clients.
 //!
-//! ## KERROS A (OSS)
+//! ## Layer A (OSS)
 //!
-//! Ei kovakoodattuja agenttipolkuja, malleja, avaimia tai perheenjäsenten
-//! sieluja. Kaikki konfiguroidaan ajonaikaisesti [`AcpAgentConfig`]:n kautta.
+//! No hardcoded agent paths, models, keys, or family members' souls.
+//! Everything is configured at runtime via [`AcpAgentConfig`].
 
 pub mod client;
 pub mod config;
@@ -30,11 +30,11 @@ pub use config::AcpAgentConfig;
 pub use error::AcpError;
 pub use message::{AcpRequest, AcpResponse, AcpToolCall, AcpToolResult};
 
-/// Spawnaa uuden ACP-agentin ja palauttaa aktiivisen clientin.
+/// Spawns a new ACP agent and returns an active client.
 ///
 /// # Errors
-/// [`AcpError::Spawn`] jos binääriä ei löydy tai prosessin käynnistys
-/// epäonnistuu.
+/// [`AcpError::Spawn`] if the binary cannot be found or the process fails
+/// to start.
 pub fn spawn(config: &AcpAgentConfig) -> Result<AcpClient, AcpError> {
     AcpClient::spawn(config)
 }

@@ -1,56 +1,59 @@
-//! [`FileJournal`] — kaatumiskestävä append-only JSONL-journal.
+//! [`FileJournal`] — crash-resistant append-only JSONL journal.
 //!
-//! Jokainen [`JournalEntry`] kirjoitetaan yhtenä JSON-rivinä (`\n`-päätteinen)
-//! tiedoston loppuun. Kirjoitus flushataan ja fsyncataan ([`std::fs::File::sync_all`])
-//! ennen kuin [`append`](crate::Journal::append) palaa, joten valmistunut askel
-//! on levyllä myös äkillisen kaatumisen jälkeen.
+//! Every [`JournalEntry`] is written as a single JSON line (`\n`-terminated)
+//! at the end of the file. The write is flushed and fsynced
+//! ([`std::fs::File::sync_all`]) before [`append`](crate::Journal::append)
+//! returns, so a completed step is on disk even after a sudden crash.
 //!
-//! ## Kaatumiskestävyys
-//! Jos prosessi kaatuu kesken rivin kirjoituksen, viimeinen rivi voi jäädä
-//! vajaaksi (ei `\n`-päätettä, tai typistynyt JSON). [`replay_from`](crate::Journal::replay_from) sietää
-//! **tasan tämän yhden tapauksen**: tiedoston *viimeinen* rivi jonka jäsennys
-//! epäonnistuu JA jolta puuttuu rivinvaihto hylätään hiljaisesti vajaana
-//! kirjoituksena. Mikä tahansa *aiempi* vioittunut rivi on aito korruptio ja
-//! palautuu [`crate::DurableError::CorruptEntry`]:nä.
+//! ## Crash resistance
+//! If the process crashes mid-write, the last line can be left incomplete
+//! (missing the `\n` terminator, or truncated JSON). [`replay_from`](crate::Journal::replay_from) tolerates
+//! **exactly this one case**: the file's *last* line, if its parse fails AND
+//! it is missing the line terminator, is silently discarded as an incomplete
+//! write. Any *earlier* corrupted line is genuine corruption and is returned
+//! as [`crate::DurableError::CorruptEntry`].
 //!
-//! ## Itse-eheytys avattaessa (heal-on-open)
-//! Vajaan viimeisen rivin **sietäminen luvussa ei riitä** — jos sitä ei poisteta
-//! levyltä, seuraava [`append`](crate::Journal::append) liittyy SAMALLE
-//! fyysiselle riville (koska tyngästä puuttuu `\n`), jolloin tynkä + tuore rivi
-//! sulautuvat yhdeksi sisäkorruptioksi joka kaataa kaikki myöhemmät luvut.
-//! Siksi [`FileJournal::open`] **typistää** tällaisen rivinvaihdottoman
-//! tyngän pois avattaessa: tynkä on aina keskeneräinen (fsyncattamaton) kirjoitus
-//! joka ei koskaan valmistunut, joten sen hylkääminen on turvallista JA
-//! välttämätöntä, jotta append jatkuu puhtaalta rivirajalta.
+//! ## Self-healing on open (heal-on-open)
+//! **Tolerating** an incomplete last line during reads is not enough — if it
+//! is not removed from disk, the next [`append`](crate::Journal::append) will
+//! attach to the SAME physical line (because the fragment is missing its
+//! `\n`), causing the fragment and the fresh line to fuse into a single
+//! internal corruption that breaks all subsequent reads. That's why
+//! [`FileJournal::open`] **truncates** such a newline-less fragment on open:
+//! the fragment is always an unfinished (unfsynced) write that never
+//! completed, so discarding it is both safe AND necessary for append to
+//! continue from a clean line boundary.
 //!
-//! ## Tiivistys (compaction) — [`FileJournal::rewrite`]
-//! Append-only-loki kasvaa rajatta jos sen päälle rakennettu tila (esim.
-//! odottavat hyväksynnät, jatkettavat vuorot) kirjaa `put`/`delete`-rivejä:
-//! poistetut ja korvatut rivit jäävät kuolleina riveinä lokiin, jolloin tiedosto
-//! paisuu ja replay muuttuu O(n):ksi rivimäärässä. [`FileJournal::rewrite`]
-//! korvaa **koko lokin** annetulla rivijoukolla **atomisesti**: rivit
-//! kirjoitetaan ensin samaan hakemistoon luotuun tilapäistiedostoon (flush +
-//! fsync), minkä jälkeen tilapäistiedosto **nimetään uudelleen** elävän tiedoston
-//! päälle (`fs::rename`, atominen samalla levyllä). Jos prosessi kaatuu kesken
-//! tiivistyksen, elävä tiedosto on yhä vanhassa (ehjässä) tilassaan — koskaan ei
-//! synny puolikkaaksi kirjoitettua lokia. Kutsujan **vastuulla** on antaa
-//! `rewrite`:lle tasan ne rivit, jotka kuvaavat halutun lopputilan (yleensä vain
-//! elävät kirjaukset, kuolleet tombstonet pudotettuina).
+//! ## Compaction — [`FileJournal::rewrite`]
+//! An append-only log grows without bound if the state built on top of it
+//! (e.g. pending approvals, resumable turns) records `put`/`delete` rows:
+//! deleted and superseded rows remain as dead rows in the log, causing the
+//! file to bloat and replay to become O(n) in row count.
+//! [`FileJournal::rewrite`] replaces **the entire log** with a given set of
+//! rows **atomically**: the rows are first written to a temporary file
+//! created in the same directory (flush + fsync), after which the temporary
+//! file is **renamed** over the live file (`fs::rename`, atomic on the same
+//! filesystem). If the process crashes mid-compaction, the live file is
+//! still in its old (intact) state — a half-written log never results. It is
+//! the caller's **responsibility** to give `rewrite` exactly the rows that
+//! describe the desired end state (typically just the live records, with
+//! dead tombstones dropped).
 //!
-//! ## Tiivistys ilman TOCTOU-aukkoa — [`FileJournal::compact_with`]
-//! [`FileJournal::rewrite`] korvaa lokin atomisesti levyä vastaan, mutta jos
-//! kutsuja lukee tilan (replay) ENNEN `rewrite`:ä ja **vapauttaa lukon välissä**,
-//! syntyy time-of-check-to-time-of-use-aukko: rinnakkainen append voi kirjoittaa
-//! vanhaan tiedostoon juuri ennen kuin `rewrite` ylikirjoittaa sen
-//! ennen-aukkoa-otetulla tilannekuvalla → append **katoaa hiljaisesti**.
-//! [`FileJournal::compact_with`] sulkee aukon pitämällä **saman** file-lukon koko
-//! luku→suodatus→swap-operaation ajan, jolloin appendit eivät mahdu väliin.
-//! Kutsuja antaa `build`-sulkimen joka saa luetut rivit ja palauttaa
-//! säilytettävät; itse swap on identtinen `rewrite`:n kanssa.
+//! ## Compaction without a TOCTOU gap — [`FileJournal::compact_with`]
+//! [`FileJournal::rewrite`] replaces the log atomically with respect to
+//! disk, but if the caller reads the state (replay) BEFORE `rewrite` and
+//! **releases the lock in between**, a time-of-check-to-time-of-use gap
+//! arises: a concurrent append can write to the old file just before
+//! `rewrite` overwrites it with a snapshot taken before the gap → the append
+//! **disappears silently**. [`FileJournal::compact_with`] closes the gap by
+//! holding the **same** file lock for the entire read→filter→swap operation,
+//! so no append can slip in between. The caller supplies a `build` closure
+//! that receives the read rows and returns the ones to keep; the swap itself
+//! is identical to `rewrite`'s.
 //!
 //! ## Object Safety
-//! Metodit ottavat `&self` jotta trait on `dyn`-yhteensopiva. File-kahva on
-//! `Mutex<File>`-suojassa.
+//! Methods take `&self` so the trait is `dyn`-compatible. The file handle is
+//! guarded by a `Mutex<File>`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -61,12 +64,12 @@ use crate::entry::{JournalEntry, StepId};
 use crate::error::{DurableError, Result};
 use crate::journal::Journal;
 
-/// Levylle kirjoittava append-only JSONL-journal.
+/// Disk-backed append-only JSONL journal.
 ///
-/// Pitää avoimen tiedostokahvan kirjoitusta varten ja muistaa polun lukua
-/// varten. Avaaminen luo tiedoston jos sitä ei ole; olemassa olevaan
-/// tiedostoon jatketaan (append-tila). File-kahva on Mutex-suojassa jotta
-/// trait on `dyn`-yhteensopiva (`&self` metodit).
+/// Holds an open file handle for writing and remembers the path for reading.
+/// Opening creates the file if it does not exist; an existing file is
+/// continued (append mode). The file handle is guarded by a Mutex so the
+/// trait is `dyn`-compatible (`&self` methods).
 #[derive(Debug)]
 pub struct FileJournal {
     path: PathBuf,
@@ -74,18 +77,20 @@ pub struct FileJournal {
 }
 
 impl FileJournal {
-    /// Avaa (tai luo) journalin annetusta polusta append-tilassa.
+    /// Opens (or creates) the journal at the given path in append mode.
     ///
-    /// Olemassa olevan tiedoston rivit säilyvät — uudet rivit lisätään loppuun.
+    /// Rows in an existing file are preserved — new rows are appended at the
+    /// end.
     ///
     /// # Errors
-    /// [`DurableError::Io`] jos tiedostoa ei voi avata/luoda.
+    /// [`DurableError::Io`] if the file cannot be opened/created.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        // Itse-eheytys ENNEN kirjoituskahvan avaamista: jos tiedoston loppuun jäi
-        // kaatumisessa rivinvaihdoton tynkä, se typistetään pois. Muuten seuraava
-        // append liittyisi samalle fyysiselle riville ja turmelisi journalin
-        // pysyvästi (sisäkorruptio). Ks. moduulin doc "heal-on-open".
+        // Self-heal BEFORE opening the write handle: if a crash left a
+        // newline-less fragment at the end of the file, it is truncated away.
+        // Otherwise the next append would attach to the same physical line and
+        // permanently corrupt the journal (internal corruption). See the
+        // module doc "heal-on-open".
         heal_torn_trailing_fragment(&path)?;
         let file = OpenOptions::new()
             .create(true)
@@ -98,63 +103,67 @@ impl FileJournal {
         })
     }
 
-    /// Palauttaa journalin tiedostopolun.
+    /// Returns the journal's file path.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Lukee ja jäsentää kaikki rivit, sietäen vajaan viimeisen rivin
-    /// (kaatumisen jälki). Palautuvat rivit ovat tiedostojärjestyksessä.
+    /// Reads and parses all rows, tolerating an incomplete last line
+    /// (a crash artifact). The returned rows are in file order.
     fn read_all_entries(&self) -> Result<Vec<JournalEntry>> {
-        // Poison-recovery sen sijaan että `unwrap()` paniikkaisi: jos jokin toinen
-        // säie paniikkasi pitäessään lukkoa, file-kahva on silti validi (mitään ei
-        // jätetä puolitiehen `read_all_entries`-polulla). `into_inner()` ottaa
-        // kahvan haltuun ilman paniikkia → ei rikota error.rs:5 invarianttia
-        // ("ei unwrap/expect/panic tuotantopolulla").
+        // Poison recovery instead of letting `unwrap()` panic: if some other
+        // thread panicked while holding the lock, the file handle is still
+        // valid (nothing is left half-done on the `read_all_entries` path).
+        // `into_inner()` takes ownership of the handle without panicking →
+        // does not violate the error.rs:5 invariant ("no unwrap/expect/panic
+        // on the production path").
         let _file = self
             .file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Itse jäsennys ei käytä `self.file`-kahvaa vaan avaa tuoreen
-        // lukukahvan polusta — `parse_entries_from_path` EI siis lukitse
-        // `self.file`:ä uudelleen (jos lukitsisi, lukko olisi jo hallussa ja std
-        // Mutex EI ole reentrantti → deadlock). Lukko pidetään tämän kutsun ajan
-        // jotta luku on yhtenäinen samanaikaisten appendien suhteen.
+        // The actual parsing does not use the `self.file` handle but opens a
+        // fresh read handle from the path — `parse_entries_from_path` therefore
+        // does NOT lock `self.file` again (if it did, the lock would already be
+        // held and std Mutex is NOT reentrant → deadlock). The lock is held for
+        // the duration of this call so the read is consistent with respect to
+        // concurrent appends.
         Self::parse_entries_from_path(&self.path)
     }
 
-    /// Jäsentää **kaikki** journal-rivit annetusta polusta, sietäen vajaan
-    /// viimeisen rivin (kaatumisen jälki). Palautuvat rivit ovat
-    /// tiedostojärjestyksessä.
+    /// Parses **all** journal rows from the given path, tolerating an
+    /// incomplete last line (a crash artifact). The returned rows are in
+    /// file order.
     ///
-    /// ## Ei lukitusta — tarkoituksella
-    /// Tämä apuri **ei** lukitse `self.file`-mutexia: se avaa oman tuoreen
-    /// lukukahvan polusta. Syy on non-reentranttisuus: sekä `read_all_entries`
-    /// että [`compact_with`](FileJournal::compact_with) lukitsevat `self.file`:n
-    /// JO ennen tämän kutsumista, ja std [`Mutex`] **ei ole reentrantti** — jos
-    /// tämä yrittäisi lukita lukon uudelleen saman säikeen sisältä, seurauksena
-    /// olisi **deadlock**. Siksi jäsennys on eriytetty lukottomaan apuriin jonka
-    /// molemmat lukon haltijat voivat kutsua turvallisesti.
+    /// ## No locking — intentionally
+    /// This helper **does not** lock the `self.file` mutex: it opens its own
+    /// fresh read handle from the path. The reason is non-reentrancy: both
+    /// `read_all_entries` and [`compact_with`](FileJournal::compact_with)
+    /// already lock `self.file` before calling this, and std [`Mutex`] **is
+    /// not reentrant** — if this tried to lock the lock again from within the
+    /// same thread, the result would be a **deadlock**. That's why parsing is
+    /// factored out into a lockless helper that both lock holders can call
+    /// safely.
     fn parse_entries_from_path(path: &Path) -> Result<Vec<JournalEntry>> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
 
-        // Kerää (rivinumero, sisältö) jotta vajaa viimeinen rivi voidaan
-        // tunnistaa luotettavasti.
+        // Collect (line number, content) so an incomplete last line can be
+        // identified reliably.
         let mut raw_lines: Vec<(u64, String)> = Vec::new();
         let mut had_trailing_newline = true;
         let mut line_no: u64 = 0;
         for line in reader.lines() {
             let line = line?;
             line_no += 1;
-            // `BufRead::lines` poistaa `\n`:n; emme suoraan tiedä oliko
-            // viimeisellä rivillä rivinvaihtoa. Se päätellään alla erikseen.
+            // `BufRead::lines` strips the `\n`; we don't directly know whether
+            // the last line had a line terminator. That is determined separately
+            // below.
             raw_lines.push((line_no, line));
         }
 
-        // Selvitä päättyikö tiedosto rivinvaihtoon: jos ei, viimeinen rivi on
-        // potentiaalisesti vajaa kirjoitus.
+        // Determine whether the file ended with a line terminator: if not, the
+        // last line is a potentially incomplete write.
         if let Some(last_byte) = last_byte_of(path)? {
             had_trailing_newline = last_byte == b'\n';
         }
@@ -163,7 +172,7 @@ impl FileJournal {
         let mut entries = Vec::with_capacity(total);
         for (idx, (line_no, content)) in raw_lines.into_iter().enumerate() {
             let is_last = idx + 1 == total;
-            // Ohita tyhjät rivit (esim. ylimääräinen rivinvaihto lopussa).
+            // Skip empty lines (e.g. an extra trailing newline).
             if content.trim().is_empty() {
                 continue;
             }
@@ -171,8 +180,9 @@ impl FileJournal {
                 Ok(entry) => entries.push(entry),
                 Err(parse_err) => {
                     if is_last && !had_trailing_newline {
-                        // Klassinen kaatumisen jälki: viimeinen rivi jäi vajaaksi
-                        // eikä siinä ole päätös-rivinvaihtoa. Hylätään hiljaisesti.
+                        // The classic crash artifact: the last line was left
+                        // incomplete and has no terminating line break. Discard
+                        // it silently.
                         continue;
                     }
                     return Err(DurableError::corrupt(
@@ -185,144 +195,149 @@ impl FileJournal {
         Ok(entries)
     }
 
-    /// Korvaa **koko lokin** annetuilla riveillä atomisesti (tiivistys).
+    /// Replaces **the entire log** with the given rows atomically (compaction).
     ///
-    /// Käyttötarkoitus: append-only-lokin päälle rakennettu tila (esim. odottavat
-    /// hyväksynnät / jatkettavat vuorot) kerryttää kuolleita rivejä (poistot ja
-    /// korvaukset) joita replay joutuu silti lukemaan. Tämä metodi kirjoittaa
-    /// lokin uudelleen sisältämään **vain** annetut rivit — kutsuja antaa
-    /// tyypillisesti vain elävät kirjaukset, jolloin kuolleet rivit katoavat ja
-    /// tiedosto kutistuu.
+    /// Purpose: state built on top of an append-only log (e.g. pending
+    /// approvals / resumable turns) accumulates dead rows (deletions and
+    /// replacements) that replay still has to read. This method rewrites the
+    /// log to contain **only** the given rows — the caller typically supplies
+    /// just the live records, so dead rows disappear and the file shrinks.
     ///
-    /// ## Atomisuus (ei koskaan turmele elävää tiedostoa)
-    /// 1. Rivit kirjoitetaan **samaan hakemistoon** luotuun tilapäistiedostoon
-    ///    (`<polku>.compact-<pid>-<aika>.tmp`).
-    /// 2. Tilapäistiedosto flushataan ja **fsyncataan** ([`File::sync_all`]).
-    /// 3. Tilapäistiedosto **nimetään uudelleen** elävän tiedoston päälle
-    ///    ([`std::fs::rename`]) — sama-levyinen rename on atominen: lukija näkee
-    ///    joko vanhan tai uuden tiedoston, ei koskaan puolikasta.
-    /// 4. Sisäinen kirjoituskahva vaihdetaan osoittamaan uuteen (nimettyyn)
-    ///    tiedostoon append-tilassa, jotta tulevat [`append`](Journal::append):it
-    ///    jatkavat tiivistetyn lokin perään.
+    /// ## Atomicity (never corrupts the live file)
+    /// 1. The rows are written to a temporary file created **in the same
+    ///    directory** (`<path>.compact-<pid>-<time>.tmp`).
+    /// 2. The temporary file is flushed and **fsynced** ([`File::sync_all`]).
+    /// 3. The temporary file is **renamed** over the live file
+    ///    ([`std::fs::rename`]) — a same-filesystem rename is atomic: a reader
+    ///    sees either the old or the new file, never a half-written one.
+    /// 4. The internal write handle is swapped to point at the new (renamed)
+    ///    file in append mode, so future [`append`](Journal::append) calls
+    ///    continue after the compacted log.
     ///
-    /// Jos prosessi kaatuu **ennen** renamea, elävä tiedosto on koskematon (vanha
-    /// ehjä tila säilyy) ja tilapäistiedosto jää orvoksi (harmiton; seuraava
-    /// `rewrite` ylikirjoittaa oman uniikin nimensä). Jos kaatuu **renamen
-    /// jälkeen**, uusi tiivistetty tiedosto on jo paikallaan ja ehjä. Kummassakaan
-    /// tapauksessa eläviä rivejä ei katoa.
+    /// If the process crashes **before** the rename, the live file is
+    /// untouched (the old intact state is preserved) and the temporary file
+    /// is left orphaned (harmless; the next `rewrite` overwrites its own
+    /// unique name). If it crashes **after the rename**, the new compacted
+    /// file is already in place and intact. In neither case do live rows get
+    /// lost.
     ///
-    /// Rivit kirjoitetaan annetussa järjestyksessä; [`StepId`]:t säilyvät
-    /// sellaisinaan (kutsuja voi uudelleennumeroida ne ennen kutsua jos haluaa
-    /// tiiviin 0..N-sekvenssin). Tyhjä `entries` tyhjentää lokin kokonaan.
+    /// Rows are written in the given order; [`StepId`]s are preserved as-is
+    /// (the caller may renumber them before the call if a tight 0..N sequence
+    /// is desired). An empty `entries` clears the log entirely.
     ///
     /// # Errors
-    /// [`DurableError::Io`] jos tilapäistiedoston luonti, kirjoitus, fsync,
-    /// rename tai uuden kahvan avaus epäonnistuu; [`DurableError::Serde`] jos
-    /// jonkin rivin sarjallistus epäonnistuu. Virhetilanteessa elävä tiedosto
-    /// jätetään entiselleen (rename tehdään vasta kun temp on ehjä levyllä).
+    /// [`DurableError::Io`] if creating, writing, fsyncing, or renaming the
+    /// temporary file, or opening the new handle, fails;
+    /// [`DurableError::Serde`] if serializing any row fails. On error, the
+    /// live file is left unchanged (the rename only happens once the temp
+    /// file is intact on disk).
     pub fn rewrite(&self, entries: &[JournalEntry]) -> Result<()> {
-        // Lukko pidetään koko swapin ajan: append ei saa kirjoittaa vanhaan
-        // kahvaan renamen ja kahvanvaihdon välissä.
+        // The lock is held for the entire swap: append must not write to the
+        // old handle between the rename and the handle swap.
         let mut file = self
             .file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Atominen swap jaetussa apurissa (sama logiikka kuin `compact_with`:ssä).
-        // `&mut *file` antaa apurille jo-hallussa-olevan lukon sisuksen, joten se
-        // EI lukitse `self.file`:ä uudelleen (non-reentrantti std Mutex).
+        // Atomic swap in a shared helper (same logic as in `compact_with`).
+        // `&mut *file` gives the helper the contents of the already-held lock,
+        // so it does NOT lock `self.file` again (std Mutex is not reentrant).
         self.atomic_swap_locked(&mut file, entries)
     }
 
-    /// Tiivistää lokin **atomisesti appendeja vastaan**: lukitsee `self.file`:n
-    /// **kerran**, lukee koko nykyisen lokin lukon ollessa hallussa, antaa rivit
-    /// `build`-sulkimelle (joka palauttaa säilytettävät rivit), ja tekee saman
-    /// atomisen temp + fsync + rename + kahvanvaihdon kuin
-    /// [`rewrite`](FileJournal::rewrite) — **kaikki saman, yhä-hallussa-olevan
-    /// lukon alla**. Palauttaa pudotettujen rivien määrän (luetut − säilytetyt,
-    /// alarajattuna nollaan).
+    /// Compacts the log **atomically against appends**: locks `self.file`
+    /// **once**, reads the entire current log while holding the lock, hands
+    /// the rows to the `build` closure (which returns the rows to keep), and
+    /// performs the same atomic temp + fsync + rename + handle-swap as
+    /// [`rewrite`](FileJournal::rewrite) — **all under the same,
+    /// still-held lock**. Returns the number of dropped rows (read − kept,
+    /// floored at zero).
     ///
-    /// ## Miksi atominen appendeja vastaan (TOCTOU-aukon sulkeminen)
-    /// Aiempi tiivistys luki tilan ([`replay_all`](Journal::replay_all)), **vapautti
-    /// lukon**, rakensi elävät rivit ja kutsui vasta sitten
-    /// [`rewrite`](FileJournal::rewrite):ä (joka lukitsi uudelleen). Lukon
-    /// vapautuksen ja rewriten välissä rinnakkainen append saattoi kirjoittaa
-    /// **vanhaan** tiedostoon — ja rewrite ylikirjoitti sen
-    /// ennen-aukkoa-otetulla tilannekuvalla, jolloin append **katosi
-    /// hiljaisesti**. `compact_with` poistaa aukon: koska lukko pidetään lukemisen,
-    /// rakentamisen JA swapin ajan, mikään append ei mahdu väliin — appendit
-    /// joko valmistuvat ennen lukon ottoa (ja näkyvät `build`:n riveissä) tai
-    /// jonottavat swapin jälkeiseen tiivistettyyn lokiin.
+    /// ## Why atomic against appends (closing the TOCTOU gap)
+    /// The previous compaction approach read the state
+    /// ([`replay_all`](Journal::replay_all)), **released the lock**, built
+    /// the live rows, and only then called [`rewrite`](FileJournal::rewrite)
+    /// (which locked again). Between the lock release and the rewrite, a
+    /// concurrent append could write to the **old** file — and the rewrite
+    /// would overwrite it with the snapshot taken before the gap, so the
+    /// append **disappeared silently**. `compact_with` removes the gap:
+    /// because the lock is held for the reading, building, AND swap, no
+    /// append can slip in between — appends either complete before the lock
+    /// is acquired (and show up in `build`'s rows) or queue up for the
+    /// compacted log after the swap.
     ///
-    /// ## Ei-reentranttisuus (miksi `build` ei saa kutsua takaisin)
-    /// Lukko on jo hallussa kun `build` ajetaan, ja std [`Mutex`] **ei ole
-    /// reentrantti**. Siksi tämä metodi EI kutsu `read_all_entries`:ä eikä
-    /// [`rewrite`](FileJournal::rewrite):ä sisältään (molemmat lukitsisivat
-    /// `self.file`:n uudelleen → **deadlock**). Sen sijaan se käyttää lukotonta
-    /// jäsennysapuria `parse_entries_from_path` ja lukotonta swap-apuria
-    /// `atomic_swap_locked` (yksityisiä apureita jotka eivät lukitse `self.file`:ä).
-    /// `build`-suljin EI myöskään saa kutsua mitään tämän journalin lukitsevaa
-    /// metodia (`append`, `replay_*`, `rewrite`, `compact_with`) — se johtaisi
-    /// samaan deadlockiin. Sopimuksen mukaan `build` tekee vain puhdasta
-    /// rivien suodatusta/uudelleennumerointia.
+    /// ## Non-reentrancy (why `build` must not call back in)
+    /// The lock is already held when `build` runs, and std [`Mutex`] **is not
+    /// reentrant**. That's why this method does NOT call `read_all_entries`
+    /// or [`rewrite`](FileJournal::rewrite) internally (both would lock
+    /// `self.file` again → **deadlock**). Instead it uses the lockless
+    /// parsing helper `parse_entries_from_path` and the lockless swap helper
+    /// `atomic_swap_locked` (private helpers that do not lock `self.file`).
+    /// The `build` closure must ALSO not call any locking method of this
+    /// journal (`append`, `replay_*`, `rewrite`, `compact_with`) — that would
+    /// lead to the same deadlock. By contract, `build` performs only pure
+    /// row filtering/renumbering.
     ///
-    /// ## Atomisuus levyä vastaan
-    /// Sama tae kuin [`rewrite`](FileJournal::rewrite):llä: rivit kirjoitetaan ensin tilapäistiedostoon
-    /// (flush + fsync), joka sitten nimetään atomisesti elävän tiedoston päälle.
-    /// Jos prosessi kaatuu ennen renamea, elävä tiedosto on yhä ehjässä vanhassa
-    /// tilassaan; jos kaatuu renamen jälkeen, uusi tiivistetty tiedosto on jo
-    /// paikallaan. Eläviä rivejä ei katoa kummassakaan tapauksessa.
+    /// ## Atomicity against disk
+    /// Same guarantee as [`rewrite`](FileJournal::rewrite): the rows are
+    /// first written to a temporary file (flush + fsync), which is then
+    /// renamed atomically over the live file. If the process crashes before
+    /// the rename, the live file is still in its intact old state; if it
+    /// crashes after the rename, the new compacted file is already in place.
+    /// Live rows are not lost in either case.
     ///
     /// # Errors
-    /// [`DurableError::Io`] jos lukeminen, tilapäistiedoston kirjoitus, fsync,
-    /// rename tai uuden kahvan avaus epäonnistuu; [`DurableError::Serde`] jos
-    /// rivin sarjallistus epäonnistuu; tai `build`-sulkimen palauttama virhe
-    /// sellaisenaan. Virhetilanteessa elävä tiedosto jätetään entiselleen.
+    /// [`DurableError::Io`] if reading, writing the temporary file, fsyncing,
+    /// renaming, or opening the new handle fails; [`DurableError::Serde`] if
+    /// serializing a row fails; or the error returned by the `build` closure,
+    /// as-is. On error, the live file is left unchanged.
     pub fn compact_with<F>(&self, build: F) -> Result<usize>
     where
         F: FnOnce(Vec<JournalEntry>) -> Result<Vec<JournalEntry>>,
     {
-        // Lukko otetaan KERRAN ja pidetään koko luku→suodatus→swap-operaation
-        // ajan. Tämä on koko TOCTOU-korjauksen ydin: appendit eivät mahdu väliin.
+        // The lock is taken ONCE and held for the entire read→filter→swap
+        // operation. This is the crux of the whole TOCTOU fix: appends cannot
+        // slip in between.
         let mut file = self
             .file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Lue koko nykyinen loki lukottomalla apurilla (lukko on JO hallussa →
-        // emme saa kutsua `read_all_entries`:ä joka lukitsisi uudelleen).
+        // Read the entire current log with the lockless helper (the lock is
+        // ALREADY held → we must not call `read_all_entries`, which would lock
+        // again).
         let current = Self::parse_entries_from_path(&self.path)?;
         let read_count = current.len();
 
-        // Kutsuja rakentaa säilytettävät rivit (suodattaa kuolleet, uudelleen-
-        // numeroi StepId:t). Virhe palautetaan sellaisenaan, elävä tiedosto on
-        // yhä koskematon (swapia ei ole vielä tehty).
+        // The caller builds the rows to keep (filters dead ones, renumbers
+        // StepIds). The error is returned as-is; the live file is still
+        // untouched (the swap has not happened yet).
         let kept = build(current)?;
         let kept_count = kept.len();
 
-        // Atominen swap saman, yhä-hallussa-olevan lukon alla.
+        // Atomic swap under the same, still-held lock.
         self.atomic_swap_locked(&mut file, &kept)?;
 
         Ok(read_count.saturating_sub(kept_count))
     }
 
-    /// Tekee atomisen temp + fsync + rename + kahvanvaihdon **olettaen että
-    /// kutsuja pitää jo `self.file`-lukkoa** (`file` = kyseinen lukko-guard).
+    /// Performs the atomic temp + fsync + rename + handle-swap **assuming the
+    /// caller already holds the `self.file` lock** (`file` = that lock guard).
     ///
-    /// Eriytetty jaettu apuri jotta [`rewrite`](FileJournal::rewrite) ja
-    /// [`compact_with`](FileJournal::compact_with) tekevät täsmälleen saman
-    /// swapin. **Ei lukitse `self.file`:ä uudelleen** — std [`Mutex`] ei ole
-    /// reentrantti, joten lukko otetaan vain kerran kutsujassa ja annetaan tänne
-    /// guardina. Swapin vaiheet:
-    /// 1. Sarjallista kaikki rivit muistiin (jos serde kaatuu, levyä ei kosketa).
-    /// 2. Kirjoita tilapäistiedostoon **samaan hakemistoon** (flush + fsync).
-    /// 3. Nimeä tilapäistiedosto atomisesti elävän tiedoston päälle.
-    /// 4. Vaihda kirjoituskahva osoittamaan uuteen tiedostoon append-tilassa.
+    /// Factored out as a shared helper so that [`rewrite`](FileJournal::rewrite)
+    /// and [`compact_with`](FileJournal::compact_with) perform exactly the
+    /// same swap. **Does not lock `self.file` again** — std [`Mutex`] is not
+    /// reentrant, so the lock is taken only once by the caller and handed in
+    /// here as a guard. Steps of the swap:
+    /// 1. Serialize all rows into memory (if serde fails, disk is not touched).
+    /// 2. Write to a temporary file **in the same directory** (flush + fsync).
+    /// 3. Atomically rename the temporary file over the live file.
+    /// 4. Swap the write handle to point at the new file in append mode.
     fn atomic_swap_locked(
         &self,
         file: &mut std::sync::MutexGuard<'_, File>,
         entries: &[JournalEntry],
     ) -> Result<()> {
-        // 1: sarjallista KAIKKI rivit ennen kuin kosketaan levyyn.
+        // 1: serialize ALL rows before touching disk.
         let mut buf = String::new();
         for entry in entries {
             let line = serde_json::to_string(entry)?;
@@ -330,12 +345,12 @@ impl FileJournal {
             buf.push('\n');
         }
 
-        // Tilapäistiedosto SAMAAN hakemistoon (rename on atominen vain saman
-        // tiedostojärjestelmän sisällä). Uniikki nimi estää rinnakkaisten
-        // tiivistysten törmäyksen.
+        // Temporary file in the SAME directory (rename is atomic only within
+        // the same filesystem). A unique name prevents collisions between
+        // concurrent compactions.
         let tmp_path = self.compaction_tmp_path();
 
-        // 2: kirjoita temp + flush + fsync.
+        // 2: write temp + flush + fsync.
         let write_result = (|| -> Result<()> {
             let mut tmp = OpenOptions::new()
                 .create(true)
@@ -348,18 +363,18 @@ impl FileJournal {
             Ok(())
         })();
         if let Err(e) = write_result {
-            // Temp jäi mahdollisesti vajaaksi — siivoa, elävä tiedosto koskematon.
+            // The temp file may have been left incomplete — clean up, live file untouched.
             let _ = std::fs::remove_file(&tmp_path);
             return Err(e);
         }
 
-        // 3: atominen rename temp → elävä tiedosto.
+        // 3: atomic rename temp → live file.
         if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(DurableError::Io(e));
         }
 
-        // 4: vaihda kirjoituskahva osoittamaan uuteen tiedostoon append-tilassa.
+        // 4: swap the write handle to point at the new file in append mode.
         let new_handle = OpenOptions::new()
             .create(true)
             .read(true)
@@ -367,13 +382,13 @@ impl FileJournal {
             .open(&self.path)?;
         **file = new_handle;
 
-        // fsync hakemisto ei ole siirrettävä Windowsilla; rename + temp-fsync
-        // antavat riittävän takeen (rename on atominen, temp-data on levyllä).
+        // Directory fsync is not portable on Windows; rename + temp-fsync
+        // provide a sufficient guarantee (rename is atomic, temp data is on disk).
         Ok(())
     }
 
-    /// Rakentaa uniikin tilapäistiedostopolun tiivistystä varten samaan
-    /// hakemistoon kuin elävä loki (jotta rename on atominen).
+    /// Builds a unique temporary file path for compaction in the same
+    /// directory as the live log (so the rename is atomic).
     fn compaction_tmp_path(&self) -> PathBuf {
         use std::fmt::Write as _;
         let nanos = std::time::SystemTime::now()
@@ -383,7 +398,7 @@ impl FileJournal {
             || "journal".to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
-        // `write!` String:iin ei voi epäonnistua → tulos sivuutetaan tarkoituksella.
+        // `write!` to a String cannot fail → the result is deliberately ignored.
         let _ = write!(name, ".compact-{}-{nanos}.tmp", std::process::id());
         match self.path.parent() {
             Some(dir) => dir.join(name),
@@ -392,34 +407,36 @@ impl FileJournal {
     }
 }
 
-/// Typistää tiedoston lopusta kaatumisen jättämän rivinvaihdottoman tyngän.
+/// Truncates a newline-less fragment left by a crash from the end of the file.
 ///
-/// Eheytys avattaessa (ks. moduulin doc): kaatuminen kesken [`append`]:in voi
-/// jättää tiedoston loppuun vajaan, **rivinvaihdottoman** rivin. Sellaista riviä
-/// ei koskaan fsyncattu loppuun, joten se ei ole sitoutunut askel — ja ellei sitä
-/// poisteta levyltä, seuraava append liittyy sen perään SAMALLE fyysiselle
-/// riville ja tuottaa pysyvän sisäkorruption.
+/// Heal-on-open (see the module doc): a crash mid-[`append`] can leave an
+/// incomplete, **newline-less** line at the end of the file. Such a line was
+/// never fsynced to completion, so it is not a committed step — and unless it
+/// is removed from disk, the next append will attach after it on the SAME
+/// physical line and produce permanent internal corruption.
 ///
-/// Toiminta on **konservatiivinen**: tiedostoa typistetään vain kun
-/// 1. tiedosto ei pääty `\n`:ään (eli viimeinen rivi on potentiaalisesti vajaa), JA
-/// 2. tuo viimeinen (rivinvaihdoton) rivi EI jäsenny ehjäksi [`JournalEntry`]:ksi.
+/// The behavior is **conservative**: the file is truncated only when
+/// 1. the file does not end with `\n` (i.e. the last line is potentially
+///    incomplete), AND
+/// 2. that last (newline-less) line does NOT parse as an intact
+///    [`JournalEntry`].
 ///
-/// Jos viimeinen rivi jäsentyy ehjäksi mutta vain `\n` puuttuu (täysin
-/// mahdollinen, jos kirjoitus ehti rungon mutta ei päätös-`\n`:ää — käytännössä
-/// `append` kirjoittaa rivin + `\n` yhtenä `write_all`-kutsuna, mutta ollaan
-/// varovaisia), riviä EI typistetä — se on validi askel ja säilytetään.
-/// Tällöin lisätään pelkkä puuttuva `\n`, jotta seuraava append alkaa puhtaalta
-/// riviltä rikkomatta ehjää askelta.
+/// If the last line parses intact but is only missing the `\n` (entirely
+/// possible if the write got through the body but not the terminating `\n` —
+/// in practice `append` writes the line + `\n` as a single `write_all` call,
+/// but we are being cautious), the line is NOT truncated — it is a valid step
+/// and is preserved. In that case only the missing `\n` is appended, so the
+/// next append starts from a clean line without breaking the intact step.
 ///
 /// # Errors
-/// [`DurableError::Io`] jos tiedoston luku tai typistys epäonnistuu.
+/// [`DurableError::Io`] if reading or truncating the file fails.
 fn heal_torn_trailing_fragment(path: &Path) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
 
-    // Olematon tai tyhjä tiedosto: ei mitään eheytettävää.
+    // Nonexistent or empty file: nothing to heal.
     let mut file = match OpenOptions::new().read(true).write(true).open(path) {
         Ok(f) => f,
-        // Tiedostoa ei vielä ole — open luo sen myöhemmin, ei eheytettävää.
+        // The file doesn't exist yet — open will create it later, nothing to heal.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(DurableError::Io(e)),
     };
@@ -428,8 +445,8 @@ fn heal_torn_trailing_fragment(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Päättyykö tiedosto rivinvaihtoon? Jos kyllä, viimeinen rivi on ehjästi
-    // päätetty eikä eheytystä tarvita.
+    // Does the file end with a line terminator? If so, the last line is
+    // cleanly terminated and no healing is needed.
     file.seek(SeekFrom::End(-1))?;
     let mut last = [0u8; 1];
     file.read_exact(&mut last)?;
@@ -437,35 +454,36 @@ fn heal_torn_trailing_fragment(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Tiedosto ei pääty `\n`:ään → etsi viimeisen rivin alku (edellisen `\n`:n
-    // jälkeinen tavu) skannaamalla taaksepäin. Lue koko tiedosto; journalit ovat
-    // rivipohjaisia eivätkä mielivaltaisen suuria yhdellä lukukerralla.
+    // The file does not end with `\n` → find the start of the last line (the
+    // byte after the previous `\n`) by scanning backward. Read the whole file;
+    // journals are line-based and not arbitrarily large in a single read.
     file.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
     file.read_to_end(&mut bytes)?;
 
-    // Viimeisen rivin alkuoffset = viimeisen `\n`:n jälkeinen tavu (tai 0).
+    // Start offset of the last line = the byte after the last `\n` (or 0).
     let last_line_start = match bytes.iter().rposition(|&b| b == b'\n') {
         Some(pos) => pos + 1,
         None => 0,
     };
     let last_line = &bytes[last_line_start..];
 
-    // Tyhjä viimeinen rivi (esim. pelkkiä välilyöntejä): ei jäsennettävää askelta,
-    // mutta ei myöskään tynkää jonka append turmelisi — jätetään rauhaan.
+    // An empty last line (e.g. just whitespace): no step to parse, but also
+    // no fragment that append would corrupt — leave it alone.
     if last_line.iter().all(u8::is_ascii_whitespace) {
         return Ok(());
     }
 
-    // Jäsentyykö viimeinen (rivinvaihdoton) rivi ehjäksi entryksi?
+    // Does the last (newline-less) line parse as an intact entry?
     if serde_json::from_slice::<JournalEntry>(last_line).is_ok() {
-        // Ehjä askel jolta vain puuttuu päätös-`\n`: säilytä rivi, lisää `\n`
-        // jotta seuraava append alkaa puhtaalta riviltä.
+        // An intact step missing only the terminating `\n`: keep the line, add
+        // the `\n` so the next append starts from a clean line.
         file.seek(SeekFrom::End(0))?;
         file.write_all(b"\n")?;
     } else {
-        // Vajaa tynkä: typistä se kokonaan pois → tiedosto päättyy edelliseen
-        // ehjään riviin (sen `\n`:ään) tai tyhjenee. Append jatkuu puhtaasti.
+        // An incomplete fragment: truncate it away entirely → the file ends at
+        // the previous intact line (its `\n`) or becomes empty. Append
+        // continues cleanly.
         let new_len = u64::try_from(last_line_start).unwrap_or(0);
         file.set_len(new_len)?;
     }
@@ -474,7 +492,7 @@ fn heal_torn_trailing_fragment(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Palauttaa tiedoston viimeisen tavun, tai `None` jos tiedosto on tyhjä.
+/// Returns the file's last byte, or `None` if the file is empty.
 fn last_byte_of(path: &Path) -> Result<Option<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = File::open(path)?;
@@ -490,21 +508,22 @@ fn last_byte_of(path: &Path) -> Result<Option<u8>> {
 
 impl Journal for FileJournal {
     fn append(&self, entry: JournalEntry) -> Result<()> {
-        // Sarjallista ensin: jos serde epäonnistuu, levyä ei kosketa.
+        // Serialize first: if serde fails, disk is not touched.
         let mut line = serde_json::to_string(&entry)?;
         line.push('\n');
-        // Poison-recovery: jos lukon haltija paniikkasi, file-kahva on yhä validi
-        // (append on atominen write_all + flush + fsync, ei osittaista tilaa joka
-        // vaatisi mutex-poisonin kunnioittamista). `into_inner()` palauttaa kahvan
-        // paniikkaamatta → noudattaa error.rs:5 invarianttia.
+        // Poison recovery: if the lock holder panicked, the file handle is
+        // still valid (append is an atomic write_all + flush + fsync, with no
+        // partial state that would require honoring the mutex poison).
+        // `into_inner()` returns the handle without panicking → complies with
+        // the error.rs:5 invariant.
         let mut file = self
             .file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         file.write_all(line.as_bytes())?;
         file.flush()?;
-        // fsync: takaa että rivi on fyysisesti levyllä ennen paluuta — tämä on
-        // koko kaatumiskestävyyden ydin.
+        // fsync: guarantees the row is physically on disk before returning —
+        // this is the crux of the whole crash-resistance guarantee.
         file.sync_all()?;
         Ok(())
     }
@@ -525,7 +544,7 @@ mod tests {
     use crate::entry::EntryKind;
     use serde_json::json;
 
-    /// Pieni RAII-temp-tiedosto ilman ulkoisia crateja.
+    /// A small RAII temp file without external crates.
     struct TempPath(PathBuf);
 
     impl TempPath {
@@ -539,7 +558,7 @@ mod tests {
                     .map_or(0, |d| d.as_nanos())
             );
             p.push(unique);
-            // Varmista puhdas alku.
+            // Ensure a clean start.
             let _ = std::fs::remove_file(&p);
             Self(p)
         }
@@ -622,8 +641,8 @@ mod tests {
             j.append(JournalEntry::completed(StepId::ZERO, "a", json!(1)))
                 .expect("append");
         }
-        // Simuloi kaatuminen kesken kirjoituksen: liitä vajaa JSON ILMAN
-        // päätös-rivinvaihtoa.
+        // Simulate a crash mid-write: append incomplete JSON WITHOUT a
+        // terminating line break.
         {
             let mut raw = OpenOptions::new()
                 .append(true)
@@ -633,7 +652,7 @@ mod tests {
                 .expect("write partial");
             raw.flush().expect("flush");
         }
-        // Replay sietää vajaan viimeisen rivin: palautuu vain ehjä ensimmäinen.
+        // Replay tolerates the incomplete last line: only the intact first row is returned.
         let j = FileJournal::open(tmp.path()).expect("reopen journal");
         let all = j.replay_all().expect("replay tolerant");
         assert_eq!(all.len(), 1);
@@ -644,8 +663,8 @@ mod tests {
     fn rejects_corrupt_interior_line() {
         let tmp = TempPath::new("corrupt-interior");
         {
-            // Kirjoita ehjä rivi, sitten roskarivi PÄÄTÖS-rivinvaihdolla
-            // (= sisäkorruptio, ei vajaa kirjoitus), sitten ehjä rivi.
+            // Write an intact line, then a garbage line WITH a terminating
+            // line break (= internal corruption, not an incomplete write), then an intact line.
             let good = serde_json::to_string(&JournalEntry::completed(StepId::ZERO, "a", json!(1)))
                 .expect("ser");
             let good2 =
@@ -668,17 +687,18 @@ mod tests {
         }
     }
 
-    /// REGRESSIO (red-team `replay_after_torn_write_leaves_journal_permanently_corrupt`):
-    /// torn-write → open eheyttää tyngän → append jatkuu PUHTAALTA rivirajalta →
-    /// uusi reopen + replay onnistuu ilman `CorruptEntry`:ä.
+    /// REGRESSION (red-team `replay_after_torn_write_leaves_journal_permanently_corrupt`):
+    /// torn-write → open heals the fragment → append continues from a CLEAN
+    /// line boundary → a new reopen + replay succeeds without `CorruptEntry`.
     ///
-    /// Ennen korjausta: open vain sieti tyngän luvussa, mutta jätti sen levylle;
-    /// seuraava append liittyi samalle riville ja tuotti sisäkorruption joka
-    /// kaatoi jokaisen myöhemmän reopenin. Nyt tynkä typistetään avattaessa.
+    /// Before the fix: open only tolerated the fragment during reads but left
+    /// it on disk; the next append attached to the same line and produced
+    /// internal corruption that broke every subsequent reopen. Now the
+    /// fragment is truncated on open.
     #[test]
     fn heals_torn_trailing_fragment_so_append_does_not_corrupt() {
         let tmp = TempPath::new("heal-torn");
-        // Vaihe 1: kaksi ehjää askelta levylle.
+        // Step 1: two intact steps to disk.
         {
             let j = FileJournal::open(tmp.path()).expect("open 1");
             j.append(JournalEntry::completed(StepId::ZERO, "a", json!(1)))
@@ -686,7 +706,7 @@ mod tests {
             j.append(JournalEntry::completed(StepId::new(1), "b", json!(2)))
                 .expect("append b");
         }
-        // Vaihe 2: simuloi kaatuminen kesken kirjoituksen — rivinvaihdoton tynkä.
+        // Step 2: simulate a crash mid-write — a newline-less fragment.
         {
             let mut raw = OpenOptions::new()
                 .append(true)
@@ -697,30 +717,30 @@ mod tests {
             raw.flush().expect("flush");
         }
 
-        // Vaihe 3: open EHEYTTÄÄ tyngän (typistys), sitten append step c.
+        // Step 3: open HEALS the fragment (truncation), then appends step c.
         {
             let j = FileJournal::open(tmp.path()).expect("open 2 heals");
-            // Heti avauksen jälkeen tiedosto päättyy ehjään riviin (\n).
+            // Immediately after opening, the file ends with an intact line (\n).
             let after_open = std::fs::read_to_string(tmp.path()).expect("read");
             assert!(
                 after_open.ends_with('\n'),
                 "heal must leave file ending in newline, got:\n{after_open}"
             );
-            // Eheytetty: vain kaksi ehjää askelta jäljellä, tynkä poissa.
+            // Healed: only two intact steps remain, the fragment is gone.
             assert_eq!(j.replay_all().expect("replay after heal").len(), 2);
             j.append(JournalEntry::completed(StepId::new(2), "c", json!(3)))
                 .expect("append c onto healed boundary");
         }
 
-        // Vaihe 4: reopen + replay ONNISTUU — ei sisäkorruptiota.
+        // Step 4: reopen + replay SUCCEEDS — no internal corruption.
         let j = FileJournal::open(tmp.path()).expect("open 3");
         let all = j.replay_all().expect("replay must not be CorruptEntry");
-        assert_eq!(all.len(), 3, "kaksi ehjää + tuore step c = 3 ehjää riviä");
+        assert_eq!(all.len(), 3, "two intact + fresh step c = 3 intact rows");
         assert_eq!(all[0].step_name(), Some("a"));
         assert_eq!(all[1].step_name(), Some("b"));
         assert_eq!(all[2].step_name(), Some("c"));
 
-        // Yksikään fyysinen rivi ei sisällä kahta step_id-avainta (= ei sulautumaa).
+        // No physical line contains two step_id keys (= no fusion).
         let contents = std::fs::read_to_string(j.path()).expect("read final");
         assert!(
             !contents
@@ -730,12 +750,12 @@ mod tests {
         );
     }
 
-    /// Eheytys EI saa typistää ehjää viimeistä riviä jolta vain puuttuu `\n`.
-    /// Tällöin lisätään pelkkä puuttuva rivinvaihto ja askel säilyy.
+    /// Healing must NOT truncate an intact last line that is only missing `\n`.
+    /// In that case only the missing line break is appended and the step is preserved.
     #[test]
     fn heal_preserves_intact_last_line_missing_only_newline() {
         let tmp = TempPath::new("heal-intact");
-        // Kirjoita yksi ehjä entry RAA'asti ILMAN päätös-`\n`:ää.
+        // Write one intact entry RAW, WITHOUT a terminating `\n`.
         {
             let good = serde_json::to_string(&JournalEntry::completed(StepId::ZERO, "a", json!(1)))
                 .expect("ser");
@@ -747,10 +767,14 @@ mod tests {
             raw.write_all(good.as_bytes()).expect("write");
             raw.flush().expect("flush");
         }
-        // open: rivi on ehjä → säilytetään, vain `\n` lisätään.
+        // open: the line is intact → preserved, only `\n` is appended.
         let j = FileJournal::open(tmp.path()).expect("open heals newline");
-        assert_eq!(j.replay_all().expect("replay").len(), 1, "ehjä rivi säilyy");
-        // Append jatkuu puhtaasti.
+        assert_eq!(
+            j.replay_all().expect("replay").len(),
+            1,
+            "the intact line is preserved"
+        );
+        // Append continues cleanly.
         j.append(JournalEntry::completed(StepId::new(1), "b", json!(2)))
             .expect("append b");
         let all = j.replay_all().expect("replay 2");
@@ -774,25 +798,25 @@ mod tests {
         assert_eq!(j.path(), tmp.path());
     }
 
-    /// REGRESSIO (error.rs:5 invariantti "ei unwrap/expect/panic tuotantopolulla"):
-    /// kun toinen säie paniikkaa pitäessään file-mutexia, lukko myrkyttyy.
-    /// `append` ja `read_all_entries`/`replay_all` käyttävät nyt
-    /// `unwrap_or_else(|e| e.into_inner())` → ne TOIPUVAT myrkystä eivätkä
-    /// paniikkaa. File-kahva pysyy validina, joten round-trip onnistuu.
+    /// REGRESSION (error.rs:5 invariant "no unwrap/expect/panic on the production path"):
+    /// when another thread panics while holding the file mutex, the lock is poisoned.
+    /// `append` and `read_all_entries`/`replay_all` now use
+    /// `unwrap_or_else(|e| e.into_inner())` → they RECOVER from the poison
+    /// instead of panicking. The file handle remains valid, so the round-trip succeeds.
     // ---- rewrite (compaction) ----
 
     #[test]
     fn rewrite_replaces_log_with_given_entries() {
         let tmp = TempPath::new("rewrite-basic");
         let j = FileJournal::open(tmp.path()).expect("open");
-        // Aluksi viisi riviä.
+        // Five rows initially.
         for i in 0..5 {
             j.append(JournalEntry::completed(StepId::new(i), "old", json!(i)))
                 .expect("append");
         }
         assert_eq!(j.replay_all().expect("replay").len(), 5);
 
-        // Tiivistä kahteen riviin.
+        // Compact to two rows.
         let kept = vec![
             JournalEntry::completed(StepId::ZERO, "keep-a", json!(1)),
             JournalEntry::completed(StepId::new(1), "keep-b", json!(2)),
@@ -817,7 +841,7 @@ mod tests {
             let kept = vec![JournalEntry::completed(StepId::ZERO, "only", json!(9))];
             j.rewrite(&kept).expect("rewrite");
         }
-        // Restart: tiivistetty muoto säilyi levyllä.
+        // Restart: the compacted form persisted to disk.
         let j2 = FileJournal::open(tmp.path()).expect("open 2");
         let all = j2.replay_all().expect("replay");
         assert_eq!(all.len(), 1);
@@ -834,14 +858,14 @@ mod tests {
         }
         j.rewrite(&[JournalEntry::completed(StepId::ZERO, "base", json!(0))])
             .expect("rewrite");
-        // Append tiivistyksen jälkeen jatkaa puhtaalta rivirajalta.
+        // Append after compaction continues from a clean line boundary.
         j.append(JournalEntry::completed(StepId::new(1), "next", json!(1)))
             .expect("append after rewrite");
         let all = j.replay_all().expect("replay");
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].step_name(), Some("base"));
         assert_eq!(all[1].step_name(), Some("next"));
-        // Yksikään fyysinen rivi ei sulauta kahta entryä.
+        // No physical line fuses two entries.
         let contents = std::fs::read_to_string(j.path()).expect("read");
         assert!(
             !contents
@@ -871,9 +895,9 @@ mod tests {
         j.rewrite(&[JournalEntry::completed(StepId::ZERO, "b", json!(2))])
             .expect("rewrite");
 
-        // TÄMÄN lokin temp-tiedostoa ei saa lojua hakemistossa (rename siirsi sen).
-        // Rajataan skannaus tämän testin tiedostonimi-etuliitteeseen, jottei
-        // rinnakkaisten testien lennossa olevat temp-tiedostot häiritse.
+        // THIS log's temp file must not linger in the directory (the rename moved it).
+        // The scan is restricted to this test's file-name prefix so that
+        // temp files from other tests running concurrently don't interfere.
         let dir = j.path().parent().expect("parent dir");
         let own_name = j
             .path()
@@ -890,11 +914,12 @@ mod tests {
         assert!(leftover.is_empty(), "temp files left behind: {leftover:?}");
     }
 
-    /// Atomisuus: simuloidaan "keskeytys ennen renamea" jättämällä elävä tiedosto
-    /// koskematta ja todistamalla että eläviä rivejä ei katoa. Koska oikeaa
-    /// crashia ei voi laukaista deterministisesti, testi varmistaa invariantin:
-    /// elävä tiedosto on aina ehjä rename-pohjaisella swapilla — ennen renamea
-    /// sen sisältö on vanha kokonaisuus, ei koskaan puolikas.
+    /// Atomicity: simulates "interrupted before the rename" by leaving the
+    /// live file untouched and demonstrating that no live rows are lost.
+    /// Since a real crash cannot be triggered deterministically, this test
+    /// verifies the invariant: the live file is always intact under a
+    /// rename-based swap — before the rename its contents are the old whole,
+    /// never a half-written mix.
     #[test]
     fn rewrite_is_atomic_live_file_never_half_written() {
         let tmp = TempPath::new("rewrite-atomic");
@@ -905,8 +930,8 @@ mod tests {
         }
         let before = std::fs::read_to_string(j.path()).expect("read before");
 
-        // Tiivistä — atominen rename. Heti onnistumisen jälkeen tiedosto on
-        // joko TÄYSIN vanha tai TÄYSIN uusi, ei sekoitus.
+        // Compact — atomic rename. Immediately after success, the file is
+        // either FULLY old or FULLY new, never a mix.
         let kept = vec![JournalEntry::completed(
             StepId::ZERO,
             "compacted",
@@ -915,7 +940,7 @@ mod tests {
         j.rewrite(&kept).expect("rewrite");
         let after = std::fs::read_to_string(j.path()).expect("read after");
 
-        // Jokainen rivi on ehjä JSON (ei puolikasta sulautumaa renamesta).
+        // Every line is intact JSON (no partial fusion from the rename).
         for line in after.lines().filter(|l| !l.trim().is_empty()) {
             serde_json::from_str::<JournalEntry>(line)
                 .expect("every line after rewrite must be intact json");
@@ -924,7 +949,7 @@ mod tests {
         assert_eq!(j.replay_all().expect("replay").len(), 1);
     }
 
-    // ---- compact_with (TOCTOU-aukon sulkeva atominen tiivistys) ----
+    // ---- compact_with (atomic compaction that closes the TOCTOU gap) ----
 
     #[test]
     fn compact_with_filters_and_renumbers_under_single_lock() {
@@ -935,7 +960,7 @@ mod tests {
                 .expect("append");
         }
 
-        // Tiivistä: säilytä vain parilliset askeleet, uudelleennumeroi 0..N.
+        // Compact: keep only even-numbered steps, renumber them 0..N.
         let dropped = j
             .compact_with(|entries| {
                 assert_eq!(entries.len(), 5, "build sees all on-disk rows");
@@ -958,42 +983,44 @@ mod tests {
             })
             .expect("compact_with");
 
-        // 5 luettua − 3 säilytettyä (0,2,4) = 2 pudotettua.
+        // 5 read − 3 kept (0,2,4) = 2 dropped.
         assert_eq!(dropped, 2);
         let all = j.replay_all().expect("replay");
         assert_eq!(all.len(), 3);
-        // Uudelleennumeroitu tiiviiksi 0..N.
+        // Renumbered to a tight 0..N.
         assert_eq!(all[0].step_id, StepId::new(0));
         assert_eq!(all[1].step_id, StepId::new(1));
         assert_eq!(all[2].step_id, StepId::new(2));
     }
 
-    /// TOCTOU-aukon sulkemisen TODISTE (regressio: append-during-compact ei katoa).
+    /// PROOF that the TOCTOU gap is closed (regression: append-during-compact does not disappear).
     ///
-    /// Atomisuus seuraa yhden-lukon-pidosta: `compact_with` lukitsee `self.file`:n
-    /// kerran ja pitää sen luku→suodatus→swap-ajan. Tämä testi todistaa kaksi
-    /// havaittavaa seurausta:
-    /// 1. `build`-suljin näkee **tasan** ne rivit jotka olivat levyllä lukon
-    ///    ottohetkellä (ei enempää, ei vähempää) — luku on yhtenäinen.
-    /// 2. `compact_with`:n PALUUN JÄLKEEN tehty append laskeutuu tiivistettyjen
-    ///    rivien PERÄÄN — ei vanhaan tiedostoon joka tuhoutuisi swapissa.
+    /// Atomicity follows from holding a single lock: `compact_with` locks
+    /// `self.file` once and holds it for the read→filter→swap operation. This
+    /// test demonstrates two observable consequences:
+    /// 1. The `build` closure sees **exactly** the rows that were on disk at
+    ///    lock-acquire time (no more, no less) — the read is consistent.
+    /// 2. An append performed AFTER `compact_with` RETURNS lands AFTER the
+    ///    compacted rows — not in the old file, which would be destroyed by
+    ///    the swap.
     ///
-    /// Koska lukko pidetään koko ajan, rinnakkainen append voi valmistua vain
-    /// ENNEN lukon ottoa (jolloin se näkyy `build`:n riveissä) tai swapin jälkeen
-    /// (jolloin se laskeutuu tiivistetyn lokin perään) — ei koskaan väliin
-    /// katoamaan. Tässä ei tarvita oikeaa rinnakkaisuutta: invariantti seuraa
-    /// rakenteesta, ja deterministinen testi on luotettavampi kuin race.
+    /// Because the lock is held throughout, a concurrent append can only
+    /// complete EITHER before the lock is acquired (in which case it shows up
+    /// in `build`'s rows) OR after the swap (in which case it lands after the
+    /// compacted log) — never disappearing in between. Real concurrency isn't
+    /// needed here: the invariant follows from the structure, and a
+    /// deterministic test is more reliable than a race.
     #[test]
     fn compact_with_holds_lock_so_post_compact_append_lands_after_compacted_rows() {
         let tmp = TempPath::new("compact-with-toctou");
         let j = FileJournal::open(tmp.path()).expect("open");
-        // Kolme riviä levylle ENNEN tiivistystä.
+        // Three rows to disk BEFORE compaction.
         for i in 0..3 {
             j.append(JournalEntry::completed(StepId::new(i), "pre", json!(i)))
                 .expect("append pre");
         }
 
-        // Tiivistä: build näkee TASAN nuo kolme riviä (yhtenäinen luku lukon alla).
+        // Compact: build sees EXACTLY those three rows (a consistent read under the lock).
         let dropped = j
             .compact_with(|entries| {
                 assert_eq!(
@@ -1005,7 +1032,7 @@ mod tests {
                     assert_eq!(e.step_name(), Some("pre"));
                     assert_eq!(e.step_id, StepId::new(i as u64));
                 }
-                // Säilytä vain yksi (uudelleennumeroitu) elävä rivi.
+                // Keep only one (renumbered) live row.
                 Ok(vec![JournalEntry::completed(
                     StepId::ZERO,
                     "compacted",
@@ -1015,7 +1042,7 @@ mod tests {
             .expect("compact_with");
         assert_eq!(dropped, 2, "3 read − 1 kept = 2 dropped");
 
-        // Append PALUUN JÄLKEEN laskeutuu tiivistettyjen rivien PERÄÄN.
+        // An append AFTER RETURN lands AFTER the compacted rows.
         j.append(JournalEntry::completed(StepId::new(1), "post", json!(100)))
             .expect("append post must land after compacted rows");
 
@@ -1024,7 +1051,7 @@ mod tests {
         assert_eq!(all[0].step_name(), Some("compacted"));
         assert_eq!(all[1].step_name(), Some("post"));
 
-        // Yksikään fyysinen rivi ei sulauta kahta entryä (swap jätti puhtaat rajat).
+        // No physical line fuses two entries (the swap left clean boundaries).
         let contents = std::fs::read_to_string(j.path()).expect("read");
         assert!(
             !contents
@@ -1034,11 +1061,10 @@ mod tests {
         );
     }
 
-    /// EI-DEADLOCK: `compact_with` lukitsee `self.file`:n vain kerran (ei
-    /// reentranttia uudelleenlukitusta), joten kutsu valmistuu, ja heti perään
-    /// tehty append + replay onnistuvat samalla säikeellä. Jos jokin
-    /// sisäpolku lukitsisi `self.file`:n uudelleen, tämä testi jumiutuisi
-    /// (timeout) tai paniikkaisi.
+    /// NO-DEADLOCK: `compact_with` locks `self.file` only once (no reentrant
+    /// re-locking), so the call completes, and an append + replay performed
+    /// immediately after succeed on the same thread. If any internal path
+    /// were to lock `self.file` again, this test would hang (timeout) or panic.
     #[test]
     fn compact_with_does_not_deadlock_then_append_then_replay() {
         let tmp = TempPath::new("compact-with-no-deadlock");
@@ -1048,9 +1074,9 @@ mod tests {
                 .expect("append");
         }
 
-        // compact_with valmistuu (ei deadlock samalla säikeellä).
+        // compact_with completes (no deadlock on the same thread).
         j.compact_with(|entries| {
-            // Suodata pois pariton output → säilytä 0 ja 2.
+            // Filter out odd outputs → keep 0 and 2.
             let mut kept = Vec::new();
             let mut step = StepId::ZERO;
             for e in entries {
@@ -1068,12 +1094,12 @@ mod tests {
         })
         .expect("compact_with completes without deadlock");
 
-        // HETI perään append (lukitsee self.file uudelleen — onnistuu koska
-        // compact_with vapautti lukkonsa palatessaan).
+        // Append IMMEDIATELY after (locks self.file again — succeeds because
+        // compact_with released its lock upon returning).
         j.append(JournalEntry::completed(StepId::new(2), "after", json!(7)))
             .expect("append after compact_with");
 
-        // Ja replay (lukitsee self.file vielä kerran) — onnistuu.
+        // And replay (locks self.file once more) — succeeds.
         let all = j.replay_all().expect("replay after compact_with");
         assert_eq!(all.len(), 3, "2 live (0,2) + 1 after-append");
         assert_eq!(all[2].step_name(), Some("after"));
@@ -1088,8 +1114,8 @@ mod tests {
         j.append(JournalEntry::completed(StepId::new(1), "b", json!(2)))
             .expect("append");
 
-        // build palauttaa virheen → compact_with palauttaa sen sellaisenaan,
-        // eikä elävää tiedostoa muuteta (swapia ei tehdä).
+        // build returns an error → compact_with returns it as-is, and the
+        // live file is not modified (no swap is performed).
         let err = j
             .compact_with(|_entries| {
                 Err(DurableError::step_failed(
@@ -1103,7 +1129,7 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
 
-        // Elävä tiedosto koskematon: molemmat alkuperäiset rivit yhä luettavissa.
+        // Live file untouched: both original rows are still readable.
         let all = j.replay_all().expect("replay after failed compact");
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].step_name(), Some("a"));
@@ -1131,11 +1157,11 @@ mod tests {
 
         let tmp = TempPath::new("poison-recovery");
         let j = Arc::new(FileJournal::open(tmp.path()).expect("open"));
-        // Yksi ehjä askel ennen myrkytystä.
+        // One intact step before poisoning.
         j.append(JournalEntry::completed(StepId::ZERO, "a", json!(1)))
             .expect("append a");
 
-        // Myrkytä mutex: paniikkaa toisessa säikeessä lukon ollessa hallussa.
+        // Poison the mutex: panic in another thread while holding the lock.
         let poisoner = Arc::clone(&j);
         let handle = std::thread::spawn(move || {
             let _guard = poisoner.file.lock().expect("acquire lock to poison");
@@ -1146,11 +1172,11 @@ mod tests {
             "poisoning thread must have panicked"
         );
 
-        // append TOIPUU myrkystä — ei paniikkaa, palauttaa Ok.
+        // append RECOVERS from the poison — no panic, returns Ok.
         j.append(JournalEntry::completed(StepId::new(1), "b", json!(2)))
             .expect("append must recover from poisoned mutex");
 
-        // replay_all (→ read_all_entries) TOIPUU myös ja näkee molemmat askeleet.
+        // replay_all (→ read_all_entries) also RECOVERS and sees both steps.
         let all = j
             .replay_all()
             .expect("replay must recover from poisoned mutex");

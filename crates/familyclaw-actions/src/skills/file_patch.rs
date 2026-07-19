@@ -1,14 +1,14 @@
-//! Esimerkkimalli (reference pattern): paikallisen tiedoston muutosehdotus (patch) (KERROS A).
+//! Reference pattern: local file patch proposal (Layer A).
 //!
-//! [`FilePatchMock`] ottaa tiedoston sisällön ([`FilePatchInput::file_content`])
-//! ja pyydetyn muutoksen ([`FilePatchInput::requested_edit`]) ja tuottaa
-//! **patch-ehdotuksen** (yhtenäinen diff). Tämä on **referenssimalli joka
-//! näyttää taidon sopimuksen** paikallista levykirjoitusta varten:
-//! suorituslogiikka on deterministinen ja muistinvarainen (se vain ehdottaa
-//! muutoksen), ja manifesti luokittelee sen paikalliseksi kirjoitukseksi
-//! ([`crate::policy::ActionRisk::WriteLocal`]) joka pakottaa ihmisen hyväksynnän
-//! ennen suoritusta. Kytke oma levylle-soveltaja tähän suoritusrunkoon, kun
-//! haluat oikeasti kirjoittaa patchin — hyväksyntäportti pysyy paikallaan.
+//! [`FilePatchMock`] takes a file's content ([`FilePatchInput::file_content`])
+//! and a requested change ([`FilePatchInput::requested_edit`]) and produces a
+//! **patch proposal** (unified diff). This is a **reference pattern that
+//! demonstrates the skill contract** for local disk writes: the execution
+//! logic is deterministic and in-memory (it only proposes the change), and
+//! the manifest classifies it as a local write ([`crate::policy::ActionRisk::WriteLocal`])
+//! which forces human approval before execution. Wire up your own
+//! disk-apply component into this execution scaffold when you want to
+//! actually write the patch — the approval gate remains in place.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -22,54 +22,54 @@ use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 
 use super::Skill;
 
-/// Taidon kiinteä tunniste, jotta rekisteröinti ja haku ovat toistettavia.
+/// Fixed identifier for the skill, so registration and lookup are reproducible.
 const SKILL_UUID: uuid::Uuid = uuid::uuid!("44444444-4444-4444-8444-444444444444");
 
-/// Taidon syöte: alkuperäinen sisältö ja pyydetty muutos.
+/// Skill input: the original content and the requested change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilePatchInput {
-    /// Tiedoston nykyinen sisältö.
+    /// The file's current content.
     pub file_content: String,
-    /// Luonnollisella kielellä kuvattu pyydetty muutos.
+    /// The requested change, described in natural language.
     pub requested_edit: String,
 }
 
-/// Taidon tulos: patch-ehdotus (ei vielä sovellettu).
+/// Skill output: the patch proposal (not yet applied).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilePatchOutput {
-    /// Ehdotettu patch yhtenäisenä diff-tekstinä.
+    /// The proposed patch as unified diff text.
     pub patch: String,
-    /// Onko patch sovellettu levylle (mockissa aina `false`).
+    /// Whether the patch has been applied to disk (always `false` in the mock).
     pub applied: bool,
 }
 
-/// Mock-taito tiedoston patch-ehdotukselle (proposal only).
+/// Mock skill for file patch proposals (proposal only).
 ///
-/// Riskiluokka on [`ActionRisk::WriteLocal`] ja käytäntö
-/// [`ApprovalPolicy::AlwaysRequireApproval`], joten suoritus vaatii aina
-/// hyväksynnän (paikallinenkin kirjoitus pysähtyy ihmiselle).
+/// The risk class is [`ActionRisk::WriteLocal`] and the policy is
+/// [`ApprovalPolicy::AlwaysRequireApproval`], so execution always requires
+/// approval (even a local write stops for a human).
 #[derive(Debug, Clone, Default)]
 pub struct FilePatchMock;
 
 impl FilePatchMock {
-    /// Luo uuden taidon.
+    /// Creates a new skill instance.
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 
-    /// Taidon kiinteä tunniste.
+    /// The skill's fixed identifier.
     #[must_use]
     pub fn skill_id() -> SkillId {
         SkillId::from_uuid(SKILL_UUID)
     }
 
-    /// Muodostaa patch-ehdotuksen (puhdas logiikka).
+    /// Builds the patch proposal (pure logic).
     ///
-    /// Mock liittää pyydetyn muutoksen kommenttirivinä sisällön loppuun ja
-    /// tuottaa yksinkertaisen yhtenäisen diffin. Oikeaa diff-algoritmia ei
-    /// tarvita KERROS A -tasolla — tärkeää on että tulos on **ehdotus**, ei
-    /// sovellettu muutos.
+    /// The mock appends the requested change as a comment line at the end of
+    /// the content and produces a simple unified diff. A real diff algorithm
+    /// is not needed at the Layer A level — what matters is that the result
+    /// is a **proposal**, not an applied change.
     #[must_use]
     pub fn make_patch(input: &FilePatchInput) -> FilePatchOutput {
         let added_line = format!("// edit: {}", input.requested_edit.trim());
@@ -119,7 +119,7 @@ impl Skill for FilePatchMock {
             name: "file_patch_mock".to_string(),
             version: "1.0.0".to_string(),
             description:
-                "Ehdottaa tiedoston muutoksen patchina (ei kirjoita levylle ilman hyväksyntää)."
+                "Proposes a file change as a patch (does not write to disk without approval)."
                     .to_string(),
             permissions: vec![SkillPermission::WriteLocalFiles],
             risk: ActionRisk::WriteLocal,
@@ -131,11 +131,11 @@ impl Skill for FilePatchMock {
                 "properties": {
                     "file_content": {
                         "type": "string",
-                        "description": "Tiedoston nykyinen sisältö."
+                        "description": "The file's current content."
                     },
                     "requested_edit": {
                         "type": "string",
-                        "description": "Luonnollisella kielellä kuvattu pyydetty muutos."
+                        "description": "The requested change, described in natural language."
                     }
                 },
                 "required": ["file_content", "requested_edit"],
@@ -171,8 +171,8 @@ mod tests {
         m.validate().expect("manifest validates");
         assert_eq!(m.name, "file_patch_mock");
         assert_eq!(m.risk, ActionRisk::WriteLocal);
-        // AlwaysRequireApproval → policy pakottaa hyväksynnän paikallisellekin
-        // kirjoitukselle.
+        // AlwaysRequireApproval → the policy forces approval even for a
+        // local write.
         assert_eq!(
             required_approval(m.risk, m.approval_policy),
             ApprovalRequirement::RequireApproval

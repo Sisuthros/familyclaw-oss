@@ -1,54 +1,54 @@
 # familyclaw-sandbox
 
-Eristetty koodisuoritus FamilyClaw-alustalle (KERROS A / OSS).
+Isolated code execution for the FamilyClaw platform (Layer A / OSS).
 
-WASM-pohjainen sandbox jossa **polttoaine (fuel) pakottaa suorituskaton** ja
-**kyvykkyysmalli rajaa pääsyn** verkkoon, tiedostoihin ja
-ympäristömuuttujiin. Suunnitteluviite: design §2 (turva).
+A WASM-based sandbox where **fuel enforces an execution ceiling** and a
+**capability model restricts access** to the network, files, and
+environment variables. Design reference: design §2 (security).
 
-## Periaate: turva oletuksena
+## Principle: secure by default
 
-- **Deny by default** — ilman eksplisiittisesti myönnettyä `Capability`:ia
-  ajettavalla koodilla ei ole verkkoa, tiedostoja eikä ympäristömuuttujia.
-- **Polttoaine pakottaa rajan** — ikuinen silmukka keskeytyy
-  `SandboxError::FuelExhausted`:lla, ei jää jumiin.
-- **Determinismi** — sama `SandboxRequest` tuottaa saman tuloksen (durable-
-  replayn edellytys).
+- **Deny by default** — without an explicitly granted `Capability`,
+  executed code has no network, file, or environment variable access.
+- **Fuel enforces the limit** — an infinite loop is interrupted with
+  `SandboxError::FuelExhausted` instead of hanging.
+- **Determinism** — the same `SandboxRequest` produces the same result (a
+  prerequisite for durable replay).
 
-## Rakenne
+## Structure
 
-Crate on kerroksittainen, jotta turvalogiikka on testattavissa **ilman**
-raskasta wasmtime-riippuvuutta:
+The crate is layered so the security logic is testable **without** the
+heavy wasmtime dependency:
 
-| Tyyppi | Vastuu |
+| Type | Responsibility |
 |--------|--------|
-| `CodeSandbox` (trait) | Backend-riippumaton rajapinta: `execute(&request) -> SandboxResult` |
-| `Capability` / `CapabilitySet` | "Deny by default" -kyvykkyysmalli (verkko, FS-luku, env) |
-| `FuelLimit` / `FuelMeter` | Polttoainebudjetti ja sen kulutuksen mittaus |
-| `SandboxRequest` / `SandboxOutput` | Suorituksen syöte ja tulos (serde-sarjallistuvia) |
-| `NoopSandbox` | **Oletustoteutus** — ei aja koodia, palauttaa `NotImplemented` |
-| `WasmtimeSandbox` | Oikea wasmtime-toteutus, **`wasmtime`-featuren takana** |
+| `CodeSandbox` (trait) | Backend-independent interface: `execute(&request) -> SandboxResult` |
+| `Capability` / `CapabilitySet` | "Deny by default" capability model (network, FS reads, env) |
+| `FuelLimit` / `FuelMeter` | Fuel budget and consumption measurement |
+| `SandboxRequest` / `SandboxOutput` | Execution input and result (serde-serializable) |
+| `NoopSandbox` | **Default implementation** — does not run code, returns `NotImplemented` |
+| `WasmtimeSandbox` | Real wasmtime implementation, **behind the `wasmtime` feature** |
 
-## Feature-flagit
+## Feature flags
 
-| Feature | Oletus | Vaikutus |
+| Feature | Default | Effect |
 |---------|--------|----------|
-| `wasmtime` | ei | Kytkee `WasmtimeSandbox`-toteutuksen. wasmtime on iso riippuvuus (Cranelift + JIT), joten se on optional ettei se hidasta koko workspacen buildia. |
+| `wasmtime` | no | Enables the `WasmtimeSandbox` implementation. wasmtime is a large dependency (Cranelift + JIT), so it's optional to avoid slowing down the whole workspace build. |
 
-Ilman `wasmtime`-featurea vain `NoopSandbox` on saatavilla, ja
-`default_sandbox()` palauttaa sen.
+Without the `wasmtime` feature only `NoopSandbox` is available, and
+`default_sandbox()` returns it.
 
 ```toml
 [dependencies]
 familyclaw-sandbox = { version = "0.1", features = ["wasmtime"] }
 ```
 
-## Käyttö
+## Usage
 
 ```rust
 use familyclaw_sandbox::{CodeSandbox, SandboxRequest, FuelLimit, Capability, CapabilitySet};
 
-// "Paras saatavilla oleva" backend (wasmtime jos käännetty, muuten noop).
+// The "best available" backend (wasmtime if compiled in, otherwise noop).
 let sandbox = familyclaw_sandbox::default_sandbox()?;
 
 let request = SandboxRequest::new(wasm_bytes)
@@ -62,15 +62,16 @@ println!("fuel consumed: {}", output.fuel_consumed);
 # Ok::<(), familyclaw_sandbox::SandboxError>(())
 ```
 
-### wasmtime-backendin suorituskonventio
+### wasmtime backend execution convention
 
-`WasmtimeSandbox` ajaa WASM-moduulin joka vie (export) parametrittoman
-funktion nimeltä `run` joka palauttaa `i32`-tilakoodin. Moduuli ajetaan
-**ilman host-importteja** — importteja vaativa moduuli hylätään selkeällä
-virheellä, koska kyvykkyydet eivät oletuksena tarjoa host-rajapintaa.
-Laajemmat WASI-kyvykkyydet lisätään myöhemmin kyvykkyysmallin ohjaamana.
+`WasmtimeSandbox` runs a WASM module that exports a parameterless function
+named `run` that returns an `i32` status code. The module runs **without
+host imports** — a module that requires imports is rejected with a clear
+error, since capabilities do not provide a host interface by default.
+Broader WASI capabilities will be added later, governed by the capability
+model.
 
-## OSS-raja (KERROS A)
+## OSS boundary (Layer A)
 
-Tämä crate ei kovakoodaa perheenjäsenten sieluja, API-avaimia, tokeneita,
-IP-osoitteita eikä henkilökohtaisia polkuja. Se on geneerinen alustakomponentti.
+This crate does not hardcode family members' souls, API keys, tokens, IP
+addresses, or personal paths. It is a generic platform component.

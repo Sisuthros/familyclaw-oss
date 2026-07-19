@@ -1,39 +1,43 @@
-//! Replay-todistettu **promootiotodiste** (WP2) — KERROS A, OSS.
+//! Replay-proven **promotion evidence** (WP2) — Layer A, OSS.
 //!
-//! Itseään parantavan agentin klassinen kritiikki: se "luulee aina onnistuneensa".
-//! Verdikti perustuu agentin omaan itsearvioon, ei todistettavaan vertailuun.
-//! Tämä moduuli vastaa siihen antamalla ehdotukselle **deterministisen,
-//! sarjallistuvan todisteen** paremmuudesta: kahden aikajanan (baseline vs.
-//! kandidaatti) [`TimeMachine::diff`]-vertailun, jonka pohjalta *kutsujan
-//! antama* metriikka päättää parannuksen — ja **todiste itse kirjaa miten
-//! verdiktiin päädyttiin**, ei vain totuusarvoa.
+//! The classic critique of a self-improving agent: it "always thinks it
+//! succeeded". A verdict based on the agent's own self-assessment is not a
+//! provable comparison. This module addresses that by giving a proposal a
+//! **deterministic, serializable proof** of improvement: a comparison of two
+//! timelines (baseline vs. candidate) via [`TimeMachine::diff`], from which a
+//! *caller-supplied* metric decides whether an improvement occurred — and
+//! **the evidence itself records how the verdict was reached**, not just a
+//! boolean.
 //!
-//! ## Suhde ehdotuspinoon (suunnittelupäätös)
+//! ## Relationship to the proposal stack (a design decision)
 //!
-//! Tämä moduuli on **puhtaasti additiivinen** eikä koske [`crate::Proposal`]-
-//! rakenteeseen. Miksei todistetta lisätty kentäksi `Proposal`iin:
+//! This module is **purely additive** and does not touch the
+//! [`crate::Proposal`] structure. Why evidence was not added as a field on
+//! `Proposal`:
 //!
-//! - `Proposal`in [`content_hash`](crate::Proposal::content_hash) on turvaportti
-//!   (TOCTOU-drift): hyväksyntä sitoutuu ehdotuksen tarkkaan sisältöön. Uusi
-//!   kenttä muuttaisi kanonista sisältönäkymää ja siten *jokaisen* olemassa
-//!   olevan ehdotuksen hajautteen — vanhat katselmoinnit ja sarjallistetut
-//!   ehdotukset lakkaisivat täsmäämästä (serde-yhteensopivuusrikko).
-//! - Todiste on *liite* ehdotukseen, ei osa sen kuvailevaa sisältöä: sama
-//!   ehdotus voi saada uuden todisteen ilman että sen identiteetti tai
-//!   katselmoitu sisältö muuttuu.
+//! - `Proposal`'s [`content_hash`](crate::Proposal::content_hash) is a safety
+//!   gate (TOCTOU drift protection): approval binds to the proposal's exact
+//!   content. A new field would change the canonical content view and thus
+//!   the hash of *every* existing proposal — old reviews and serialized
+//!   proposals would stop matching (a serde compatibility break).
+//! - Evidence is an *attachment* to a proposal, not part of its descriptive
+//!   content: the same proposal can receive new evidence without its
+//!   identity or reviewed content changing.
 //!
-//! Siksi todiste pidetään **rinnakkaisessa rakenteessa** ([`EvidenceLedger`]),
-//! joka avaimena on ehdotuksen [`ProposalId`](crate::ProposalId). Näin ydin
-//! pysyy koskemattomana ja rakenteellisesti apply-vapaana.
+//! For that reason, evidence is kept in a **parallel structure**
+//! ([`EvidenceLedger`]), keyed by the proposal's
+//! [`ProposalId`](crate::ProposalId). This keeps the core untouched and
+//! structurally free of any apply path.
 //!
 //! ## Fail-closed
 //!
-//! [`evaluate_for_approval`] EI koskaan hyväksy mitään — se **vain toteaa**
-//! täyttyvätkö todistevaatimukset. Puuttuva todiste, regressio (`improved ==
-//! false`) tai tyhjä vertailu → [`EvidenceVerdict::insufficient`]. Ihmisen/
-//! operaattorin hyväksyntäporttia ([`crate::ProposalStore::approve`]) tämä ei
-//! korvaa vaan täydentää: todistevaatimus on *ehto* hyväksynnälle, ei
-//! hyväksyntä itse.
+//! [`evaluate_for_approval`] NEVER approves anything — it **only states**
+//! whether the evidence requirements are met. Missing evidence, a regression
+//! (`improved == false`), or an empty comparison →
+//! [`EvidenceVerdict::insufficient`]. This does not replace the human/
+//! operator approval gate ([`crate::ProposalStore::approve`]); it complements
+//! it: the evidence requirement is a *precondition* for approval, not the
+//! approval itself.
 
 use std::collections::HashMap;
 
@@ -42,36 +46,39 @@ use serde::{Deserialize, Serialize};
 
 use crate::ProposalId;
 
-/// Kutsujan antama parannusmetriikka: **miten** kahden aikajanan diffistä
-/// johdetaan verdikti "parani / ei parantunut".
+/// A caller-supplied improvement metric: **how** a verdict of "improved /
+/// did not improve" is derived from a diff of two timelines.
 ///
-/// Metriikka on tarkoituksella eksplisiittinen ja kirjattava, jotta todiste
-/// dokumentoi *millä perusteella* paremmuus todettiin — ei pelkkää
-/// totuusarvoa. Näin vältetään "agentti luulee onnistuneensa" -ansa: verdiktin
-/// peruste on aina luettavissa todisteesta.
+/// The metric is deliberately explicit and recorded, so the evidence
+/// documents *on what basis* an improvement was determined — not just a
+/// boolean. This avoids the "agent thinks it succeeded" trap: the basis for
+/// the verdict is always readable from the evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImprovementMetric {
-    /// Parannus = kandidaatti tuotti **enemmän onnistuneita askelia** kuin
-    /// baseline (ja vähintään yksi askel verrattiin). Yksinkertainen,
-    /// deterministinen oletusmetriikka.
+    /// Improvement = the candidate produced **more completed steps** than
+    /// the baseline (with at least one step compared). A simple,
+    /// deterministic default metric.
     MoreCompletedSteps,
-    /// Parannus = kandidaatti muutti täsmälleen **odotetun määrän** askelia
-    /// eikä erkaantunut nimeltään (kohdennettu korjaus, ei villi ajautuminen).
+    /// Improvement = the candidate changed exactly the **expected number**
+    /// of steps and did not diverge by name (a targeted fix, not wild
+    /// drift).
     ExactChangedCount {
-        /// Odotettu muuttuneiden askelten määrä.
+        /// The expected number of changed steps.
         expected: usize,
     },
-    /// Parannus = aikajanat **eivät erkaantuneet nimeltään** (sama askelrunko)
-    /// ja vähintään yksi askel muuttui (jotain oikeasti tapahtui).
+    /// Improvement = the timelines **did not diverge by name** (same step
+    /// skeleton) and at least one step changed (something actually
+    /// happened).
     NoDivergenceWithChange,
 }
 
 impl ImprovementMetric {
-    /// Ajaa metriikan baseline- ja kandidaattiaikajanan yli ja tuottaa
-    /// verdiktin sekä ihmisluettavan perustelun.
+    /// Runs the metric over the baseline and candidate timelines and
+    /// produces a verdict along with a human-readable justification.
     ///
-    /// Palauttaa `(improved, verdict_reason)`. Perustelu kertoo aina *miksi*
-    /// verdikti on se mikä on — myös silloin kun parannusta ei todettu.
+    /// Returns `(improved, verdict_reason)`. The justification always
+    /// explains *why* the verdict is what it is — including when no
+    /// improvement was found.
     fn evaluate(
         &self,
         baseline: &Timeline,
@@ -113,7 +120,7 @@ impl ImprovementMetric {
     }
 }
 
-/// Onnistuneiden (Completed) askelten lukumäärä aikajanalla.
+/// The number of completed (Completed) steps in a timeline.
 fn completed_count(timeline: &Timeline) -> usize {
     timeline
         .steps
@@ -122,53 +129,55 @@ fn completed_count(timeline: &Timeline) -> usize {
         .count()
 }
 
-/// Deterministinen, sarjallistuva **todiste** kahden aikajanan vertailusta.
+/// A deterministic, serializable **proof** comparing two timelines.
 ///
-/// Kaappaa baseline- ja kandidaattiaikajanan [`TimelineDiff`]-vertailun sekä
-/// tiivistelmäkentät ja eksplisiittisen `improved`-verdiktin
-/// `verdict_reason`-perusteluineen. Todiste on **inertti data**: se ei sovella
-/// eikä hyväksy mitään, se vain *todistaa* millä perusteella kandidaatti oli
-/// (tai ei ollut) parannus.
+/// Captures the [`TimelineDiff`] comparison of the baseline and candidate
+/// timelines, along with summary fields and an explicit `improved` verdict
+/// with its `verdict_reason` justification. The evidence is **inert data**:
+/// it does not apply or approve anything, it merely *proves* on what basis
+/// the candidate was (or was not) an improvement.
 ///
-/// Rakennetaan [`ReplayEvidence::from_journals`]- tai
-/// [`ReplayEvidence::from_timelines`]-kutsulla. Molemmat ovat **lukevia**
-/// journalien/aikajanojen suhteen — mikään olemassa oleva aikajana ei muutu.
+/// Constructed via [`ReplayEvidence::from_journals`] or
+/// [`ReplayEvidence::from_timelines`]. Both are **read-only** with respect to
+/// the journals/timelines involved — no existing timeline is modified.
 ///
-/// ## Miksi diff on `serde_json::Value` eikä `TimelineDiff`
+/// ## Why `diff` is `serde_json::Value` instead of `TimelineDiff`
 ///
-/// [`TimelineDiff`] (ja sen `StepDiff`/`StepOutcome`) derivoivat *vain*
-/// [`Serialize`]n durable-cratessa, ei [`Deserialize`]a. Jotta todiste on
-/// **täysin roundtrippaava** (tallennus + uudelleenluku) koskematta
-/// durable-craten tyyppeihin, säilytämme diffin sen **sarjallistetussa
-/// muodossa** ([`serde_json::Value`]). Muoto on deterministinen ja
-/// ihmisluettava, ja alkuperäinen [`TimelineDiff`] on aina uudelleen
-/// johdettavissa ajamalla vertailu uudestaan lähdeaikajanoista.
+/// [`TimelineDiff`] (and its `StepDiff`/`StepOutcome`) derive *only*
+/// [`Serialize`] in the durable crate, not [`Deserialize`]. For the evidence
+/// to be **fully roundtrippable** (store + reload) without touching the
+/// durable crate's types, we keep the diff in its **serialized form**
+/// ([`serde_json::Value`]). The format is deterministic and human-readable,
+/// and the original [`TimelineDiff`] can always be re-derived by rerunning
+/// the comparison from the source timelines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayEvidence {
-    /// Käytetty parannusmetriikka (miten verdiktiin päädyttiin).
+    /// The improvement metric used (how the verdict was reached).
     pub metric: ImprovementMetric,
-    /// Vertailun tuottanut deterministinen diff **sarjallistettuna**
-    /// (baseline vs. kandidaatti). Talletettu [`serde_json::Value`]nä, ks.
-    /// tyypin doc miksi.
+    /// The deterministic diff produced by the comparison
+    /// (baseline vs. candidate), **serialized**. Stored as
+    /// [`serde_json::Value`]; see the type doc for why.
     pub diff: serde_json::Value,
-    /// Verrattujen askelten lukumäärä (diffissä olevat askelparit/-jäännökset).
+    /// The number of steps compared (the step pairs/remainders present in
+    /// the diff).
     pub steps_compared: usize,
-    /// Montako askelta muuttui ([`TimelineDiff::changed_count`]).
+    /// How many steps changed ([`TimelineDiff::changed_count`]).
     pub changed_count: usize,
-    /// Montako askelta oli vain toisella aikajanalla
+    /// How many steps were present on only one timeline
     /// ([`TimelineDiff::tail_count`]).
     pub tail_count: usize,
-    /// Ensimmäinen paikka jossa aikajanat erkanivat nimeltään, jos sellainen on.
+    /// The first point where the timelines diverged by name, if any.
     pub first_divergence: Option<usize>,
-    /// Eksplisiittinen verdikti: oliko kandidaatti parannus.
+    /// The explicit verdict: whether the candidate was an improvement.
     pub improved: bool,
-    /// Ihmisluettava perustelu verdiktille — *miten* siihen päädyttiin.
+    /// A human-readable justification for the verdict — *how* it was
+    /// reached.
     pub verdict_reason: String,
 }
 
 impl ReplayEvidence {
-    /// Johtaa todisteen kahdesta valmiiksi luetusta aikajanasta annetulla
-    /// metriikalla. Puhtaasti laskeva; ei kosketa lähteitä.
+    /// Derives evidence from two already-read timelines using the given
+    /// metric. Purely computational; does not touch the sources.
     #[must_use]
     pub fn from_timelines(
         baseline: &Timeline,
@@ -177,11 +186,12 @@ impl ReplayEvidence {
     ) -> Self {
         let diff = TimelineDiff::from_timelines(baseline, candidate);
         let (improved, verdict_reason) = metric.evaluate(baseline, candidate, &diff);
-        // Tiivistelmäkentät luetaan aina *oikeasta* TimelineDiffistä, joten
-        // verdikti on riippumaton sarjallistuksen onnistumisesta. Vain talletettu
-        // diff-arvo on sarjallistettu muoto; käytännössä TimelineDiffin
-        // sarjallistus ei epäonnistu (pelkkää dataa), mutta jos silti kävisi,
-        // talletetaan `null` (fail-closed: ei paniikkia, tiivistelmät säilyvät).
+        // The summary fields are always read from the *real* TimelineDiff, so
+        // the verdict is independent of whether serialization succeeds. Only
+        // the stored diff value is the serialized form; in practice
+        // TimelineDiff serialization does not fail (it's plain data), but if
+        // it ever did, we store `null` (fail-closed: no panic, summaries are
+        // preserved).
         let diff_value = serde_json::to_value(&diff).unwrap_or(serde_json::Value::Null);
         Self {
             metric,
@@ -195,81 +205,88 @@ impl ReplayEvidence {
         }
     }
 
-    /// Johtaa todisteen kahdesta journalista annetulla metriikalla: lukee
-    /// molemmat aikajanoiksi ([`TimeMachine::diff`]-tyyliin) ja vertaa.
+    /// Derives evidence from two journals using the given metric: reads both
+    /// as timelines (in the style of [`TimeMachine::diff`]) and compares
+    /// them.
     ///
-    /// `baseline` on vertailun lähtökohta ja `candidate` (esim. haarautettu
-    /// counterfactual) sen kanssa vertailtava jatko. Kumpaakaan journalia ei
-    /// muuteta.
+    /// `baseline` is the starting point of the comparison, and `candidate`
+    /// (e.g. a forked counterfactual) is the continuation compared against
+    /// it. Neither journal is modified.
     ///
     /// # Errors
-    /// Vie kummankin journalin lukuvirheen läpi
+    /// Propagates a read error from either journal
     /// ([`familyclaw_durable::DurableError`]).
     pub fn from_journals<A: Journal, B: Journal>(
         baseline: &A,
         candidate: &B,
         metric: ImprovementMetric,
     ) -> DurableResult<Self> {
-        // Sama lukutapa kuin TimeMachine::diff — pidetään yhtenäisenä.
+        // Same read approach as TimeMachine::diff — kept consistent.
         let base_tl = TimeMachine::inspect(baseline)?;
         let cand_tl = TimeMachine::inspect(candidate)?;
         Ok(Self::from_timelines(&base_tl, &cand_tl, metric))
     }
 
-    /// Onko vertailu **tyhjä** (nollattu askel verrattu) → todiste ei todista
-    /// mitään. Fail-closed-arviointi kohtelee tätä riittämättömänä.
+    /// Whether the comparison is **empty** (zero steps compared) → the
+    /// evidence proves nothing. Fail-closed evaluation treats this as
+    /// insufficient.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.steps_compared == 0
     }
 }
 
-/// Verdikti siitä, täyttääkö ehdotukseen liitetty todiste hyväksynnän
-/// **todistevaatimukset**. Tämä EI ole hyväksyntä — se on portin *ehto*.
+/// The verdict on whether the evidence attached to a proposal meets the
+/// **evidence requirements** for approval. This is NOT an approval — it is
+/// the *precondition* for the gate.
 ///
-/// Fail-closed: kaikki epävarmuus (puuttuva todiste, regressio, tyhjä
-/// vertailu) tuottaa [`EvidenceVerdict::Insufficient`] perusteluineen.
+/// Fail-closed: any uncertainty (missing evidence, regression, empty
+/// comparison) produces [`EvidenceVerdict::Insufficient`] with a reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvidenceVerdict {
-    /// Todistevaatimukset täyttyvät: liitetty todiste on ei-tyhjä ja sen
-    /// verdikti on `improved == true`. **Ei silti hyväksyntä** — ihmisen/
-    /// operaattorin hyväksyntäportti pysyy polulla.
+    /// The evidence requirements are met: the attached evidence is
+    /// non-empty and its verdict is `improved == true`. **Still not an
+    /// approval** — the human/operator approval gate remains on the path.
     RequirementsMet,
-    /// Todistevaatimukset EIVÄT täyty → ei hyväksyttävissä (deny-by-default).
+    /// The evidence requirements are NOT met → not approvable
+    /// (deny-by-default).
     Insufficient {
-        /// Ihmisluettava syy miksi todiste ei riitä (auditointijälki).
+        /// A human-readable reason why the evidence is insufficient (audit
+        /// trail).
         reason: String,
     },
 }
 
 impl EvidenceVerdict {
-    /// Rakentaa riittämättömyys-verdiktin annetulla syyllä.
+    /// Builds an insufficient verdict with the given reason.
     fn insufficient(reason: impl Into<String>) -> Self {
         Self::Insufficient {
             reason: reason.into(),
         }
     }
 
-    /// Täyttyivätkö todistevaatimukset.
+    /// Whether the evidence requirements were met.
     #[must_use]
     pub const fn is_met(&self) -> bool {
         matches!(self, EvidenceVerdict::RequirementsMet)
     }
 }
 
-/// Arvioi täyttääkö annettu todiste hyväksynnän **todistevaatimukset**.
-/// **Fail-closed**: tämä funktio ei hyväksy mitään — se toteaa vain onko
-/// hyväksynnän ehto (todistettu paremmuus) olemassa.
+/// Evaluates whether the given evidence meets the **evidence requirements**
+/// for approval. **Fail-closed**: this function does not approve anything —
+/// it only states whether the precondition for approval (proven
+/// improvement) exists.
 ///
-/// Riittämätön (→ [`EvidenceVerdict::Insufficient`]) kun:
-/// - todistetta ei ole liitetty (`None`),
-/// - todiste on tyhjä (0 askelta verrattu),
-/// - todisteen verdikti on `improved == false` (regressio tai ei parannusta).
+/// Insufficient (→ [`EvidenceVerdict::Insufficient`]) when:
+/// - no evidence is attached (`None`),
+/// - the evidence is empty (0 steps compared),
+/// - the evidence's verdict is `improved == false` (regression or no
+///   improvement).
 ///
-/// Vain kun todiste on olemassa, ei-tyhjä ja `improved == true`, palautetaan
-/// [`EvidenceVerdict::RequirementsMet`]. Silloinkin varsinainen hyväksyntä on
-/// erillinen, ihmisen/operaattorin tekemä askel
-/// ([`crate::ProposalStore::approve`]) — tämä funktio ei sitä korvaa.
+/// Only when evidence exists, is non-empty, and `improved == true` is
+/// [`EvidenceVerdict::RequirementsMet`] returned. Even then, the actual
+/// approval is a separate, human/operator-performed step
+/// ([`crate::ProposalStore::approve`]) — this function does not replace it.
 #[must_use]
 pub fn evaluate_for_approval(evidence: Option<&ReplayEvidence>) -> EvidenceVerdict {
     let Some(evidence) = evidence else {
@@ -293,27 +310,27 @@ pub fn evaluate_for_approval(evidence: Option<&ReplayEvidence>) -> EvidenceVerdi
     EvidenceVerdict::RequirementsMet
 }
 
-/// Rinnakkainen, additiivinen **todistekirja**: liittää replay-todisteita
-/// ehdotuksiin niiden [`ProposalId`]:n kautta koskematta [`crate::Proposal`]-
-/// rakenteeseen (eikä siten sen sisältöhajautteeseen).
+/// A parallel, additive **evidence ledger**: attaches replay evidence to
+/// proposals via their [`ProposalId`], without touching the
+/// [`crate::Proposal`] structure (and therefore not its content hash).
 ///
-/// Puhtaasti kirjaava/kysyvä — **ei apply-polkua**, samoin kuin
-/// [`crate::ProposalStore`]. Todisteen liittäminen ei hyväksy eikä sovella
-/// mitään; arviointi tapahtuu [`evaluate_for_approval`]-funktiolla.
+/// Purely record-keeping/query — **no apply path**, just like
+/// [`crate::ProposalStore`]. Attaching evidence does not approve or apply
+/// anything; evaluation happens via the [`evaluate_for_approval`] function.
 #[derive(Debug, Default, Clone)]
 pub struct EvidenceLedger {
     evidence: HashMap<ProposalId, ReplayEvidence>,
 }
 
 impl EvidenceLedger {
-    /// Luo tyhjän todistekirjan.
+    /// Creates an empty evidence ledger.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Liittää (tai korvaa) ehdotukseen replay-todisteen. Palauttaa
-    /// mahdollisen aiemman todisteen. EI hyväksy eikä sovella mitään.
+    /// Attaches (or replaces) the replay evidence for a proposal. Returns
+    /// any previous evidence. Does NOT approve or apply anything.
     pub fn attach(
         &mut self,
         proposal_id: ProposalId,
@@ -322,26 +339,27 @@ impl EvidenceLedger {
         self.evidence.insert(proposal_id, evidence)
     }
 
-    /// Hakee ehdotukseen liitetyn todisteen, jos sellainen on.
+    /// Retrieves the evidence attached to a proposal, if any.
     #[must_use]
     pub fn get(&self, proposal_id: ProposalId) -> Option<&ReplayEvidence> {
         self.evidence.get(&proposal_id)
     }
 
-    /// Arvioi ehdotukseen liitetyn todisteen hyväksynnän todistevaatimuksia
-    /// vasten (fail-closed). Puuttuva todiste → [`EvidenceVerdict::Insufficient`].
+    /// Evaluates the evidence attached to a proposal against the approval
+    /// evidence requirements (fail-closed). Missing evidence →
+    /// [`EvidenceVerdict::Insufficient`].
     #[must_use]
     pub fn evaluate(&self, proposal_id: ProposalId) -> EvidenceVerdict {
         evaluate_for_approval(self.get(proposal_id))
     }
 
-    /// Liitettyjen todisteiden lukumäärä.
+    /// The number of attached evidence entries.
     #[must_use]
     pub fn len(&self) -> usize {
         self.evidence.len()
     }
 
-    /// Onko kirja tyhjä.
+    /// Whether the ledger is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.evidence.is_empty()
@@ -353,7 +371,7 @@ mod tests {
     use super::*;
     use familyclaw_durable::{DurableContext, InMemoryJournal};
 
-    /// Apuri: kahden askeleen ajo (load → decide) annetuilla arvoilla.
+    /// Helper: a two-step run (load → decide) with the given values.
     fn two_step_run(load: i64, decide: i64) -> InMemoryJournal {
         let mut ctx = DurableContext::new(InMemoryJournal::new()).expect("ctx");
         let a: i64 = ctx.step("load", || Ok(load)).expect("load");
@@ -361,11 +379,11 @@ mod tests {
         ctx.finish()
     }
 
-    // ---------- ReplayEvidence-johtaminen ----------
+    // ---------- ReplayEvidence derivation ----------
 
     #[test]
     fn evidence_from_timelines_records_how_verdict_was_reached() {
-        // Baseline: yksi epäonnistunut askel. Kandidaatti: sama askel onnistuu.
+        // Baseline: one failed step. Candidate: the same step succeeds.
         let mut base = DurableContext::new(InMemoryJournal::new()).expect("base");
         let _ = base.step::<i32, _>("risky", || Err("boom".to_string()));
         let base = base.finish();
@@ -396,15 +414,15 @@ mod tests {
     #[test]
     fn evidence_from_journals_matches_time_machine_diff() {
         let base = two_step_run(10, 5);
-        // Kandidaatti: sama load, eri decide → yksi muuttunut askel.
+        // Candidate: same load, different decide → one changed step.
         let cand = two_step_run(10, 7);
 
         let ev =
             ReplayEvidence::from_journals(&base, &cand, ImprovementMetric::NoDivergenceWithChange)
                 .expect("evidence");
 
-        // Sama lukutapa kuin TimeMachine::diff — talletettu diff on sen
-        // sarjallistettu muoto.
+        // Same read approach as TimeMachine::diff — the stored diff is its
+        // serialized form.
         let direct = TimeMachine::diff(&base, &cand).expect("diff");
         let direct_value = serde_json::to_value(&direct).expect("serialize diff");
         assert_eq!(ev.diff, direct_value);
@@ -413,7 +431,7 @@ mod tests {
         assert!(ev.improved, "ei erkaantumista + yksi muutos = parannus");
     }
 
-    // ---------- evaluate_for_approval: fail-closed-portti ----------
+    // ---------- evaluate_for_approval: fail-closed gate ----------
 
     #[test]
     fn no_evidence_is_insufficient() {
@@ -443,7 +461,7 @@ mod tests {
 
     #[test]
     fn regression_is_insufficient() {
-        // Identtiset aikajanat → NoDivergenceWithChange: 0 muutosta → ei parannusta.
+        // Identical timelines → NoDivergenceWithChange: 0 changes → no improvement.
         let base = two_step_run(10, 5);
         let cand = two_step_run(10, 5);
         let ev =
@@ -465,7 +483,7 @@ mod tests {
 
     #[test]
     fn empty_comparison_is_insufficient() {
-        // Kaksi tyhjää journalia → 0 askelta verrattu.
+        // Two empty journals → 0 steps compared.
         let base = InMemoryJournal::new();
         let cand = InMemoryJournal::new();
         let ev = ReplayEvidence::from_journals(&base, &cand, ImprovementMetric::MoreCompletedSteps)
@@ -483,7 +501,7 @@ mod tests {
         }
     }
 
-    // ---------- serde-roundtrip ----------
+    // ---------- serde roundtrip ----------
 
     #[test]
     fn replay_evidence_roundtrips_json() {
@@ -499,7 +517,7 @@ mod tests {
         let json = serde_json::to_string(&ev).expect("serialize");
         let back: ReplayEvidence = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(ev, back);
-        // Verdikti + perustelu säilyvät kierroksen yli.
+        // Verdict + justification survive the round trip.
         assert_eq!(ev.improved, back.improved);
         assert_eq!(ev.verdict_reason, back.verdict_reason);
     }
@@ -517,7 +535,7 @@ mod tests {
         assert_eq!(insufficient, back);
     }
 
-    // ---------- EvidenceLedger: rinnakkainen additiivinen rakenne ----------
+    // ---------- EvidenceLedger: parallel additive structure ----------
 
     #[test]
     fn ledger_attaches_and_evaluates_without_touching_proposal() {
@@ -530,7 +548,7 @@ mod tests {
         let mut ledger = EvidenceLedger::new();
         let id = ProposalId::new();
 
-        // Ennen liittämistä: fail-closed (ei todistetta).
+        // Before attaching: fail-closed (no evidence).
         assert!(!ledger.evaluate(id).is_met());
         assert!(ledger.is_empty());
 
@@ -544,14 +562,14 @@ mod tests {
         );
     }
 
-    /// Ydintesti (end-to-end): rakennetaan kaksi oikeaa journalia
-    /// [`DurableContext`]illa — baseline ja parannettu counterfactual — ja
-    /// johdetaan todiste [`TimeMachine::diff`]-vertailun kautta. Todistaa että
-    /// koko ketju (ajo → diff → todiste → fail-closed-arviointi) toimii oikeilla
-    /// aikajanoilla.
+    /// Core test (end-to-end): builds two real journals with
+    /// [`DurableContext`] — a baseline and an improved counterfactual — and
+    /// derives evidence via a [`TimeMachine::diff`] comparison. Proves that
+    /// the whole chain (run → diff → evidence → fail-closed evaluation)
+    /// works with real timelines.
     #[test]
     fn end_to_end_baseline_vs_improved_counterfactual() {
-        // Baseline: kolmivaiheinen ajo jossa "act" epäonnistuu (huono lopputulos).
+        // Baseline: a three-step run where "act" fails (a bad outcome).
         let mut base = DurableContext::new(InMemoryJournal::new()).expect("base");
         let amount: i64 = base.step("load", || Ok(100)).expect("load");
         let approved: i64 = base.step("decide", || Ok(amount * 2)).expect("decide");
@@ -561,18 +579,18 @@ mod tests {
         });
         let baseline = base.finish();
 
-        // Haaraudu ennen "act"-askelta ja aja korjattu jatko jossa "act" onnistuu.
+        // Fork before the "act" step and run a fixed continuation where "act" succeeds.
         let fork = TimeMachine::fork(&baseline, 2).expect("fork");
         let mut cand = DurableContext::new(fork).expect("cand ctx");
-        let amount: i64 = cand.step("load", || Ok(0)).expect("load replay"); // replay lokista
-        let approved: i64 = cand.step("decide", || Ok(0)).expect("decide replay"); // replay
+        let amount: i64 = cand.step("load", || Ok(0)).expect("load replay"); // replayed from the log
+        let approved: i64 = cand.step("decide", || Ok(0)).expect("decide replay"); // replayed
         assert_eq!((amount, approved), (100, 200), "prefiksi palautuu lokista");
         let _receipt: String = cand
             .step("act", move || Ok(format!("sent:{approved}")))
             .expect("act candidate");
         let candidate = cand.finish();
 
-        // Johda todiste: kandidaatilla enemmän onnistuneita askelia kuin baselinella.
+        // Derive evidence: the candidate has more completed steps than the baseline.
         let ev = ReplayEvidence::from_journals(
             &baseline,
             &candidate,
@@ -593,13 +611,13 @@ mod tests {
             ev.verdict_reason
         );
 
-        // Fail-closed-portti: todistevaatimukset täyttyvät (mutta EI hyväksyntä).
+        // Fail-closed gate: evidence requirements are met (but NOT an approval).
         let mut ledger = EvidenceLedger::new();
         let id = ProposalId::new();
         ledger.attach(id, ev);
         assert!(ledger.evaluate(id).is_met());
 
-        // Baseline ei muuttunut vertailun aikana (append-only-invariantti).
+        // The baseline did not change during the comparison (append-only invariant).
         let baseline_after = TimeMachine::inspect(&baseline).expect("inspect");
         assert_eq!(baseline_after.len(), 3);
     }

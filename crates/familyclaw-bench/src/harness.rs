@@ -1,8 +1,9 @@
-//! [`Harness`]: ajaa skenaariot subjektia vasten ja kokoaa [`Scorecard`]:n.
+//! [`Harness`]: runs scenarios against a subject and assembles a [`Scorecard`].
 //!
-//! Harness on saumaton (design §2.1): se ei tiedä *kuka* subjekti on eikä
-//! *mitä* skenaario tekee — se vain ajaa `Scenario × Subject → ScenarioResult`
-//! ja aggregoi tulokset. Kello on injektoitu, joten ajo on reprodusoitava.
+//! The harness is seamless (design §2.1): it doesn't know *who* the subject
+//! is or *what* the scenario does — it just runs `Scenario × Subject →
+//! ScenarioResult` and aggregates the results. The clock is injected, so
+//! the run is reproducible.
 
 use familyclaw_core::Timestamp;
 
@@ -11,28 +12,28 @@ use crate::scenario::Scenario;
 use crate::scorecard::Scorecard;
 use crate::subject::Subject;
 
-/// Skenaarioajojen suorittaja ja scorecardin koostaja.
+/// The runner for scenario runs and the scorecard assembler.
 ///
-/// Tilaton — koko ajotila kulkee parametreina, jotta sama kutsu tuottaa saman
-/// tuloksen (design §2.2).
+/// Stateless — the entire run state travels through parameters, so the same
+/// call produces the same result (design §2.2).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Harness;
 
 impl Harness {
-    /// Rakentaa uuden harnessin.
+    /// Builds a new harness.
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 
-    /// Ajaa kaikki skenaariot annettua subjektia vasten ja palauttaa
-    /// aggregoidun [`Scorecard`]:n.
+    /// Runs every scenario against the given subject and returns the
+    /// aggregated [`Scorecard`].
     ///
-    /// `clock` on injektoitu referenssihetki joka välitetään jokaiselle
-    /// skenaariolle ja talletetaan scorecardiin — järjestelmäkelloa ei lueta.
+    /// `clock` is the injected reference instant passed to every scenario
+    /// and stored on the scorecard — the system clock is never read.
     ///
     /// # Errors
-    /// Palauttaa ensimmäisen skenaarion virheen joka epäonnistuu (`?`).
+    /// Returns the error from the first scenario that fails (`?`).
     pub async fn run(
         &self,
         subject: &mut dyn Subject,
@@ -50,7 +51,7 @@ impl Harness {
 }
 
 #[cfg(test)]
-#[allow(clippy::unnecessary_literal_bound)] // Stub-toteutukset palauttavat literaaleja.
+#[allow(clippy::unnecessary_literal_bound)] // Stub implementations return literals.
 mod tests {
     use std::collections::BTreeMap;
 

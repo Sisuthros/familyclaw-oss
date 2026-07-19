@@ -3,9 +3,6 @@
 A concise technical overview of the FamilyClaw workspace: the crates, the data
 flow between them, and the invariants that hold the platform together.
 
-For the *why* behind these choices, read
-[`plans/2026-06-03-familyclaw-v2-design.md`](plans/2026-06-03-familyclaw-v2-design.md).
-
 ---
 
 ## 1. Two layers (the load-bearing boundary)

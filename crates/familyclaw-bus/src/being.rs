@@ -1,14 +1,15 @@
-//! Olennot (beings) busissa: rekisteröintitiedot ja vastaanottajan tyyppi.
+//! Beings on the bus: registration data and the recipient type.
 //!
-//! Busiin liittyvä olento on **Ractor-actor**, jonka viestityyppi on
-//! [`ResonanceMessage`]. Bus pitää kirjaa liittyneistä olennoista
-//! ([`BeingInfo`]) ja toimittaa heille viestit `cast`-kutsuilla. Yhden
-//! olennon kaatuminen ei kaada busia (supervision; ks. [`crate::bus`]).
+//! A being attached to the bus is a **Ractor actor** whose message type is
+//! [`ResonanceMessage`]. The bus keeps track of joined beings
+//! ([`BeingInfo`]) and delivers messages to them via `cast` calls. The
+//! crash of a single being does not bring down the bus (supervision; see
+//! [`crate::bus`]).
 //!
-//! Tämä moduuli tarjoaa myös valmiin [`CollectorBeing`]-actorin, joka kerää
-//! vastaanottamansa viestit. Se on tarkoitettu testeihin ja esimerkkeihin —
-//! todelliset perheenjäsenet (KERROS B) toteuttavat oman actorinsa, joka
-//! reagoi sisarusten resonanssiin.
+//! This module also provides a ready-made [`CollectorBeing`] actor that
+//! collects the messages it receives. It is intended for tests and
+//! examples — real family members (Layer B) implement their own actor
+//! that reacts to sibling resonance.
 
 use std::sync::{Arc, Mutex};
 
@@ -18,24 +19,24 @@ use familyclaw_emotion::{EmotionState, EmotionTransition};
 
 use crate::message::{BeingId, BusMessage, ResonanceMessage};
 
-/// Busiin rekisteröidyn olennon metatiedot.
+/// Metadata for a being registered on the bus.
 ///
-/// Kantaa olennotunnisteen, ihmisluettavan nimen ja [`ActorRef`]-viitteen,
-/// jonka kautta bus toimittaa viestit. Viite on tyypitetty
-/// [`ResonanceMessage`]:lle, joten olennot voivat ottaa vastaan vain busin
-/// kieltä.
+/// Carries the being identifier, a human-readable name, and the
+/// [`ActorRef`] through which the bus delivers messages. The reference is
+/// typed for [`ResonanceMessage`], so beings can only receive the bus's
+/// language.
 #[derive(Clone)]
 pub struct BeingInfo {
-    /// Olennon tunniste.
+    /// The being's identifier.
     id: BeingId,
-    /// Olennon näyttönimi (geneerinen, esim. `"agent_a"`).
+    /// The being's display name (generic, e.g. `"agent_a"`).
     name: String,
-    /// Postilaatikko, johon viestit toimitetaan.
+    /// The inbox to which messages are delivered.
     inbox: ActorRef<ResonanceMessage>,
 }
 
 impl BeingInfo {
-    /// Rakentaa rekisteröintitiedon.
+    /// Constructs registration data.
     #[must_use]
     pub fn new(id: BeingId, name: impl Into<String>, inbox: ActorRef<ResonanceMessage>) -> Self {
         Self {
@@ -45,19 +46,19 @@ impl BeingInfo {
         }
     }
 
-    /// Olennon tunniste.
+    /// The being's identifier.
     #[must_use]
     pub const fn id(&self) -> BeingId {
         self.id
     }
 
-    /// Olennon näyttönimi.
+    /// The being's display name.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Olennon postilaatikko (toimitusosoite).
+    /// The being's inbox (delivery address).
     #[must_use]
     pub fn inbox(&self) -> &ActorRef<ResonanceMessage> {
         &self.inbox
@@ -73,18 +74,18 @@ impl std::fmt::Debug for BeingInfo {
     }
 }
 
-/// Kevyt, sarjallistuva tilannekuva olennosta — [`BeingInfo`] ilman
-/// actor-viitettä.
+/// A lightweight, serializable snapshot of a being — [`BeingInfo`] without
+/// the actor reference.
 ///
-/// Tätä palauttaa [`crate::bus::BusHandle::beings`]: se kertoo *kuka* on
-/// liittynyt ilman että paljastaa sisäistä actor-koneistoa. **Tämän listan
-/// EI saa olla tyhjä kun olentoja on liittynyt** — se on suoraan korjaus
-/// live-3500-busin `beings:[]`-tyhjyyteen (design §2.2).
+/// This is what [`crate::bus::BusHandle::beings`] returns: it reports
+/// *who* is joined without exposing internal actor machinery. **This list
+/// must NOT be empty when beings are joined** — this is a direct fix for
+/// the live-3500 bus's `beings:[]` emptiness bug (design §2.2).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BeingSnapshot {
-    /// Olennon tunniste.
+    /// The being's identifier.
     pub id: BeingId,
-    /// Olennon näyttönimi.
+    /// The being's display name.
     pub name: String,
 }
 
@@ -97,23 +98,23 @@ impl From<&BeingInfo> for BeingSnapshot {
     }
 }
 
-/// Jaettu, säieturvallinen loki vastaanotetuista viesteistä.
+/// A shared, thread-safe log of received messages.
 ///
-/// [`CollectorBeing`] kirjoittaa tähän, ja testit/esimerkit lukevat sen.
+/// [`CollectorBeing`] writes to this, and tests/examples read from it.
 pub type CollectedLog = Arc<Mutex<Vec<ResonanceMessage>>>;
 
-/// Valmis olento-actor, joka kerää vastaanottamansa [`ResonanceMessage`]:t
-/// jaettuun lokiin.
+/// A ready-made being actor that collects the [`ResonanceMessage`]s it
+/// receives into a shared log.
 ///
-/// Tarkoitettu testeihin ja esimerkkeihin. Tuotannossa perheenjäsen
-/// toteuttaa oman [`Actor`]-toteutuksensa, joka reagoi resonanssiin (esim.
-/// päivittää omaa tunnetilaansa naapurin pulssin perusteella — affective
+/// Intended for tests and examples. In production a family member
+/// implements its own [`Actor`] that reacts to resonance (e.g. updating
+/// its own emotional state based on a neighbor's pulse — affective
 /// contagion).
 pub struct CollectorBeing;
 
-/// [`CollectorBeing`]:n tila: jaettu loki johon viestit kertyvät.
+/// [`CollectorBeing`]'s state: the shared log messages accumulate into.
 pub struct CollectorState {
-    /// Loki johon vastaanotetut viestit kirjoitetaan.
+    /// The log to which received messages are written.
     pub log: CollectedLog,
 }
 
@@ -136,9 +137,9 @@ impl Actor for CollectorBeing {
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        // Lukko voi olla myrkytetty vain jos jokin toinen säie panikoi sitä
-        // pidellessään; siinä tapauksessa otamme datan silti talteen sen
-        // sijaan että levittäisimme paniikin tähän actoriin.
+        // The lock can only be poisoned if another thread panicked while
+        // holding it; in that case we still capture the data rather than
+        // propagate the panic into this actor.
         let mut guard = match state.log.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -149,64 +150,68 @@ impl Actor for CollectorBeing {
 }
 
 impl CollectorBeing {
-    /// Luo jaetun lokin [`CollectorBeing`]-actorille.
+    /// Creates a shared log for the [`CollectorBeing`] actor.
     #[must_use]
     pub fn new_log() -> CollectedLog {
         Arc::new(Mutex::new(Vec::new()))
     }
 }
 
-/// **Affektiivinen tartunta (affective contagion) — vastaanottopuoli.**
+/// **Affective contagion — the receiving side.**
 ///
-/// Imee sisarukselta saapuneen tunnetilan (`incoming`) olennon omaan tilaan
-/// (`own`) [`EmotionTransition::blend`]:n inertialla:
+/// Absorbs a sibling's incoming emotion state (`incoming`) into the being's
+/// own state (`own`) using [`EmotionTransition::blend`]'s inertia:
 /// `next = inertia * own + (1 - inertia) * incoming`.
 ///
-/// Tämä on bus-kerroksen *puuttuva pala*: bus jo **kuljettaa**
-/// [`BusMessage::EmotionPulse`]:n sisaruksille, mutta kukaan ei ennen tätä
-/// **imenyt** pulssia omaan tunnetilaansa. Iso inertia → oma mieliala pysyy
-/// vakaana ja vain hieman värähtää naapurin suuntaan; pieni inertia → tarttuu
-/// nopeasti. Tulos pysyy aina [`EmotionState`]:n rajoissa (`blend` siivoaa).
+/// This is the *missing piece* of the bus layer: the bus already **carries**
+/// [`BusMessage::EmotionPulse`] to siblings, but until now nothing **absorbed**
+/// the pulse into its own emotion state. High inertia → the being's own mood
+/// stays stable and only shifts slightly toward the neighbor's; low inertia →
+/// contagion happens quickly. The result always stays within [`EmotionState`]'s
+/// bounds (`blend` clamps it).
 ///
-/// Puhdas ja sivuvaikutukseton viittausten ulkopuolelta: ainoa muutos on
-/// `own`-tilan paikallaan-päivitys. Uudelleenkäytettävissä myös ilman
-/// actor-koneistoa (esim. KERROS B:n oma olento-toteutus voi kutsua tätä).
+/// Pure and free of side effects outside its references: the only change is
+/// the in-place update of the `own` state. Also reusable without the actor
+/// machinery (e.g. Layer B's own being implementation can call this directly).
 pub fn on_pulse(own: &mut EmotionState, incoming: &EmotionState, transition: EmotionTransition) {
     *own = transition.blend(own, incoming);
 }
 
-/// Valmis olento-actor, joka **reagoi** sisarusten tunnepulsseihin imemällä ne
-/// omaan [`EmotionState`]:ensa ([`on_pulse`]) — affective contagion käytännössä.
+/// A ready-made being actor that **reacts** to siblings' emotion pulses by
+/// absorbing them into its own [`EmotionState`] ([`on_pulse`]) — affective
+/// contagion in practice.
 ///
-/// Toisin kuin [`CollectorBeing`] (joka vain kerää viestit), tämä actor pitää
-/// yllä omaa tunnetilaansa ja liikuttaa sitä naapurin mielialaa kohti aina kun
-/// busista saapuu [`BusMessage::EmotionPulse`]. Muut viestilajit (teksti,
-/// tehtävätapahtumat, …) jätetään huomiotta — ne eivät muuta tunnetilaa.
+/// Unlike [`CollectorBeing`] (which only collects messages), this actor
+/// maintains its own emotion state and moves it toward a neighbor's mood
+/// whenever a [`BusMessage::EmotionPulse`] arrives from the bus. Other
+/// message kinds (text, task events, …) are ignored — they do not change
+/// the emotion state.
 ///
-/// Tila jaetaan testeille/esimerkeille [`AffectiveState::emotion`]-kahvan
-/// kautta (`Arc<Mutex<…>>`), jotta vastaanotettu tartunta voidaan todentaa
-/// ulkopuolelta. Tuotannossa KERROS B toteuttaa oman olentonsa; tämä on
-/// uudelleenkäytettävä esimerkki + testikalusto.
+/// State is shared with tests/examples via the [`AffectiveState::emotion`]
+/// handle (`Arc<Mutex<…>>`), so absorbed contagion can be verified from the
+/// outside. In production, Layer B implements its own being; this is a
+/// reusable example plus test fixture.
 pub struct AffectiveBeing;
 
-/// Olennon jaettu, säieturvallinen tunnetila.
+/// A being's shared, thread-safe emotion state.
 ///
-/// [`AffectiveBeing`] mutatoi tätä; testit/esimerkit lukevat sen.
+/// [`AffectiveBeing`] mutates this; tests/examples read it.
 pub type SharedEmotion = Arc<Mutex<EmotionState>>;
 
-/// [`AffectiveBeing`]:n tila: oma tunnetila + tartunnan inertia.
+/// [`AffectiveBeing`]'s state: its own emotion state + contagion inertia.
 pub struct AffectiveState {
-    /// Olennon oma tunnetila, jaettu lukon takana havainnointia varten.
+    /// The being's own emotion state, shared behind a lock for observation.
     pub emotion: SharedEmotion,
-    /// Inertia, jolla saapuvat pulssit imetään omaan tilaan.
+    /// The inertia with which incoming pulses are absorbed into the own state.
     pub transition: EmotionTransition,
 }
 
-/// [`AffectiveBeing`]:n käynnistysargumentit: alkutila + inertia.
+/// [`AffectiveBeing`]'s startup arguments: initial state + inertia.
 pub struct AffectiveArgs {
-    /// Jaettu kahva olennon alkutunnetilaan (sama, jota testi tarkkailee).
+    /// A shared handle to the being's initial emotion state (the same one
+    /// the test observes).
     pub emotion: SharedEmotion,
-    /// Tartunnan inertia (`0.0..=1.0`; ks. [`EmotionTransition`]).
+    /// The contagion inertia (`0.0..=1.0`; see [`EmotionTransition`]).
     pub transition: EmotionTransition,
 }
 
@@ -232,11 +237,11 @@ impl Actor for AffectiveBeing {
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        // Vain tunnepulssi liikuttaa omaa tunnetilaa; muut lajit eivät.
+        // Only an emotion pulse moves the own state; other kinds do not.
         if let BusMessage::EmotionPulse { state: incoming } = &message.payload {
-            // Lukko voi olla myrkytetty vain jos jokin toinen säie panikoi sitä
-            // pidellessään; otamme silti tartunnan vastaan sen sijaan että
-            // levittäisimme paniikin tähän actoriin.
+            // The lock can only be poisoned if another thread panicked while
+            // holding it; we still absorb the contagion rather than
+            // propagate the panic into this actor.
             let mut guard = match state.emotion.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
@@ -248,7 +253,7 @@ impl Actor for AffectiveBeing {
 }
 
 impl AffectiveBeing {
-    /// Luo jaetun tunnetilakahvan annetusta alkutilasta.
+    /// Creates a shared emotion-state handle from the given initial state.
     #[must_use]
     pub fn shared(initial: EmotionState) -> SharedEmotion {
         Arc::new(Mutex::new(initial))
@@ -257,8 +262,8 @@ impl AffectiveBeing {
 
 #[cfg(test)]
 mod tests {
-    // Affektiiviset testit vertaavat tarkkoja, esitettäviä f32-tunnetila-arvoja
-    // (esim. 50.0 puolivälissä) — tarkka vertailu on tässä oikein.
+    // Affective tests compare exact, representable f32 emotion-state values
+    // (e.g. 50.0 at the midpoint) — exact comparison is correct here.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -276,16 +281,16 @@ mod tests {
         let env = ResonanceMessage::new(BeingId::new(), BusMessage::text("hi"));
         actor.cast(env.clone()).expect("cast to collector");
 
-        // Anna actorin käsitellä jonossa oleva viesti. (Stop-signaali voi
-        // ohittaa tavalliset viestit, joten emme luota pelkkään stop+join
-        // -järjestykseen viestin perillemenon todentamiseen.)
+        // Let the actor process the queued message. (A stop signal can
+        // overtake regular messages, so we don't rely solely on stop+join
+        // ordering to verify message delivery.)
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         {
             let recorded = log.lock().expect("lock");
             assert_eq!(recorded.len(), 1);
             assert_eq!(recorded[0], env);
-        } // lukko vapautetaan ennen .await:ia
+        } // release the lock before .await
 
         actor.stop(None);
         handle.await.expect("join");
@@ -307,7 +312,7 @@ mod tests {
         assert_eq!(snap.id, id);
         assert_eq!(snap.name, "agent_a");
 
-        // Debug ei panikoi eikä vuoda actor-sisäistä tilaa.
+        // Debug does not panic or leak internal actor state.
         let dbg = format!("{info:?}");
         assert!(dbg.contains("agent_a"));
 
@@ -326,19 +331,19 @@ mod tests {
         assert_eq!(snap, back);
     }
 
-    // ---- Affektiivinen tartunta (affective contagion) ------------------
+    // ---- Affective contagion --------------------------------------------
     //
-    // KRIITTINEN ractor::pg-sääntö: jokainen oikealla busilla ajava testi
-    // spawnaa OMAN `ResonanceBus`-instanssinsa (kukin saa tuoreen
-    // `resonance-bus-{n}`-ryhmän), jotta rinnakkaiset testit eivät jaa
-    // jäsenpoolia. Ei serial_test-riippuvuutta.
+    // CRITICAL ractor::pg rule: every test that runs against a real bus
+    // spawns its OWN `ResonanceBus` instance (each gets a fresh
+    // `resonance-bus-{n}` group), so parallel tests don't share a member
+    // pool. No serial_test dependency needed.
 
-    /// Apuri: pieni odotus, jotta asynkroninen toimitus ehtii valmistua.
+    /// Helper: a short wait so asynchronous delivery has time to complete.
     async fn settle() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    /// Rakentaa tunnetilan, jossa yksi dimensio on annetussa arvossa.
+    /// Builds an emotion state where one dimension is set to the given value.
     fn state_with(dim: Dimension, value: f32) -> EmotionState {
         let mut s = EmotionState::neutral();
         s.set(dim, value);
@@ -347,18 +352,18 @@ mod tests {
 
     #[test]
     fn on_pulse_moves_own_state_toward_incoming() {
-        // Puhdas helper: oma tila liikkuu havaintoa kohti inertian mukaan.
+        // Pure helper: own state moves toward the observation per inertia.
         let mut own = state_with(Dimension::Joy, 0.0);
         let incoming = state_with(Dimension::Joy, 100.0);
 
-        // inertia 0.5 → puoliväli (0*0.5 + 100*0.5 = 50).
+        // inertia 0.5 → midpoint (0*0.5 + 100*0.5 = 50).
         on_pulse(&mut own, &incoming, EmotionTransition::new(0.5));
         assert_eq!(own.value(Dimension::Joy), 50.0);
     }
 
     #[test]
     fn on_pulse_full_inertia_keeps_own_state() {
-        // inertia 1.0 → ei tartuntaa, oma tila ei muutu.
+        // inertia 1.0 → no contagion, own state does not change.
         let mut own = state_with(Dimension::Sadness, 70.0);
         let incoming = state_with(Dimension::Sadness, 0.0);
 
@@ -368,7 +373,7 @@ mod tests {
 
     #[test]
     fn on_pulse_zero_inertia_absorbs_incoming_fully() {
-        // inertia 0.0 → havainto korvaa oman tilan kokonaan.
+        // inertia 0.0 → the observation fully replaces the own state.
         let mut own = state_with(Dimension::Anger, 90.0);
         let incoming = state_with(Dimension::Hope, 80.0);
 
@@ -377,13 +382,13 @@ mod tests {
         assert_eq!(
             own.value(Dimension::Anger),
             0.0,
-            "havainto syrjäyttää vanhan"
+            "the observation displaces the old value"
         );
     }
 
     #[test]
     fn on_pulse_repeated_converges_toward_incoming() {
-        // Toistuva sama pulssi → oma tila lähestyy lähettäjän tilaa (inertia <1).
+        // Repeating the same pulse → own state approaches the sender's state (inertia <1).
         let mut own = EmotionState::neutral();
         let incoming = state_with(Dimension::Curiosity, 90.0);
         let t = EmotionTransition::new(0.5);
@@ -392,13 +397,13 @@ mod tests {
         }
         assert!(
             (own.value(Dimension::Curiosity) - 90.0).abs() < 0.5,
-            "toistuva tartunta vetää tilan lähelle lähettäjän tilaa"
+            "repeated contagion pulls the state close to the sender's state"
         );
     }
 
     #[tokio::test]
     async fn affective_being_absorbs_pulse_directly() {
-        // Suora cast (ilman busia): actor imee pulssin omaan tilaansa.
+        // Direct cast (without a bus): the actor absorbs the pulse into its own state.
         let emotion = AffectiveBeing::shared(state_with(Dimension::Joy, 0.0));
         let (actor, handle) = Actor::spawn(
             None,
@@ -423,7 +428,7 @@ mod tests {
             assert_eq!(
                 got.value(Dimension::Joy),
                 50.0,
-                "oma Joy liikkui puoliväliin"
+                "own Joy moved to the midpoint"
             );
         }
 
@@ -433,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn affective_being_ignores_non_pulse_messages() {
-        // Tekstiviesti EI saa muuttaa tunnetilaa.
+        // A text message must NOT change the emotion state.
         let emotion = AffectiveBeing::shared(state_with(Dimension::Love, 42.0));
         let (actor, handle) = Actor::spawn(
             None,
@@ -449,7 +454,7 @@ mod tests {
         actor
             .cast(ResonanceMessage::new(
                 BeingId::new(),
-                BusMessage::text("vain juttelua"),
+                BusMessage::text("just chatting"),
             ))
             .expect("cast text");
         settle().await;
@@ -459,7 +464,7 @@ mod tests {
             assert_eq!(
                 got.value(Dimension::Love),
                 42.0,
-                "ei-pulssi ei muuta tunnetilaa"
+                "a non-pulse message does not change the emotion state"
             );
         }
 
@@ -469,12 +474,12 @@ mod tests {
 
     #[tokio::test]
     async fn pulse_over_real_bus_shifts_receiver_toward_sender() {
-        // Tämän paketin ydintesti: oikealla busilla kulkeva pulssi muuttaa
-        // VASTAANOTTAVAN olennon omaa tunnetilaa lähettäjän suuntaan.
-        // OMA bus-instanssi (tuore resonance-bus-{n}-ryhmä).
+        // This module's core test: a pulse traveling over a real bus shifts
+        // the RECEIVING being's own emotion state toward the sender's.
+        // OWN bus instance (fresh resonance-bus-{n} group).
         let bus = ResonanceBus::start(None).await.expect("start bus");
 
-        // Lähettäjä: tavallinen kerääjä-olento (vain julkaisee pulssin).
+        // Sender: a plain collector being (only publishes the pulse).
         let sender_id = BeingId::new();
         let sender_log = CollectorBeing::new_log();
         let (sender_actor, _hs) = Actor::spawn(None, CollectorBeing, sender_log)
@@ -483,8 +488,8 @@ mod tests {
         bus.register(BeingInfo::new(sender_id, "agent_a", sender_actor))
             .expect("register sender");
 
-        // Vastaanottaja: affektiivinen olento, joka imee pulssin omaan tilaansa.
-        // Alkutila Joy=0; lähettäjä lähettää Joy=100; inertia 0.5 → odotus 50.
+        // Receiver: an affective being that absorbs the pulse into its own state.
+        // Initial state Joy=0; sender sends Joy=100; inertia 0.5 → expect 50.
         let recv_emotion = AffectiveBeing::shared(state_with(Dimension::Joy, 0.0));
         let (recv_actor, _hr) = Actor::spawn(
             None,
@@ -499,7 +504,7 @@ mod tests {
         bus.register(BeingInfo::new(BeingId::new(), "agent_b", recv_actor))
             .expect("register receiver");
 
-        // agent_a vuotaa korkean ilon pulssina busiin.
+        // agent_a leaks a high-joy pulse into the bus.
         bus.publish(
             sender_id,
             BusMessage::emotion_pulse(state_with(Dimension::Joy, 100.0)),
@@ -512,7 +517,7 @@ mod tests {
             assert_eq!(
                 got.value(Dimension::Joy),
                 50.0,
-                "busin yli saapunut pulssi siirsi vastaanottajan tilaa lähettäjän suuntaan"
+                "a pulse arriving over the bus shifted the receiver's state toward the sender's"
             );
         }
 
@@ -521,8 +526,8 @@ mod tests {
 
     #[tokio::test]
     async fn sender_does_not_absorb_own_pulse_over_bus() {
-        // Lähettäjä ei saa omaa pulssiaan → sen oma tila ei muutu busin kautta.
-        // Toinen, ERILLINEN bus-instanssi.
+        // The sender does not receive its own pulse → its own state does not change via the bus.
+        // A second, SEPARATE bus instance.
         let bus = ResonanceBus::start(None).await.expect("start bus");
 
         let sender_id = BeingId::new();
@@ -540,7 +545,7 @@ mod tests {
         bus.register(BeingInfo::new(sender_id, "agent_a", sender_actor))
             .expect("register sender");
 
-        // Toinen olento, jotta busissa on vastaanottaja (broadcast-reitti).
+        // A second being, so the bus has a receiver (broadcast route).
         let other_emotion = AffectiveBeing::shared(EmotionState::neutral());
         let (other_actor, _ho) = Actor::spawn(
             None,
@@ -567,7 +572,7 @@ mod tests {
             assert_eq!(
                 got.value(Dimension::Joy),
                 100.0,
-                "lähettäjä ei saa omaa pulssiaan eikä siten muuta tilaansa"
+                "the sender does not receive its own pulse and so its state does not change"
             );
         }
 

@@ -1,34 +1,34 @@
-//! Config → runtime -silta: [`ModelConfig`] → ajettava [`LlmFailover`].
+//! Config → runtime bridge: [`ModelConfig`] → runnable [`LlmFailover`].
 //!
-//! Tämä moduuli täyttää suunnittelun aukon (recon: *ei* `build_llm_chain`):
-//! konfiguraatiokerroksen [`ModelConfig`]`{primary, fallbacks}`
-//! (`familyclaw-core`) muunnetaan järjestetyksi ketjuksi ajettavia
-//! [`LlmConfig`]-asetuksia (`crate::llm`). Itse mallinimi → endpoint/avain
-//! -kuvaus on **resolverin** vastuulla ([`LlmEndpointResolver`]), jotta
-//! KERROS A (tämä OSS-runko) ei kovakoodaa endpointteja, avaimia eikä
-//! provider-nimiä.
+//! This module fills the design gap (recon: *no* `build_llm_chain`):
+//! the config layer's [`ModelConfig`]`{primary, fallbacks}`
+//! (`familyclaw-core`) is converted into an ordered chain of runnable
+//! [`LlmConfig`] settings (`crate::llm`). The actual model name → endpoint/key
+//! mapping is the **resolver's** responsibility ([`LlmEndpointResolver`]), so
+//! Layer A (this OSS core) does not hardcode endpoints, keys, or
+//! provider names.
 //!
-//! ## Kerrosraja (KERROS A / KERROS B)
-//! - **KERROS A (tämä tiedosto):** trait-raja + ketjun rakennus + failover.
-//!   Ei avaimia, ei endpointteja, ei perheenjäsenten malleja.
-//! - **KERROS B (esim. [`EnvEndpointResolver`]):** kuvaa `"provider/model"`
-//!   -merkkijonon ajettavaksi [`LlmConfig`]:ksi lukien API-avaimet
-//!   ympäristömuuttujista (esim. `OPENCODE_API_KEY`, `DEEPSEEK_API_KEY`).
-//!   [`EnvEndpointResolver`] on geneerinen apuri — se ei tunne perhettä,
-//!   vain provider-prefiksin.
+//! ## Layer boundary (Layer A / Layer B)
+//! - **Layer A (this file):** trait boundary + chain construction + failover.
+//!   No keys, no endpoints, no family-member models.
+//! - **Layer B (e.g. [`EnvEndpointResolver`]):** maps a `"provider/model"`
+//!   string to a runnable [`LlmConfig`], reading API keys
+//!   from environment variables (e.g. `OPENCODE_API_KEY`, `DEEPSEEK_API_KEY`).
+//!   [`EnvEndpointResolver`] is a generic helper — it doesn't know about the
+//!   family, only the provider prefix.
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_agent::llm_chain::{build_llm_chain, EnvEndpointResolver};
 //! use familyclaw_core::ModelConfig;
 //!
-//! // Provider-prefiksit kuvataan endpointteihin; avaimet luetaan env:stä.
+//! // Provider prefixes are mapped to endpoints; keys are read from env.
 //! let resolver = EnvEndpointResolver::new()
 //!     .with_provider("openai", "https://api.openai.com/v1", "OPENAI_API_KEY");
 //! let model = ModelConfig::new("openai/gpt-4o").with_fallback("openai/gpt-4o-mini");
 //!
-//! // Avain voi puuttua testiympäristössä → tyhjä avain on sallittu rakennukseen,
-//! // virhe näkyy vasta varsinaisessa complete()-kutsussa.
+//! // The key may be missing in a test environment → an empty key is allowed at
+//! // build time; the error only surfaces on the actual complete() call.
 //! let chain = build_llm_chain(&model, &resolver).expect("chain builds");
 //! assert_eq!(chain.primary_model(), "openai/gpt-4o");
 //! assert_eq!(chain.len(), 2);
@@ -42,23 +42,24 @@ use familyclaw_core::{FamilyClawError, ModelConfig, Result};
 
 use crate::llm::{CompletionResult, LlmClient, LlmConfig, LlmError, LlmMessage, ToolDefinition};
 
-/// Kello-abstraktio failover-päätöslogiikalle (cooldown-tilakone, KERROS B).
+/// Clock abstraction for failover decision logic (cooldown state machine, Layer B).
 ///
-/// **Miksi trait eikä suora [`familyclaw_core::time::now`]?** Cooldown-päätökset
-/// (`onko tämä entry vielä jäähdyllä?`, `cooled_until = now + ladder[strike]`)
-/// luetaan **vain** tämän rajapinnan kautta, jotta testit voivat askeltaa aikaa
-/// determinisesti ilman `tokio::time::sleep`-odotusta. Tuotannossa
-/// [`SystemClock`] delegoi [`familyclaw_core::time::now`]:hin — se on failover-
-/// polun **ainoa** seinäkellokosketus. Tämä noudattaa olemassa olevaa
-/// koodikannan tapaa (aika injektoidaan, ks. `OrchestratedTurn::now`), ei tuo
-/// uutta kehystä.
+/// **Why a trait instead of calling [`familyclaw_core::time::now`] directly?**
+/// Cooldown decisions
+/// (`is this entry still cooling down?`, `cooled_until = now + ladder[strike]`)
+/// are read **only** through this interface, so tests can step time
+/// deterministically without waiting on `tokio::time::sleep`. In production,
+/// [`SystemClock`] delegates to [`familyclaw_core::time::now`] — it is the
+/// **only** wall-clock touchpoint on the failover path. This follows the
+/// existing codebase convention (time is injected, see `OrchestratedTurn::now`),
+/// it doesn't introduce a new pattern.
 pub trait Clock: Send + Sync {
-    /// Nykyhetki UTC-aikaleimana.
+    /// The current instant as a UTC timestamp.
     fn now(&self) -> Timestamp;
 }
 
-/// Tuotannon kello: delegoi [`familyclaw_core::time::now`]:hin (UTC). Ainoa
-/// seinäkellon luku failover-polulla.
+/// Production clock: delegates to [`familyclaw_core::time::now`] (UTC). The only
+/// wall-clock read on the failover path.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
@@ -68,31 +69,31 @@ impl Clock for SystemClock {
     }
 }
 
-/// Kuvaa mallinimen (`"provider/model"`) ajettavaksi [`LlmConfig`]:ksi.
+/// Maps a model name (`"provider/model"`) to a runnable [`LlmConfig`].
 ///
-/// KERROS B toteuttaa tämän (endpointit + avaimet). KERROS A (ketjun
-/// rakennus) näkee vain trait-rajan, joten OSS-runko pysyy puhtaana
-/// kovakoodatuista endpointeista ja avaimista.
+/// Layer B implements this (endpoints + keys). Layer A (chain construction)
+/// only sees the trait boundary, so the OSS core stays free of hardcoded
+/// endpoints and keys.
 pub trait LlmEndpointResolver: Send + Sync {
-    /// Ratkaisee mallinimen ajettavaksi asetukseksi.
+    /// Resolves the model name to a runnable config.
     ///
     /// # Errors
-    /// [`FamilyClawError::Config`] jos mallinimeä ei voida kuvata
-    /// endpointiksi (esim. tuntematon provider-prefiksi).
+    /// [`FamilyClawError::Config`] if the model name cannot be mapped to an
+    /// endpoint (e.g. unknown provider prefix).
     fn resolve(&self, model_name: &str) -> Result<LlmConfig>;
 
-    /// Ratkaisee mallinimen **provider-identiteetiksi + avain-pooliksi**
-    /// ([`ResolvedEntry`]) cooldown/key-rotation -kerrokselle.
+    /// Resolves the model name to a **provider identity + key pool**
+    /// ([`ResolvedEntry`]) for the cooldown/key-rotation layer.
     ///
-    /// Oletustoteutus delegoi [`resolve`](Self::resolve):lle ja kääräisee
-    /// tuloksen yhden avaimen pooliksi (provider = mallinimen `provider/`-osa,
-    /// avain = ratkaistun configin `api_key`). Näin **olemassa olevat**
-    /// resolverit, jotka toteuttavat vain `resolve`:n, kääntyvät yhä eivätkä
-    /// tarjoa multi-key-rotaatiota. [`EnvEndpointResolver`] **ylikirjoittaa**
-    /// tämän palauttaakseen aidon monen avaimen poolin.
+    /// The default implementation delegates to [`resolve`](Self::resolve) and
+    /// wraps the result into a single-key pool (provider = the model name's
+    /// `provider/` part, key = the resolved config's `api_key`). This way,
+    /// **existing** resolvers that only implement `resolve` still compile,
+    /// but they don't offer multi-key rotation. [`EnvEndpointResolver`]
+    /// **overrides** this to return a genuine multi-key pool.
     ///
     /// # Errors
-    /// Sama kuin [`resolve`](Self::resolve).
+    /// Same as [`resolve`](Self::resolve).
     fn resolve_entry(&self, model_name: &str) -> Result<ResolvedEntry> {
         let cfg = self.resolve(model_name)?;
         let provider = model_name
@@ -108,68 +109,68 @@ pub trait LlmEndpointResolver: Send + Sync {
     }
 }
 
-/// Yhden mallinimen ratkaisu cooldown/rotation-kerrokselle: provider-identiteetti,
-/// ajettava [`LlmConfig`]-pohja (template, `api_key` täytetään poolista) ja
-/// avain-pool (yksi tai useampi env-avain).
+/// Resolution of a single model name for the cooldown/rotation layer:
+/// provider identity, a runnable [`LlmConfig`] base (template, `api_key` is
+/// filled in from the pool), and a key pool (one or more env keys).
 ///
-/// `template.api_key` voi olla mitä tahansa — efektiivinen avain valitaan aina
-/// `keys`-poolista (ks. `ChainEntry`). `keys` ei ole koskaan tyhjä: jos
-/// providerille ei ole avainta, pool on `vec![String::new()]` (tyhjä avain →
-/// virhe näkyy vasta complete():ssa, kuten ennenkin).
+/// `template.api_key` can be anything — the effective key is always chosen
+/// from the `keys` pool (see `ChainEntry`). `keys` is never empty: if the
+/// provider has no key, the pool is `vec![String::new()]` (an empty key →
+/// the error only surfaces in `complete()`, as before).
 #[derive(Debug, Clone)]
 pub struct ResolvedEntry {
-    /// Provider-prefiksi (esim. `"openai"`). Sama prefiksi jaetut entryt
-    /// jäähdytetään yhdessä avain-poolin loputtua (jaettu avain).
+    /// Provider prefix (e.g. `"openai"`). Entries sharing the same prefix are
+    /// cooled down together once the key pool is exhausted (shared key).
     pub provider: String,
-    /// Ajettava asetuspohja (`api_key` korvataan poolin aktiivisella avaimella).
+    /// Runnable config base (`api_key` is replaced with the pool's active key).
     pub template: LlmConfig,
-    /// Avain-pool round-robin-rotaatiolle. Ei koskaan tyhjä.
+    /// Key pool for round-robin rotation. Never empty.
     pub keys: Vec<String>,
 }
 
-/// Geneerinen, env-pohjainen resolveri (KERROS B -apuri).
+/// Generic, env-based resolver (Layer B helper).
 ///
-/// Kuvaa `"provider/model"`-merkkijonon endpointiksi provider-prefiksin
-/// perusteella ja lukee API-avaimen ympäristömuuttujasta. Provider-taulu
-/// rekisteröidään ajonaikaisesti — mitään perhe- tai malliriippuvaista
-/// tietoa ei kovakoodata tähän.
+/// Maps a `"provider/model"` string to an endpoint based on the provider
+/// prefix and reads the API key from an environment variable. The provider
+/// table is registered at runtime — no family- or model-specific data is
+/// hardcoded here.
 ///
-/// Mallinimen muoto: `"<provider>/<model>"`. Esim. `"openai/gpt-4o"` →
-/// provider `"openai"`, malli `"gpt-4o"`. Jos `/`-erotinta ei ole, koko
-/// merkkijonoa käytetään sekä providerin avaimena että mallinimenä.
+/// Model name format: `"<provider>/<model>"`. E.g. `"openai/gpt-4o"` →
+/// provider `"openai"`, model `"gpt-4o"`. If there's no `/` separator, the
+/// whole string is used as both the provider key and the model name.
 #[derive(Debug, Clone, Default)]
 pub struct EnvEndpointResolver {
-    /// provider-prefiksi → (`api_base`, env-muuttujien nimet).
+    /// provider prefix → (`api_base`, env variable names).
     ///
-    /// Avain-env-lista mahdollistaa **key-poolin** per provider: useampi avain
-    /// kierrätetään round-robinilla `AuthFailed`-tilanteessa
-    /// (`ChainEntry`). Yhden avaimen [`with_provider`](Self::with_provider)
-    /// työntää listaan yhden alkion (taaksepäin-yhteensopiva).
+    /// The key-env list enables a **key pool** per provider: multiple keys
+    /// are rotated round-robin on an `AuthFailed` condition
+    /// (`ChainEntry`). The single-key [`with_provider`](Self::with_provider)
+    /// pushes one element onto the list (backwards-compatible).
     providers: HashMap<String, (String, Vec<String>)>,
-    /// Maksimi tokenit per vastaus (välitetään jokaiseen [`LlmConfig`]:iin).
+    /// Max tokens per response (passed to every [`LlmConfig`]).
     max_tokens: Option<u32>,
-    /// Request-timeout (ms) joka asetetaan jokaiseen ratkaistuun
-    /// [`LlmConfig`]:iin (KERROS B -viritys). `None` → [`LlmConfig`]:n oletus
-    /// ([`crate::llm::DEFAULT_REQUEST_TIMEOUT_MS`]) jää voimaan.
+    /// Request timeout (ms) set on every resolved [`LlmConfig`] (F1, Layer B
+    /// tuning). `None` → the [`LlmConfig`] default
+    /// ([`crate::llm::DEFAULT_REQUEST_TIMEOUT_MS`]) stays in effect.
     request_timeout_ms: Option<u64>,
-    /// Connect-timeout (ms) joka asetetaan jokaiseen ratkaistuun
-    /// [`LlmConfig`]:iin. `None` → [`crate::llm::DEFAULT_CONNECT_TIMEOUT_MS`].
+    /// Connect timeout (ms) set on every resolved [`LlmConfig`]. `None` →
+    /// [`crate::llm::DEFAULT_CONNECT_TIMEOUT_MS`].
     connect_timeout_ms: Option<u64>,
 }
 
 impl EnvEndpointResolver {
-    /// Rakentaa tyhjän resolverin ilman provider-kuvauksia.
+    /// Builds an empty resolver without any provider mappings.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Rekisteröi provider-prefiksin: endpoint + env-muuttuja josta avain
-    /// luetaan ajonaikaisesti (builder-tyyli).
+    /// Registers a provider prefix: endpoint + the env variable the key is
+    /// read from at runtime (builder-style).
     ///
-    /// - `prefix` — mallinimen `provider/`-osa, esim. `"openai"`.
-    /// - `api_base` — OpenAI-yhteensopiva base-URL.
-    /// - `key_env` — ympäristömuuttuja, esim. `"OPENAI_API_KEY"`.
+    /// - `prefix` — the model name's `provider/` part, e.g. `"openai"`.
+    /// - `api_base` — OpenAI-compatible base URL.
+    /// - `key_env` — environment variable, e.g. `"OPENAI_API_KEY"`.
     #[must_use]
     pub fn with_provider(
         mut self,
@@ -182,16 +183,16 @@ impl EnvEndpointResolver {
         self
     }
 
-    /// Kuten [`with_provider`](Self::with_provider), mutta rekisteröi **useita**
-    /// avain-env-muuttujia (key-pool). `AuthFailed`-tilanteessa
-    /// cooldown-kerros kierrättää poolin avaimet round-robinilla ennen kuin
-    /// koko provider jäähdytetään (KERROS B). Tyhjä `key_envs` putoaa takaisin
-    /// käytökseen "ei avainta" (yksi tyhjä avain), jotta resolveri ei koskaan
-    /// tuota tyhjää poolia.
+    /// Like [`with_provider`](Self::with_provider), but registers **multiple**
+    /// key env variables (key pool). On an `AuthFailed` condition, the
+    /// cooldown layer rotates the pool's keys round-robin before the whole
+    /// provider is cooled down (Layer B). An empty `key_envs` falls back to
+    /// the "no key" behavior (one empty key), so the resolver never produces
+    /// an empty pool.
     ///
-    /// - `prefix` — mallinimen `provider/`-osa, esim. `"openai"`.
-    /// - `api_base` — OpenAI-yhteensopiva base-URL.
-    /// - `key_envs` — ympäristömuuttujat järjestyksessä, esim.
+    /// - `prefix` — the model name's `provider/` part, e.g. `"openai"`.
+    /// - `api_base` — OpenAI-compatible base URL.
+    /// - `key_envs` — environment variables in order, e.g.
     ///   `["OPENAI_API_KEY_1", "OPENAI_API_KEY_2"]`.
     #[must_use]
     pub fn with_provider_keys(
@@ -210,30 +211,30 @@ impl EnvEndpointResolver {
         self
     }
 
-    /// Asettaa max_tokens-arvon kaikkiin ratkaistuihin asetuksiin.
+    /// Sets the `max_tokens` value on all resolved configs.
     #[must_use]
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
     }
 
-    /// Asettaa request-timeoutin (ms) kaikkiin ratkaistuihin asetuksiin
-    /// (F1, KERROS B -viritys). Ks. [`LlmConfig::with_request_timeout_ms`].
+    /// Sets the request timeout (ms) on all resolved configs
+    /// (F1, Layer B tuning). See [`LlmConfig::with_request_timeout_ms`].
     #[must_use]
     pub fn with_request_timeout_ms(mut self, ms: u64) -> Self {
         self.request_timeout_ms = Some(ms);
         self
     }
 
-    /// Asettaa connect-timeoutin (ms) kaikkiin ratkaistuihin asetuksiin
-    /// (F1, KERROS B -viritys). Ks. [`LlmConfig::with_connect_timeout_ms`].
+    /// Sets the connect timeout (ms) on all resolved configs
+    /// (F1, Layer B tuning). See [`LlmConfig::with_connect_timeout_ms`].
     #[must_use]
     pub fn with_connect_timeout_ms(mut self, ms: u64) -> Self {
         self.connect_timeout_ms = Some(ms);
         self
     }
 
-    /// Pilkkoo mallinimen `(provider, malli)`-pariksi.
+    /// Splits the model name into a `(provider, model)` pair.
     fn split(model_name: &str) -> (&str, &str) {
         match model_name.split_once('/') {
             Some((provider, model)) => (provider, model),
@@ -243,9 +244,9 @@ impl EnvEndpointResolver {
 }
 
 impl EnvEndpointResolver {
-    /// Soveltaa `max_tokens` + timeout -viritykset annettuun configiin (jaettu
-    /// [`resolve`](LlmEndpointResolver::resolve) ja
-    /// [`resolve_entry`](LlmEndpointResolver::resolve_entry) kesken).
+    /// Applies the `max_tokens` + timeout tunings to the given config (shared
+    /// between [`resolve`](LlmEndpointResolver::resolve) and
+    /// [`resolve_entry`](LlmEndpointResolver::resolve_entry)).
     fn apply_tunings(&self, mut cfg: LlmConfig) -> LlmConfig {
         if let Some(max) = self.max_tokens {
             cfg = cfg.with_max_tokens(max);
@@ -266,11 +267,12 @@ impl LlmEndpointResolver for EnvEndpointResolver {
         let (api_base, key_envs) = self.providers.get(provider).ok_or_else(|| {
             FamilyClawError::config(format!("unknown provider prefix for model '{model_name}'"))
         })?;
-        // Avain luetaan ajonaikaisesti env:stä. Puuttuva avain ei estä
-        // ketjun rakennusta (esim. fallback-mallit, joita ei kenties tarvita)
-        // — tyhjä avain päätyy LlmConfigiin ja virhe näkyy vasta complete():ssa.
-        // `resolve` käyttää poolin **ensimmäistä** avainta (taaksepäin-
-        // yhteensopiva yhden avaimen polku); rotaatio elää resolve_entry:ssä.
+        // The key is read from env at runtime. A missing key does not block
+        // chain construction (e.g. fallback models that may not be needed)
+        // — an empty key ends up in the LlmConfig and the error only
+        // surfaces in complete(). `resolve` uses the pool's **first** key
+        // (backwards-compatible single-key path); rotation lives in
+        // resolve_entry.
         let api_key = key_envs
             .first()
             .map(|e| std::env::var(e).unwrap_or_default())
@@ -284,10 +286,10 @@ impl LlmEndpointResolver for EnvEndpointResolver {
         let (api_base, key_envs) = self.providers.get(provider).ok_or_else(|| {
             FamilyClawError::config(format!("unknown provider prefix for model '{model_name}'"))
         })?;
-        // Lue koko avain-pool ajonaikaisesti env:stä. Tyhjä env → tyhjä
-        // merkkijono (virhe näkyy vasta complete():ssa). Pool ei ole koskaan
-        // tyhjä (rekisteröinti takaa ≥1 alkion), joten ChainEntry saa aina
-        // vähintään yhden (mahdollisesti tyhjän) avaimen.
+        // Read the whole key pool from env at runtime. An empty env → an
+        // empty string (the error only surfaces in complete()). The pool is
+        // never empty (registration guarantees ≥1 element), so ChainEntry
+        // always gets at least one (possibly empty) key.
         let keys: Vec<String> = key_envs
             .iter()
             .map(|e| std::env::var(e).unwrap_or_default())
@@ -305,57 +307,59 @@ impl LlmEndpointResolver for EnvEndpointResolver {
     }
 }
 
-/// Yhden ketju-entryn (provider/malli-pari) **terveystila** cooldown-
-/// tilakoneelle.
+/// **Health state** of a single chain entry (provider/model pair) for the
+/// cooldown state machine.
 ///
-/// `cooled_until` = aikaleima johon asti entry on jäähdyllä (`None` = terve).
-/// `strike` = yleinen eskalaatiolaskuri (rate-limit/overload/http/timeout) ja
-/// `auth_strike` = erillinen auth-eskalaatio (avain-poolin loputtua). Molemmat
-/// `saturating_add`-kasvatettuja → ei wraparound-bugia.
+/// `cooled_until` = the timestamp until which the entry is cooling down
+/// (`None` = healthy). `strike` = the general escalation counter
+/// (rate-limit/overload/http/timeout) and `auth_strike` = a separate auth
+/// escalation (once the key pool is exhausted). Both are incremented with
+/// `saturating_add` → no wraparound bug.
 #[derive(Debug, Clone, Default)]
 struct EntryHealth {
-    /// Aikaleima johon asti entry ohitetaan (PASS 1). `None` = terve.
+    /// Timestamp until which the entry is skipped (PASS 1). `None` = healthy.
     cooled_until: Option<Timestamp>,
-    /// Yleinen eskalaatiolaskuri (indeksoi [`LlmFailover::COOLDOWN_LADDER`]).
+    /// General escalation counter (indexes [`LlmFailover::COOLDOWN_LADDER`]).
     strike: u8,
-    /// Auth-eskalaatiolaskuri (indeksoi [`LlmFailover::AUTH_COOLDOWN_LADDER`]),
-    /// käytössä vain kun koko avain-pool on loppuun yritetty.
+    /// Auth escalation counter (indexes [`LlmFailover::AUTH_COOLDOWN_LADDER`]),
+    /// used only once the whole key pool has been tried.
     auth_strike: u8,
 }
 
-/// Yksi ajettava ketju-entry: provider-identiteetti, asetuspohja, avain-pool +
-/// kursori, rakennettu [`LlmClient`] ja [`EntryHealth`].
+/// One runnable chain entry: provider identity, config template, key pool +
+/// cursor, the built [`LlmClient`], and [`EntryHealth`].
 ///
-/// Avain vaihdetaan `AuthFailed`-tilanteessa kasvattamalla `key_cursor`ia
-/// (round-robin) ja rakentamalla `client` uudelleen poolin seuraavalla
-/// avaimella. Kursori **säilyy** `complete()`-kutsujen yli, jotta toimiva avain
-/// ei aina aloita uudelleen poolin alusta.
+/// The key is switched on an `AuthFailed` condition by incrementing
+/// `key_cursor` (round-robin) and rebuilding `client` with the pool's next
+/// key. The cursor **persists** across `complete()` calls, so a working key
+/// doesn't always restart from the beginning of the pool.
 struct ChainEntry {
-    /// Provider-prefiksi (esim. `"openai"`). Sama prefiksi jaetut entryt
-    /// jäähdytetään yhdessä avain-poolin loputtua.
+    /// Provider prefix (e.g. `"openai"`). Entries sharing the same prefix are
+    /// cooled down together once the key pool is exhausted.
     provider: String,
-    /// Asetuspohja (`api_key` korvataan aktiivisella poolin avaimella).
+    /// Config template (`api_key` is replaced with the pool's active key).
     template: LlmConfig,
-    /// Avain-pool (ei koskaan tyhjä).
+    /// Key pool (never empty).
     keys: Vec<String>,
-    /// Aktiivisen avaimen indeksi `keys`-poolissa (säilyy kutsujen yli).
+    /// Index of the active key in the `keys` pool (persists across calls).
     key_cursor: usize,
-    /// Rakennettu klientti aktiivisella avaimella.
+    /// Client built with the active key.
     client: LlmClient,
-    /// Eskalaatio-/cooldown-tila.
+    /// Escalation/cooldown state.
     health: EntryHealth,
 }
 
 impl ChainEntry {
-    /// Rakentaa entryn ratkaistusta [`ResolvedEntry`]:stä. Aloittaa avaimesta
-    /// 0 ja terveestä tilasta.
+    /// Builds an entry from a resolved [`ResolvedEntry`]. Starts at key 0 and
+    /// a healthy state.
     fn from_resolved(resolved: ResolvedEntry) -> Self {
         let ResolvedEntry {
             provider,
             template,
             mut keys,
         } = resolved;
-        // Pool ei saa olla tyhjä — turvaverkko (resolve_entry takaa tämän jo).
+        // The pool must not be empty — a safety net (resolve_entry already
+        // guarantees this).
         if keys.is_empty() {
             keys.push(String::new());
         }
@@ -370,7 +374,8 @@ impl ChainEntry {
         }
     }
 
-    /// Template + avain → ajettava [`LlmConfig`] (avain korvaa templaten kentän).
+    /// Template + key → runnable [`LlmConfig`] (the key replaces the
+    /// template's field).
     fn config_with_key(template: &LlmConfig, api_key: &str) -> LlmConfig {
         let mut cfg = template.clone();
         cfg.api_key.clear();
@@ -378,83 +383,85 @@ impl ChainEntry {
         cfg
     }
 
-    /// Rakentaa [`LlmClient`]:n templatesta annetulla avaimella.
+    /// Builds an [`LlmClient`] from the template with the given key.
     fn build_client(template: &LlmConfig, api_key: &str) -> LlmClient {
         LlmClient::new(Self::config_with_key(template, api_key))
     }
 
-    /// Vaihtaa aktiiviseen avaimeen `idx` ja rakentaa klientin uudelleen.
+    /// Switches to the active key `idx` and rebuilds the client.
     fn switch_to_key(&mut self, idx: usize) {
         self.key_cursor = idx;
         self.client = Self::build_client(&self.template, &self.keys[self.key_cursor]);
     }
 
-    /// Efektiivinen ajettava asetus (template + aktiivinen avain).
+    /// Effective runnable config (template + active key).
     fn effective_config(&self) -> LlmConfig {
         Self::config_with_key(&self.template, &self.keys[self.key_cursor])
     }
 
-    /// Nollaa terveystilan onnistuneen kutsun jälkeen (toimiva avain todistaa
-    /// providerin elossa).
+    /// Resets the health state after a successful call (a working key proves
+    /// the provider is alive).
     fn mark_healthy(&mut self) {
         self.health = EntryHealth::default();
     }
 }
 
-/// Failover-tilakoneen muuttuva osa: ketju-entryt. Kaikki mutatoitava tila elää
-/// täällä [`std::sync::Mutex`]:n takana.
+/// Mutable part of the failover state machine: chain entries. All mutable
+/// state lives here behind [`std::sync::Mutex`].
 struct FailoverState {
     entries: Vec<ChainEntry>,
 }
 
-/// Päätös epäonnistuneen entry-yrityksen jälkeen (ei sisällä Ok-arvoa, jotta
-/// se on geneerinen-vapaa ja jaettu `complete`/`complete_with_tools` kesken).
+/// Decision after a failed entry attempt (does not hold an Ok value, so it
+/// stays generic-free and is shared between `complete`/`complete_with_tools`).
 enum FailureStep {
-    /// Entry epäonnistui retryable-virheellä → jatka seuraavaan entryyn.
+    /// The entry failed with a retryable error → move on to the next entry.
     NextEntry(LlmError),
-    /// Avain vaihdettiin (`AuthFailed`, pool ei vielä loppu) → yritä SAMA entry
-    /// uudelleen heti.
+    /// The key was switched (`AuthFailed`, pool not yet exhausted) → retry the
+    /// SAME entry immediately.
     RetrySameEntry,
-    /// Ei-retryable virhe → palauta heti (älä jauha ketjua).
+    /// Non-retryable error → return immediately (don't grind through the
+    /// chain).
     Fatal(LlmError),
 }
 
-/// Lopputulos yhden entryn yrityksestä: onnistui (arvo `T`), vai virhe-askel.
+/// Outcome of a single entry attempt: succeeded (value `T`), or an error step.
 enum Attempt<T> {
-    /// Kutsu onnistui.
+    /// The call succeeded.
     Ok(T),
-    /// Epäonnistui — seuraava askel.
+    /// Failed — next step.
     Failure(FailureStep),
 }
 
-/// Järjestetty failover-ketju **cooldown-tilakoneella ja key-pool-rotaatiolla**.
+/// An ordered failover chain **with a cooldown state machine and key-pool
+/// rotation**.
 ///
-/// Rakennetaan [`ModelConfig`]:sta [`build_llm_chain`]illa: ensin `primary`,
-/// sitten `fallbacks` järjestyksessä ([`ModelConfig::preference_order`]).
-/// [`complete`](LlmFailover::complete) yrittää jokaista **tervettä** entryä
-/// järjestyksessä; jäähdyllä olevat ohitetaan (PASS 1). Jos mikään terve entry
-/// ei vastaa, **viimeisenä keinona** (PASS 2) yritetään jokaista entryä
-/// jäähdystä välittämättä — perhe ei jää koskaan ilman vastausta vaikka kaikki
-/// ilmaismallit jäähtyisivät yhtä aikaa.
+/// Built from a [`ModelConfig`] via [`build_llm_chain`]: first `primary`,
+/// then `fallbacks` in order ([`ModelConfig::preference_order`]).
+/// [`complete`](LlmFailover::complete) tries every **healthy** entry in
+/// order; entries that are cooling down are skipped (PASS 1). If no healthy
+/// entry responds, **as a last resort** (PASS 2) every entry is tried
+/// regardless of cooldown — the family never goes without an answer even if
+/// all free models cool down at the same time.
 ///
 /// ## Interior mutability
-/// `complete()` pysyy `&self`:nä (taaksepäin-yhteensopiva); kaikki muuttuva tila
-/// (cooldown, kursori) elää [`Mutex`]:n takana. Lukko pidetään **vain**
-/// synkronisten luku-/kirjoitusaskelten ajan (lue cooldown / kirjaa virhe /
-/// vaihda avain / kloonaa klientti-kahva) — **ei koskaan** `.await`:n yli.
+/// `complete()` remains `&self` (backwards-compatible); all mutable state
+/// (cooldown, cursor) lives behind a [`Mutex`]. The lock is held **only**
+/// for the duration of synchronous read/write steps (read cooldown / record
+/// error / switch key / clone client handle) — **never** across an `.await`.
 pub struct LlmFailover {
     state: Mutex<FailoverState>,
-    /// Primary-mallin nimi (`preference_order`in ensimmäinen), raportointiin.
+    /// Primary model name (first in `preference_order`), for reporting.
     primary: String,
-    /// Päätöslogiikan kello (oletus [`SystemClock`]). Testit injektoivat fake-
-    /// kellon [`with_clock`](Self::with_clock):lla.
+    /// Clock for decision logic (default [`SystemClock`]). Tests inject a
+    /// fake clock via [`with_clock`](Self::with_clock).
     clock: Arc<dyn Clock>,
 }
 
 impl LlmFailover {
-    /// Yleinen eskalaatioporras (rate-limit/overload/http/timeout/nocontent),
-    /// indeksoitu `strike`illä kasvatuksen JÄLKEEN, saturoiden viimeiseen
-    /// ämpäriin: strike 1→60 s, 2→5 min, 3→25 min, 4+→1 h.
+    /// General escalation rung (rate-limit/overload/http/timeout/nocontent),
+    /// indexed by `strike` AFTER incrementing, saturating at the last bucket:
+    /// strike 1→60 s, 2→5 min, 3→25 min, 4+→1 h.
     const COOLDOWN_LADDER: [std::time::Duration; 4] = [
         std::time::Duration::from_secs(60),
         std::time::Duration::from_secs(300),
@@ -462,8 +469,8 @@ impl LlmFailover {
         std::time::Duration::from_secs(3_600),
     ];
 
-    /// Pidempi auth-porras (avain peruttu / laskutus loppu — toipuu hitaasti).
-    /// Saavutetaan vasta kun koko avain-pool on loppuun yritetty: 5 min / 30 min
+    /// Longer auth rung (key revoked / billing exhausted — recovers slowly).
+    /// Only reached once the whole key pool has been exhausted: 5 min / 30 min
     /// / 2 h / 6 h.
     const AUTH_COOLDOWN_LADDER: [std::time::Duration; 4] = [
         std::time::Duration::from_secs(300),
@@ -472,13 +479,13 @@ impl LlmFailover {
         std::time::Duration::from_secs(21_600),
     ];
 
-    /// Rakentaa **yhden klientin** failover-ketjun (pituus 1) valmiista
-    /// [`LlmConfig`]:sta — taaksepäin-yhteensopiva silta yhden mallin
-    /// tapaukselle ([`Agent::new`](crate::Agent::new) kääräisee tähän, kun
-    /// sille annetaan `Some(LlmConfig)`). Käyttäytyy täsmälleen kuin suora
-    /// `LlmClient::new(cfg)`-kutsu, mutta [`complete`](LlmFailover::complete)
-    /// kulkee saman failover-rajapinnan läpi (ketjun pituus 1 = ei fallbackeja,
-    /// avain-pool yksi alkio).
+    /// Builds a **single-client** failover chain (length 1) from a ready
+    /// [`LlmConfig`] — a backwards-compatible bridge for the single-model
+    /// case ([`Agent::new`](crate::Agent::new) wraps this when given
+    /// `Some(LlmConfig)`). Behaves exactly like a direct
+    /// `LlmClient::new(cfg)` call, but [`complete`](LlmFailover::complete)
+    /// goes through the same failover interface (chain length 1 = no
+    /// fallbacks, key pool of one element).
     #[must_use]
     pub fn single(cfg: LlmConfig) -> Self {
         let primary = cfg.model.clone();
@@ -502,21 +509,23 @@ impl LlmFailover {
         }
     }
 
-    /// Vaihtaa päätöskellon (testibuilder). Tuotanto käyttää [`SystemClock`]:ia.
+    /// Switches the decision clock (test builder). Production uses
+    /// [`SystemClock`].
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
     }
 
-    /// Laskee cooldown-keston yleiselle (ei-auth) retryable-virheelle
-    /// `strike`-arvon (kasvatuksen JÄLKEEN) perusteella. Saturoi
-    /// [`COOLDOWN_LADDER`](Self::COOLDOWN_LADDER):n viimeiseen ämpäriin.
+    /// Computes the cooldown duration for a general (non-auth) retryable
+    /// error based on the `strike` value (AFTER incrementing). Saturates at
+    /// [`COOLDOWN_LADDER`](Self::COOLDOWN_LADDER)'s last bucket.
     ///
-    /// - `RateLimited`: `max(cooldown_hint, ladder[strike])` — provider-vihjettä
-    ///   (esim. `Retry-After`) **kunnioitetaan lattiana** kun se ylittää portaan,
-    ///   mutta valehteleva `retry_after:1` ei estä eskalaatiota toiston myötä.
-    /// - `Overloaded`: `max(cooldown_hint, ladder[strike])` (hint = 2 s oletus).
+    /// - `RateLimited`: `max(cooldown_hint, ladder[strike])` — a provider hint
+    ///   (e.g. `Retry-After`) **is honored as a floor** when it exceeds the
+    ///   rung, but a lying `retry_after:1` doesn't prevent escalation over
+    ///   repeated attempts.
+    /// - `Overloaded`: `max(cooldown_hint, ladder[strike])` (hint = 2 s default).
     /// - `Http`/`Timeout`/`NoContent`: `ladder[strike]`.
     fn general_cooldown(err: &LlmError, strike: u8) -> std::time::Duration {
         let rung = Self::ladder_at(&Self::COOLDOWN_LADDER, strike);
@@ -526,31 +535,31 @@ impl LlmFailover {
         }
     }
 
-    /// Indeksoi portaan saturoiden (strike on 1-pohjainen kasvatuksen jälkeen →
-    /// indeksi `strike-1`, viimeiseen ämpäriin asti). `strike == 0` → ensimmäinen.
+    /// Indexes the rung with saturation (strike is 1-based after incrementing
+    /// → index `strike-1`, up to the last bucket). `strike == 0` → the first.
     fn ladder_at(ladder: &[std::time::Duration; 4], strike: u8) -> std::time::Duration {
         let idx = (strike.saturating_sub(1) as usize).min(ladder.len() - 1);
         ladder[idx]
     }
 
-    /// Kuvaa [`std::time::Duration`]:n [`chrono::Duration`]:ksi cooldown-
-    /// aritmetiikkaa varten. Ylivuoto (epätodennäköistä portaiden kanssa)
-    /// kuvautuu maksimiin → entry pysyy pitkään jäähdyllä, ei paniikkia.
+    /// Converts a [`std::time::Duration`] to [`chrono::Duration`] for cooldown
+    /// arithmetic. An overflow (unlikely with the rungs) maps to the maximum
+    /// → the entry stays cooling down for a long time, no panic.
     fn chrono_dur(d: std::time::Duration) -> chrono::Duration {
         chrono::Duration::from_std(d).unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX / 1000))
     }
 
-    /// Onko entry juuri nyt jäähdyllä (PASS 1 ohittaa nämä)?
+    /// Is the entry cooling down right now (PASS 1 skips these)?
     fn is_cooled(now: Timestamp, health: &EntryHealth) -> bool {
         health.cooled_until.is_some_and(|until| until > now)
     }
 
-    /// Yrittää **yhtä** entryä `complete`/`complete_with_tools`-kutsulla.
-    /// Lukko on jo VAPAUTETTU ennen tätä; tämä ottaa lukon vain
-    /// avaimen-vaihdon / virheen-kirjauksen ajaksi.
+    /// Tries **one** entry with a `complete`/`complete_with_tools` call. The
+    /// lock is already RELEASED before this; this only takes the lock for the
+    /// duration of the key switch / error recording.
     ///
-    /// `tried_keys` seuraa per-invocation kierretyt avaimet (täysi lap →
-    /// pool loppu → jäähdytä provider).
+    /// `tried_keys` tracks the keys cycled through per invocation (a full lap
+    /// → pool exhausted → cool down the provider).
     async fn try_entry_complete(
         &self,
         idx: usize,
@@ -567,7 +576,7 @@ impl LlmFailover {
         }
     }
 
-    /// Kuten [`try_entry_complete`](Self::try_entry_complete) mutta tool-calleilla.
+    /// Like [`try_entry_complete`](Self::try_entry_complete) but with tool calls.
     async fn try_entry_complete_with_tools(
         &self,
         idx: usize,
@@ -589,7 +598,7 @@ impl LlmFailover {
         }
     }
 
-    /// Nollaa entryn terveystilan onnistuneen kutsun jälkeen (lukon alla).
+    /// Resets the entry's health state after a successful call (under lock).
     fn record_success(&self, idx: usize) {
         if let Ok(mut state) = self.state.lock() {
             if let Some(entry) = state.entries.get_mut(idx) {
@@ -598,22 +607,23 @@ impl LlmFailover {
         }
     }
 
-    /// Kirjaa entryn epäonnistumisen lukon alla ja päättää seuraavan askeleen:
-    /// vaihda avain (retry sama), jäähdytä provider, jäähdytä entry (jatka), tai
-    /// fatal (ei-retryable). Ei `.await`:a — lukko vapautuu palautuksessa.
+    /// Records the entry's failure under lock and decides the next step:
+    /// switch key (retry same), cool down provider, cool down entry
+    /// (continue), or fatal (non-retryable). No `.await` — the lock is
+    /// released on return.
     fn record_failure(
         &self,
         idx: usize,
         err: LlmError,
         tried_keys: &mut std::collections::BTreeSet<usize>,
     ) -> FailureStep {
-        // Ei-retryable → fatal heti, ilman tilamuutosta.
+        // Non-retryable → fatal immediately, without changing state.
         if !err.is_retryable() {
             return FailureStep::Fatal(err);
         }
         let now = self.clock.now();
         let Ok(mut state) = self.state.lock() else {
-            // Myrkytetty lukko: kohtele kuten "kokeile seuraavaa" — ei paniikkia.
+            // Poisoned lock: treat like "try the next one" — no panic.
             return FailureStep::NextEntry(err);
         };
         let Some(entry) = state.entries.get_mut(idx) else {
@@ -622,21 +632,21 @@ impl LlmFailover {
 
         if matches!(err, LlmError::AuthFailed(_)) {
             tried_keys.insert(entry.key_cursor);
-            // Onko poolissa avain jota EI vielä yritetty tällä kutsulla?
+            // Is there a key in the pool that has NOT yet been tried this call?
             let next = (0..entry.keys.len()).find(|k| !tried_keys.contains(k));
             if let Some(next_idx) = next {
-                // Vaihda avaimeen ja yritä SAMA entry uudelleen heti.
-                // Kuollut avain ei kerro mitään mallin elinkelpoisuudesta.
+                // Switch to the key and retry the SAME entry immediately.
+                // A dead key says nothing about the model's viability.
                 entry.switch_to_key(next_idx);
                 FailureStep::RetrySameEntry
             } else {
-                // Koko pool yritetty → jäähdytä KOKO provider (jaettu avain).
+                // Whole pool tried → cool down the WHOLE provider (shared key).
                 let provider = entry.provider.clone();
                 Self::cool_provider(&mut state, &provider, now);
                 FailureStep::NextEntry(err)
             }
         } else {
-            // Yleinen retryable → eskaloiva backoff tälle entrylle.
+            // General retryable → escalating backoff for this entry.
             entry.health.strike = entry.health.strike.saturating_add(1);
             let dur = Self::general_cooldown(&err, entry.health.strike);
             entry.health.cooled_until = Some(now + Self::chrono_dur(dur));
@@ -644,9 +654,9 @@ impl LlmFailover {
         }
     }
 
-    /// Jäähdyttää KAIKKI annettua provideria jakavat entryt auth-portaalla
-    /// (jaettu avain → yksi kuollut avain tappaa kaikki sen mallit). Kasvattaa
-    /// `auth_strike`in ja asettaa `cooled_until`in.
+    /// Cools down ALL entries sharing the given provider on the auth rung
+    /// (shared key → one dead key kills all its models). Increments
+    /// `auth_strike` and sets `cooled_until`.
     fn cool_provider(state: &mut FailoverState, provider: &str, now: Timestamp) {
         for entry in state.entries.iter_mut().filter(|e| e.provider == provider) {
             entry.health.auth_strike = entry.health.auth_strike.saturating_add(1);
@@ -655,21 +665,21 @@ impl LlmFailover {
         }
     }
 
-    /// Snapshot yhden entryn (idx, klientti-kahva) **terveistä** entryistä
-    /// järjestyksessä, lukon alla. Kloonaa vain klientti-kahvan (`reqwest::Client`
-    /// = halpa Arc-klooni) jotta `.await` tapahtuu lukon ulkopuolella.
+    /// Snapshot of (idx, client handle) pairs for the **healthy** entries in
+    /// order, under lock. Only clones the client handle (`reqwest::Client`
+    /// = a cheap Arc clone) so `.await` happens outside the lock.
     fn healthy_clients(&self, now: Timestamp) -> Vec<(usize, LlmClient)> {
         self.snapshot_clients(now, true)
     }
 
-    /// Kuten [`healthy_clients`](Self::healthy_clients) mutta KAIKKI entryt
-    /// (PASS 2, viimeinen keino — jäähdystä ei huomioida).
+    /// Like [`healthy_clients`](Self::healthy_clients) but ALL entries
+    /// (PASS 2, last resort — cooldown is ignored).
     fn all_clients(&self) -> Vec<(usize, LlmClient)> {
         self.snapshot_clients(self.clock.now(), false)
     }
 
-    /// Kerää (idx, kloonattu klientti-kahva) -parit. `only_healthy=true` →
-    /// ohita jäähdyllä olevat.
+    /// Collects (idx, cloned client handle) pairs. `only_healthy=true` →
+    /// skip entries that are cooling down.
     fn snapshot_clients(&self, now: Timestamp, only_healthy: bool) -> Vec<(usize, LlmClient)> {
         let Ok(state) = self.state.lock() else {
             return Vec::new();
@@ -683,33 +693,34 @@ impl LlmFailover {
             .collect()
     }
 
-    /// Kloonaa entryn aktiivisen klientti-kahvan indeksillä (lukon alla).
-    /// `None` jos entry on poistunut. Käytetään avaimen-vaihto-retryssä.
+    /// Clones the entry's active client handle by index (under lock).
+    /// `None` if the entry has been removed. Used in the key-switch retry.
     fn client_at(&self, idx: usize) -> Option<LlmClient> {
         let state = self.state.lock().ok()?;
         state.entries.get(idx).map(|e| e.client.clone())
     }
 
-    /// Yrittää `complete()`:ä cooldown-tietoisesti: PASS 1 terveet entryt
-    /// (jäähdyllä olevat ohitetaan), PASS 2 viimeisenä keinona kaikki entryt.
-    /// Avain-rotaatio `AuthFailed`-tilanteessa, eskaloiva backoff muille
-    /// retryable-virheille. Palauttaa viimeisen virheen jos kaikki epäonnistuvat.
+    /// Tries `complete()` in a cooldown-aware way: PASS 1 healthy entries
+    /// (entries cooling down are skipped), PASS 2 tries all entries as a last
+    /// resort. Key rotation on an `AuthFailed` condition, escalating backoff
+    /// for other retryable errors. Returns the last error if all attempts fail.
     ///
-    /// **F1 — retryable-semantiikka säilyy:** ei-retryable virhe (esim. parse)
-    /// palautetaan **välittömästi**. Cooldown-kerros lisää tähän: jäähdyllä
-    /// oleva entry ohitetaan PASS 1:ssä, mutta PASS 2 takaa ettei perhe jää
-    /// ilman vastausta vaikka kaikki entryt olisivat jäähdyllä.
+    /// **F1 — retryable semantics are preserved:** a non-retryable error
+    /// (e.g. parse) is returned **immediately**. The cooldown layer adds to
+    /// this: an entry that is cooling down is skipped in PASS 1, but PASS 2
+    /// guarantees the family never goes without an answer even if every
+    /// entry is cooling down.
     ///
     /// # Errors
-    /// Viimeisin [`LlmError`] jos kaikki ketjun entryt epäonnistuvat (tai
-    /// ensimmäinen ei-retryable virhe), tai [`LlmError::NoContent`] jos ketju on
-    /// tyhjä.
+    /// The last [`LlmError`] if all chain entries fail (or the first
+    /// non-retryable error), or [`LlmError::NoContent`] if the chain is
+    /// empty.
     pub async fn complete(&self, messages: &[LlmMessage]) -> std::result::Result<String, LlmError> {
         let mut last_err: Option<LlmError> = None;
 
-        // PASS 1: terveet entryt (jäähdyllä olevat ohitetaan). Snapshot otetaan
-        // nyt; PASS 2:n snapshot otetaan VASTA PASS 1:n jälkeen jotta se näkee
-        // PASS 1:n avain-vaihdot.
+        // PASS 1: healthy entries (entries cooling down are skipped). The
+        // snapshot is taken now; PASS 2's snapshot is taken only AFTER PASS 1
+        // so it sees PASS 1's key switches.
         for (idx, mut client) in self.healthy_clients(self.clock.now()) {
             let mut tried_keys = std::collections::BTreeSet::new();
             loop {
@@ -731,8 +742,9 @@ impl LlmFailover {
             }
         }
 
-        // PASS 2 (viimeinen keino): kaikki entryt, jäähdystä välittämättä —
-        // perhe ei jää koskaan ilman vastausta vaikka kaikki entryt jäähtyisivät.
+        // PASS 2 (last resort): all entries, ignoring cooldown —
+        // the family never goes without an answer even if every entry cools
+        // down.
         for (idx, mut client) in self.all_clients() {
             let mut tried_keys = std::collections::BTreeSet::new();
             loop {
@@ -757,10 +769,10 @@ impl LlmFailover {
         Err(last_err.unwrap_or(LlmError::NoContent))
     }
 
-    /// Kuten [`complete`](Self::complete), mutta SSE-striimauksella.
+    /// Like [`complete`](Self::complete), but with SSE streaming.
     ///
     /// # Errors
-    /// Viimeisin [`LlmError`] jos kaikki ketjun entryt epäonnistuvat.
+    /// The last [`LlmError`] if all chain entries fail.
     pub async fn complete_stream(
         &self,
         messages: &[LlmMessage],
@@ -798,14 +810,14 @@ impl LlmFailover {
         Err(last_err.unwrap_or(LlmError::NoContent))
     }
 
-    /// Kuten [`complete`](Self::complete), mutta mainostaa `tools`-työkalut ja
-    /// palauttaa [`CompletionResult`]:n (teksti + mahdolliset tool-callit).
-    /// Sama cooldown/rotation-logiikka (PASS 1 terveet, PASS 2 viimeinen keino).
+    /// Like [`complete`](Self::complete), but advertises the `tools` and
+    /// returns a [`CompletionResult`] (text + possible tool calls). Same
+    /// cooldown/rotation logic (PASS 1 healthy, PASS 2 last resort).
     ///
     /// # Errors
-    /// Viimeisin [`LlmError`] jos kaikki ketjun entryt epäonnistuvat (tai
-    /// ensimmäinen ei-retryable virhe), tai [`LlmError::NoContent`] jos ketju on
-    /// tyhjä.
+    /// The last [`LlmError`] if all chain entries fail (or the first
+    /// non-retryable error), or [`LlmError::NoContent`] if the chain is
+    /// empty.
     pub async fn complete_with_tools(
         &self,
         messages: &[LlmMessage],
@@ -823,7 +835,7 @@ impl LlmFailover {
     ) -> std::result::Result<CompletionResult, LlmError> {
         let mut last_err: Option<LlmError> = None;
 
-        // PASS 1: terveet entryt.
+        // PASS 1: healthy entries.
         for (idx, mut client) in self.healthy_clients(self.clock.now()) {
             let mut tried_keys = std::collections::BTreeSet::new();
             loop {
@@ -852,7 +864,7 @@ impl LlmFailover {
             }
         }
 
-        // PASS 2 (viimeinen keino): kaikki entryt, jäähdystä välittämättä.
+        // PASS 2 (last resort): all entries, ignoring cooldown.
         for (idx, mut client) in self.all_clients() {
             let mut tried_keys = std::collections::BTreeSet::new();
             loop {
@@ -884,26 +896,26 @@ impl LlmFailover {
         Err(last_err.unwrap_or(LlmError::NoContent))
     }
 
-    /// Primary-mallin nimi (`preference_order`in ensimmäinen).
+    /// Primary model name (first in `preference_order`).
     #[must_use]
     pub fn primary_model(&self) -> &str {
         &self.primary
     }
 
-    /// Ketjun pituus (primary + onnistuneesti ratkaistut fallbackit).
+    /// Chain length (primary + successfully resolved fallbacks).
     #[must_use]
     pub fn len(&self) -> usize {
         self.state.lock().map_or(0, |s| s.entries.len())
     }
 
-    /// Onko ketju tyhjä.
+    /// Whether the chain is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Primary-entryn efektiivinen ajettava asetus (template + aktiivinen
-    /// avain). `None` jos ketju on tyhjä.
+    /// The primary entry's effective runnable config (template + active
+    /// key). `None` if the chain is empty.
     #[must_use]
     pub fn primary_config(&self) -> Option<LlmConfig> {
         let state = self.state.lock().ok()?;
@@ -911,16 +923,16 @@ impl LlmFailover {
     }
 }
 
-/// Rakentaa failover-ketjun [`ModelConfig`]:sta resolverin avulla.
+/// Builds a failover chain from a [`ModelConfig`] using a resolver.
 ///
-/// Iteroi [`ModelConfig::preference_order`]in (primary → fallbacks) ja
-/// ratkaisee jokaisen mallinimen [`LlmConfig`]:ksi resolverilla. Mallit, joita
-/// resolveri ei tunne, **ohitetaan** (eivät kaada koko ketjua) — näin yksi
-/// kelvoton fallback ei estä toimivaa primaryä.
+/// Iterates [`ModelConfig::preference_order`] (primary → fallbacks) and
+/// resolves each model name to an [`LlmConfig`] via the resolver. Models the
+/// resolver doesn't know are **skipped** (they don't bring down the whole
+/// chain) — this way, one invalid fallback doesn't block a working primary.
 ///
 /// # Errors
-/// [`FamilyClawError::Config`] jos `primary` on tyhjä tai jos **yksikään**
-/// malli `preference_order`issa ei ratkennut (tyhjä ketju on kelvoton).
+/// [`FamilyClawError::Config`] if `primary` is empty or if **none** of the
+/// models in `preference_order` resolved (an empty chain is invalid).
 pub fn build_llm_chain(
     cfg: &ModelConfig,
     resolver: &dyn LlmEndpointResolver,
@@ -928,13 +940,13 @@ pub fn build_llm_chain(
     build_llm_chain_with_clock(cfg, resolver, Arc::new(SystemClock))
 }
 
-/// Kuten [`build_llm_chain`], mutta injektoi cooldown-tilakoneen **kellon**
-/// (testikäyttö). Tuotanto käyttää [`build_llm_chain`]:ia joka antaa
-/// [`SystemClock`]:n. Testit antavat fake-kellon askeltaakseen cooldown-ikkunan
-/// yli ilman `tokio::time::sleep`-odotusta.
+/// Like [`build_llm_chain`], but injects the cooldown state machine's
+/// **clock** (test use). Production uses [`build_llm_chain`], which supplies
+/// [`SystemClock`]. Tests supply a fake clock to step past the cooldown
+/// window without waiting on `tokio::time::sleep`.
 ///
 /// # Errors
-/// Sama kuin [`build_llm_chain`].
+/// Same as [`build_llm_chain`].
 pub fn build_llm_chain_with_clock(
     cfg: &ModelConfig,
     resolver: &dyn LlmEndpointResolver,
@@ -947,7 +959,7 @@ pub fn build_llm_chain_with_clock(
         match resolver.resolve_entry(model_name) {
             Ok(entry_spec) => entries.push(ChainEntry::from_resolved(entry_spec)),
             Err(e) => {
-                // Ohita tuntematon malli mutta kirjaa syy debug-tasolla.
+                // Skip the unknown model but log the reason at debug level.
                 tracing::debug!(model = model_name, error = %e, "skipping unresolvable model");
             }
         }
@@ -966,18 +978,18 @@ pub fn build_llm_chain_with_clock(
     })
 }
 
-/// Poimii agentin primary-[`LlmConfig`]:n config-kerroksesta — valmis
-/// syötettäväksi [`Agent::new`](crate::Agent::new):lle (joka ottaa
+/// Extracts the agent's primary [`LlmConfig`] from the config layer — ready
+/// to feed into [`Agent::new`](crate::Agent::new) (which takes an
 /// `Option<LlmConfig>`).
 ///
-/// Tämä on kevyt silta TEHTÄVÄ C4:lle: `FamilyConfig` →
-/// (agentti, [`ModelConfig`]) → ajettava primary-asetus. Agentin
-/// julkista konstruktiopintaa ei muuteta — palautetaan vain valmis
-/// `Option<LlmConfig>`, jonka kutsuja antaa eteenpäin.
+/// This is a lightweight bridge for TASK C4: `FamilyConfig` →
+/// (agent, [`ModelConfig`]) → runnable primary config. The agent's
+/// public construction surface is not changed — only a ready-made
+/// `Option<LlmConfig>` is returned, which the caller passes along.
 ///
 /// # Errors
-/// [`FamilyClawError::Config`] jos mallikonfiguraatio on kelvoton tai jos
-/// yksikään malli ei ratkennut endpointiksi.
+/// [`FamilyClawError::Config`] if the model configuration is invalid or if
+/// no model resolved to an endpoint.
 pub fn primary_llm_config(
     model: &ModelConfig,
     resolver: &dyn LlmEndpointResolver,
@@ -993,7 +1005,7 @@ mod tests {
     use super::*;
     use familyclaw_core::{AgentConfig, FamilyConfig};
 
-    /// Resolveri joka tuntee provider-prefiksit ilman env-riippuvuutta.
+    /// Resolver that knows the provider prefixes without an env dependency.
     fn test_resolver() -> EnvEndpointResolver {
         EnvEndpointResolver::new()
             .with_provider("openai", "https://api.openai.com/v1", "OPENAI_API_KEY")
@@ -1062,8 +1074,8 @@ mod tests {
     fn build_chain_errors_when_nothing_resolves() {
         let r = test_resolver();
         let model = ModelConfig::new("mystery/a").with_fallback("mystery/b");
-        // Result<LlmFailover>: LlmFailover ei toteuta Debugia (LlmClient ei),
-        // joten matchataan suoraan ilman expect_err:iä.
+        // Result<LlmFailover>: LlmFailover does not implement Debug (LlmClient
+        // doesn't), so match directly instead of using expect_err.
         match build_llm_chain(&model, &r) {
             Err(FamilyClawError::Config(_)) => {}
             Err(other) => panic!("expected Config error, got {other:?}"),
@@ -1086,8 +1098,8 @@ mod tests {
         assert_eq!(cfg.model, "deepseek-v4-pro");
     }
 
-    /// TEHTÄVÄ C4 -hyväksyntä: `FamilyConfig`-JSON → agentti rakentuu ilman
-    /// paniikkia (primary `LlmConfig` saadaan config-kerroksesta + resolverista).
+    /// TASK C4 acceptance: `FamilyConfig` JSON → the agent builds without a
+    /// panic (primary `LlmConfig` is obtained from the config layer + resolver).
     #[test]
     fn family_json_builds_agent_llm_config_without_panic() {
         let json = r#"{
@@ -1107,19 +1119,20 @@ mod tests {
 
         let agent: &AgentConfig = family.agents.first().expect("one agent");
         let chain = build_llm_chain(&agent.model, &resolver).expect("chain builds");
-        // primary + yksi tunnettu fallback; tuntematon "mystery/" ohitettu.
+        // primary + one known fallback; unknown "mystery/" skipped.
         assert_eq!(chain.len(), 2);
         assert_eq!(chain.primary_model(), "deepseek/deepseek-v4-pro");
 
-        // Valmis primary-asetus, jonka kutsuja antaa Agent::new(Some(cfg)):lle.
+        // Ready-made primary config, which the caller passes to Agent::new(Some(cfg)).
         let primary = primary_llm_config(&agent.model, &resolver).expect("primary config");
         assert_eq!(primary.model, "deepseek-v4-pro");
     }
 
     #[test]
     fn resolver_applies_timeouts_to_resolved_config() {
-        // F1: KERROS B virittää timeoutin → se päätyy ratkaistuun LlmConfigiin
-        // → gateway-tuotantopolku perii sen (build_resolver → resolve → new).
+        // F1: Layer B sets a timeout tuning → it ends up in the resolved
+        // LlmConfig → the gateway production path inherits it
+        // (build_resolver → resolve → new).
         let r = test_resolver()
             .with_request_timeout_ms(7_000)
             .with_connect_timeout_ms(800);
@@ -1130,24 +1143,24 @@ mod tests {
 
     #[test]
     fn resolver_without_timeout_leaves_config_default() {
-        // Ilman viritystä resolveri ei pakota timeoutia → LlmConfigin oletus
-        // (60s/10s LlmClient::new:ssä) jää voimaan.
+        // Without a tuning, the resolver doesn't force a timeout → the
+        // LlmConfig default (60s/10s in LlmClient::new) stays in effect.
         let r = test_resolver();
         let cfg = r.resolve("openai/gpt-4o").expect("resolves");
         assert_eq!(cfg.request_timeout_ms, None);
         assert_eq!(cfg.connect_timeout_ms, None);
     }
 
-    /// F1 retryable-semantiikka yksikkötasolla: ei-retryable virhe palautetaan
-    /// **välittömästi** eikä koko ketjua jauheta. Käytämme tyhjää (mahdotonta
-    /// ratkaista) endpointtia varmistaaksemme rakenteen — varsinainen
-    /// timeout→failover-todiste on runtime-roundtripissä
-    /// (`timeout_primary_fails_over_to_live_fallback`).
+    /// F1 retryable semantics at the unit level: a non-retryable error is
+    /// returned **immediately** and the whole chain is not ground through.
+    /// We use an empty (impossible to resolve) endpoint to verify the
+    /// structure — the actual timeout→failover proof is in the runtime
+    /// roundtrip (`timeout_primary_fails_over_to_live_fallback`).
     #[tokio::test]
     async fn complete_on_empty_chain_path_is_no_content() {
-        // Suora rakennus tyhjällä ketjulla ei ole sallittu rajapinnan kautta,
-        // mutta complete()-semantiikka tyhjälle ketjulle on määritelty:
-        // varmistetaan ettei se paniikkaa.
+        // Direct construction with an empty chain isn't allowed through the
+        // public interface, but complete()'s semantics for an empty chain
+        // are defined: verify it doesn't panic.
         let failover = LlmFailover {
             state: Mutex::new(FailoverState {
                 entries: Vec::new(),
@@ -1180,8 +1193,8 @@ mod cooldown_tests {
         build_llm_chain_with_clock, Clock, EnvEndpointResolver, LlmError, LlmFailover, LlmMessage,
     };
 
-    /// Determinismiä varten ohjattava fake-kello: askelletaan aikaa ilman
-    /// `sleep`-odotusta cooldown-ikkunan yli.
+    /// Controllable fake clock for determinism: time is stepped over the
+    /// cooldown window without waiting on `sleep`.
     struct FixedClock(Mutex<Timestamp>);
 
     impl FixedClock {
@@ -1191,7 +1204,7 @@ mod cooldown_tests {
             )))
         }
 
-        /// Siirtää kelloa eteenpäin annetut sekunnit.
+        /// Advances the clock forward by the given seconds.
         fn advance(&self, secs: i64) {
             let mut t = self.0.lock().expect("clock lock");
             *t += chrono::Duration::seconds(secs);
@@ -1204,12 +1217,12 @@ mod cooldown_tests {
         }
     }
 
-    /// Yhden mallin vastausresepti, valittu pyyntölaskurin (per-portti) tai
-    /// Bearer-avaimen mukaan.
+    /// Response recipe for a single model, chosen by the request counter
+    /// (per port) or by the Bearer key.
     #[derive(Clone)]
     struct Reply {
         status: u16,
-        /// Vastauksen sisältö onnistuneessa tapauksessa (assistant content).
+        /// Response content in the success case (assistant content).
         content: String,
     }
 
@@ -1228,20 +1241,22 @@ mod cooldown_tests {
         }
     }
 
-    /// Pieni HTTP/1.1-mock joka EI vaadi axumia: lukee pyynnön, valitsee
-    /// `Reply`:n ja vastaa. Vastaukset voi ohjata joko pyyntöjärjestyksellä
-    /// (`script`) tai Bearer-avaimen mukaan (`by_key`). Laskee pyynnöt.
+    /// Small HTTP/1.1 mock that does NOT require axum: reads the request,
+    /// picks a `Reply`, and responds. Responses can be steered either by
+    /// request order (`script`) or by the Bearer key (`by_key`). Counts
+    /// requests.
     struct MockLlm {
         base_url: String,
         calls: Arc<AtomicUsize>,
-        /// Avain-kohtaiset pyyntölaskurit (rotaatiotodisteeksi).
+        /// Per-key request counters (proof of rotation).
         key_calls: Arc<Mutex<HashMap<String, usize>>>,
     }
 
     impl MockLlm {
-        /// Käynnistää mockin, joka palauttaa `script[min(call, len-1)]`-vastauksen
-        /// (saturoi viimeiseen). `by_key` (jos `Some`) ohittaa scriptin: vastaus
-        /// valitaan Bearer-tokenin mukaan (puuttuva avain → `default`).
+        /// Starts the mock, which returns the `script[min(call, len-1)]`
+        /// response (saturates at the last one). `by_key` (if `Some`)
+        /// overrides the script: the response is chosen by the Bearer token
+        /// (a missing key → `default`).
         fn spawn(script: Vec<Reply>, by_key: Option<(HashMap<String, Reply>, Reply)>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind to ephemeral port");
             let addr = listener.local_addr().expect("mock local_addr");
@@ -1286,7 +1301,7 @@ mod cooldown_tests {
             by_key: Option<&(HashMap<String, Reply>, Reply)>,
             key_calls: &Arc<Mutex<HashMap<String, usize>>>,
         ) {
-            // Lue request-headerit kunnes tyhjä rivi; poimi Bearer + body-pituus.
+            // Read the request headers until an empty line; extract the Bearer + body length.
             let mut buf = [0_u8; 4096];
             let read = stream.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..read]);
@@ -1346,13 +1361,14 @@ mod cooldown_tests {
         vec![LlmMessage::user("hi")]
     }
 
-    /// Kuvaa typitetyn fake-kellon trait-objektiksi `build_llm_chain_with_clock`:lle
-    /// (Arc<FixedClock> ei auto-coerce Arc<dyn Clock>:ksi argumenttina).
+    /// Coerces the typed fake clock into a trait object for
+    /// `build_llm_chain_with_clock` (Arc<FixedClock> doesn't auto-coerce to
+    /// Arc<dyn Clock> as an argument).
     fn dyn_clock(clock: &Arc<FixedClock>) -> Arc<dyn Clock> {
         Arc::clone(clock) as Arc<dyn Clock>
     }
 
-    /// Rakentaa yhden mallin failoverin annetulla mockilla + fake-kellolla.
+    /// Builds a single-model failover with the given mock + fake clock.
     fn single_model_failover(mock: &MockLlm, clock: &Arc<FixedClock>) -> LlmFailover {
         let resolver = EnvEndpointResolver::new().with_provider(
             "mock",
@@ -1367,9 +1383,9 @@ mod cooldown_tests {
 
     #[tokio::test]
     async fn rate_limited_entry_cools_then_last_resort_retries() {
-        // Yksi malli: 429 ensimmäisellä kutsulla → entry jäähtyy → PASS 2
-        // (viimeinen keino) yrittää saman entryn uudelleen samalla kutsulla.
-        // Toinen mock-kutsu palauttaa 200 → onnistuu.
+        // One model: 429 on the first call → the entry cools down → PASS 2
+        // (last resort) retries the same entry with the same call. The
+        // second mock call returns 200 → succeeds.
         let mock = MockLlm::spawn(vec![Reply::status(429), Reply::ok("recovered")], None);
         let clock = FixedClock::at(1000);
         let failover = single_model_failover(&mock, &clock);
@@ -1379,13 +1395,13 @@ mod cooldown_tests {
             .await
             .expect("last-resort succeeds");
         assert_eq!(out, "recovered");
-        // PASS 1 (429 → cool) + PASS 2 (200) = 2 kutsua.
+        // PASS 1 (429 → cool) + PASS 2 (200) = 2 calls.
         assert_eq!(mock.total_calls(), 2);
     }
 
     #[tokio::test]
     async fn healthy_fallback_used_when_primary_rate_limited() {
-        // Kaksi mallia eri providereilla: primary 429 (jäähtyy), fallback 200.
+        // Two models with different providers: primary 429 (cools down), fallback 200.
         let primary = MockLlm::spawn(vec![Reply::status(429)], None);
         let fallback = MockLlm::spawn(vec![Reply::ok("from-fallback")], None);
         let clock = FixedClock::at(1000);
@@ -1406,9 +1422,10 @@ mod cooldown_tests {
 
     #[tokio::test]
     async fn cooled_entry_skipped_until_clock_advances_past_window() {
-        // 429 (60 s -porras strike 1) → entry jäähtyy 1000..1060.
-        // Kakkoskutsu klo 1030 (yhä jäähdyllä): PASS 1 ohittaa, mutta 200 tulee
-        // PASS 2:sta. Kolmoskutsu klo 1100 (jäähdy ohi): PASS 1 onnistuu suoraan.
+        // 429 (60 s rung, strike 1) → the entry cools down 1000..1060.
+        // Second call at 1030 (still cooling down): PASS 1 skips it, but 200
+        // comes from PASS 2. Third call at 1100 (cooldown over): PASS 1
+        // succeeds directly.
         let mock = MockLlm::spawn(
             vec![Reply::status(429), Reply::ok("a"), Reply::ok("b")],
             None,
@@ -1416,13 +1433,13 @@ mod cooldown_tests {
         let clock = FixedClock::at(1000);
         let failover = single_model_failover(&mock, &clock);
 
-        // Kutsu 1: 429 → cool until 1060, sitten PASS 2 antaa "a".
+        // Call 1: 429 → cool until 1060, then PASS 2 gives "a".
         assert_eq!(failover.complete(&msgs()).await.expect("c1"), "a");
         let after_c1 = mock.total_calls();
         assert!(after_c1 >= 2, "expected 429 + last-resort, got {after_c1}");
 
-        // Onnistunut kutsu nollasi terveyden → seuraava kutsu on terve PASS 1.
-        // Varmista determinismi: askella kello selvästi eteenpäin joka tapauksessa.
+        // The successful call reset the health → the next call is healthy in PASS 1.
+        // Ensure determinism: step the clock clearly forward regardless.
         clock.advance(120);
         let out = failover.complete(&msgs()).await.expect("c2 healthy");
         assert_eq!(out, "b");
@@ -1430,8 +1447,8 @@ mod cooldown_tests {
 
     #[tokio::test]
     async fn last_resort_serves_when_all_entries_cooled() {
-        // Molemmat mallit 429 ensin (molemmat jäähtyvät PASS 1:ssä), sitten 200.
-        // PASS 2 (viimeinen keino) takaa vastauksen vaikka kaikki jäähtyivät.
+        // Both models get 429 first (both cool down in PASS 1), then 200.
+        // PASS 2 (last resort) guarantees an answer even if everything cooled down.
         let a = MockLlm::spawn(vec![Reply::status(429), Reply::ok("a-ok")], None);
         let b = MockLlm::spawn(vec![Reply::status(429), Reply::ok("b-ok")], None);
         let clock = FixedClock::at(1000);
@@ -1442,7 +1459,7 @@ mod cooldown_tests {
         let failover =
             build_llm_chain_with_clock(&model, &resolver, dyn_clock(&clock)).expect("builds");
 
-        // PASS 1: a→429(cool), b→429(cool). PASS 2: a→200 "a-ok".
+        // PASS 1: a→429(cools down), b→429(cools down). PASS 2: a→200 "a-ok".
         let out = failover
             .complete(&msgs())
             .await
@@ -1456,9 +1473,9 @@ mod cooldown_tests {
 
     #[tokio::test]
     async fn auth_failed_rotates_to_next_key_in_pool() {
-        // Avain #1 (env KA1) → 401, avain #2 (env KA2) → 200. Rotaatio kesken
-        // saman complete()-kutsun: kuollut avain ei jäähdytä mallia, vaan
-        // seuraavaa avainta yritetään heti.
+        // Key #1 (env KA1) → 401, key #2 (env KA2) → 200. Rotation happens
+        // within the same complete() call: a dead key doesn't cool down the
+        // model — the next key is tried immediately instead.
         std::env::set_var("FCT_KA1", "dead-key");
         std::env::set_var("FCT_KA2", "good-key");
         let mut by_key = HashMap::new();
@@ -1478,7 +1495,7 @@ mod cooldown_tests {
 
         let out = failover.complete(&msgs()).await.expect("rotation succeeds");
         assert_eq!(out, "rotated-ok");
-        // Molempia avaimia kokeiltiin täsmälleen kerran (rotaatio, ei jäähdytys).
+        // Both keys were tried exactly once (rotation, not cooldown).
         assert_eq!(mock.calls_for_key("dead-key"), 1);
         assert_eq!(mock.calls_for_key("good-key"), 1);
 
@@ -1488,8 +1505,8 @@ mod cooldown_tests {
 
     #[tokio::test]
     async fn provider_exhausted_when_all_keys_auth_fail() {
-        // Molemmat avaimet → 401. Pool loppuu → provider jäähdytetään →
-        // ei loputonta silmukkaa. Lopputulos: virhe (kaikki kuolleet).
+        // Both keys → 401. The pool is exhausted → the provider is cooled
+        // down → no infinite loop. Result: an error (everything dead).
         std::env::set_var("FCT_KB1", "k1");
         std::env::set_var("FCT_KB2", "k2");
         let mock = MockLlm::spawn(Vec::new(), Some((HashMap::new(), Reply::status(401))));
@@ -1509,9 +1526,9 @@ mod cooldown_tests {
             .await
             .expect_err("all keys dead → error, not hang");
         assert!(matches!(err, LlmError::AuthFailed(_)));
-        // Per complete(): PASS 1 kokeilee k1(401)→k2(401)→pool loppu→jäähdytys.
-        // PASS 2 kokeilee uudelleen (jäähdy ohitettu): k1(401)→k2(401)→loppu.
-        // = 4 kutsua, ei enempää (tried-set estää loopin).
+        // Per complete(): PASS 1 tries k1(401)→k2(401)→pool exhausted→cooldown.
+        // PASS 2 tries again (cooldown ignored): k1(401)→k2(401)→exhausted.
+        // = 4 calls, no more (the tried-set prevents a loop).
         assert_eq!(mock.calls_for_key("k1"), 2);
         assert_eq!(mock.calls_for_key("k2"), 2);
 
@@ -1523,7 +1540,7 @@ mod cooldown_tests {
 
     #[test]
     fn general_cooldown_escalates_and_saturates() {
-        // strike 1→60s, 2→300s, 3→1500s, 4→3600s, 5+→3600s (saturoi).
+        // strike 1→60s, 2→300s, 3→1500s, 4→3600s, 5+→3600s (saturates).
         let http = LlmError::Http("x".into());
         assert_eq!(
             LlmFailover::general_cooldown(&http, 1),
@@ -1537,7 +1554,7 @@ mod cooldown_tests {
             LlmFailover::general_cooldown(&http, 4),
             std::time::Duration::from_secs(3_600)
         );
-        // Saturoi viimeiseen ämpäriin (ei wraparound u8:lla).
+        // Saturates at the last bucket (no wraparound with u8).
         assert_eq!(
             LlmFailover::general_cooldown(&http, 250),
             std::time::Duration::from_secs(3_600)
@@ -1546,7 +1563,7 @@ mod cooldown_tests {
 
     #[test]
     fn rate_limited_honors_retry_after_as_floor() {
-        // retry_after 600 s > strike-1 porras (60 s) → lattiana 600 s.
+        // retry_after 600 s > strike-1 rung (60 s) → 600 s as the floor.
         let big = LlmError::RateLimited {
             message: "429".into(),
             retry_after: Some(600),
@@ -1555,8 +1572,8 @@ mod cooldown_tests {
             LlmFailover::general_cooldown(&big, 1),
             std::time::Duration::from_secs(600)
         );
-        // retry_after 1 s < porras 60 s → porras voittaa (provider ei voi
-        // valehdella pois eskalaatiosta).
+        // retry_after 1 s < rung 60 s → the rung wins (a provider can't lie
+        // its way out of escalation).
         let tiny = LlmError::RateLimited {
             message: "429".into(),
             retry_after: Some(1),
@@ -1585,9 +1602,9 @@ mod cooldown_tests {
 
     #[tokio::test]
     async fn retryable_http_error_grinds_pass1_and_pass2_then_returns_last() {
-        // 418 → Http (retryable, ei tarkkaa luokkaa) → PASS 1 jäähdyttää, PASS 2
-        // (viimeinen keino) yrittää uudelleen = 2 kutsua, sitten viimeinen virhe
-        // palautetaan. Todistaa että retryable EI ole fatal ja PASS 2 ajetaan.
+        // 418 → Http (retryable, no exact class) → PASS 1 cools it down, PASS 2
+        // (last resort) retries = 2 calls, then the last error is returned.
+        // Proves that retryable is NOT fatal and PASS 2 does run.
         let mock = MockLlm::spawn(vec![Reply::status(418)], None);
         let clock = FixedClock::at(1000);
         let failover = single_model_failover(&mock, &clock);
@@ -1598,8 +1615,8 @@ mod cooldown_tests {
 
     #[test]
     fn success_resets_health_via_primary_config_roundtrip() {
-        // Rakenteellinen tarkistus: primary_config palauttaa efektiivisen
-        // avaimen poolista (ei tyhjää templatea).
+        // Structural check: primary_config returns the effective key from
+        // the pool (not an empty template).
         std::env::set_var("FCT_PCFG", "live-key-xyz");
         let resolver = EnvEndpointResolver::new().with_provider_keys(
             "mock",

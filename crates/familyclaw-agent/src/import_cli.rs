@@ -1,44 +1,42 @@
-//! `familyclaw import` — `OpenClaw` / `Hermes` -migraatiotyökalu ("replacement path").
+//! `familyclaw import` — `OpenClaw` / `Hermes` migration tool ("replacement path").
 //!
-//! Tämä moduuli toteuttaa `familyclaw`-binäärin `import`-alikomennon: se lukee
-//! toisen agenttiajoympäristön (`OpenClaw` tai `Hermes`) **viennin** (export) ja
-//! muuntaa sen `FamilyClaw`'n omaan esitykseen — **turvallisesti ja rehellisesti**.
+//! This module implements the `import` subcommand of the `familyclaw` binary: it
+//! reads the **export** of another agent runtime (`OpenClaw` or `Hermes`) and
+//! converts it into `FamilyClaw`'s own representation — **safely and honestly**.
 //!
 //! ```text
 //! familyclaw import --from openclaw|hermes --input <path> [--out <dir>] [--json]
 //! ```
 //!
-//! ## Miksi tämä on turvallisuusherkkä
-//! Tuotu data on **epäluotettavaa syötettä toisesta järjestelmästä**. Kaksi
-//! rakenteellista takuuta suojaavat runtimea (ks. myös `docs/MIGRATION.md`):
+//! ## Why this is security-sensitive
+//! Imported data is **untrusted input from another system**. Two structural
+//! guarantees protect the runtime (see also `docs/MIGRATION.md`):
 //!
-//! 1. **Taidot karanteeniin (`Quarantined`).** Tuotu taito EI koskaan
-//!    rekisteröidy eikä suoritu. Importteri kirjoittaa sen erilliseen
-//!    *karanteenimanifestiin* ([`QuarantinedSkill`]) riskiluokalla
-//!    [`ActionRisk::ExecuteCode`] ja käytännöllä
-//!    [`ApprovalPolicy::AlwaysRequireApproval`] — aktivointi vaatii
-//!    hiekkalaatikkovalidoinnin + operaattorin nimenomaisen hyväksynnän.
-//!    Tämä moduuli ei kutsu rekisteriä eikä suoritinta lainkaan.
-//! 2. **Muistot matalan luottamuksen alkuperällä.** Tuotu muisto saa
-//!    [`Provenance::External`]-alkuperän matalalla luottamuksella
-//!    ([`UNTRUSTED_IMPORT_TRUST`]), jolloin `familyclaw-memory`:n
-//!    provenance-portti hallitsee niitä — niitä **ei** oteta sisään
-//!    luotettuina identiteetti-ankkureina.
+//! 1. **Skills go into quarantine (`Quarantined`).** An imported skill is NEVER
+//!    registered and never executed. The importer writes it to a separate
+//!    *quarantine manifest* ([`QuarantinedSkill`]) with risk class
+//!    [`ActionRisk::ExecuteCode`] and policy
+//!    [`ApprovalPolicy::AlwaysRequireApproval`] — activation requires sandbox
+//!    validation + the operator's explicit approval. This module never calls
+//!    the registry or the executor.
+//! 2. **Memories carry low-trust provenance.** An imported memory receives
+//!    [`Provenance::External`] provenance with low trust
+//!    ([`UNTRUSTED_IMPORT_TRUST`]), so `familyclaw-memory`'s provenance gate
+//!    governs them — they are **not** admitted as trusted identity anchors.
 //!
-//! ## Suunnittelurajoite (rehellisyys)
-//! Meillä **ei** ole `OpenClaw`'n/`Hermes`in tarkkaa, suljettua vientiskeemaa.
-//! Siksi määrittelemme pienen, versioidun **väliesityksen** ([`ImportedBundle`])
-//! ja kirjoitamme kaksi *sietävää* adapteria ([`from_openclaw`],
-//! [`from_hermes`]) jotka jäsentävät dokumentoidun, uskottavan JSON-muodon
-//! (kuvattu doc-kommenteissa + `docs/MIGRATION.md`). Tuntemattomat kentät
-//! **ohitetaan** — ne eivät koskaan ole kohtalokkaita. Virheellinen syöte
-//! epäonnistuu **fail-closed** selkeällä virheellä — ei koskaan paniikkia.
+//! ## Design constraint (honesty)
+//! We do **not** have `OpenClaw`'s/`Hermes`'s exact, closed export schema.
+//! Therefore we define a small, versioned **intermediate representation**
+//! ([`ImportedBundle`]) and write two *tolerant* adapters ([`from_openclaw`],
+//! [`from_hermes`]) that parse a documented, plausible JSON format
+//! (described in doc comments + `docs/MIGRATION.md`). Unknown fields are
+//! **ignored** — they are never fatal. Malformed input fails **fail-closed**
+//! with a clear error — never a panic.
 //!
-//! ## Testattavuus
-//! Komentokäsittelijät ([`parse`], [`execute`], adapterit) ovat puhtaita
-//! funktioita jotka palauttavat `Result<_, ImportError>` — ne eivät tulosta
-//! itse eivätkä kutsu `process::exit`:iä. Sama kuvio kuin
-//! [`crate::replay_cli`]:ssä.
+//! ## Testability
+//! The command handlers ([`parse`], [`execute`], adapters) are pure functions
+//! that return `Result<_, ImportError>` — they never print themselves nor
+//! call `process::exit`. Same pattern as in [`crate::replay_cli`].
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -50,39 +48,38 @@ use familyclaw_memory::{ImportanceFactors, Memory, Provenance};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Väliesityksen skeemaversio. Kasvatetaan jos [`ImportedBundle`]-rakenne
-/// muuttuu taaksepäin-yhteensopimattomasti.
+/// Schema version of the intermediate representation. Bumped if the
+/// [`ImportedBundle`] structure changes in a backwards-incompatible way.
 pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
 
-/// Tuotujen muistojen luottamus [`Provenance::External`]-alkuperässä.
+/// Trust level of imported memories under [`Provenance::External`] provenance.
 ///
-/// Tarkoituksellisesti matala: alle `familyclaw-memory`:n
-/// `ProvenanceGate`:n oletuskynnyksen (`0.5`), joten tuotu muisto **ei**
-/// automaattisesti pääse luotettuun haetuun ilman operaattorin punnintaa.
-/// Näin tuotu data ei voi naamioitua olennon omaksi kokemukseksi.
+/// Deliberately low: below `familyclaw-memory`'s `ProvenanceGate` default
+/// threshold (`0.5`), so an imported memory does **not** automatically gain
+/// trusted retrieval without operator judgment. This prevents imported data
+/// from masquerading as the being's own experience.
 pub const UNTRUSTED_IMPORT_TRUST: f32 = 0.2;
 
 // ---------------------------------------------------------------------------
-// Virhetyyppi
+// Error type
 // ---------------------------------------------------------------------------
 
-/// `import`-CLI:n virhetyyppi.
+/// Error type for the `import` CLI.
 ///
-/// Kaikki virheet ovat **paniikittomia**: virheellinen syöte (puuttuva
-/// argumentti, tuntematon lähde, olematon/virheellinen syöte) palautuu tämän
-/// tyypin kautta, ja binääri kuvaa sen selkeäksi virheviestiksi +
-/// nollasta poikkeavaksi paluukoodiksi.
+/// All errors are **panic-free**: malformed input (missing argument, unknown
+/// source, missing/invalid input) is returned via this type, and the binary
+/// renders it as a clear error message + a nonzero exit code.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ImportError {
-    /// Argumenttien jäsennys epäonnistui (puuttuva/tuntematon lippu tai arvo,
-    /// tuntematon `--from`-lähde).
+    /// Argument parsing failed (missing/unknown flag or value, unknown
+    /// `--from` source).
     Usage(String),
-    /// Syötetiedoston luku epäonnistui.
+    /// Reading the input file failed.
     Io(std::io::Error),
-    /// Vienti-JSON:n jäsennys epäonnistui (virheellinen JSON) — fail-closed.
+    /// Parsing the export JSON failed (invalid JSON) — fail-closed.
     Parse(String),
-    /// Tuloksen (raportti / manifesti / muisti) JSON-sarjallistus epäonnistui.
+    /// JSON serialization of the result (report / manifest / memory) failed.
     Serde(serde_json::Error),
 }
 
@@ -112,24 +109,24 @@ impl From<serde_json::Error> for ImportError {
 }
 
 // ---------------------------------------------------------------------------
-// Lähde (--from)
+// Source (--from)
 // ---------------------------------------------------------------------------
 
-/// Tuettu vientilähde.
+/// Supported export source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportSource {
-    /// OpenClaw-vienti.
+    /// `OpenClaw` export.
     OpenClaw,
-    /// Hermes Agent -vienti.
+    /// Hermes Agent export.
     Hermes,
 }
 
 impl ImportSource {
-    /// Jäsentää lähteen `--from`-arvosta (tuntematon → [`ImportError::Usage`]).
+    /// Parses the source from a `--from` value (unknown → [`ImportError::Usage`]).
     ///
     /// # Errors
-    /// [`ImportError::Usage`] jos arvo ei ole `openclaw` tai `hermes`.
+    /// [`ImportError::Usage`] if the value is not `openclaw` or `hermes`.
     pub fn parse(value: &str) -> Result<Self, ImportError> {
         match value.trim().to_ascii_lowercase().as_str() {
             "openclaw" => Ok(Self::OpenClaw),
@@ -140,7 +137,7 @@ impl ImportSource {
         }
     }
 
-    /// Vakaa, kone-luettava nimi.
+    /// Stable, machine-readable name.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -151,60 +148,61 @@ impl ImportSource {
 }
 
 // ---------------------------------------------------------------------------
-// Väliesitys (intermediate representation)
+// Intermediate representation
 // ---------------------------------------------------------------------------
 
-/// Yhden tuodun muiston väliesitys (lähteestä riippumaton).
+/// Intermediate representation of a single imported memory (source-independent).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImportedMemory {
-    /// Muiston tekstisisältö.
+    /// The memory's text content.
     pub content: String,
-    /// Vapaamuotoiset tägit (geneerisiä).
+    /// Free-form tags (generic).
     pub tags: Vec<String>,
-    /// Alkuperäisen lähteen ilmoittama tärkeys `0.0..=1.0` (jos oli); muuten
-    /// oletus. Käytetään vain vihjeenä — tuotu tärkeys ei ohita provenance-
-    /// porttia.
+    /// Importance `0.0..=1.0` as declared by the original source (if any);
+    /// otherwise the default. Used only as a hint — the imported importance
+    /// does not bypass the provenance gate.
     pub importance_hint: f32,
 }
 
-/// Yhden tuodun taidon väliesitys.
+/// Intermediate representation of a single imported skill.
 ///
-/// Tämä on **kuvaus**, ei suoritettava taito: importteri ei koskaan aja
-/// tuodun taidon koodia. Nimi/kuvaus/oikeudet siirretään karanteenimanifestiin.
+/// This is a **description**, not an executable skill: the importer never
+/// runs the imported skill's code. The name/description/permissions are
+/// carried over into the quarantine manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImportedSkill {
-    /// Taidon nimi lähteessä.
+    /// The skill's name in the source.
     pub name: String,
-    /// Kuvaus (jos oli).
+    /// Description (if any).
     pub description: String,
-    /// Lähteen ilmoittamat oikeudet raakana (kartoitetaan varovaisesti).
+    /// Permissions declared by the source, raw (mapped cautiously).
     pub declared_permissions: Vec<String>,
 }
 
-/// Lähteestä riippumaton **väliesitys** koko tuodusta paketista.
+/// Source-independent **intermediate representation** of the whole imported bundle.
 ///
-/// Adapterit ([`from_openclaw`], [`from_hermes`]) tuottavat tämän; raportointi
-/// ja emissio ([`ImportPlan`]) kuluttavat tämän. Versioitu
+/// The adapters ([`from_openclaw`], [`from_hermes`]) produce this; reporting
+/// and emission ([`ImportPlan`]) consume it. Versioned
 /// ([`BUNDLE_SCHEMA_VERSION`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImportedBundle {
-    /// Skeemaversio.
+    /// Schema version.
     pub schema_version: u32,
-    /// Mistä lähteestä tämä tuotiin.
+    /// Which source this was imported from.
     pub source: ImportSource,
-    /// Tuodut muistot.
+    /// Imported memories.
     pub memories: Vec<ImportedMemory>,
-    /// Tuodut taidot (menevät karanteeniin — eivät koskaan aktivoidu).
+    /// Imported skills (go into quarantine — never activated).
     pub skills: Vec<ImportedSkill>,
-    /// Konfiguraatiovihjeet (avain → arvo), ihmisen katsottavaksi. Näitä ei
-    /// sovelleta automaattisesti — pelkkä vihje migraatiossa.
+    /// Configuration hints (key → value), for a human to look at. These are
+    /// not applied automatically — merely a hint during migration.
     pub config_hints: Vec<(String, String)>,
-    /// Varoitukset asioista jotka ohitettiin tai eivät kartoittuneet siististi.
+    /// Warnings about things that were skipped or did not map cleanly.
     pub warnings: Vec<String>,
 }
 
 impl ImportedBundle {
-    /// Luo tyhjän paketin annetulle lähteelle.
+    /// Creates an empty bundle for the given source.
     #[must_use]
     pub fn empty(source: ImportSource) -> Self {
         Self {
@@ -219,44 +217,44 @@ impl ImportedBundle {
 }
 
 // ---------------------------------------------------------------------------
-// Karanteenimanifesti (tuodut taidot)
+// Quarantine manifest (imported skills)
 // ---------------------------------------------------------------------------
 
-/// Yhden karanteeniin asetetun taidon manifesti.
+/// Manifest for a single quarantined skill.
 ///
-/// **Turvallisuustakuu:** tämä ei ole rekisteröitävä taito. Se kantaa
-/// [`ActionRisk::ExecuteCode`]-riskiä ja
-/// [`ApprovalPolicy::AlwaysRequireApproval`]-käytäntöä, ja se on merkitty
-/// [`quarantined = true`](QuarantinedSkill::quarantined). Aktivointi vaatii
-/// hiekkalaatikkovalidoinnin + operaattorin nimenomaisen hyväksynnän erikseen;
-/// tämä importteri ei tarjoa aktivointipolkua.
+/// **Security guarantee:** this is not a registrable skill. It carries
+/// [`ActionRisk::ExecuteCode`] risk and
+/// [`ApprovalPolicy::AlwaysRequireApproval`] policy, and is marked
+/// [`quarantined = true`](QuarantinedSkill::quarantined). Activation requires
+/// sandbox validation + the operator's explicit approval, done separately;
+/// this importer provides no activation path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuarantinedSkill {
-    /// Aina `true` — dokumentoi että taito on karanteenissa eikä aktiivinen.
+    /// Always `true` — documents that the skill is quarantined, not active.
     pub quarantined: bool,
-    /// Mistä lähteestä taito tuotiin.
+    /// Which source the skill was imported from.
     pub source: ImportSource,
-    /// Geneerinen skill-manifesti (nimi, kuvaus, oikeudet, riski, käytäntö).
+    /// Generic skill manifest (name, description, permissions, risk, policy).
     pub manifest: SkillManifest,
 }
 
-/// Koko karanteenimanifesti: kaikki tuodut taidot.
+/// The full quarantine manifest: all imported skills.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuarantineManifest {
-    /// Skeemaversio.
+    /// Schema version.
     pub schema_version: u32,
-    /// Ihmisluettava huomautus takuusta.
+    /// Human-readable note about the guarantee.
     pub note: String,
-    /// Karanteeniin asetetut taidot.
+    /// Quarantined skills.
     pub skills: Vec<QuarantinedSkill>,
 }
 
 // ---------------------------------------------------------------------------
-// Adapterit: raaka vienti-JSON → väliesitys
+// Adapters: raw export JSON → intermediate representation
 // ---------------------------------------------------------------------------
 
-/// Lukee `f32`-tärkeysvihjeen JSON-arvosta, puristettuna `0.0..=1.0`;
-/// puuttuva/ei-numeerinen → oletus `0.3`.
+/// Reads an `f32` importance hint from a JSON value, clamped to `0.0..=1.0`;
+/// missing/non-numeric → default `0.3`.
 fn importance_from(value: Option<&Value>) -> f32 {
     value.and_then(Value::as_f64).map_or(0.3, |f| {
         #[allow(clippy::cast_possible_truncation)]
@@ -265,8 +263,8 @@ fn importance_from(value: Option<&Value>) -> f32 {
     })
 }
 
-/// Lukee merkkijonolistan JSON-arvosta; ei-merkkijonoalkiot ohitetaan
-/// (sietävä). Puuttuva → tyhjä.
+/// Reads a string list from a JSON value; non-string elements are skipped
+/// (tolerant). Missing → empty.
 fn string_list(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -279,11 +277,11 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Adapteri: OpenClaw-vienti (JSON) → [`ImportedBundle`].
+/// Adapter: `OpenClaw` export (JSON) → [`ImportedBundle`].
 ///
-/// ## Hyväksytty muoto (dokumentoitu, sietävä)
-/// Kohdistuu havaittuun/julkiseen OpenClaw-vientimuotoon. Tuntemattomat kentät
-/// ohitetaan, puuttuvat kentät saavat oletukset. Odotettu ylätason objekti:
+/// ## Accepted format (documented, tolerant)
+/// Targets the observed/public `OpenClaw` export format. Unknown fields are
+/// ignored, missing fields get defaults. Expected top-level object:
 ///
 /// ```json
 /// {
@@ -294,13 +292,13 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
 /// }
 /// ```
 ///
-/// Vaihtoehtoiset avainnimet hyväksytään sietävästi: muistoille `memories`,
-/// taidoille `skills`, konfiguraatiolle `config`. Muiston teksti luetaan
-/// avaimesta `text` tai `content`.
+/// Alternative key names are accepted tolerantly: `memories` for memories,
+/// `skills` for skills, `config` for configuration. The memory text is read
+/// from the `text` or `content` key.
 ///
 /// # Errors
-/// [`ImportError::Parse`] jos syöte ei ole kelvollista JSON:ia tai ylätaso ei
-/// ole JSON-objekti (fail-closed). Ei koskaan paniikkia.
+/// [`ImportError::Parse`] if the input is not valid JSON or the top level is
+/// not a JSON object (fail-closed). Never panics.
 pub fn from_openclaw(raw: &str) -> Result<ImportedBundle, ImportError> {
     let root: Value = serde_json::from_str(raw)
         .map_err(|e| ImportError::Parse(format!("openclaw export is not valid JSON: {e}")))?;
@@ -310,7 +308,7 @@ pub fn from_openclaw(raw: &str) -> Result<ImportedBundle, ImportError> {
 
     let mut bundle = ImportedBundle::empty(ImportSource::OpenClaw);
 
-    // --- muistot ---
+    // --- memories ---
     if let Some(arr) = obj.get("memories").and_then(Value::as_array) {
         for (idx, item) in arr.iter().enumerate() {
             let Some(mem_obj) = item.as_object() else {
@@ -340,7 +338,7 @@ pub fn from_openclaw(raw: &str) -> Result<ImportedBundle, ImportError> {
         }
     }
 
-    // --- taidot (→ karanteeni) ---
+    // --- skills (→ quarantine) ---
     if let Some(arr) = obj.get("skills").and_then(Value::as_array) {
         for (idx, item) in arr.iter().enumerate() {
             let Some(skill_obj) = item.as_object() else {
@@ -373,17 +371,17 @@ pub fn from_openclaw(raw: &str) -> Result<ImportedBundle, ImportError> {
         }
     }
 
-    // --- config-vihjeet ---
+    // --- config hints ---
     collect_config_hints(obj.get("config"), &mut bundle);
 
     Ok(bundle)
 }
 
-/// Adapteri: Hermes Agent -vienti (JSON) → [`ImportedBundle`].
+/// Adapter: Hermes Agent export (JSON) → [`ImportedBundle`].
 ///
-/// ## Hyväksytty muoto (dokumentoitu, sietävä)
-/// Kohdistuu havaittuun/julkiseen Hermes-vientimuotoon. Hermes ryhmittää
-/// datan `agent`-objektin alle; tuntemattomat kentät ohitetaan.
+/// ## Accepted format (documented, tolerant)
+/// Targets the observed/public Hermes export format. Hermes groups its data
+/// under an `agent` object; unknown fields are ignored.
 ///
 /// ```json
 /// {
@@ -396,13 +394,13 @@ pub fn from_openclaw(raw: &str) -> Result<ImportedBundle, ImportError> {
 /// }
 /// ```
 ///
-/// Sietävyys: jos `agent`-objektia ei ole, kentät luetaan ylätasolta.
-/// Muiston teksti luetaan avaimesta `value` tai `text`. Taidon nimi luetaan
-/// avaimesta `id` tai `name`.
+/// Tolerance: if there is no `agent` object, fields are read from the top
+/// level. The memory text is read from the `value` or `text` key. The skill
+/// name is read from the `id` or `name` key.
 ///
 /// # Errors
-/// [`ImportError::Parse`] jos syöte ei ole kelvollista JSON:ia tai ylätaso ei
-/// ole JSON-objekti (fail-closed). Ei koskaan paniikkia.
+/// [`ImportError::Parse`] if the input is not valid JSON or the top level is
+/// not a JSON object (fail-closed). Never panics.
 pub fn from_hermes(raw: &str) -> Result<ImportedBundle, ImportError> {
     let root: Value = serde_json::from_str(raw)
         .map_err(|e| ImportError::Parse(format!("hermes export is not valid JSON: {e}")))?;
@@ -410,7 +408,7 @@ pub fn from_hermes(raw: &str) -> Result<ImportedBundle, ImportError> {
         ImportError::Parse("hermes export root must be a JSON object".to_string())
     })?;
 
-    // Sietävyys: käytä `agent`-objektia jos on, muuten ylätasoa.
+    // Tolerance: use the `agent` object if present, otherwise the top level.
     let scope = root_obj
         .get("agent")
         .and_then(Value::as_object)
@@ -418,7 +416,7 @@ pub fn from_hermes(raw: &str) -> Result<ImportedBundle, ImportError> {
 
     let mut bundle = ImportedBundle::empty(ImportSource::Hermes);
 
-    // --- muistot ---
+    // --- memories ---
     if let Some(arr) = scope.get("memory").and_then(Value::as_array) {
         for (idx, item) in arr.iter().enumerate() {
             let Some(mem_obj) = item.as_object() else {
@@ -448,7 +446,7 @@ pub fn from_hermes(raw: &str) -> Result<ImportedBundle, ImportError> {
         }
     }
 
-    // --- taidot (→ karanteeni) ---
+    // --- skills (→ quarantine) ---
     if let Some(arr) = scope.get("abilities").and_then(Value::as_array) {
         for (idx, item) in arr.iter().enumerate() {
             let Some(skill_obj) = item.as_object() else {
@@ -482,15 +480,15 @@ pub fn from_hermes(raw: &str) -> Result<ImportedBundle, ImportError> {
         }
     }
 
-    // --- config-vihjeet ---
+    // --- config hints ---
     collect_config_hints(scope.get("settings"), &mut bundle);
 
     Ok(bundle)
 }
 
-/// Kerää config-vihjeet (avain → arvo) JSON-objektista pakettiin. Ei-objekti
-/// tai puuttuva ohitetaan hiljaa. Sisäkkäiset arvot sarjallistetaan takaisin
-/// kompaktiksi JSON-merkkijonoksi, jotta vihje pysyy tekstinä.
+/// Collects config hints (key → value) from a JSON object into the bundle.
+/// A non-object or missing value is skipped silently. Nested values are
+/// serialized back to a compact JSON string, so the hint stays as text.
 fn collect_config_hints(value: Option<&Value>, bundle: &mut ImportedBundle) {
     let Some(map) = value.and_then(Value::as_object) else {
         return;
@@ -505,24 +503,24 @@ fn collect_config_hints(value: Option<&Value>, bundle: &mut ImportedBundle) {
 }
 
 // ---------------------------------------------------------------------------
-// Emissio: väliesitys → oikea muistiesitys + karanteenimanifesti
+// Emission: intermediate representation → real memory representation + quarantine manifest
 // ---------------------------------------------------------------------------
 
-/// Muuntaa yhden tuodun muiston `FamilyClaw`'n oikeaksi [`Memory`]:ksi
-/// **matalan luottamuksen ulkoisella alkuperällä**.
+/// Converts a single imported memory into `FamilyClaw`'s real [`Memory`]
+/// **with low-trust external provenance**.
 ///
-/// Alkuperä on [`Provenance::External`] luottamuksella
-/// [`UNTRUSTED_IMPORT_TRUST`], joten muistin provenance-portti hallitsee tämän
-/// muiston — sitä ei oteta sisään luotettuna ankkurina. Lähdetunniste on
-/// geneerinen `"import_openclaw"` / `"import_hermes"`.
+/// The provenance is [`Provenance::External`] with trust
+/// [`UNTRUSTED_IMPORT_TRUST`], so the memory's provenance gate governs this
+/// memory — it is not admitted as a trusted anchor. The source tag is the
+/// generic `"import_openclaw"` / `"import_hermes"`.
 #[must_use]
 pub fn imported_memory_to_memory(source: ImportSource, mem: &ImportedMemory) -> Memory {
     let source_tag = match source {
         ImportSource::OpenClaw => "import_openclaw",
         ImportSource::Hermes => "import_hermes",
     };
-    // Tärkeys on pelkkä vihje (emotion-osatekijä); identiteetti = 0, jottei
-    // tuotu muisto teeskentele identiteetti-ankkuria.
+    // Importance is merely a hint (the emotion factor); identity = 0, so the
+    // imported memory does not masquerade as an identity anchor.
     let factors = ImportanceFactors::new(mem.importance_hint.clamp(0.0, 1.0), 0.0, 0.0, 0.0);
     let mut tags = mem.tags.clone();
     tags.push("imported".to_string());
@@ -535,14 +533,14 @@ pub fn imported_memory_to_memory(source: ImportSource, mem: &ImportedMemory) -> 
         .build()
 }
 
-/// Muuntaa yhden tuodun taidon **karanteenimanifestiksi** (ei koskaan
-/// rekisteröidä eikä suoriteta).
+/// Converts a single imported skill into a **quarantine manifest** (never
+/// registered or executed).
 ///
-/// Riski on [`ActionRisk::ExecuteCode`] ja käytäntö
-/// [`ApprovalPolicy::AlwaysRequireApproval`]: aktivointi vaatii aina
-/// operaattorin hyväksynnän. Oikeus [`SkillPermission::ExecuteCode`] lisätään,
-/// jotta manifesti kuvaa taidon todellisen (tuntemattoman) vaarapinnan
-/// pessimistisesti.
+/// The risk is [`ActionRisk::ExecuteCode`] and the policy
+/// [`ApprovalPolicy::AlwaysRequireApproval`]: activation always requires the
+/// operator's approval. The [`SkillPermission::ExecuteCode`] permission is
+/// added, so the manifest describes the skill's real (unknown) danger
+/// surface pessimistically.
 #[must_use]
 pub fn imported_skill_to_quarantine(
     source: ImportSource,
@@ -557,8 +555,9 @@ pub fn imported_skill_to_quarantine(
             source.as_str()
         )
     };
-    // Säilytä lähteen ilmoittamat oikeudet ihmisluettavana vihjeenä, mutta
-    // älä anna niiden laskea riskiluokkaa — riski on aina ExecuteCode.
+    // Preserve the permissions declared by the source as a human-readable
+    // hint, but do not let them lower the risk class — the risk is always
+    // ExecuteCode.
     if !skill.declared_permissions.is_empty() {
         let _ = write!(
             description,
@@ -587,26 +586,26 @@ pub fn imported_skill_to_quarantine(
     }
 }
 
-/// Koko import-suunnitelma: väliesityksestä johdetut oikeat artefaktit +
-/// laskurit raporttia varten. Ei kirjoita mitään levylle — se on
-/// [`execute`]:n vastuulla.
+/// The full import plan: real artifacts derived from the intermediate
+/// representation + counters for the report. Writes nothing to disk — that
+/// is [`execute`]'s responsibility.
 #[derive(Debug, Clone)]
 pub struct ImportPlan {
-    /// Lähde.
+    /// Source.
     pub source: ImportSource,
-    /// Oikeaan esitykseen muunnetut muistot (matala luottamus).
+    /// Memories converted to the real representation (low trust).
     pub memories: Vec<Memory>,
-    /// Karanteenimanifesti.
+    /// Quarantine manifest.
     pub quarantine: QuarantineManifest,
-    /// Config-vihjeet.
+    /// Config hints.
     pub config_hints: Vec<(String, String)>,
-    /// Varoitukset.
+    /// Warnings.
     pub warnings: Vec<String>,
 }
 
 impl ImportPlan {
-    /// Rakentaa suunnitelman väliesityksestä. **Ei rekisteröi eikä suorita
-    /// mitään** — vain muunnos dataksi.
+    /// Builds the plan from the intermediate representation. **Registers or
+    /// executes nothing** — only converts to data.
     #[must_use]
     pub fn from_bundle(bundle: &ImportedBundle) -> Self {
         let memories = bundle
@@ -635,21 +634,21 @@ impl ImportPlan {
         }
     }
 
-    /// Montako muistoa tuotiin.
+    /// How many memories were imported.
     #[must_use]
     pub fn memory_count(&self) -> usize {
         self.memories.len()
     }
 
-    /// Montako taitoa asetettiin karanteeniin.
+    /// How many skills were placed into quarantine.
     #[must_use]
     pub fn quarantined_skill_count(&self) -> usize {
         self.quarantine.skills.len()
     }
 
-    /// Todistaa invariantin: **jokaisen** tuodun taidon on oltava karanteenissa
-    /// ja aina-hyväksyntää vaativa. Palauttaa `true` jos invariantti pitää
-    /// (tyhjälle listalle triviaalisti `true`).
+    /// Proves the invariant: **every** imported skill must be quarantined
+    /// and require approval always. Returns `true` if the invariant holds
+    /// (trivially `true` for an empty list).
     #[must_use]
     pub fn all_skills_quarantined(&self) -> bool {
         self.quarantine.skills.iter().all(|s| {
@@ -659,8 +658,8 @@ impl ImportPlan {
         })
     }
 
-    /// Todistaa invariantin: **jokaisen** tuodun muiston alkuperä on matalan
-    /// luottamuksen ulkoinen lähde (ei suora kokemus / ankkuri).
+    /// Proves the invariant: **every** imported memory's provenance is a
+    /// low-trust external source (not direct experience / an anchor).
     #[must_use]
     pub fn all_memories_untrusted(&self) -> bool {
         self.memories
@@ -670,28 +669,28 @@ impl ImportPlan {
 }
 
 // ---------------------------------------------------------------------------
-// Raportti (markdown / JSON)
+// Report (markdown / JSON)
 // ---------------------------------------------------------------------------
 
-/// Koneluettava import-raportti (`--json`).
+/// Machine-readable import report (`--json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportReport {
-    /// Lähde.
+    /// Source.
     pub source: ImportSource,
-    /// Tuotujen muistojen määrä.
+    /// Number of memories imported.
     pub memories_imported: usize,
-    /// Karanteeniin asetettujen taitojen määrä.
+    /// Number of skills placed into quarantine.
     pub skills_quarantined: usize,
-    /// Config-vihjeiden määrä.
+    /// Number of config hints.
     pub config_hints: usize,
-    /// Varoitukset (ohitetut/epäselvät kohteet).
+    /// Warnings (skipped/ambiguous items).
     pub warnings: Vec<String>,
-    /// Turvallisuustakuut, dokumentoituna raporttiin.
+    /// Security guarantees, documented in the report.
     pub guarantees: Vec<String>,
 }
 
 impl ImportReport {
-    /// Rakentaa raportin suunnitelmasta.
+    /// Builds the report from the plan.
     #[must_use]
     pub fn from_plan(plan: &ImportPlan) -> Self {
         Self {
@@ -713,7 +712,7 @@ impl ImportReport {
         }
     }
 
-    /// Renderöi raportin ihmisluettavana markdownina.
+    /// Renders the report as human-readable markdown.
     #[must_use]
     pub fn render_markdown(&self) -> String {
         let mut out = String::new();
@@ -744,22 +743,22 @@ impl ImportReport {
 // CLI: parse / execute / run / usage
 // ---------------------------------------------------------------------------
 
-/// Jäsennetty `import`-komento valmiina suoritettavaksi.
+/// Parsed `import` command ready to execute.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ImportCommand {
-    /// Vientilähde (`--from`).
+    /// Export source (`--from`).
     pub source: ImportSource,
-    /// Syötetiedoston polku (`--input`).
+    /// Path of the input file (`--input`).
     pub input: PathBuf,
-    /// Valinnainen kohdehakemisto artefakteille (`--out`). Kun asetettu,
-    /// raportti, muistot ja karanteenimanifesti kirjoitetaan tänne.
+    /// Optional target directory for artifacts (`--out`). When set, the
+    /// report, memories, and quarantine manifest are written here.
     pub out: Option<PathBuf>,
-    /// Tulostetaanko raportti JSON:na (`true`) vai markdownina (`false`).
+    /// Whether to print the report as JSON (`true`) or markdown (`false`).
     pub json: bool,
 }
 
-/// `import`-alikomennon käyttöohje.
+/// Usage instructions for the `import` subcommand.
 #[must_use]
 pub fn usage() -> &'static str {
     "familyclaw import — migrate configs, memories & skills from another runtime\n\
@@ -780,12 +779,12 @@ pub fn usage() -> &'static str {
      anchors."
 }
 
-/// Jäsentää `import`-alikomennon argumentit (ilman `familyclaw import`
-/// -prefiksiä).
+/// Parses the `import` subcommand's arguments (without the
+/// `familyclaw import` prefix).
 ///
 /// # Errors
-/// [`ImportError::Usage`] jos pakollinen lippu/arvo puuttuu, lippu on
-/// tuntematon tai `--from` on tuntematon lähde.
+/// [`ImportError::Usage`] if a required flag/value is missing, a flag is
+/// unknown, or `--from` is an unknown source.
 pub fn parse<I, S>(args: I) -> Result<ImportCommand, ImportError>
 where
     I: IntoIterator<Item = S>,
@@ -821,16 +820,16 @@ where
     })
 }
 
-/// Ottaa lipun arvon iteraattorista tai palauttaa selkeän usage-virheen.
+/// Takes the flag's value from the iterator or returns a clear usage error.
 fn take_value<I: Iterator<Item = String>>(args: &mut I, flag: &str) -> Result<String, ImportError> {
     args.next()
         .ok_or_else(|| ImportError::Usage(format!("flag `{flag}` requires a value")))
 }
 
-/// Ajaa adapterin lähteen mukaan.
+/// Runs the adapter matching the source.
 ///
 /// # Errors
-/// Vie adapterin [`ImportError::Parse`]:n läpi.
+/// Propagates the adapter's [`ImportError::Parse`].
 pub fn parse_bundle(source: ImportSource, raw: &str) -> Result<ImportedBundle, ImportError> {
     match source {
         ImportSource::OpenClaw => from_openclaw(raw),
@@ -838,22 +837,22 @@ pub fn parse_bundle(source: ImportSource, raw: &str) -> Result<ImportedBundle, I
     }
 }
 
-/// Suorittaa jäsennetyn [`ImportCommand`]:n ja palauttaa tulostettavan
-/// raporttimerkkijonon.
+/// Executes the parsed [`ImportCommand`] and returns the printable report
+/// string.
 ///
-/// Jos `--out` on annettu, kirjoittaa hakemistoon kolme tiedostoa:
-/// - `import_report.md` / `import_report.json` — raportti,
-/// - `imported_memories.json` — oikeaan esitykseen muunnetut muistot,
-/// - `quarantine_manifest.json` — karanteeniin asetetut taidot.
+/// If `--out` is given, writes three files to the directory:
+/// - `import_report.md` / `import_report.json` — the report,
+/// - `imported_memories.json` — memories converted to the real representation,
+/// - `quarantine_manifest.json` — the quarantined skills.
 ///
-/// **Turvallisuus:** ei koskaan rekisteröi eikä suorita tuotua taitoa. Muistot
-/// vain sarjallistetaan levylle; niiden varsinainen sisäänotto muistiin kulkee
-/// erikseen provenance-portin läpi (matala luottamus).
+/// **Security:** never registers or executes an imported skill. Memories
+/// are only serialized to disk; their actual admission into memory goes
+/// through the provenance gate separately (low trust).
 ///
 /// # Errors
-/// [`ImportError::Io`] jos syötteen luku tai kohdehakemiston kirjoitus
-/// epäonnistuu; [`ImportError::Parse`] jos vienti on virheellinen;
-/// [`ImportError::Serde`] jos sarjallistus epäonnistuu.
+/// [`ImportError::Io`] if reading the input or writing the target directory
+/// fails; [`ImportError::Parse`] if the export is malformed;
+/// [`ImportError::Serde`] if serialization fails.
 pub fn execute(command: &ImportCommand) -> Result<String, ImportError> {
     let raw = std::fs::read_to_string(&command.input)?;
     let bundle = parse_bundle(command.source, &raw)?;
@@ -863,7 +862,7 @@ pub fn execute(command: &ImportCommand) -> Result<String, ImportError> {
     if let Some(dir) = &command.out {
         std::fs::create_dir_all(dir)?;
 
-        // Raportti (kumpaakin muotoa ei pakoteta; kirjoita valittu muoto).
+        // Report (both formats are not forced; write the chosen format).
         if command.json {
             let json = serde_json::to_string_pretty(&report)?;
             std::fs::write(dir.join("import_report.json"), json)?;
@@ -871,11 +870,11 @@ pub fn execute(command: &ImportCommand) -> Result<String, ImportError> {
             std::fs::write(dir.join("import_report.md"), report.render_markdown())?;
         }
 
-        // Muistot oikeassa esityksessä (matala luottamus).
+        // Memories in the real representation (low trust).
         let memories_json = serde_json::to_string_pretty(&plan.memories)?;
         std::fs::write(dir.join("imported_memories.json"), memories_json)?;
 
-        // Karanteenimanifesti (taidot — EI koskaan rekisteröidä).
+        // Quarantine manifest (skills — NEVER registered).
         let quarantine_json = serde_json::to_string_pretty(&plan.quarantine)?;
         std::fs::write(dir.join("quarantine_manifest.json"), quarantine_json)?;
     }
@@ -887,12 +886,12 @@ pub fn execute(command: &ImportCommand) -> Result<String, ImportError> {
     }
 }
 
-/// Yksi kutsu koko `import`-alikomennolle: jäsennä + suorita.
+/// A single call for the whole `import` subcommand: parse + execute.
 ///
-/// `args` on `familyclaw import`-prefiksin jälkeiset argumentit.
+/// `args` are the arguments following the `familyclaw import` prefix.
 ///
 /// # Errors
-/// Vie [`parse`]:n ja [`execute`]:n virheet läpi.
+/// Propagates errors from [`parse`] and [`execute`].
 pub fn run<I, S>(args: I) -> Result<String, ImportError>
 where
     I: IntoIterator<Item = S>,
@@ -907,7 +906,7 @@ mod tests {
 
     use super::*;
 
-    /// Pieni RAII-temp-hakemisto (sama kuvio kuin `replay_cli`-testeissä).
+    /// Small RAII temp directory (same pattern as in the `replay_cli` tests).
     struct TempDir(PathBuf);
 
     impl TempDir {

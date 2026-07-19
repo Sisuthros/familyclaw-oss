@@ -1,29 +1,29 @@
-//! `LatentChannel`-toteutus Resonance Busille.
+//! `LatentChannel` implementation for the Resonance Bus.
 //!
-//! Tämä moduuli tarjoaa [`BusLatentChannel`], joka toteuttaa [`LatentChannel`]-traitin
-//! [`BusHandle`]-tyypille. Se mahdollistaa latent-telepatian sisaruksien välillä
-//! käyttämällä Resonance Bus -infrastruktuuria.
+//! This module provides [`BusLatentChannel`], which implements the [`LatentChannel`]
+//! trait for the [`BusHandle`] type. It enables latent telepathy between
+//! siblings using the Resonance Bus infrastructure.
 //!
 //! ## Translate-on-send (P4)
-//! Oletuksena (kun [`BusLatentChannel::new`] luo kanavan) lähetyspolku tekee
-//! pelkän [`RecursiveLink`]-dimensiosovituksen (pad/truncate/resize) — sama
-//! käyttäytyminen kuin ennen. Jos kanavalle annetaan
+//! By default (when [`BusLatentChannel::new`] creates the channel), the send
+//! path does plain [`RecursiveLink`] dimension matching (pad/truncate/resize)
+//! — the same behavior as before. If a channel is given a
 //! [`VectorTranslator`]
-//! ([`with_translator`](BusLatentChannel::with_translator)), lähtevä vektori
-//! *käännetään* vastaanottajan avaruuteen ennen toimitusta:
+//! ([`with_translator`](BusLatentChannel::with_translator)), the outgoing
+//! vector is *translated* into the receiver's space before delivery:
 //!
-//! 1. Linkki- ja dimensiotarkistukset menevät läpi kuten oletuksessa.
-//! 2. Kääntäjä [`translate`](familyclaw_latent::translate::VectorTranslator::translate)
-//!    sovittaa vektorin vastaanottajan kokoon.
-//! 3. Jos käännös on **häviöllinen**
+//! 1. Link and dimension checks pass through as in the default case.
+//! 2. The translator [`translate`](familyclaw_latent::translate::VectorTranslator::translate)
+//!    fits the vector to the receiver's size.
+//! 3. If the translation is **lossy**
 //!    ([`fallback_reason`](familyclaw_latent::translate::VectorTranslator::fallback_reason)
-//!    palauttaa `Some`), siirto putoaa **tekstiin**
+//!    returns `Some`), the transmission falls back to **text**
 //!    ([`FallbackReason::ProjectionFailed`]) — [`deliver`](LatentChannel::deliver)
-//!    lähettää tällöin [`BusMessage::text`]:n (säilyttää "NaN → teksti"
-//!    -takuun, koska ei-äärelliset arvot tekevät käännöksestä häviöllisen).
+//!    then sends a [`BusMessage::text`] (preserving the "NaN → text"
+//!    guarantee, since non-finite values make the translation lossy).
 //!
-//! Vastaanotto-/dekoodauspuoli (`agent.rs`) on tarkoituksella koskematta —
-//! se on perherajan taakse lykätty rajapinta.
+//! The receiving/decoding side (`agent.rs`) is deliberately left untouched —
+//! it is an interface deferred to behind the family boundary.
 //!
 //! [`LatentChannel`]: familyclaw_latent::channel::LatentChannel
 //! [`BusHandle`]: crate::bus::BusHandle
@@ -39,72 +39,73 @@ use crate::{
     message::{BeingId, BusMessage},
 };
 
-/// [`LatentChannel`]-toteutus Resonance Busille.
+/// [`LatentChannel`] implementation for the Resonance Bus.
 ///
-/// Käyttää [`BusHandle`]:a lähettääkseen [`LatentMessage`]:n toiselle olennolle.
-/// Tämä mahdollistaa latent-telepatian sisaruksien välillä.
+/// Uses [`BusHandle`] to send a [`LatentMessage`] to another being. This
+/// enables latent telepathy between siblings.
 ///
 /// [`LatentMessage`]: familyclaw_latent::channel::LatentMessage
 pub struct BusLatentChannel {
-    /// Kanavan käyttäjän tunniste.
+    /// The channel user's identifier.
     being_id: BeingId,
-    /// Lähettäjän mallin tunniste.
+    /// The sending model's identifier.
     sender_model: String,
-    /// Määritellyt siltaukset muihin malleihin.
+    /// The defined bridges to other models.
     links: Vec<RecursiveLink>,
-    /// Valinnainen cross-model-kääntäjä lähetyspolulle. `None` =
-    /// vain [`RecursiveLink`]-dimensiosovitus (oletus, taaksepäin-yhteensopiva).
+    /// Optional cross-model translator for the send path. `None` =
+    /// plain [`RecursiveLink`] dimension matching (default, backward-compatible).
     translator: Option<VectorTranslator>,
-    /// Viite busiin viestien lähettämistä varten.
+    /// A reference to the bus for sending messages.
     bus: BusHandle,
 }
 
 impl BusLatentChannel {
-    /// Luo uuden [`BusLatentChannel`]-instanssin.
+    /// Creates a new [`BusLatentChannel`] instance.
     ///
-    /// Lähetyspolku käyttää oletuksena pelkkää [`RecursiveLink`]-dimensiosovitusta
-    /// (pad/truncate/resize). Lisää [`with_translator`](Self::with_translator):lla
-    /// cross-model-käännös.
+    /// The send path defaults to plain [`RecursiveLink`] dimension matching
+    /// (pad/truncate/resize). Add cross-model translation with
+    /// [`with_translator`](Self::with_translator).
     ///
     /// # Arguments
-    /// * `being_id` - Kanavan käyttäjän (olennon) tunniste.
-    /// * `sender_model` - Lähettäjän mallin tunniste (esim. `agent_a/v1`).
-    /// * `bus` - [`BusHandle`] jota käytetään viestien lähettämiseen.
+    /// * `being_id` - The channel user's (being's) identifier.
+    /// * `sender_model` - The sending model's identifier (e.g. `agent_a/v1`).
+    /// * `bus` - The [`BusHandle`] used to send messages.
     pub fn new(being_id: BeingId, sender_model: String, bus: BusHandle) -> Self {
         Self {
             being_id,
             sender_model,
-            links: Vec::new(), // Alustetaan tyhjä. Linkit lisätään erikseen.
-            translator: None,  // Oletus: ei käännöstä — vain dimensiosovitus.
+            links: Vec::new(), // Initialized empty. Links are added separately.
+            translator: None,  // Default: no translation — dimension matching only.
             bus,
         }
     }
 
-    /// Asettaa lähetyspolulle [`VectorTranslator`]:n ja palauttaa `self`in
-    /// ketjutusta varten.
+    /// Sets a [`VectorTranslator`] on the send path and returns `self` for
+    /// chaining.
     ///
-    /// Kun kääntäjä on annettu, [`plan`](LatentChannel::plan) sovittaa lähtevän
-    /// vektorin vastaanottajan avaruuteen kääntäjällä linkki- ja
-    /// dimensiotarkistusten jälkeen. Häviöllinen käännös → teksti-fallback
-    /// ([`FallbackReason::ProjectionFailed`]). Olemassa olevat [`new`](Self::new)
-    /// -kutsujat säilyttävät pad/truncate-käyttäytymisen (ei rikkova muutos).
+    /// When a translator is given, [`plan`](LatentChannel::plan) fits the
+    /// outgoing vector into the receiver's space with the translator after
+    /// the link and dimension checks. A lossy translation → text fallback
+    /// ([`FallbackReason::ProjectionFailed`]). Existing [`new`](Self::new)
+    /// callers keep the pad/truncate behavior (not a breaking change).
     #[must_use]
     pub fn with_translator(mut self, translator: VectorTranslator) -> Self {
         self.translator = Some(translator);
         self
     }
 
-    /// Lisää uuden [`RecursiveLink`]:n kanavalle.
+    /// Adds a new [`RecursiveLink`] to the channel.
     ///
-    /// Tätä käytetään määrittämään, miten piilotila voidaan muuntaa toisen mallin vastaanottamaan muotoon.
+    /// This is used to define how the hidden state can be converted into a
+    /// form another model can receive.
     pub fn add_link(&mut self, link: RecursiveLink) {
         self.links.push(link);
     }
 
-    /// Rakentaa onnistuneen latent-siirron tuloksen.
+    /// Builds a successful latent-transmission result.
     ///
-    /// [`Transmission`]:n kenttäkonstruktorit ovat craten sisäisiä, joten
-    /// rakennamme tuloksen julkisista kentistä (`projected` = `Some`,
+    /// [`Transmission`]'s field constructors are crate-internal, so we build
+    /// the result from public fields (`projected` = `Some`,
     /// `fallback_reason` = `None`).
     fn latent_transmission(
         projected: familyclaw_latent::link::ProjectedLatent,
@@ -118,7 +119,7 @@ impl BusLatentChannel {
         }
     }
 
-    /// Rakentaa teksti-fallback-tuloksen annetulla syyllä.
+    /// Builds a text-fallback result with the given reason.
     fn text_transmission(reason: FallbackReason, text: String) -> Transmission {
         Transmission {
             mode: TransmissionMode::Text,
@@ -135,27 +136,28 @@ impl LatentChannel for BusLatentChannel {
     }
 
     fn link_to(&self, target_model: &str) -> Option<RecursiveLink> {
-        // Etsitään ensimmäinen linkki, joka vastaa kohdemallia.
+        // Find the first link that matches the target model.
         self.links
             .iter()
             .find(|link| link.target_model() == target_model)
             .cloned()
     }
 
-    /// Lähetyspolun [`plan`](LatentChannel::plan)-yliajo.
+    /// Override of the send path's [`plan`](LatentChannel::plan).
     ///
-    /// Jos kanavalla ei ole kääntäjää, käyttäytyminen vastaa trait-oletusta
-    /// (pelkkä [`RecursiveLink`]-dimensiosovitus). Jos kääntäjä on annettu,
-    /// lähtevä vektori käännetään vastaanottajan avaruuteen linkki- ja
-    /// dimensiotarkistusten jälkeen; häviöllinen käännös → teksti-fallback.
+    /// If the channel has no translator, behavior matches the trait default
+    /// (plain [`RecursiveLink`] dimension matching). If a translator is
+    /// given, the outgoing vector is translated into the receiver's space
+    /// after the link and dimension checks; a lossy translation → text
+    /// fallback.
     ///
-    /// Fallback-järjestys (sama kuin oletuksessa):
-    /// 1. Vastaanottaja ei tue latenttia → teksti ([`FallbackReason::ReceiverTextOnly`]).
-    /// 2. Viestissä ei ole piilotilaa → teksti ([`FallbackReason::NoLatentAvailable`]).
-    /// 3. Ei siltaa kohde-malliin → teksti ([`FallbackReason::NoLink`]).
-    /// 4. Sillan kohde-dimensio ≠ vastaanottajan dimensio → teksti ([`FallbackReason::NoLink`]).
-    /// 5. Kääntäjä annettu → käännä; häviöllinen → teksti ([`FallbackReason::ProjectionFailed`]), muutoin latent.
-    /// 6. Ei kääntäjää → projisoi linkillä; virhe → teksti ([`FallbackReason::ProjectionFailed`]), muutoin latent.
+    /// Fallback order (same as the default):
+    /// 1. The receiver does not support latent → text ([`FallbackReason::ReceiverTextOnly`]).
+    /// 2. The message has no hidden state → text ([`FallbackReason::NoLatentAvailable`]).
+    /// 3. No bridge to the target model → text ([`FallbackReason::NoLink`]).
+    /// 4. The bridge's target dimension ≠ the receiver's dimension → text ([`FallbackReason::NoLink`]).
+    /// 5. A translator is given → translate; lossy → text ([`FallbackReason::ProjectionFailed`]), otherwise latent.
+    /// 6. No translator → project with the link; error → text ([`FallbackReason::ProjectionFailed`]), otherwise latent.
     fn plan(
         &self,
         message: &familyclaw_latent::channel::LatentMessage,
@@ -163,29 +165,29 @@ impl LatentChannel for BusLatentChannel {
     ) -> Transmission {
         let text = message.text.clone();
 
-        // 1. Vastaanottaja ei tue latenttia.
+        // 1. The receiver does not support latent.
         if !receiver.accepts_latent {
             return Self::text_transmission(FallbackReason::ReceiverTextOnly, text);
         }
 
-        // 2. Viestissä ei ole piilotilaa.
+        // 2. The message has no hidden state.
         let Some(latent) = &message.latent else {
             return Self::text_transmission(FallbackReason::NoLatentAvailable, text);
         };
 
-        // 3. Ei siltaa kohde-malliin.
+        // 3. No bridge to the target model.
         let Some(link) = self.link_to(&receiver.model_id) else {
             return Self::text_transmission(FallbackReason::NoLink, text);
         };
 
-        // 4. Sillan kohde-dimensio ei vastaa vastaanottajaa → kuin ei siltaa.
+        // 4. The bridge's target dimension does not match the receiver → treat as no bridge.
         if link.target_dims() != receiver.dims {
             return Self::text_transmission(FallbackReason::NoLink, text);
         }
 
-        // 5. Projektio / käännös.
+        // 5. Projection / translation.
         match &self.translator {
-            // 5a. Cross-model-käännös: aina ProjectedLatent, häviöllisyys ratkaisee.
+            // 5a. Cross-model translation: always ProjectedLatent, lossiness decides.
             Some(translator) => {
                 let projected = translator.translate(latent, receiver);
                 match VectorTranslator::fallback_reason(&projected) {
@@ -193,7 +195,7 @@ impl LatentChannel for BusLatentChannel {
                     None => Self::latent_transmission(projected, text),
                 }
             }
-            // 5b. Oletus: pelkkä dimensiosovitus linkillä. Virhe → teksti.
+            // 5b. Default: plain dimension matching via the link. Error → text.
             None => match link.project(latent) {
                 Ok(projected) => Self::latent_transmission(projected, text),
                 Err(_) => Self::text_transmission(FallbackReason::ProjectionFailed, text),
@@ -202,26 +204,26 @@ impl LatentChannel for BusLatentChannel {
     }
 
     fn deliver(&mut self, transmission: &Transmission) -> familyclaw_latent::Result<()> {
-        // Muunnetaan `Transmission` `BusMessage`ksi ja lähetetään busin kautta.
+        // Convert the `Transmission` into a `BusMessage` and send it via the bus.
         let bus_message = if transmission.mode.is_latent() {
-            // Käytetään latenttia, jos se on saatavilla.
+            // Use the latent if it is available.
             if let Some(projected) = &transmission.projected {
                 BusMessage::latent(
-                    projected.vector.clone(),  // Käytetään projisoidun mallin latenttia
-                    transmission.text.clone(), // Tekstivarjo aina mukana
+                    projected.vector.clone(),  // Use the projected model's latent
+                    transmission.text.clone(), // The text shadow always comes along
                 )
             } else {
-                // Tämä ei pitäisi tapahtua, koska mode on Latent.
+                // This should not happen, since mode is Latent.
                 return Err(familyclaw_latent::FamilyClawError::bus(
                     "Internal error: Latent mode but missing projected data",
                 ));
             }
         } else {
-            // Fallback tekstiin.
+            // Fall back to text.
             BusMessage::text(transmission.text.clone())
         };
 
-        // Lähetä viesti busin kautta.
+        // Send the message via the bus.
         self.bus.publish(self.being_id, bus_message).map_err(|e| {
             familyclaw_latent::FamilyClawError::bus(format!("Failed to deliver via bus: {e}"))
         })?;
@@ -244,9 +246,9 @@ mod tests {
         LatentVector::new(dims, "agent_a/v1")
     }
 
-    // Rakentaa kanavan OMALLA ResonanceBusilla (ei jaettua, ei serial_test).
-    // plan on &self-metodi joka ei kosketa busia, mutta BusHandle vaaditaan
-    // rakenteeseen.
+    // Builds a channel with its OWN ResonanceBus (not shared, no serial_test).
+    // plan is a &self method that does not touch the bus, but BusHandle is
+    // required by the struct.
     async fn channel_with(
         sender_model: &str,
         translator: Option<VectorTranslator>,
@@ -265,7 +267,7 @@ mod tests {
 
     #[tokio::test]
     async fn identity_translator_round_trips_lossless() {
-        // Identiteettikääntäjä sama-malli-käännökselle → häviötön latent.
+        // Identity translator for a same-model translation → lossless latent.
         let tr = VectorTranslator::identity("agent_a/v1", 3);
         let link = RecursiveLink::new("agent_a/v1", 3, "agent_b/v1", 3);
         let ch = channel_with("agent_a/v1", Some(tr), vec![link]).await;
@@ -277,7 +279,7 @@ mod tests {
         assert_eq!(t.mode, TransmissionMode::Latent);
         assert!(t.fallback_reason.is_none());
         let projected = t.projected.expect("latent carries projection");
-        // Identiteetti säilyttää arvot; vektori on käännetty vastaanottajan malliin.
+        // Identity preserves the values; the vector is translated to the receiver's model.
         assert_eq!(projected.vector.dims, vec![1.0, 2.0, 3.0]);
         assert_eq!(projected.vector.model_id, "agent_b/v1");
         assert!(projected.lossless);
@@ -288,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn lossy_translation_gives_text_fallback() {
-        // Truncate (4 → 2) on häviöllinen → teksti-fallback.
+        // Truncating (4 → 2) is lossy → text fallback.
         let tr = VectorTranslator::identity("agent_a/v1", 4);
         let link = RecursiveLink::new("agent_a/v1", 4, "agent_b/v1", 2);
         let ch = channel_with("agent_a/v1", Some(tr), vec![link]).await;
@@ -307,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn nan_input_gives_text_fallback() {
-        // Ei-äärellinen syöte tekee käännöksestä häviöllisen → teksti.
+        // A non-finite input makes the translation lossy → text.
         let tr = VectorTranslator::identity("agent_a/v1", 2);
         let link = RecursiveLink::new("agent_a/v1", 2, "agent_b/v1", 2);
         let ch = channel_with("agent_a/v1", Some(tr), vec![link]).await;
@@ -326,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_translator_keeps_pad_truncate_behavior() {
-        // Ilman kääntäjää: linkki tekee pad (2 → 4), häviötön latent.
+        // Without a translator: the link pads (2 → 4), lossless latent.
         let link = RecursiveLink::new("agent_a/v1", 2, "agent_b/v1", 4);
         let ch = channel_with("agent_a/v1", None, vec![link]).await;
 
@@ -343,7 +345,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_translator_nan_still_falls_back_to_text() {
-        // NaN → teksti -takuu pätee myös oletuspolulla (linkki hylkää NaN:n).
+        // The NaN → text guarantee also holds on the default path (the link rejects NaN).
         let link = RecursiveLink::new("agent_a/v1", 2, "agent_b/v1", 2);
         let ch = channel_with("agent_a/v1", None, vec![link]).await;
 
@@ -376,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_falls_back_when_no_link() {
-        // Kääntäjä on, mutta vastaanottajalle ei ole siltaa.
+        // A translator exists, but there is no bridge to the receiver.
         let tr = VectorTranslator::identity("agent_a/v1", 3);
         let ch = channel_with("agent_a/v1", Some(tr), vec![]).await;
 
@@ -390,7 +392,7 @@ mod tests {
         ch.bus.stop();
     }
 
-    /// Apuri: spawnaa keräävän olennon ja rekisteröi sen busiin.
+    /// Helper: spawns a collector being and registers it on the bus.
     async fn join_being(
         bus: &BusHandle,
         name: &str,
@@ -411,7 +413,7 @@ mod tests {
 
     #[tokio::test]
     async fn transmit_lossless_delivers_latent_over_bus() {
-        // Oma ResonanceBus (ei serial_test): lähettäjä + vastaanottaja.
+        // Own ResonanceBus (no serial_test): sender + receiver.
         let bus = ResonanceBus::start(None).await.expect("start bus");
         let (_rx_id, _rx_actor, rx_log) = join_being(&bus, "agent_b").await;
 
@@ -446,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn transmit_lossy_delivers_text_over_bus() {
-        // Häviöllinen käännös → vastaanottaja saa BusMessage::Text.
+        // A lossy translation → the receiver gets BusMessage::Text.
         let bus = ResonanceBus::start(None).await.expect("start bus");
         let (_rx_id, _rx_actor, rx_log) = join_being(&bus, "agent_b").await;
 

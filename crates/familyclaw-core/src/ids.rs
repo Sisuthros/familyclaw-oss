@@ -1,14 +1,15 @@
-//! Tyypitetyt tunnisteet (newtype) alustan entiteeteille.
+//! Typed identifiers (newtype) for platform entities.
 //!
-//! Jokainen tunniste kääri [`uuid::Uuid`]-arvon omaan tyyppiinsä jotta
-//! kääntäjä estää eri tunnistetyyppien sekoittamisen (esim. ettei
-//! [`AgentId`]-arvoa voi vahingossa antaa [`MessageId`]-paikkaan).
+//! Each identifier wraps a [`uuid::Uuid`] value in its own type so that
+//! the compiler prevents different identifier types from being mixed up
+//! (e.g. so an [`AgentId`] value can't accidentally be passed where a
+//! [`MessageId`] is expected).
 //!
-//! Kaikki tunnisteet:
-//! - sarjallistuvat samaan muotoon kuin alla oleva UUID (`serde transparent`),
-//! - tukevat `v4`-satunnaisgenerointia `new`-konstruktorilla,
-//! - jäsentyvät merkkijonosta [`std::str::FromStr`]-toteutuksella,
-//! - tulostuvat kanonisena UUID-merkkijonona [`std::fmt::Display`]-toteutuksella.
+//! All identifiers:
+//! - serialize in the same form as the underlying UUID (`serde transparent`),
+//! - support `v4` random generation via the `new` constructor,
+//! - parse from a string via the [`std::str::FromStr`] implementation,
+//! - print as the canonical UUID string via the [`std::fmt::Display`] implementation.
 
 use std::fmt;
 use std::str::FromStr;
@@ -16,18 +17,18 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Kiinteä nimiavaruus deterministisille (`UUIDv5`) tunnisteille.
+/// Fixed namespace for deterministic (`UUIDv5`) identifiers.
 ///
-/// Käytetään [`AgentId::from_name`]-tyyppisissä johdannaisissa, jotta vakaa
-/// nimi tuottaa aina saman tunnisteen yli prosessin uudelleenkäynnistyksen.
-/// Arvo on satunnaisesti valittu **kerran** eikä saa muuttua — sen
-/// vaihtaminen rikkoisi kaikkien aiemmin johdettujen tunnisteiden vakauden.
+/// Used in derivations like [`AgentId::from_name`] so that a stable
+/// name always produces the same identifier across process restarts.
+/// The value was chosen randomly **once** and must never change — changing
+/// it would break the stability of all previously derived identifiers.
 pub const ID_NAMESPACE: Uuid = uuid::uuid!("6f1c0e2a-9b3d-4f5a-8c7e-1d2b3a4c5d6e");
 
-/// Generoi newtype-tunnistetyypin annetulla nimellä ja dokumentaatiolla.
+/// Generates a newtype identifier type with the given name and documentation.
 ///
-/// Makro pitää toteutukset identtisinä kaikille tunnisteille ja vähentää
-/// toistoa ilman että julkinen API muuttuu.
+/// The macro keeps the implementation identical across all identifiers and
+/// reduces repetition without changing the public API.
 macro_rules! define_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -38,54 +39,54 @@ macro_rules! define_id {
         pub struct $name(Uuid);
 
         impl $name {
-            /// Luo uuden satunnaisen (`v4`) tunnisteen.
+            /// Creates a new random (`v4`) identifier.
             #[must_use]
             pub fn new() -> Self {
                 Self(Uuid::new_v4())
             }
 
-            /// Kääri olemassa olevan [`Uuid`]-arvon tähän tunnistetyyppiin.
+            /// Wraps an existing [`Uuid`] value in this identifier type.
             #[must_use]
             pub const fn from_uuid(uuid: Uuid) -> Self {
                 Self(uuid)
             }
 
-            /// Johtaa **deterministisen** tunnisteen vakaasta nimestä (`UUIDv5`).
+            /// Derives a **deterministic** identifier from a stable name (`UUIDv5`).
             ///
-            /// Sama `name` tuottaa AINA saman tunnisteen — yli prosessin
-            /// uudelleenkäynnistyksen, yli koneiden, ilman levyltä luettua tilaa.
-            /// Tämä on edellytys sille, että olennon identiteetti (ja siitä
-            /// johdettu `being_id`) pysyy **vakaana yli restartin**: ilman vakaata
-            /// tunnistetta kaatumiskestävälle pinnalle tallennettu jatkettava vuoro
-            /// ei enää täsmäisi heränneen agentin omistajuustarkistukseen.
+            /// The same `name` ALWAYS produces the same identifier — across process
+            /// restarts, across machines, without reading any state from disk.
+            /// This is a precondition for an entity's identity (and the `being_id`
+            /// derived from it) staying **stable across a restart**: without a stable
+            /// identifier, a resumable turn stored on the crash-resilient substrate
+            /// would no longer match the ownership check of the reawakened agent.
             ///
-            /// Nimiavaruus on [`ID_NAMESPACE`] (kiinteä, projektikohtainen),
-            /// joten eri tunnistetyypit johtavat saman nimen samaan UUID:hen —
-            /// tyyppijärjestelmä pitää ne silti erillään käännösaikana.
+            /// The namespace is [`ID_NAMESPACE`] (fixed, project-specific), so
+            /// different identifier types derive the same UUID from the same name —
+            /// the type system still keeps them separate at compile time.
             #[must_use]
             pub fn from_name(name: &str) -> Self {
                 Self(Uuid::new_v5(&ID_NAMESPACE, name.as_bytes()))
             }
 
-            /// Palauttaa sisällä olevan [`Uuid`]-arvon.
+            /// Returns the wrapped [`Uuid`] value.
             #[must_use]
             pub const fn as_uuid(&self) -> &Uuid {
                 &self.0
             }
 
-            /// Kuluttaa tunnisteen ja palauttaa sisällä olevan [`Uuid`]-arvon.
+            /// Consumes the identifier and returns the wrapped [`Uuid`] value.
             #[must_use]
             pub const fn into_uuid(self) -> Uuid {
                 self.0
             }
 
-            /// `nil`-tunniste (kaikki nollia) — käytetään oletus-/tyhjäarvona.
+            /// The `nil` identifier (all zeros) — used as a default/empty value.
             #[must_use]
             pub const fn nil() -> Self {
                 Self(Uuid::nil())
             }
 
-            /// Onko tämä `nil`-tunniste.
+            /// Whether this is the `nil` identifier.
             #[must_use]
             pub fn is_nil(&self) -> bool {
                 self.0.is_nil()
@@ -93,8 +94,8 @@ macro_rules! define_id {
         }
 
         impl Default for $name {
-            /// Oletuksena uusi satunnainen tunniste — jotta entiteetit
-            /// saavat aina ainutkertaisen identiteetin ilman erillistä kutsua.
+            /// Defaults to a new random identifier — so entities always get a
+            /// unique identity without a separate call.
             fn default() -> Self {
                 Self::new()
             }
@@ -129,17 +130,17 @@ macro_rules! define_id {
 }
 
 define_id! {
-    /// Yksittäisen agentin (perheenjäsenen) tunniste.
+    /// Identifier for a single agent (family member).
     AgentId
 }
 
 define_id! {
-    /// Perheen (agenttiryhmän) tunniste.
+    /// Identifier for a family (agent group).
     FamilyId
 }
 
 define_id! {
-    /// Yksittäisen viestin tunniste busissa.
+    /// Identifier for a single message on the bus.
     MessageId
 }
 
@@ -201,7 +202,7 @@ mod tests {
         let id = MessageId::new();
         let id_json = serde_json::to_string(&id).expect("serialize id");
         let uuid_json = serde_json::to_string(id.as_uuid()).expect("serialize uuid");
-        // Newtype sarjallistuu täsmälleen kuin paljas UUID-merkkijono.
+        // The newtype serializes exactly like a bare UUID string.
         assert_eq!(id_json, uuid_json);
 
         let back: MessageId = serde_json::from_str(&id_json).expect("deserialize id");
@@ -210,8 +211,8 @@ mod tests {
 
     #[test]
     fn distinct_id_types_do_not_share_serde_confusion() {
-        // Sama UUID, eri tyypit — arvot sarjallistuvat samaksi merkkijonoksi
-        // mutta tyyppijärjestelmä pitää ne erillään käännösaikana.
+        // Same UUID, different types — the values serialize to the same string
+        // but the type system keeps them separate at compile time.
         let raw = Uuid::new_v4();
         let agent = AgentId::from_uuid(raw);
         let message = MessageId::from_uuid(raw);
@@ -230,8 +231,9 @@ mod tests {
 
     #[test]
     fn from_name_is_deterministic_across_calls() {
-        // Sama nimi → sama tunniste. Tämä on vakauden ydin: kahdesti johdettu
-        // (kuin kahdessa eri prosessissa) tunniste täsmää, ei satunnaisuutta.
+        // Same name → same identifier. This is the core of the stability
+        // guarantee: an identifier derived twice (as if in two different
+        // processes) matches, with no randomness involved.
         let a = AgentId::from_name("agent_a");
         let b = AgentId::from_name("agent_a");
         assert_eq!(a, b);
@@ -248,8 +250,8 @@ mod tests {
 
     #[test]
     fn from_name_matches_known_v5_vector() {
-        // Kiinteä vektori suojaa nimiavaruuden tahattomalta muutokselta:
-        // jos `ID_NAMESPACE` muuttuu, tämä testi hälyttää (vakaus rikkoutuisi).
+        // A fixed vector protects the namespace against accidental changes:
+        // if `ID_NAMESPACE` changes, this test will flag it (stability would break).
         let expected = Uuid::new_v5(&ID_NAMESPACE, b"agent_a");
         assert_eq!(AgentId::from_name("agent_a").into_uuid(), expected);
     }

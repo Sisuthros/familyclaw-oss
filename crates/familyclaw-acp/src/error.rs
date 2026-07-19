@@ -1,53 +1,53 @@
-//! ACP-virhetyypit.
+//! ACP error types.
 //!
-//! Kaikki virheet joita ACP-clientti voi kohdata: spawn, JSON, I/O, timeout.
+//! All errors the ACP client can encounter: spawn, JSON, I/O, timeout.
 
 use std::path::PathBuf;
 
-/// ACP-clientin virhetyypit.
+/// ACP client error types.
 #[derive(Debug, thiserror::Error)]
 pub enum AcpError {
-    /// Binäärin spawn epäonnistui.
+    /// Spawning the binary failed.
     #[error("failed to spawn ACP agent '{binary}': {reason}")]
     Spawn {
-        /// Binääri jota yritettiin käynnistää.
+        /// The binary that was attempted to start.
         binary: PathBuf,
-        /// Syy.
+        /// Reason.
         reason: String,
     },
 
-    /// JSON-serialisointi/epäserialisointi epäonnistui.
+    /// JSON serialization/deserialization failed.
     #[error("ACP JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// I/O-virhe stdin/stdout-yhteydessä.
+    /// I/O error on the stdin/stdout connection.
     #[error("ACP I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Agentti aikakatkaistiin.
+    /// The agent timed out.
     #[error("ACP agent timeout after {secs}s: {agent}")]
     Timeout {
-        /// Agentin nimi.
+        /// The agent's name.
         agent: String,
-        /// Aikaraja sekunneissa.
+        /// Timeout limit in seconds.
         secs: u64,
     },
 
-    /// Agentti palautti virheellisen vastauksen.
+    /// The agent returned an invalid response.
     #[error("ACP unexpected response from '{agent}': {detail}")]
     UnexpectedResponse {
-        /// Agentin nimi.
+        /// The agent's name.
         agent: String,
-        /// Tarkennus.
+        /// Details.
         detail: String,
     },
 
-    /// Agentti kaatui (exit code != 0).
+    /// The agent crashed (exit code != 0).
     #[error("ACP agent '{agent}' crashed with exit code {code}")]
     Crash {
-        /// Agentin nimi.
+        /// The agent's name.
         agent: String,
-        /// Prosessin exit-koodi.
+        /// The process's exit code.
         code: i32,
     },
 }
@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn json_display_wraps_inner_message() {
-        // Tuota oikea serde_json::Error From-konversion kautta.
+        // Produce a real serde_json::Error via the From conversion.
         let json_err = serde_json::from_str::<i32>("not json").unwrap_err();
         let inner = json_err.to_string();
         let err: AcpError = json_err.into();
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn question_mark_propagates_io_error_via_from() {
-        // Varmistaa että `?` reitittää io::Error → AcpError::Io.
+        // Verifies that `?` routes io::Error → AcpError::Io.
         fn inner() -> Result<(), AcpError> {
             Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))?;
             Ok(())

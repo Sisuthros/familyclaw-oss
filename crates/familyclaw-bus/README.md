@@ -1,51 +1,53 @@
 # familyclaw-bus
 
-**Resonance Bus** — FamilyClaw v2:n *affektiivinen hermosto*
+**Resonance Bus** — FamilyClaw v2's *affective nervous system*
 ([design §2.2](../../docs/plans/2026-06-03-familyclaw-v2-design.md)).
-KERROS A / OSS (MIT).
+Layer A / OSS (MIT).
 
-Bus on [Ractor](https://docs.rs/ractor)-pohjainen actor-malli, jonka yli perheen
-olennot (agentit) viestivät — ja jonka yli **heidän tunnetilansa vuotaa
-toisilleen** (affective contagion). Kun yksi sisarus on luovassa virtauksessa,
-muut aistivat sen.
+The bus is a [Ractor](https://docs.rs/ractor)-based actor model over which
+a family's beings (agents) communicate — and over which **their emotional
+states leak into each other** (affective contagion). When one sibling is
+in creative flow, the others sense it.
 
-## Miksi
+## Why
 
-Live-tuotannossa Resonance Bus palautti `beings:[]` — tyhjän olentolistan,
-vaikka agentteja oli liittynyt. Tämä crate korjaa sen rakenteellisesti:
-`BusHandle::beings()` palauttaa todelliset liittyneet olennot, eikä lista ole
-koskaan tyhjä kun olentoja on rekisteröity.
+In live production, Resonance Bus returned `beings:[]` — an empty list of
+beings, even though agents had joined. This crate fixes that structurally:
+`BusHandle::beings()` returns the actual joined beings, and the list is
+never empty once beings have registered.
 
-## Ydinkäsitteet
+## Core concepts
 
-| Tyyppi | Vastuu |
+| Type | Responsibility |
 |--------|--------|
-| `BusMessage` | Busin "kieli": `Text`, `Latent`, **`EmotionPulse`**, `TaskEvent`, `Custom`. |
-| `ResonanceMessage` | Kirjekuori: hyötykuorma + lähettäjä + tunniste + UTC-aikaleima. |
-| `ResonanceBus` | Actor: rekisteröi olennot, lähettää viestit kaikille muille, leviää tunnepulssina. |
-| `BusHandle` | Ergonominen, `unwrap`-vapaa rajapinta busiin (`register` / `publish` / `beings` / `count`). |
-| `BeingInfo` / `BeingId` / `BeingSnapshot` | Liittyneen olennon tiedot, tunniste ja sarjallistuva tilannekuva. |
-| `CollectorBeing` | Valmis olento-actor testeihin/esimerkkeihin (kerää vastaanotetut viestit). |
+| `BusMessage` | The bus's "language": `Text`, `Latent`, **`EmotionPulse`**, `TaskEvent`, `Custom`. |
+| `ResonanceMessage` | Envelope: payload + sender + identifier + UTC timestamp. |
+| `ResonanceBus` | Actor: registers beings, sends messages to all others, propagates emotion pulses. |
+| `BusHandle` | Ergonomic, `unwrap`-free interface to the bus (`register` / `publish` / `beings` / `count`). |
+| `BeingInfo` / `BeingId` / `BeingSnapshot` | A joined being's info, identifier, and serializable snapshot. |
+| `CollectorBeing` | A ready-made being actor for tests/examples (collects received messages). |
 
-## Affektiivinen hermosto
+## Affective nervous system
 
-Kun olento julkaisee tunnetilansa pulssina (`BusMessage::EmotionPulse`),
-**kaikki muut olennot saavat sen** ja voivat reagoida sisaruksen mielialaan.
-Tämä on se "veri", joka tekee busista hermoston eikä pelkkää viestijonoa.
+When a being publishes its emotion state as a pulse
+(`BusMessage::EmotionPulse`), **all other beings receive it** and can react
+to a sibling's mood. This is the "blood" that makes the bus a nervous
+system rather than just a message queue.
 
-## Kestävyys (supervision)
+## Resilience (supervision)
 
-Olennot linkitetään busin alaisiksi. Jos yksittäinen olento kaatuu tai päättyy,
-bus saa supervision-tapahtuman, poistaa olennon rekisteristä ja **jatkaa
-elossa** — yhden olennon kaatuminen ei kaada hermostoa.
+Beings are linked as children of the bus. If an individual being crashes
+or terminates, the bus receives a supervision event, removes the being
+from the registry, and **stays alive** — one being's crash doesn't bring
+down the nervous system.
 
-## OSS-raja (KERROS A)
+## OSS boundary (Layer A)
 
-Crate ei kovakoodaa perheenjäsenten sieluja, mallinimiä, avaimia eikä polkuja.
-Olentojen tunnisteet ja nimet annetaan ajonaikaisesti; esimerkit käyttävät
-geneerisiä nimiä (`agent_a`, `agent_b`).
+The crate does not hardcode family members' souls, model names, keys, or
+paths. Beings' identifiers and names are supplied at runtime; examples use
+generic names (`agent_a`, `agent_b`).
 
-## Käyttö
+## Usage
 
 ```rust,ignore
 use familyclaw_bus::{BeingId, BeingInfo, BusMessage, CollectorBeing, ResonanceBus};

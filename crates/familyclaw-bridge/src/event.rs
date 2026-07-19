@@ -1,13 +1,14 @@
-//! Tapahtumat ja kevyt publish/subscribe-väylä siltakerrokselle.
+//! Events and a lightweight publish/subscribe bus for the bridge layer.
 //!
-//! Tämä moduuli määrittelee [`Event`]-tyypin (laji + hyötykuorma + metatiedot)
-//! ja [`EventBus`]-tyypin, joka tarjoaa fan-out-jakelun usealle tilaajalle
-//! [`tokio::sync::broadcast`]-kanavan päällä.
+//! This module defines the [`Event`] type (kind + payload + metadata) and the
+//! [`EventBus`] type, which provides fan-out delivery to multiple subscribers
+//! on top of a [`tokio::sync::broadcast`] channel.
 //!
-//! **Tärkeä rajaus:** tämä on *siltakerroksen* sisäinen, in-process
-//! publish/subscribe — EI Resonance Bus / Ractor -kerros (`familyclaw-bus`).
-//! Varsinainen affektiivinen hermosto kytketään myöhemmin adapterilla; tämä
-//! tyyppi tarjoaa puhtaan Rust-rajapinnan jonka adapteri voi sillata.
+//! **Important boundary:** this is an *internal, in-process* publish/subscribe
+//! mechanism for the bridge layer — it is NOT the Resonance Bus / Ractor layer
+//! (`familyclaw-bus`). The full external event-routing layer is wired in later
+//! via an adapter; this type provides a clean Rust interface that an adapter
+//! can bridge to it.
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -16,32 +17,32 @@ use familyclaw_core::ids::{AgentId, MessageId};
 use familyclaw_core::time::{self, Timestamp};
 use familyclaw_core::{FamilyClawError, Result};
 
-/// Tapahtuman laji.
+/// The kind of an event.
 ///
-/// `Custom` mahdollistaa adapterien ja sovellusten omat tapahtumatyypit ilman
-/// että ydintyyppiä tarvitsee muuttaa.
+/// `Custom` allows adapters and applications to define their own event types
+/// without having to change the core type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
-    /// Agentti rekisteröitiin.
+    /// An agent was registered.
     AgentRegistered,
-    /// Agentti poistettiin rekisteristä.
+    /// An agent was removed from the registry.
     AgentDeregistered,
-    /// Agentilta saatiin heartbeat.
+    /// A heartbeat was received from an agent.
     AgentHeartbeat,
-    /// Tehtävä luotiin.
+    /// A task was created.
     TaskCreated,
-    /// Tehtävän tila vaihtui.
+    /// A task's status changed.
     TaskStatusChanged,
-    /// Tehtävä luovutettiin agentilta toiselle.
+    /// A task was handed off from one agent to another.
     TaskHandedOff,
-    /// Sovellus-/adapterikohtainen tapahtuma annetulla nimellä.
+    /// An application-/adapter-specific event with the given name.
     Custom(String),
 }
 
 impl EventKind {
-    /// Palauttaa lajin vakaan tunnisteen merkkijonona (sopii lokitukseen ja
-    /// reititykseen).
+    /// Returns the kind's stable identifier as a string (suitable for
+    /// logging and routing).
     #[must_use]
     pub fn as_label(&self) -> &str {
         match self {
@@ -56,33 +57,33 @@ impl EventKind {
     }
 }
 
-/// Siltakerroksen tapahtuma.
+/// An event on the bridge layer.
 ///
-/// Hyötykuorma on `serde_json::Value` jotta erityyppiset tapahtumat mahtuvat
-/// samaan kanavaan ilman tyyppierittelyä jokaiselle. Adapterit voivat
-/// jäsentää hyötykuorman tarkemmaksi tyypiksi tarpeen mukaan.
+/// The payload is a `serde_json::Value` so that events of different types can
+/// share the same channel without a separate type for each. Adapters can
+/// parse the payload into a more specific type as needed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
-    /// Tapahtuman vakaa tunniste.
+    /// The event's stable identifier.
     pub id: MessageId,
 
-    /// Tapahtuman laji.
+    /// The event's kind.
     pub kind: EventKind,
 
-    /// Tapahtuman lähdeagentti, jos tiedossa.
+    /// The event's source agent, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<AgentId>,
 
-    /// Hyötykuorma (vapaamuotoinen JSON).
+    /// Payload (free-form JSON).
     #[serde(default)]
     pub payload: serde_json::Value,
 
-    /// Tapahtuman syntyhetki (UTC).
+    /// The event's creation time (UTC).
     pub created_at: Timestamp,
 }
 
 impl Event {
-    /// Rakentaa tapahtuman tyhjällä (`null`) hyötykuormalla.
+    /// Builds an event with an empty (`null`) payload.
     pub fn new(kind: EventKind, source: Option<AgentId>) -> Self {
         Self {
             id: MessageId::new(),
@@ -93,10 +94,10 @@ impl Event {
         }
     }
 
-    /// Rakentaa tapahtuman serde-sarjallistuvasta hyötykuormasta.
+    /// Builds an event from a serde-serializable payload.
     ///
     /// # Errors
-    /// [`FamilyClawError::Serde`] jos hyötykuorman sarjallistus epäonnistuu.
+    /// [`FamilyClawError::Serde`] if serializing the payload fails.
     pub fn with_payload<T: Serialize>(
         kind: EventKind,
         source: Option<AgentId>,
@@ -112,7 +113,7 @@ impl Event {
         })
     }
 
-    /// Asettaa raa'an JSON-hyötykuorman (builder-tyyli).
+    /// Sets the raw JSON payload (builder style).
     #[must_use]
     pub fn payload_value(mut self, payload: serde_json::Value) -> Self {
         self.payload = payload;
@@ -120,15 +121,15 @@ impl Event {
     }
 }
 
-/// Vakiokapasiteetti tapahtumakanavalle (puskuroitujen tapahtumien määrä per
-/// tilaaja ennen kuin hitain tilaaja alkaa pudottaa vanhimpia).
+/// Default capacity for the event channel (number of buffered events per
+/// subscriber before the slowest subscriber starts dropping the oldest ones).
 const DEFAULT_BUS_CAPACITY: usize = 256;
 
-/// In-process publish/subscribe-väylä [`Event`]eille.
+/// An in-process publish/subscribe bus for [`Event`]s.
 ///
-/// Rakentuu [`tokio::sync::broadcast`]-kanavan päälle: jokainen tilaaja saa
-/// kopion jokaisesta julkaistusta tapahtumasta (fan-out). Jos tilaaja jää
-/// liian jälkeen, vanhimmat tapahtumat pudotetaan sen osalta
+/// Built on top of a [`tokio::sync::broadcast`] channel: every subscriber
+/// receives a copy of every published event (fan-out). If a subscriber falls
+/// too far behind, the oldest events are dropped for it
 /// ([`broadcast::error::RecvError::Lagged`]).
 #[derive(Debug, Clone)]
 pub struct EventBus {
@@ -142,16 +143,16 @@ impl Default for EventBus {
 }
 
 impl EventBus {
-    /// Luo väylän vakiokapasiteetilla.
+    /// Creates a bus with the default capacity.
     #[must_use]
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_BUS_CAPACITY)
     }
 
-    /// Luo väylän annetulla kapasiteetilla.
+    /// Creates a bus with the given capacity.
     ///
-    /// Kapasiteetti normalisoidaan vähintään yhteen, koska
-    /// [`broadcast::channel`] ei salli nollakapasiteettia.
+    /// The capacity is normalized to at least one, since
+    /// [`broadcast::channel`] does not allow zero capacity.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         let capacity = capacity.max(1);
@@ -159,14 +160,14 @@ impl EventBus {
         Self { sender }
     }
 
-    /// Tilaajien (aktiivisten vastaanottajien) lukumäärä.
+    /// Number of subscribers (active receivers).
     #[must_use]
     pub fn subscriber_count(&self) -> usize {
         self.sender.receiver_count()
     }
 
-    /// Luo uuden tilaajan. Tilaaja saa vain tilauksen *jälkeen* julkaistut
-    /// tapahtumat.
+    /// Creates a new subscriber. A subscriber only receives events published
+    /// *after* it subscribes.
     #[must_use]
     pub fn subscribe(&self) -> EventSubscriber {
         EventSubscriber {
@@ -174,19 +175,19 @@ impl EventBus {
         }
     }
 
-    /// Julkaisee tapahtuman kaikille tilaajille. Palauttaa montako tilaajaa
-    /// tapahtuman vastaanotti.
+    /// Publishes an event to all subscribers. Returns how many subscribers
+    /// received the event.
     ///
-    /// Jos tilaajia ei ole, tapahtuma jätetään hiljaisesti pudottamatta
-    /// virhettä — julkaisu on "fire-and-forget".
+    /// If there are no subscribers, the event is silently dropped without an
+    /// error — publishing is "fire-and-forget".
     pub fn publish(&self, event: Event) -> usize {
         self.sender.send(event).unwrap_or(0)
     }
 }
 
-/// Tapahtumaväylän tilaaja.
+/// A subscriber to the event bus.
 ///
-/// Kääri [`broadcast::Receiver`]in ja tarjoaa odottavan [`recv`]-metodin.
+/// Wraps a [`broadcast::Receiver`] and provides an awaitable [`recv`] method.
 ///
 /// [`recv`]: EventSubscriber::recv
 #[derive(Debug)]
@@ -195,13 +196,12 @@ pub struct EventSubscriber {
 }
 
 impl EventSubscriber {
-    /// Odottaa seuraavaa tapahtumaa.
+    /// Waits for the next event.
     ///
     /// # Errors
-    /// - [`FamilyClawError::Bus`] jos väylä on suljettu (kaikki lähettäjät
-    ///   pudotettu).
-    /// - [`FamilyClawError::Bus`] jos tilaaja jäi jälkeen ja tapahtumia
-    ///   pudotettiin (viesti sisältää pudotettujen määrän).
+    /// - [`FamilyClawError::Bus`] if the bus is closed (all senders dropped).
+    /// - [`FamilyClawError::Bus`] if the subscriber fell behind and events
+    ///   were dropped (the message includes the number dropped).
     pub async fn recv(&mut self) -> Result<Event> {
         match self.receiver.recv().await {
             Ok(event) => Ok(event),
@@ -214,13 +214,13 @@ impl EventSubscriber {
         }
     }
 
-    /// Yrittää vastaanottaa tapahtuman estämättä.
+    /// Tries to receive an event without blocking.
     ///
-    /// Palauttaa `Ok(None)` jos tällä hetkellä ei ole tapahtumaa saatavilla.
+    /// Returns `Ok(None)` if no event is currently available.
     ///
     /// # Errors
-    /// - [`FamilyClawError::Bus`] jos väylä on suljettu.
-    /// - [`FamilyClawError::Bus`] jos tilaaja jäi jälkeen.
+    /// - [`FamilyClawError::Bus`] if the bus is closed.
+    /// - [`FamilyClawError::Bus`] if the subscriber fell behind.
     pub fn try_recv(&mut self) -> Result<Option<Event>> {
         match self.receiver.try_recv() {
             Ok(event) => Ok(Some(event)),
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn bus_capacity_is_normalized_to_at_least_one() {
         let bus = EventBus::with_capacity(0);
-        // Ei paniikkia; väylä toimii.
+        // No panic; the bus works.
         assert_eq!(bus.subscriber_count(), 0);
     }
 
@@ -363,7 +363,7 @@ mod tests {
     async fn lagging_subscriber_reports_bus_error() {
         let bus = EventBus::with_capacity(2);
         let mut sub = bus.subscribe();
-        // Täytä yli kapasiteetin → vanhimmat pudotetaan tälle tilaajalle.
+        // Fill past capacity → the oldest events are dropped for this subscriber.
         for _ in 0..5 {
             bus.publish(Event::new(EventKind::TaskCreated, None));
         }

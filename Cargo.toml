@@ -3,7 +3,9 @@ members = ["crates/*", "examples/minimal-gateway"]
 # NOTE: "compiler" (the experimental Claw language) is intentionally excluded from the
 # workspace build until it compiles cleanly. It is a future side-project, not part of the
 # agent runtime, and must not block the core build. Re-add once parser.rs is complete.
-exclude = ["compiler"]
+# NOTE: "crates/familyclaw-gemu" is intentionally excluded per MASTERPLAN §7 — it is not
+# a public/shipped component. Kept on disk (untracked), not part of the public workspace.
+exclude = ["compiler", "crates/familyclaw-gemu/"]
 resolver = "2"
 
 [workspace.package]
@@ -45,7 +47,6 @@ familyclaw-dream = { path = "crates/familyclaw-dream" }
 familyclaw-durable = { path = "crates/familyclaw-durable" }
 familyclaw-embeddings = { path = "crates/familyclaw-embeddings" }
 familyclaw-emotion = { path = "crates/familyclaw-emotion" }
-familyclaw-gemu = { path = "crates/familyclaw-gemu" }
 familyclaw-growth = { path = "crates/familyclaw-growth" }
 familyclaw-hearth = { path = "crates/familyclaw-hearth" }
 familyclaw-latent = { path = "crates/familyclaw-latent" }

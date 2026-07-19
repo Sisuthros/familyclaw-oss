@@ -4,12 +4,12 @@ Get FamilyClaw running in 5 minutes.
 
 ## Prerequisites
 
-- Rust 1.85+ (install with [`rustup`](https://rustup.rs/))
+- Rust 1.88+ (install with [`rustup`](https://rustup.rs/))
 - Git
 
 Verify Rust is installed:
 ```bash
-rustc --version  # Should show 1.85 or higher
+rustc --version  # Should show 1.88 or higher
 ```
 
 ## Build & Run
@@ -112,18 +112,18 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/... cargo run -p familyclaw
 
 ### Learn the Architecture
 
-Read [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) to understand:
+Read [`ARCHITECTURE.md`](ARCHITECTURE.md) to understand:
 - The Resonance Bus design
 - Agent lifecycle and memory system
 - Emotion contagion and dream consolidation
-- KERROS A/B layer separation
+- Layer A / Layer B separation
 
 ### Contribute
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for:
+See [`CONTRIBUTING.md`](../CONTRIBUTING.md) for:
 - How to set up your development environment
 - Testing conventions (full test suite, all passing)
-- Code style guidelines (no `unsafe`, Finnish comments OK)
+- Code style guidelines (no `unsafe`, English comments and docs)
 
 ### Explore the Code
 

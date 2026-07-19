@@ -1,75 +1,76 @@
-//! Kyvykkyysmalli (capability model) sandboxille.
+//! Capability model for the sandbox.
 //!
-//! Sandboxissa ajettava koodi saa **vain ne oikeudet jotka sille
-//! eksplisiittisesti myönnetään**. Oletuksena koodilla ei ole verkkoa eikä
-//! tiedostojärjestelmäpääsyä — "deny by default". Tämä on KERROS A:n
-//! turvaperiaate (design §2 turva): epäluotettu koodi ei pääse käsiksi
-//! verkkoon, salaisuuksiin tai mielivaltaisiin polkuihin.
+//! Code executed in the sandbox is granted **only the rights explicitly
+//! given to it**. By default, code has no network or filesystem access —
+//! "deny by default". This is a Layer A security principle (design §2
+//! security): untrusted code cannot reach the network, secrets, or
+//! arbitrary paths.
 //!
-//! Malli on tarkoituksella **deklaratiivinen tieto** — varsinainen
-//! pakottaminen tapahtuu ajonaikaisessa backendissä (esim. wasmtime-WASI).
-//! Tämä erottelu pitää kyvykkyyslogiikan testattavana ilman raskasta
-//! wasmtime-riippuvuutta.
+//! The model is deliberately **declarative data** — the actual enforcement
+//! happens in the runtime backend (e.g. wasmtime-WASI). This separation
+//! keeps the capability logic testable without the heavy wasmtime
+//! dependency.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Yksittäinen kyvykkyys jonka sandboxissa ajettava koodi voi saada.
+/// A single capability that code executed in the sandbox can be granted.
 ///
-/// Kyvykkyydet ovat additiivisia: koodi saa täsmälleen ne joukot jotka
-/// [`CapabilitySet`]:iin on lisätty, ei mitään muuta.
+/// Capabilities are additive: code is granted exactly the sets added to the
+/// [`CapabilitySet`], nothing else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 #[non_exhaustive]
 pub enum Capability {
-    /// Lukuoikeus yhteen tiedostojärjestelmäpolkuun (ja sen alipuuhun).
+    /// Read access to a single filesystem path (and its subtree).
     ///
-    /// Polku tulkitaan etuliitteenä: pääsy sallitaan tiedostoon `p` jos
-    /// jokin myönnetty `ReadOnlyFs`-polku on `p`:n esi-isä tai sama polku.
+    /// The path is interpreted as a prefix: access to file `p` is allowed if
+    /// some granted `ReadOnlyFs` path is an ancestor of `p` or the same path.
     ReadOnlyFs {
-        /// Sallittu juuripolku (etuliite).
+        /// The allowed root path (prefix).
         path: PathBuf,
     },
 
-    /// Verkkopääsy nimettyyn isäntään (host). Oletuksena verkkoa EI ole;
-    /// tämä on harkittu poikkeus. Tyhjä `host` ei ole sallittu.
+    /// Network access to a named host. By default there is NO network
+    /// access; this is a deliberate exception. An empty `host` is not
+    /// allowed.
     Network {
-        /// Sallittu isäntänimi tai osoite (esim. `"api.example.com"`).
+        /// The allowed hostname or address (e.g. `"api.example.com"`).
         host: String,
     },
 
-    /// Ympäristömuuttujan lukuoikeus nimen perusteella.
+    /// Read access to an environment variable by name.
     EnvVar {
-        /// Sallitun ympäristömuuttujan nimi.
+        /// The name of the allowed environment variable.
         name: String,
     },
 }
 
 impl Capability {
-    /// Rakentaa [`Capability::ReadOnlyFs`]-kyvyn annetusta polusta.
+    /// Builds a [`Capability::ReadOnlyFs`] capability from the given path.
     #[must_use]
     pub fn read_only_fs(path: impl Into<PathBuf>) -> Self {
         Self::ReadOnlyFs { path: path.into() }
     }
 
-    /// Rakentaa [`Capability::Network`]-kyvyn annetusta isännästä.
+    /// Builds a [`Capability::Network`] capability from the given host.
     #[must_use]
     pub fn network(host: impl Into<String>) -> Self {
         Self::Network { host: host.into() }
     }
 
-    /// Rakentaa [`Capability::EnvVar`]-kyvyn annetusta muuttujanimestä.
+    /// Builds a [`Capability::EnvVar`] capability from the given variable name.
     #[must_use]
     pub fn env_var(name: impl Into<String>) -> Self {
         Self::EnvVar { name: name.into() }
     }
 
-    /// Onko tämä kyvykkyys hyvinmuodostettu (ei tyhjiä pakollisia kenttiä).
+    /// Whether this capability is well-formed (no empty required fields).
     ///
-    /// Käytetään [`CapabilitySet::validate`]:ssa. Erityisesti tyhjä host /
-    /// env-nimi tai tyhjä polku katsotaan virheelliseksi, koska ne johtaisivat
-    /// epämääräiseen tai liian laajaan pääsyyn.
+    /// Used in [`CapabilitySet::validate`]. In particular, an empty host /
+    /// env name or an empty path is considered invalid, because it would
+    /// lead to ambiguous or overly broad access.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         match self {
@@ -80,65 +81,65 @@ impl Capability {
     }
 }
 
-/// Joukko kyvykkyyksiä jotka sandbox myöntää ajettavalle koodille.
+/// The set of capabilities the sandbox grants to executed code.
 ///
-/// Oletuksena ([`CapabilitySet::deny_all`] / [`Default`]) joukko on tyhjä:
-/// ei verkkoa, ei tiedostoja, ei ympäristömuuttujia. Kyvykkyyksiä lisätään
-/// eksplisiittisesti builder-tyylillä.
+/// By default ([`CapabilitySet::deny_all`] / [`Default`]) the set is empty:
+/// no network, no files, no environment variables. Capabilities are added
+/// explicitly using the builder style.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CapabilitySet {
-    /// Myönnetyt kyvykkyydet. Järjestys ei ole merkitsevä.
+    /// The granted capabilities. Order is not significant.
     capabilities: Vec<Capability>,
 }
 
 impl CapabilitySet {
-    /// Tyhjä joukko — "deny all". Tämä on turvallinen oletus.
+    /// An empty set — "deny all". This is the safe default.
     #[must_use]
     pub fn deny_all() -> Self {
         Self::default()
     }
 
-    /// Rakentaa joukon valmiista kyvykkyyksien iteraattorista.
+    /// Builds a set from a ready iterator of capabilities.
     pub fn from_iter_caps(caps: impl IntoIterator<Item = Capability>) -> Self {
         Self {
             capabilities: caps.into_iter().collect(),
         }
     }
 
-    /// Lisää kyvykkyyden (builder-tyyli). Duplikaatteja ei lisätä uudelleen.
+    /// Adds a capability (builder style). Duplicates are not added again.
     #[must_use]
     pub fn with(mut self, capability: Capability) -> Self {
         self.grant(capability);
         self
     }
 
-    /// Lisää kyvykkyyden paikan päällä. Jos identtinen kyvykkyys on jo
-    /// joukossa, ei lisätä duplikaattia.
+    /// Adds a capability in place. If an identical capability is already in
+    /// the set, no duplicate is added.
     pub fn grant(&mut self, capability: Capability) {
         if !self.capabilities.contains(&capability) {
             self.capabilities.push(capability);
         }
     }
 
-    /// Onko joukko tyhjä (täysi "deny all").
+    /// Whether the set is empty (full "deny all").
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.capabilities.is_empty()
     }
 
-    /// Myönnettyjen kyvykkyyksien lukumäärä.
+    /// The number of granted capabilities.
     #[must_use]
     pub fn len(&self) -> usize {
         self.capabilities.len()
     }
 
-    /// Iteroi myönnetyt kyvykkyydet.
+    /// Iterates over the granted capabilities.
     pub fn iter(&self) -> impl Iterator<Item = &Capability> {
         self.capabilities.iter()
     }
 
-    /// Onko verkkopääsyä myönnetty lainkaan.
+    /// Whether any network access is granted at all.
     #[must_use]
     pub fn allows_any_network(&self) -> bool {
         self.capabilities
@@ -146,7 +147,7 @@ impl CapabilitySet {
             .any(|c| matches!(c, Capability::Network { .. }))
     }
 
-    /// Onko verkkopääsy annettuun isäntään myönnetty.
+    /// Whether network access to the given host is granted.
     #[must_use]
     pub fn allows_network_host(&self, host: &str) -> bool {
         self.capabilities
@@ -154,12 +155,12 @@ impl CapabilitySet {
             .any(|c| matches!(c, Capability::Network { host: h } if h == host))
     }
 
-    /// Onko lukupääsy annettuun polkuun myönnetty.
+    /// Whether read access to the given path is granted.
     ///
-    /// Pääsy sallitaan jos jokin myönnetty [`Capability::ReadOnlyFs`]-polku on
-    /// pyydetyn polun etuliite (esi-isä tai sama polku). Vertailu tehdään
-    /// komponenttitasolla, joten `/data` EI salli `/data2`:ta vaikka se onkin
-    /// merkkijono-etuliite.
+    /// Access is allowed if some granted [`Capability::ReadOnlyFs`] path is a
+    /// prefix of the requested path (an ancestor or the same path). The
+    /// comparison is done at the component level, so `/data` does NOT allow
+    /// `/data2` even though it is a string prefix.
     #[must_use]
     pub fn allows_read_path(&self, path: impl AsRef<Path>) -> bool {
         let path = path.as_ref();
@@ -169,7 +170,7 @@ impl CapabilitySet {
         })
     }
 
-    /// Onko annettu ympäristömuuttuja sallittu luettavaksi.
+    /// Whether the given environment variable is allowed to be read.
     #[must_use]
     pub fn allows_env_var(&self, name: &str) -> bool {
         self.capabilities
@@ -177,11 +178,11 @@ impl CapabilitySet {
             .any(|c| matches!(c, Capability::EnvVar { name: n } if n == name))
     }
 
-    /// Validoi koko kyvykkyysjoukon.
+    /// Validates the entire capability set.
     ///
     /// # Errors
-    /// [`crate::SandboxError::Capability`] jos jokin kyvykkyys on huonosti
-    /// muodostettu (esim. tyhjä host, tyhjä polku tai tyhjä env-nimi).
+    /// [`crate::SandboxError::Capability`] if some capability is malformed
+    /// (e.g. an empty host, empty path, or empty env name).
     pub fn validate(&self) -> crate::Result<()> {
         for cap in &self.capabilities {
             if !cap.is_well_formed() {
@@ -209,18 +210,19 @@ impl<'a> IntoIterator for &'a CapabilitySet {
     }
 }
 
-/// Onko `candidate` polku `root`:in alla (sama tai alipuu), komponenttitasolla.
+/// Whether `candidate` is under `root` (same path or a subtree), at the
+/// component level.
 ///
-/// Komponenttivertailu estää väärät osumat kuten `/data` vs `/data2`.
+/// Component-level comparison prevents false matches like `/data` vs `/data2`.
 fn path_is_within(root: &Path, candidate: &Path) -> bool {
     let mut root_components = root.components();
     let mut cand_components = candidate.components();
     loop {
         match root_components.next() {
-            // Root loppui ilman eroavaisuutta → candidate on rootin alla.
+            // Root ended without a mismatch -> candidate is under root.
             None => return true,
             Some(rc) => match cand_components.next() {
-                // Candidate loppui ennen rootia → ei voi olla sen alla.
+                // Candidate ended before root -> it cannot be under root.
                 None => return false,
                 Some(cc) => {
                     if rc != cc {
@@ -274,12 +276,12 @@ mod tests {
         assert!(caps.allows_read_path("/data"));
         assert!(caps.allows_read_path("/data/file.txt"));
         assert!(caps.allows_read_path("/data/nested/deep.bin"));
-        // Komponenttitaso: /data2 EI ole /data:n alla vaikka merkkijonona on.
+        // Component level: /data2 is NOT under /data even though it is as a string.
         assert!(!caps.allows_read_path("/data2"));
         assert!(!caps.allows_read_path("/data2/secret"));
-        // Eri juuri ei salli.
+        // A different root does not allow it.
         assert!(!caps.allows_read_path("/etc/passwd"));
-        // Lyhyempi polku ei ole rootin alla.
+        // A shorter path is not under the root.
         assert!(!caps.allows_read_path("/"));
     }
 

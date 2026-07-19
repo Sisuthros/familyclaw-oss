@@ -108,4 +108,6 @@ Open a **Discussion** on GitHub (not an issue) for design questions, architectur
 
 ---
 
-**FamilyClaw is KERROS A (OSS).** No hardcoded family members, keys, or paths. All runtime config via env / `familyclaw.toml`. Keep it that way.
+**FamilyClaw is Layer A (OSS).** No hardcoded family members, keys, or paths. All runtime config via env / `familyclaw.toml`. Keep it that way.
+
+**Language:** all code comments, commit messages, and documentation in this repository are written in **English**. This applies to new contributions and to translations of existing content.

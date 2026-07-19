@@ -1,34 +1,34 @@
-//! Roolipohjainen pääsynvalvonta ([`RbacPolicy`]) agenttien kyvykkyyksille.
+//! Role-based access control ([`RbacPolicy`]) for agent capabilities.
 //!
-//! Tämä on **syvyyspuolustusta** wasmtime-hiekkalaatikon päällä: vaikka
-//! sandbox rajaa mitä koodi *voi* tehdä, RBAC rajaa mitä kullakin roolilla on
-//! *lupa* tehdä. Politiikka kuvaa roolista ([`AgentRole`]) sallittuihin
-//! kyvykkyystunnisteisiin (esim. `"browser"`, `"system.run"`).
+//! This is **defense in depth** on top of the wasmtime sandbox: while the
+//! sandbox restricts what code *can* do, RBAC restricts what each role is
+//! *permitted* to do. A policy maps a role ([`AgentRole`]) to the set of
+//! allowed capability identifiers (e.g. `"browser"`, `"system.run"`).
 //!
-//! ## Periaatteet
-//! - **Oletuksena kielto.** Tyhjä politiikka kieltää kaiken. Luvat lisätään
-//!   eksplisiittisesti [`RbacPolicy::allow`]-rakentajalla.
-//! - **Deterministinen.** Tarkastus on puhdas funktio politiikan tilasta.
-//! - **OSS-raja:** roolit ja kyvykkyydet ovat geneerisiä tunnisteita, ei
-//!   sieluja eikä avaimia.
+//! ## Principles
+//! - **Deny by default.** An empty policy denies everything. Grants are
+//!   added explicitly via the [`RbacPolicy::allow`] builder.
+//! - **Deterministic.** A check is a pure function of the policy state.
+//! - **OSS boundary:** roles and capabilities are generic identifiers, not
+//!   private identities or secrets.
 
 use std::collections::{HashMap, HashSet};
 
 use familyclaw_bridge::AgentRole;
 use familyclaw_core::{FamilyClawError, Result};
 
-/// RBAC-tarkastuksen virhe.
+/// Error from an RBAC check.
 ///
-/// Erillinen tyyppi joka muuntuu [`FamilyClawError`]:ksi (`?`-operaattorilla),
-/// jotta kutsuja saa selkeän pääsynvalvontavirheen mutta voi silti yhdistää
-/// sen alustan keskitettyyn virhetyyppiin.
+/// A distinct type that converts into [`FamilyClawError`] (via the `?`
+/// operator), so callers get a clear access-control error while still being
+/// able to fold it into the platform's unified error type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RbacError {
-    /// Roolilla ei ole oikeutta annettuun kyvykkyyteen.
+    /// The role does not have permission for the given capability.
     Denied {
-        /// Rooli jolle pääsy evättiin.
+        /// The role for which access was denied.
         role: AgentRole,
-        /// Kyvykkyys jota yritettiin käyttää.
+        /// The capability that was attempted.
         capability: String,
     },
 }
@@ -54,11 +54,11 @@ impl From<RbacError> for FamilyClawError {
     }
 }
 
-/// Roolipohjainen pääsynvalvontapolitiikka.
+/// Role-based access control policy.
 ///
-/// Kuvaa kullekin [`AgentRole`]:lle joukon sallittuja kyvykkyystunnisteita.
-/// Oletuksena (tyhjä politiikka) kaikki on kielletty; luvat lisätään
-/// [`allow`]-rakentajalla.
+/// Maps each [`AgentRole`] to a set of allowed capability identifiers.
+/// By default (an empty policy) everything is denied; grants are added via
+/// the [`allow`]-builder.
 ///
 /// [`allow`]: RbacPolicy::allow
 #[derive(Debug, Clone, Default)]
@@ -67,16 +67,16 @@ pub struct RbacPolicy {
 }
 
 impl RbacPolicy {
-    /// Luo tyhjän politiikan (kaikki kielletty).
+    /// Creates an empty policy (everything denied).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Lisää luvan: rooli `role` saa käyttää kyvykkyyttä `capability`.
+    /// Adds a grant: role `role` may use capability `capability`.
     ///
-    /// Rakentaja-tyyli (palauttaa `self`), joten lupia voi ketjuttaa.
-    /// Idempotentti: saman luvan lisääminen kahdesti ei muuta tilaa.
+    /// Builder-style (returns `self`), so grants can be chained.
+    /// Idempotent: adding the same grant twice does not change the state.
     #[must_use]
     pub fn allow(mut self, role: AgentRole, capability: impl Into<String>) -> Self {
         self.allowed
@@ -86,7 +86,7 @@ impl RbacPolicy {
         self
     }
 
-    /// Lisää luvan paikan päällä (ei-rakentaja-variantti).
+    /// Adds a grant in place (non-builder variant).
     pub fn grant(&mut self, role: AgentRole, capability: impl Into<String>) {
         self.allowed
             .entry(role)
@@ -94,14 +94,14 @@ impl RbacPolicy {
             .insert(capability.into());
     }
 
-    /// Poistaa luvan. Palauttaa `true` jos lupa oli olemassa.
+    /// Removes a grant. Returns `true` if the grant existed.
     pub fn revoke(&mut self, role: AgentRole, capability: &str) -> bool {
         self.allowed
             .get_mut(&role)
             .is_some_and(|set| set.remove(capability))
     }
 
-    /// Onko roolilla lupa annettuun kyvykkyyteen (boolitarkastus, ei virhettä).
+    /// Whether the role has permission for the given capability (boolean check, no error).
     #[must_use]
     pub fn is_allowed(&self, role: AgentRole, capability: &str) -> bool {
         self.allowed
@@ -109,10 +109,10 @@ impl RbacPolicy {
             .is_some_and(|set| set.contains(capability))
     }
 
-    /// Tarkastaa luvan ja palauttaa virheen jos pääsy evätään.
+    /// Checks permission and returns an error if access is denied.
     ///
     /// # Errors
-    /// [`RbacError::Denied`] jos roolilla ei ole oikeutta kyvykkyyteen.
+    /// [`RbacError::Denied`] if the role does not have permission for the capability.
     pub fn check(&self, role: AgentRole, capability: &str) -> std::result::Result<(), RbacError> {
         if self.is_allowed(role, capability) {
             Ok(())
@@ -124,19 +124,20 @@ impl RbacPolicy {
         }
     }
 
-    /// Tarkastaa luvan ja muuntaa virheen alustan [`FamilyClawError`]:ksi.
+    /// Checks permission and converts the error into the platform's [`FamilyClawError`].
     ///
-    /// Mukavuusmetodi kun kutsuja työskentelee [`Result`]-tyypin kanssa.
+    /// A convenience method for when the caller is working with the
+    /// [`Result`] type.
     ///
     /// # Errors
-    /// [`FamilyClawError::InvalidInput`] (kääritty [`RbacError`]) jos pääsy
-    /// evätään.
+    /// [`FamilyClawError::InvalidInput`] (wrapping [`RbacError`]) if access
+    /// is denied.
     pub fn check_core(&self, role: AgentRole, capability: &str) -> Result<()> {
         self.check(role, capability).map_err(FamilyClawError::from)
     }
 
-    /// Palauttaa roolin sallitut kyvykkyydet aakkosjärjestyksessä
-    /// (deterministinen, sopii tarkastukseen/lokitukseen).
+    /// Returns the role's allowed capabilities in alphabetical order
+    /// (deterministic, suitable for auditing/logging).
     #[must_use]
     pub fn capabilities_for(&self, role: AgentRole) -> Vec<String> {
         let mut out: Vec<String> = self
@@ -170,7 +171,7 @@ mod tests {
         assert!(policy.is_allowed(AgentRole::Executor, "browser"));
         assert!(policy.check(AgentRole::Executor, "system.run").is_ok());
 
-        // Toinen rooli ei peri lupia.
+        // Another role does not inherit grants.
         assert!(!policy.is_allowed(AgentRole::Scout, "system.run"));
     }
 
@@ -222,7 +223,7 @@ mod tests {
 
         assert!(policy.revoke(AgentRole::Executor, "browser"));
         assert!(!policy.is_allowed(AgentRole::Executor, "browser"));
-        // Toinen revoke samalle: ei ollut olemassa.
+        // A second revoke of the same: did not exist.
         assert!(!policy.revoke(AgentRole::Executor, "browser"));
     }
 
@@ -244,23 +245,23 @@ mod tests {
             policy.capabilities_for(AgentRole::Strategy),
             vec!["alpha", "mu", "zeta"]
         );
-        // Roolilla ilman lupia → tyhjä.
+        // A role with no grants -> empty.
         assert!(policy.capabilities_for(AgentRole::Scout).is_empty());
     }
 
-    // --- Reunatapaukset ---
+    // --- Edge cases ---
 
-    /// Tyhjä merkkijono on validi (mutta erillinen) kyvykkyystunniste:
-    /// se täytyy myöntää eksplisiittisesti, eikä se vuoda muille tunnisteille.
+    /// The empty string is a valid (but distinct) capability identifier:
+    /// it must be granted explicitly, and it does not leak to other identifiers.
     #[test]
     fn empty_string_capability_is_distinct_and_must_be_granted() {
-        // Oletuksena (ei myönnetty) tyhjä kyvykkyys on kielletty.
+        // By default (not granted), the empty capability is denied.
         let denied = RbacPolicy::new();
         assert!(!denied.is_allowed(AgentRole::Executor, ""));
         assert!(denied.check(AgentRole::Executor, "").is_err());
 
-        // Eksplisiittisesti myönnetty tyhjä kyvykkyys sallitaan, mutta se ei
-        // anna lupaa ei-tyhjään kyvykkyyteen (eikä päinvastoin).
+        // An explicitly granted empty capability is allowed, but it does not
+        // grant permission for a non-empty capability (nor vice versa).
         let policy = RbacPolicy::new().allow(AgentRole::Executor, "");
         assert!(policy.is_allowed(AgentRole::Executor, ""));
         assert!(policy.check(AgentRole::Executor, "").is_ok());
@@ -270,26 +271,26 @@ mod tests {
         assert!(!only_named.is_allowed(AgentRole::Executor, ""));
     }
 
-    /// Kyvykkyydet ovat tarkka (case-sensitive) `HashSet`-täsmäys:
-    /// `"Browser"` ei vastaa myönnettyä `"browser"`:ia.
+    /// Capabilities are matched with exact (case-sensitive) `HashSet` equality:
+    /// `"Browser"` does not match a granted `"browser"`.
     #[test]
     fn capability_match_is_case_sensitive() {
         let policy = RbacPolicy::new().allow(AgentRole::Executor, "browser");
 
-        // Tarkka täsmäys sallitaan.
+        // An exact match is allowed.
         assert!(policy.is_allowed(AgentRole::Executor, "browser"));
 
-        // Eri kirjainkoko ei täsmää.
+        // A different case does not match.
         assert!(!policy.is_allowed(AgentRole::Executor, "Browser"));
         assert!(!policy.is_allowed(AgentRole::Executor, "BROWSER"));
         assert!(policy.check(AgentRole::Executor, "Browser").is_err());
 
-        // Revoke on myös kirjainkoolle herkkä: väärä koko ei poista mitään.
+        // Revoke is also case-sensitive: the wrong case removes nothing.
         let mut mutable = RbacPolicy::new();
         mutable.grant(AgentRole::Executor, "browser");
         assert!(!mutable.revoke(AgentRole::Executor, "Browser"));
         assert!(mutable.is_allowed(AgentRole::Executor, "browser"));
-        // Oikealla kirjainkoolla revoke onnistuu.
+        // With the correct case, revoke succeeds.
         assert!(mutable.revoke(AgentRole::Executor, "browser"));
     }
 }

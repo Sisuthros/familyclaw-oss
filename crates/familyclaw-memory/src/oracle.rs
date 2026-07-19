@@ -1,9 +1,9 @@
 //! Pattern Oracle — verification-gated provenance.
 //!
-//! Ennen muistin kirjoitusta tai tärkeää päätöstä Oracle tarkistaa
-//! onko vastaavia kuvioita (pattern) nähty aiemmin. Confirmed-muistot
-//! painavat 5× enemmän kuin Claim-muistot, joten vahvistamattomat
-//! väitteet eivät voi hukuttaa vahvistettua tietoa.
+//! Before a memory write or an important decision, the Oracle checks
+//! whether similar patterns have been seen before. Confirmed memories
+//! weigh 5× more than Claim memories, so unverified
+//! claims cannot drown out confirmed information.
 //!
 //! # Score
 //! ```text
@@ -11,7 +11,7 @@
 //! weight: Confirmed=1.0, Evidence=0.6, Claim=0.2
 //! ```
 //!
-//! # Riskitasot
+//! # Risk levels
 //! - score < 1.0: Low
 //! - score < 3.0: Medium
 //! - score < 6.0: High
@@ -19,21 +19,21 @@
 
 use crate::memory::{Memory, VerificationStatus};
 
-/// Riskitaso Oracle-tulosteelle.
+/// Risk level for Oracle output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RiskLevel {
-    /// Matala riski — ei merkittäviä osuvia kuvioita.
+    /// Low risk — no significant matching patterns.
     Low,
-    /// Keskitaso — joitain osuvia kuvioita, kannattaa tarkistaa.
+    /// Medium — some matching patterns, worth checking.
     Medium,
-    /// Korkea riski — vahvistettuja kuvioita osuu, toimi varoen.
+    /// High risk — confirmed patterns match, proceed with caution.
     High,
-    /// Kriittinen — vahvistettuja ja tiheästi toistuvia kuvioita osuu.
+    /// Critical — confirmed and frequently recurring patterns match.
     Critical,
 }
 
 impl RiskLevel {
-    /// Ihmisluettava nimi.
+    /// Human-readable name.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -45,33 +45,33 @@ impl RiskLevel {
     }
 }
 
-/// Yksittäinen osuma Oracle-haussa.
+/// A single match in an Oracle lookup.
 #[derive(Debug, Clone)]
 pub struct PatternMatch {
-    /// Ryhmittelyavain, jos asetettu.
+    /// Grouping key, if set.
     pub pattern_key: Option<String>,
-    /// Muiston sisältö (otsikko).
+    /// The memory's content (title).
     pub title: String,
-    /// Luottamustaso (0.0–1.0).
+    /// Confidence level (0.0-1.0).
     pub confidence: f32,
-    /// Varmennustila.
+    /// Verification status.
     pub verification_status: VerificationStatus,
-    /// Osuus tämän osuman painosta kokonaispisteisiin.
+    /// This match's contribution to the total score.
     pub weight_contribution: f32,
 }
 
-/// Oracle-tuloste.
+/// Oracle output.
 #[derive(Debug, Clone)]
 pub struct OracleResult {
-    /// Riskitaso.
+    /// Risk level.
     pub risk_level: RiskLevel,
-    /// Kokonaispistemäärä.
+    /// Total score.
     pub score: f32,
-    /// Osuneet kuviot.
+    /// Matched patterns.
     pub matched_patterns: Vec<PatternMatch>,
 }
 
-/// Pilkkoo tekstin tokeneiksi vertailua varten.
+/// Splits text into tokens for comparison.
 fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.len() > 2)
@@ -79,13 +79,13 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Laskee kuinka monta prosenttia promptin tokeneista löytyy muistosta.
+/// Computes what percentage of the prompt's tokens are found in the memory.
 fn token_overlap(prompt_tokens: &[String], memory: &Memory) -> f32 {
     if prompt_tokens.is_empty() || memory.content.is_empty() {
         return 0.0;
     }
 
-    // Uniikit tokenit — duplikaatit eivät saa kasvattaa nimittäjää
+    // Unique tokens — duplicates must not inflate the denominator
     let mut seen = std::collections::HashSet::new();
     let uniq_tokens: Vec<&String> = prompt_tokens
         .iter()
@@ -115,19 +115,19 @@ fn token_overlap(prompt_tokens: &[String], memory: &Memory) -> f32 {
     ratio
 }
 
-/// Aja Oracle-preflight: tarkista onko annetuissa ehdokasmuistoissa
-/// kuvioita jotka osuvat annettuun promptiin.
+/// Runs the Oracle preflight: checks whether the given candidate memories
+/// contain patterns that match the given prompt.
 ///
-/// # Parametrit
-/// - `prompt`: teksti johon verrataan (esim. uusi muistin sisältö tai tehtävä)
-/// - `candidates`: ehdokasmuistot joista etsitään osumia (tyypillisesti
-///   kaikki aktiiviset muistot tai pattern_key-ryhmän muistot)
+/// # Parameters
+/// - `prompt`: the text to compare against (e.g. new memory content or a task)
+/// - `candidates`: candidate memories to search for matches (typically
+///   all active memories or memories in a `pattern_key` group)
 ///
-/// # Palauttaa
-/// [`OracleResult`]: riskitaso, pisteet ja osuneet kuviot.
+/// # Returns
+/// [`OracleResult`]: risk level, score, and matched patterns.
 #[must_use]
 pub fn preflight(prompt: &str, candidates: &[Memory]) -> OracleResult {
-    // Minimiosuma: vähintään 15% tokeneista täsmättävä
+    // Minimum match: at least 15% of tokens must match
     const OVERLAP_THRESHOLD: f32 = 0.15;
 
     let prompt_tokens = tokenize(prompt);
@@ -154,7 +154,7 @@ pub fn preflight(prompt: &str, candidates: &[Memory]) -> OracleResult {
         });
     }
 
-    // Järjestä painavimmat ensin
+    // Sort heaviest first
     matches.sort_by(|a, b| {
         b.weight_contribution
             .partial_cmp(&a.weight_contribution)
@@ -210,13 +210,13 @@ mod tests {
         let claim = mem("rust memory engine"); // verification_status default = Claim, confidence = 0.0
         let confirmed = confirmed_mem("rust memory engine");
 
-        // Token-overlap on sama, mutta confidence + status weight eroaa
+        // Token overlap is the same, but confidence + status weight differ
         let r_claim = preflight("rust memory engine", &[claim]);
         let r_confirmed = preflight("rust memory engine", &[confirmed]);
 
         // Confirmed: confidence=1.0 × weight=1.0 = 1.0
         // Claim: confidence=0.0 × weight=0.2 = 0.0
-        // Confirmed pitäisi olla suurempi (mutta claim voi olla 0 jos confidence=0)
+        // Confirmed should be larger (but claim may be 0 if confidence=0)
         assert!(r_confirmed.score > r_claim.score);
     }
 
@@ -231,10 +231,10 @@ mod tests {
             "Configure agent endpoint with vendor-a/vendor-b/model-x",
             &candidates,
         );
-        // Kaksi confirmed-muistoa joissa on osuvia tokeneita (model, endpoint)
+        // Two confirmed memories containing matching tokens (model, endpoint)
         assert!(
             result.score > 0.0,
-            "odotus: score > 0.0, saatiin: {}",
+            "expected: score > 0.0, got: {}",
             result.score
         );
         assert!(!result.matched_patterns.is_empty());
@@ -248,7 +248,7 @@ mod tests {
         ];
 
         let result = preflight("configure agent endpoint with provider prefix", &candidates);
-        // Claim-ilman confidencea = 0 pistettä
+        // Claim without confidence = 0 points
         assert!(result.score < 1.0);
     }
 
@@ -257,7 +257,7 @@ mod tests {
         let m = mem("älä käytä MongoDB:tä, käytä Postgresia");
         let tokens = tokenize("MongoDB käyttö kielletty");
         let overlap = token_overlap(&tokens, &m);
-        assert!(overlap > 0.0, "ä/ö-tokenien pitäisi osua");
+        assert!(overlap > 0.0, "ä/ö tokens should match");
     }
 
     #[test]

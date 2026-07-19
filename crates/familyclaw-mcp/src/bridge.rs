@@ -1,4 +1,4 @@
-//! Silta MCP-työkaluista [`ActionRuntime`]-taidoiksi (KERROS A).
+//! Bridge from MCP tools to [`ActionRuntime`] skills (Layer A).
 
 use std::sync::Arc;
 
@@ -17,16 +17,17 @@ use crate::client::{McpClient, SharedMcpClient};
 use crate::env::load_mcp_servers_from_env;
 use crate::error::{McpError, Result};
 
-/// MCP-skillien deterministinen UUID-v5-nimiavaruus.
+/// Deterministic UUID v5 namespace for MCP skills.
 const MCP_SKILL_NAMESPACE: Uuid = uuid::uuid!("c3d4e5f6-a7b8-4901-c2d3-e4f5a6b7c8d9");
 
-/// Rekisteröi kaikki MCP-asiakkaan työkalut dynaamisina [`Skill`]-taitoina.
+/// Registers all of an MCP client's tools as dynamic [`Skill`]s.
 ///
-/// Jokainen työkalu saa manifestin MCP-kuvauksesta ja suorituksessa kutsuu
-/// [`McpClient::call_tool`]:ia. Tuloste on aina epäluotettava (taint).
+/// Each tool gets a manifest derived from its MCP description, and at
+/// execution time calls into [`McpClient::call_tool`]. Output is always
+/// treated as untrusted (tainted).
 ///
 /// # Errors
-/// Työkalujen listaus tai rekisteröinti epäonnistuu.
+/// Returns an error if listing the tools or registering a skill fails.
 pub async fn register_mcp_skills(
     runtime: &mut ActionRuntime,
     client: &SharedMcpClient,
@@ -41,10 +42,11 @@ pub async fn register_mcp_skills(
     Ok(())
 }
 
-/// Lukee `FAMILYCLAW_MCP_SERVERS` ja rekisteröi kaikki löydetyt palvelimet.
+/// Reads `FAMILYCLAW_MCP_SERVERS` and registers all discovered servers.
 ///
 /// # Errors
-/// Ympäristön jäsennys, yhteys tai rekisteröinti epäonnistuu.
+/// Returns an error if parsing the environment variable, connecting, or
+/// registering fails.
 pub async fn register_from_env(runtime: &mut ActionRuntime) -> Result<()> {
     let configs = load_mcp_servers_from_env()?;
     for config in configs {
@@ -54,7 +56,7 @@ pub async fn register_from_env(runtime: &mut ActionRuntime) -> Result<()> {
     Ok(())
 }
 
-/// Dynaaminen taito joka delegoi suorituksen MCP-asiakkaalle.
+/// A dynamic skill that delegates execution to the MCP client.
 struct McpDynamicSkill {
     client: SharedMcpClient,
     descriptor: McpToolDescriptor,

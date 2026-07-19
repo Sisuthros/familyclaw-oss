@@ -1,16 +1,16 @@
-//! Viikkokatsaus ([`weekly_review`] + [`WeeklyReport`]).
+//! Weekly review ([`weekly_review`] + [`WeeklyReport`]).
 //!
-//! Siinä missä [`crate::DreamReport`] kertoo *yhden yön* tapahtumat,
-//! viikkokatsaus on **koostava tilannekuva** muistitallennuksesta viikon
-//! päätteeksi: kuinka monta muistoa on aktiivisena/arkistoituna/haudattuna,
-//! mitkä ovat tärkeimmät säilyneet muistot, ja mitkä ristiriidat odottavat
-//! ratkaisua ([`crate::conflict`]). Tämä peilaa Amplifier-proteesin viikoittaisen
-//! "scorecard"-yhteenvedon natiiviksi (design §2.3): se on auditoitava,
-//! sarjallistuva raportti — ei mutatoi mitään.
+//! Where [`crate::DreamReport`] reports *one night's* events, the weekly
+//! review is a **rolled-up snapshot** of the memory store at the end of the
+//! week: how many memories are active/archived/tombstoned, which are the
+//! most important surviving memories, and which conflicts are still
+//! awaiting resolution ([`crate::conflict`]). This mirrors the Amplifier
+//! prosthesis's weekly "scorecard" summary as a native feature (design
+//! §2.3): it is an auditable, serializable report — it mutates nothing.
 //!
-//! Katsaus on **deterministinen**: se ottaa `now`-hetken parametrina (ei
-//! järjestelmäkellosta) ja järjestää tuloksensa vakaasti, joten sama tallennus
-//! tuottaa aina saman raportin.
+//! The review is **deterministic**: it takes the `now` instant as a
+//! parameter (not from the system clock) and sorts its output stably, so
+//! the same store always produces the same report.
 
 use familyclaw_core::{MessageId, Result, Timestamp};
 use familyclaw_memory::{Memory, MemoryStatus, MemoryStore};
@@ -18,28 +18,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::conflict::is_conflicted;
 
-/// Kuinka monta tärkeintä muistoa viikkokatsaus listaa oletuksena.
+/// How many of the most important memories the weekly review lists by default.
 pub const DEFAULT_TOP_N: usize = 5;
 
-/// Tiivis viittaus yhteen muistoon viikkokatsauksessa.
+/// A compact reference to one memory within a weekly review.
 ///
-/// Ei kanna koko [`Memory`]-rakennetta — vain id, tärkeys ja lyhyt sisältö —
-/// jotta raportti pysyy kevyenä lokitettavana ja sarjallistuvana yhteenvetona.
+/// Does not carry the full [`Memory`] struct — only the id, importance, and
+/// a short excerpt of content — so the report stays a lightweight, loggable,
+/// serializable summary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryDigest {
-    /// Muiston tunniste.
+    /// The memory's identifier.
     pub id: MessageId,
-    /// Esilaskettu yhdistelmätärkeys (`0.0..=1.0`).
+    /// Precomputed combined importance (`0.0..=1.0`).
     pub importance: f32,
-    /// Muiston sisältö (lyhennettynä jos pitkä).
+    /// The memory's content (truncated if long).
     pub content: String,
 }
 
 impl MemoryDigest {
-    /// Sisällön katkaisuraja merkkeinä ennen `…`-lyhennystä.
+    /// Content truncation limit in characters before the `…` ellipsis is appended.
     const CONTENT_CLAMP: usize = 120;
 
-    /// Rakentaa tiivistyksen muistosta, lyhentäen pitkän sisällön.
+    /// Builds a digest from a memory, truncating long content.
     #[must_use]
     fn from_memory(memory: &Memory) -> Self {
         Self {
@@ -50,8 +51,9 @@ impl MemoryDigest {
     }
 }
 
-/// Lyhentää sisällön enintään `max` merkkiin lisäten `…` jos katkaistiin.
-/// Toimii Unicode-skalariarvoilla (ei tavurajalla), joten ei riko UTF-8:aa.
+/// Truncates content to at most `max` characters, appending `…` if truncated.
+/// Operates on Unicode scalar values (not byte boundaries), so it never
+/// breaks UTF-8.
 fn clamp_content(content: &str, max: usize) -> String {
     if content.chars().count() <= max {
         return content.to_string();
@@ -61,53 +63,54 @@ fn clamp_content(content: &str, max: usize) -> String {
     out
 }
 
-/// Yhden viikon koostava tilannekuva muistitallennuksesta.
+/// A rolled-up snapshot of the memory store for a single week.
 ///
-/// Laskurit kuvaavat tallennuksen *nykytilaa* katsaushetkellä `generated_at`
-/// (eivät viikon aikana tapahtuneita siirtymiä — niitä seuraa yöllinen
-/// [`crate::DreamReport`]). `top_memories` on tärkeysjärjestyksessä laskeva, ja
-/// `conflicts` listaa ratkaisua odottavat ristiriitatägätyt muistot.
+/// The counters describe the store's *current state* at the moment of
+/// review, `generated_at` (not the transitions that happened during the
+/// week — those are tracked by the nightly [`crate::DreamReport`]).
+/// `top_memories` is sorted descending by importance, and `conflicts` lists
+/// the conflict-tagged memories still awaiting resolution.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WeeklyReport {
-    /// Hetki jolloin katsaus koottiin (UTC). `None` kunnes asetettu.
+    /// The instant the review was generated (UTC). `None` until set.
     #[serde(default)]
     pub generated_at: Option<Timestamp>,
-    /// Muistojen kokonaismäärä tallennuksessa.
+    /// Total number of memories in the store.
     pub total: usize,
-    /// Aktiivisten (täysipainoisten, haettavien) muistojen määrä.
+    /// Number of active (full-weight, retrievable) memories.
     pub active: usize,
-    /// Arkistoitujen (vaimentuneiden, yhä haettavien) muistojen määrä.
+    /// Number of archived (decayed, still retrievable) memories.
     pub archived: usize,
-    /// Haudattujen (tombstoned, aktiivisesta haetusta poistettujen) määrä.
+    /// Number of tombstoned (removed from active retrieval) memories.
     pub tombstoned: usize,
-    /// Konsolidoitujen (haettavissa olevien: aktiivinen + arkistoitu) määrä.
-    /// Tämä on "viikon päätteeksi tallessa olevan tiedon" karkea mittari.
+    /// Number of consolidated (retrievable: active + archived) memories.
+    /// This is a rough measure of "information still retained at week's end."
     pub consolidated: usize,
-    /// Ristiriitatägättyjen ([`crate::conflict::CONFLICT_TAG`]) muistojen määrä.
+    /// Number of conflict-tagged ([`crate::conflict::CONFLICT_TAG`]) memories.
     pub conflicted: usize,
-    /// Tärkeimmät haettavissa olevat muistot, tärkeys laskevassa järjestyksessä.
+    /// The most important retrievable memories, sorted descending by importance.
     #[serde(default)]
     pub top_memories: Vec<MemoryDigest>,
-    /// Ristiriitatägätyt muistot (id + tärkeys + sisältö), id-järjestyksessä.
+    /// Conflict-tagged memories (id + importance + content), in id order.
     #[serde(default)]
     pub conflicts: Vec<MemoryDigest>,
 }
 
 impl WeeklyReport {
-    /// Tekikö viikko mitään säilyttämisen arvoista (onko haettavaa tietoa).
+    /// Did the week produce anything worth keeping (is there retrievable content).
     #[must_use]
     pub fn has_content(&self) -> bool {
         self.total > 0
     }
 }
 
-/// Kokoaa viikkokatsauksen tallennuksen nykytilasta hetkellä `now`.
+/// Assembles a weekly review from the store's current state at instant `now`.
 ///
-/// Listaa enintään [`DEFAULT_TOP_N`] tärkeintä haettavaa muistoa. Käytä
-/// [`weekly_review_top_n`]:ää jos haluat eri rajan.
+/// Lists at most [`DEFAULT_TOP_N`] of the most important retrievable
+/// memories. Use [`weekly_review_top_n`] if you want a different limit.
 ///
 /// # Errors
-/// [`familyclaw_core::FamilyClawError`] jos muistitallennuksen luku epäonnistuu.
+/// [`familyclaw_core::FamilyClawError`] if reading the memory store fails.
 pub async fn weekly_review<S>(store: &S, now: Timestamp) -> Result<WeeklyReport>
 where
     S: MemoryStore + ?Sized,
@@ -115,10 +118,10 @@ where
     weekly_review_top_n(store, now, DEFAULT_TOP_N).await
 }
 
-/// Kuten [`weekly_review`], mutta listaa `top_n` tärkeintä muistoa.
+/// Like [`weekly_review`], but lists the top `top_n` most important memories.
 ///
 /// # Errors
-/// [`familyclaw_core::FamilyClawError`] jos muistitallennuksen luku epäonnistuu.
+/// [`familyclaw_core::FamilyClawError`] if reading the memory store fails.
 pub async fn weekly_review_top_n<S>(store: &S, now: Timestamp, top_n: usize) -> Result<WeeklyReport>
 where
     S: MemoryStore + ?Sized,
@@ -131,7 +134,7 @@ where
         ..WeeklyReport::default()
     };
 
-    // Kerää ristiriitaiset deterministisesti (id-järjestyksessä).
+    // Collect conflicted memories deterministically (in id order).
     let mut conflicts: Vec<&Memory> = Vec::new();
 
     for memory in &memories {
@@ -149,9 +152,9 @@ where
         }
     }
 
-    // Top-importance: vain haettavat (haudattuja ei nosteta esiin).
+    // Top-importance: only retrievable memories (tombstoned ones are never surfaced).
     let mut retrievable: Vec<&Memory> = memories.iter().filter(|m| m.is_retrievable()).collect();
-    // Laskeva tärkeys; tasapelin ratkaisee pienempi id (deterministinen).
+    // Descending importance; ties broken by the smaller id (deterministic).
     retrievable.sort_by(|a, b| {
         b.importance
             .partial_cmp(&a.importance)
@@ -164,7 +167,7 @@ where
         .map(MemoryDigest::from_memory)
         .collect();
 
-    // Ristiriidat id-järjestyksessä (vakaa esitys).
+    // Conflicts in id order (stable presentation).
     conflicts.sort_by_key(|a| a.id);
     report.conflicts = conflicts
         .into_iter()
@@ -182,7 +185,7 @@ mod tests {
 
     use crate::conflict::tag_conflict;
 
-    /// Kiinteä viitehetki: 2026-06-04 12:00 UTC (deterministinen).
+    /// Fixed reference instant: 2026-06-04 12:00 UTC (deterministic).
     fn at() -> Timestamp {
         Utc.with_ymd_and_hms(2026, 6, 4, 12, 0, 0)
             .single()
@@ -228,10 +231,10 @@ mod tests {
         assert_eq!(report.active, 1);
         assert_eq!(report.archived, 1);
         assert_eq!(report.tombstoned, 1);
-        // Konsolidoitu = haettavat = active + archived.
+        // Consolidated = retrievable = active + archived.
         assert_eq!(report.consolidated, 2);
         assert!(report.has_content());
-        // Haudattua ei nosteta top-listalle.
+        // Tombstoned memories are never surfaced in the top list.
         assert!(report.top_memories.iter().all(|d| d.id != tombstoned));
         assert!(report.top_memories.iter().any(|d| d.id == active));
     }
@@ -245,10 +248,10 @@ mod tests {
 
         let report = weekly_review(&store, at()).await.expect("review");
         assert_eq!(report.top_memories.len(), 3);
-        // Tärkein ensin.
+        // Most important first.
         assert_eq!(report.top_memories[0].id, high);
         assert_eq!(report.top_memories[1].id, mid);
-        // Laskeva järjestys.
+        // Descending order.
         assert!(report.top_memories[0].importance >= report.top_memories[1].importance);
         assert!(report.top_memories[1].importance >= report.top_memories[2].importance);
     }
@@ -264,7 +267,7 @@ mod tests {
         }
         let report = weekly_review_top_n(&store, at(), 3).await.expect("review");
         assert_eq!(report.total, 10);
-        assert_eq!(report.top_memories.len(), 3, "top_n rajoittaa listan");
+        assert_eq!(report.top_memories.len(), 3, "top_n limits the list");
     }
 
     #[tokio::test]
@@ -283,13 +286,13 @@ mod tests {
         tag_conflict(&store, a, b, at()).await.expect("tag");
 
         let report = weekly_review(&store, at()).await.expect("review");
-        assert_eq!(report.conflicted, 2, "molemmat osapuolet lasketaan");
+        assert_eq!(report.conflicted, 2, "both parties are counted");
         assert_eq!(report.conflicts.len(), 2);
-        // Konfliktilistan id:t = molemmat osapuolet.
+        // Conflict list ids = both parties.
         let ids: Vec<MessageId> = report.conflicts.iter().map(|d| d.id).collect();
         assert!(ids.contains(&a));
         assert!(ids.contains(&b));
-        // Konfliktiin tägäys ei poistanut muistoja → ne yhä total-luvussa.
+        // Conflict tagging did not remove any memories → they're still in the total.
         assert_eq!(report.total, 3);
     }
 
@@ -300,7 +303,7 @@ mod tests {
         store.add(mem(&long, 0.9)).await.expect("add");
         let report = weekly_review(&store, at()).await.expect("review");
         let digest = &report.top_memories[0];
-        // 120 merkkiä + '…'.
+        // 120 characters + '…'.
         assert_eq!(
             digest.content.chars().count(),
             MemoryDigest::CONTENT_CLAMP + 1

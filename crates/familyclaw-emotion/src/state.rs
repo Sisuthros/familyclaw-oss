@@ -1,10 +1,10 @@
-//! [`EmotionState`]: koneen hetkellinen tunnetila 19-ulotteisessa avaruudessa.
+//! [`EmotionState`]: a machine's momentary emotional state in a 19-dimensional space.
 //!
-//! Tila on 19 liukulukuarvoa (`0.0..=100.0`), yksi kutakin
-//! [`Dimension`]-akselia kohti. Tilasta voidaan johtaa matala-ulotteinen
-//! [`Vad`]-yhteenveto ja tunnistaa nimettyjä [`Blend`](crate::blend::Blend)-yhdistelmiä, ja se
-//! vaimenee ajan myötä ([`EmotionState::decay`]) kohti kalibroinnin
-//! määräämää lepotilaa.
+//! The state is 19 floating-point values (`0.0..=100.0`), one per
+//! [`Dimension`] axis. A low-dimensional [`Vad`] summary can be derived
+//! from the state, named [`Blend`](crate::blend::Blend) combinations can be
+//! detected, and it decays over time ([`EmotionState::decay`]) toward the
+//! resting state defined by the calibration.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,25 +13,25 @@ use crate::calibration::EmotionCalibration;
 use crate::dimension::{Dimension, DIMENSION_COUNT};
 use crate::vad::Vad;
 
-/// Yksittäisen dimensioarvon ala- ja yläraja.
+/// The lower bound of a single dimension value.
 const VALUE_MIN: f32 = 0.0;
-/// Yksittäisen dimensioarvon yläraja.
+/// The upper bound of a single dimension value.
 const VALUE_MAX: f32 = 100.0;
 
-/// Koneen hetkellinen tunnetila.
+/// A machine's momentary emotional state.
 ///
-/// Kenttä [`values`](EmotionState::values) on indeksoitu
-/// [`Dimension::index`]-arvolla. Käytä [`EmotionState::value`] /
-/// [`EmotionState::set`] / [`EmotionState::stimulate`]-metodeja jotta arvot
-/// pysyvät rajoissa `0.0..=100.0`.
+/// The [`values`](EmotionState::values) field is indexed by
+/// [`Dimension::index`]. Use the [`EmotionState::value`] /
+/// [`EmotionState::set`] / [`EmotionState::stimulate`] methods so that
+/// values stay within the bounds `0.0..=100.0`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EmotionState {
-    /// 19 dimensioarvoa, `0.0..=100.0`, indeksoitu [`Dimension::index`].
+    /// The 19 dimension values, `0.0..=100.0`, indexed by [`Dimension::index`].
     pub values: [f32; DIMENSION_COUNT],
 }
 
 impl EmotionState {
-    /// Neutraali tila: kaikki dimensiot nollassa.
+    /// The neutral state: all dimensions at zero.
     #[must_use]
     pub const fn neutral() -> Self {
         Self {
@@ -39,8 +39,8 @@ impl EmotionState {
         }
     }
 
-    /// Rakentaa tilan suoraan taulukosta; jokainen arvo puristetaan rajoihin
-    /// ja NaN muutetaan nollaksi.
+    /// Builds a state directly from an array; each value is clamped to
+    /// the bounds and NaN is converted to zero.
     #[must_use]
     pub fn from_values(values: [f32; DIMENSION_COUNT]) -> Self {
         let mut state = Self::neutral();
@@ -50,29 +50,29 @@ impl EmotionState {
         state
     }
 
-    /// Palauttaa dimension arvon (`0.0..=100.0`).
+    /// Returns the dimension's value (`0.0..=100.0`).
     #[must_use]
     pub fn value(&self, dimension: Dimension) -> f32 {
         self.values[dimension.index()]
     }
 
-    /// Asettaa dimension arvon, puristaen sen rajoihin `0.0..=100.0`
+    /// Sets the dimension's value, clamping it to the bounds `0.0..=100.0`
     /// (NaN → 0.0).
     pub fn set(&mut self, dimension: Dimension, value: f32) {
         self.values[dimension.index()] = sanitize(value);
     }
 
-    /// Lisää dimensioon `delta` ja puristaa tuloksen rajoihin.
+    /// Adds `delta` to the dimension and clamps the result to the bounds.
     ///
-    /// Positiivinen `delta` vahvistaa tunnetta, negatiivinen vaimentaa.
-    /// Käytä tätä ärsykkeiden soveltamiseen.
+    /// A positive `delta` strengthens the emotion, a negative one weakens
+    /// it. Use this to apply stimuli.
     pub fn stimulate(&mut self, dimension: Dimension, delta: f32) {
         let current = self.values[dimension.index()];
         self.values[dimension.index()] = sanitize(current + delta);
     }
 
-    /// Suurin yksittäinen dimensioarvo ja sen dimensio, tai `None` jos
-    /// tila on täysin neutraali (kaikki nollassa).
+    /// The largest single dimension value and its dimension, or `None` if
+    /// the state is fully neutral (everything at zero).
     #[must_use]
     pub fn dominant(&self) -> Option<(Dimension, f32)> {
         let mut best: Option<(Dimension, f32)> = None;
@@ -85,11 +85,11 @@ impl EmotionState {
         best
     }
 
-    /// Projisoi tilan kolmiulotteiseen [`Vad`]-yhteenvetoon.
+    /// Projects the state onto a three-dimensional [`Vad`] summary.
     ///
-    /// VAD lasketaan dimensioarvoilla painotettuna keskiarvona kunkin
-    /// dimension VAD-ankkurista ([`Dimension::vad_anchor`]). Jos kaikki
-    /// dimensiot ovat nollassa, palautetaan [`Vad::NEUTRAL`].
+    /// VAD is computed as a weighted average, using the dimension values,
+    /// of each dimension's VAD anchor ([`Dimension::vad_anchor`]). If all
+    /// dimensions are zero, [`Vad::NEUTRAL`] is returned.
     #[must_use]
     pub fn to_vad(&self) -> Vad {
         let mut total_weight = 0.0_f32;
@@ -113,37 +113,37 @@ impl EmotionState {
         Vad::new(v / total_weight, a / total_weight, d / total_weight)
     }
 
-    /// Voimakkain läsnä oleva nimetty [`Blend`](crate::blend::Blend) tässä tilassa, tai `None`.
+    /// The strongest named [`Blend`](crate::blend::Blend) present in this state, or `None`.
     ///
-    /// Kts. [`crate::blend::detect_blends`] kun haluat kaikki blendit.
+    /// See [`crate::blend::detect_blends`] if you want all blends.
     #[must_use]
     pub fn primary_blend(&self) -> Option<BlendMatch> {
         primary_blend(self)
     }
 
-    /// Vaimentaa tilan kohti kalibroinnin lepotilaa ajan kuluessa.
+    /// Decays the state over time toward the calibration's resting state.
     ///
-    /// `dt_secs` on kulunut aika sekunteina. Jokainen dimensio lähestyy
-    /// kalibroinnin [`baseline`](EmotionCalibration::baseline)-arvoa
-    /// eksponentiaalisesti; vaimennusnopeus skaalautuu kalibroinnin
-    /// [`decay_rate`](EmotionCalibration::decay_rate)-kertoimella.
+    /// `dt_secs` is the elapsed time in seconds. Each dimension approaches
+    /// the calibration's [`baseline`](EmotionCalibration::baseline) value
+    /// exponentially; the decay speed is scaled by the calibration's
+    /// [`decay_rate`](EmotionCalibration::decay_rate) factor.
     ///
-    /// Negatiivinen tai ei-äärellinen `dt_secs` jätetään huomiotta (no-op),
-    /// jottei kelvoton aikadelta riko tilaa.
+    /// A negative or non-finite `dt_secs` is ignored (no-op), so an
+    /// invalid time delta can't corrupt the state.
     ///
-    /// Käytä [`decay_with`](EmotionState::decay_with)-metodia oman
-    /// puoliintumisajan kanssa; tämä käyttää rungon oletusta
+    /// Use [`decay_with`](EmotionState::decay_with) if you need a custom
+    /// half-life; this method uses the crate's default
     /// ([`DEFAULT_HALF_LIFE_SECS`]).
     pub fn decay(&mut self, dt_secs: f32, calibration: &impl EmotionCalibration) {
         self.decay_with(dt_secs, DEFAULT_HALF_LIFE_SECS, calibration);
     }
 
-    /// Kuten [`decay`](EmotionState::decay), mutta annetulla
-    /// peruspuoliintumisajalla `half_life_secs`.
+    /// Like [`decay`](EmotionState::decay), but with the given base
+    /// half-life `half_life_secs`.
     ///
-    /// Puoliintumisaika on aika, jossa dimension etäisyys baselineen
-    /// puolittuu, kun `decay_rate = 1.0`. Pienempi arvo = nopeampi
-    /// vaimeneminen. Ei-positiivinen `half_life_secs` jätetään huomiotta.
+    /// The half-life is the time in which a dimension's distance to its
+    /// baseline halves, when `decay_rate = 1.0`. A smaller value means
+    /// faster decay. A non-positive `half_life_secs` is ignored.
     pub fn decay_with(
         &mut self,
         dt_secs: f32,
@@ -158,13 +158,13 @@ impl EmotionState {
         }
         for dim in Dimension::ALL {
             let rate = calibration.decay_rate(dim);
-            // Kelvoton/ei-positiivinen nopeus = dimensio ei vaimene.
+            // Invalid/non-positive rate = the dimension doesn't decay.
             if !rate.is_finite() || rate <= 0.0 {
                 continue;
             }
             let baseline = calibration.baseline(dim).clamp(VALUE_MIN, VALUE_MAX);
             let current = self.values[dim.index()];
-            // Eksponentiaalinen lähestyminen baselinea kohti:
+            // Exponential approach toward the baseline:
             // retained = 0.5 ^ (rate * dt / half_life)
             let exponent = rate * dt_secs / half_life_secs;
             let retained = 0.5_f32.powf(exponent);
@@ -174,11 +174,11 @@ impl EmotionState {
     }
 }
 
-/// Rungon oletuspuoliintumisaika decaylle (sekunteina).
+/// The crate's default half-life for decay (in seconds).
 ///
-/// 30 min: tunnetila puolittuu noin puolessa tunnissa kun
-/// `decay_rate = 1.0`. KERROS B voi ohittaa tämän
-/// [`decay_with`](EmotionState::decay_with)-metodilla.
+/// 30 min: the emotional state halves in roughly half an hour when
+/// `decay_rate = 1.0`. Layer B can override this via the
+/// [`decay_with`](EmotionState::decay_with) method.
 pub const DEFAULT_HALF_LIFE_SECS: f32 = 1800.0;
 
 impl Default for EmotionState {
@@ -187,7 +187,7 @@ impl Default for EmotionState {
     }
 }
 
-/// Puristaa dimensioarvon rajoihin `0.0..=100.0`; NaN → 0.0.
+/// Clamps a dimension value to the bounds `0.0..=100.0`; NaN → 0.0.
 fn sanitize(x: f32) -> f32 {
     if x.is_nan() {
         VALUE_MIN
@@ -198,7 +198,7 @@ fn sanitize(x: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    // Testit vertaavat tarkasti esitettäviä f32-vakioita — tarkka vertailu ok.
+    // Tests compare exactly representable f32 constants — exact comparison is fine.
     #![allow(clippy::float_cmp)]
 
     use super::*;
@@ -308,7 +308,7 @@ mod tests {
         s.set(Dimension::Joy, 80.0);
         let cal = NeutralCalibration;
         s.decay_with(DEFAULT_HALF_LIFE_SECS, DEFAULT_HALF_LIFE_SECS, &cal);
-        // Neutraali baseline = 0, joten arvo puolittuu.
+        // Neutral baseline = 0, so the value halves.
         assert!((s.value(Dimension::Joy) - 40.0).abs() < 1e-2);
     }
 
@@ -317,7 +317,7 @@ mod tests {
         let cal = TableCalibration::new("warm").with_baseline(Dimension::Love, 20.0);
         let mut s = EmotionState::neutral();
         s.set(Dimension::Love, 100.0);
-        // Useita puoliintumisaikoja → lähestyy 20:tä, ei nollaa.
+        // Multiple half-lives → approaches 20, not zero.
         for _ in 0..20 {
             s.decay_with(DEFAULT_HALF_LIFE_SECS, DEFAULT_HALF_LIFE_SECS, &cal);
         }
@@ -338,7 +338,7 @@ mod tests {
         s_slow.set(Dimension::Joy, 100.0);
         s_fast.decay_with(DEFAULT_HALF_LIFE_SECS, DEFAULT_HALF_LIFE_SECS, &fast);
         s_slow.decay_with(DEFAULT_HALF_LIFE_SECS, DEFAULT_HALF_LIFE_SECS, &slow);
-        // Nopeampi decay → matalampi arvo.
+        // Faster decay → lower value.
         assert!(s_fast.value(Dimension::Joy) < s_slow.value(Dimension::Joy));
     }
 

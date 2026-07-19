@@ -1,12 +1,15 @@
 [package]
 name = "familyclaw-core"
-description = "Core types, config, error handling (no unwrap)"
+description = "Foundational types, configuration, error handling, and time utilities shared across the FamilyClaw agent runtime"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["agent", "runtime", "core", "types", "error-handling"]
+categories = ["development-tools", "rust-patterns"]
 
 [lints]
 workspace = true

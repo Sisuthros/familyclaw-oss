@@ -1,48 +1,47 @@
-//! Polttoaineen mittaus (fuel metering) sandboxin suoritukselle.
+//! Fuel metering for sandbox execution.
 //!
-//! "Fuel" on wasmtimen mekanismi suorituksen kustannuksen rajoittamiseen:
-//! jokainen WASM-operaatio kuluttaa polttoainetta, ja kun raja saavutetaan,
-//! suoritus keskeytyy. Tämä estää ikuiset silmukat ja resurssien
-//! väärinkäytön (design §2 turva). Tässä moduulissa on **puhdas
-//! laskentalogiikka** ilman wasmtime-riippuvuutta, jotta budjetointi on
-//! testattavaa ilman raskasta backendia.
+//! "Fuel" is wasmtime's mechanism for bounding execution cost: every WASM
+//! operation consumes fuel, and once the limit is reached, execution is
+//! interrupted. This prevents infinite loops and resource abuse (design §2
+//! security). This module contains **pure accounting logic** with no
+//! wasmtime dependency, so budgeting is testable without the heavy backend.
 
 use serde::{Deserialize, Serialize};
 
-/// Polttoaineraja yhden suorituksen kululle.
+/// The fuel limit for a single execution's cost.
 ///
-/// `Limited` antaa tarkan budjetin; `Unlimited` poistaa rajoituksen
-/// (käytä vain täysin luotetulle koodille — oletus on aina rajoitettu).
+/// `Limited` gives an exact budget; `Unlimited` removes the restriction
+/// (use only for fully trusted code — the default is always limited).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "amount")]
 pub enum FuelLimit {
-    /// Rajattu budjetti — annettu määrä polttoaineyksiköitä.
+    /// A limited budget — a given number of fuel units.
     Limited(u64),
 
-    /// Ei rajaa. Vain luotetulle koodille; oletuksena EI käytetä.
+    /// No limit. For trusted code only; NOT used by default.
     Unlimited,
 }
 
 impl FuelLimit {
-    /// Konservatiivinen oletusbudjetti (yksi miljoona yksikköä).
+    /// A conservative default budget (one million units).
     ///
-    /// Riittää kevyeen laskentaan mutta katkaisee ikuiset silmukat. Sopivan
-    /// arvon viritys on kutsujan vastuulla työkuorman mukaan.
+    /// Enough for light computation but cuts off infinite loops. Tuning an
+    /// appropriate value for the workload is the caller's responsibility.
     pub const DEFAULT_BUDGET: u64 = 1_000_000;
 
-    /// Rakentaa rajatun budjetin.
+    /// Builds a limited budget.
     #[must_use]
     pub const fn limited(amount: u64) -> Self {
         Self::Limited(amount)
     }
 
-    /// Onko budjetti rajaton.
+    /// Whether the budget is unlimited.
     #[must_use]
     pub const fn is_unlimited(&self) -> bool {
         matches!(self, Self::Unlimited)
     }
 
-    /// Palauttaa rajatun budjetin määrän, tai `None` jos rajaton.
+    /// Returns the limited budget amount, or `None` if unlimited.
     #[must_use]
     pub const fn budget(&self) -> Option<u64> {
         match self {
@@ -51,9 +50,9 @@ impl FuelLimit {
         }
     }
 
-    /// Riittääkö budjetti annetulle kulutukselle.
+    /// Whether the budget covers the given consumption.
     ///
-    /// Rajaton riittää aina. Rajattu riittää jos `consumed <= budget`.
+    /// Unlimited always covers it. Limited covers it if `consumed <= budget`.
     #[must_use]
     pub const fn covers(&self, consumed: u64) -> bool {
         match self {
@@ -64,17 +63,17 @@ impl FuelLimit {
 }
 
 impl Default for FuelLimit {
-    /// Turvallinen oletus: rajattu [`FuelLimit::DEFAULT_BUDGET`]-budjetti.
+    /// Safe default: a limited [`FuelLimit::DEFAULT_BUDGET`] budget.
     fn default() -> Self {
         Self::Limited(Self::DEFAULT_BUDGET)
     }
 }
 
-/// Polttoainemittari joka seuraa yhden suorituksen kulutusta budjettia vasten.
+/// A fuel meter that tracks a single execution's consumption against a budget.
 ///
-/// Mittari on tilallinen: [`consume`](FuelMeter::consume) vähentää jäljellä
-/// olevaa budjettia ja palauttaa virheen jos budjetti loppuu. Tämä mallintaa
-/// wasmtimen `add_fuel` / `fuel_consumed` -semantiikkaa testattavasti.
+/// The meter is stateful: [`consume`](FuelMeter::consume) decrements the
+/// remaining budget and returns an error if the budget runs out. This models
+/// wasmtime's `add_fuel` / `fuel_consumed` semantics in a testable way.
 #[derive(Debug, Clone)]
 pub struct FuelMeter {
     limit: FuelLimit,
@@ -82,34 +81,34 @@ pub struct FuelMeter {
 }
 
 impl FuelMeter {
-    /// Luo mittarin annetulla rajalla, kulutus nollasta.
+    /// Creates a meter with the given limit, consumption starting at zero.
     #[must_use]
     pub const fn new(limit: FuelLimit) -> Self {
         Self { limit, consumed: 0 }
     }
 
-    /// Luo mittarin rajatulla budjetilla.
+    /// Creates a meter with a limited budget.
     #[must_use]
     pub const fn with_budget(budget: u64) -> Self {
         Self::new(FuelLimit::Limited(budget))
     }
 
-    /// Tähän mennessä kulutettu polttoaine.
+    /// Fuel consumed so far.
     #[must_use]
     pub const fn consumed(&self) -> u64 {
         self.consumed
     }
 
-    /// Konfiguroitu raja.
+    /// The configured limit.
     #[must_use]
     pub const fn limit(&self) -> FuelLimit {
         self.limit
     }
 
-    /// Jäljellä oleva budjetti, tai `None` jos rajaton.
+    /// Remaining budget, or `None` if unlimited.
     ///
-    /// Ei koskaan mene miinukselle: jos budjetti on ylittynyt (mitä `consume`
-    /// ei salli tapahtua hiljaa), tämä palauttaa `0`.
+    /// Never goes negative: if the budget has been exceeded (which `consume`
+    /// never allows to happen silently), this returns `0`.
     #[must_use]
     pub const fn remaining(&self) -> Option<u64> {
         match self.limit {
@@ -118,7 +117,7 @@ impl FuelMeter {
         }
     }
 
-    /// Onko polttoaine loppunut (vain rajatulla budjetilla).
+    /// Whether the fuel has run out (only meaningful for a limited budget).
     #[must_use]
     pub const fn is_exhausted(&self) -> bool {
         match self.limit {
@@ -127,23 +126,24 @@ impl FuelMeter {
         }
     }
 
-    /// Kuluttaa `amount` yksikköä polttoainetta.
+    /// Consumes `amount` units of fuel.
     ///
-    /// Onnistuessaan kasvattaa kulutusta ja palauttaa jäljellä olevan
-    /// budjetin (`None` jos rajaton). Jos kulutus ylittäisi budjetin, mittari
-    /// asetetaan täyteen kulutukseen (budjetti = consumed) ja palautetaan
-    /// virhe — tila pysyy johdonmukaisena (ei osittaista kulutusta yli rajan).
+    /// On success, increases consumption and returns the remaining budget
+    /// (`None` if unlimited). If the consumption would exceed the budget,
+    /// the meter is set to full consumption (budget = consumed) and an error
+    /// is returned — state stays consistent (no partial consumption beyond
+    /// the limit).
     ///
     /// # Errors
-    /// [`crate::SandboxError::FuelExhausted`] jos budjetti ei riitä `amount`:lle.
+    /// [`crate::SandboxError::FuelExhausted`] if the budget cannot cover `amount`.
     pub fn consume(&mut self, amount: u64) -> crate::Result<Option<u64>> {
         match self.limit {
             FuelLimit::Limited(budget) => {
-                // Lasketaan uusi kulutus ylivuototurvallisesti.
+                // Compute the new consumption in an overflow-safe way.
                 let next = self.consumed.saturating_add(amount);
                 if next > budget {
-                    // Pinnataan kulutus budjettiin: mittari on "tyhjä",
-                    // ei mielivaltaisesti yli.
+                    // Pin consumption to the budget: the meter is "empty",
+                    // not arbitrarily over.
                     self.consumed = budget;
                     return Err(crate::SandboxError::fuel_exhausted(budget, next));
                 }
@@ -225,7 +225,7 @@ mod tests {
     fn consume_over_budget_errors_and_pins_to_budget() {
         let mut meter = FuelMeter::with_budget(100);
         let err = meter.consume(150).expect_err("over budget must fail");
-        // Tila johdonmukainen: kulutus pinnattu budjettiin, ei yli.
+        // State is consistent: consumption pinned to the budget, not over.
         assert_eq!(meter.consumed(), 100);
         assert!(meter.is_exhausted());
         assert_eq!(meter.remaining(), Some(0));
@@ -255,15 +255,15 @@ mod tests {
         assert_eq!(meter.consume(u64::MAX).expect("unlimited ok"), None);
         assert!(!meter.is_exhausted());
         assert_eq!(meter.remaining(), None);
-        // Saturoituu, ei panikoi ylivuodosta.
+        // Saturates, does not panic on overflow.
         assert_eq!(meter.consume(1).expect("still ok"), None);
         assert_eq!(meter.consumed(), u64::MAX);
     }
 
     #[test]
     fn consume_saturates_on_overflow_for_limited() {
-        // Lähellä u64-rajaa: saturating_add ei panikoi, ja koska next > budget,
-        // saadaan virhe eikä ylivuotoa.
+        // Near the u64 limit: saturating_add does not panic, and since
+        // next > budget, we get an error instead of an overflow.
         let mut meter = FuelMeter::with_budget(10);
         meter.consume(5).expect("ok");
         let err = meter.consume(u64::MAX).expect_err("huge consume fails");

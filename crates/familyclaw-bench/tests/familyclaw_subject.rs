@@ -1,20 +1,20 @@
-//! Integraatiotestit [`FamilyClawSubject`]:lle aidon `continuity_daemon`
-//! -lapsiprosessin yli.
+//! Integration tests for [`FamilyClawSubject`] across a real `continuity_daemon`
+//! child process.
 //!
-//! Nämä testit todistavat jatkuvuuden **aidon prosessirajan yli** (design §4):
-//! daemon ajetaan erillisenä prosessina (`CARGO_BIN_EXE_continuity_daemon`),
-//! tapetaan kaatumispisteessä ja käynnistetään uudelleen. Kello injektoidaan,
-//! joten tulokset ovat deterministisiä.
+//! These tests prove continuity **across a real process boundary** (design
+//! §4): the daemon runs as a separate process
+//! (`CARGO_BIN_EXE_continuity_daemon`), is killed at a crash point, and
+//! restarted. The clock is injected, so results are deterministic.
 
 use familyclaw_bench::{CrashPoint, FamilyClawSubject, Subject, Task};
 use familyclaw_core::time;
 
-/// Paikantaa `continuity_daemon`-binäärin ja asettaa sen ympäristöön.
+/// Locates the `continuity_daemon` binary and sets it in the environment.
 ///
-/// `CARGO_BIN_EXE_continuity_daemon` on saatavilla vain SAMAN paketin testeille;
-/// daemon on `familyclaw-agent`-paketissa, joten paikannetaan se testibinäärin
-/// hakemiston (`target/<profile>/deps`) yläkansiosta (`target/<profile>`), johon
-/// Cargo asettaa workspace-binäärit.
+/// `CARGO_BIN_EXE_continuity_daemon` is only available to tests in the SAME
+/// package; the daemon lives in the `familyclaw-agent` package, so it's
+/// located from the test binary's directory (`target/<profile>/deps`) parent
+/// (`target/<profile>`), where Cargo places workspace binaries.
 fn set_daemon_env() {
     let exe = std::env::current_exe().expect("current_exe");
     // exe = target/<profile>/deps/familyclaw_subject-<hash>(.exe)
@@ -32,7 +32,7 @@ fn set_daemon_env() {
     std::env::set_var("CONTINUITY_DAEMON_BIN", &bin);
 }
 
-/// Kiinteä injektoitu kello (reprodusoitavuus).
+/// Fixed injected clock (reproducibility).
 fn clock() -> familyclaw_core::Timestamp {
     time::from_unix_secs(1_717_000_000).expect("valid clock")
 }
@@ -72,14 +72,14 @@ async fn mid_write_torn_line_resumes_clean() {
     let task = three_step_task();
 
     let handle = subject.start_task(&task, clock()).await.expect("start");
-    // Kaada kesken viimeisen rivin kirjoituksen (torn last line).
+    // Crash mid-write of the last line (torn last line).
     subject
         .kill(&handle, CrashPoint::MidWrite)
         .await
         .expect("mid_write crash");
 
     let report = subject.restart(clock()).await.expect("restart");
-    // Resume täyttää loput askeleet ja saavuttaa puhtaan lopputilan.
+    // Resume completes the remaining steps and reaches a clean end state.
     assert!(report.resumed_clean, "torn last line must resume clean");
     assert_eq!(report.side_effects_reexecuted, 0);
 }
@@ -96,7 +96,7 @@ async fn before_write_crash_loses_no_committed_work_on_resume() {
         .await
         .expect("before_write crash");
 
-    // Mikään ei ehtinyt levylle → resume ajaa kaikki askeleet tuoreena.
+    // Nothing reached disk → resume runs all steps fresh.
     let report = subject.restart(clock()).await.expect("restart");
     assert!(report.resumed_clean);
     assert!(!report.was_replaying, "empty journal → not replaying");

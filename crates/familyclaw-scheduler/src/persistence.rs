@@ -1,24 +1,24 @@
-//! Perhe-agency-tilan **config-persistenssi** (Phase 4, D5).
+//! **Config persistence** for family-agency state (Phase 4, D5).
 //!
-//! Ajastettujen tehtävien kill-switch-tila ([`crate::ScheduledTask::enabled`])
-//! pitää säilyä yli prosessin restartin: jos operaattori pysäytti tehtävän, sen
-//! pitää pysyä pysäytettynä myös uudelleenkäynnistyksen jälkeen. Tämä moduuli
-//! tallentaa tilan **erilliseen config-tiedostoon** (esim.
-//! `<data_dir>/agency.json`), EI durable-replay-journaliin — roadmap D5 varoittaa
-//! nimenomaan timer-/agency-tilan sekoittamisesta replay-substraattiin
-//! (eri elinkaari, eri omistajuus).
+//! The kill-switch state of scheduled tasks ([`crate::ScheduledTask::enabled`])
+//! must survive a process restart: if an operator stopped a task, it must
+//! remain stopped after a restart as well. This module stores that state in a
+//! **separate config file** (e.g. `<data_dir>/agency.json`), NOT in the
+//! durable-replay journal — the D5 roadmap specifically warns against mixing
+//! timer/agency state into the replay substrate (different lifecycle,
+//! different ownership).
 //!
-//! Muoto on tarkoituksella minimaalinen: vain **disabloitujen tehtävien
-//! id-lista** UUID-merkkijonoina. Käyttöön otetut tehtävät ovat oletus, joten
-//! niitä ei tarvitse listata → tiedosto pysyy pienenä ja diffattavana.
+//! The format is deliberately minimal: just a list of **disabled task ids**
+//! as UUID strings. Enabled tasks are the default, so they don't need to be
+//! listed → the file stays small and diff-friendly.
 //!
 //! ```json
 //! { "disabled": ["d4ea3c1c-0000-4000-8000-647265616d63"] }
 //! ```
 //!
-//! I/O on **synkronista** (`std::fs`): tilaa luetaan kerran bootissa ja
-//! kirjoitetaan vain harvoissa operaattorimutaatioissa, joten async-overhead ei
-//! ole perusteltu. Puuttuva tiedosto = tyhjä config (ei virhe) — ensikäynnistys.
+//! I/O is **synchronous** (`std::fs`): state is read once at boot and written
+//! only on rare operator mutations, so the async overhead isn't justified. A
+//! missing file means an empty config (not an error) — first-time startup.
 
 use std::io;
 use std::path::Path;
@@ -33,25 +33,25 @@ use familyclaw_actions::SkillId;
 use crate::dispatch::Scheduler;
 use crate::task::{ScheduledTask, ScheduledTaskId};
 
-/// Persistoitu ajastettu tehtävä agency-configissa.
+/// A scheduled task persisted in the agency config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgencyScheduledTask {
-    /// Tehtävän vakaa tunniste (UUID-merkkijono).
+    /// The task's stable identifier (UUID string).
     pub id: String,
-    /// Suoritettavan taidon tunniste (UUID-merkkijono).
+    /// The identifier of the skill to execute (UUID string).
     pub skill_id: String,
-    /// Taidolle annettava geneerinen JSON-payload.
+    /// The generic JSON payload passed to the skill.
     pub payload: Value,
-    /// Cron-lauseke; kun asetettu, ohittaa `interval_secs`:n.
+    /// Cron expression; when set, overrides `interval_secs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron_expression: Option<String>,
-    /// Intervalli sekunteina (taaksepäin-yhteensopiva; käytetään jos ei cron).
+    /// Interval in seconds (backward-compatible; used if no cron is set).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_secs: Option<i64>,
-    /// Olennon geneerinen tunniste lähetykselle.
+    /// The generic identifier of the being to dispatch on behalf of.
     #[serde(default = "default_being_id")]
     pub being_id: String,
-    /// Onko tehtävä aktiivinen (oletus `true`).
+    /// Whether the task is active (defaults to `true`).
     #[serde(default = "default_task_enabled")]
     pub enabled: bool,
 }
@@ -65,10 +65,10 @@ const fn default_task_enabled() -> bool {
 }
 
 impl AgencyScheduledTask {
-    /// Muuntaa config-merkinnän ajastimen [`ScheduledTask`]:ksi.
+    /// Converts this config entry into a scheduler [`ScheduledTask`].
     ///
-    /// Palauttaa virheen jos tunnisteet eivät ole kelvollisia UUID:ita tai
-    /// aikataulua ei voi johtaa (ei cron eikä intervallia).
+    /// Returns an error if the identifiers aren't valid UUIDs or if no
+    /// schedule can be derived (neither cron nor interval set).
     pub fn to_scheduled_task(&self) -> Result<ScheduledTask, String> {
         let id =
             Uuid::parse_str(&self.id).map_err(|e| format!("invalid task id {}: {e}", self.id))?;
@@ -94,26 +94,26 @@ impl AgencyScheduledTask {
     }
 }
 
-/// Persistoitu perhe-agency-tila: mitkä ajastetut tehtävät on otettu pois
-/// käytöstä (kill-switch) ja mitkä cron/intervalli-tehtävät on rekisteröity.
+/// Persisted family-agency state: which scheduled tasks have been disabled
+/// (kill switch) and which cron/interval tasks have been registered.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgencyConfig {
-    /// Pois käytöstä otettujen tehtävien tunnisteet UUID-merkkijonoina.
+    /// Identifiers of disabled tasks, as UUID strings.
     #[serde(default)]
     pub disabled: Vec<String>,
-    /// Agentin tai operaattorin rekisteröimät ajastetut tehtävät.
+    /// Scheduled tasks registered by an agent or operator.
     #[serde(default)]
     pub scheduled_tasks: Vec<AgencyScheduledTask>,
 }
 
 impl AgencyConfig {
-    /// Lataa configin tiedostosta. **Puuttuva tiedosto = tyhjä config** (ei
-    /// virhe) — tämä on normaali ensikäynnistys.
+    /// Loads the config from a file. **A missing file means an empty
+    /// config** (not an error) — this is normal on first startup.
     ///
     /// # Errors
-    /// [`io::Error`] jos tiedosto on olemassa mutta sitä ei voi lukea, tai
-    /// [`serde_json`] -jäsennysvirhe käärittynä `io::Error`:iin
-    /// ([`io::ErrorKind::InvalidData`]) jos sisältö ei ole kelvollista `JSON`ia.
+    /// [`io::Error`] if the file exists but can't be read, or a
+    /// [`serde_json`] parse error wrapped in an `io::Error`
+    /// ([`io::ErrorKind::InvalidData`]) if the content isn't valid `JSON`.
     pub fn load(path: &Path) -> io::Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(raw) => serde_json::from_str(&raw)
@@ -123,36 +123,36 @@ impl AgencyConfig {
         }
     }
 
-    /// Tallentaa configin tiedostoon (atominen: kirjoita temp + rename, jottei
-    /// keskeytynyt kirjoitus jätä rikkinäistä tiedostoa).
+    /// Saves the config to a file (atomically: write to a temp file then
+    /// rename, so an interrupted write never leaves a corrupt file behind).
     ///
     /// # Errors
-    /// [`io::Error`] jos hakemiston luonti, kirjoitus tai uudelleennimeäminen
-    /// epäonnistuu.
+    /// [`io::Error`] if creating the directory, writing, or renaming fails.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        // Atominen vaihto: kirjoita viereiseen temp-tiedostoon ja rename päälle.
+        // Atomic swap: write to an adjacent temp file, then rename over the target.
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json.as_bytes())?;
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
-    /// Onko annettu tehtävä merkitty pois käytöstä tässä configissa.
+    /// Whether the given task is marked disabled in this config.
     #[must_use]
     pub fn is_disabled(&self, id: ScheduledTaskId) -> bool {
         let id_str = id.to_string();
         self.disabled.iter().any(|d| d == &id_str)
     }
 
-    /// Merkitsee tehtävän pois käytöstä / käyttöön configissa (idempotentti).
+    /// Marks a task as disabled/enabled in the config (idempotent).
     ///
-    /// `enabled = false` lisää id:n disabled-listaan (jos puuttuu); `true`
-    /// poistaa sen. Ei kirjoita tiedostoon — kutsu [`save`](Self::save) erikseen.
+    /// `enabled = false` adds the id to the disabled list (if missing);
+    /// `true` removes it. Does not write to disk — call [`save`](Self::save)
+    /// separately.
     pub fn set(&mut self, id: ScheduledTaskId, enabled: bool) {
         let id_str = id.to_string();
         if enabled {
@@ -162,7 +162,7 @@ impl AgencyConfig {
         }
     }
 
-    /// Lisää tai päivittää ajastetun tehtävän configissa (idempotentti `id`:llä).
+    /// Adds or updates a scheduled task in the config (idempotent on `id`).
     pub fn upsert_scheduled_task(&mut self, task: AgencyScheduledTask) {
         if let Some(slot) = self
             .scheduled_tasks
@@ -175,11 +175,11 @@ impl AgencyConfig {
         }
     }
 
-    /// Rekisteröi configin `scheduled_tasks`-merkinnät ajastimeen.
+    /// Registers the config's `scheduled_tasks` entries with the scheduler.
     ///
-    /// Virheelliset merkinnät ohitetaan hiljaisesti (boot ei kaadu yhden
-    /// rikkinäisen rivin takia). `disabled`-lista sovelletaan erikseen
-    /// [`Scheduler::apply_agency_config`]:lla.
+    /// Invalid entries are skipped silently (boot doesn't crash over one
+    /// corrupt line). The `disabled` list is applied separately via
+    /// [`Scheduler::apply_agency_config`].
     pub fn register_scheduled_tasks(&self, scheduler: &mut Scheduler) {
         for entry in &self.scheduled_tasks {
             match entry.to_scheduled_task() {
@@ -213,14 +213,14 @@ mod tests {
         let mut cfg = AgencyConfig::default();
         cfg.set(id(1), false);
         assert!(cfg.is_disabled(id(1)));
-        // Toista disablointi → ei duplikaattia.
+        // Repeated disable -> no duplicate.
         cfg.set(id(1), false);
         assert_eq!(cfg.disabled.len(), 1);
-        // Käyttöön otto poistaa.
+        // Re-enabling removes it.
         cfg.set(id(1), true);
         assert!(!cfg.is_disabled(id(1)));
         assert!(cfg.disabled.is_empty());
-        // Käyttöön otto tuntemattomalle → no-op.
+        // Re-enabling an unknown id -> no-op.
         cfg.set(id(2), true);
         assert!(cfg.disabled.is_empty());
     }

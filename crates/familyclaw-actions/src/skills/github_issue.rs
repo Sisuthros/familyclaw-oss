@@ -1,8 +1,8 @@
-//! GitHub-issue-taito: luonnos tai oikea issue `GITHUB_TOKEN`:lla (KERROS A).
+//! GitHub issue skill: draft or a real issue via `GITHUB_TOKEN` (Layer A).
 //!
-//! Kun `create` on `false`, taito tuottaa vain luonnoksen (ei verkkokutsua).
-//! Kun `create` on `true`, POST GitHub REST API:in — [`ActionRisk::WriteExternal`]
-//! + hyväksyntä ennen suoritusta.
+//! When `create` is `false`, the skill only produces a draft (no network
+//! call). When `create` is `true`, it POSTs to the GitHub REST API —
+//! [`ActionRisk::WriteExternal`] + approval before execution.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -16,28 +16,28 @@ use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 
 use super::Skill;
 
-/// Geneerinen esimerkkirepo (KERROS A).
+/// Generic example repo (Layer A).
 pub const EXAMPLE_REPO: &str = "example-org/example-repo";
 
-/// Sama UUID kuin aiemmalla mock-taidolla — taaksepäin-yhteensopiva rekisteröinti.
+/// Same UUID as the earlier mock skill — backward-compatible registration.
 const SKILL_UUID: uuid::Uuid = uuid::uuid!("11111111-1111-4111-8111-111111111111");
 
-/// Syöte GitHub-issue-taidolle.
+/// Input for the GitHub issue skill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubIssueInput {
-    /// Kohderepo `owner/repo` muodossa.
+    /// Target repo in `owner/repo` form.
     #[serde(default = "default_repo")]
     pub repo: String,
-    /// Issuen otsikko.
+    /// The issue's title.
     #[serde(default)]
     pub title: String,
-    /// Issuen runko (Markdown).
+    /// The issue's body (Markdown).
     #[serde(default)]
     pub body: String,
-    /// Vapaamuotoinen bugiraportti (vaihtoehto title/body:lle).
+    /// Free-form bug report (an alternative to title/body).
     #[serde(default)]
     pub bug_report: Option<String>,
-    /// `true` → luo oikea issue API:lla (vaatii hyväksynnän). `false` → vain luonnos.
+    /// `true` → creates a real issue via the API (requires approval). `false` → draft only.
     #[serde(default)]
     pub create: bool,
 }
@@ -46,43 +46,43 @@ fn default_repo() -> String {
     EXAMPLE_REPO.to_string()
 }
 
-/// Tulos GitHub-issue-taidolle (luonnos tai luotu issue).
+/// Result for the GitHub issue skill (draft or created issue).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubIssueOutput {
-    /// Issuen otsikko.
+    /// The issue's title.
     pub title: String,
-    /// Issuen runko (Markdown).
+    /// The issue's body (Markdown).
     pub body: String,
-    /// Kohderepo `owner/repo` muodossa.
+    /// Target repo in `owner/repo` form.
     pub repo: String,
-    /// `true` jos issue luotiin oikeasti API:lla (`false` = luonnos).
+    /// `true` if the issue was actually created via the API (`false` = draft).
     pub created: bool,
-    /// Luodun issuen numero (vain kun `created`).
+    /// The created issue's number (only when `created`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue_number: Option<u64>,
-    /// Luodun issuen URL (vain kun `created`).
+    /// The created issue's URL (only when `created`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue_url: Option<String>,
 }
 
-/// Aito GitHub-issue-taito (`GITHUB_TOKEN` + reqwest).
+/// Genuine GitHub issue skill (`GITHUB_TOKEN` + reqwest).
 #[derive(Debug, Clone, Default)]
 pub struct GithubIssueSkill;
 
 impl GithubIssueSkill {
-    /// Luo uuden taidon.
+    /// Creates a new skill.
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 
-    /// Taidon kiinteä tunniste.
+    /// The skill's fixed identifier.
     #[must_use]
     pub fn skill_id() -> SkillId {
         SkillId::from_uuid(SKILL_UUID)
     }
 
-    /// Muodostaa issue-luonnoksen syötteestä (ei kutsu API:a).
+    /// Builds an issue draft from the input (does not call the API).
     #[must_use]
     pub fn build_draft(input: &GithubIssueInput) -> GithubIssueOutput {
         let (title, body) = if let Some(report) = input.bug_report.as_ref() {

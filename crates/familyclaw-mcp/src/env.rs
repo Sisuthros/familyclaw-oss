@@ -1,41 +1,41 @@
-//! `FAMILYCLAW_MCP_SERVERS` -ympäristömuuttujan jäsennys (KERROS A).
+//! Parsing of the `FAMILYCLAW_MCP_SERVERS` environment variable (Layer A).
 //!
-//! Muoto: `name=command args` (stdio) tai `name=http://host[:port][/path]`.
-//! Useita palvelimia erotetaan puolipisteellä (`;`).
+//! Format: `name=command args` (stdio) or `name=http://host[:port][/path]`.
+//! Multiple servers are separated by a semicolon (`;`).
 
 use crate::error::{McpError, Result};
 
-/// Yhden MCP-palvelimen konfiguraatio.
+/// Configuration for a single MCP server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
-    /// Looginen nimi (prefiksi taidoille).
+    /// Logical name (prefix for skills).
     pub name: String,
-    /// Kuljetustyyppi.
+    /// Transport type.
     pub transport: McpTransportConfig,
 }
 
-/// Stdio- tai HTTP-kuljetus.
+/// Stdio or HTTP transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTransportConfig {
-    /// Käynnistä prosessi ja käytä stdin/stdout JSON-RPC -rivejä.
+    /// Spawn a process and use JSON-RPC lines over stdin/stdout.
     Stdio {
-        /// Suoritettava komento (ensimmäinen argumentti).
+        /// The command to run (first argument).
         command: String,
-        /// Lisäargumentit.
+        /// Additional arguments.
         args: Vec<String>,
     },
-    /// HTTP POST JSON-RPC `/mcp`-päätepisteeseen.
+    /// HTTP POST JSON-RPC to the `/mcp` endpoint.
     Http {
-        /// Täysi tai juuri-URL (polku täydennetään tarvittaessa).
+        /// Full or root URL (the path is appended if needed).
         url: String,
     },
 }
 
-/// Jäsentää `FAMILYCLAW_MCP_SERVERS`-arvon.
+/// Parses the value of `FAMILYCLAW_MCP_SERVERS`.
 ///
 /// # Errors
-/// Palauttaa [`McpError::EnvParse`] jos merkkijono on tyhjä segmentin jälkeen
-/// tai `name=value` -pari on epäkelpo.
+/// Returns [`McpError::EnvParse`] if a segment is empty after trimming, or
+/// if a `name=value` pair is malformed.
 pub fn parse_mcp_servers(raw: &str) -> Result<Vec<McpServerConfig>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -49,7 +49,7 @@ pub fn parse_mcp_servers(raw: &str) -> Result<Vec<McpServerConfig>> {
     Ok(out)
 }
 
-/// Lukee `FAMILYCLAW_MCP_SERVERS` prosessin ympäristöstä.
+/// Reads `FAMILYCLAW_MCP_SERVERS` from the process environment.
 pub fn load_mcp_servers_from_env() -> Result<Vec<McpServerConfig>> {
     match std::env::var("FAMILYCLAW_MCP_SERVERS") {
         Ok(raw) => parse_mcp_servers(&raw),

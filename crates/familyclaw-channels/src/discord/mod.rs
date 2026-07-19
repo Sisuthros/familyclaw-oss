@@ -1,37 +1,39 @@
-//! [`DiscordChannel`] — Discord-adapteri serenity-gatewayllä.
+//! [`DiscordChannel`] — Discord adapter over the serenity gateway.
 //!
-//! Tämä moduuli toteuttaa [`Channel`]-rajapinnan Discordille käyttäen
-//! **serenity 0.12** -kirjastoa. Koko toteutus on feature-gated (`discord`),
-//! jotta oletuskäännökseen ei vedetä raskasta gateway-WebSocket-SDK:ta ilman
-//! tarvetta.
+//! This module implements the [`Channel`] interface for Discord using the
+//! **serenity 0.12** library. The entire implementation is feature-gated
+//! (`discord`) so that the default build does not pull in the heavy
+//! gateway/WebSocket SDK unless it is needed.
 //!
-//! ## Rakenne
-//! - [`DiscordChannel`] omistaa kohdekanavan id:n, jaetun `Arc<Http>`-asiakkaan
-//!   lähetyksiä varten sekä saapuvan virran mpsc-päät.
-//! - [`DiscordChannel::start`] käynnistää serenity-gatewayn taustatehtävänä ja
-//!   palaa vasta kun yhteys on `ready` tai se epäonnistuu (ei niele virheitä).
-//! - [`Channel::receive`] luovuttaa saapuvan virran **kerran**: gatewayn
-//!   vastaanottamat viestit ohjataan `inbound_tx`:n kautta tähän virtaan.
-//! - [`Channel::send`] lähettää viestin Discordin REST-rajapinnalla `Arc<Http>`:n
-//!   kautta, pilkottuna Discordin 2000 merkin rajaan ([`split::split_message`]).
-//! - [`DiscordChannel::stop`] sulkee gatewayn siististi (`shutdown_all`).
+//! ## Structure
+//! - [`DiscordChannel`] owns the target channel id, a shared `Arc<Http>`
+//!   client for sending, and the mpsc ends of the inbound stream.
+//! - [`DiscordChannel::start`] starts the serenity gateway as a background
+//!   task and only returns once the connection is `ready` or has failed
+//!   (it does not swallow errors).
+//! - [`Channel::receive`] hands out the inbound stream **once**: messages
+//!   received by the gateway are forwarded into this stream via `inbound_tx`.
+//! - [`Channel::send`] sends a message through Discord's REST API via
+//!   `Arc<Http>`, split to Discord's 2000-character limit
+//!   ([`split::split_message`]).
+//! - [`DiscordChannel::stop`] shuts down the gateway cleanly (`shutdown_all`).
 //!
-//! ## Apumoduulit (raita B)
-//! Saapuvan viestin suodatus/muunnos ([`map::map_message`]) ja lähtevän viestin
-//! pilkonta ([`split::split_message`]) ovat serenity-riippumattomissa
-//! alimoduuleissa, jotta niiden logiikka on yksikkötestattavissa ilman
-//! gateway-kontekstia.
+//! ## Helper modules (Layer B)
+//! Inbound message filtering/mapping ([`map::map_message`]) and outbound
+//! message splitting ([`split::split_message`]) live in serenity-independent
+//! submodules so their logic is unit-testable without a gateway context.
 //!
-//! ## `MESSAGE_CONTENT` -intent (privileged)
-//! Botti EI saa viestien tekstisisältöä ilman [`GatewayIntents::MESSAGE_CONTENT`]
-//! -intentiä. Sen lisäksi intent on aktivoitava **Discord Developer Portalissa**
-//! (Bot → Privileged Gateway Intents → Message Content Intent). Ilman tätä
-//! `msg.content` on tyhjä kaikissa guild-viesteissä ja ne suodattuvat pois.
+//! ## `MESSAGE_CONTENT` intent (privileged)
+//! The bot does NOT receive message text content without the
+//! [`GatewayIntents::MESSAGE_CONTENT`] intent. In addition, the intent must be
+//! activated in the **Discord Developer Portal** (Bot → Privileged Gateway
+//! Intents → Message Content Intent). Without this, `msg.content` is empty
+//! for all guild messages and they get filtered out.
 //!
-//! ## KERROS A -säännöt
-//! Kaikki konfiguraatio (`bot_token`, `target_channel_id`) on ajonaikaista — ei
-//! kovakoodattuja arvoja. Tokenia ei koskaan lokiteta eikä se päädy
-//! `Debug`-tulosteeseen (ks. [`std::fmt::Debug`]-toteutus).
+//! ## Layer A rules
+//! All configuration (`bot_token`, `target_channel_id`) is runtime — no
+//! hardcoded values. The token is never logged and never ends up in
+//! `Debug` output (see the [`std::fmt::Debug`] implementation).
 
 pub mod map;
 pub mod split;
@@ -56,55 +58,55 @@ use crate::message::{ChannelKind, InboundEnvelope, OutboundMessage};
 use map::map_message;
 use split::split_message;
 
-/// Discordin viestin enimmäispituus merkkeinä (Unicode scalar -määrä).
+/// Discord's maximum message length in characters (Unicode scalar count).
 const DISCORD_MAX_MESSAGE_CHARS: usize = 2000;
 
-/// Kuinka kauan [`DiscordChannel::start`] odottaa `ready`-tapahtumaa ennen kuin
-/// se luovuttaa ja palauttaa virheen (esim. väärä token jää muuten roikkumaan).
+/// How long [`DiscordChannel::start`] waits for the `ready` event before
+/// giving up and returning an error (e.g. an invalid token would otherwise
+/// hang indefinitely).
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Discord-kanava — toteuttaa [`Channel`]-rajapinnan serenity-gatewayllä.
+/// Discord channel — implements the [`Channel`] interface over the serenity gateway.
 ///
-/// Kaikki asetukset (token, `target_channel_id`) annetaan rakennettaessa.
-/// Mikään arvo ei ole kovakoodattu.
+/// All settings (token, `target_channel_id`) are supplied at construction
+/// time. No value is hardcoded.
 pub struct DiscordChannel {
-    /// Tämän kanavainstanssin vakaa tunniste (`discord-<id>`).
+    /// The stable identifier for this channel instance (`discord-<id>`).
     channel_id: String,
-    /// Discord bot token (ladataan runtime-konfigista, ei kovakoodata).
+    /// Discord bot token (loaded from runtime config, never hardcoded).
     bot_token: String,
-    /// Kohdekanavan Discord-id.
+    /// The Discord id of the target channel.
     target_channel_id: u64,
-    /// Jaettu HTTP-asiakas REST-lähetyksiin. Luodaan **kerran** konstruktorissa.
+    /// Shared HTTP client for REST sends. Created **once** in the constructor.
     http: Arc<Http>,
-    /// Saapuvan virran vastaanotin; luovutetaan **kerran** [`Channel::receive`]:ssä.
+    /// Receiver for the inbound stream; handed out **once** in [`Channel::receive`].
     inbound_rx: Mutex<Option<mpsc::UnboundedReceiver<InboundEnvelope>>>,
-    /// Lähetin saapuville viesteille; kloonataan gateway-handlerille
-    /// [`DiscordChannel::start`]:ssa.
+    /// Sender for inbound messages; cloned for the gateway handler in
+    /// [`DiscordChannel::start`].
     inbound_tx: mpsc::UnboundedSender<InboundEnvelope>,
-    /// Käynnissä olevan gatewayn `ShardManager`; asetetaan
-    /// [`DiscordChannel::start`]:ssa, käytetään [`DiscordChannel::stop`]:ssa
-    /// graceful shutdowniin.
+    /// The running gateway's `ShardManager`; set in [`DiscordChannel::start`],
+    /// used in [`DiscordChannel::stop`] for graceful shutdown.
     shard_manager: Mutex<Option<Arc<ShardManager>>>,
-    /// Huoltajan/operaattorin Discord-user-id. Vain tämä id saa `DMata` agenttia
-    /// (kahdenkeskinen keskustelu). Annetaan konstruktorissa (johdetaan
-    /// runtime-konfigista, EI lueta env:stä tässä kerroksessa); 0 = ei asetettu
-    /// → DM:t pudotetaan kaikilta (turvallinen oletus).
+    /// The operator's Discord user id. Only this id may DM the agent
+    /// (one-on-one conversation). Supplied via the constructor (derived from
+    /// runtime config, NOT read from env at this layer); 0 = not set →
+    /// DMs are dropped from everyone (safe default).
     owner_id: u64,
 }
 
 impl DiscordChannel {
-    /// Luo uuden Discord-kanavan.
+    /// Creates a new Discord channel.
     ///
     /// # Arguments
-    /// * `bot_token` — Discord bot token (ladataan runtime-konfigista, ei kovakoodata).
-    /// * `target_channel_id` — kohdekanavan id Discordissa (ei saa olla 0).
-    /// * `owner_id` — huoltajan Discord-user-id DM-portille (johdetaan
-    ///   runtime-konfigista). 0 = ei asetettu → DM:t pudotetaan (turvallinen
-    ///   oletus). Tätä EI lueta env:stä tässä — konfig-kerros resolvoi sen.
+    /// * `bot_token` — Discord bot token (loaded from runtime config, never hardcoded).
+    /// * `target_channel_id` — the target channel's id in Discord (must not be 0).
+    /// * `owner_id` — the operator's Discord user id for the DM gate (derived
+    ///   from runtime config). 0 = not set → DMs are dropped (safe default).
+    ///   This is NOT read from env here — the config layer resolves it.
     ///
     /// # Errors
-    /// [`ChannelError::InvalidInput`] jos token on tyhjä tai `target_channel_id`
-    /// on 0.
+    /// [`ChannelError::InvalidInput`] if the token is empty or `target_channel_id`
+    /// is 0.
     pub fn new(
         bot_token: impl Into<String>,
         target_channel_id: u64,
@@ -122,15 +124,16 @@ impl DiscordChannel {
         }
 
         let channel_id = format!("discord-{target_channel_id}");
-        // Yksi Http-asiakas koko kanavan eliniäksi (jaetaan Arc:lla send-kutsuille).
+        // A single Http client for the channel's entire lifetime (shared via Arc for send calls).
         let http = Arc::new(Http::new(&bot_token));
-        // YKSI mpsc-pari koko kanavan eliniäksi: tx menee gatewaylle, rx
-        // luovutetaan receive()-kutsujalle. Tämä korjaa vian, jossa vanha
-        // toteutus pudotti vastaanottimen konstruktorissa (viestejä ei saatu).
+        // ONE mpsc pair for the channel's entire lifetime: tx goes to the
+        // gateway, rx is handed to the receive() caller. This fixes a bug
+        // where the old implementation dropped the receiver in the
+        // constructor (messages were never delivered).
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
 
-        // Huoltajan id annetaan konfig-kerroksesta (kahdenkeskinen DM). 0 = ei
-        // asetettu → DM:t pois. Tätä EI lueta env:stä tässä — konfig resolvoi.
+        // The operator id is supplied by the config layer (one-on-one DM). 0 = not
+        // set → DMs disabled. This is NOT read from env here — config resolves it.
 
         Ok(Self {
             channel_id,
@@ -144,17 +147,19 @@ impl DiscordChannel {
         })
     }
 
-    /// Käynnistää Discord-gateway-yhteyden taustatehtävänä ja palaa vasta kun
-    /// yhteys on `ready` tai käynnistys epäonnistuu.
+    /// Starts the Discord gateway connection as a background task and only
+    /// returns once the connection is `ready` or startup has failed.
     ///
-    /// Saapuvat viestit ohjataan `inbound_tx`-kanavaan ja sieltä
-    /// [`Channel::receive`]-virtaan. `start()` ei niele gateway-virheitä: jos
-    /// token on väärä tai yhteys katkeaa heti, kutsu palauttaa virheen
-    /// `READY_TIMEOUT`:n sisällä sen sijaan että jäisi hiljaa roikkumaan.
+    /// Inbound messages are forwarded into the `inbound_tx` channel and from
+    /// there into the [`Channel::receive`] stream. `start()` does not swallow
+    /// gateway errors: if the token is invalid or the connection drops
+    /// immediately, the call returns an error within `READY_TIMEOUT` instead
+    /// of hanging silently.
     ///
     /// # Errors
-    /// [`ChannelError::Backend`] jos serenity-clientin rakennus epäonnistuu,
-    /// gateway-tehtävä kaatuu ennen valmiutta tai `ready` ei saavu ajoissa.
+    /// [`ChannelError::Backend`] if building the serenity client fails, the
+    /// gateway task crashes before becoming ready, or `ready` does not arrive
+    /// in time.
     pub async fn start(&self) -> ChannelResult<()> {
         let intents = gateway_intents();
 
@@ -167,9 +172,10 @@ impl DiscordChannel {
             owner_id: self.owner_id,
         };
 
-        // Aseta eksplisiittinen online-presence jo IDENTIFY-payloadiin. Ilman
-        // tätä serenity lähettää presence=null, jolloin botti näkyy OFFLINE
-        // Discordin jäsenlistalla vaikka gateway-yhteys on täysin terve.
+        // Set an explicit online presence already on the IDENTIFY payload.
+        // Without this, serenity sends presence=null, which makes the bot
+        // show as OFFLINE in Discord's member list even though the gateway
+        // connection is perfectly healthy.
         let mut client = Client::builder(&self.bot_token, intents)
             .event_handler(handler)
             .status(OnlineStatus::Online)
@@ -177,22 +183,23 @@ impl DiscordChannel {
             .await
             .map_err(|e| ChannelError::backend(&self.channel_id, e.to_string()))?;
 
-        // Talleta shard_manager stop()-kutsua varten.
+        // Store shard_manager for use by stop().
         *self.shard_manager.lock().await = Some(client.shard_manager.clone());
 
-        // Käynnistä client taustatehtävänä. Virhe välitetään takaisin
-        // err-kanavan kautta, jotta start() ei niele sitä (T4).
+        // Start the client as a background task. Errors are forwarded back
+        // via the err channel so start() does not swallow them (T4).
         let (err_tx, err_rx) = oneshot::channel::<ChannelError>();
         let channel_label = self.channel_id.clone();
         tokio::spawn(async move {
             if let Err(e) = client.start().await {
-                // Lähetys voi epäonnistua jos start() on jo palannut ready-polulta;
-                // se on ok (gateway oli jo valmis, virhe tuli vasta myöhemmin).
+                // The send may fail if start() has already returned via the
+                // ready path; that's fine (the gateway was already ready,
+                // the error only arrived later).
                 let _ = err_tx.send(ChannelError::backend(&channel_label, e.to_string()));
             }
         });
 
-        // Odota ENSIMMÄISTÄ tapahtumaa: ready, varhainen virhe tai timeout.
+        // Wait for the FIRST event: ready, an early error, or timeout.
         tokio::select! {
             res = ready_rx => {
                 match res {
@@ -200,7 +207,7 @@ impl DiscordChannel {
                         info!(channel = %self.channel_id, "Discord gateway ready");
                         Ok(())
                     }
-                    // ready_tx pudotettiin ilman signaalia → handler katosi.
+                    // ready_tx was dropped without a signal → the handler disappeared.
                     Err(_) => Err(ChannelError::backend(
                         &self.channel_id,
                         "gateway handler dropped before ready",
@@ -225,14 +232,14 @@ impl DiscordChannel {
         }
     }
 
-    /// Sulkee gateway-yhteyden siististi.
+    /// Shuts down the gateway connection cleanly.
     ///
-    /// Idempotentti: jos gatewaytä ei ole käynnistetty tai se on jo suljettu,
-    /// kutsu palaa `Ok`-tilassa.
+    /// Idempotent: if the gateway was never started or is already closed,
+    /// the call returns `Ok`.
     ///
     /// # Errors
-    /// Ei palauta virhettä normaalitilanteessa; allekirjoitus säilyttää
-    /// [`ChannelResult`]-muodon symmetrian [`DiscordChannel::start`]:n kanssa.
+    /// Does not return an error under normal conditions; the signature keeps
+    /// the [`ChannelResult`] shape symmetric with [`DiscordChannel::start`].
     pub async fn stop(&self) -> ChannelResult<()> {
         if let Some(manager) = self.shard_manager.lock().await.take() {
             manager.shutdown_all().await;
@@ -243,24 +250,24 @@ impl DiscordChannel {
         Ok(())
     }
 
-    /// Onko bot-gateway käynnissä (`start()` onnistui). Webhook-tilassa `false`.
+    /// Whether the bot gateway is running (`start()` succeeded). `false` in webhook mode.
     #[must_use]
     pub async fn is_gateway_connected(&self) -> bool {
         self.shard_manager.lock().await.is_some()
     }
 
-    /// Rakentaa Discord-kanavan **webhook/HTTP-inbound-polkua** varten (gatewayn
-    /// `/inject` + `/discord/interactions`-reitit). Tässä mallissa saapuva
-    /// liikenne tulee [`DiscordChannel::inject`]:n kautta — serenity-gatewaytä ei
-    /// käynnistetä [`DiscordChannel::start`]:lla.
+    /// Builds a Discord channel for the **webhook/HTTP inbound path** (the
+    /// gateway's `/inject` + `/discord/interactions` routes). In this model,
+    /// inbound traffic arrives via [`DiscordChannel::inject`] — the serenity
+    /// gateway is not started via [`DiscordChannel::start`].
     ///
-    /// `channel_id` on tämän kanavainstanssin vakaa tunniste (esim.
-    /// `"discord-main"`), ei välttämättä Discord-snowflake. Jos se on numeerinen,
-    /// se talletetaan myös `target_channel_id`:ksi lähetyksiä varten; muuten
-    /// lähetys kulkee bus-pumpun kautta (`inject`/`receive`).
+    /// `channel_id` is the stable identifier for this channel instance (e.g.
+    /// `"discord-main"`), not necessarily a Discord snowflake. If it is
+    /// numeric, it is also stored as `target_channel_id` for sending;
+    /// otherwise sending goes through the bus pump (`inject`/`receive`).
     ///
     /// # Errors
-    /// [`ChannelError::InvalidInput`] jos `webhook_url` tai `channel_id` on tyhjä.
+    /// [`ChannelError::InvalidInput`] if `webhook_url` or `channel_id` is empty.
     pub fn from_webhook(
         webhook_url: impl Into<String>,
         channel_id: impl Into<String>,
@@ -275,14 +282,14 @@ impl DiscordChannel {
             return Err(ChannelError::invalid_input("channel_id must not be empty"));
         }
 
-        // Numeerinen channel_id → snowflake lähetyksiä varten; muuten 0
-        // (webhook-only, lähetys kulkee bus-pumpun läpi).
+        // Numeric channel_id → snowflake for sending; otherwise 0
+        // (webhook-only, sending goes through the bus pump).
         let target_channel_id = channel_id
             .trim_start_matches("discord-")
             .parse::<u64>()
             .unwrap_or(0);
-        // Http-asiakas luodaan webhook-urlilla; sitä käytetään vain jos
-        // target_channel_id on aito snowflake.
+        // The Http client is created with the webhook url; it is only used
+        // if target_channel_id is a real snowflake.
         let http = Arc::new(Http::new(&webhook_url));
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
 
@@ -294,28 +301,28 @@ impl DiscordChannel {
             inbound_rx: Mutex::new(Some(inbound_rx)),
             inbound_tx,
             shard_manager: Mutex::new(None),
-            // Webhook-only-instanssi ei käsittele DM:iä → owner-portti pois käytöstä.
+            // A webhook-only instance never handles DMs → owner gate disabled.
             owner_id: 0,
         })
     }
 
-    /// Injektoi valmiin [`InboundEnvelope`]:n saapuvaan virtaan.
+    /// Injects a completed [`InboundEnvelope`] into the inbound stream.
     ///
-    /// Käytetään HTTP-inbound-poluissa (`/inject`, `/discord/interactions`):
-    /// työntää envelopen **samaan** `inbound_tx`:ään jota serenity-handler ja
-    /// [`Channel::receive`]-virta käyttävät — injektoidut ja gatewayn
-    /// vastaanottamat viestit jakavat yhden virran.
+    /// Used on HTTP inbound paths (`/inject`, `/discord/interactions`):
+    /// pushes the envelope into the **same** `inbound_tx` used by the
+    /// serenity handler and the [`Channel::receive`] stream — injected
+    /// messages and gateway-received messages share a single stream.
     ///
     /// # Errors
-    /// [`ChannelError::Receive`] jos vastaanotin on suljettu (stream pudotettu).
+    /// [`ChannelError::Receive`] if the receiver is closed (stream dropped).
     pub fn inject(&self, envelope: InboundEnvelope) -> ChannelResult<()> {
         self.inbound_tx
             .send(envelope)
             .map_err(|e| ChannelError::receive(&self.channel_id, e.to_string()))
     }
 
-    /// Pilkkoo lähtevän viestin Discordin merkkirajaan ja lähettää palat
-    /// järjestyksessä `Arc<Http>`:n kautta.
+    /// Splits an outbound message at Discord's character limit and sends the
+    /// chunks in order via `Arc<Http>`.
     async fn send_body(
         http: &Http,
         channel: ChannelId,
@@ -344,14 +351,14 @@ impl DiscordChannel {
     }
 }
 
-/// Muuntaa serenity-lähetysvirheen [`ChannelError`]:ksi siten, että
-/// uudelleenyritettävyys (rate-limit / palvelinvirhe) erottuu pysyvistä
-/// konfiguraatiovirheistä (väärä token / puuttuva pääsy).
+/// Converts a serenity send error into a [`ChannelError`] such that
+/// retryability (rate limit / server error) is distinguished from permanent
+/// configuration errors (invalid token / missing access).
 fn map_send_error(channel_id: &str, err: &serenity::Error) -> ChannelError {
     if let serenity::Error::Http(http_err) = err {
         if let Some(status) = http_err.status_code() {
             let code = status.as_u16();
-            // 401/403/404 = pysyvä: token/oikeudet/kanava väärin → ei uudelleenyritystä.
+            // 401/403/404 = permanent: token/permissions/channel wrong → no retry.
             if matches!(code, 401 | 403 | 404) {
                 return ChannelError::backend(
                     channel_id,
@@ -360,33 +367,33 @@ fn map_send_error(channel_id: &str, err: &serenity::Error) -> ChannelError {
             }
         }
     }
-    // 429 / 5xx / verkkovirhe = väliaikainen → uudelleenyritettävä (Send).
+    // 429 / 5xx / network error = transient → retryable (Send).
     ChannelError::send(channel_id, err.to_string())
 }
 
-/// Discord-tapahtumakäsittelijä: ohjaa kohdekanavan viestit `inbound_tx`:ään ja
-/// signaloi valmiuden `ready_tx`:llä.
+/// Discord event handler: forwards target-channel messages into `inbound_tx`
+/// and signals readiness via `ready_tx`.
 struct DiscordHandler {
     target_channel_id: u64,
     inbound_tx: mpsc::UnboundedSender<InboundEnvelope>,
-    /// Kertasignaali [`DiscordChannel::start`]:lle kun gateway on `ready`.
+    /// One-shot signal for [`DiscordChannel::start`] once the gateway is `ready`.
     ready_tx: Mutex<Option<oneshot::Sender<()>>>,
-    /// Botin oma user-id (asetetaan `ready`:ssä). Käytetään self-echo-suojaan
-    /// `message`:ssa. 0 = ei vielä tiedossa (ennen ready-eventtiä).
+    /// The bot's own user id (set on `ready`). Used for self-echo protection
+    /// in `message`. 0 = not yet known (before the ready event).
     self_id: std::sync::atomic::AtomicU64,
-    /// Huoltajan user-id DM-portille (vain hän saa `DMata`). 0 = DM:t pois.
+    /// The operator's user id for the DM gate (only they may DM the bot). 0 = DMs disabled.
     owner_id: u64,
 }
 
 #[async_trait]
 impl EventHandler for DiscordHandler {
     async fn ready(&self, ctx: Context, ready: Ready) {
-        // Talleta botin oma id self-echo-suojaa varten (map_message self_id).
+        // Store the bot's own id for self-echo protection (map_message self_id).
         self.self_id
             .store(ready.user.id.get(), std::sync::atomic::Ordering::Relaxed);
-        // Uudelleenvahvista online-presence jokaisen READYn kohdalla. RESUME ei
-        // lähetä presenceä uudelleen, joten tämä pitää botin online myös pitkän
-        // reconnect-ketjun jälkeen (builder-status kattaa vain ensimmäisen IDENTIFYn).
+        // Re-assert online presence on every READY. RESUME does not resend
+        // presence, so this keeps the bot online even after a long reconnect
+        // chain (the builder status only covers the initial IDENTIFY).
         ctx.set_presence(
             Some(ActivityData::custom("FamilyClaw")),
             OnlineStatus::Online,
@@ -396,16 +403,17 @@ impl EventHandler for DiscordHandler {
             guilds = ready.guilds.len(),
             "Discord gateway connected"
         );
-        // Signaloi start():lle (kerran). Lukko otetaan ja vapautetaan tässä
-        // lohkossa ennen funktion paluuta; deadlock-riskiä ei ole.
+        // Signal start() (once). The lock is acquired and released within
+        // this block before the function returns; there is no deadlock risk.
         if let Some(tx) = self.ready_tx.lock().await.take() {
             let _ = tx.send(());
         }
     }
 
-    // Diagnostiikka: lokita JOKAINEN guild-availability-eventti. Jos guild jää
-    // pysyvästi `unavailable` eikä guild_create laukea, gateway ei saa guild-
-    // viestejä — tämä handler tekee sen näkyväksi (gateway-debug).
+    // Diagnostics: log EVERY guild-availability event. If a guild stays
+    // permanently `unavailable` and guild_create never fires, the gateway
+    // won't receive guild messages — this handler makes that visible
+    // (gateway debug aid).
     async fn guild_create(
         &self,
         _ctx: Context,
@@ -422,11 +430,12 @@ impl EventHandler for DiscordHandler {
 
     async fn message(&self, _ctx: Context, msg: Message) {
         let self_id = self.self_id.load(std::sync::atomic::Ordering::Relaxed);
-        // Mainintaportti perheen botti-viesteille: kuullaan toinen botti vain
-        // jos se @-mainitsee meidät (estää megaloopin). msg.mentions sisältää
-        // suorat user-maininnat; mention_everyone ei laukaise (liian leveä).
+        // Mention gate for messages from other bots: another bot is only
+        // heard if it @-mentions us (prevents an infinite bot-to-bot loop).
+        // msg.mentions contains direct user mentions; mention_everyone does
+        // not trigger this (too broad).
         let mentions_me = msg.mentions.iter().any(|u| u.id.get() == self_id);
-        // DM tunnistetaan guild_id:n puuttumisesta (yksityisviesti ei ole guildissa).
+        // A DM is identified by the absence of guild_id (a private message is not in a guild).
         let is_dm = msg.guild_id.is_none();
         info!(
             author = msg.author.id.get(),
@@ -436,8 +445,8 @@ impl EventHandler for DiscordHandler {
             is_dm,
             "MESSAGE_CREATE received"
         );
-        // Suodatus ja muunnos delegoidaan puhtaalle funktiolle (raita B), jotta
-        // logiikka on testattavissa ilman serenity-kontekstia.
+        // Filtering and mapping is delegated to a pure function (Layer B) so
+        // the logic is testable without a serenity context.
         let Some(envelope) = map_message(
             msg.author.id.get(),
             msg.author.bot,
@@ -460,7 +469,7 @@ impl EventHandler for DiscordHandler {
 
 impl std::fmt::Debug for DiscordChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Token EI päädy lokeihin/Debug-tulosteeseen (KERROS A: ei salaisuuksia).
+        // The token never ends up in logs/Debug output (Layer A: no secrets).
         f.debug_struct("DiscordChannel")
             .field("channel_id", &self.channel_id)
             .field("target_channel_id", &self.target_channel_id)
@@ -480,11 +489,11 @@ impl Channel for DiscordChannel {
 
     fn send(&self, message: OutboundMessage) -> SendFuture<'_> {
         let http = Arc::clone(&self.http);
-        // DM-korjaus (2026-06-23): OutboundMessage.target kantaa vastauskanavan
-        // snowflakea (DM-kanava tai guild-kanava). Käytetään sitä ensisijaisena,
-        // jotta DM-vastaukset reitittyvät oikein eivätkä päädy guild-kanavalle.
-        // Fallback: self.target_channel_id (vanha käytös, esim. webhook-instanssi
-        // tai bus-pumppu ilman selkeää targetia).
+        // DM fix (2026-06-23): OutboundMessage.target carries the reply
+        // channel's snowflake (DM channel or guild channel). It is used
+        // preferentially so DM replies route correctly instead of ending up
+        // in the guild channel. Fallback: self.target_channel_id (legacy
+        // behavior, e.g. a webhook instance or bus pump without a clear target).
         let target_from_msg = message.target.trim().parse::<u64>().ok();
         let target_id = target_from_msg
             .filter(|&id| id != 0)
@@ -518,8 +527,9 @@ impl Channel for DiscordChannel {
     }
 
     fn receive(&self) -> ChannelResult<MessageStream> {
-        // Ota talletettu rx KERRAN. Toinen kutsu → selkeä virhe (sama yksi
-        // mpsc-pari kuin start() käyttää; viestit eivät katoa irralliseen kanavaan).
+        // Take the stored rx ONCE. A second call → a clear error (the same
+        // single mpsc pair used by start(); messages don't vanish into a
+        // disconnected channel).
         let rx = self
             .inbound_rx
             .try_lock()
@@ -532,15 +542,17 @@ impl Channel for DiscordChannel {
     }
 }
 
-/// Gateway-intent-maski jolla botti tunnistautuu Discordiin.
+/// Gateway intent mask used by the bot to authenticate with Discord.
 ///
-/// `GUILDS` on PAKOLLINEN: ilman sitä Discord ei lähetä `GUILD_CREATE`-eventtiä,
-/// jolloin guild jää pysyvästi `unavailable: true` eikä botti vastaanota yhdenkään
-/// guild-kanavan `MESSAGE_CREATE`-viestiä — se on rakenteellisesti kuuro perheen
-/// kanavalla vaikka gateway on muuten `ready`. (Regressiovartija: ks. testit.)
+/// `GUILDS` is MANDATORY: without it, Discord never sends the `GUILD_CREATE`
+/// event, so the guild remains permanently `unavailable: true` and the bot
+/// never receives any guild channel's `MESSAGE_CREATE` message — it is
+/// structurally deaf on the target channel even though the gateway is
+/// otherwise `ready`. (Regression guard: see tests.)
 ///
-/// `MESSAGE_CONTENT` on privileged-intent: ilman sitä `msg.content` on tyhjä
-/// (ks. moduulidokumentaatio). Aktivoitava myös Developer Portalissa.
+/// `MESSAGE_CONTENT` is a privileged intent: without it, `msg.content` is
+/// empty (see module documentation). Must also be activated in the
+/// Developer Portal.
 fn gateway_intents() -> GatewayIntents {
     GatewayIntents::GUILDS
         | GatewayIntents::GUILD_MESSAGES
@@ -552,20 +564,20 @@ fn gateway_intents() -> GatewayIntents {
 mod tests {
     use super::*;
 
-    /// Regressiovartija: `GUILDS`-intentin puuttuminen teki botista kuuron
-    /// guild-kanavilla (guild unavailable, ei `MESSAGE_CREATE`). Älä poista.
+    /// Regression guard: missing the `GUILDS` intent made the bot deaf on
+    /// guild channels (guild unavailable, no `MESSAGE_CREATE`). Do not remove.
     #[test]
     fn gateway_intents_include_guilds_and_message_content() {
         let i = gateway_intents();
         assert!(
             i.contains(GatewayIntents::GUILDS),
-            "GUILDS pakollinen: ilman sitä guild jää unavailable, botti ei kuule guild-viestejä"
+            "GUILDS is mandatory: without it the guild stays unavailable, the bot cannot hear guild messages"
         );
         assert!(i.contains(GatewayIntents::GUILD_MESSAGES));
         assert!(i.contains(GatewayIntents::DIRECT_MESSAGES));
         assert!(
             i.contains(GatewayIntents::MESSAGE_CONTENT),
-            "MESSAGE_CONTENT pakollinen: ilman sitä msg.content on tyhjä"
+            "MESSAGE_CONTENT is mandatory: without it msg.content is empty"
         );
     }
 
@@ -577,11 +589,12 @@ mod tests {
         assert!(DiscordChannel::new("valid_token", 123_456, 0).is_ok());
     }
 
-    /// Regressiovartija: `DiscordChannel::new` EI saa lukea `FAMILYCLAW_OWNER_ID`:tä
-    /// env:stä — `owner_id` annetaan konstruktorissa (konfig-kerros resolvoi env:n).
-    /// Asetetaan env tarkoituksella ERI arvoon kuin argumentti ja todennetaan että
-    /// instanssi käyttää ARGUMENTTIA, ei env-arvoa. (Allekirjoitus pakottaa tämän jo
-    /// käännösaikaisesti, mutta tämä todentaa myös ajonaikaisen käytöksen.)
+    /// Regression guard: `DiscordChannel::new` must NOT read `FAMILYCLAW_OWNER_ID`
+    /// from env — `owner_id` is supplied via the constructor (the config layer
+    /// resolves env). The env var is intentionally set to a DIFFERENT value
+    /// than the argument, and we verify the instance uses the ARGUMENT, not
+    /// the env value. (The signature already enforces this at compile time,
+    /// but this also verifies the runtime behavior.)
     #[test]
     fn new_uses_owner_id_argument_not_env() {
         std::env::set_var("FAMILYCLAW_OWNER_ID", "999999");
@@ -612,15 +625,16 @@ mod tests {
         );
     }
 
-    /// KERROS A -vartija: kun rakennus epäonnistuu (`target_channel_id` == 0), bot
-    /// token EI saa vuotaa virheviestiin. Käytetään tunnistettavaa keksittyä
-    /// token-merkkijonoa ja todennetaan ettei se näy virhetekstissä eikä Debugissa.
+    /// Layer A guard: when construction fails (`target_channel_id` == 0), the
+    /// bot token must NOT leak into the error message. Uses a recognizable
+    /// made-up token string and verifies it does not appear in the error text
+    /// or in Debug output.
     #[test]
     fn construction_error_does_not_echo_token() {
-        // Keksitty token-merkkijono (ei oikea salaisuus); muuttujanimi ilman
-        // "token"-sanaa, jottei Layer-B-skanneri tulkitse sitä kovakoodatuksi.
+        // A made-up token string (not a real secret); the variable name
+        // avoids the word "token" so the Layer B scanner doesn't flag it as hardcoded.
         let marker = "ctor-marker-xyz-abc";
-        // Token validi (ei tyhjä), mutta target_channel_id == 0 → InvalidInput.
+        // The token is valid (not empty), but target_channel_id == 0 → InvalidInput.
         let err = DiscordChannel::new(marker, 0, 0).expect_err("target 0 must error");
         let msg = err.to_string();
         assert!(
@@ -634,13 +648,13 @@ mod tests {
         );
     }
 
-    /// Tyhjän tokenin hylkäys ei myöskään saa kaiuttaa syötettä virheviestiin.
+    /// Rejecting an empty token must also not echo the input back into the error message.
     #[test]
     fn empty_token_error_does_not_echo_input() {
         let err = DiscordChannel::new("   ", 123_456, 0).expect_err("empty token must error");
         let msg = err.to_string();
-        // Virheen tulee selittää SYY (tyhjä token) paljastamatta raakaa syötettä
-        // sellaisenaan; staattinen viesti kertoo "must not be empty".
+        // The error must explain the REASON (empty token) without revealing
+        // the raw input as-is; the static message states "must not be empty".
         assert!(
             msg.contains("bot_token"),
             "error should name the offending field, got: {msg}"
@@ -662,9 +676,10 @@ mod tests {
         let ch = DiscordChannel::new("token", 777, 0).expect("channel");
         let mut stream = ch.receive().expect("stream");
 
-        // Simuloi gatewayn vastaanottama viesti raita B:n map_message-funktion
-        // kautta ja työnnä se inbound_tx:ään (sama polku kuin EventHandler::message).
-        // Ihmisviesti ryhmäkanavalla (ei botti, ei DM), self_id=9 ≠ author.
+        // Simulate a message received by the gateway via the Layer B
+        // map_message function and push it into inbound_tx (same path as
+        // EventHandler::message). A human message on a group channel (not a
+        // bot, not a DM), self_id=9 ≠ author.
         let env = map_message(42, false, 777, 777, "hei", 9, false, false, 5).expect("valid");
         ch.inbound_tx.send(env).expect("send to inbound");
 
@@ -696,7 +711,7 @@ mod tests {
 
     #[test]
     fn from_webhook_parses_discord_prefixed_snowflake() {
-        // "discord-<snowflake>" → prefiksi karsitaan, numero parsitaan target_channel_id:ksi.
+        // "discord-<snowflake>" → the prefix is stripped, the number is parsed into target_channel_id.
         let ch = DiscordChannel::from_webhook("https://example.invalid/wh", "discord-123456")
             .expect("channel");
         assert_eq!(ch.channel_id(), "discord-123456");
@@ -705,7 +720,7 @@ mod tests {
 
     #[test]
     fn from_webhook_parses_bare_numeric_channel_id() {
-        // Pelkkä numeerinen id (ilman prefiksiä) parsitaan suoraan.
+        // A bare numeric id (without a prefix) is parsed directly.
         let ch =
             DiscordChannel::from_webhook("https://example.invalid/wh", "987654").expect("channel");
         assert_eq!(ch.channel_id(), "987654");
@@ -714,7 +729,7 @@ mod tests {
 
     #[test]
     fn from_webhook_non_numeric_channel_id_defaults_target_to_zero() {
-        // Ei-numeerinen id (esim. nimetty kanava) → target_channel_id = 0 (webhook-only).
+        // A non-numeric id (e.g. a named channel) → target_channel_id = 0 (webhook-only).
         let ch = DiscordChannel::from_webhook("https://example.invalid/wh", "discord-main")
             .expect("channel");
         assert_eq!(ch.channel_id(), "discord-main");
@@ -724,9 +739,9 @@ mod tests {
 
     #[tokio::test]
     async fn send_on_inbound_only_webhook_returns_clear_error() {
-        // Webhook-only-instanssi (target_channel_id == 0) ei voi lähettää: send()
-        // palauttaa SELKEÄN InvalidInput-virheen sen sijaan että yrittäisi
-        // hämärästi lähettää Discord-kanavalle 0. (P1: outbound impossible to misunderstand.)
+        // A webhook-only instance (target_channel_id == 0) cannot send: send()
+        // returns a CLEAR InvalidInput error instead of obscurely attempting
+        // to send to Discord channel 0. (P1: outbound impossible to misunderstand.)
         let ch = DiscordChannel::from_webhook("https://example.invalid/wh", "discord-main")
             .expect("channel");
         assert_eq!(ch.target_channel_id, 0);
@@ -749,7 +764,7 @@ mod tests {
 
     #[test]
     fn from_webhook_debug_does_not_leak_url() {
-        // bot_token-kenttään talletettu webhook_url ei saa näkyä Debug-tulosteessa.
+        // The webhook_url stored in the bot_token field must not appear in Debug output.
         let ch = DiscordChannel::from_webhook(
             "https://example.invalid/webhook-url-marker",
             "discord-main",
@@ -763,22 +778,21 @@ mod tests {
         );
     }
 
-    // --- HTTP-virhepolut: send_body oikean reqwest-kuljetuksen yli ---
+    // --- HTTP error paths: send_body over a real reqwest transport ---
     //
-    // Kartoitusaukko: `send_body`-onnistumispolku (pilkonta + tyhjän hylkäys) oli
-    // katettu, mutta Discord-REST:n ei-2xx-vastaukset (429 rate-limit, 5xx
-    // palvelinvirhe) ja verkkovirhe olivat testaamattomia. Nämä testit ajavat
-    // `send_body`:n oikealla `serenity::Http`-asiakkaalla joka on ohjattu
-    // `HttpBuilder::proxy`:llä paikalliseen mock-palvelimeen — todistavat että
-    // jokainen virhepolku palauttaa selkeän `ChannelError`:n (ei paniikkia, ei
-    // valheellista `Ok`:ta) ja että `map_send_error`-luokittelu pätee
-    // päästä päähän (429/5xx → uudelleenyritettävä Send; 401/403/404 → pysyvä
-    // Backend).
+    // Coverage gap: the `send_body` success path (splitting + empty-body
+    // rejection) was covered, but Discord REST's non-2xx responses (429 rate
+    // limit, 5xx server error) and network errors were untested. These tests
+    // run `send_body` with a real `serenity::Http` client redirected via
+    // `HttpBuilder::proxy` to a local mock server — proving that every error
+    // path returns a clear `ChannelError` (no panic, no false `Ok`) and that
+    // `map_send_error` classification holds end-to-end (429/5xx → retryable
+    // Send; 401/403/404 → permanent Backend).
     //
-    // Mock on pelkkä `std::net::TcpListener` (ei `wiremock`/`httpmock`-dependencyä
-    // → ei uusia dev-riippuvuuksia, ei `cargo-deny`-riskiä). Ratelimiter on
-    // poistettu käytöstä (`ratelimiter_disabled(true)`), jotta serenity ei jää
-    // uudelleenyrittämään 429:ää vaan palauttaa virheen heti.
+    // The mock is just a `std::net::TcpListener` (no `wiremock`/`httpmock`
+    // dependency → no new dev dependencies, no `cargo-deny` risk). The
+    // ratelimiter is disabled (`ratelimiter_disabled(true)`) so serenity
+    // doesn't keep retrying the 429 but returns the error immediately.
     mod http_error_paths {
         use super::*;
         use std::io::{Read, Write};
@@ -788,9 +802,9 @@ mod tests {
 
         use serenity::http::HttpBuilder;
 
-        /// Käynnistää minimaalisen HTTP/1.1-mockin joka vastaa `status`-koodilla
-        /// jokaiseen pyyntöön. Palauttaa `(proxy_base_url, call_counter)`. Discord
-        /// REST -reitit menevät proxyn kautta muodossa `<base>/api/v10/...`.
+        /// Starts a minimal HTTP/1.1 mock that responds with `status` to
+        /// every request. Returns `(proxy_base_url, call_counter)`. Discord
+        /// REST routes go through the proxy in the form `<base>/api/v10/...`.
         fn spawn_mock(status: u16) -> (String, Arc<AtomicUsize>) {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
             let addr = listener.local_addr().expect("local_addr");
@@ -813,10 +827,10 @@ mod tests {
                         403 => "Forbidden",
                         _ => "Error",
                     };
-                    // Discord-tyylinen virherunko. Ratelimiter on pois → serenity
-                    // EI lue `retry-after`-headeria, joten 429 ei aiheuta
-                    // uudelleenyrityssilmukkaa; vastaus muuttuu suoraan
-                    // UnsuccessfulRequest-virheeksi.
+                    // A Discord-style error body. The ratelimiter is off →
+                    // serenity does NOT read the `retry-after` header, so 429
+                    // does not trigger a retry loop; the response turns
+                    // directly into an UnsuccessfulRequest error.
                     let body = format!(r#"{{"code":0,"message":"{reason}"}}"#);
                     let response = format!(
                         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -830,8 +844,8 @@ mod tests {
             (base_url, calls)
         }
 
-        /// Rakentaa serenity-`Http`:n joka lähettää REST-pyynnöt `proxy`-URL:iin
-        /// (mock), ratelimiter pois päältä.
+        /// Builds a serenity `Http` that sends REST requests to the `proxy`
+        /// URL (mock), with the ratelimiter disabled.
         fn http_pointing_at(proxy: &str) -> Http {
             HttpBuilder::new("Bot test-token")
                 .proxy(proxy.to_string())
@@ -841,8 +855,8 @@ mod tests {
 
         #[tokio::test]
         async fn send_body_429_rate_limit_is_retryable_send_error() {
-            // 429 → map_send_error luokittelee uudelleenyritettäväksi
-            // (ChannelError::Send), EI paniikkia eikä pysyvää Backend-virhettä.
+            // 429 → map_send_error classifies it as retryable
+            // (ChannelError::Send), NOT a panic and NOT a permanent Backend error.
             let (base, calls) = spawn_mock(429);
             let http = http_pointing_at(&base);
 
@@ -859,7 +873,7 @@ mod tests {
 
         #[tokio::test]
         async fn send_body_500_server_error_is_retryable_send_error() {
-            // 5xx → uudelleenyritettävä Send (ei paniikki, ei valheellinen Ok).
+            // 5xx → retryable Send (no panic, no false Ok).
             let (base, _calls) = spawn_mock(500);
             let http = http_pointing_at(&base);
 
@@ -875,8 +889,8 @@ mod tests {
 
         #[tokio::test]
         async fn send_body_403_forbidden_is_permanent_backend_error() {
-            // 403 = oikeudet väärin → PYSYVÄ virhe (Backend), ei uudelleenyritystä.
-            // Todistaa map_send_error:n 401/403/404-haaran oikean HTTP-vastauksen yli.
+            // 403 = wrong permissions → PERMANENT error (Backend), no retry.
+            // Proves the map_send_error 401/403/404 branch over a real HTTP response.
             let (base, _calls) = spawn_mock(403);
             let http = http_pointing_at(&base);
 
@@ -892,10 +906,11 @@ mod tests {
 
         #[tokio::test]
         async fn send_body_network_error_is_send_error_not_panic() {
-            // Verkkovirhe: sido portti, lue osoite ja sulje listener heti →
-            // yhteys torjutaan (connection refused). Deterministinen korvike
-            // timeoutille; sama polku (reqwest-virhe, ei HttpError) → serenity
-            // palauttaa ei-Http-virheen jonka map_send_error luokittelee Send:ksi.
+            // Network error: bind a port, read its address, and close the
+            // listener immediately → the connection is refused. A
+            // deterministic substitute for a timeout; the same path
+            // (a reqwest error, not an HttpError) → serenity returns a
+            // non-Http error that map_send_error classifies as Send.
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let addr = listener.local_addr().expect("addr");
             drop(listener);

@@ -1,0 +1,121 @@
+name: Release
+
+# Triggers on any tag matching v* (e.g. v1.2.0). Re-runs the Layer B audit and
+# the full test suite before building anything — a release must not ship if
+# either gate is red, even though the tag already passed CI on the commit it
+# points at (branch protection can be bypassed for tags).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  layer-b-audit:
+    name: Layer B leak audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Layer B leak audit
+        run: bash scripts/audit-layer-b.sh
+
+      - name: Run Layer B audit regression tests
+        run: bash scripts/test-audit-layer-b.sh
+
+  test:
+    name: Full test suite (all features)
+    needs: layer-b-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # See ci.yml's `all-features` job: familyclaw-bench integration tests
+      # spawn the continuity_daemon binary as a child process and expect it
+      # already built under target/debug/, since `cargo test --workspace`
+      # does not build another crate's [[bin]] target for the test run.
+      - name: Build continuity_daemon binary (familyclaw-bench process boundary)
+        run: cargo build -p familyclaw-agent --bin continuity_daemon
+
+      - name: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features
+
+  build:
+    name: Build release binary (${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-latest
+            bin_name: familyclaw-gateway
+            asset_name: familyclaw-gateway-linux-x86_64
+          - target: windows-x86_64
+            os: windows-latest
+            bin_name: familyclaw-gateway.exe
+            asset_name: familyclaw-gateway-windows-x86_64.exe
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # Only familyclaw-gateway ships as a release binary — it is the sole
+      # long-running process binary meant for external deployment (see its
+      # Cargo.toml [[bin]] "familyclaw-gateway"). Other workspace [[bin]]
+      # targets (familyclaw, crash_replay, continuity_daemon, bench, the
+      # familyclaw-actions CLIs, dream-cron-job, mock-mcp-stdio-server) are
+      # dev/ops/benchmark tooling, not release artifacts.
+      - name: Build familyclaw-gateway (release)
+        run: cargo build --release -p familyclaw-gateway
+
+      - name: Stage release asset
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin_name }}" "dist/${{ matrix.asset_name }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

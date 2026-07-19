@@ -1,33 +1,35 @@
-//! Lippulaiva-taito: allowlistattu paikallisen tiedoston luku (KERROS A).
+//! Flagship skill: allowlisted local file read (Layer A).
 //!
-//! [`FsReadAllowlisted`] todistaa koko työkalusilmukan (observe→…→report)
-//! **avaamatta verkko-ovea**: se on tarkoituksella **ei** http-get, vaan lukee
-//! vain paikallisia tiedostoja, ja on **SSRF-turvallinen rakenteeltaan** —
-//! verkkopyyntöä ei voi muodostaa, koska taito ei koskaan koske verkkoon.
+//! [`FsReadAllowlisted`] proves out the entire tool loop (observe→…→report)
+//! **without opening a network door**: it is intentionally **not** an
+//! http-get, but reads only local files, and is **SSRF-safe by construction**
+//! — a network request cannot be formed, because the skill never touches
+//! the network.
 //!
-//! ## Kuormaa kantava turvallisuus: kanonisointi + allowlist
-//! Taito ottaa polun ([`FsReadInput::path`]) ja:
-//! 1. **kanonisoi** sen ([`std::fs::canonicalize`]) — purkaa `..`-segmentit ja
-//!    seuraa symlinkit niiden todelliseen kohteeseen,
-//! 2. varmistaa että kanoninen polku pysyy **jonkin allowlistatun juuren alla**
-//!    (juuret myös kanonisoidaan ennen vertailua),
-//! 3. **hylkää** kaikki polut allowlistin ulkopuolella — mukaan lukien
-//!    symlink-pakenemiset (symlink allowlistin sisällä joka osoittaa ulos
-//!    kanonisoituu ulkopuoliseksi kohteeksi ja hylätään).
+//! ## Load-bearing security: canonicalization + allowlist
+//! The skill takes a path ([`FsReadInput::path`]) and:
+//! 1. **canonicalizes** it ([`std::fs::canonicalize`]) — resolves `..`
+//!    segments and follows symlinks to their real target,
+//! 2. verifies that the canonical path stays **under some allowlisted root**
+//!    (the roots are also canonicalized before comparison),
+//! 3. **rejects** any path outside the allowlist — including symlink
+//!    escapes (a symlink inside the allowlist that points outside
+//!    canonicalizes to an outside target and is rejected).
 //!
-//! Allowlistin alle osuva luku ajaa **automaattisesti** (ei hyväksyntää);
-//! allowlistin ulkopuolinen polku hylätään.
+//! A read landing under the allowlist runs **automatically** (no approval);
+//! a path outside the allowlist is rejected.
 //!
-//! ## Todistepaketti ei sisällä koko tiedostoa
-//! Tulos sisältää oletuksena vain polun **tiivisteen** (SHA-256), tiedoston
-//! **koon** tavuina sekä lyhyen **yhteenvedon** — EI koko tiedoston sisältöä.
-//! Näin todiste ei vuoda luettua dataa eikä paisu.
+//! ## The proof package does not contain the whole file
+//! By default the result contains only the path's **hash** (SHA-256), the
+//! file's **size** in bytes, and a short **summary** — NOT the full file
+//! contents. This way the proof cannot leak the data read, nor does it
+//! bloat.
 //!
-//! ## Taint (epäluotettavuus)
-//! Luettu tuloste on oletuksena **epäluotettavaa** (taint). Vain jos kanoninen
-//! polku osuu erikseen **luotettujen** juurten alle (projektin omat tiedostot),
-//! tuloste merkitään luotetuksi. Näin ulkopuolelta tuotu sisältö ei pese
-//! itseään puhtaaksi.
+//! ## Taint (untrustworthiness)
+//! By default, the content read is **untrusted** (tainted). Only if the
+//! canonical path falls under separately configured **trusted** roots (the
+//! project's own files) is the output marked trusted. This way content
+//! brought in from outside cannot launder itself clean.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -45,82 +47,83 @@ use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 
 use super::Skill;
 
-/// Taidon kiinteä tunniste, jotta rekisteröinti ja haku ovat toistettavia.
+/// The skill's fixed identifier, so registration and lookup are repeatable.
 const SKILL_UUID: uuid::Uuid = uuid::uuid!("55555555-5555-4555-8555-555555555555");
 
-/// Yhteenvedon enimmäispituus tavuina — pidetään lyhyenä, jottei koko tiedoston
-/// sisältö koskaan vuoda todisteeseen yhteenvedon kautta.
+/// Maximum summary length in bytes — kept short so the full file contents
+/// never leak into the proof via the summary.
 const SUMMARY_MAX_BYTES: usize = 120;
 
-/// Hakemistolistan enimmäismäärä merkintöjä yhteenvedossa.
+/// Maximum number of directory-listing entries in the summary.
 const DIR_LIST_MAX_ENTRIES: usize = 64;
 
-/// Täyden sisällön enimmäiskoko tavuina tool-tuloksessa (`read_full_content`).
+/// Maximum full-content size in bytes in the tool result (`read_full_content`).
 const FULL_CONTENT_MAX_BYTES: usize = 64 * 1024;
 
-/// Taidon syöte: luettavan tiedoston polku.
+/// The skill's input: the path of the file to read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FsReadInput {
-    /// Luettavan tiedoston polku (suhteellinen tai absoluuttinen). Polku
-    /// kanonisoidaan ja sen on pysyttävä allowlistatun juuren alla.
+    /// Path of the file to read (relative or absolute). The path is
+    /// canonicalized and must stay under an allowlisted root.
     pub path: String,
-    /// Kun `true`, palauttaa myös `content`-kentän (typistettynä rajaan asti).
-    /// Oletus `false` — vain tiiviste + yhteenveto todisteeseen.
+    /// When `true`, also returns the `content` field (truncated to the
+    /// limit). Default `false` — only hash + summary in the proof.
     #[serde(default)]
     pub read_full_content: bool,
 }
 
-/// Taidon tulos: todistepaketin ydin (tiiviste + koko + yhteenveto).
+/// The skill's result: the core of the proof package (hash + size + summary).
 ///
-/// **EI** sisällä koko tiedoston sisältöä — vain kuormaa kantavat metatiedot.
+/// Does **NOT** contain the full file contents — only load-bearing metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsReadOutput {
-    /// Kanonisen polun SHA-256-tiiviste (heksa) — EI raakaa polkua.
+    /// SHA-256 hash of the canonical path (hex) — NOT the raw path.
     pub path_hash: String,
-    /// Luetun tiedoston koko tavuina.
+    /// Size of the file read, in bytes.
     pub size: u64,
-    /// Lyhyt ihmisluettava yhteenveto (typistetty, EI koko sisältöä).
+    /// Short human-readable summary (truncated, NOT the full contents).
     pub summary: String,
-    /// Onko sisältö projektin luotettua tiedostoa (vaikuttaa taint-tilaan).
+    /// Whether the content is a trusted project file (affects taint state).
     pub trusted: bool,
 }
 
-/// Allowlist-kokoonpano: sallitut juuret ja niiden luotettava osajoukko.
+/// Allowlist configuration: allowed roots and their trusted subset.
 ///
-/// Kokoonpano on **konfiguroitavissa** — taito ei kovakoodaa mitään polkua,
-/// joten julkaistava lähde pysyy geneerisenä (ei yksityisiä polkuja). Tyhjä
-/// allowlist (oletus) hylkää **kaikki** polut — fail-closed.
+/// The configuration is **configurable** — the skill does not hardcode any
+/// path, so the published source stays generic (no private paths). An empty
+/// allowlist (default) rejects **all** paths — fail-closed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FsReadConfig {
-    /// Sallitut juurihakemistot. Luku sallitaan vain jos kanoninen polku pysyy
-    /// jonkin näistä (kanonisoidun) juuren alla.
+    /// Allowed root directories. A read is allowed only if the canonical
+    /// path stays under one of these (canonicalized) roots.
     allow_roots: Vec<PathBuf>,
-    /// Luotettujen juurten osajoukko: näiden alta luettu sisältö merkitään
-    /// luotetuksi (taint poistuu). Tyhjä = mikään ei ole luotettua.
+    /// Subset of trusted roots: content read from under these is marked
+    /// trusted (taint is cleared). Empty = nothing is trusted.
     trusted_roots: Vec<PathBuf>,
 }
 
 impl FsReadConfig {
-    /// Luo tyhjän kokoonpanon, joka hylkää kaikki polut (fail-closed).
+    /// Creates an empty configuration that rejects all paths (fail-closed).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Lisää sallitun juuren (rakentaja-ketjutus).
+    /// Adds an allowed root (builder chaining).
     ///
-    /// Juurta ei kanonisoida tässä — kanonisointi tehdään vasta lukuhetkellä,
-    /// jotta kokoonpanon voi rakentaa myös ennen kuin hakemisto on olemassa.
+    /// The root is not canonicalized here — canonicalization happens only
+    /// at read time, so the configuration can also be built before the
+    /// directory exists.
     #[must_use]
     pub fn allow_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.allow_roots.push(root.into());
         self
     }
 
-    /// Lisää luotetun juuren (rakentaja-ketjutus).
+    /// Adds a trusted root (builder chaining).
     ///
-    /// Luotettu juuri lisätään myös sallittuihin juuriin, jottei luotetuksi
-    /// merkittyä polkua voi vahingossa jättää allowlistin ulkopuolelle.
+    /// The trusted root is also added to the allowed roots, so that a path
+    /// marked trusted can never accidentally be left outside the allowlist.
     #[must_use]
     pub fn trusted_root(mut self, root: impl Into<PathBuf>) -> Self {
         let root = root.into();
@@ -129,18 +132,18 @@ impl FsReadConfig {
         self
     }
 
-    /// Kanonisoi sallitut juuret. Olemassaolemattomat tai kanonisoitumattomat
-    /// juuret ohitetaan hiljaa (niiden alle ei voi koskaan osua).
+    /// Canonicalizes the allowed roots. Nonexistent or non-canonicalizable
+    /// roots are silently skipped (nothing can ever land under them).
     fn canonical_allow_roots(&self) -> Vec<PathBuf> {
         Self::canonicalize_all(&self.allow_roots)
     }
 
-    /// Kanonisoi luotetut juuret (sama logiikka kuin sallituilla).
+    /// Canonicalizes the trusted roots (same logic as for allowed roots).
     fn canonical_trusted_roots(&self) -> Vec<PathBuf> {
         Self::canonicalize_all(&self.trusted_roots)
     }
 
-    /// Kanonisoi listan juuria; epäonnistuneet (esim. puuttuvat) jätetään pois.
+    /// Canonicalizes a list of roots; failures (e.g. missing) are dropped.
     fn canonicalize_all(roots: &[PathBuf]) -> Vec<PathBuf> {
         roots
             .iter()
@@ -149,79 +152,81 @@ impl FsReadConfig {
     }
 }
 
-/// Lippulaiva-taito allowlistatulle tiedoston luvulle (vain luku, SSRF-vapaa).
+/// Flagship skill for allowlisted file reads (read-only, SSRF-free).
 ///
-/// Riskiluokka on [`ActionRisk::ReadOnly`] ja käytäntö
-/// [`ApprovalPolicy::AutoIfReadOnly`], joten allowlistin alle osuva luku ajaa
-/// automaattisesti ilman hyväksyntää. Allowlistin ulkopuolinen polku hylätään.
+/// Risk class is [`ActionRisk::ReadOnly`] and policy
+/// [`ApprovalPolicy::AutoIfReadOnly`], so a read landing under the allowlist
+/// runs automatically without approval. A path outside the allowlist is
+/// rejected.
 #[derive(Debug, Clone, Default)]
 pub struct FsReadAllowlisted {
-    /// Allowlist-kokoonpano (sallitut + luotetut juuret).
+    /// Allowlist configuration (allowed + trusted roots).
     config: FsReadConfig,
 }
 
 impl FsReadAllowlisted {
-    /// Luo taidon tyhjällä allowlistilla (hylkää kaikki polut, fail-closed).
+    /// Creates the skill with an empty allowlist (rejects all paths, fail-closed).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Luo taidon annetulla allowlist-kokoonpanolla.
+    /// Creates the skill with the given allowlist configuration.
     #[must_use]
     pub fn with_config(config: FsReadConfig) -> Self {
         Self { config }
     }
 
-    /// Taidon kiinteä tunniste.
+    /// The skill's fixed identifier.
     #[must_use]
     pub fn skill_id() -> SkillId {
         SkillId::from_uuid(SKILL_UUID)
     }
 
-    /// Ratkaisee allowlistatun, kanonisoidun polun syötteen polusta.
+    /// Resolves the allowlisted, canonicalized path from the input path.
     ///
-    /// Kanonisoi pyydetyn polun (purkaa `..` ja seuraa symlinkit) ja varmistaa
-    /// että tulos pysyy jonkin sallitun juuren alla. Symlink-pakeneminen
-    /// (allowlistin sisällä oleva linkki joka osoittaa ulos) hylätään, koska
-    /// kanonisointi paljastaa todellisen kohteen ulkopuoliseksi.
+    /// Canonicalizes the requested path (resolves `..` and follows symlinks)
+    /// and verifies that the result stays under some allowed root. A
+    /// symlink escape (a link inside the allowlist that points outside) is
+    /// rejected, because canonicalization reveals the real target as
+    /// outside.
     ///
     /// # Errors
-    /// - [`ActionError::PolicyDenied`] jos polku ei kanonisoidu (esim. tiedostoa
-    ///   ei ole) tai jos kanoninen polku ei ole minkään sallitun juuren alla.
+    /// - [`ActionError::PolicyDenied`] if the path does not canonicalize
+    ///   (e.g. the file doesn't exist) or if the canonical path is not under
+    ///   any allowed root.
     fn resolve_allowed(&self, requested: &str) -> Result<PathBuf> {
         let roots = self.config.canonical_allow_roots();
         if roots.is_empty() {
             return Err(ActionError::PolicyDenied(
-                "ei sallittuja juuria — kaikki polut hylätään (fail-closed)".to_string(),
+                "no allowed roots — all paths rejected (fail-closed)".to_string(),
             ));
         }
 
-        // Kanonisointi purkaa `..`-segmentit ja seuraa symlinkit todelliseen
-        // kohteeseen. Tämä on kuormaa kantava turvallisuus: pakenemisyritys
-        // (../ tai symlink ulos) paljastuu tässä.
+        // Canonicalization resolves `..` segments and follows symlinks to
+        // their real target. This is load-bearing security: an escape
+        // attempt (../ or a symlink pointing out) is revealed here.
         let canonical = std::fs::canonicalize(requested).map_err(|e| {
-            ActionError::PolicyDenied(format!("polkua ei voi kanonisoida (hylätty): {e}"))
+            ActionError::PolicyDenied(format!("path could not be canonicalized (rejected): {e}"))
         })?;
 
         if path_is_under_any(&canonical, &roots) {
             Ok(canonical)
         } else {
             Err(ActionError::PolicyDenied(
-                "kanoninen polku on allowlistin ulkopuolella (hylätty)".to_string(),
+                "canonical path is outside the allowlist (rejected)".to_string(),
             ))
         }
     }
 
-    /// Lukee kanonisoidun tiedoston ja koostaa todistepaketin ytimen
-    /// (tiiviste + koko + yhteenveto) — EI koko sisältöä.
+    /// Reads the canonicalized file and assembles the core of the proof
+    /// package (hash + size + summary) — NOT the full contents.
     ///
-    /// Sisältö merkitään luotetuksi vain jos kanoninen polku osuu luotetun
-    /// juuren alle.
+    /// Content is marked trusted only if the canonical path falls under a
+    /// trusted root.
     ///
     /// # Errors
-    /// Palauttaa [`ActionError::ExecutionFailed`] jos tiedoston luku
-    /// epäonnistuu.
+    /// Returns [`ActionError::ExecutionFailed`] if reading the file fails.
     async fn read_proof(&self, canonical: &Path) -> Result<FsReadOutput> {
         let meta = tokio::fs::metadata(canonical)
             .await
@@ -273,12 +278,12 @@ impl FsReadAllowlisted {
         }
 
         let mut summary = if names.is_empty() {
-            "[tyhjä hakemisto]".to_string()
+            "[empty directory]".to_string()
         } else {
             format!("dir: {}", names.join(", "))
         };
         if total > DIR_LIST_MAX_ENTRIES {
-            let _ = write!(summary, " … (+{} lisää)", total - DIR_LIST_MAX_ENTRIES);
+            let _ = write!(summary, " … (+{} more)", total - DIR_LIST_MAX_ENTRIES);
         }
         truncate_utf8(&mut summary, SUMMARY_MAX_BYTES * 4);
 
@@ -294,48 +299,49 @@ impl FsReadAllowlisted {
     }
 }
 
-/// Muotoilee tiedostojärjestelmävirheen selkeäksi agentille.
+/// Formats a filesystem error clearly for the agent.
 fn map_fs_error(path: &Path, err: &std::io::Error) -> ActionError {
     use std::io::ErrorKind;
     let path_display = path.to_string_lossy();
     match err.kind() {
         ErrorKind::NotFound => ActionError::ExecutionFailed(format!(
-            "polkua ei löydy: {path_display} (tarkista polku tai luo tiedosto file_write:lla)"
+            "path not found: {path_display} (check the path or create the file with file_write)"
         )),
         ErrorKind::PermissionDenied => ActionError::ExecutionFailed(format!(
-            "käyttö estetty polulle {path_display} — tarkista että polku on allowlistilla \
-             eikä osoita kiellettyyn juureen"
+            "access denied for path {path_display} — check that the path is on the allowlist \
+             and does not point to a forbidden root"
         )),
-        _ => ActionError::ExecutionFailed(format!(
-            "tiedoston luku epäonnistui ({path_display}): {err}"
-        )),
+        _ => ActionError::ExecutionFailed(format!("file read failed ({path_display}): {err}")),
     }
 }
 
-/// Onko `path` jonkin annetun juuren alla (tai itse juuri).
+/// Whether `path` is under any of the given roots (or is the root itself).
 ///
-/// Vertailu tehdään komponentti-tasolla [`Path::starts_with`]-semantiikalla,
-/// joten esim. `/allow/dir2` ei osu juureen `/allow/dir` (etuliite ei riitä —
-/// koko komponentin on täsmättävä).
+/// The comparison is done at the component level with
+/// [`Path::starts_with`] semantics, so e.g. `/allow/dir2` does not match the
+/// root `/allow/dir` (a prefix is not enough — the whole component must
+/// match).
 fn path_is_under_any(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 
-/// Laskee kanonisen polun SHA-256-tiivisteen heksamerkkijonona.
+/// Computes the SHA-256 hash of the canonical path as a hex string.
 ///
-/// Polku tiivistetään tavuesityksestään; tiiviste tallennetaan todisteeseen
-/// raakapolun sijasta, jottei (mahdollisesti yksityinen) polku vuoda.
+/// The path is hashed from its byte representation; the hash is stored in
+/// the proof instead of the raw path, so that a (potentially private) path
+/// does not leak.
 fn hash_path(path: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(path.to_string_lossy().as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
-/// Koostaa lyhyen, typistetyn yhteenvedon tiedoston tavuista.
+/// Assembles a short, truncated summary from the file's bytes.
 ///
-/// Ottaa ensimmäisen rivin (tai koko sisällön jos rivinvaihtoa ei ole),
-/// typistää [`SUMMARY_MAX_BYTES`]-rajaan UTF-8-turvallisesti ja siivoaa
-/// kontrollimerkit. **Ei** koko sisältöä — yhteenveto on tarkoituksella suppea.
+/// Takes the first line (or the whole content if there is no line break),
+/// truncates it to the [`SUMMARY_MAX_BYTES`] limit in a UTF-8-safe way, and
+/// strips control characters. **Not** the full content — the summary is
+/// intentionally terse.
 fn summarize(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     let first_line = text.lines().next().unwrap_or("");
@@ -344,7 +350,7 @@ fn summarize(bytes: &[u8]) -> String {
     summary.trim().to_string()
 }
 
-/// Typistää merkkijonon enintään `max_bytes` tavuun säilyttäen UTF-8-rajat.
+/// Truncates a string to at most `max_bytes` bytes while preserving UTF-8 boundaries.
 fn truncate_utf8(s: &mut String, max_bytes: usize) {
     if s.len() <= max_bytes {
         return;
@@ -369,8 +375,8 @@ impl ActionExecutor for FsReadAllowlisted {
             }
         };
 
-        // Ratkaise + validoi allowlist. Hylätty polku → epäonnistunut tulos
-        // (ei paniikkia, ei virhettä joka kaataisi putken).
+        // Resolve + validate against the allowlist. A rejected path →
+        // a failure result (no panic, no error that would crash the pipeline).
         let canonical = match self.resolve_allowed(&input.path) {
             Ok(path) => path,
             Err(e) => {
@@ -407,7 +413,7 @@ impl ActionExecutor for FsReadAllowlisted {
 
         let trusted = out.trusted;
         let result = ActionResult::success(
-            if out.summary.starts_with("dir:") || out.summary == "[tyhjä hakemisto]" {
+            if out.summary.starts_with("dir:") || out.summary == "[empty directory]" {
                 format!("listed {} entries in allowlisted directory", out.size)
             } else {
                 format!("read {} byte(s) from allowlisted path", out.size)
@@ -416,8 +422,8 @@ impl ActionExecutor for FsReadAllowlisted {
             request.now,
         );
 
-        // Taint poistetaan vain luotetuille projektitiedostoille; muuten tuloste
-        // pysyy epäluotettavana (oletus).
+        // Taint is cleared only for trusted project files; otherwise the
+        // output stays untrusted (default).
         if trusted {
             Ok(result.trusted())
         } else {
@@ -432,9 +438,9 @@ impl Skill for FsReadAllowlisted {
             id: Self::skill_id(),
             name: "fs_read_allowlisted".to_string(),
             version: "1.0.0".to_string(),
-            description: "Lukee paikallisen tiedoston tai listaa hakemiston vain allowlistatun \
-                 juuren alta (kanonisoitu polku, ei verkkoa). Oletus: tiiviste + yhteenveto; \
-                 `read_full_content: true` palauttaa myös sisällön (max 64 KiB)."
+            description: "Reads a local file or lists a directory only from under an \
+                 allowlisted root (canonicalized path, no network). Default: hash + summary; \
+                 `read_full_content: true` also returns the content (max 64 KiB)."
                 .to_string(),
             permissions: vec![SkillPermission::ReadFiles],
             risk: ActionRisk::ReadOnly,
@@ -446,11 +452,11 @@ impl Skill for FsReadAllowlisted {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Luettavan tiedoston polku (kanonisoidaan; on pysyttävä allowlistatun juuren alla)."
+                        "description": "Path of the file to read (canonicalized; must stay under an allowlisted root)."
                     },
                     "read_full_content": {
                         "type": "boolean",
-                        "description": "Kun true, palauttaa myös tiedoston sisällön (max 64 KiB). Oletus false."
+                        "description": "When true, also returns the file's content (max 64 KiB). Default false."
                     }
                 },
                 "required": ["path"],
@@ -473,8 +479,8 @@ mod tests {
         from_unix_secs(secs).expect("valid unix seconds")
     }
 
-    /// Luo eristetyn väliaikaishakemiston tälle testille (kanonisoituna, jotta
-    /// macOS `/var`→`/private/var`-symlinkit eivät sotke `starts_with`-vertailua).
+    /// Creates an isolated temp directory for this test (canonicalized so
+    /// macOS `/var`→`/private/var` symlinks don't confuse `starts_with` comparisons).
     fn temp_dir(tag: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!("familyclaw_fs_read_{tag}_{}", uuid::Uuid::new_v4()));
@@ -482,7 +488,7 @@ mod tests {
         std::fs::canonicalize(&dir).expect("canonicalize temp dir")
     }
 
-    /// Kirjoittaa tiedoston annetulla sisällöllä ja palauttaa sen polun.
+    /// Writes a file with the given content and returns its path.
     fn write_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
         let mut f = std::fs::File::create(&path).expect("create file");
@@ -497,13 +503,13 @@ mod tests {
         assert_eq!(m.name, "fs_read_allowlisted");
         assert_eq!(m.risk, ActionRisk::ReadOnly);
         assert_eq!(m.approval_policy, ApprovalPolicy::AutoIfReadOnly);
-        // Skeema mainostaa `path`-kentän aitona JSON Schemana.
+        // The schema advertises the `path` field as genuine JSON Schema.
         assert_eq!(m.input_schema["properties"]["path"]["type"], "string");
         assert_eq!(m.input_schema["required"][0], "path");
-        // Geneerinen: ei perhenimiä, ei yksityisiä polkuja manifestissa.
-        // Kielletyt nimet rakennetaan ajonaikana fragmenteista, jottei
-        // lähdetiedostossa ole yhtäkään kokonaista perhenimi-literaalia
-        // (scripts/audit-layer-b.sh löytäisi muuten oman testimme).
+        // Generic: no family names, no private paths in the manifest.
+        // Forbidden names are built at runtime from fragments, so the
+        // source file contains no single whole family-name literal
+        // (otherwise scripts/audit-layer-b.sh would flag our own test).
         let rendered = serde_json::to_string(&m).expect("serialize manifest");
         let forbidden_fragments: [(&str, &str); 6] = [
             ("Lum", "en"),
@@ -520,7 +526,7 @@ mod tests {
                 "manifest must be generic (no family names)"
             );
         }
-        // Eikä absoluuttisia/yksityisiä polkuja (geneerinen julkaistava skill).
+        // And no absolute/private paths either (generic publishable skill).
         assert!(!rendered.contains(":\\"), "no Windows absolute paths");
         assert!(
             !rendered.contains("/home/"),
@@ -582,7 +588,7 @@ mod tests {
     async fn rejects_outside_allowlist() {
         let allowed = temp_dir("allowed");
         let other = temp_dir("other");
-        // Tiedosto ON olemassa (kanonisoituu) mutta EI allowlistatun juuren alla.
+        // The file DOES exist (canonicalizes) but is NOT under the allowlisted root.
         write_file(&other, "secret.txt", "outside");
         let skill = FsReadAllowlisted::with_config(FsReadConfig::new().allow_root(&allowed));
 
@@ -608,17 +614,17 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_dot_dot_traversal() {
-        // Allowlist = alihakemisto; yritetään `..`-pakeneminen ulos.
+        // Allowlist = subdirectory; attempt a `..` escape outward.
         let base = temp_dir("traversal");
         let allowed = base.join("inside");
         std::fs::create_dir_all(&allowed).expect("create inside");
-        // Salainen tiedosto sisaren hakemistossa (allowlistin ulkopuolella).
+        // Secret file in the sibling directory (outside the allowlist).
         write_file(&base, "outside.txt", "secret");
 
         let skill = FsReadAllowlisted::with_config(FsReadConfig::new().allow_root(&allowed));
 
-        // `<allowed>/../outside.txt` → kanonisoituu `<base>/outside.txt`:ksi,
-        // joka EI ole allowlistin alla → hylätään.
+        // `<allowed>/../outside.txt` → canonicalizes to `<base>/outside.txt`,
+        // which is NOT under the allowlist → rejected.
         let traversal = allowed.join("..").join("outside.txt");
         let payload = serde_json::to_value(FsReadInput {
             path: traversal.to_string_lossy().to_string(),
@@ -642,8 +648,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_symlink_escape() {
-        // Symlink allowlistin SISÄLLÄ joka osoittaa allowlistin ULKOPUOLELLE.
-        // Kanonisointi seuraa linkin → todellinen kohde paljastuu ulkopuoliseksi.
+        // Symlink INSIDE the allowlist that points OUTSIDE the allowlist.
+        // Canonicalization follows the link → the real target is revealed as outside.
         let allowed = temp_dir("symlink_allowed");
         let outside = temp_dir("symlink_outside");
         let secret = write_file(&outside, "secret.txt", "leak me");
@@ -675,9 +681,9 @@ mod tests {
     #[cfg(not(unix))]
     #[tokio::test]
     async fn rejects_symlink_escape() {
-        // Ei-Unix-alustoilla symlinkin luonti voi vaatia oikeuksia; varmistetaan
-        // sama invariantti junctionin/`..`:n kautta: ulkopuolinen kohde hylätään.
-        // (Symlink-pakeneminen on katettu Unixilla erikseen.)
+        // On non-Unix platforms, creating a symlink may require privileges;
+        // verify the same invariant via a junction/`..`: an outside target
+        // is rejected. (Symlink escape is covered separately on Unix.)
         let allowed = temp_dir("symlink_allowed_win");
         let outside = temp_dir("symlink_outside_win");
         write_file(&outside, "secret.txt", "leak me");
@@ -713,8 +719,8 @@ mod tests {
     #[tokio::test]
     async fn proof_contains_hash_and_size_not_contents() {
         let dir = temp_dir("proof");
-        // Tunnistemerkki on TARKOITUKSELLA toisella rivillä: yhteenveto ottaa vain
-        // ensimmäisen rivin, joten koko tiedoston runko (rivit 2+) ei saa vuotaa.
+        // The tell-tale marker is INTENTIONALLY on the second line: the summary
+        // takes only the first line, so the rest of the file body (lines 2+) must not leak.
         let contents = "harmless first line\nmust never appear: full body line two\n";
         write_file(&dir, "doc.txt", contents);
         let skill = FsReadAllowlisted::with_config(FsReadConfig::new().allow_root(&dir));
@@ -734,7 +740,7 @@ mod tests {
         let res = skill.execute(req).await.expect("execute");
         assert!(res.status.is_success());
 
-        // Tiiviste (64 heksamerkkiä) ja koko ovat läsnä.
+        // The hash (64 hex characters) and size are present.
         let hash = res.raw_output_redacted["path_hash"]
             .as_str()
             .expect("path_hash present");
@@ -745,14 +751,14 @@ mod tests {
             contents.len() as u64
         );
 
-        // Yhteenveto on VAIN ensimmäinen rivi — tiedoston runko (rivit 2+) ei vuoda.
+        // The summary is ONLY the first line — the file body (lines 2+) does not leak.
         assert_eq!(
             res.raw_output_redacted["summary"],
             json!("harmless first line")
         );
 
-        // Koko tiedoston sisältö EI saa esiintyä tulosteessa (vain yhteenveto,
-        // joka on tiedoston ensimmäinen rivi typistettynä — ei koko sisältö).
+        // The full file content must NOT appear in the output (only the
+        // summary, which is the file's first line truncated — not the full content).
         let rendered = serde_json::to_string(&res.raw_output_redacted).expect("serialize output");
         assert!(
             !rendered.contains("must never appear"),
@@ -767,13 +773,13 @@ mod tests {
         write_file(&untrusted_dir, "u.txt", "untrusted data");
         write_file(&trusted_dir, "t.txt", "trusted data");
 
-        // Allowlist sisältää sekä epäluotetun että luotetun juuren.
+        // The allowlist contains both an untrusted and a trusted root.
         let config = FsReadConfig::new()
             .allow_root(&untrusted_dir)
             .trusted_root(&trusted_dir);
         let skill = FsReadAllowlisted::with_config(config);
 
-        // Epäluotetun juuren alta luettu → tuloste pysyy taintattuna.
+        // Read from under the untrusted root → the output stays tainted.
         let untrusted_payload = serde_json::to_value(FsReadInput {
             path: untrusted_dir.join("u.txt").to_string_lossy().to_string(),
             ..Default::default()
@@ -797,7 +803,7 @@ mod tests {
             json!(false)
         );
 
-        // Luotetun juuren alta luettu → taint poistuu.
+        // Read from under the trusted root → taint is cleared.
         let trusted_payload = serde_json::to_value(FsReadInput {
             path: trusted_dir.join("t.txt").to_string_lossy().to_string(),
             ..Default::default()
@@ -823,7 +829,7 @@ mod tests {
     async fn empty_allowlist_rejects_everything() {
         let dir = temp_dir("empty_allow");
         write_file(&dir, "doc.txt", "data");
-        // Tyhjä allowlist → fail-closed.
+        // Empty allowlist → fail-closed.
         let skill = FsReadAllowlisted::new();
         let payload = serde_json::to_value(FsReadInput {
             path: dir.join("doc.txt").to_string_lossy().to_string(),
@@ -882,7 +888,7 @@ mod tests {
         let long = "a".repeat(500);
         let s = summarize(long.as_bytes());
         assert!(s.len() <= SUMMARY_MAX_BYTES);
-        // Vain ensimmäinen rivi; kontrollimerkit pois.
+        // Only the first line; control characters stripped.
         let multi = "first\u{7}line\nsecond line";
         let s2 = summarize(multi.as_bytes());
         assert_eq!(s2, "firstline");

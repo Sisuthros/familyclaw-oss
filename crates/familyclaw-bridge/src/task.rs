@@ -1,13 +1,13 @@
-//! Tehtävätaulu: [`Task`], sen tilakone ([`TaskStatus`]) ja säieturvallinen
-//! [`TaskBoard`].
+//! Task board: [`Task`], its state machine ([`TaskStatus`]), and the
+//! thread-safe [`TaskBoard`].
 //!
-//! Taulu hoitaa tehtävien luonnin, tilasiirtymät ja luovutuksen (handoff)
-//! agentilta toiselle. Tilakone on tarkoituksellisen tiukka: laittomat
-//! siirtymät (esim. valmiin tehtävän uudelleenaktivointi) hylätään virheellä,
-//! jotta durable-replay ja konsolidointi pysyvät johdonmukaisina.
+//! The board handles task creation, state transitions, and handoff between
+//! agents. The state machine is deliberately strict: illegal transitions
+//! (e.g. reactivating a finished task) are rejected with an error, so that
+//! durable replay and consolidation stay consistent.
 //!
-//! Kuten [`crate::agent`], taulu on riippumaton kuljetuskerroksesta ja
-//! suojattu [`tokio::sync::RwLock`]illa.
+//! Like [`crate::agent`], the board is independent of the transport layer and
+//! is protected by a [`tokio::sync::RwLock`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,43 +19,43 @@ use familyclaw_core::ids::{AgentId, MessageId};
 use familyclaw_core::time::{self, Timestamp};
 use familyclaw_core::{FamilyClawError, Result};
 
-/// Tehtävän vakaa tunniste.
+/// A task's stable identifier.
 ///
-/// Uudelleenkäyttää alustan [`MessageId`]-newtypeä (sama UUID-pohja, oma
-/// nimi luettavuuden vuoksi).
+/// Reuses the platform's [`MessageId`] newtype (same UUID basis, its own
+/// name for readability).
 pub type TaskId = MessageId;
 
-/// Tehtävän tila (tilakone).
+/// A task's state (state machine).
 ///
-/// Sallitut siirtymät:
-/// - `Pending → Active` (otetaan työn alle)
-/// - `Pending → Handed`, `Active → Handed` (luovutus toiselle agentille)
-/// - `Active → Done` (valmis)
-/// - `Handed → Active` (vastaanottaja ottaa työn alle)
-/// - `Pending → Done` (suora valmistuminen ilman erillistä aktivointia)
+/// Allowed transitions:
+/// - `Pending → Active` (picked up for work)
+/// - `Pending → Handed`, `Active → Handed` (handoff to another agent)
+/// - `Active → Done` (complete)
+/// - `Handed → Active` (the recipient picks up the work)
+/// - `Pending → Done` (direct completion without a separate activation step)
 ///
-/// `Done` on terminaalinen — siitä ei ole siirtymiä eteenpäin.
+/// `Done` is terminal — there are no transitions out of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
-    /// Luotu, ei vielä työn alla.
+    /// Created, not yet picked up.
     Pending,
-    /// Työn alla.
+    /// Picked up for work.
     Active,
-    /// Valmis (terminaalinen).
+    /// Complete (terminal).
     Done,
-    /// Luovutettu odottamaan vastaanottajan kuittausta.
+    /// Handed off, awaiting acknowledgement from the recipient.
     Handed,
 }
 
 impl TaskStatus {
-    /// Onko tila terminaalinen (ei siirtymiä eteenpäin).
+    /// Whether the state is terminal (no transitions out of it).
     #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(self, TaskStatus::Done)
     }
 
-    /// Onko siirtymä `self → next` sallittu.
+    /// Whether the transition `self → next` is allowed.
     #[must_use]
     pub fn can_transition_to(self, next: TaskStatus) -> bool {
         use TaskStatus::{Active, Done, Handed, Pending};
@@ -66,37 +66,37 @@ impl TaskStatus {
     }
 }
 
-/// Yksittäinen tehtävä taululla.
+/// A single task on the board.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
-    /// Tehtävän vakaa tunniste.
+    /// The task's stable identifier.
     pub id: TaskId,
 
-    /// Lyhyt otsikko.
+    /// Short title.
     pub title: String,
 
-    /// Vapaamuotoinen kuvaus.
+    /// Free-form description.
     #[serde(default)]
     pub description: String,
 
-    /// Tehtävän nykyinen vastuuagentti, tai `None` jos jakamaton.
+    /// The task's current assignee, or `None` if unassigned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<AgentId>,
 
-    /// Tehtävän nykyinen tila.
+    /// The task's current status.
     pub status: TaskStatus,
 
-    /// Luontihetki (UTC).
+    /// Creation time (UTC).
     pub created_at: Timestamp,
 
-    /// Viimeisimmän muutoksen hetki (UTC).
+    /// Time of the most recent change (UTC).
     pub updated_at: Timestamp,
 }
 
 impl Task {
-    /// Rakentaa uuden tehtävän tilassa [`TaskStatus::Pending`].
+    /// Builds a new task in state [`TaskStatus::Pending`].
     ///
-    /// `created_at` ja `updated_at` asetetaan nykyhetkeen.
+    /// `created_at` and `updated_at` are set to the current time.
     pub fn new(id: TaskId, title: impl Into<String>, assignee: Option<AgentId>) -> Self {
         let now = time::now();
         Self {
@@ -110,17 +110,17 @@ impl Task {
         }
     }
 
-    /// Asettaa kuvauksen (builder-tyyli).
+    /// Sets the description (builder style).
     #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
         self
     }
 
-    /// Validoi tehtävän.
+    /// Validates the task.
     ///
     /// # Errors
-    /// [`FamilyClawError::InvalidInput`] jos otsikko on tyhjä.
+    /// [`FamilyClawError::InvalidInput`] if the title is empty.
     pub fn validate(&self) -> Result<()> {
         if self.title.trim().is_empty() {
             return Err(FamilyClawError::invalid_input(
@@ -131,17 +131,18 @@ impl Task {
     }
 }
 
-/// Säieturvallinen tehtävätaulu.
+/// A thread-safe task board.
 ///
-/// Hoitaa tehtävien luonnin, tilasiirtymät ja luovutuksen. Sisäinen tila on
-/// suojattu [`tokio::sync::RwLock`]illa ja taulun voi kloonata (jaettu `Arc`).
+/// Handles task creation, state transitions, and handoff. Internal state is
+/// protected by a [`tokio::sync::RwLock`], and the board can be cloned
+/// (shared `Arc`).
 #[derive(Debug, Clone, Default)]
 pub struct TaskBoard {
     inner: Arc<RwLock<HashMap<TaskId, Task>>>,
 }
 
 impl TaskBoard {
-    /// Luo tyhjän tehtävätaulun.
+    /// Creates an empty task board.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -149,10 +150,10 @@ impl TaskBoard {
         }
     }
 
-    /// Luo uuden tehtävän taululle ja palauttaa sen.
+    /// Creates a new task on the board and returns it.
     ///
     /// # Errors
-    /// [`FamilyClawError::InvalidInput`] jos otsikko on tyhjä.
+    /// [`FamilyClawError::InvalidInput`] if the title is empty.
     pub async fn create(
         &self,
         title: impl Into<String>,
@@ -165,11 +166,11 @@ impl TaskBoard {
         Ok(task)
     }
 
-    /// Lisää valmiiksi rakennetun tehtävän taululle (esim. durable-replay).
+    /// Inserts an already-built task onto the board (e.g. for durable replay).
     ///
     /// # Errors
-    /// [`FamilyClawError::InvalidInput`] jos tehtävä on kelvoton, tai
-    /// jos taululla on jo sama tunniste.
+    /// [`FamilyClawError::InvalidInput`] if the task is invalid, or if the
+    /// board already has the same identifier.
     pub async fn insert(&self, task: Task) -> Result<()> {
         task.validate()?;
         let mut guard = self.inner.write().await;
@@ -183,26 +184,26 @@ impl TaskBoard {
         Ok(())
     }
 
-    /// Hakee tehtävän tunnisteen perusteella.
+    /// Looks up a task by identifier.
     pub async fn get(&self, id: TaskId) -> Option<Task> {
         let guard = self.inner.read().await;
         guard.get(&id).cloned()
     }
 
-    /// Tehtävien määrä taululla.
+    /// Number of tasks on the board.
     pub async fn len(&self) -> usize {
         let guard = self.inner.read().await;
         guard.len()
     }
 
-    /// Onko taulu tyhjä.
+    /// Whether the board is empty.
     pub async fn is_empty(&self) -> bool {
         let guard = self.inner.read().await;
         guard.is_empty()
     }
 
-    /// Palauttaa kaikki tehtävät luontihetken (ja tasapelitilanteessa
-    /// tunnisteen) mukaan järjestettynä.
+    /// Returns all tasks, ordered by creation time (and, on ties, by
+    /// identifier).
     pub async fn list(&self) -> Vec<Task> {
         let guard = self.inner.read().await;
         let mut out: Vec<Task> = guard.values().cloned().collect();
@@ -210,7 +211,7 @@ impl TaskBoard {
         out
     }
 
-    /// Palauttaa tietyn agentin vastuulla olevat tehtävät (luontijärjestys).
+    /// Returns the tasks assigned to a given agent (creation order).
     pub async fn list_for_assignee(&self, assignee: AgentId) -> Vec<Task> {
         let guard = self.inner.read().await;
         let mut out: Vec<Task> = guard
@@ -222,7 +223,7 @@ impl TaskBoard {
         out
     }
 
-    /// Palauttaa tietyssä tilassa olevat tehtävät (luontijärjestys).
+    /// Returns the tasks in a given status (creation order).
     pub async fn list_by_status(&self, status: TaskStatus) -> Vec<Task> {
         let guard = self.inner.read().await;
         let mut out: Vec<Task> = guard
@@ -234,15 +235,15 @@ impl TaskBoard {
         out
     }
 
-    /// Vaihtaa tehtävän tilan tilakoneen sääntöjen mukaisesti ja palauttaa
-    /// päivitetyn tehtävän.
+    /// Changes the task's status according to the state machine's rules and
+    /// returns the updated task.
     ///
-    /// Sama-tilaan-siirtymä (`status == next`) on no-op joka onnistuu mutta
-    /// ei muuta `updated_at`-leimaa.
+    /// A same-state transition (`status == next`) is a no-op that succeeds
+    /// but does not change the `updated_at` timestamp.
     ///
     /// # Errors
-    /// - [`FamilyClawError::NotFound`] jos tehtävää ei ole.
-    /// - [`FamilyClawError::InvalidInput`] jos siirtymä on laiton.
+    /// - [`FamilyClawError::NotFound`] if the task does not exist.
+    /// - [`FamilyClawError::InvalidInput`] if the transition is illegal.
     pub async fn update_status(&self, id: TaskId, next: TaskStatus) -> Result<Task> {
         let mut guard = self.inner.write().await;
         let task = guard
@@ -263,20 +264,20 @@ impl TaskBoard {
         Ok(task.clone())
     }
 
-    /// Luovuttaa tehtävän agentilta `from` agentille `to`.
+    /// Hands off a task from agent `from` to agent `to`.
     ///
-    /// Säännöt:
-    /// - Tehtävän nykyisen vastuuagentin on oltava `from` (estää väärinkäytön).
-    /// - `from` ja `to` eivät saa olla sama agentti.
-    /// - Tehtävä ei saa olla terminaalitilassa ([`TaskStatus::Done`]).
+    /// Rules:
+    /// - The task's current assignee must be `from` (prevents misuse).
+    /// - `from` and `to` must not be the same agent.
+    /// - The task must not be in a terminal state ([`TaskStatus::Done`]).
     ///
-    /// Onnistuessa tehtävän `assignee` vaihtuu `to`:ksi ja tila siirtyy
-    /// [`TaskStatus::Handed`]:iin. Palauttaa päivitetyn tehtävän.
+    /// On success, the task's `assignee` changes to `to` and its status
+    /// moves to [`TaskStatus::Handed`]. Returns the updated task.
     ///
     /// # Errors
-    /// - [`FamilyClawError::NotFound`] jos tehtävää ei ole.
-    /// - [`FamilyClawError::InvalidInput`] jos `from` ei ole nykyinen
-    ///   vastuuagentti, `from == to`, tai tehtävä on terminaalitilassa.
+    /// - [`FamilyClawError::NotFound`] if the task does not exist.
+    /// - [`FamilyClawError::InvalidInput`] if `from` is not the current
+    ///   assignee, `from == to`, or the task is in a terminal state.
     pub async fn handoff(&self, id: TaskId, from: AgentId, to: AgentId) -> Result<Task> {
         if from == to {
             return Err(FamilyClawError::invalid_input(
@@ -314,11 +315,11 @@ impl TaskBoard {
         Ok(task.clone())
     }
 
-    /// Asettaa tehtävän vastuuagentin (tai poistaa sen `None`:lla) muuttamatta
-    /// tilaa. Palauttaa päivitetyn tehtävän.
+    /// Sets the task's assignee (or clears it with `None`) without changing
+    /// its status. Returns the updated task.
     ///
     /// # Errors
-    /// [`FamilyClawError::NotFound`] jos tehtävää ei ole.
+    /// [`FamilyClawError::NotFound`] if the task does not exist.
     pub async fn assign(&self, id: TaskId, assignee: Option<AgentId>) -> Result<Task> {
         let mut guard = self.inner.write().await;
         let task = guard
@@ -475,7 +476,7 @@ mod tests {
         assert_eq!(handed.assignee, Some(to));
         assert_eq!(handed.status, TaskStatus::Handed);
 
-        // Vastaanottaja ottaa työn alle.
+        // The recipient picks up the work.
         let active = board
             .update_status(task.id, TaskStatus::Active)
             .await
@@ -521,7 +522,7 @@ mod tests {
             .await
             .expect_err("wrong source");
         assert!(matches!(err, FamilyClawError::InvalidInput(_)));
-        // Tehtävä ei muuttunut.
+        // The task did not change.
         let unchanged = board.get(task.id).await.expect("present");
         assert_eq!(unchanged.assignee, Some(owner));
         assert_eq!(unchanged.status, TaskStatus::Pending);

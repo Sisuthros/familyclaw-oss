@@ -1,35 +1,40 @@
-//! [`TelegramChannel`] — Telegram-adapteri Bot API:n long-poll-pollauksella.
+//! [`TelegramChannel`] — Telegram adapter using long-poll polling of the Bot API.
 //!
-//! Kevyt Telegram-integraatio joka EI vedä sisään raskasta `teloxide`-SDK:ta:
-//! - **Lähetys** (`sendMessage`) ja **vastaanotto** (`getUpdates`) tapahtuvat
-//!   suoraan Telegram Bot API:n HTTP-REST-endpointeilla `reqwest`:illä.
-//! - Saapuvat viestit haetaan **long-poll**-pollauksella: `getUpdates`-kutsu
-//!   blokkaa palvelimella `timeout`-sekuntia kunnes uusia päivityksiä tulee,
-//!   sitten kuitataan ne nostamalla `offset` viimeisimmän `update_id + 1`:een.
+//! A lightweight Telegram integration that does NOT pull in the heavy
+//! `teloxide` SDK:
+//! - **Sending** (`sendMessage`) and **receiving** (`getUpdates`) happen
+//!   directly against the Telegram Bot API's HTTP REST endpoints via `reqwest`.
+//! - Inbound messages are fetched via **long-poll** polling: the
+//!   `getUpdates` call blocks on the server for `timeout` seconds until new
+//!   updates arrive, then they are acknowledged by advancing `offset` to the
+//!   latest `update_id + 1`.
 //!
-//! ## Miksi REST eikä teloxide?
-//! Sama linja kuin [`crate::DiscordChannel`]:llä — `teloxide` vetää kymmeniä
-//! riippuvuuksia ja sen API elää. Bot API:n `getUpdates`/`sendMessage` ovat
-//! vakaita ja riittävät MVP:hen. Ainoa lisäriippuvuus on `reqwest`, joka on jo
-//! workspacessa (sama versio kuin Discord-adapterilla).
+//! ## Why REST instead of teloxide?
+//! Same rationale as [`crate::DiscordChannel`] — `teloxide` pulls in dozens
+//! of dependencies and its API is still evolving. The Bot API's
+//! `getUpdates`/`sendMessage` are stable and sufficient for the MVP. The only
+//! extra dependency is `reqwest`, which is already in the workspace (same
+//! version as the Discord adapter).
 //!
-//! ## `getUpdates`-offset-kuittaus (Telegram Bot API)
-//! `getUpdates` palauttaa taulukon päivityksiä, kukin nousevalla `update_id`:llä.
-//! Seuraavassa kutsussa annetaan `offset = max(update_id) + 1`, mikä **kuittaa**
-//! kaikki sitä pienemmät päivitykset — palvelin ei lähetä niitä enää. Näin
-//! sama viesti ei tule kahdesti, eikä klientin tarvitse deduplikoida.
+//! ## `getUpdates` offset acknowledgment (Telegram Bot API)
+//! `getUpdates` returns an array of updates, each with an increasing
+//! `update_id`. The next call supplies `offset = max(update_id) + 1`, which
+//! **acknowledges** all updates below that value — the server no longer
+//! sends them. This way the same message never arrives twice, and the
+//! client doesn't need to deduplicate.
 //!
-//! ## `conversation` ja `channel_id` (invariantit #2, #4)
-//! Jokainen kanonisoitu [`InboundEnvelope`] kantaa:
-//! - `channel_id` = tämän kanavainstanssin tunniste (vastaajan reititystä
-//!   varten), ja
-//! - `conversation` = Telegram `chat.id` (sama chat johon vastaus ohjataan
-//!   `sendMessage`:lla). Näin alkuperä ei katoa bus-hopissa.
+//! ## `conversation` and `channel_id` (invariants #2, #4)
+//! Every canonicalized [`InboundEnvelope`] carries:
+//! - `channel_id` = the identifier of this channel instance (for routing
+//!   replies), and
+//! - `conversation` = the Telegram `chat.id` (the same chat the reply is
+//!   routed to via `sendMessage`). This way the origin is never lost across
+//!   the bus hop.
 //!
-//! ## KERROS A -säännöt
-//! Tokenia ei kovakoodata: se luetaan ajonaikaisesti ympäristöstä
-//! (`TELEGRAM_BOT_TOKEN`) tai annetaan konstruktorille. `api_base` on myös
-//! ajonaikaista, jotta testit voivat osoittaa mock-palvelimelle.
+//! ## Layer A rules
+//! The token is never hardcoded: it is read at runtime from the environment
+//! (`TELEGRAM_BOT_TOKEN`) or supplied to the constructor. `api_base` is also
+//! runtime configuration so tests can point it at a mock server.
 
 use std::sync::{Arc, Mutex};
 
@@ -39,35 +44,35 @@ use crate::channel::{Channel, MessageStream, SendFuture};
 use crate::error::{ChannelError, ChannelResult};
 use crate::message::{ChannelKind, InboundEnvelope, InboundMessage, OutboundMessage};
 
-/// Ympäristömuuttuja josta bot-token luetaan oletuksena.
+/// The environment variable the bot token is read from by default.
 const TOKEN_ENV: &str = "TELEGRAM_BOT_TOKEN";
 
-/// Telegramin julkinen Bot API -juuri. Token liitetään polkuun
+/// Telegram's public Bot API root. The token is appended to the path
 /// (`/bot<token>/<method>`).
 const DEFAULT_API_BASE: &str = "https://api.telegram.org";
 
-/// Long-poll `getUpdates`-timeout sekunteina (palvelinpuolen blokkaus).
+/// Long-poll `getUpdates` timeout in seconds (server-side blocking).
 const LONG_POLL_TIMEOUT_SECS: u64 = 30;
 
-/// HTTP-asiakkaan kokonaistimeout: long-poll + marginaali, jotta klientti ei
-/// katkaise pyyntöä ennen palvelimen omaa timeoutia.
+/// The HTTP client's overall timeout: long-poll + margin, so the client
+/// doesn't cut off the request before the server's own timeout.
 const HTTP_TIMEOUT_SECS: u64 = LONG_POLL_TIMEOUT_SECS + 15;
 
-/// Telegram-kanava Bot API:n long-poll-pollauksella — toteuttaa
-/// [`Channel`]-rajapinnan.
+/// Telegram channel using long-poll polling of the Bot API — implements the
+/// [`Channel`] interface.
 ///
-/// Vastaanotto käynnistää taustatehtävän [`Channel::receive`]-kutsussa: tehtävä
-/// pollaa `getUpdates`-endpointtia ja työntää jokaisen tekstiviestin
-/// kanonisoituna [`InboundEnvelope`]:nä virtaan. Lähetys (`send`) tekee
-/// `sendMessage`-pyynnön (HTTP `POST`) synkronisesti.
+/// Receiving starts a background task in the [`Channel::receive`] call: the
+/// task polls the `getUpdates` endpoint and pushes each text message into
+/// the stream as a canonicalized [`InboundEnvelope`]. Sending (`send`) makes
+/// a `sendMessage` request (HTTP `POST`) synchronously.
 ///
-/// Kaikki asetukset (token, `api_base`) ovat ajonaikaisia — ei kovakoodattuja
-/// arvoja.
+/// All settings (token, `api_base`) are runtime configuration — no
+/// hardcoded values.
 pub struct TelegramChannel {
     inner: Arc<Inner>,
-    /// Saapuvan virran vastaanotin; luovutetaan kerran [`Channel::receive`]:ssä.
+    /// Receiver for the inbound stream; handed out once in [`Channel::receive`].
     inbound_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<InboundEnvelope>>>,
-    /// Lähetin jonka taustatehtävä saa [`Channel::receive`]-kutsussa.
+    /// Sender the background task receives in the [`Channel::receive`] call.
     inbound_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<InboundEnvelope>>>,
 }
 
@@ -79,21 +84,21 @@ struct Inner {
 }
 
 impl TelegramChannel {
-    /// Luo Telegram-kanavan eksplisiittisellä tokenilla.
+    /// Creates a Telegram channel with an explicit token.
     ///
     /// # Errors
-    /// [`ChannelError::InvalidInput`] jos token tai kanavatunniste on tyhjä,
-    /// tai jos HTTP-asiakkaan rakennus epäonnistuu.
+    /// [`ChannelError::InvalidInput`] if the token or channel id is empty,
+    /// or if building the HTTP client fails.
     pub fn new(token: impl Into<String>, channel_id: impl Into<String>) -> ChannelResult<Self> {
         Self::with_api_base(token, channel_id, DEFAULT_API_BASE)
     }
 
-    /// Luo Telegram-kanavan lukien tokenin `TELEGRAM_BOT_TOKEN`-ympäristö-
-    /// muuttujasta.
+    /// Creates a Telegram channel, reading the token from the
+    /// `TELEGRAM_BOT_TOKEN` environment variable.
     ///
     /// # Errors
-    /// [`ChannelError::InvalidInput`] jos ympäristömuuttuja puuttuu/on tyhjä
-    /// tai kanavatunniste on tyhjä.
+    /// [`ChannelError::InvalidInput`] if the environment variable is
+    /// missing/empty or the channel id is empty.
     pub fn from_env(channel_id: impl Into<String>) -> ChannelResult<Self> {
         let token = std::env::var(TOKEN_ENV).map_err(|_| {
             ChannelError::invalid_input(format!(
@@ -103,12 +108,12 @@ impl TelegramChannel {
         Self::new(token, channel_id)
     }
 
-    /// Luo Telegram-kanavan kustomoidulla API-juurella (esim. mock-palvelin
-    /// testeissä). Token liitetään polkuun muodossa `/bot<token>/<method>`.
+    /// Creates a Telegram channel with a custom API root (e.g. a mock server
+    /// in tests). The token is appended to the path as `/bot<token>/<method>`.
     ///
     /// # Errors
-    /// [`ChannelError::InvalidInput`] jos token, kanavatunniste tai `api_base`
-    /// on tyhjä, tai jos HTTP-asiakkaan rakennus epäonnistuu.
+    /// [`ChannelError::InvalidInput`] if the token, channel id, or `api_base`
+    /// is empty, or if building the HTTP client fails.
     pub fn with_api_base(
         token: impl Into<String>,
         channel_id: impl Into<String>,
@@ -151,18 +156,18 @@ impl TelegramChannel {
         })
     }
 
-    /// Rakentaa metodi-URL:n: `<api_base>/bot<token>/<method>`.
+    /// Builds the method URL: `<api_base>/bot<token>/<method>`.
     fn method_url(inner: &Inner, method: &str) -> String {
         format!("{}/bot{}/{}", inner.api_base, inner.token, method)
     }
 
-    /// Yksi `getUpdates`-long-poll-kierros annetulla offsetilla. Palauttaa
-    /// jäsennetyt saapuvat viestit sekä seuraavan offsetin (`None` jos offset ei
-    /// muuttunut, ts. ei uusia päivityksiä).
+    /// One `getUpdates` long-poll round with the given offset. Returns the
+    /// parsed inbound messages plus the next offset (`None` if the offset
+    /// did not change, i.e. no new updates).
     async fn poll_once(inner: &Inner, offset: Option<i64>) -> ChannelResult<PollOutcome> {
         let mut body = serde_json::json!({
             "timeout": LONG_POLL_TIMEOUT_SECS,
-            // Vain tekstiviestit kiinnostavat — vähentää turhaa liikennettä.
+            // Only text messages are of interest — reduces unnecessary traffic.
             "allowed_updates": ["message"],
         });
         if let Some(off) = offset {
@@ -198,9 +203,10 @@ impl TelegramChannel {
             .map_err(|reason| ChannelError::receive(&inner.channel_id, reason))
     }
 
-    /// Long-poll-silmukka: pollaa `getUpdates`, kanonisoi viestit ja työntää ne
-    /// virtaan. Palaa kun vastaanotin (`tx`) on suljettu (stream pudotettu) tai
-    /// virhe on pysyvä. Verkkovirheissä jatkaa pienen viiveen jälkeen.
+    /// Long-poll loop: polls `getUpdates`, canonicalizes messages, and pushes
+    /// them into the stream. Returns once the receiver (`tx`) is closed
+    /// (stream dropped) or the error is permanent. On network errors, it
+    /// continues after a short delay.
     async fn poll_loop(inner: Arc<Inner>, tx: tokio::sync::mpsc::UnboundedSender<InboundEnvelope>) {
         let mut offset: Option<i64> = None;
         loop {
@@ -315,7 +321,7 @@ impl TelegramChannel {
 
 impl std::fmt::Debug for TelegramChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Token EI päädy lokeihin/Debug-tulosteeseen (KERROS A: ei salaisuuksia).
+        // The token never ends up in logs/Debug output (Layer A: no secrets).
         f.debug_struct("TelegramChannel")
             .field("channel_id", &self.inner.channel_id)
             .field("api_base", &self.inner.api_base)
@@ -350,7 +356,7 @@ impl Channel for TelegramChannel {
                 ChannelError::receive(self.channel_id(), "receive stream already taken")
             })?;
 
-        // Luovuta lähetin taustatehtävälle (kerran). Käynnistä long-poll.
+        // Hand over the sender to the background task (once). Start the long-poll.
         let tx = self
             .inbound_tx
             .lock()
@@ -367,29 +373,29 @@ impl Channel for TelegramChannel {
     }
 }
 
-/// `getUpdates`-kierroksen tulos: jäsennetyt viestit + seuraava offset.
+/// The result of a `getUpdates` round: parsed messages + the next offset.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PollOutcome {
-    /// Tällä kierroksella saapuneet tekstiviestit (kanonisoitavissa).
+    /// Text messages received in this round (ready for canonicalization).
     messages: Vec<InboundMessage>,
-    /// Seuraavan `getUpdates`-kutsun offset (`max(update_id) + 1`). `None` jos
-    /// päivityksiä ei tullut, jolloin edellinen offset säilytetään.
+    /// The offset for the next `getUpdates` call (`max(update_id) + 1`).
+    /// `None` if no updates arrived, in which case the previous offset is kept.
     next_offset: Option<i64>,
 }
 
-/// Jäsentää `getUpdates`-JSON-vastauksen viesteiksi + seuraavaksi offsetiksi.
+/// Parses a `getUpdates` JSON response into messages + the next offset.
 ///
-/// Tämä on **puhdas funktio** (ei verkkoa), jotta long-poll-parsinta on
-/// yksikkötestattavissa ilman oikeaa Telegram-palvelinta. Logiikka:
-/// - `ok: false` → virhe (`description` mukaan).
-/// - jokainen `result[]`-päivitys jonka `message.text` on ei-tyhjä → yksi
+/// This is a **pure function** (no network) so long-poll parsing is
+/// unit-testable without a real Telegram server. Logic:
+/// - `ok: false` → an error (based on `description`).
+/// - each `result[]` update whose `message.text` is non-empty → one
 ///   [`InboundMessage`] (`sender` = `from.id`, `conversation` = `chat.id`).
-/// - offset-kuittaus: `next_offset = max(update_id) + 1` kaikista nähdyistä
-///   päivityksistä (myös ei-teksti-päivityksistä, jotta ne eivät tule
-///   uudestaan). `prev_offset` säilyy jos päivityksiä ei tullut.
+/// - offset acknowledgment: `next_offset = max(update_id) + 1` across all
+///   seen updates (including non-text updates, so they don't arrive again).
+///   `prev_offset` is kept if no updates arrived.
 ///
 /// # Errors
-/// Merkkijono-virheen jos JSON on viallinen tai `ok` ei ole `true`.
+/// A string error if the JSON is malformed or `ok` is not `true`.
 fn parse_get_updates(body: &str, prev_offset: Option<i64>) -> Result<PollOutcome, String> {
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("invalid getUpdates JSON: {e}"))?;
@@ -416,7 +422,7 @@ fn parse_get_updates(body: &str, prev_offset: Option<i64>) -> Result<PollOutcome
     let mut max_update_id: Option<i64> = None;
 
     for update in results {
-        // Kuittaa jokainen nähty päivitys (myös ei-teksti), jotta se ei toistu.
+        // Acknowledge every update seen (including non-text), so it doesn't repeat.
         if let Some(uid) = update.get("update_id").and_then(serde_json::Value::as_i64) {
             max_update_id = Some(max_update_id.map_or(uid, |m: i64| m.max(uid)));
         }
@@ -425,15 +431,15 @@ fn parse_get_updates(body: &str, prev_offset: Option<i64>) -> Result<PollOutcome
             continue;
         };
         let Some(text) = msg.get("text").and_then(serde_json::Value::as_str) else {
-            // Ei-teksti-viesti (kuva/sticker/…): ohitetaan sisällöltä, mutta
-            // update_id on jo kuitattu yllä.
+            // A non-text message (photo/sticker/…): skipped for content, but
+            // the update_id is already acknowledged above.
             continue;
         };
         if text.is_empty() {
             continue;
         }
 
-        // conversation = chat.id (invariantti #4: vastausosoite säilyy).
+        // conversation = chat.id (invariant #4: the reply address is preserved).
         let Some(chat_id) = msg
             .get("chat")
             .and_then(|c| c.get("id"))
@@ -442,15 +448,15 @@ fn parse_get_updates(body: &str, prev_offset: Option<i64>) -> Result<PollOutcome
             continue;
         };
 
-        // sender = from.id; fallback chat.id jos 'from' puuttuu (esim.
-        // kanavaviestit). Tyhjää lähettäjää ei sallita (InboundMessage::new).
+        // sender = from.id; falls back to chat.id if 'from' is missing (e.g.
+        // channel posts). An empty sender is not allowed (InboundMessage::new).
         let sender_id = msg
             .get("from")
             .and_then(|fr| fr.get("id"))
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(chat_id);
 
-        // Yksittäinen kelvoton viesti ei kaada koko kierrosta — ohitetaan.
+        // A single invalid message does not abort the whole round — it is skipped.
         if let Ok(inbound) = InboundMessage::new(sender_id.to_string(), chat_id.to_string(), text) {
             messages.push(inbound);
         }
@@ -502,19 +508,19 @@ mod tests {
     fn method_url_builds_bot_path() {
         let ch = TelegramChannel::with_api_base("TKN", "tg-1", "https://example.test/")
             .expect("channel");
-        // Trailing slash on jo trimmattu; polku on /bot<token>/<method>.
+        // The trailing slash is already trimmed; the path is /bot<token>/<method>.
         let url = TelegramChannel::method_url(&ch.inner, "getUpdates");
         assert_eq!(url, "https://example.test/botTKN/getUpdates");
     }
 
     #[test]
     fn from_env_errors_when_unset() {
-        // Varmista että muuttuja ei ole asetettu tässä testissä.
+        // Make sure the variable is not set in this test.
         std::env::remove_var(TOKEN_ENV);
         assert!(TelegramChannel::from_env("tg-1").is_err());
     }
 
-    // --- parse_get_updates: long-poll-parsinta (ei verkkoa) ---
+    // --- parse_get_updates: long-poll parsing (no network) ---
 
     #[test]
     fn parse_single_text_message() {
@@ -536,10 +542,10 @@ mod tests {
         assert_eq!(outcome.messages.len(), 1);
         let m = &outcome.messages[0];
         assert_eq!(m.sender, "4242");
-        // conversation = chat.id (invariantti #4)
+        // conversation = chat.id (invariant #4)
         assert_eq!(m.conversation, "-1009");
         assert_eq!(m.body, "moi");
-        // offset-kuittaus: max(update_id) + 1
+        // offset acknowledgment: max(update_id) + 1
         assert_eq!(outcome.next_offset, Some(101));
     }
 
@@ -555,7 +561,7 @@ mod tests {
         }"#;
         let outcome = parse_get_updates(body, Some(5)).expect("parse ok");
         assert_eq!(outcome.messages.len(), 3);
-        // max update_id = 7 → seuraava offset 8 (kuittaa 5,6,7).
+        // max update_id = 7 → next offset 8 (acknowledges 5,6,7).
         assert_eq!(outcome.next_offset, Some(8));
     }
 
@@ -564,14 +570,14 @@ mod tests {
         let body = r#"{ "ok": true, "result": [] }"#;
         let outcome = parse_get_updates(body, Some(42)).expect("parse ok");
         assert!(outcome.messages.is_empty());
-        // Ei uusia päivityksiä → edellinen offset säilyy.
+        // No new updates → the previous offset is kept.
         assert_eq!(outcome.next_offset, Some(42));
     }
 
     #[test]
     fn parse_non_text_update_is_acked_but_not_emitted() {
-        // Sticker/kuva-päivitys ilman 'text'-kenttää: ei viestiä, mutta
-        // update_id kuitataan jotta se ei tule uudelleen.
+        // A sticker/photo update without a 'text' field: no message, but the
+        // update_id is acknowledged so it doesn't arrive again.
         let body = r#"{
             "ok": true,
             "result": [
@@ -585,7 +591,7 @@ mod tests {
 
     #[test]
     fn parse_message_without_from_falls_back_to_chat_id_as_sender() {
-        // Kanavaviestissä 'from' voi puuttua → sender = chat.id.
+        // In a channel post 'from' may be missing → sender = chat.id.
         let body = r#"{
             "ok": true,
             "result": [
@@ -608,7 +614,7 @@ mod tests {
         }"#;
         let outcome = parse_get_updates(body, None).expect("parse ok");
         assert!(outcome.messages.is_empty());
-        // update_id silti kuitataan (ettei tyhjä viesti jää loputtomaan looppiin).
+        // update_id is still acknowledged (so an empty message doesn't loop forever).
         assert_eq!(outcome.next_offset, Some(4));
     }
 
@@ -633,8 +639,8 @@ mod tests {
 
     #[test]
     fn parse_canonicalizes_into_telegram_envelope() {
-        // Round-trip: parsittu InboundMessage → InboundEnvelope säilyttää
-        // channel_id + conversation (invariantit #2 ja #4).
+        // Round-trip: the parsed InboundMessage → InboundEnvelope preserves
+        // channel_id + conversation (invariants #2 and #4).
         let body = r#"{
             "ok": true,
             "result": [
@@ -650,7 +656,7 @@ mod tests {
         assert_eq!(env.conversation, "77"); // #4
         assert_eq!(env.sender, "88");
         assert_eq!(env.body, "hi");
-        // Reply ohjautuu takaisin samaan chattiin.
+        // The reply is routed back to the same chat.
         let reply = env.reply("pong").expect("reply");
         assert_eq!(reply.target, "77");
     }

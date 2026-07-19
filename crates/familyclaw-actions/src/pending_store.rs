@@ -1,58 +1,61 @@
-//! Odottavien hyväksyntöjen tallennuspinta ([`PendingApprovalStore`]) — KERROS A.
+//! Storage surface for pending approvals ([`PendingApprovalStore`]) — Layer A.
 //!
-//! [`crate::facade::ActionRuntime`] jättää `write-external`-tehtävän odottamaan
-//! ihmisen hyväksyntää: `submit-task` myöntää payload-sidotun hyväksynnän ja
-//! tallentaa odottavan kirjauksen, jonka `approve` myöhemmin kuluttaa. Aiemmin
-//! tämä kirjaus eli pelkässä prosessin sisäisessä `HashMap`:ssa — **prosessin
-//! kaatuminen `submit-task`:n ja `approve`:n välissä menetti odottavan
-//! hyväksynnän pysyvästi**, jolloin jo myönnetty toiminto jäi roikkumaan eikä
-//! sitä voinut enää hyväksyä eikä evätä.
+//! [`crate::facade::ActionRuntime`] leaves a `write-external` task waiting
+//! for human approval: `submit-task` grants a payload-bound approval and
+//! stores a pending record, which `approve` later consumes. Previously this
+//! record lived in a plain in-process `HashMap` — **a process crash between
+//! `submit-task` and `approve` permanently lost the pending approval**,
+//! leaving the already-granted action stuck, unable to be either approved or
+//! denied.
 //!
-//! Tämä moduuli abstrahoi tallennuksen [`PendingApprovalStore`]-traitin taakse
-//! ja tarjoaa kaksi toteutusta:
+//! This module abstracts storage behind the [`PendingApprovalStore`] trait
+//! and provides two implementations:
 //!
-//! - [`InMemoryPendingStore`] — `HashMap` traitin takana. Oletus + testikäyttö.
-//!   Nopea, mutta **ei** selviä kaatumisesta.
-//! - [`JournalPendingStore`] — kaatumiskestävä, [`familyclaw_durable::FileJournal`]-
-//!   pohjainen append-only-loki. Jokainen lisäys ja poisto kirjataan levylle
-//!   (flush + fsync), ja uudelleenkäynnistyksessä tila rekonstruoidaan lokista —
-//!   odottava hyväksyntä **säilyy kaatumisen yli** ja on yhä hyväksyttävissä.
+//! - [`InMemoryPendingStore`] — a `HashMap` behind the trait. Default + test
+//!   use. Fast, but does **not** survive a crash.
+//! - [`JournalPendingStore`] — crash-resistant, an append-only log based on
+//!   [`familyclaw_durable::FileJournal`]. Every insert and removal is
+//!   recorded to disk (flush + fsync), and on restart state is reconstructed
+//!   from the log — the pending approval **survives a crash** and is still
+//!   approvable.
 //!
-//! ## Salaisuusinvariantti (ehdoton)
-//! Tallennettu muoto ([`PendingRecord`]) ei koskaan sisällä **raakaa payloadia,
-//! salaisuuksia eikä KERROS B -dataa** — vain:
-//! - hyväksynnän ja tehtävän tunnisteet,
-//! - payloadin SHA-256-**tiivisteen** ([`crate::approval::Approval::payload_hash`]),
-//! - redaktoidun ihmisluettavan tiivistelmän ([`PendingRecord::redacted_summary`]),
-//! - luonti- ja vanhentumisaikaleimat.
+//! ## Secrecy invariant (absolute)
+//! The stored form ([`PendingRecord`]) never contains **the raw payload,
+//! secrets, or Layer B data** — only:
+//! - the approval and task ids,
+//! - the payload's SHA-256 **hash** ([`crate::approval::Approval::payload_hash`]),
+//! - a redacted, human-readable summary ([`PendingRecord::redacted_summary`]),
+//! - creation and expiry timestamps.
 //!
-//! Payload-sidonta säilyy tiivisteen kautta: kun `approve` myöhemmin kuluttaa
-//! hyväksynnän, esitetty payload tiivistetään uudelleen ja verrataan
-//! tallennettuun tiivisteeseen ([`crate::approval::ApprovalLedger::consume`]).
-//! Levyltä ei siis koskaan voi lukea itse payloadia takaisin.
+//! Payload binding is preserved through the hash: when `approve` later
+//! consumes the approval, the presented payload is re-hashed and compared
+//! against the stored hash ([`crate::approval::ApprovalLedger::consume`]).
+//! The payload itself can therefore never be read back from disk.
 //!
-//! ## Kapasiteettikatto, TTL-häätö ja rate-limit-koukku
-//! - **Kapasiteettikatto** ([`PendingCapacity`]): lisäys hylätään fail-closed
-//!   ([`ActionError::PolicyDenied`]) kun odottavia on jo katon verran — estää
-//!   muistin/levyn rajattoman kasvun (DoS-suoja).
-//! - **TTL-häätö** ([`PendingApprovalStore::evict_expired`]): vanhentuneet
-//!   kirjaukset poistetaan käyttäen täsmälleen samaa fail-closed-vanhentumista
-//!   kuin [`crate::approval`] (`now > expires_at`). Vanhentunutta hyväksyntää ei
-//!   voi enää kuluttaa, joten sen säilyttäminen olisi pelkkää roskaa.
-//! - **Per-olento-rate-limit** ([`DangerousToolRateLimiter`]): laskuri
-//!   vaarallisten (hyväksyntää vaativien) työkalukutsujen rajoittamiseen
-//!   liukuvalla aikaikkunalla. **Kytketty hyväksyntäpolkuun**
-//!   ([`crate::facade::ActionRuntime::submit_task`]): kun tehtävä jäisi
-//!   odottamaan ihmisen hyväksyntää, julkisivu kysyy ensin tältä rajoittimelta
-//!   onko olennolla vielä tilaa — jos ei, hyväksyntää ei myönnetä vaan kutsu
-//!   hylätään fail-closed ([`ActionError::PolicyDenied`]). Globaali
-//!   kapasiteettikatto rajaa koko jonon; tämä lisää siihen **per-olento**-katon.
-//!   Auto-run-tehtäviä (luku / paikallinen kirjoitus) ei rate-limititä.
-//!   Deterministinen: aikaleima injektoidaan.
+//! ## Capacity cap, TTL eviction, and the rate-limit hook
+//! - **Capacity cap** ([`PendingCapacity`]): an insert is rejected
+//!   fail-closed ([`ActionError::PolicyDenied`]) once the number pending
+//!   already reaches the cap — prevents unbounded memory/disk growth (`DoS`
+//!   protection).
+//! - **TTL eviction** ([`PendingApprovalStore::evict_expired`]): expired
+//!   records are removed using exactly the same fail-closed expiry as
+//!   [`crate::approval`] (`now > expires_at`). An expired approval can no
+//!   longer be consumed, so keeping it around would be pure garbage.
+//! - **Per-being rate limit** ([`DangerousToolRateLimiter`]): a counter for
+//!   limiting dangerous (approval-requiring) tool calls with a sliding time
+//!   window. **Hooked into the approval path**
+//!   ([`crate::facade::ActionRuntime::submit_task`]): when a task would be
+//!   left waiting for human approval, the facade first asks this limiter
+//!   whether the being still has room — if not, approval is not granted and
+//!   the call is rejected fail-closed ([`ActionError::PolicyDenied`]). The
+//!   global capacity cap bounds the whole queue; this adds a **per-being**
+//!   cap on top of it. Auto-run tasks (read / local write) are not
+//!   rate-limited. Deterministic: a timestamp is injected.
 //!
-//! ## Determinismi
-//! Kaikki aikaa lukeva logiikka ottaa aikaleiman injektoituna
-//! ([`familyclaw_core::time::Timestamp`]) — kelloa ei lueta moduulin sisällä.
+//! ## Determinism
+//! All time-reading logic takes the timestamp as an injected parameter
+//! ([`familyclaw_core::time::Timestamp`]) — the clock is never read inside
+//! the module.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -68,51 +71,50 @@ use crate::approval::Approval;
 use crate::error::{ActionError, Result};
 use crate::ids::{ActionTaskId, ApprovalId};
 
-/// Moduulin valmiusaste — säilytetään, jotta [`crate::all_modules_scaffolded`]
-/// kääntyy edelleen muiden moduulien rinnalla.
+/// Module readiness flag — kept so that [`crate::all_modules_scaffolded`]
+/// still compiles alongside the other modules.
 pub(crate) const SCAFFOLDED: bool = true;
 
-/// Odottavan hyväksynnän **salaisuudeton** tallennusmuoto.
+/// The **secret-free** storage form of a pending approval.
 ///
-/// Tämä on yksi rivi tallennuspinnalla: se kantaa juuri sen tiedon jonka
-/// `approve` tarvitsee jatkaakseen pysähtyneen tehtävän suoritusta — tehtävän
-/// tunnisteen ja payload-sidotun hyväksynnän — sekä redaktoidun tiivistelmän
-/// operaattorin näytettäväksi.
+/// This is one row in the storage surface: it carries exactly the data
+/// `approve` needs to resume a stalled task's execution — the task's id and
+/// its payload-bound approval — plus a redacted summary for display to the
+/// operator.
 ///
-/// ## Salaisuusinvariantti
-/// Kenttä kentältä:
-/// - [`PendingRecord::task_id`] — tehtävän UUID (ei salaisuus).
-/// - [`PendingRecord::approval`] — [`Approval`], jonka ainoa payload-johdannainen
-///   kenttä on SHA-256-**tiiviste** (ei raaka payload). Loput ovat tunnisteita,
-///   aikaleimoja ja kertakäyttölippu.
-/// - [`PendingRecord::redacted_summary`] — ihmisluettava, redaktoitu tiivistelmä
-///   (esim. "`github_issue_draft` odottaa hyväksyntää"). Kutsujan **vastuulla** on
-///   olla laittamatta tähän salaisuuksia; oletuksena se johdetaan vain taidon
-///   nimestä ja tunnisteista.
-/// - [`PendingRecord::created_at`] — luontihetki (auditointi).
+/// ## Secrecy invariant
+/// Field by field:
+/// - [`PendingRecord::task_id`] — the task's UUID (not a secret).
+/// - [`PendingRecord::approval`] — an [`Approval`], whose only
+///   payload-derived field is a SHA-256 **hash** (not the raw payload). The
+///   rest are ids, timestamps, and a single-use flag.
+/// - [`PendingRecord::redacted_summary`] — a human-readable, redacted
+///   summary (e.g. "`github_issue_draft` is awaiting approval"). It is the
+///   caller's **responsibility** not to put secrets here; by default it is
+///   derived only from the skill's name and ids.
+/// - [`PendingRecord::created_at`] — the creation moment (for auditing).
 ///
-/// Raakaa payloadia, API-avaimia, tokeneita tai KERROS B -dataa ei tallenneta.
+/// The raw payload, API keys, tokens, or Layer B data are never stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRecord {
-    /// Tehtävä jota hyväksyntä koskee.
+    /// The task the approval concerns.
     pub task_id: ActionTaskId,
-    /// Payload-sidottu hyväksyntä (kantaa vain payloadin **tiivisteen**).
+    /// The payload-bound approval (carries only the payload's **hash**).
     pub approval: Approval,
-    /// Redaktoitu ihmisluettava tiivistelmä operaattorin näytettäväksi.
+    /// A redacted, human-readable summary for display to the operator.
     ///
-    /// Ei saa sisältää raakaa payloadia eikä salaisuuksia — vain neutraalia
-    /// metatietoa (taidon nimi, mitä hyväksyntä koskee yleisellä tasolla).
+    /// Must not contain the raw payload or secrets — only neutral metadata
+    /// (the skill's name, what the approval concerns at a general level).
     pub redacted_summary: String,
-    /// Hetki jolloin odottava kirjaus luotiin (auditointi).
+    /// The moment the pending record was created (for auditing).
     pub created_at: Timestamp,
 }
 
 impl PendingRecord {
-    /// Rakentaa odottavan kirjauksen tehtävälle ja sen payload-sidotulle
-    /// hyväksynnälle.
+    /// Builds a pending record for a task and its payload-bound approval.
     ///
-    /// `redacted_summary` on kutsujan antama neutraali tiivistelmä; **sen ei saa
-    /// sisältää salaisuuksia** (tallennetaan sellaisenaan levylle).
+    /// `redacted_summary` is a neutral summary provided by the caller; **it
+    /// must not contain secrets** (it is stored to disk as-is).
     #[must_use]
     pub fn new(
         task_id: ActionTaskId,
@@ -128,60 +130,63 @@ impl PendingRecord {
         }
     }
 
-    /// Hyväksynnän tunniste (tallennuspinnan avain).
+    /// The approval's id (the storage surface key).
     #[must_use]
     pub fn approval_id(&self) -> ApprovalId {
         self.approval.id
     }
 
-    /// Hetki jonka jälkeen kirjaus on vanhentunut (`approval.expires_at`).
+    /// The moment after which the record is expired (`approval.expires_at`).
     #[must_use]
     pub fn expires_at(&self) -> Timestamp {
         self.approval.expires_at
     }
 
-    /// Onko kirjaus vanhentunut annettuun hetkeen `now` nähden (`now > expires_at`).
+    /// Whether the record is expired relative to the given moment `now`
+    /// (`now > expires_at`).
     ///
-    /// Käyttää täsmälleen samaa fail-closed-vanhentumisrajaa kuin
-    /// [`Approval::is_expired`]: tasan `expires_at` kelpaa vielä, aidosti
-    /// myöhempi ei.
+    /// Uses exactly the same fail-closed expiry boundary as
+    /// [`Approval::is_expired`]: exactly `expires_at` is still valid, a
+    /// genuinely later moment is not.
     #[must_use]
     pub fn is_expired(&self, now: Timestamp) -> bool {
         self.approval.is_expired(now)
     }
 }
 
-/// Kapasiteettikatto odottavien hyväksyntöjen lukumäärälle.
+/// Capacity cap for the number of pending approvals.
 ///
-/// Estää tallennuspinnan rajattoman kasvun (muisti/levy): kun odottavia on jo
-/// katon verran, uusi lisäys hylätään fail-closed. Oletus on [`PendingCapacity::DEFAULT`].
+/// Prevents unbounded growth of the storage surface (memory/disk): once the
+/// number pending already reaches the cap, a new insert is rejected
+/// fail-closed. The default is [`PendingCapacity::DEFAULT`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingCapacity(usize);
 
 impl PendingCapacity {
-    /// Oletuskatto (1024 odottavaa hyväksyntää).
+    /// The default cap (1024 pending approvals).
     ///
-    /// Käytännön human-in-the-loop-kuormalla odottavia on yleensä kourallinen;
-    /// tuhannen katto antaa runsaan marginaalin mutta rajaa silti DoS-pinnan.
+    /// Under a realistic human-in-the-loop load, pending approvals are
+    /// usually a handful; a cap of a thousand gives ample margin while still
+    /// bounding the `DoS` surface.
     pub const DEFAULT: PendingCapacity = PendingCapacity(1024);
 
-    /// Rakentaa katon annetusta rajasta.
+    /// Builds a cap from the given limit.
     ///
-    /// Raja `0` tarkoittaa "ei mahdu yhtäkään" — kaikki lisäykset hylätään (voi
-    /// käyttää häiriötilan kytkemiseen pois). Käytä [`PendingCapacity::DEFAULT`]
-    /// jos et tarvitse erityistä rajaa.
+    /// A limit of `0` means "no room for even one" — all inserts are
+    /// rejected (can be used to disable a subsystem). Use
+    /// [`PendingCapacity::DEFAULT`] if you don't need a specific limit.
     #[must_use]
     pub const fn new(limit: usize) -> Self {
         Self(limit)
     }
 
-    /// Palauttaa katon numeroarvon (suurin sallittu odottavien määrä).
+    /// Returns the cap's numeric value (the maximum allowed number pending).
     #[must_use]
     pub const fn limit(self) -> usize {
         self.0
     }
 
-    /// Mahtuuko vielä yksi lisää kun nykyinen koko on `current`.
+    /// Whether there is room for one more when the current size is `current`.
     #[must_use]
     pub const fn has_room_for_one_more(self, current: usize) -> bool {
         current < self.0
@@ -189,44 +194,44 @@ impl PendingCapacity {
 }
 
 impl Default for PendingCapacity {
-    /// Oletus on [`PendingCapacity::DEFAULT`].
+    /// The default is [`PendingCapacity::DEFAULT`].
     fn default() -> Self {
         Self::DEFAULT
     }
 }
 
-/// Per-olento rate-limit vaarallisille (hyväksyntää vaativille) työkalukutsuille.
+/// Per-being rate limit for dangerous (approval-requiring) tool calls.
 ///
-/// Liukuva aikaikkuna: kullekin olennolle (`being`) sallitaan korkeintaan
-/// `max_per_window` kirjausta `window_secs` sekunnin ikkunassa (molemmat
-/// annetaan [`DangerousToolRateLimiter::new`]:lle). Tämä on tallennuspinnasta
-/// riippumaton koukku jonka julkisivu ([`crate::facade::ActionRuntime`]) kysyy
-/// `submit-task`:ssa **ennen** kuin se myöntää uuden hyväksynnän — fail-closed-
-/// suoja sille, ettei yksi olento voi tulvittaa odottavien jonoa vaarallisilla
-/// pyynnöillä. Globaali kapasiteettikatto ([`PendingCapacity`]) rajaa koko jonon;
-/// tämä lisää siihen **per-olento**-katon.
+/// A sliding time window: each being (`being`) is allowed at most
+/// `max_per_window` records within a `window_secs`-second window (both given
+/// to [`DangerousToolRateLimiter::new`]). This is a storage-surface-
+/// independent hook that the facade ([`crate::facade::ActionRuntime`]) asks
+/// in `submit-task` **before** it grants a new approval — fail-closed
+/// protection against a single being flooding the pending queue with
+/// dangerous requests. The global capacity cap ([`PendingCapacity`]) bounds
+/// the whole queue; this adds a **per-being** cap on top of it.
 ///
-/// ## Determinismi
-/// Aikaleima injektoidaan ([`DangerousToolRateLimiter::check_and_record`]); kelloa
-/// ei lueta sisällä. Vanhentuneet aikaleimat siivotaan laiskasti tarkistuksen
-/// yhteydessä.
+/// ## Determinism
+/// A timestamp is injected
+/// ([`DangerousToolRateLimiter::check_and_record`]); the clock is never read
+/// inside. Expired timestamps are lazily cleaned up during the check.
 #[derive(Debug, Default)]
 pub struct DangerousToolRateLimiter {
-    /// Ikkunan pituus sekunteina.
+    /// The window length in seconds.
     window_secs: i64,
-    /// Suurin sallittu kirjausmäärä ikkunassa per olento.
+    /// The maximum allowed number of records in the window per being.
     max_per_window: usize,
-    /// Olento → viimeaikaiset kirjausaikaleimat (vanhin edessä).
+    /// Being → recent record timestamps (oldest first).
     hits: Mutex<HashMap<String, VecDeque<Timestamp>>>,
 }
 
 impl DangerousToolRateLimiter {
-    /// Rakentaa rajoittimen annetulla ikkunalla ja kattomäärällä.
+    /// Builds a limiter with the given window and cap.
     ///
-    /// `max_per_window = 0` estää kaikki kutsut (kovakatkaisu). `window_secs <= 0`
-    /// käsitellään hetkellisenä ikkunana (käytännössä jokainen kutsu on uudessa
-    /// ikkunassa) — tämä ei panikoi, vaan toimii fail-open vain ikkunan osalta;
-    /// käytä positiivista ikkunaa todelliseen rajoitukseen.
+    /// `max_per_window = 0` blocks all calls (a hard cutoff). `window_secs
+    /// <= 0` is treated as an instantaneous window (in practice every call
+    /// is in a new window) — this does not panic, but is fail-open only with
+    /// respect to the window; use a positive window for a real limit.
     #[must_use]
     pub fn new(window_secs: i64, max_per_window: usize) -> Self {
         Self {
@@ -236,16 +241,18 @@ impl DangerousToolRateLimiter {
         }
     }
 
-    /// Tarkistaa onko olennolla tilaa uudelle vaaralliselle kutsulle, ja jos on,
-    /// **kirjaa** sen ja palauttaa `Ok(())`. Jos kiintiö on täynnä, palauttaa
-    /// [`ActionError::PolicyDenied`] **kirjaamatta** kutsua (fail-closed).
+    /// Checks whether the being has room for a new dangerous call, and if
+    /// so, **records** it and returns `Ok(())`. If the quota is exhausted,
+    /// returns [`ActionError::PolicyDenied`] **without recording** the call
+    /// (fail-closed).
     ///
-    /// Liukuva ikkuna: ennen tarkistusta vanhemmat kuin `now - window_secs`
-    /// -aikaleimat häädetään. Näin laskuri seuraa vain ikkunan sisäisiä kutsuja.
+    /// Sliding window: before the check, timestamps older than `now -
+    /// window_secs` are evicted. This way the counter only tracks calls
+    /// within the window.
     ///
     /// # Errors
-    /// [`ActionError::PolicyDenied`] jos olento on jo käyttänyt kiintiönsä tässä
-    /// ikkunassa.
+    /// [`ActionError::PolicyDenied`] if the being has already used its quota
+    /// in this window.
     pub fn check_and_record(&self, being: &str, now: Timestamp) -> Result<()> {
         let cutoff = now - chrono::Duration::seconds(self.window_secs.max(0));
         let mut guard = self
@@ -253,7 +260,7 @@ impl DangerousToolRateLimiter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = guard.entry(being.to_string()).or_default();
-        // Häädä ikkunan ulkopuoliset aikaleimat (vanhin edessä).
+        // Evict timestamps outside the window (oldest first).
         while entry.front().is_some_and(|t| *t < cutoff) {
             entry.pop_front();
         }
@@ -270,8 +277,8 @@ impl DangerousToolRateLimiter {
         Ok(())
     }
 
-    /// Kuinka monta kirjausta olennolla on ikkunassa hetkellä `now` (häätää
-    /// vanhentuneet ensin). Lähinnä testausta ja diagnostiikkaa varten.
+    /// How many records the being has in the window at moment `now`
+    /// (evicts expired ones first). Mainly for testing and diagnostics.
     #[must_use]
     pub fn count_in_window(&self, being: &str, now: Timestamp) -> usize {
         let cutoff = now - chrono::Duration::seconds(self.window_secs.max(0));
@@ -289,138 +296,145 @@ impl DangerousToolRateLimiter {
     }
 }
 
-/// Odottavien hyväksyntöjen tallennuspinta.
+/// Storage surface for pending approvals.
 ///
-/// Abstrahoi sen, **missä** odottavat hyväksynnät elävät — prosessin muistissa
-/// vai kaatumiskestävällä levyllä — jotta [`crate::facade::ActionRuntime`] voi
-/// vaihtaa tallennustaustan rikkomatta logiikkaansa. Kaikki metodit ovat `&self`
-/// (sisäinen mutaatio lukon takana), jotta trait on `dyn`-yhteensopiva.
+/// Abstracts **where** pending approvals live — in process memory or on
+/// crash-resistant disk — so that [`crate::facade::ActionRuntime`] can swap
+/// the storage backend without breaking its logic. All methods take `&self`
+/// (internal mutation behind a lock), so the trait is `dyn`-compatible.
 ///
-/// ## Sopimus
-/// - [`insert`](PendingApprovalStore::insert) **kunnioittaa kapasiteettikattoa**:
-///   jos pinta on jo täynnä, lisäys hylätään fail-closed
-///   ([`ActionError::PolicyDenied`]) eikä mitään kirjoiteta.
+/// ## Contract
+/// - [`insert`](PendingApprovalStore::insert) **honors the capacity cap**:
+///   if the surface is already full, the insert is rejected fail-closed
+///   ([`ActionError::PolicyDenied`]) and nothing is written.
 /// - [`get`](PendingApprovalStore::get) / [`remove`](PendingApprovalStore::remove)
-///   palauttavat tallennetun [`PendingRecord`]:n koko muodossaan (sisältää
-///   payload-sidotun hyväksynnän), jotta `approve` voi jatkaa suoritusta.
-/// - [`remove`](PendingApprovalStore::remove) on **kertakäyttöinen**: kulutettua
-///   tunnistetta ei enää löydy (sama nonce-semantiikka kuin
+///   return the stored [`PendingRecord`] in its full form (including the
+///   payload-bound approval), so `approve` can resume execution.
+/// - [`remove`](PendingApprovalStore::remove) is **single-use**: a consumed
+///   id can no longer be found (the same nonce semantics as
 ///   [`crate::approval`]).
-/// - [`list`](PendingApprovalStore::list) palauttaa kaikki odottavat kirjaukset
-///   (operaattorin pinta + kapasiteetin laskenta).
-/// - [`evict_expired`](PendingApprovalStore::evict_expired) poistaa vanhentuneet
-///   kirjaukset fail-closed-rajalla.
+/// - [`list`](PendingApprovalStore::list) returns all pending records (used
+///   by the operator surface + capacity accounting).
+/// - [`evict_expired`](PendingApprovalStore::evict_expired) removes expired
+///   records using the fail-closed boundary.
 ///
-/// ## Salaisuudet
-/// Toteutus joka tallentaa levylle saa kirjoittaa **vain** [`PendingRecord`]:n
-/// salaisuudettomat kentät (tiiviste + tunnisteet + redaktoitu tiivistelmä) —
-/// ei koskaan raakaa payloadia.
+/// ## Secrets
+/// An implementation that persists to disk may write **only**
+/// [`PendingRecord`]'s secret-free fields (hash + ids + redacted summary) —
+/// never the raw payload.
 pub trait PendingApprovalStore: Send + Sync {
-    /// Lisää odottavan kirjauksen, **jos** kapasiteettikatto ei ylity.
+    /// Inserts a pending record, **if** the capacity cap is not exceeded.
     ///
-    /// Avain on `record.approval_id()`. Saman tunnisteen uudelleenlisäys korvaa
-    /// aiemman (käytännössä tunnisteet ovat uniikkeja). Lisäys lasketaan
-    /// kapasiteettia vasten vain kun kyseessä on **uusi** tunniste.
+    /// The key is `record.approval_id()`. Re-inserting the same id replaces
+    /// the prior one (in practice ids are unique). An insert is counted
+    /// against capacity only when it is a **new** id.
     ///
     /// # Errors
-    /// [`ActionError::PolicyDenied`] jos kapasiteettikatto ([`PendingCapacity`])
-    /// estää uuden tunnisteen lisäämisen. Levytoteutuksilla lisäksi I/O-virhe
-    /// ([`ActionError::Proof`]) jos journaliin kirjoitus epäonnistuu.
+    /// [`ActionError::PolicyDenied`] if the capacity cap
+    /// ([`PendingCapacity`]) prevents adding a new id. On disk
+    /// implementations, also an I/O error ([`ActionError::Proof`]) if
+    /// writing to the journal fails.
     fn insert(&self, record: PendingRecord) -> Result<()>;
 
-    /// Hakee odottavan kirjauksen hyväksynnän tunnisteella; `None` jos ei löydy
-    /// (tai se on jo kulutettu/häädetty).
+    /// Looks up a pending record by approval id; `None` if not found (or
+    /// already consumed/evicted).
     ///
-    /// Palauttaa kopion koko kirjauksesta (ei viitettä), jotta toteutus voi pitää
-    /// sisäisen lukon vain haun ajan.
+    /// Returns a copy of the whole record (not a reference), so the
+    /// implementation can hold its internal lock only for the duration of
+    /// the lookup.
     ///
     /// # Errors
-    /// Levytoteutuksilla [`ActionError::Proof`] jos lokin luku epäonnistuu.
+    /// On disk implementations, [`ActionError::Proof`] if reading the log
+    /// fails.
     fn get(&self, approval_id: ApprovalId) -> Result<Option<PendingRecord>>;
 
-    /// Poistaa (kuluttaa) odottavan kirjauksen ja palauttaa sen, jos se oli
-    /// olemassa; `None` jos sitä ei ollut.
+    /// Removes (consumes) a pending record and returns it, if it existed;
+    /// `None` if it did not.
     ///
-    /// Kertakäyttöinen: poiston jälkeen sama tunniste ei enää löydy
-    /// [`get`](PendingApprovalStore::get):llä. Levytoteutuksilla poisto on pysyvä
-    /// (kaatumisen yli).
+    /// Single-use: after removal the same id can no longer be found via
+    /// [`get`](PendingApprovalStore::get). On disk implementations, removal
+    /// is permanent (across a crash).
     ///
     /// # Errors
-    /// Levytoteutuksilla [`ActionError::Proof`] jos poistomerkinnän kirjoitus
-    /// epäonnistuu.
+    /// On disk implementations, [`ActionError::Proof`] if writing the
+    /// removal record fails.
     fn remove(&self, approval_id: ApprovalId) -> Result<Option<PendingRecord>>;
 
-    /// Odottavien kirjausten lukumäärä.
+    /// The number of pending records.
     ///
     /// # Errors
-    /// Levytoteutuksilla [`ActionError::Proof`] jos lokin luku epäonnistuu.
+    /// On disk implementations, [`ActionError::Proof`] if reading the log
+    /// fails.
     fn len(&self) -> Result<usize>;
 
-    /// Onko pinta tyhjä (ei yhtäkään odottavaa kirjausta).
+    /// Whether the surface is empty (no pending records at all).
     ///
     /// # Errors
-    /// Sama kuin [`len`](PendingApprovalStore::len).
+    /// Same as [`len`](PendingApprovalStore::len).
     fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
     }
 
-    /// Luettelee kaikki odottavat kirjaukset.
+    /// Lists all pending records.
     ///
-    /// Käytetään sekä operaattorin pinnan ([`crate::facade::ActionRuntime::pending_approvals`])
-    /// että kapasiteettikaton laskennassa. Järjestystä ei taata; kutsuja
-    /// vakauttaa sen tarvittaessa (esim. hyväksynnän tunnisteen mukaan).
+    /// Used both by the operator surface ([`crate::facade::ActionRuntime::pending_approvals`])
+    /// and by capacity-cap accounting. Order is not guaranteed; the caller
+    /// stabilizes it if needed (e.g. by approval id).
     ///
     /// # Errors
-    /// Levytoteutuksilla [`ActionError::Proof`] jos lokin luku epäonnistuu.
+    /// On disk implementations, [`ActionError::Proof`] if reading the log
+    /// fails.
     fn list(&self) -> Result<Vec<PendingRecord>>;
 
-    /// Poistaa kaikki annettuun hetkeen `now` mennessä vanhentuneet kirjaukset
-    /// ja palauttaa häädettyjen lukumäärän.
+    /// Removes all records expired as of the given moment `now` and returns
+    /// the number evicted.
     ///
-    /// Käyttää täsmälleen samaa fail-closed-vanhentumisrajaa kuin
-    /// [`crate::approval`] ([`PendingRecord::is_expired`]): `now > expires_at`.
-    /// Vanhentunutta hyväksyntää ei voi enää kuluttaa, joten sen säilyttäminen
-    /// olisi vain roskaa tallennuspinnalla.
+    /// Uses exactly the same fail-closed expiry boundary as
+    /// [`crate::approval`] ([`PendingRecord::is_expired`]): `now >
+    /// expires_at`. An expired approval can no longer be consumed, so
+    /// keeping it around would be pure garbage on the storage surface.
     ///
     /// # Errors
-    /// Levytoteutuksilla [`ActionError::Proof`] jos lokin luku/kirjoitus
-    /// epäonnistuu.
+    /// On disk implementations, [`ActionError::Proof`] if reading/writing
+    /// the log fails.
     fn evict_expired(&self, now: Timestamp) -> Result<usize>;
 
-    /// Palauttaa pinnan **lajitunnisteen** (`"in-memory"` tai `"journal"`).
+    /// Returns the surface's **kind tag** (`"in-memory"` or `"journal"`).
     ///
-    /// Tämä on salaisuudeton tarkistuskoukku kokoojalle ja testeille: sillä voi
-    /// todeta että persistentti kokoonpano sai kaatumiskestävän (`"journal"`)
-    /// odottavien hyväksyntöjen pinnan oletuksellisen muistinvaraisen
-    /// (`"in-memory"`) sijaan, paljastamatta sisäistä tilaa tai tiedostopolkua.
-    /// Sama tarkoitus kuin [`crate::dispatch_outbox::DispatchOutboxStore::kind`]:lla.
-    /// Oletus on `"in-memory"`; kaatumiskestävät toteutukset ohittavat tämän.
+    /// This is a secret-free check hook for the assembler and tests: it
+    /// lets you confirm that a persistent configuration got the
+    /// crash-resistant (`"journal"`) pending-approvals surface instead of
+    /// the default in-memory (`"in-memory"`) one, without exposing internal
+    /// state or the file path. Same purpose as
+    /// [`crate::dispatch_outbox::DispatchOutboxStore::kind`]. The default is
+    /// `"in-memory"`; crash-resistant implementations override this.
     fn kind(&self) -> &'static str {
         "in-memory"
     }
 }
 
-/// Muistinvarainen tallennuspinta ([`HashMap`] traitin takana).
+/// In-memory storage surface ([`HashMap`] behind the trait).
 ///
-/// Oletus ja testikäyttö: nopea ja yksinkertainen, **mutta ei selviä prosessin
-/// kaatumisesta** — kaatuessa kaikki odottavat hyväksynnät katoavat. Tuotannossa
-/// jossa kaatumiskestävyys on vaatimus, käytä [`JournalPendingStore`]:a.
+/// Default and test use: fast and simple, **but does not survive a process
+/// crash** — on a crash all pending approvals are lost. In production where
+/// crash resistance is a requirement, use [`JournalPendingStore`].
 #[derive(Debug)]
 pub struct InMemoryPendingStore {
-    /// Hyväksynnän tunniste → odottava kirjaus.
+    /// Approval id → pending record.
     inner: Mutex<HashMap<ApprovalId, PendingRecord>>,
-    /// Kapasiteettikatto.
+    /// The capacity cap.
     capacity: PendingCapacity,
 }
 
 impl InMemoryPendingStore {
-    /// Luo tyhjän muistipinnan oletuskapasiteetilla ([`PendingCapacity::DEFAULT`]).
+    /// Creates an empty in-memory surface with the default capacity
+    /// ([`PendingCapacity::DEFAULT`]).
     #[must_use]
     pub fn new() -> Self {
         Self::with_capacity(PendingCapacity::DEFAULT)
     }
 
-    /// Luo tyhjän muistipinnan annetulla kapasiteettikatolla.
+    /// Creates an empty in-memory surface with the given capacity cap.
     #[must_use]
     pub fn with_capacity(capacity: PendingCapacity) -> Self {
         Self {
@@ -429,7 +443,7 @@ impl InMemoryPendingStore {
         }
     }
 
-    /// Lukitsee sisäisen kartan, toipuen myrkytetystä lukosta paniikkaamatta.
+    /// Locks the internal map, recovering from a poisoned lock without panicking.
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ApprovalId, PendingRecord>> {
         self.inner
             .lock()
@@ -438,7 +452,7 @@ impl InMemoryPendingStore {
 }
 
 impl Default for InMemoryPendingStore {
-    /// Oletus on tyhjä pinta oletuskapasiteetilla.
+    /// The default is an empty surface with the default capacity.
     fn default() -> Self {
         Self::new()
     }
@@ -448,8 +462,8 @@ impl PendingApprovalStore for InMemoryPendingStore {
     fn insert(&self, record: PendingRecord) -> Result<()> {
         let mut map = self.lock();
         let id = record.approval_id();
-        // Kapasiteetti lasketaan vain UUSILLE tunnisteille: olemassa olevan
-        // korvaaminen ei kasvata kokoa.
+        // Capacity is counted only for NEW ids: replacing an existing one
+        // does not grow the size.
         if !map.contains_key(&id) && !self.capacity.has_room_for_one_more(map.len()) {
             return Err(ActionError::PolicyDenied(format!(
                 "odottavien hyväksyntöjen kapasiteettikatto {} täynnä",
@@ -484,70 +498,75 @@ impl PendingApprovalStore for InMemoryPendingStore {
     }
 }
 
-/// Journal-rivin looginen nimi odottavan kirjauksen lisäykselle.
+/// The journal row's logical name for a pending-record insert.
 const PENDING_PUT: &str = "pending_approval_put";
-/// Journal-rivin looginen nimi odottavan kirjauksen poistolle (tombstone).
+/// The journal row's logical name for a pending-record removal (tombstone).
 const PENDING_DELETE: &str = "pending_approval_delete";
 
-/// Tiivistyksen oletuskerroin: loki tiivistetään automaattisesti kun fyysisten
-/// rivien määrä ylittää `AUTO_COMPACT_FACTOR * elävien_kirjausten_määrä`.
+/// Default compaction factor: the log is compacted automatically when the
+/// number of physical rows exceeds `AUTO_COMPACT_FACTOR *
+/// number_of_live_records`.
 ///
-/// Kerroin 2 tarkoittaa "tiivistä kun vähintään puolet riveistä on kuolleita"
-/// (poistettuja tai korvattuja). Tämä rajaa kuolleiden rivien kertymisen
-/// vakiokertoimeen elävää kohti, joten lokin koko ja replayn O(n)-kustannus
-/// pysyvät elävän tilan kokoluokassa rajattoman kasvun sijaan.
+/// A factor of 2 means "compact once at least half the rows are dead"
+/// (removed or replaced). This bounds the accumulation of dead rows to a
+/// constant factor per live record, so the log's size and the replay's O(n)
+/// cost stay on the order of the live state's size instead of growing
+/// unboundedly.
 const AUTO_COMPACT_FACTOR: usize = 2;
 
-/// Pienin fyysinen rivimäärä jolla auto-tiivistys ylipäänsä harkitaan.
+/// The minimum physical row count at which auto-compaction is even
+/// considered.
 ///
-/// Estää turhan tiivistyksen pienillä lokeilla (esim. 1 elävä + 1 tombstone =
-/// 2 riviä laukaisisi muuten heti). Vasta kun rivejä on tämän verran,
-/// dead-row-suhdetta aletaan valvoa.
+/// Prevents pointless compaction on small logs (e.g. 1 live + 1 tombstone =
+/// 2 rows would otherwise trigger it immediately). Only once there are this
+/// many rows does the dead-row ratio start being monitored.
 const AUTO_COMPACT_MIN_ROWS: usize = 64;
 
-/// Kaatumiskestävä tallennuspinta [`familyclaw_durable::FileJournal`]:n päällä.
+/// Crash-resistant storage surface on top of [`familyclaw_durable::FileJournal`].
 ///
-/// Append-only-loki: jokainen lisäys kirjoitetaan `pending_approval_put`-markerina
-/// (sisältää koko salaisuudettoman [`PendingRecord`]:n) ja jokainen poisto
-/// `pending_approval_delete`-markerina (sisältää vain hyväksynnän tunnisteen,
-/// tombstone). Tila rekonstruoidaan toistamalla loki: myöhempi rivi voittaa,
-/// joten poisto kumoaa aiemman lisäyksen.
+/// An append-only log: every insert is written as a `pending_approval_put`
+/// marker (contains the whole secret-free [`PendingRecord`]) and every
+/// removal as a `pending_approval_delete` marker (contains only the
+/// approval id, a tombstone). State is reconstructed by replaying the log:
+/// a later row wins, so a removal undoes an earlier insert.
 ///
-/// Koska [`FileJournal::append`] flushaa ja fsyncaa ennen paluuta, valmistunut
-/// lisäys/poisto on levyllä myös äkillisen kaatumisen jälkeen. Avattaessa
-/// `FileJournal` eheyttää kaatumisen jättämän vajaan viimeisen rivin, joten
-/// loki säilyy luettavana. Näin **odottava hyväksyntä selviää
-/// `submit-task`:n ja `approve`:n välisestä kaatumisesta**.
+/// Because [`FileJournal::append`] flushes and fsyncs before returning, a
+/// completed insert/removal is on disk even after an abrupt crash. When
+/// opened, `FileJournal` repairs any incomplete trailing row left by a
+/// crash, so the log remains readable. This is how **a pending approval
+/// survives a crash between `submit-task` and `approve`**.
 ///
-/// ## Tiivistys (compaction) — rajaton kasvu kuriin
-/// Koska loki on append-only, jokainen poisto ([`remove`](PendingApprovalStore::remove)
-/// / [`evict_expired`](PendingApprovalStore::evict_expired)) ja saman tunnisteen
-/// korvaus jättää **kuolleita rivejä** lokiin: tila on yhä oikea (myöhempi rivi
-/// voittaa replayssa), mutta tiedosto kasvaa rajatta ja replay muuttuu O(n):ksi
-/// rivimäärässä — ei elävien kirjausten määrässä.
-/// [`compact`](JournalPendingStore::compact) kirjoittaa lokin uudelleen
-/// sisältämään **vain elävät kirjaukset** (kuolleet/tombstonatut/korvatut rivit
-/// pudotetaan) atomisesti [`FileJournal::rewrite`]:n kautta — elävä tila säilyy
-/// bitilleen, eikä keskeytyminen koskaan menetä eläviä rivejä (rename-pohjainen
-/// swap). Tiivistys laukeaa joko operaattorin kutsumana
-/// ([`compact`](JournalPendingStore::compact)) tai **automaattisesti** lisäyksen
-/// ja häädön yhteydessä kun kuolleiden rivien osuus ylittää kynnyksen (ks.
-/// `AUTO_COMPACT_FACTOR` ja [`with_auto_compact_factor`](JournalPendingStore::with_auto_compact_factor)).
+/// ## Compaction — keeping unbounded growth in check
+/// Because the log is append-only, every removal
+/// ([`remove`](PendingApprovalStore::remove) /
+/// [`evict_expired`](PendingApprovalStore::evict_expired)) and every
+/// replacement of the same id leaves **dead rows** in the log: the state is
+/// still correct (a later row wins on replay), but the file grows without
+/// bound and replay becomes O(n) in the row count — not in the number of
+/// live records. [`compact`](JournalPendingStore::compact) rewrites the log
+/// to contain **only the live records** (dead/tombstoned/replaced rows are
+/// dropped) atomically via [`FileJournal::rewrite`] — the live state is
+/// preserved bit-for-bit, and an interruption never loses live rows
+/// (rename-based swap). Compaction is triggered either by an operator call
+/// ([`compact`](JournalPendingStore::compact)) or **automatically** during
+/// an insert or eviction when the fraction of dead rows exceeds a threshold
+/// (see `AUTO_COMPACT_FACTOR` and
+/// [`with_auto_compact_factor`](JournalPendingStore::with_auto_compact_factor)).
 ///
-/// ## Salaisuusinvariantti
-/// Levylle kirjoitetaan vain [`PendingRecord`]:n salaisuudettomat kentät
-/// (payloadin tiiviste, tunnisteet, redaktoitu tiivistelmä, aikaleimat) — ei
-/// koskaan raakaa payloadia. Tiivistys säilyttää tämän: uudelleenkirjoitettu loki
-/// sisältää samat salaisuudettomat `pending_approval_put`-rivit.
+/// ## Secrecy invariant
+/// Only [`PendingRecord`]'s secret-free fields (the payload's hash, ids, the
+/// redacted summary, timestamps) are written to disk — never the raw
+/// payload. Compaction preserves this: the rewritten log contains the same
+/// secret-free `pending_approval_put` rows.
 pub struct JournalPendingStore {
-    /// Append-only-loki johon lisäykset ja poistot kirjataan.
+    /// The append-only log to which inserts and removals are recorded.
     journal: FileJournal,
-    /// Seuraavan rivin sekvenssipaikka (monotoninen).
+    /// The next row's sequence position (monotonic).
     next_step: Mutex<StepId>,
-    /// Kapasiteettikatto.
+    /// The capacity cap.
     capacity: PendingCapacity,
-    /// Auto-tiivistyksen kerroin: tiivistä kun `rivit > factor * elävät`.
-    /// `0` poistaa auto-tiivistyksen käytöstä (vain manuaalinen `compact`).
+    /// Auto-compaction factor: compact when `rows > factor * live`.
+    /// `0` disables auto-compaction (manual `compact` only).
     auto_compact_factor: usize,
 }
 
@@ -561,28 +580,28 @@ impl std::fmt::Debug for JournalPendingStore {
 }
 
 impl JournalPendingStore {
-    /// Avaa (tai luo) kaatumiskestävän pinnan annetusta tiedostopolusta
-    /// oletuskapasiteetilla.
+    /// Opens (or creates) a crash-resistant surface from the given file
+    /// path with the default capacity.
     ///
-    /// Olemassa olevasta lokista odottavat hyväksynnät rekonstruoidaan heti, joten
-    /// uudelleenkäynnistyksen jälkeen ne ovat yhä [`get`](PendingApprovalStore::get)-
-    /// haettavissa ja hyväksyttävissä.
+    /// Pending approvals are reconstructed immediately from an existing
+    /// log, so after a restart they are still retrievable via
+    /// [`get`](PendingApprovalStore::get) and approvable.
     ///
     /// # Errors
-    /// [`ActionError::Proof`] jos journalia ei voi avata tai sen lukeminen
-    /// (sekvenssipaikan päättelyä varten) epäonnistuu.
+    /// [`ActionError::Proof`] if the journal cannot be opened or reading it
+    /// (to infer the sequence position) fails.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_capacity(path, PendingCapacity::DEFAULT)
     }
 
-    /// Avaa (tai luo) pinnan annetulla kapasiteettikatolla.
+    /// Opens (or creates) a surface with the given capacity cap.
     ///
     /// # Errors
-    /// [`ActionError::Proof`] jos journalia ei voi avata tai lukea.
+    /// [`ActionError::Proof`] if the journal cannot be opened or read.
     pub fn open_with_capacity(path: impl AsRef<Path>, capacity: PendingCapacity) -> Result<Self> {
         let journal = FileJournal::open(path)
             .map_err(|e| ActionError::Proof(format!("open pending journal failed: {e}")))?;
-        // Päättele seuraava sekvenssipaikka olemassa olevan lokin pituudesta.
+        // Infer the next sequence position from the existing log's length.
         let len = journal
             .len()
             .map_err(|e| ActionError::Proof(format!("read pending journal failed: {e}")))?;
@@ -595,26 +614,26 @@ impl JournalPendingStore {
         })
     }
 
-    /// Asettaa auto-tiivistyksen kertoimen (ketjutus).
+    /// Sets the auto-compaction factor (chainable).
     ///
-    /// Loki tiivistetään automaattisesti kun fyysisten rivien määrä ylittää
-    /// `factor * elävien_kirjausten_määrä` (ja rivejä on vähintään
-    /// `AUTO_COMPACT_MIN_ROWS`). Oletus on `AUTO_COMPACT_FACTOR` (2). Arvo `0`
-    /// **poistaa** auto-tiivistyksen käytöstä — tällöin loki tiivistetään vain
-    /// [`compact`](Self::compact)-kutsulla.
+    /// The log is compacted automatically when the number of physical rows
+    /// exceeds `factor * number_of_live_records` (and there are at least
+    /// `AUTO_COMPACT_MIN_ROWS` rows). The default is `AUTO_COMPACT_FACTOR`
+    /// (2). A value of `0` **disables** auto-compaction — the log is then
+    /// compacted only via a [`compact`](Self::compact) call.
     #[must_use]
     pub const fn with_auto_compact_factor(mut self, factor: usize) -> Self {
         self.auto_compact_factor = factor;
         self
     }
 
-    /// Palauttaa lokin tiedostopolun.
+    /// Returns the log's file path.
     #[must_use]
     pub fn path(&self) -> &Path {
         self.journal.path()
     }
 
-    /// Varaa ja palauttaa seuraavan sekvenssipaikan (monotoninen).
+    /// Reserves and returns the next sequence position (monotonic).
     fn next_step_id(&self) -> StepId {
         let mut guard = self
             .next_step
@@ -625,7 +644,7 @@ impl JournalPendingStore {
         current
     }
 
-    /// Liittää markerin lokiin annetulla nimellä ja hyötykuormalla.
+    /// Appends a marker to the log with the given name and payload.
     fn append_marker(&self, name: &str, payload: serde_json::Value) -> Result<()> {
         let entry = JournalEntry::marker(self.next_step_id(), name, payload);
         self.journal
@@ -633,11 +652,12 @@ impl JournalPendingStore {
             .map_err(|e| ActionError::Proof(format!("append pending marker failed: {e}")))
     }
 
-    /// Rekonstruoi nykytilan (hyväksynnän tunniste → kirjaus) toistamalla lokin.
+    /// Reconstructs the current state (approval id → record) by replaying the log.
     ///
-    /// Toisto käy rivit järjestyksessä: `pending_approval_put` lisää/korvaa
-    /// kirjauksen, `pending_approval_delete` poistaa sen (tombstone). Muut rivit
-    /// ohitetaan. Näin myöhempi rivi voittaa ja poisto kumoaa lisäyksen.
+    /// The replay processes rows in order: `pending_approval_put`
+    /// inserts/replaces the record, `pending_approval_delete` removes it
+    /// (tombstone). Other rows are skipped. This way a later row wins and a
+    /// removal undoes an insert.
     fn replay_state(&self) -> Result<HashMap<ApprovalId, PendingRecord>> {
         let entries = self
             .journal
@@ -646,16 +666,18 @@ impl JournalPendingStore {
         Self::reconstruct_state(entries)
     }
 
-    /// Rakentaa nykytilan annetuista journal-riveistä (puhdas funktio, ei I/O).
+    /// Builds the current state from the given journal rows (a pure
+    /// function, no I/O).
     ///
-    /// Toisto käy rivit järjestyksessä: `pending_approval_put` lisää/korvaa
-    /// kirjauksen, `pending_approval_delete` poistaa sen (tombstone). Muut rivit
-    /// ohitetaan. Myöhempi rivi voittaa, joten poisto kumoaa aiemman lisäyksen.
-    /// Eriytetty [`replay_state`](Self::replay_state):stä jotta sekä levyltä
-    /// lukeva replay että [`compact`](Self::compact):n
-    /// [`FileJournal::compact_with`]-suljin voivat rakentaa tilan **samalla
-    /// logiikalla** — jälkimmäinen saa rivit valmiiksi luettuina lukon alta, eikä
-    /// saa lukea journalia uudelleen (deadlock).
+    /// The replay processes rows in order: `pending_approval_put`
+    /// inserts/replaces the record, `pending_approval_delete` removes it
+    /// (tombstone). Other rows are skipped. A later row wins, so a removal
+    /// undoes an earlier insert. Separated from
+    /// [`replay_state`](Self::replay_state) so that both the log-reading
+    /// replay and [`compact`](Self::compact)'s
+    /// [`FileJournal::compact_with`] closure can build state with **the same
+    /// logic** — the latter receives the rows already read from under the
+    /// lock, and must not read the journal again (deadlock).
     fn reconstruct_state(entries: Vec<JournalEntry>) -> Result<HashMap<ApprovalId, PendingRecord>> {
         let mut state: HashMap<ApprovalId, PendingRecord> = HashMap::new();
         for entry in entries {
@@ -681,64 +703,65 @@ impl JournalPendingStore {
         Ok(state)
     }
 
-    /// Fyysisten journal-rivien määrä (eläviä + kuolleita). Tämä on se luku jota
-    /// vasten dead-row-suhde mitataan; eroaa [`len`](PendingApprovalStore::len):
-    /// stä joka palauttaa vain elävien kirjausten määrän.
+    /// The number of physical journal rows (live + dead). This is the
+    /// number the dead-row ratio is measured against; differs from
+    /// [`len`](PendingApprovalStore::len), which returns only the number of
+    /// live records.
     fn physical_row_count(&self) -> Result<usize> {
         self.journal
             .len()
             .map_err(|e| ActionError::Proof(format!("read pending journal len failed: {e}")))
     }
 
-    /// Kirjoittaa lokin uudelleen sisältämään **vain elävät kirjaukset**
-    /// (tiivistys), pudottaen kaikki kuolleet rivit (tombstonet ja korvatut
-    /// `put`-rivit). Palauttaa pudotettujen kuolleiden rivien määrän.
+    /// Rewrites the log to contain **only the live records** (compaction),
+    /// dropping all dead rows (tombstones and replaced `put` rows). Returns
+    /// the number of dead rows dropped.
     ///
-    /// Elävä tila säilyy bitilleen: tiivistyksen jälkeen täsmälleen samat
-    /// hyväksynnät ovat [`get`](PendingApprovalStore::get)-haettavissa, ja
-    /// uudelleenlatauksesta (restart) rekonstruoituu identtinen tila. Tiivistys
-    /// on **atominen** ([`FileJournal::rewrite`]: temp + fsync + rename) — jos
-    /// prosessi kaatuu kesken, elävä tiedosto on yhä ehjässä vanhassa tilassaan
-    /// eikä yhtään elävää hyväksyntää katoa.
+    /// The live state is preserved bit-for-bit: after compaction exactly the
+    /// same approvals are retrievable via [`get`](PendingApprovalStore::get),
+    /// and reloading (restart) reconstructs identical state. Compaction is
+    /// **atomic** ([`FileJournal::rewrite`]: temp + fsync + rename) — if the
+    /// process crashes mid-operation, the live file is still in its intact
+    /// old state and no live approval is lost.
     ///
-    /// Rivit uudelleennumeroidaan tiiviiksi `0..N`-sekvenssiksi, ja sisäinen
-    /// sekvenssikursori asetetaan vastaamaan, jotta tulevat lisäykset jatkavat
-    /// oikealta paikalta.
+    /// Rows are renumbered into a tight `0..N` sequence, and the internal
+    /// sequence cursor is set to match, so future inserts continue from the
+    /// right place.
     ///
     /// # Errors
-    /// [`ActionError::Proof`] jos lokin luku, rivien sarjallistus tai atominen
-    /// uudelleenkirjoitus epäonnistuu. Virhetilanteessa elävä loki jätetään
-    /// entiselleen (rewrite ei koske elävään tiedostoon ennen kuin temp on ehjä).
+    /// [`ActionError::Proof`] if reading the log, serializing rows, or the
+    /// atomic rewrite fails. On error the live log is left unchanged
+    /// (rewrite does not touch the live file until the temp file is intact).
     pub fn compact(&self) -> Result<usize> {
-        // Atominen tiivistys appendeja vastaan: [`FileJournal::compact_with`]
-        // pitää saman file-lukon koko luku→suodatus→swap-operaation ajan, joten
-        // rinnakkainen lisäys/poisto ei voi laskeutua aukkoon ja kadota
-        // (TOCTOU-korjaus). `build`-suljin saa luetut rivit, rekonstruoi elävän
-        // tilan ja palauttaa uudelleennumeroidut elävät PENDING_PUT-rivit.
+        // Atomic compaction against appends: [`FileJournal::compact_with`]
+        // holds the same file lock for the whole read→filter→swap operation, so
+        // a concurrent insert/removal cannot land in a gap and be lost
+        // (TOCTOU fix). The `build` closure receives the rows already read,
+        // reconstructs the live state, and returns the renumbered live PENDING_PUT rows.
         //
-        // Sekvenssikursorin asetus tehdään ERIKSEEN sulkimen ulkopuolella: suljin
-        // EI saa lukita journalia uudelleen, mutta `next_step` on eri mutex kuin
-        // file-lukko, joten sen päivittäminen sulkimen sisältä OLISI turvallista —
-        // mutta tehdään se silti `compact_with`:n PALUUN jälkeen jotta kursori
-        // päivittyy vain kun swap tosiasiassa onnistui.
-        // Elävien rivien määrä smugletaan sulkimesta `Cell`:llä, jotta
-        // sekvenssikursori voidaan asettaa swapin jälkeen (suljin EI saa lukita
-        // journalia uudelleen → ei voi lukea kursoria omalta polultaan).
+        // Setting the sequence cursor is done SEPARATELY outside the closure: the
+        // closure must NOT lock the journal again, but `next_step` is a different
+        // mutex than the file lock, so updating it from inside the closure WOULD be
+        // safe — but it is still done AFTER `compact_with` RETURNS, so the cursor
+        // only updates once the swap has actually succeeded.
+        // The live row count is smuggled out of the closure via a `Cell`, so the
+        // sequence cursor can be set after the swap (the closure must NOT lock
+        // the journal again → it cannot read the cursor via its own path).
         let live_count = std::cell::Cell::new(0usize);
         let dropped = self
             .journal
             .compact_with(|entries| {
-                // Rekonstruoi elävä tila valmiiksi luetuista riveistä (sama
-                // logiikka kuin replayssa, mutta EI uudelleenlukua — uudelleenluku
-                // lukitsisi journalin ja deadlockkaisi). ActionError kääritään
-                // DurableError-tekstiksi jotta tyyppi sopii compact_with-sopimukseen.
+                // Reconstruct the live state from the rows already read (same
+                // logic as in replay, but WITHOUT re-reading — re-reading would
+                // lock the journal and deadlock). The ActionError is wrapped as
+                // DurableError text so the type fits compact_with's contract.
                 let state = Self::reconstruct_state(entries).map_err(|e| {
                     familyclaw_durable::DurableError::step_failed(
                         "compact_reconstruct",
                         e.to_string(),
                     )
                 })?;
-                // Yksi PENDING_PUT-rivi per elävä kirjaus, uudelleennumeroituna 0..N.
+                // One PENDING_PUT row per live record, renumbered 0..N.
                 let mut kept = Vec::with_capacity(state.len());
                 let mut step = StepId::ZERO;
                 for record in state.values() {
@@ -751,8 +774,8 @@ impl JournalPendingStore {
             })
             .map_err(|e| ActionError::Proof(format!("compact pending journal failed: {e}")))?;
 
-        // Sekvenssikursori osoittamaan tiivistetyn lokin perään (= elävien määrä,
-        // koska rivit uudelleennumeroitiin tiiviisti 0..N).
+        // Point the sequence cursor past the end of the compacted log (= the
+        // live count, since rows were renumbered tightly as 0..N).
         {
             let mut guard = self
                 .next_step
@@ -764,14 +787,15 @@ impl JournalPendingStore {
         Ok(dropped)
     }
 
-    /// Tiivistää lokin **jos** kuolleiden rivien osuus ylittää kynnyksen.
+    /// Compacts the log **if** the fraction of dead rows exceeds the threshold.
     ///
-    /// Laukaisuehto: `auto_compact_factor > 0` JA fyysisiä rivejä on vähintään
-    /// [`AUTO_COMPACT_MIN_ROWS`] JA `rivit > factor * elävät`. Muuten ei tee
-    /// mitään. Kutsutaan lisäyksen ja häädön jälkeen, jotta kuolleet rivit eivät
-    /// kerry rajatta. Auto-tiivistyksen epäonnistuminen **ei** kaada kutsujaa:
-    /// data on jo turvallisesti lokissa, joten tiivistys on pelkkä optimointi —
-    /// virhe niellään (loki vain pysyy tiivistämättömänä tällä kertaa).
+    /// Trigger condition: `auto_compact_factor > 0` AND there are at least
+    /// [`AUTO_COMPACT_MIN_ROWS`] physical rows AND `rows > factor * live`.
+    /// Otherwise does nothing. Called after an insert and after an eviction,
+    /// so dead rows don't accumulate without bound. A failure of
+    /// auto-compaction **does not** fail the caller: the data is already
+    /// safely in the log, so compaction is a pure optimization — the error
+    /// is swallowed (the log just stays uncompacted this time).
     fn maybe_auto_compact(&self) {
         if self.auto_compact_factor == 0 {
             return;
@@ -786,7 +810,7 @@ impl JournalPendingStore {
             return;
         };
         if rows > self.auto_compact_factor.saturating_mul(live) {
-            // Tiivistä; virhe niellään (data on jo lokissa, tiivistys on optimointi).
+            // Compact; the error is swallowed (data is already in the log, compaction is an optimization).
             let _ = self.compact();
         }
     }
@@ -794,8 +818,8 @@ impl JournalPendingStore {
 
 impl PendingApprovalStore for JournalPendingStore {
     fn insert(&self, record: PendingRecord) -> Result<()> {
-        // Kapasiteetti tarkistetaan rekonstruoitua tilaa vasten; uusi tunniste
-        // ei mahdu jos pinta on jo täynnä (olemassa olevan korvaus sallitaan).
+        // Capacity is checked against the reconstructed state; a new id
+        // doesn't fit if the surface is already full (replacing an existing one is allowed).
         let state = self.replay_state()?;
         let id = record.approval_id();
         if !state.contains_key(&id) && !self.capacity.has_room_for_one_more(state.len()) {
@@ -807,7 +831,7 @@ impl PendingApprovalStore for JournalPendingStore {
         let payload = serde_json::to_value(&record)
             .map_err(|e| ActionError::Proof(format!("encode pending record failed: {e}")))?;
         self.append_marker(PENDING_PUT, payload)?;
-        // Korvaus jätti kuolleen rivin (vanha put) → harkitse auto-tiivistystä.
+        // A replacement left a dead row (the old put) → consider auto-compaction.
         self.maybe_auto_compact();
         Ok(())
     }
@@ -819,11 +843,11 @@ impl PendingApprovalStore for JournalPendingStore {
     fn remove(&self, approval_id: ApprovalId) -> Result<Option<PendingRecord>> {
         let existing = self.replay_state()?.remove(&approval_id);
         if existing.is_some() {
-            // Kirjaa tombstone vain jos kirjaus oli olemassa — turha rivi vältetään.
+            // Record a tombstone only if the record existed — avoids a pointless row.
             let payload = serde_json::to_value(approval_id)
                 .map_err(|e| ActionError::Proof(format!("encode pending delete id failed: {e}")))?;
             self.append_marker(PENDING_DELETE, payload)?;
-            // Tombstone on kuollut rivi → harkitse auto-tiivistystä.
+            // A tombstone is a dead row → consider auto-compaction.
             self.maybe_auto_compact();
         }
         Ok(existing)
@@ -850,13 +874,13 @@ impl PendingApprovalStore for JournalPendingStore {
             self.append_marker(PENDING_DELETE, payload)?;
         }
         if !expired.is_empty() {
-            // Häätö tuotti tombstoneja (kuolleita rivejä) → harkitse tiivistystä.
+            // The eviction produced tombstones (dead rows) → consider compaction.
             self.maybe_auto_compact();
         }
         Ok(expired.len())
     }
 
-    /// Kaatumiskestävä pinta: `"journal"`.
+    /// Crash-resistant surface: `"journal"`.
     fn kind(&self) -> &'static str {
         "journal"
     }
@@ -875,7 +899,7 @@ mod tests {
         from_unix_secs(secs).expect("valid unix seconds")
     }
 
-    /// Apuri: payload-sidottu hyväksyntä annetulla TTL:llä.
+    /// Helper: a payload-bound approval with the given TTL.
     fn approval_at(now: Timestamp, ttl: Duration) -> Approval {
         let payload =
             serde_json::to_vec(&serde_json::json!({ "to": "general" })).expect("serialize payload");
@@ -889,7 +913,7 @@ mod tests {
         }
     }
 
-    /// Apuri: odottava kirjaus annetulla TTL:llä.
+    /// Helper: a pending record with the given TTL.
     fn record_at(now: Timestamp, ttl: Duration) -> PendingRecord {
         PendingRecord::new(
             ActionTaskId::new(),
@@ -899,7 +923,7 @@ mod tests {
         )
     }
 
-    /// RAII-temp-tiedosto ilman ulkoisia crateja.
+    /// RAII temp file without external crates.
     struct TempPath(PathBuf);
 
     impl TempPath {
@@ -947,7 +971,7 @@ mod tests {
 
         let removed = store.remove(id).expect("remove ok").expect("was present");
         assert_eq!(removed.approval_id(), id);
-        // Kertakäyttö: poiston jälkeen ei enää löydy.
+        // Single-use: after removal it can no longer be found.
         assert!(store.get(id).expect("get ok").is_none());
         assert!(store.remove(id).expect("remove ok").is_none());
         assert!(store.is_empty().expect("empty"));
@@ -985,7 +1009,7 @@ mod tests {
             .insert(record_at(now, Duration::minutes(60)))
             .expect("second fits");
 
-        // Kolmas ylittää katon → fail-closed.
+        // The third exceeds the cap → fail-closed.
         let err = store
             .insert(record_at(now, Duration::minutes(60)))
             .expect_err("third exceeds cap");
@@ -1001,10 +1025,10 @@ mod tests {
         let id = record.approval_id();
 
         store.insert(record.clone()).expect("first");
-        // Saman tunnisteen uudelleenlisäys ei kasvata kokoa → ei rikota kattoa.
+        // Re-inserting the same id doesn't grow the size → doesn't breach the cap.
         store.insert(record).expect("replace same id under cap");
         assert_eq!(store.len().expect("len"), 1);
-        // Sama tunniste on yhä haettavissa korvauksen jälkeen.
+        // The same id is still retrievable after the replacement.
         assert!(store.get(id).expect("get").is_some());
     }
 
@@ -1015,7 +1039,7 @@ mod tests {
         let store = InMemoryPendingStore::new();
         let now = at(1_700_000_000);
 
-        // Yksi vanhentuu 60s päästä, toinen 3600s päästä.
+        // One expires in 60s, the other in 3600s.
         let short = record_at(now, Duration::seconds(60));
         let long = record_at(now, Duration::seconds(3600));
         let short_id = short.approval_id();
@@ -1023,7 +1047,7 @@ mod tests {
         store.insert(short).expect("insert short");
         store.insert(long).expect("insert long");
 
-        // now + 120s: lyhyt vanhentunut, pitkä ei.
+        // now + 120s: the short one is expired, the long one isn't.
         let evicted = store.evict_expired(at(1_700_000_120)).expect("evict");
         assert_eq!(evicted, 1);
         assert!(store.get(short_id).expect("get").is_none());
@@ -1038,10 +1062,10 @@ mod tests {
         let id = record.approval_id();
         store.insert(record).expect("insert");
 
-        // Tasan expires_at (now+60) EI vanhentunut (sama fail-closed-raja kuin approval.rs).
+        // Exactly expires_at (now+60) is NOT expired (same fail-closed boundary as approval.rs).
         assert_eq!(store.evict_expired(at(1_700_000_060)).expect("evict"), 0);
         assert!(store.get(id).expect("get").is_some());
-        // Yksi sekunti rajan jälkeen → häädetään.
+        // One second past the boundary → evicted.
         assert_eq!(store.evict_expired(at(1_700_000_061)).expect("evict"), 1);
         assert!(store.get(id).expect("get").is_none());
     }
@@ -1057,28 +1081,28 @@ mod tests {
         let task_id = record.task_id;
         let payload_hash = record.approval.payload_hash.clone();
 
-        // Vaihe 1: kirjoita kirjaus pintaan ja PUDOTA se (simuloi kaatuminen).
+        // Step 1: write a record to the surface and DROP it (simulates a crash).
         {
             let store = JournalPendingStore::open(tmp.path()).expect("open 1");
             store.insert(record).expect("insert");
             assert_eq!(store.len().expect("len"), 1);
-        } // store droppataan = prosessi "kaatuu"
+        } // the store is dropped = the process "crashes"
 
-        // Vaihe 2: luo pinta UUDELLEEN samasta tiedostosta — kirjaus säilyi.
+        // Step 2: create the surface AGAIN from the same file — the record survived.
         let resumed = JournalPendingStore::open(tmp.path()).expect("open 2");
         assert_eq!(resumed.len().expect("len"), 1, "pending survived restart");
         let got = resumed.get(id).expect("get").expect("still present");
         assert_eq!(got.approval_id(), id);
         assert_eq!(got.task_id, task_id);
-        // Payload-sidonta säilyi: tiiviste on yhä sama (approve voi kuluttaa).
+        // Payload binding survived: the hash is still the same (approve can consume it).
         assert_eq!(got.approval.payload_hash, payload_hash);
         assert!(!got.approval.consumed, "not yet consumed → approvable");
 
-        // Approvable: poisto kuluttaa sen pysyvästi.
+        // Approvable: removal consumes it permanently.
         let removed = resumed.remove(id).expect("remove").expect("present");
         assert_eq!(removed.approval_id(), id);
 
-        // Vaihe 3: vielä yksi restart — poisto myös säilyi (tombstone).
+        // Step 3: one more restart — the removal also survived (tombstone).
         let after_remove = JournalPendingStore::open(tmp.path()).expect("open 3");
         assert!(after_remove.get(id).expect("get").is_none());
         assert!(after_remove.is_empty().expect("empty"));
@@ -1089,8 +1113,8 @@ mod tests {
         let tmp = TempPath::new("no-secret");
         let now = at(1_700_000_000);
 
-        // Rakenna kirjaus jonka payload SISÄLSI salaisuuden — mutta vain tiiviste
-        // tallennetaan, ei raakaa arvoa.
+        // Build a record whose payload CONTAINED a secret — but only the hash
+        // is stored, not the raw value.
         let secret = format!("sk-{}", "live".repeat(4));
         let payload =
             serde_json::to_vec(&serde_json::json!({ "api_key": secret })).expect("serialize");
@@ -1112,14 +1136,14 @@ mod tests {
         let store = JournalPendingStore::open(tmp.path()).expect("open");
         store.insert(record).expect("insert");
 
-        // Levyltä luettu raakateksti EI saa sisältää salaisuutta.
+        // The raw text read from disk must NOT contain the secret.
         let on_disk = std::fs::read_to_string(tmp.path()).expect("read journal file");
         assert!(
             !on_disk.contains(&secret),
             "persisted journal must never contain the raw secret"
         );
         assert!(!on_disk.contains("sk-livelivelivelive"));
-        // Mutta tiiviste ON läsnä (payload-sidonta säilyy).
+        // But the hash IS present (payload binding is preserved).
         assert!(on_disk.contains(&sha256_hex(&payload)));
     }
 
@@ -1156,7 +1180,7 @@ mod tests {
             let evicted = store.evict_expired(at(1_700_000_120)).expect("evict");
             assert_eq!(evicted, 1);
         }
-        // Restart: häätö säilyi.
+        // Restart: the eviction persisted.
         let resumed = JournalPendingStore::open(tmp.path()).expect("open 2");
         assert!(resumed.get(short_id).expect("get").is_none());
         assert!(resumed.get(long_id).expect("get").is_some());
@@ -1165,7 +1189,7 @@ mod tests {
 
     // ---- Compaction ----
 
-    /// Laskee fyysiset (eläviä + kuolleita) journal-rivit lukemalla tiedoston.
+    /// Counts physical (live + dead) journal rows by reading the file.
     fn physical_rows(path: &Path) -> usize {
         std::fs::read_to_string(path)
             .map_or(0, |s| s.lines().filter(|l| !l.trim().is_empty()).count())
@@ -1175,26 +1199,26 @@ mod tests {
     fn compact_drops_dead_rows_keeps_live_entries() {
         let tmp = TempPath::new("compact-basic");
         let now = at(1_700_000_000);
-        // Auto-tiivistys pois päältä, jotta hallitaan tiivistys käsin.
+        // Auto-compaction turned off, so compaction is controlled manually.
         let store = JournalPendingStore::open(tmp.path())
             .expect("open")
             .with_auto_compact_factor(0);
 
-        // Kirjaa N kirjausta, poista puolet → kuolleita rivejä kertyy.
+        // Insert N records, remove half → dead rows accumulate.
         let mut ids = Vec::new();
         for _ in 0..10 {
             let record = record_at(now, Duration::minutes(60));
             ids.push(record.approval_id());
             store.insert(record).expect("insert");
         }
-        // Poista ensimmäiset 5 (10 put + 5 delete = 15 fyysistä riviä).
+        // Remove the first 5 (10 put + 5 delete = 15 physical rows).
         for id in ids.iter().take(5) {
             store.remove(*id).expect("remove");
         }
         assert_eq!(physical_rows(tmp.path()), 15, "10 put + 5 tombstone");
         assert_eq!(store.len().expect("len"), 5, "5 live remain");
 
-        // Tiivistä: 10 kuollutta riviä (5 poistettua put + 5 tombstone) pudotetaan.
+        // Compact: 10 dead rows (5 removed puts + 5 tombstones) are dropped.
         let dropped = store.compact().expect("compact");
         assert_eq!(dropped, 10, "15 rows → 5 live rows = 10 dropped");
         assert_eq!(
@@ -1204,7 +1228,7 @@ mod tests {
         );
         assert_eq!(store.len().expect("len"), 5, "live count unchanged");
 
-        // Kaikki elävät kirjaukset yhä haettavissa, poistetut eivät.
+        // All live records are still retrievable, removed ones aren't.
         for id in ids.iter().take(5) {
             assert!(store.get(*id).expect("get").is_none(), "removed gone");
         }
@@ -1228,7 +1252,7 @@ mod tests {
                 ids.push(record.approval_id());
                 store.insert(record).expect("insert");
             }
-            // Poista kolme.
+            // Remove three.
             for id in ids.iter().take(3) {
                 store.remove(*id).expect("remove");
             }
@@ -1236,7 +1260,7 @@ mod tests {
             ids
         };
 
-        // Restart pelkästä tiivistetystä tiedostosta → identtinen tila.
+        // Restart from just the compacted file → identical state.
         let resumed = JournalPendingStore::open(tmp.path()).expect("open 2");
         assert_eq!(
             resumed.len().expect("len"),
@@ -1252,15 +1276,15 @@ mod tests {
         for id in live_ids.iter().skip(3) {
             assert!(resumed.get(*id).expect("get").is_some(), "live stay live");
         }
-        // Vain elävät rivit levyllä.
+        // Only live rows on disk.
         assert_eq!(physical_rows(tmp.path()), 3);
     }
 
     #[test]
     fn compact_is_atomic_temp_then_rename() {
-        // Tiivistys EI saa jättää temp-tiedostoa lojumaan eikä turmella elävää
-        // tiedostoa: rewrite kirjoittaa temppiin, fsyncaa, ja vasta sitten
-        // nimeää atomisesti. Jokainen rivi tiivistyksen jälkeen on ehjä JSON.
+        // Compaction must NOT leave a temp file lying around nor corrupt the live
+        // file: rewrite writes to a temp file, fsyncs, and only then renames
+        // atomically. Every row after compaction is intact JSON.
         let tmp = TempPath::new("compact-atomic");
         let now = at(1_700_000_000);
         let store = JournalPendingStore::open(tmp.path())
@@ -1276,23 +1300,23 @@ mod tests {
         for id in &ids {
             store.remove(*id).expect("remove");
         }
-        // Lisää yksi elävä takaisin.
+        // Add one live record back.
         let live = record_at(now, Duration::minutes(60));
         let live_id = live.approval_id();
         store.insert(live).expect("insert live");
 
         store.compact().expect("compact");
 
-        // Jokainen levyllä oleva rivi jäsentyy ehjäksi (ei puolikasta renamesta).
+        // Every row on disk parses as intact (no half-written row from renaming).
         let on_disk = std::fs::read_to_string(tmp.path()).expect("read");
         for line in on_disk.lines().filter(|l| !l.trim().is_empty()) {
             serde_json::from_str::<JournalEntry>(line).expect("intact json line");
         }
-        // Vain elävä kirjaus jäljellä, haettavissa.
+        // Only the live record remains, retrievable.
         assert_eq!(store.len().expect("len"), 1);
         assert!(store.get(live_id).expect("get").is_some());
 
-        // Ei orpoa temp-tiedostoa tämän lokin nimellä.
+        // No orphaned temp file under this log's name.
         let dir = tmp.path().parent().expect("parent");
         let own = tmp
             .path()
@@ -1311,9 +1335,9 @@ mod tests {
 
     #[test]
     fn compact_drops_expired_entries() {
-        // Tiivistys EI itse häädä vanhentuneita, mutta evict_expired tombstonaa
-        // ne ja sitä seuraava tiivistys pudottaa sekä tombstonet että kuolleet
-        // put-rivit — joten vanhentuneet katoavat levyltä tiivistyksessä.
+        // Compaction itself does NOT evict expired records, but evict_expired
+        // tombstones them and a subsequent compaction drops both the tombstones
+        // and the dead put rows — so expired records disappear from disk on compaction.
         let tmp = TempPath::new("compact-expired");
         let now = at(1_700_000_000);
         let store = JournalPendingStore::open(tmp.path())
@@ -1327,15 +1351,15 @@ mod tests {
         store.insert(short).expect("insert short");
         store.insert(long).expect("insert long");
 
-        // Häädä vanhentunut → tombstone. Sitten tiivistä.
+        // Evict the expired one → tombstone. Then compact.
         assert_eq!(store.evict_expired(at(1_700_000_120)).expect("evict"), 1);
         store.compact().expect("compact");
 
-        // Vanhentunut on poissa sekä tilasta että levyltä; voimassa oleva säilyy.
+        // The expired one is gone from both state and disk; the valid one survives.
         assert!(store.get(short_id).expect("get").is_none());
         assert!(store.get(long_id).expect("get").is_some());
         assert_eq!(physical_rows(tmp.path()), 1, "only the live entry remains");
-        // Vanhentuneen tiivistetiiviste/tunniste ei näy enää levyllä.
+        // The expired record's hash/id no longer appears on disk.
         let on_disk = std::fs::read_to_string(tmp.path()).expect("read");
         assert!(
             !on_disk.contains(&short_id.to_string()),
@@ -1345,20 +1369,20 @@ mod tests {
 
     #[test]
     fn auto_compact_triggers_when_dead_rows_exceed_threshold() {
-        // Oletuskerroin (2) + insert/remove-sykli kasvattaa kuolleita rivejä,
-        // kunnes auto-tiivistys laukeaa ja kutistaa lokin elävän tilan tasolle.
+        // The default factor (2) + an insert/remove cycle grows dead rows,
+        // until auto-compaction triggers and shrinks the log to the live state's size.
         let tmp = TempPath::new("auto-compact");
         let now = at(1_700_000_000);
         let store = JournalPendingStore::open(tmp.path()).expect("open"); // default factor
 
-        // Pidä vain muutama elävä, mutta tee paljon insert/remove-pareja → kun
-        // fyysisiä rivejä > 2*elävät JA >= AUTO_COMPACT_MIN_ROWS, tiivistys laukeaa.
-        // Yksi pysyvä elävä:
+        // Keep only a few live, but do many insert/remove pairs → once
+        // physical rows > 2*live AND >= AUTO_COMPACT_MIN_ROWS, compaction triggers.
+        // One permanent live record:
         let keeper = record_at(now, Duration::minutes(60));
         let keeper_id = keeper.approval_id();
         store.insert(keeper).expect("insert keeper");
 
-        // 100 insert+remove paria = 200 kuollutta riviä jos ei tiivistystä.
+        // 100 insert+remove pairs = 200 dead rows if there were no compaction.
         for _ in 0..100 {
             let r = record_at(now, Duration::minutes(60));
             let id = r.approval_id();
@@ -1366,13 +1390,13 @@ mod tests {
             store.remove(id).expect("remove churn");
         }
 
-        // Auto-tiivistyksen ansiosta fyysisiä rivejä on PALJON vähemmän kuin 201.
+        // Thanks to auto-compaction, physical rows are FAR fewer than 201.
         let rows = physical_rows(tmp.path());
         assert!(
             rows < 50,
             "auto-compaction should keep the log small, got {rows} rows"
         );
-        // Elävä keeper säilyi koko ajan.
+        // The live keeper survived throughout.
         assert!(store.get(keeper_id).expect("get").is_some());
         assert_eq!(store.len().expect("len"), 1);
     }
@@ -1386,15 +1410,16 @@ mod tests {
         assert_eq!(physical_rows(tmp.path()), 0);
     }
 
-    /// TOCTOU-aukon sulkemisen regressio: tiivistys lukee tilan ja kirjoittaa
-    /// lokin uudelleen **saman file-lukon alla** ([`FileJournal::compact_with`]),
-    /// joten rinnakkainen lisäys ei voi laskeutua aukkoon ja kadota. Tässä ei aja
-    /// oikeaa rinnakkaisuutta (race on epädeterministinen) — todistetaan sen
-    /// sijaan rakenteesta seuraava havaittava invariantti: tiivistyksen PALUUN
-    /// JÄLKEEN tehty lisäys laskeutuu tiivistettyjen elävien rivien PERÄÄN, ja
-    /// uudelleenlataus tuottaa täsmälleen oikean tilan (sekä tiivistetyt elävät
-    /// ETTÄ tiivistyksen jälkeen lisätty). Concurrent-append-turvallisuus seuraa
-    /// nyt yhden-lukon-pidosta, ei vapaaehtoisesta ajoituksesta.
+    /// Regression test for closing the TOCTOU gap: compaction reads the
+    /// state and rewrites the log **under the same file lock**
+    /// ([`FileJournal::compact_with`]), so a concurrent insert cannot land
+    /// in the gap and be lost. This test does not run real concurrency (the
+    /// race is nondeterministic) — instead it proves the observable
+    /// invariant that follows from the structure: an insert made AFTER
+    /// compaction RETURNS lands AFTER the compacted live rows, and a reload
+    /// produces exactly the correct state (both the compacted live rows AND
+    /// the one inserted after compaction). Concurrent-append safety now
+    /// follows from holding a single lock, not from lucky timing.
     #[test]
     fn compact_then_append_does_not_lose_post_compact_insert() {
         let tmp = TempPath::new("compact-toctou");
@@ -1403,7 +1428,7 @@ mod tests {
             .expect("open")
             .with_auto_compact_factor(0);
 
-        // Kuusi lisäystä, poista kolme → kuolleita rivejä kertyy.
+        // Six inserts, remove three → dead rows accumulate.
         let mut ids = Vec::new();
         for _ in 0..6 {
             let record = record_at(now, Duration::minutes(60));
@@ -1415,7 +1440,7 @@ mod tests {
         }
         assert_eq!(store.len().expect("len"), 3, "3 live before compact");
 
-        // Tiivistä (atominen, yhden lukon alla).
+        // Compact (atomic, under a single lock).
         let dropped = store.compact().expect("compact");
         assert_eq!(
             dropped, 6,
@@ -1423,7 +1448,7 @@ mod tests {
         );
         assert_eq!(physical_rows(tmp.path()), 3, "only live rows after compact");
 
-        // Tiivistyksen JÄLKEEN lisätty kirjaus laskeutuu elävien PERÄÄN (ei katoa).
+        // A record inserted AFTER compaction lands AFTER the live ones (not lost).
         let post = record_at(now, Duration::minutes(60));
         let post_id = post.approval_id();
         store.insert(post).expect("insert after compact");
@@ -1433,8 +1458,8 @@ mod tests {
             "post-compact insert present"
         );
 
-        // Uudelleenlataus tuottaa TÄSMÄLLEEN oikean tilan: tiivistetyt elävät +
-        // tiivistyksen jälkeen lisätty; poistetut pysyvät poissa.
+        // A reload produces EXACTLY the correct state: the compacted live rows +
+        // the one inserted after compaction; removed ones stay removed.
         let resumed = JournalPendingStore::open(tmp.path()).expect("reopen");
         assert_eq!(resumed.len().expect("len"), 4);
         for id in ids.iter().take(3) {
@@ -1461,7 +1486,7 @@ mod tests {
 
         limiter.check_and_record("being-a", now).expect("first");
         limiter.check_and_record("being-a", now).expect("second");
-        // Kolmas ikkunassa → estetään.
+        // The third in the window → blocked.
         let err = limiter
             .check_and_record("being-a", now)
             .expect_err("third denied");
@@ -1476,11 +1501,11 @@ mod tests {
         limiter
             .check_and_record("being-a", now)
             .expect("being-a first");
-        // Eri olento → oma kiintiö.
+        // A different being → its own quota.
         limiter
             .check_and_record("being-b", now)
             .expect("being-b first");
-        // being-a jo täynnä.
+        // being-a's quota is already exhausted.
         assert!(limiter.check_and_record("being-a", now).is_err());
     }
 
@@ -1490,7 +1515,7 @@ mod tests {
         let now = at(1_700_000_000);
         limiter.check_and_record("being-a", now).expect("first");
         assert!(limiter.check_and_record("being-a", now).is_err());
-        // Ikkunan jälkeen (now + 61s) vanha kirjaus häätyy → tilaa taas.
+        // After the window (now + 61s) the old record is evicted → room again.
         limiter
             .check_and_record("being-a", at(1_700_000_061))
             .expect("after window slides");

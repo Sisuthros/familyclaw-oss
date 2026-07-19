@@ -1,9 +1,9 @@
-//! Skill-rekisteri: taitojen rekisteröinti, haku tunnisteella ja luettelointi
-//! (KERROS A). Vain mock-taitoja — ei oikeita Gmail-/GitHub-verkkokutsuja.
+//! Skill registry: skill registration, lookup by identifier, and listing
+//! (Layer A). Mock skills only — no real Gmail/GitHub network calls.
 //!
-//! Rekisteri säilyttää validoidut [`SkillManifest`]-manifestit tunnisteen
-//! ([`SkillId`]) mukaan indeksoituna. Rekisteröinti validoi manifestin ennen
-//! tallennusta ja hylkää duplikaattitunnisteet.
+//! The registry stores validated [`SkillManifest`] manifests indexed by
+//! identifier ([`SkillId`]). Registration validates the manifest before
+//! storing it and rejects duplicate identifiers.
 
 use std::collections::HashMap;
 
@@ -11,42 +11,43 @@ use crate::error::{ActionError, Result};
 use crate::ids::SkillId;
 use crate::manifest::SkillManifest;
 
-/// Moduulin valmiusaste (luuranko-yhteensopivuus).
+/// Module readiness level (scaffold compatibility).
 ///
-/// Säilytetään, jotta [`crate::all_modules_scaffolded`] kääntyy edelleen.
+/// Kept so that [`crate::all_modules_scaffolded`] still compiles.
 pub(crate) const SCAFFOLDED: bool = true;
 
-/// In-memory-rekisteri rekisteröidyille taidoille.
+/// In-memory registry for registered skills.
 ///
-/// Indeksoi manifestit tunnisteella nopeaa hakua varten. Rekisteri ei tee
-/// verkkokutsuja eikä lue levyä — se on puhdas tietorakenne.
+/// Indexes manifests by identifier for fast lookup. The registry makes no
+/// network calls and does not read disk — it is a pure data structure.
 #[derive(Debug, Clone, Default)]
 pub struct SkillRegistry {
-    /// Tunniste → manifesti -kartta.
+    /// Identifier → manifest map.
     map: HashMap<SkillId, SkillManifest>,
 }
 
 impl SkillRegistry {
-    /// Luo uuden tyhjän rekisterin.
+    /// Creates a new, empty registry.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Rekisteröi taidon manifestin.
+    /// Registers a skill's manifest.
     ///
-    /// Manifesti validoidaan ([`SkillManifest::validate`]) ennen tallennusta,
-    /// ja saman tunnisteen kaksinkertainen rekisteröinti hylätään.
+    /// The manifest is validated ([`SkillManifest::validate`]) before
+    /// storing, and a duplicate registration of the same identifier is
+    /// rejected.
     ///
     /// # Errors
-    /// - Manifestin validoinnin virhe (esim. salaisuus, kelvoton tunniste,
-    ///   `write_external` ilman hyväksyntää).
-    /// - [`ActionError::ManifestValidation`] jos sama tunniste on jo rekisterissä.
+    /// - A manifest validation error (e.g. a secret, an invalid identifier,
+    ///   `write_external` without approval).
+    /// - [`ActionError::ManifestValidation`] if the same identifier is already in the registry.
     pub fn register(&mut self, manifest: SkillManifest) -> Result<()> {
         manifest.validate()?;
         if self.map.contains_key(&manifest.id) {
             return Err(ActionError::ManifestValidation(format!(
-                "taito {} on jo rekisteröity (duplikaatti)",
+                "skill {} is already registered (duplicate)",
                 manifest.id
             )));
         }
@@ -54,31 +55,31 @@ impl SkillRegistry {
         Ok(())
     }
 
-    /// Hakee taidon manifestin tunnisteella; `None` jos ei löydy.
+    /// Looks up a skill's manifest by identifier; `None` if not found.
     #[must_use]
     pub fn get(&self, id: &SkillId) -> Option<&SkillManifest> {
         self.map.get(id)
     }
 
-    /// Onko annetun tunnisteen taito rekisterissä.
+    /// Whether the skill with the given identifier is in the registry.
     #[must_use]
     pub fn contains(&self, id: &SkillId) -> bool {
         self.map.contains_key(id)
     }
 
-    /// Luettelee kaikki rekisteröidyt manifestit (järjestys määrittelemätön).
+    /// Lists all registered manifests (order unspecified).
     #[must_use]
     pub fn list(&self) -> Vec<&SkillManifest> {
         self.map.values().collect()
     }
 
-    /// Rekisteröityjen taitojen lukumäärä.
+    /// Number of registered skills.
     #[must_use]
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
-    /// Onko rekisteri tyhjä.
+    /// Whether the registry is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
@@ -90,7 +91,7 @@ mod tests {
     use super::*;
     use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 
-    /// Apuri: kelvollinen mock-manifesti annetulla tunnisteella.
+    /// Helper: a valid mock manifest with the given identifier.
     fn manifest_with(id: SkillId) -> SkillManifest {
         SkillManifest {
             id,
@@ -150,10 +151,11 @@ mod tests {
         assert!(!reg.contains(&SkillId::new()));
     }
 
-    /// INVARIANT (adversarial): rahaa käyttävä taito jonka manifesti yrittää
-    /// merkitä riskinsä auto-ajettavaksi (`read_only` + `auto_if_read_only`) EI saa
-    /// päästä rekisteriin. Tämä on portti joka estää putkea koskaan johtamasta
-    /// `required_approval == AutoRun` rahankäytölle.
+    /// INVARIANT (adversarial): a money-spending skill whose manifest tries
+    /// to tag its risk as auto-runnable (`read_only` + `auto_if_read_only`)
+    /// must NOT be allowed into the registry. This is the gate that prevents
+    /// the pipeline from ever deriving `required_approval == AutoRun` for
+    /// spending money.
     #[test]
     fn registry_rejects_spend_money_skill_disguised_as_auto_run() {
         let mut reg = SkillRegistry::new();
@@ -163,7 +165,7 @@ mod tests {
             version: "1.0.0".to_string(),
             description: "Maksaa laskun (yrittää ajaa ilman hyväksyntää).".to_string(),
             permissions: vec![SkillPermission::SpendMoney],
-            // Hyökkäys: merkitse rahankäyttö lukutoiminnoksi + auto-käytäntö.
+            // Attack: tag spending money as a read operation + auto policy.
             risk: ActionRisk::ReadOnly,
             approval_policy: ApprovalPolicy::AutoIfReadOnly,
             input_hint: None,

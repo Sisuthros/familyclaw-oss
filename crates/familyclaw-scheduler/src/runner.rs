@@ -1,18 +1,18 @@
-//! [`SchedulerRunner`]: ohut asynkroninen tikkisilmukka — **ainoa** osa joka
-//! koskettaa oikeaa aikaa.
+//! [`SchedulerRunner`]: a thin asynchronous tick loop — the **only** part
+//! that touches real time.
 //!
-//! Runner herää kiinteällä välillä ([`tokio::time::interval`]), kutsuu
-//! ajastimen puhdasta erääntymislogiikkaa **oikealla nykyhetkellä** ja lähettää
-//! erääntyneet tehtävät idempotentisti ([`Scheduler::tick`]). Päätöslogiikka
-//! pysyy puhtaana ja testattavana ilman oikeaa aikaa — runner vain syöttää sille
-//! kellon.
+//! The runner wakes up at a fixed interval ([`tokio::time::interval`]),
+//! calls the scheduler's pure due-checking logic with the **real current
+//! time**, and dispatches due tasks idempotently ([`Scheduler::tick`]). The
+//! decision logic stays pure and testable without real time — the runner
+//! just feeds it the clock.
 //!
-//! ## Peruutettavuus (kill switch)
-//! Silmukka pysähtyy siististi kun [`CancellationSignal`] laukaistaan
-//! (`cancel()`-kutsu **tai** sen pudottaminen). Toteutus käyttää
-//! [`tokio::sync::watch`]-kanavaa: lähettäjän pudottaminen sulkee kanavan ja
-//! silmukka näkee sen → pysähtyy. Näin sekä eksplisiittinen sammutussignaali
-//! että kahvan pudottaminen lopettavat ajastimen.
+//! ## Cancellation (kill switch)
+//! The loop stops cleanly when [`CancellationSignal`] is triggered (a
+//! `cancel()` call **or** dropping it). The implementation uses a
+//! [`tokio::sync::watch`] channel: dropping the sender closes the channel
+//! and the loop observes it -> stops. This way both an explicit shutdown
+//! signal and dropping the handle stop the scheduler.
 
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -23,59 +23,61 @@ use tokio::sync::{watch, Mutex};
 
 use crate::dispatch::Scheduler;
 
-/// Jaettu kahva ajastimeen ajon aikana (perhe-agency operaattoripinnalle).
+/// Shared handle to the scheduler while it's running (family-agency
+/// operator surface).
 ///
-/// [`SchedulerRunner::run_shared`] palauttaa tämän, jotta tikkisilmukan rinnalla
-/// esim. gateway voi kytkeä tehtäviä päälle/pois
-/// ([`Scheduler::set_task_enabled`]). Lukko otetaan **lyhyesti** sekä tikissä
-/// (per erääntymisarvio) että operaattorimutaatiossa — ei pitkiä pitoja.
+/// [`SchedulerRunner::run_shared`] returns this so that, alongside the tick
+/// loop, e.g. a gateway can toggle tasks on/off
+/// ([`Scheduler::set_task_enabled`]). The lock is held **briefly** both in
+/// the tick (per due-check) and in an operator mutation — never for long.
 pub type SchedulerHandle = Arc<Mutex<Scheduler>>;
 
-/// Peruutussignaali ajastinsilmukalle (kill switch).
+/// Cancellation signal for the scheduler loop (kill switch).
 ///
-/// Säilytä tämä kahva ajastimen ulkopuolella. [`CancellationSignal::cancel`]
-/// (tai kahvan pudottaminen) pysäyttää silmukan siististi seuraavalla tikillä
-/// tai välittömästi jos se odottaa.
+/// Keep this handle outside the scheduler. [`CancellationSignal::cancel`]
+/// (or dropping the handle) stops the loop cleanly on the next tick, or
+/// immediately if it's waiting.
 #[derive(Debug)]
 pub struct CancellationSignal {
     tx: watch::Sender<bool>,
 }
 
 impl CancellationSignal {
-    /// Pyytää silmukkaa pysähtymään.
+    /// Requests that the loop stop.
     ///
-    /// Idempotentti: useampi kutsu on turvallinen. Vaikutus on sama kuin
-    /// kahvan pudottaminen.
+    /// Idempotent: calling it more than once is safe. The effect is the
+    /// same as dropping the handle.
     pub fn cancel(&self) {
-        // Lähetysvirhe tarkoittaa että vastaanottaja on jo pudonnut (silmukka
-        // lopetti) — silloin ei ole mitään pysäytettävää.
+        // A send error means the receiver has already been dropped (the
+        // loop has already stopped) — in that case there's nothing to stop.
         let _ = self.tx.send(true);
     }
 }
 
-/// Sisäinen peruutuksen vastaanottopää, jonka silmukka pollaa.
+/// Internal cancellation receiver that the loop polls.
 #[derive(Debug, Clone)]
 struct CancellationToken {
     rx: watch::Receiver<bool>,
 }
 
 impl CancellationToken {
-    /// Onko peruutusta pyydetty (joko `cancel()` tai lähettäjä pudonnut).
+    /// Whether cancellation has been requested (either `cancel()` or the
+    /// sender was dropped).
     fn is_cancelled(&self) -> bool {
-        // Suljettu kanava (lähettäjä pudonnut) ⇒ peruutettu. Muuten lue lippu.
+        // A closed channel (sender dropped) => cancelled. Otherwise read the flag.
         if self.rx.has_changed().is_err() {
             return true;
         }
         *self.rx.borrow()
     }
 
-    /// Odottaa kunnes peruutus laukeaa (lippu tai kanavan sulkeutuminen).
+    /// Waits until cancellation is triggered (flag set or channel closed).
     async fn cancelled(&mut self) {
         loop {
             if *self.rx.borrow() {
                 return;
             }
-            // `changed()` palauttaa Err kun lähettäjä on pudonnut → peruutettu.
+            // `changed()` returns Err once the sender is dropped -> cancelled.
             if self.rx.changed().await.is_err() {
                 return;
             }
@@ -83,18 +85,18 @@ impl CancellationToken {
     }
 }
 
-/// Luo peruutussignaali–token-parin.
+/// Creates a cancellation signal-token pair.
 #[must_use]
 fn cancellation_pair() -> (CancellationSignal, CancellationToken) {
     let (tx, rx) = watch::channel(false);
     (CancellationSignal { tx }, CancellationToken { rx })
 }
 
-/// Asynkroninen ajastinsilmukka jonka voi peruuttaa.
+/// An asynchronous, cancellable scheduler loop.
 ///
-/// Runner omistaa [`Scheduler`]:n ja [`ActionRuntime`]:n ajon ajan ja tikittää
-/// niitä kiinteällä välillä. Aloita ajo [`SchedulerRunner::run`]:lla; se palaa
-/// vasta kun silmukka peruutetaan.
+/// The runner owns the [`Scheduler`] and [`ActionRuntime`] for the duration
+/// of the run and ticks them at a fixed interval. Start the run with
+/// [`SchedulerRunner::run`]; it returns only once the loop is cancelled.
 #[derive(Debug)]
 pub struct SchedulerRunner {
     scheduler: Scheduler,
@@ -103,13 +105,13 @@ pub struct SchedulerRunner {
 }
 
 impl SchedulerRunner {
-    /// Luo runnerin annetulla ajastimella, toimintoajoympäristöllä ja
-    /// tikkivälillä.
+    /// Creates a runner with the given scheduler, action runtime, and tick
+    /// period.
     ///
-    /// `period` on **runnerin** herätysväli (kuinka usein erääntymistä
-    /// arvioidaan) — eri asia kuin yksittäisen tehtävän intervalli. Pidä se
-    /// pienempänä tai yhtä suurena kuin lyhin tehtäväintervalli, jotta
-    /// erääntymiset huomataan ajoissa.
+    /// `period` is the **runner's** wake-up interval (how often due-checking
+    /// is evaluated) — distinct from any individual task's interval. Keep it
+    /// smaller than or equal to the shortest task interval so due tasks are
+    /// noticed in time.
     #[must_use]
     pub fn new(scheduler: Scheduler, runtime: ActionRuntime, period: StdDuration) -> Self {
         Self {
@@ -119,20 +121,21 @@ impl SchedulerRunner {
         }
     }
 
-    /// Ajaa tikkisilmukkaa kunnes `cancel` laukeaa.
+    /// Runs the tick loop until `cancel` is triggered.
     ///
-    /// Palauttaa peruutussignaalin (kill switch) jonka kautta silmukka
-    /// pysäytetään. `now_fn` injektoi nykyhetken **tikin sisällä** — tuotannossa
-    /// [`familyclaw_core::time::now`], testissä ohjattava kello. Silmukka itse
-    /// käyttää oikeaa aikaa vain [`tokio::time::interval`]:n kautta; mitä
-    /// *kelloa* tehtäthe operator annetaan, tulee `now_fn`:stä, joten erääntymislogiikka
-    /// pysyy testattavana.
+    /// Returns the cancellation signal (kill switch) used to stop the loop.
+    /// `now_fn` injects the current time **inside the tick** — in
+    /// production, [`familyclaw_core::time::now`]; in tests, a controllable
+    /// clock. The loop itself only touches real time via
+    /// [`tokio::time::interval`]; whatever *clock* is handed to tasks comes
+    /// from `now_fn`, so the due-checking logic stays testable.
     ///
-    /// Lähetysvirheet ([`Scheduler::tick`]) lokitetaan ja silmukka **jatkaa** —
-    /// yhden tehtävän ohimenevä virhe ei kaada koko ajastinta.
+    /// Dispatch errors ([`Scheduler::tick`]) are logged and the loop
+    /// **continues** — a transient error in one task doesn't bring down the
+    /// whole scheduler.
     ///
-    /// Vaatii että kutsutaan Tokio-ajoympäristön sisältä
-    /// ([`tokio::spawn`]:ia varten).
+    /// Requires being called from within a Tokio runtime (for
+    /// [`tokio::spawn`]).
     pub fn run<F>(self, now_fn: F) -> CancellationSignal
     where
         F: Fn() -> Timestamp + Send + 'static,
@@ -157,7 +160,7 @@ impl SchedulerRunner {
                         }
                         let now = now_fn();
                         if let Err(error) = scheduler.tick(&mut runtime, now).await {
-                            tracing::warn!(%error, "ajastimen tikki epäonnistui — jatketaan");
+                            tracing::warn!(%error, "scheduler tick failed — continuing");
                         }
                     }
                 }
@@ -167,32 +170,33 @@ impl SchedulerRunner {
         signal
     }
 
-    /// Kuten [`run`](Self::run), mutta palauttaa myös **jaetun kahvan** ajastimeen
-    /// ([`SchedulerHandle`]) operaattoripinnalle (perhe-agency, Phase 4).
+    /// Like [`run`](Self::run), but also returns a **shared handle** to the
+    /// scheduler ([`SchedulerHandle`]) for the operator surface
+    /// (family-agency, Phase 4).
     ///
-    /// Ajastin laitetaan `Arc<Mutex<Scheduler>>`:n taakse, ja palautettu kahva
-    /// sallii esim. gatewayn kytkeä tehtäviä päälle/pois
-    /// ([`Scheduler::set_task_enabled`]) saman lukon kautta.
+    /// The scheduler is placed behind an `Arc<Mutex<Scheduler>>`, and the
+    /// returned handle lets e.g. a gateway toggle tasks on/off
+    /// ([`Scheduler::set_task_enabled`]) through the same lock.
     ///
-    /// ## Lukkoa EI pidetä lähetyksen (`await`) yli
-    /// Jokainen tikki tekee kolme vaihetta: **(1)** ottaa lukon **vain hetkeksi**
-    /// ja kerää erääntyneet lähetysohjeet ([`Scheduler::collect_due`], puhdas, ei
-    /// `await`), **(2)** vapauttaa lukon ja ajaa idempotentit lähetykset
-    /// ([`ActionRuntime::submit_task_idempotent`]) **ilman lukkoa**, **(3)** ottaa
-    /// lukon taas lyhyesti kirjatakseen `last_fired`:n onnistuneille
-    /// ([`Scheduler::record_fired`]). Näin pitkä lähetys-I/O **ei** estä
-    /// operaattoripinnan mutaatioita (pause/resume/kill-switch) — ne mahtuvat
-    /// väliin vaiheiden 2 aikana, kun lukko on vapaana. Aiemmin lukko pidettiin
-    /// koko `tick().await`:n yli, jolloin gateway-komennot jonottivat hitaan
-    /// tikin taakse.
+    /// ## The lock is NOT held across dispatch (`await`)
+    /// Each tick does three steps: **(1)** takes the lock **only briefly**
+    /// and collects due dispatch instructions ([`Scheduler::collect_due`],
+    /// pure, no `await`), **(2)** releases the lock and runs idempotent
+    /// dispatches ([`ActionRuntime::submit_task_idempotent`]) **without the
+    /// lock**, **(3)** briefly reacquires the lock to record `last_fired`
+    /// for successful firings ([`Scheduler::record_fired`]). This way, long
+    /// dispatch I/O **doesn't** block operator-surface mutations
+    /// (pause/resume/kill switch) — they fit in during step 2, while the
+    /// lock is free. Previously the lock was held across the entire
+    /// `tick().await`, which queued gateway commands behind a slow tick.
     ///
-    /// Erääntymispäätös pysyy oikeana: avain ([`crate::decision::firing_key`]) on
-    /// vakaa intervalli-ikkunan sisällä ja lähetys on idempotentti, joten vaikka
-    /// tehtävä kytkettäisiin pois lähetyksen aikana, jo aloitettu laukaisu menee
-    /// loppuun korkeintaan kerran eikä `last_fired`-kirjaus riko seuraavaa
-    /// ikkunaa.
+    /// The due decision stays correct: the key
+    /// ([`crate::decision::firing_key`]) is stable within an interval
+    /// window and dispatch is idempotent, so even if a task were disabled
+    /// during dispatch, a firing already in progress completes at most
+    /// once, and the `last_fired` record doesn't corrupt the next window.
     ///
-    /// Vaatii Tokio-ajoympäristön ([`tokio::spawn`]).
+    /// Requires a Tokio runtime ([`tokio::spawn`]).
     pub fn run_shared<F>(self, now_fn: F) -> (CancellationSignal, SchedulerHandle)
     where
         F: Fn() -> Timestamp + Send + 'static,
@@ -218,15 +222,15 @@ impl SchedulerRunner {
                         }
                         let now = now_fn();
 
-                        // (1) Lukko vain päätöksen ajaksi: kerää erääntyneet
-                        //     lähetysohjeet (puhdas, ei await) ja vapauta lukko.
+                        // (1) Lock held only for the decision: collect due
+                        //     dispatch instructions (pure, no await) and release the lock.
                         let due = {
                             let sched = loop_handle.lock().await;
                             sched.collect_due(now)
                         };
 
-                        // (2) Lähetä ILMAN lukkoa → operaattorimutaatiot mahtuvat
-                        //     väliin pitkänkin lähetyksen aikana.
+                        // (2) Dispatch WITHOUT the lock -> operator mutations
+                        //     fit in even during a long dispatch.
                         for dispatch in due {
                             let result = runtime
                                 .submit_task_idempotent(
@@ -239,11 +243,11 @@ impl SchedulerRunner {
                                 .await;
                             match result {
                                 Ok(_) => {
-                                    // (3) Lukko taas lyhyesti vain kirjausta varten.
+                                    // (3) Lock reacquired briefly, only to record the result.
                                     loop_handle.lock().await.record_fired(dispatch.task_id, now);
                                 }
                                 Err(error) => {
-                                    tracing::warn!(%error, "ajastimen lähetys epäonnistui — jatketaan");
+                                    tracing::warn!(%error, "scheduler dispatch failed — continuing");
                                 }
                             }
                         }
@@ -256,11 +260,11 @@ impl SchedulerRunner {
     }
 }
 
-/// Mukavuusfunktio: ajaa runnerin ja palauttaa peruutussignaalin.
+/// Convenience function: runs the runner and returns the cancellation signal.
 ///
-/// Vastaa [`SchedulerRunner::run`]:ia oletuskellolla
-/// ([`familyclaw_core::time::now`]). Käytä [`SchedulerRunner::run`]:ia suoraan
-/// jos haluat injektoida kellon testissä. Vaatii Tokio-ajoympäristön.
+/// Equivalent to [`SchedulerRunner::run`] with the default clock
+/// ([`familyclaw_core::time::now`]). Use [`SchedulerRunner::run`] directly
+/// if you want to inject a clock in tests. Requires a Tokio runtime.
 #[must_use]
 pub fn run_until_cancelled(runner: SchedulerRunner) -> CancellationSignal {
     runner.run(familyclaw_core::time::now)
@@ -276,10 +280,10 @@ mod tests {
         familyclaw_core::time::from_unix_secs(secs).expect("valid unix seconds")
     }
 
-    // (4) Runner on peruutettavissa: käynnistä, peruuta, varmista pysähtyminen.
+    // (4) The runner is cancellable: start, cancel, verify it stops.
     #[tokio::test(start_paused = true)]
     async fn runner_stops_after_explicit_cancel() {
-        // Laske kuinka monta kertaa now_fn kutsutaan (= tikkien määrä).
+        // Count how many times now_fn is called (= number of ticks).
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_clone = Arc::clone(&calls);
 
@@ -293,13 +297,13 @@ mod tests {
             now_at_secs(0)
         });
 
-        // Anna muutaman tikin tapahtua paused-ajassa.
+        // Let a few ticks happen in paused time.
         tokio::time::advance(StdDuration::from_millis(35)).await;
         tokio::task::yield_now().await;
         let before = calls.load(Ordering::SeqCst);
-        assert!(before >= 1, "silmukan piti tikittää ainakin kerran");
+        assert!(before >= 1, "the loop should have ticked at least once");
 
-        // Peruuta ja varmista että silmukka pysähtyy (ei lisää tikkejä).
+        // Cancel and verify the loop stops (no more ticks).
         signal.cancel();
         tokio::task::yield_now().await;
         tokio::time::advance(StdDuration::from_millis(100)).await;
@@ -309,10 +313,7 @@ mod tests {
         tokio::time::advance(StdDuration::from_millis(100)).await;
         tokio::task::yield_now().await;
         let final_count = calls.load(Ordering::SeqCst);
-        assert_eq!(
-            after, final_count,
-            "peruutuksen jälkeen ei saa tikittää lisää"
-        );
+        assert_eq!(after, final_count, "must not tick again after cancellation");
     }
 
     #[tokio::test(start_paused = true)]
@@ -333,7 +334,7 @@ mod tests {
         tokio::time::advance(StdDuration::from_millis(25)).await;
         tokio::task::yield_now().await;
 
-        // Pudota kahva → kanava sulkeutuu → silmukka pysähtyy.
+        // Drop the handle -> channel closes -> loop stops.
         drop(signal);
         tokio::task::yield_now().await;
         tokio::time::advance(StdDuration::from_millis(50)).await;
@@ -345,7 +346,7 @@ mod tests {
         assert_eq!(
             after,
             calls.load(Ordering::SeqCst),
-            "pudotuksen jälkeen ei lisää tikkejä"
+            "no more ticks after dropping"
         );
     }
 
@@ -365,12 +366,13 @@ mod tests {
         assert!(token.is_cancelled());
     }
 
-    // ── Lukko-ei-pidossa-await-yli -testit (PR: control-plane ei jonota tikin
-    //    taakse) ────────────────────────────────────────────────────────────
+    // ── Lock-not-held-across-await tests (PR: control plane doesn't queue
+    //    behind a tick) ────────────────────────────────────────────────────
     //
-    // Nämä testit käyttävät OIKEAA aikaa (ei start_paused) ja multi-thread-
-    // runtimea, koska ne mittaavat aitoa rinnakkaisuutta runnerin tikkisilmukan
-    // ja ulkoisen operaattorimutaation välillä jaetun lukon kautta.
+    // These tests use REAL time (no start_paused) and a multi-thread
+    // runtime, because they measure genuine concurrency between the
+    // runner's tick loop and an external operator mutation through the
+    // shared lock.
 
     use std::time::Duration as RealDuration;
 
@@ -385,13 +387,13 @@ mod tests {
 
     use crate::task::{ScheduledTask, ScheduledTaskId};
 
-    /// Testitaito jonka suoritus **jää odottamaan** hallittua vapautusbarriääriä.
+    /// A test skill whose execution **blocks** on a controlled release barrier.
     ///
-    /// `execute` ilmoittaa ensin että suoritus on alkanut (`started`), laskee
-    /// suorituskerrat (`run_count`), ja jää sitten odottamaan `release`-
-    /// barriäriä ennen palaamista. Näin testi voi pitää yhden tikin lähetyksen
-    /// "käynnissä" ja todistaa että operaattorimutaatio mahtuu väliin lukon
-    /// ollessa vapaana.
+    /// `execute` first signals that execution has started (`started`),
+    /// counts the number of runs (`run_count`), and then waits on the
+    /// `release` barrier before returning. This lets a test keep a single
+    /// tick's dispatch "in progress" and prove that an operator mutation
+    /// fits in while the lock is free.
     #[derive(Debug)]
     struct BarrierSkill {
         id: SkillId,
@@ -422,7 +424,7 @@ mod tests {
             request: ActionRequest,
         ) -> familyclaw_actions::Result<ActionResult> {
             self.run_count.fetch_add(1, Ordering::SeqCst);
-            // Ilmoita että suoritus on alkanut, jää sitten odottamaan vapautusta.
+            // Signal that execution has started, then wait for release.
             self.started.notify_one();
             self.release.notified().await;
             Ok(ActionResult::success(
@@ -462,8 +464,9 @@ mod tests {
         )
     }
 
-    // (core) Operaattorimutaatio (set_task_enabled) valmistuu SAMALLA kun pitkä
-    // tikin lähetys on käynnissä — todistaa ettei lukkoa pidetä await-yli.
+    // (core) An operator mutation (set_task_enabled) completes WHILE a
+    // long tick dispatch is in progress — proves the lock isn't held
+    // across the await.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn control_mutation_completes_while_long_action_in_progress() {
         let skill_id = SkillId::new();
@@ -483,15 +486,16 @@ mod tests {
         let runner = SchedulerRunner::new(sched, runtime, RealDuration::from_millis(5));
         let (signal, handle) = runner.run_shared(|| now_at_secs(0));
 
-        // Odota että ensimmäisen erääntyneen tehtävän lähetys on KÄYNNISSÄ
-        // (skill jäi barriäriin). Tässä pisteessä lähetyssilmukka on await:ssa
-        // EIKÄ pidä ajastimen lukkoa (se kerättiin ja vapautettiin ennen await:ia).
+        // Wait for the first due task's dispatch to be IN PROGRESS
+        // (the skill is blocked on the barrier). At this point the
+        // dispatch loop is awaiting and does NOT hold the scheduler lock
+        // (it was collected and released before the await).
         tokio::time::timeout(RealDuration::from_secs(5), started.notified())
             .await
             .expect("barrier skill should have started");
 
-        // Operaattorimutaatio: pitää valmistua VÄLITTÖMÄSTI vaikka lähetys on
-        // käynnissä — lukko on vapaana await:n aikana.
+        // Operator mutation: must complete IMMEDIATELY even while dispatch
+        // is in progress — the lock is free during the await.
         let mutation = tokio::time::timeout(RealDuration::from_secs(2), async {
             let mut s = handle.lock().await;
             s.set_task_enabled(other_id, false)
@@ -499,25 +503,25 @@ mod tests {
         .await;
         assert!(
             mutation.is_ok(),
-            "set_task_enabled jumiutui lähetyksen taakse — lukko pidettiin await-yli"
+            "set_task_enabled got stuck behind dispatch — the lock was held across the await"
         );
         assert!(
             mutation.unwrap(),
-            "tunnettu id → set_task_enabled palauttaa true"
+            "known id -> set_task_enabled returns true"
         );
 
-        // Vapauta barriäri ettei runtime jää roikkumaan, ja pysäytä silmukka.
+        // Release the barrier so the runtime doesn't hang, and stop the loop.
         release.notify_waiters();
         signal.cancel();
     }
 
-    // (dispatch-once) Erääntynyt tehtävä lähetetään täsmälleen kerran per ikkuna.
+    // (dispatch-once) A due task is dispatched exactly once per window.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_runner_dispatches_due_task_exactly_once() {
         let skill_id = SkillId::new();
         let (skill, started, release, run_count) = BarrierSkill::new(skill_id);
-        // Vapauta barriäri heti jokaiselle odottajalle, jotta lähetys palaa
-        // välittömästi (ei jää roikkumaan) — tämä testi mittaa laukaisukertoja.
+        // Release the barrier immediately for every waiter, so dispatch
+        // returns right away (doesn't hang) — this test measures firing counts.
         let release_for_task = Arc::clone(&release);
         tokio::spawn(async move {
             loop {
@@ -533,16 +537,16 @@ mod tests {
         let task_id = ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(111));
         sched.register(barrier_task(task_id, skill_id));
 
-        // Kiinteä now → sama intervalli-ikkuna joka tikillä; idempotenssiavain on
-        // sama, joten useampi tikki samassa ikkunassa EI saa laukaista uudelleen.
+        // Fixed now -> same interval window on every tick; the idempotency
+        // key is the same, so multiple ticks in the same window must NOT refire.
         let runner = SchedulerRunner::new(sched, runtime, RealDuration::from_millis(3));
         let (signal, _handle) = runner.run_shared(|| now_at_secs(1000));
 
-        // Odota ensimmäinen laukaisu.
+        // Wait for the first firing.
         tokio::time::timeout(RealDuration::from_secs(5), started.notified())
             .await
             .expect("task should fire once");
-        // Anna monta tikkiä kulua samassa ikkunassa.
+        // Let many ticks pass within the same window.
         tokio::time::sleep(RealDuration::from_millis(60)).await;
         signal.cancel();
         tokio::time::sleep(RealDuration::from_millis(20)).await;
@@ -550,16 +554,16 @@ mod tests {
         assert_eq!(
             run_count.load(Ordering::SeqCst),
             1,
-            "sama ikkuna → outbox dedup → täsmälleen yksi laukaisu"
+            "same window -> outbox dedup -> exactly one firing"
         );
     }
 
-    // (disabled stays quiet) Pois käytöstä otettu tehtävä ei lähetä mitään.
+    // (disabled stays quiet) A disabled task dispatches nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_runner_disabled_task_stays_quiet() {
         let skill_id = SkillId::new();
         let (skill, _started, release, run_count) = BarrierSkill::new(skill_id);
-        release.notify_waiters(); // ei odottajia vielä; varmuuden vuoksi
+        release.notify_waiters(); // no waiters yet; just in case
 
         let mut runtime = ActionRuntime::new();
         runtime.register_skill(skill).expect("register");
@@ -571,7 +575,7 @@ mod tests {
         let runner = SchedulerRunner::new(sched, runtime, RealDuration::from_millis(3));
         let (signal, _handle) = runner.run_shared(|| now_at_secs(0));
 
-        // Anna useita tikkejä kulua — disabloitu tehtävä ei saa laukaista.
+        // Let several ticks pass — a disabled task must not fire.
         tokio::time::sleep(RealDuration::from_millis(60)).await;
         signal.cancel();
         tokio::time::sleep(RealDuration::from_millis(10)).await;
@@ -579,12 +583,12 @@ mod tests {
         assert_eq!(
             run_count.load(Ordering::SeqCst),
             0,
-            "disabloitu tehtävä ei laukea jaetussa runnerissa"
+            "a disabled task does not fire in the shared runner"
         );
     }
 
-    // (cancellation) Jaettu runner pysähtyy cancel-signaalilla myös kun lähetys
-    // ei pidä lukkoa.
+    // (cancellation) The shared runner stops on the cancel signal even
+    // when dispatch doesn't hold the lock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_runner_stops_on_cancel() {
         let skill_id = SkillId::new();
@@ -611,19 +615,19 @@ mod tests {
 
         tokio::time::sleep(RealDuration::from_millis(30)).await;
         signal.cancel();
-        // Anna silmukan nähdä peruutus ja pysähtyä.
+        // Let the loop observe the cancellation and stop.
         tokio::time::sleep(RealDuration::from_millis(20)).await;
         let after_cancel = run_count.load(Ordering::SeqCst);
         tokio::time::sleep(RealDuration::from_millis(40)).await;
         assert_eq!(
             run_count.load(Ordering::SeqCst),
             after_cancel,
-            "peruutuksen jälkeen ei uusia laukaisuja"
+            "no new firings after cancellation"
         );
     }
 
-    // (no deadlock) Rinnakkaiset set_task_enabled-kutsut tikin kanssa eivät
-    // lukkiudu: silmukka jatkaa lähetystä lukon ollessa pääosin vapaa.
+    // (no deadlock) Concurrent set_task_enabled calls alongside ticking
+    // don't deadlock: the loop keeps dispatching while the lock is mostly free.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shared_runner_no_deadlock_under_concurrent_mutations() {
         let skill_id = SkillId::new();
@@ -650,7 +654,7 @@ mod tests {
         let runner = SchedulerRunner::new(sched, runtime, RealDuration::from_millis(2));
         let (signal, handle) = runner.run_shared(|| now_at_secs(0));
 
-        // Hakkaa operaattorimutaatioita rinnakkain tikin kanssa.
+        // Hammer operator mutations concurrently with ticking.
         let hammer = {
             let handle = Arc::clone(&handle);
             let ids = ids.clone();
@@ -666,12 +670,9 @@ mod tests {
             })
         };
 
-        // Koko homma pitää valmistua reilusti aikarajan sisällä (ei deadlockia).
+        // The whole thing must complete comfortably within the time limit (no deadlock).
         let done = tokio::time::timeout(RealDuration::from_secs(10), hammer).await;
-        assert!(
-            done.is_ok(),
-            "rinnakkaiset mutaatiot lukkiutuivat (deadlock)"
-        );
+        assert!(done.is_ok(), "concurrent mutations deadlocked");
         done.unwrap().expect("hammer task panicked");
 
         signal.cancel();

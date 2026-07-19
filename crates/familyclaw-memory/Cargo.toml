@@ -1,12 +1,15 @@
 [package]
 name = "familyclaw-memory"
-description = "Eternal Thread — Ebbinghaus decay, VAD, identity anchors"
+description = "Persistent agent memory store with Ebbinghaus-style decay, VAD emotional tagging, and permanent identity anchors"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["agent", "memory", "persistence", "vector-search", "runtime"]
+categories = ["data-structures", "asynchronous"]
 
 [lints]
 workspace = true

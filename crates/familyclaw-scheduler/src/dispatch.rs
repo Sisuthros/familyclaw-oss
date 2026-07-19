@@ -1,17 +1,16 @@
-//! [`Scheduler`]: ajastettujen tehtävien joukko + erääntyneiden lähetys.
+//! [`Scheduler`]: the set of scheduled tasks + dispatch of due ones.
 //!
-//! Ajastin **ei suorita työkaluja itse**. Erääntyneen tehtävän laukaisu
-//! reititetään olemassa olevan **idempotentin lähetyksen**
-//! ([`familyclaw_actions::ActionRuntime::submit_task_idempotent`]) läpi
-//! deterministisellä avaimella ([`crate::decision::firing_key`]). Näin sama
-//! looginen laukaisu lähetetään **korkeintaan kerran** myös prosessin
-//! kaatumisen yli — koko at-most-once-takuu tulee uudelleenkäytettynä
-//! toimintopinosta, ajastin ei keksi sitä uudelleen.
+//! The scheduler **never executes tools itself**. Firing a due task is
+//! routed through the existing **idempotent dispatch**
+//! ([`familyclaw_actions::ActionRuntime::submit_task_idempotent`]) with a
+//! deterministic key ([`crate::decision::firing_key`]). This way the same
+//! logical firing is dispatched **at most once**, even across a process
+//! crash — the entire at-most-once guarantee is reused from the action
+//! stack; the scheduler doesn't reinvent it.
 //!
-//! Erääntymispäätös tehdään puhtaalla logiikalla ([`crate::decision`]),
-//! injektoidulla kellolla — tämä moduuli vain yhdistää sen lähetykseen ja
-//! kirjaa `last_fired`-tilan, jotta tehtävä ei laukea uudelleen ennen seuraavaa
-//! intervallia.
+//! The due decision is made by pure logic ([`crate::decision`]) with an
+//! injected clock — this module just wires that up to dispatch and records
+//! `last_fired` state so a task doesn't fire again before its next interval.
 
 use std::collections::HashMap;
 
@@ -22,77 +21,78 @@ use serde_json::Value;
 use crate::decision::{decide, due_tasks};
 use crate::task::{ScheduledTask, ScheduledTaskId};
 
-/// Yhden tikin lähetysyhteenveto.
+/// Dispatch summary for a single tick.
 ///
-/// Kertoo kuinka monta tehtävää oli erääntynyt ja lähetettiin tällä tikillä,
-/// sekä laukaisukohtaiset lopputulokset (tunniste + idempotenssiavain +
-/// lähetyksen tulos). Pelkkä yhteenveto — ei salaisuuksia eikä raakaa payloadia.
+/// Reports how many tasks were due and dispatched on this tick, along with
+/// per-firing outcomes (identifier + idempotency key + dispatch result).
+/// A summary only — no secrets and no raw payload.
 #[derive(Debug, Default)]
 pub struct DispatchSummary {
-    /// Tällä tikillä erääntyneet ja lähetetyt tehtävät: tunniste, avain, tulos.
+    /// Tasks that were due and dispatched on this tick: identifier, key, outcome.
     pub fired: Vec<(ScheduledTaskId, String, SubmitOutcome)>,
 }
 
 impl DispatchSummary {
-    /// Tällä tikillä laukaistujen tehtävien lukumäärä.
+    /// The number of tasks fired on this tick.
     #[must_use]
     pub fn fired_count(&self) -> usize {
         self.fired.len()
     }
 }
 
-/// Yhden erääntyneen tehtävän **lähetysohje**: kaikki mitä idempotenttiin
-/// lähetykseen tarvitaan, irrotettuna [`Scheduler`]:sta.
+/// **Dispatch instruction** for a single due task: everything needed for
+/// idempotent dispatch, detached from [`Scheduler`].
 ///
-/// [`Scheduler::collect_due`] palauttaa nämä **lukon alla nopeasti** (puhdas
-/// erääntymispäätös + tehtävädatan kopiointi). Lähetys
-/// ([`ActionRuntime::submit_task_idempotent`]) voidaan sitten ajaa **ilman
-/// lukkoa**, jottei pitkä lähetys-I/O estä operaattoripinnan mutaatioita
-/// (esim. [`Scheduler::set_task_enabled`]). Sisältää vain geneerisiä tunnisteita
-/// ja payloadin — ei lukkoa, ei viittausta ajastimeen (KERROS A turvallinen).
+/// [`Scheduler::collect_due`] returns these **quickly, while holding the
+/// lock** (pure due decision + copying task data). Dispatch
+/// ([`ActionRuntime::submit_task_idempotent`]) can then be run **without
+/// the lock**, so long dispatch I/O doesn't block operator-surface
+/// mutations (e.g. [`Scheduler::set_task_enabled`]). Contains only generic
+/// identifiers and the payload — no lock, no reference to the scheduler
+/// (Layer A safe).
 #[derive(Debug, Clone)]
 pub struct DueDispatch {
-    /// Erääntyneen tehtävän tunniste (`last_fired`-kirjausta varten).
+    /// The due task's identifier (for recording `last_fired`).
     pub task_id: ScheduledTaskId,
-    /// Deterministinen idempotenssiavain tälle laukaisulle.
+    /// The deterministic idempotency key for this firing.
     pub key: String,
-    /// Olennon tunniste jonka nimissä lähetys tehdään.
+    /// Identifier of the being on whose behalf dispatch happens.
     pub being_id: String,
-    /// Suoritettavan taidon tunniste.
+    /// Identifier of the skill to execute.
     pub skill_id: SkillId,
-    /// Taidolle annettava payload.
+    /// The payload passed to the skill.
     pub payload: Value,
 }
 
-/// Intervalliperustainen ajastin: pitää joukkoa ajastettuja tehtäviä ja niiden
-/// viimeisiä laukaisuaikoja, ja lähettää erääntyneet idempotentisti.
+/// Interval-based scheduler: holds a set of scheduled tasks and their last
+/// firing times, and dispatches due ones idempotently.
 ///
-/// `last_fired`-tila pidetään muistissa; kaatumiskestävyyden idempotenssi tulee
-/// **lähetys-outboxista** (deterministinen avain), ei tästä tilasta. Jos
-/// `last_fired` nollautuu restartissa, sama intervalli-ikkuna johtaa samaan
-/// avaimeen, joten outbox estää kaksoislaukaisun.
+/// The `last_fired` state is kept in memory; crash-resistant idempotency
+/// comes from the **dispatch outbox** (deterministic key), not from this
+/// state. If `last_fired` is lost on restart, the same interval window
+/// yields the same key, so the outbox prevents a duplicate firing.
 #[derive(Debug, Default)]
 pub struct Scheduler {
     tasks: Vec<ScheduledTask>,
     last_fired: HashMap<ScheduledTaskId, Timestamp>,
-    /// Viimeisin kirjattu ihmisaktiivisuus (perhe-agency: vanhene-jos-ei-
-    /// ihmistä, Phase 4). `None` = ihmistä ei ole vielä nähty. Päivitetään
-    /// [`Scheduler::note_human_activity`]:lla kun ihminen on aktiivinen.
+    /// The most recently recorded human activity (family-agency:
+    /// expire-if-no-human, Phase 4). `None` = no human seen yet. Updated
+    /// via [`Scheduler::note_human_activity`] when a human is active.
     last_human_activity: Option<Timestamp>,
 }
 
 impl Scheduler {
-    /// Luo tyhjän ajastimen.
+    /// Creates an empty scheduler.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Rekisteröi ajastetun tehtävän.
+    /// Registers a scheduled task.
     ///
-    /// Saman tunnisteen uudelleenrekisteröinti **korvaa** aiemman tehtävän
-    /// määrittelyn mutta **säilyttää** sen `last_fired`-tilan, jotta intervalli
-    /// ei nollaudu vahingossa.
+    /// Re-registering the same identifier **replaces** the previous task
+    /// definition but **preserves** its `last_fired` state, so the interval
+    /// isn't accidentally reset.
     pub fn register(&mut self, task: ScheduledTask) {
         if let Some(slot) = self.tasks.iter_mut().find(|t| t.id == task.id) {
             *slot = task;
@@ -101,13 +101,14 @@ impl Scheduler {
         }
     }
 
-    /// Kytkee tehtävän päälle/pois (perhe-agency kill-switch, Phase 4).
+    /// Toggles a task on/off (family-agency kill switch, Phase 4).
     ///
-    /// Asettaa [`ScheduledTask::enabled`]-lipun annetulle tehtävälle. `false` =
-    /// ajastin ohittaa sen seuraavissa tikeissä; `true` = ottaa taas käyttöön.
-    /// Palauttaa `true` jos tehtävä löytyi ja tila asetettiin, `false` jos
-    /// tunnistetta ei ole rekisteröity. EI nollaa `last_fired`-tilaa (käyttöön
-    /// otto jatkaa normaalia intervallia, ei laukaise heti ellei jo erääntynyt).
+    /// Sets the [`ScheduledTask::enabled`] flag on the given task. `false` =
+    /// the scheduler skips it on subsequent ticks; `true` = re-enables it.
+    /// Returns `true` if the task was found and the state was set, `false`
+    /// if the identifier isn't registered. Does NOT reset `last_fired`
+    /// state (re-enabling continues the normal interval; it won't fire
+    /// immediately unless already due).
     pub fn set_task_enabled(&mut self, id: ScheduledTaskId, enabled: bool) -> bool {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
             task.enabled = enabled;
@@ -117,35 +118,36 @@ impl Scheduler {
         }
     }
 
-    /// Tehtävän nykyinen enabled-tila (introspektio), tai `None` jos tuntematon.
+    /// The task's current enabled state (introspection), or `None` if unknown.
     #[must_use]
     pub fn task_enabled(&self, id: ScheduledTaskId) -> Option<bool> {
         self.tasks.iter().find(|t| t.id == id).map(|t| t.enabled)
     }
 
-    /// Rekisteröityjen tehtävien tunnisteet (introspektio operaattoripinnalle).
+    /// Identifiers of registered tasks (introspection for the operator surface).
     #[must_use]
     pub fn task_ids(&self) -> Vec<ScheduledTaskId> {
         self.tasks.iter().map(|t| t.id).collect()
     }
 
-    /// Soveltaa persistoidun perhe-agency-configin rekisteröityihin tehtäviin
-    /// (Phase 4): configin disabled-listalla olevat otetaan pois käytöstä, loput
-    /// jätetään käyttöön. Kutsu **bootissa** rekisteröinnin jälkeen, jotta
-    /// operaattorin kill-switch säilyy yli restartin. Tuntemattomat id:t
-    /// configissa sivuutetaan vaarattomasti.
+    /// Applies a persisted family-agency config to registered tasks
+    /// (Phase 4): tasks in the config's disabled list are disabled, the
+    /// rest are left enabled. Call this **at boot**, after registration, so
+    /// the operator's kill switch survives a restart. Unknown ids in the
+    /// config are silently ignored.
     pub fn apply_agency_config(&mut self, config: &crate::persistence::AgencyConfig) {
         for task in &mut self.tasks {
             task.enabled = !config.is_disabled(task.id);
         }
     }
 
-    /// Kirjaa ihmisaktiivisuuden (perhe-agency: vanhene-jos-ei-ihmistä, Phase 4).
+    /// Records human activity (family-agency: expire-if-no-human, Phase 4).
     ///
-    /// Kutsu kun ihminen on aktiivinen (esim. saapuva ihmisviesti). Päivittää
-    /// `last_human_activity`-ajan vain eteenpäin (ei taakse), jotta vanha
-    /// aikaleima ei nollaa tuoreempaa. `expire_after_idle`-tehtävät pysyvät
-    /// hereillä niin kauan kuin ihminen on ollut aktiivinen tämän ajan sisällä.
+    /// Call this when a human is active (e.g. an incoming human message).
+    /// Updates `last_human_activity` only forward (never backward), so an
+    /// old timestamp doesn't overwrite a more recent one.
+    /// `expire_after_idle` tasks stay awake as long as a human has been
+    /// active within that time window.
     pub fn note_human_activity(&mut self, at: Timestamp) {
         match self.last_human_activity {
             Some(prev) if prev >= at => {}
@@ -153,32 +155,32 @@ impl Scheduler {
         }
     }
 
-    /// Viimeisin kirjattu ihmisaktiivisuus (introspektio), tai `None`.
+    /// The most recently recorded human activity (introspection), or `None`.
     #[must_use]
     pub fn last_human_activity(&self) -> Option<Timestamp> {
         self.last_human_activity
     }
 
-    /// Rekisteröityjen tehtävien lukumäärä.
+    /// The number of registered tasks.
     #[must_use]
     pub fn len(&self) -> usize {
         self.tasks.len()
     }
 
-    /// Onko ajastin tyhjä (ei rekisteröityjä tehtäviä).
+    /// Whether the scheduler is empty (no registered tasks).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
 
-    /// Palauttaa tehtävän viimeisen laukaisuajan (tai `None`).
+    /// Returns the task's last firing time (or `None`).
     #[must_use]
     pub fn last_fired(&self, id: ScheduledTaskId) -> Option<Timestamp> {
         self.last_fired.get(&id).copied()
     }
 
-    /// Laskee tällä nykyhetkellä erääntyneet tehtävät **suorittamatta** mitään
-    /// (puhdas tarkastelu testaukseen ja introspektioon).
+    /// Computes the tasks due at this point in time **without executing**
+    /// anything (a pure view for testing and introspection).
     #[must_use]
     pub fn due_now(&self, now: Timestamp) -> Vec<crate::decision::DueDecision> {
         due_tasks(
@@ -189,17 +191,18 @@ impl Scheduler {
         )
     }
 
-    /// Kerää tällä nykyhetkellä erääntyneiden tehtävien **lähetysohjeet**
-    /// ([`DueDispatch`]) **suorittamatta** mitään (puhdas, ei `await`).
+    /// Collects the **dispatch instructions** ([`DueDispatch`]) for tasks
+    /// due at this point in time, **without executing** anything (pure, no
+    /// `await`).
     ///
-    /// Tämä on tarkoituksella halpa ja synkroninen: erääntymispäätös
-    /// ([`crate::decision`]) lasketaan ja erääntyneiden tehtävien lähetysdata
-    /// (avain, olento, taito, payload) kopioidaan irti ajastimesta. Näin
-    /// jaetun ajastimen ([`crate::runner::SchedulerHandle`]) lukko voidaan
-    /// **vapauttaa** ennen varsinaista lähetys-I/O:ta, jottei pitkä lähetys estä
-    /// operaattoripinnan mutaatioita (esim. [`Scheduler::set_task_enabled`]).
-    /// Lähetyksen ajamisen jälkeen kutsu [`Scheduler::record_fired`] kullekin
-    /// onnistuneelle laukaisulle.
+    /// This is deliberately cheap and synchronous: the due decision
+    /// ([`crate::decision`]) is computed, and the dispatch data for due
+    /// tasks (key, being, skill, payload) is copied out of the scheduler.
+    /// This lets the shared scheduler's ([`crate::runner::SchedulerHandle`])
+    /// lock be **released** before the actual dispatch I/O, so a long
+    /// dispatch doesn't block operator-surface mutations (e.g.
+    /// [`Scheduler::set_task_enabled`]). After running dispatch, call
+    /// [`Scheduler::record_fired`] for each successful firing.
     #[must_use]
     pub fn collect_due(&self, now: Timestamp) -> Vec<DueDispatch> {
         let mut out = Vec::new();
@@ -219,39 +222,42 @@ impl Scheduler {
         out
     }
 
-    /// Kirjaa yhden tehtävän laukaisuajan (`last_fired`) onnistuneen lähetyksen
-    /// jälkeen.
+    /// Records a task's firing time (`last_fired`) after a successful
+    /// dispatch.
     ///
-    /// Erotettu [`Scheduler::collect_due`]:sta jotta lähetys voidaan ajaa ilman
-    /// ajastimen lukkoa: kerää erääntyneet lukon alla → vapauta lukko → lähetä →
-    /// ota lukko lyhyesti takaisin ja kutsu tätä per onnistunut laukaisu. `now`
-    /// on sama nykyhetki jolla erääntyminen arvioitiin, jotta intervalli-ikkuna
-    /// pysyy johdonmukaisena.
+    /// Separated from [`Scheduler::collect_due`] so dispatch can run
+    /// without the scheduler lock: collect due tasks under the lock ->
+    /// release the lock -> dispatch -> briefly reacquire the lock and call
+    /// this per successful firing. `now` is the same point in time at
+    /// which due-checking was evaluated, so the interval window stays
+    /// consistent.
     pub fn record_fired(&mut self, task_id: ScheduledTaskId, now: Timestamp) {
         self.last_fired.insert(task_id, now);
     }
 
-    /// Suorittaa yhden tikin: lähettää kaikki erääntyneet tehtävät
-    /// idempotentisti ja kirjaa niiden `last_fired`-ajan.
+    /// Runs a single tick: dispatches all due tasks idempotently and
+    /// records their `last_fired` time.
     ///
-    /// Jokainen erääntynyt tehtävä reititetään
-    /// [`ActionRuntime::submit_task_idempotent`]:n läpi sen deterministisellä
-    /// avaimella ([`crate::decision::firing_key`]) — ajastin ei suorita
-    /// työkalua itse. `last_fired` päivitetään vasta onnistuneen lähetyksen
-    /// jälkeen, joten ohimenevä virhe ei "kuluta" intervallia: tehtävä yrittää
-    /// uudelleen seuraavalla tikillä (ja idempotenssiavain estää
-    /// kaksoislaukaisun jos sivuvaikutus oli jo sitoutunut outboxiin).
+    /// Each due task is routed through
+    /// [`ActionRuntime::submit_task_idempotent`] with its deterministic key
+    /// ([`crate::decision::firing_key`]) — the scheduler doesn't execute
+    /// the tool itself. `last_fired` is only updated after a successful
+    /// dispatch, so a transient error doesn't "consume" the interval: the
+    /// task retries on the next tick (and the idempotency key prevents a
+    /// duplicate firing if the side effect was already committed to the
+    /// outbox).
     ///
-    /// Sisäisesti tämä on [`Scheduler::collect_due`] + lähetys +
-    /// [`Scheduler::record_fired`]. Käytä sitä kun ajastin **ei** ole jaetun
-    /// lukon takana (esim. [`crate::runner::SchedulerRunner::run`]); jaetussa
-    /// ajossa ([`crate::runner::SchedulerRunner::run_shared`]) noita kahta
-    /// kutsutaan erikseen jottei lukkoa pidetä lähetyksen yli.
+    /// Internally this is [`Scheduler::collect_due`] + dispatch +
+    /// [`Scheduler::record_fired`]. Use it when the scheduler is **not**
+    /// behind a shared lock (e.g. [`crate::runner::SchedulerRunner::run`]);
+    /// in the shared run path
+    /// ([`crate::runner::SchedulerRunner::run_shared`]) those two are
+    /// called separately so the lock isn't held across dispatch.
     ///
     /// # Errors
-    /// Palauttaa ensimmäisen lähetysvirheen ([`ActionRuntime::submit_task_idempotent`]).
-    /// Sitä ennen onnistuneet laukaisut on jo kirjattu summaariin ja
-    /// `last_fired`-tilaan.
+    /// Returns the first dispatch error ([`ActionRuntime::submit_task_idempotent`]).
+    /// Firings that succeeded before that are already recorded in the
+    /// summary and in `last_fired` state.
     pub async fn tick(
         &mut self,
         runtime: &mut ActionRuntime,
@@ -259,8 +265,8 @@ impl Scheduler {
     ) -> Result<DispatchSummary> {
         let mut summary = DispatchSummary::default();
 
-        // Sama erääntymis- ja lähetyslogiikka kuin jaetussa polussa: kerää
-        // erääntyneet (puhdas), lähetä idempotentisti, kirjaa onnistuneet.
+        // Same due-checking and dispatch logic as the shared path: collect
+        // due tasks (pure), dispatch idempotently, record successes.
         for dispatch in self.collect_due(now) {
             let outcome = runtime
                 .submit_task_idempotent(
@@ -272,7 +278,7 @@ impl Scheduler {
                 )
                 .await?;
 
-            // Kirjaa last_fired vasta onnistuneen lähetyksen jälkeen.
+            // Record last_fired only after a successful dispatch.
             self.record_fired(dispatch.task_id, now);
             summary
                 .fired
@@ -282,7 +288,7 @@ impl Scheduler {
         Ok(summary)
     }
 
-    /// Pakottaa yhden tehtävän erääntymispäätöksen tarkasteluun (introspektio).
+    /// Exposes a single task's due decision for inspection (introspection).
     #[must_use]
     pub fn decision_for(
         &self,
@@ -315,15 +321,15 @@ mod tests {
         rt
     }
 
-    // (3) Idempotentti lähetys: saman tehtävän laukaisu kahdesti samalla
-    //     avaimella reitittyy outboxin läpi → sivuvaikutus korkeintaan kerran.
+    // (3) Idempotent dispatch: firing the same task twice with the same
+    //     key routes through the outbox -> side effect at most once.
     #[tokio::test]
     async fn second_tick_in_same_window_does_not_refire() {
         let mut rt = runtime_with_fs_read();
         let mut sched = Scheduler::new();
 
-        // fs-read epäonnistuu (tyhjä allowlist) mutta lähetys palauttaa
-        // committed-tuloksen outboxiin — riittää todistamaan dedupin.
+        // fs-read fails (empty allowlist) but dispatch still returns a
+        // committed result to the outbox — enough to prove dedup.
         let task = ScheduledTask::with_id(
             ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(11)),
             FsReadAllowlisted::skill_id(),
@@ -333,15 +339,15 @@ mod tests {
         );
         sched.register(task);
 
-        // Tikki 1: erääntynyt (ei koskaan laukennut) → lähetetään.
+        // Tick 1: due (never fired) -> dispatched.
         let s1 = sched.tick(&mut rt, at(0)).await.expect("tick 1");
         assert_eq!(s1.fired_count(), 1);
 
-        // Tikki 2 samassa ikkunassa: EI erääntynyt (last_fired = 0, interval 60).
+        // Tick 2 in the same window: NOT due (last_fired = 0, interval 60).
         let s2 = sched.tick(&mut rt, at(30)).await.expect("tick 2");
         assert_eq!(s2.fired_count(), 0);
 
-        // Tikki 3 seuraavassa ikkunassa: erääntynyt taas.
+        // Tick 3 in the next window: due again.
         let s3 = sched.tick(&mut rt, at(60)).await.expect("tick 3");
         assert_eq!(s3.fired_count(), 1);
     }
@@ -359,19 +365,19 @@ mod tests {
         );
         sched.register(task);
 
-        // Oletus enabled.
+        // Default enabled.
         assert_eq!(sched.task_enabled(id), Some(true));
         assert_eq!(sched.task_ids(), vec![id]);
 
         // Kill-switch off.
-        assert!(sched.set_task_enabled(id, false), "tunnettu id → true");
+        assert!(sched.set_task_enabled(id, false), "known id -> true");
         assert_eq!(sched.task_enabled(id), Some(false));
 
-        // Takaisin päälle.
+        // Back on.
         assert!(sched.set_task_enabled(id, true));
         assert_eq!(sched.task_enabled(id), Some(true));
 
-        // Tuntematon id → false, ei paniikkia.
+        // Unknown id -> false, no panic.
         let unknown = ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(999));
         assert!(!sched.set_task_enabled(unknown, false));
         assert_eq!(sched.task_enabled(unknown), None);
@@ -379,8 +385,8 @@ mod tests {
 
     #[tokio::test]
     async fn idle_task_sleeps_until_human_activity() {
-        // Perhe-agency (Phase 4) end-to-end: idle-katollinen tehtävä ei laukea
-        // tyhjään huoneeseen, mutta herää kun ihminen on aktiivinen.
+        // Family-agency (Phase 4) end-to-end: a task with an idle cap
+        // doesn't fire into an empty room, but wakes up when a human is active.
         let mut rt = runtime_with_fs_read();
         let mut sched = Scheduler::new();
         let task = ScheduledTask::with_id(
@@ -393,19 +399,19 @@ mod tests {
         .with_expire_after_idle(Duration::seconds(100));
         sched.register(task);
 
-        // Ei ihmistä koskaan → idle-vanhentunut → ei laukea vaikka erääntynyt.
+        // No human ever -> idle-expired -> doesn't fire even though due.
         let s1 = sched.tick(&mut rt, at(0)).await.expect("tick idle");
-        assert_eq!(s1.fired_count(), 0, "ei laukea tyhjään huoneeseen");
+        assert_eq!(s1.fired_count(), 0, "doesn't fire into an empty room");
 
-        // Ihminen aktiivinen → herää → laukeaa (sama ikkuna, sama erääntyminen).
+        // Human active -> wakes up -> fires (same window, same due-check).
         sched.note_human_activity(at(10));
         let s2 = sched.tick(&mut rt, at(10)).await.expect("tick after human");
-        assert_eq!(s2.fired_count(), 1, "herää kun ihminen on läsnä");
+        assert_eq!(s2.fired_count(), 1, "wakes up when a human is present");
 
-        // Ihminen poissa kauan (200s idle > 100s katto) → hiljenee taas.
-        // (Seuraava ikkuna at(120) jotta erääntyminen olisi muuten ok.)
+        // Human away for a long time (200s idle > 100s cap) -> goes quiet again.
+        // (Next window at(120) so due-checking would otherwise be fine.)
         let s3 = sched.tick(&mut rt, at(220)).await.expect("tick idle again");
-        assert_eq!(s3.fired_count(), 0, "hiljenee taas kun ihminen poissa");
+        assert_eq!(s3.fired_count(), 0, "goes quiet again once human is away");
     }
 
     #[tokio::test]
@@ -423,23 +429,19 @@ mod tests {
                 "being",
             ));
         }
-        // Config disabloi vain a:n (simuloi restartia jossa a oli pysäytetty).
+        // The config disables only a (simulates a restart where a was stopped).
         let mut cfg = AgencyConfig::default();
         cfg.set(a, false);
         sched.apply_agency_config(&cfg);
 
-        assert_eq!(
-            sched.task_enabled(a),
-            Some(false),
-            "a palautui disabloituna"
-        );
-        assert_eq!(sched.task_enabled(b), Some(true), "b jäi käyttöön");
+        assert_eq!(sched.task_enabled(a), Some(false), "a came back disabled");
+        assert_eq!(sched.task_enabled(b), Some(true), "b remained enabled");
     }
 
     #[tokio::test]
     async fn disabled_task_does_not_fire_until_reenabled() {
-        // Perhe-agency (Phase 4) end-to-end: disabloitu tehtävä ei lähetä
-        // mitään tickissä; käyttöön otto palauttaa laukaisun.
+        // Family-agency (Phase 4) end-to-end: a disabled task dispatches
+        // nothing on tick; re-enabling restores firing.
         let mut rt = runtime_with_fs_read();
         let mut sched = Scheduler::new();
         let task = ScheduledTask::with_id(
@@ -452,21 +454,22 @@ mod tests {
         .with_enabled(false);
         sched.register(task.clone());
 
-        // Disabloitu → tick ei lähetä, vaikka muuten olisi erääntynyt.
+        // Disabled -> tick dispatches nothing, even though otherwise due.
         let s1 = sched.tick(&mut rt, at(0)).await.expect("tick disabled");
-        assert_eq!(s1.fired_count(), 0, "disabloitu ei laukea");
+        assert_eq!(s1.fired_count(), 0, "disabled task does not fire");
 
-        // Ota käyttöön (register korvaa määrittelyn) → laukeaa.
+        // Re-enable (register replaces the definition) -> fires.
         sched.register(task.with_enabled(true));
         let s2 = sched.tick(&mut rt, at(0)).await.expect("tick enabled");
-        assert_eq!(s2.fired_count(), 1, "käyttöön otto palauttaa laukaisun");
+        assert_eq!(s2.fired_count(), 1, "re-enabling restores firing");
     }
 
     #[tokio::test]
     async fn restart_with_lost_last_fired_dedups_via_outbox_key() {
-        // Sama avain samassa ikkunassa: vaikka ajastin "unohtaa" last_fired
-        // (uusi Scheduler = restart), idempotenssiavain on sama → outbox
-        // palauttaa saman tuloksen ajamatta sivuvaikutusta uudelleen.
+        // Same key in the same window: even though the scheduler "forgets"
+        // last_fired (a new Scheduler = restart), the idempotency key is
+        // the same -> the outbox returns the same result without running
+        // the side effect again.
         let mut rt = runtime_with_fs_read();
         let task = ScheduledTask::with_id(
             ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(22)),
@@ -482,14 +485,14 @@ mod tests {
         assert_eq!(s_a.fired_count(), 1);
         let key_a = s_a.fired[0].1.clone();
 
-        // "Restart": uusi ajastin, last_fired kadonnut, sama ikkuna [60,120).
+        // "Restart": a new scheduler, last_fired lost, same window [60,120).
         let mut sched_b = Scheduler::new();
         sched_b.register(task);
         let s_b = sched_b.tick(&mut rt, at(119)).await.expect("tick b");
         assert_eq!(s_b.fired_count(), 1);
         let key_b = s_b.fired[0].1.clone();
 
-        // Sama avain → outbox dedup (sivuvaikutus korkeintaan kerran).
+        // Same key -> outbox dedup (side effect at most once).
         assert_eq!(key_a, key_b);
     }
 
@@ -516,7 +519,7 @@ mod tests {
         sched.tick(&mut rt, at(0)).await.expect("tick");
         assert_eq!(sched.last_fired(id), Some(at(0)));
 
-        // Re-register sama id: last_fired säilyy, ei laukea heti uudelleen.
+        // Re-register the same id: last_fired is preserved, doesn't fire immediately again.
         sched.register(ScheduledTask::with_id(
             id,
             FsReadAllowlisted::skill_id(),
@@ -531,7 +534,7 @@ mod tests {
 
     #[test]
     fn unknown_skill_decision_still_pure() {
-        // decision_for ei lähetä mitään — pelkkä puhdas tarkastelu.
+        // decision_for dispatches nothing — just a pure inspection.
         let mut sched = Scheduler::new();
         let id = ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(44));
         sched.register(ScheduledTask::with_id(

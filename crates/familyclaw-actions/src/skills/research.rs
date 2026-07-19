@@ -1,26 +1,26 @@
-//! Tutkimustaito: monilähteinen kerääminen jäsennellyksi tuotokseksi (KERROS A).
+//! Research skill: multi-source gathering into a structured output (Layer A).
 //!
-//! [`ResearchSkill`] orkestroi useasta julkisesta web-lähteestä keräämisen
-//! yhdeksi rakenteelliseksi tuotokseksi: se hakee annetut ehdokas-`URLit`
-//! (uudelleenkäyttäen [`web_fetch`]:n SSRF-vartiointia), **deduplikoi hostin
-//! mukaan** ja tuottaa mallipohjaisen Markdown-raportin (otsikko, per-lähde
-//! -poiminta ja Sources-lista).
+//! [`ResearchSkill`] orchestrates gathering from several public web sources
+//! into a single structured output: it fetches the given candidate `URLs`
+//! (reusing [`web_fetch`]'s SSRF guarding), **deduplicates by host**, and
+//! produces a template-based Markdown report (heading, per-source excerpt,
+//! and a Sources list).
 //!
-//! ## Kuormaa kantava turvallisuus: `validate_url` + ei-redirect + tavukatto
-//! Ennen yhtäkään verkkopyyntöä jokainen URL validoidaan
-//! [`super::web_fetch`]:n `validate_url`-vartioinnilla (vain http/https, ei
-//! localhostia, ei yksityisiä/loopback/link-local-osoitteita). Pyyntö ei seuraa
-//! redirectejä ([`reqwest::redirect::Policy::none`]) eikä lue kuin katon verran
-//! tavuja. Epäonnistunut haku **ohitetaan** (skip) — taito ei koskaan paniikkaa
-//! yksittäisen lähteen kaatuessa.
+//! ## Load-bearing security: `validate_url` + no-redirect + byte cap
+//! Before any network request, every URL is validated with
+//! [`super::web_fetch`]'s `validate_url` guard (http/https only, no
+//! localhost, no private/loopback/link-local addresses). The request does
+//! not follow redirects ([`reqwest::redirect::Policy::none`]) and reads no
+//! more than a capped number of bytes. A failed fetch is **skipped** — the
+//! skill never panics when a single source fails.
 //!
-//! ## Puhtaat funktiot (yksikkötestattavat ilman verkkoa)
-//! `dedup_sources_by_host` ja `render_markdown` ovat **puhtaita** — ne eivät
-//! tee verkkopyyntöä eivätkä lue kelloa, joten ne testataan suoraan.
+//! ## Pure functions (unit-testable without a network)
+//! `dedup_sources_by_host` and `render_markdown` are **pure** — they make no
+//! network request and read no clock, so they are tested directly.
 //!
-//! ## Taint (epäluotettavuus)
-//! Haettu web-sisältö on AINA epäluotettavaa — `execute` EI kutsu `.trusted()`.
-//! Verkosta tuotu sisältö ei pese itseään puhtaaksi.
+//! ## Taint (untrustedness)
+//! Fetched web content is ALWAYS untrusted — `execute` does NOT call `.trusted()`.
+//! Content brought in from the network does not cleanse itself.
 
 use std::time::Duration;
 
@@ -37,70 +37,70 @@ use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 use super::web_fetch;
 use super::Skill;
 
-/// Taidon kiinteä tunniste (1-6 varattuja muille oletustaidoille).
+/// Fixed identifier of the skill (1-6 reserved for other default skills).
 const SKILL_UUID: uuid::Uuid = uuid::uuid!("88888888-8888-4888-8888-888888888888");
 
-/// Poimintatekstin enimmäispituus tavuina per lähde (pidetään lyhyenä, ettei
-/// koko sivun runko vuoda raporttiin).
+/// Maximum length of the excerpt text in bytes per source (kept short so the
+/// whole page body doesn't leak into the report).
 const EXCERPT_MAX_BYTES: usize = 280;
 
-/// Haetun rungon tavukatto per lähde (32 KiB) — estää muistin syömisen.
+/// Byte cap on the fetched body per source (32 KiB) — prevents memory exhaustion.
 const FETCH_MAX_BYTES: usize = 32 * 1024;
 
-/// Ehdokas-`URLien` oletusenimmäismäärä, jos `max_sources` puuttuu.
+/// Default maximum number of candidate `URLs` if `max_sources` is absent.
 const DEFAULT_MAX_SOURCES: usize = 8;
 
-/// Ehdokas-`URLien` kova yläraja — estää mielivaltaisen ison työn.
+/// Hard upper bound on candidate `URLs` — prevents arbitrarily large jobs.
 const HARD_MAX_SOURCES: usize = 32;
 
-/// Verkkopyynnön aikakatkaisu per lähde.
+/// Network request timeout per source.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Taidon syöte: tutkittava aihe + valinnaiset ehdokas-`URLit` ja lähdekatto.
+/// Skill input: topic to research + optional candidate `URLs` and source cap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResearchInput {
-    /// Tutkittava aihe (näkyy raportin otsikossa).
+    /// Topic to research (shown in the report heading).
     pub topic: String,
-    /// Valinnainen lista haettavia ehdokas-`URLeja`. Ilman tätä taito palauttaa
-    /// epäonnistumisen ja pyytää `URLit` (pidetään testattavana ilman live-hakua).
+    /// Optional list of candidate `URLs` to fetch. Without this, the skill
+    /// returns a failure and asks for `URLs` (kept testable without a live fetch).
     #[serde(default)]
     pub candidate_urls: Option<Vec<String>>,
-    /// Valinnainen haettavien lähteiden enimmäismäärä (rajataan 1..=`HARD_MAX_SOURCES`).
+    /// Optional maximum number of sources to fetch (clamped to 1..=`HARD_MAX_SOURCES`).
     #[serde(default)]
     pub max_sources: Option<usize>,
 }
 
-/// Yksittäinen kerätty lähde raportissa.
+/// A single gathered source in the report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Source {
-    /// Lähteen URL (validoitu, julkinen host).
+    /// Source URL (validated, public host).
     pub url: String,
-    /// Lähteen host (dedup-avain).
+    /// Source host (dedup key).
     pub host: String,
-    /// Lyhyt, typistetty poiminta lähteen sisällöstä (epäluotettava).
+    /// Short, truncated excerpt of the source content (untrusted).
     pub excerpt: String,
 }
 
-/// Read-only tutkimustaito monilähteiselle keräämiselle.
+/// Read-only research skill for multi-source gathering.
 #[derive(Debug, Default, Clone)]
 pub struct ResearchSkill;
 
 impl ResearchSkill {
-    /// Luo uuden taidon.
+    /// Creates a new skill.
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 
-    /// Taidon kiinteä tunniste.
+    /// Fixed identifier of the skill.
     #[must_use]
     pub fn skill_id() -> SkillId {
         SkillId::from_uuid(SKILL_UUID)
     }
 }
 
-/// Deduplikoi lähteet **hostin mukaan**, säilyttäen ensimmäisen esiintymän
-/// järjestyksen. PUHDAS funktio — ei verkkoa, ei kelloa.
+/// Deduplicates sources **by host**, preserving the order of first
+/// occurrence. PURE function — no network, no clock.
 #[must_use]
 fn dedup_sources_by_host(sources: Vec<Source>) -> Vec<Source> {
     let mut seen_hosts: Vec<String> = Vec::new();
@@ -116,7 +116,7 @@ fn dedup_sources_by_host(sources: Vec<Source>) -> Vec<Source> {
     out
 }
 
-/// Typistää merkkijonon enintään `max_bytes` tavuun säilyttäen UTF-8-rajat.
+/// Truncates a string to at most `max_bytes` bytes while preserving UTF-8 boundaries.
 fn truncate_utf8(s: &mut String, max_bytes: usize) {
     if s.len() <= max_bytes {
         return;
@@ -128,8 +128,8 @@ fn truncate_utf8(s: &mut String, max_bytes: usize) {
     s.truncate(end);
 }
 
-/// Poimii lyhyen yhteenvetopoiminnan haetusta rungosta: ensimmäinen
-/// ei-tyhjä rivi, kontrollimerkit siivottu, typistetty [`EXCERPT_MAX_BYTES`]:iin.
+/// Extracts a short summary excerpt from the fetched body: the first
+/// non-empty line, control characters stripped, truncated to [`EXCERPT_MAX_BYTES`].
 fn make_excerpt(body: &str) -> String {
     let first_line = body
         .lines()
@@ -141,13 +141,13 @@ fn make_excerpt(body: &str) -> String {
     excerpt.trim().to_string()
 }
 
-/// Escapea Markdownin erikoismerkit poiminnasta/aiheesta, ettei epäluotettava
-/// web-sisältö riko raportin rakennetta (esim. injektoi otsikoita/listoja).
+/// Escapes Markdown special characters from the excerpt/topic, so untrusted
+/// web content cannot break the report's structure (e.g. inject headings/lists).
 fn escape_markdown(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {
         match c {
-            // Rivinvaihdot litistetään välilyönniksi (yksi bullet per lähde).
+            // Newlines are flattened to a space (one bullet per source).
             '\n' | '\r' => out.push(' '),
             '\\' | '`' | '*' | '_' | '[' | ']' | '#' | '|' => {
                 out.push('\\');
@@ -159,13 +159,13 @@ fn escape_markdown(raw: &str) -> String {
     out
 }
 
-/// Rakentaa mallipohjaisen Markdown-raportin aiheesta ja (dedupatuista)
-/// lähteistä. PUHDAS funktio — ei verkkoa, ei kelloa.
+/// Builds a template-based Markdown report from the topic and (deduplicated)
+/// sources. PURE function — no network, no clock.
 ///
-/// Raportissa on:
-/// - aihe-otsikko (`# Research: <topic>`),
-/// - per-lähde bullet poiminnalla,
-/// - `## Sources` -lista `URLeista`.
+/// The report contains:
+/// - a topic heading (`# Research: <topic>`),
+/// - a bullet per source with an excerpt,
+/// - a `## Sources` list of `URLs`.
 #[must_use]
 fn render_markdown(topic: &str, sources: &[Source]) -> String {
     let mut md = String::new();
@@ -205,10 +205,10 @@ fn render_markdown(topic: &str, sources: &[Source]) -> String {
     md
 }
 
-/// Hakee yhden lähteen SSRF-vartioidusti. Palauttaa `None` jos URL hylätään tai
-/// haku epäonnistuu (lähde ohitetaan — ei paniikkia).
+/// Fetches a single source with SSRF guarding. Returns `None` if the URL is
+/// rejected or the fetch fails (the source is skipped — no panic).
 async fn fetch_source(client: &reqwest::Client, raw_url: &str) -> Option<Source> {
-    // SSRF-vartiointi ENNEN pyyntöä (uudelleenkäytetty web_fetch:n logiikka).
+    // SSRF guarding BEFORE the request (reused web_fetch logic).
     let url = web_fetch::validate_url(raw_url).ok()?;
     let host = url.host_str().unwrap_or("").to_string();
     if host.is_empty() {
@@ -249,7 +249,7 @@ impl ActionExecutor for ResearchSkill {
             ));
         }
 
-        // Ilman ehdokas-URLeja taito ei tee live-hakua — pyytää URLit.
+        // Without candidate URLs the skill does not do a live fetch — it asks for URLs.
         let candidate_urls = match input.candidate_urls {
             Some(urls) if !urls.is_empty() => urls,
             _ => {
@@ -266,7 +266,7 @@ impl ActionExecutor for ResearchSkill {
             .unwrap_or(DEFAULT_MAX_SOURCES)
             .clamp(1, HARD_MAX_SOURCES);
 
-        // EI redirektejä (estää 302→yksityinen ohituksen) + aikakatkaisu.
+        // NO redirects (prevents a 302→private bypass) + timeout.
         let client = match reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(FETCH_TIMEOUT)
@@ -281,7 +281,7 @@ impl ActionExecutor for ResearchSkill {
             }
         };
 
-        // Hae kukin lähde; epäonnistuneet ohitetaan hiljaa (ei paniikkia).
+        // Fetch each source; failures are skipped silently (no panic).
         let mut gathered: Vec<Source> = Vec::new();
         for raw_url in candidate_urls.iter().take(limit) {
             if let Some(source) = fetch_source(&client, raw_url).await {
@@ -289,7 +289,7 @@ impl ActionExecutor for ResearchSkill {
             }
         }
 
-        // Deduplikoi hostin mukaan ja rakenna raportti (puhtaat funktiot).
+        // Deduplicate by host and build the report (pure functions).
         let sources = dedup_sources_by_host(gathered);
         let summary_markdown = render_markdown(&input.topic, &sources);
         let source_count = sources.len();
@@ -312,7 +312,7 @@ impl ActionExecutor for ResearchSkill {
             "source_count": source_count,
         });
 
-        // Haettu web-sisältö pysyy AINA epäluotettavana (ei .trusted()).
+        // Fetched web content ALWAYS stays untrusted (no .trusted()).
         Ok(ActionResult::success(
             format!("gathered {source_count} source(s) for research topic"),
             output,
@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn dedup_by_host_keeps_first_of_each_host() {
-        // Kolme lähdettä, joista KAKSI samalta hostilta → dedup 2:een.
+        // Three sources, of which TWO from the same host → dedup to 2.
         let sources = vec![
             source("https://a.example.com/1", "a.example.com", "first from a"),
             source("https://b.example.com/1", "b.example.com", "first from b"),
@@ -395,7 +395,7 @@ mod tests {
         let deduped = dedup_sources_by_host(sources);
         assert_eq!(deduped.len(), 2, "two same-host sources must dedup to one");
         assert_eq!(deduped[0].host, "a.example.com");
-        // Ensimmäinen esiintymä säilyy (järjestys ennallaan).
+        // The first occurrence is kept (order unchanged).
         assert_eq!(deduped[0].excerpt, "first from a");
         assert_eq!(deduped[1].host, "b.example.com");
     }
@@ -444,15 +444,15 @@ mod tests {
 
     #[test]
     fn render_markdown_escapes_injection_from_untrusted_excerpt() {
-        // Epäluotettava poiminta yrittää injektoida oman otsikon/listan.
+        // An untrusted excerpt attempts to inject its own heading/list.
         let sources = vec![source(
             "https://evil.example.com/x",
             "evil.example.com",
             "# Injected Heading\n- fake bullet",
         )];
         let md = render_markdown("Safe topic", &sources);
-        // Poiminta ei saa tuottaa aitoa `# `-otsikkoa raportin rakenteeseen:
-        // rivinvaihdot litistetään ja `#` escapetaan.
+        // The excerpt must not produce a real `# ` heading in the report structure:
+        // newlines are flattened and `#` is escaped.
         assert!(
             !md.contains("\n# Injected Heading"),
             "untrusted excerpt must not inject a real heading"
@@ -480,9 +480,9 @@ mod tests {
         assert_eq!(m.input_schema["properties"]["topic"]["type"], "string");
         assert_eq!(m.input_schema["required"][0], "topic");
 
-        // Layer B: manifestissa ei saa olla perheen nimiä (geneerinen Kerros A).
-        // Kielletyt fragmentit rakennetaan fragmenteista, ettei lähdetiedosto
-        // sisällä yhtäkään kokonaista perhenimeä literaalina.
+        // Layer B: the manifest must not contain family names (generic Layer A).
+        // The forbidden fragments are built from fragments so the source file
+        // does not contain a single whole family name as a literal.
         let rendered = serde_json::to_string(&m).expect("serialize manifest");
         let forbidden_fragments: [(&str, &str); 6] = [
             ("Lum", "en"),
@@ -550,7 +550,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_payload_fails_without_panic() {
         let skill = ResearchSkill::new();
-        // Väärä tyyppi topicille → deserialisointi epäonnistuu.
+        // Wrong type for topic → deserialization fails.
         let payload = json!({ "topic": 123 });
         let req = ActionRequest::new(
             ActionId::new(),
@@ -566,8 +566,8 @@ mod tests {
 
     #[tokio::test]
     async fn all_candidate_urls_rejected_yields_zero_sources_not_panic() {
-        // Kaikki URLit ovat SSRF-vartioinnin hylkäämiä (loopback/localhost/skeema)
-        // → jokainen ohitetaan, tulos onnistuu 0 lähteellä (ei paniikkia, ei verkkoa).
+        // All URLs are rejected by SSRF guarding (loopback/localhost/scheme)
+        // → each is skipped, the result succeeds with 0 sources (no panic, no network).
         let skill = ResearchSkill::new();
         let payload = serde_json::to_value(ResearchInput {
             topic: "Blocked sources".to_string(),
@@ -596,7 +596,7 @@ mod tests {
             json!(0),
             "all URLs rejected → zero sources"
         );
-        // Raportti on silti muodostettu (topic-otsikko + tyhjä Sources).
+        // The report is still built (topic heading + empty Sources).
         let md = res.raw_output_redacted["summary_markdown"]
             .as_str()
             .expect("summary_markdown present");

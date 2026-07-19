@@ -92,23 +92,30 @@ pub fn filter_memories_for_operator<T>(
         .collect()
 }
 
+/// Generic substrings that mark a recalled memory as third-party roleplay
+/// noise rather than genuine operator context (e.g. a sibling-persona voice
+/// bleeding into an operator DM). These are deliberately generic examples;
+/// there is no configuration hook today for deployments to supply their own
+/// patterns, so real deployments should extend this list in code rather than
+/// relying on runtime config.
+const DEFAULT_ROLEPLAY_NOISE_PATTERNS: &[&str] = &[
+    "your sibling ",
+    "sibling here",
+    "— agent_b",
+    "agent_b here",
+    "agent_b speaking",
+    "your sister",
+    "cronjob response:",
+];
+
 fn memory_is_roleplay_noise(content: &str) -> bool {
     let lower = content.to_lowercase();
-    [
-        "sisaresi ",
-        "sister ",
-        "— vega",
-        "vega täältä",
-        "vega täällä",
-        "your sister",
-        "cronjob response:",
-        "he i vega",
-    ]
-    .iter()
-    .any(|m| lower.contains(m))
+    DEFAULT_ROLEPLAY_NOISE_PATTERNS
+        .iter()
+        .any(|m| lower.contains(m))
 }
 
-/// `true` for short agent-name pings like "Nova?!" (≤4 words, ≤48 chars).
+/// `true` for short agent-name pings like "`agent_a`?!" (≤4 words, ≤48 chars).
 #[must_use]
 pub fn is_brief_ping(query: &str, agent_name: &str) -> bool {
     let t = query.trim();
@@ -188,7 +195,7 @@ pub fn operator_diagnostic_reply(
     let q = query.trim().to_lowercase();
     if q.contains("minne siirrät") || q.contains("where are you moving") {
         return Some(
-            "Siirrän tutkimusmateriaalit tähän polkuun:\n- E:\\Nova\\home\\research\\legacy\\2026-07\n\nKasvuun liittyvät legacyt tähän:\n- E:\\Nova\\home\\growth\\legacy\\2026-07\n\nEn siirrä salaisuuksia sisältäviä tiedostoja (.env, secrets).".to_string(),
+            "Moving research materials to this path:\n- /data/agent_home/research/legacy/2026-07\n\nGrowth-related legacy files go here:\n- /data/agent_home/growth/legacy/2026-07\n\nI will not move files containing secrets (.env, secrets).".to_string(),
         );
     }
     if q.contains("pystyt nyt toimimaan")
@@ -472,11 +479,11 @@ mod tests {
 
     #[test]
     fn brief_ping_detects_short_call() {
-        assert!(is_brief_ping("Nova?!", "Nova"));
-        assert!(is_brief_ping("nova?", "Nova"));
+        assert!(is_brief_ping("agent_a?!", "agent_a"));
+        assert!(is_brief_ping("agent_a?", "agent_a"));
         assert!(!is_brief_ping(
-            "Nova, read your SOUL and write a full report",
-            "Nova"
+            "agent_a, read your SOUL and write a full report",
+            "agent_a"
         ));
     }
 
@@ -489,7 +496,7 @@ mod tests {
         let origin = MessageOrigin::new("discord-1", "100", "42");
         let memories = vec![
             "normal operator question".to_string(),
-            "Hei Nova! Sisaresi Vega täältä.".to_string(),
+            "Hey agent_a! Your sibling agent_b here.".to_string(),
         ];
         let filtered = filter_memories_for_operator(memories, Some(&origin), |s| s.as_str());
         assert_eq!(filtered.len(), 1);
@@ -512,7 +519,7 @@ mod tests {
         let origin = MessageOrigin::new("discord-1", "100", "42");
         let moved = operator_diagnostic_reply(&BusMessage::text("Minne siirrät?"), Some(&origin))
             .expect("direct move question should be fast-pathed");
-        assert!(moved.contains(r"E:\Nova\home\research\legacy\2026-07"));
+        assert!(moved.contains("/data/agent_home/research/legacy/2026-07"));
         let can_work =
             operator_status_message(&BusMessage::text("Pystyt nyt toimimaan?"), Some(&origin));
         assert!(can_work);

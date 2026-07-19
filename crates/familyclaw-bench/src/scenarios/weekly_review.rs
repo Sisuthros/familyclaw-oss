@@ -1,43 +1,43 @@
-//! S8 Weekly Review — viikoittainen koostava tilannekuva muistista.
+//! S8 Weekly Review — a weekly aggregate snapshot of memory state.
 //!
-//! Siinä missä [`crate::scenarios::dream_quality`] todistaa *yhden yön*
-//! konsolidaation, tämä skenaario todistaa että muistitallennuksesta saa
-//! **deterministisen viikkokatsauksen**: kuinka monta muistoa on
-//! aktiivisena/arkistoituna/haudattuna, mitkä ovat tärkeimmät säilyneet
-//! muistot tärkeysjärjestyksessä, ja kuinka monta ristiriitaa odottaa
-//! ratkaisua. Tämä peilaa Amplifier-proteesin viikoittaisen "scorecard"-
-//! yhteenvedon natiiviksi (design §2.3) — auditoitava raportti joka ei mutatoi
-//! mitään.
+//! Where [`crate::scenarios::dream_quality`] proves consolidation for *a single
+//! night*, this scenario proves that memory storage yields a **deterministic
+//! weekly review**: how many memories are active/archived/tombstoned, which
+//! surviving memories are the most important in importance order, and how many
+//! conflicts are awaiting resolution. This mirrors the Amplifier prosthesis's
+//! weekly "scorecard" summary natively (design §2.3) — an auditable report
+//! that mutates nothing.
 //!
-//! ## Mitä tämä mittaa
-//! Skenaario kylvää [`LocalJsonStore`]:iin tunnetun joukon muistoja eri tiloissa
-//! ja eri tärkeyksillä, tägää yhden ristiriitaparin, ja ajaa
-//! [`weekly_review`]:n injektoidulla `now`-hetkellä. Sitten se varmistaa että:
-//! 1. **Tilalaskurit** (`total`/`active`/`archived`/`tombstoned`/`consolidated`)
-//!    vastaavat kylvettyä tilaa.
-//! 2. **`top_memories`-järjestys** on tärkeys laskevassa järjestyksessä ja
-//!    haudattuja ei nosteta esiin.
-//! 3. **Ristiriitalaskuri** vastaa tägätyn parin kokoa.
+//! ## What this measures
+//! The scenario seeds [`LocalJsonStore`] with a known set of memories in
+//! different states and with different importance values, tags one conflicting
+//! pair, and runs [`weekly_review`] at the injected `now` instant. It then
+//! verifies that:
+//! 1. **State counters** (`total`/`active`/`archived`/`tombstoned`/`consolidated`)
+//!    match the seeded state.
+//! 2. The **`top_memories` ordering** is in descending importance order and
+//!    tombstoned memories are never surfaced.
+//! 3. The **conflict counter** matches the size of the tagged pair.
 //!
-//! Mittarit:
-//! - `counts_correct` — 1.0 jos kaikki tilalaskurit vastaavat odotettua.
-//! - `top_order_correct` — 1.0 jos `top_memories` on laskevassa
-//!   tärkeysjärjestyksessä eikä sisällä haudattuja.
-//! - `conflicts_correct` — 1.0 jos ristiriitalaskuri vastaa odotettua.
-//! - `retrievable_ratio` — haettavien (aktiivinen + arkistoitu) osuus kaikista.
+//! Metrics:
+//! - `counts_correct` — 1.0 if all state counters match the expected values.
+//! - `top_order_correct` — 1.0 if `top_memories` is in descending importance
+//!   order and contains no tombstoned memories.
+//! - `conflicts_correct` — 1.0 if the conflict counter matches the expected value.
+//! - `retrievable_ratio` — the fraction of retrievable (active + archived) memories.
 //!
-//! ## Reprodusoitavuus
-//! `now` injektoidaan [`Scenario::run`]:n `clock`-parametrina — katsaus
-//! ottaa hetken parametrina (ei järjestelmäkellosta) ja järjestää tuloksensa
-//! vakaasti (tärkeys laskeva, tasapeli pienempi id), joten sama kylvö tuottaa
-//! aina saman raportin (design §2.2).
+//! ## Reproducibility
+//! `now` is injected as [`Scenario::run`]'s `clock` parameter — the review
+//! takes the instant as a parameter (not from the system clock) and orders its
+//! results stably (importance descending, ties broken by lower id), so the
+//! same seed always produces the same report (design §2.2).
 //!
-//! ## Subjektin rooli
-//! [`Scenario::run`] saa subjektin mustana laatikkona ([`Subject`]); subjektin
-//! elävyys varmistetaan kevyellä `sleep_cycle`-kutsulla joka ei saa kaataa
-//! subjektia. Auktoritatiiviset mittarit lasketaan omistetusta kylvetystä
-//! tallennuksesta, koska viikkokatsaus on memory/dream-tason invariantti joka
-//! on sama kaikille subjekteille.
+//! ## Role of the subject
+//! [`Scenario::run`] receives the subject as a black box ([`Subject`]); the
+//! subject's liveness is verified with a lightweight `sleep_cycle` call that
+//! must not crash the subject. The authoritative metrics are computed from a
+//! dedicated seeded store, since the weekly review is a memory/dream-level
+//! invariant that is the same for every subject.
 
 use async_trait::async_trait;
 
@@ -49,62 +49,61 @@ use crate::error::{BenchError, Result};
 use crate::scenario::{Scenario, ScenarioResult};
 use crate::subject::Subject;
 
-/// S8 Weekly Review -skenaario.
+/// S8 Weekly Review scenario.
 ///
-/// Tilaton arvo; kaikki ajotila kylvetään [`Scenario::run`]:ssa injektoidun
-/// kellon suhteen, joten skenaarion voi ajaa monta kertaa ja saada saman
-/// tuloksen.
+/// Stateless value; all run state is seeded within [`Scenario::run`] relative
+/// to the injected clock, so the scenario can be run many times and yield the
+/// same result.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WeeklyReviewScenario;
 
 impl WeeklyReviewScenario {
-    /// Skenaarion vakaa tunniste.
+    /// The scenario's stable identifier.
     pub const ID: &'static str = "s8_weekly_review";
 
-    /// Rakentaa skenaarion.
+    /// Builds the scenario.
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 }
 
-/// Tunnettu kylvö: odotetut laskurit ja tärkeysjärjestys jälkikäteistä
-/// arviointia varten.
+/// Known seed: expected counters and importance order for later evaluation.
 struct Seeded {
-    /// Muistojen kokonaismäärä.
+    /// Total number of memories.
     total: usize,
-    /// Aktiivisten määrä.
+    /// Number of active memories.
     active: usize,
-    /// Arkistoitujen määrä.
+    /// Number of archived memories.
     archived: usize,
-    /// Haudattujen määrä.
+    /// Number of tombstoned memories.
     tombstoned: usize,
-    /// Haettavien (aktiivinen + arkistoitu) määrä = `consolidated`.
+    /// Number of retrievable (active + archived) memories = `consolidated`.
     consolidated: usize,
-    /// Ristiriitatägättyjen muistojen määrä (tägätty pari → 2).
+    /// Number of memories tagged as conflicted (a tagged pair → 2).
     conflicted: usize,
-    /// Haettavien muistojen sisällöt tärkeys laskevassa järjestyksessä —
-    /// odotettu `top_memories`-järjestys.
+    /// Contents of retrievable memories in descending importance order —
+    /// the expected `top_memories` ordering.
     expected_top_order: Vec<String>,
 }
 
 impl WeeklyReviewScenario {
-    /// Kylvää tunnetun tallennuksen injektoidun kellon suhteen ja palauttaa
-    /// odotetut laskurit + tärkeysjärjestyksen.
+    /// Seeds a known store relative to the injected clock and returns the
+    /// expected counters + importance order.
     ///
-    /// Kylvö (tärkeysarvot valittu erottuviksi ettei tasapeli sotke
-    /// järjestystä):
-    /// - 3 aktiivista (tärkeydet 0.9, 0.5, 0.2),
-    /// - 1 arkistoitu (tärkeys 0.7) — haettava, joten mukana top-listalla,
-    /// - 1 haudattu (tärkeys 0.95) — EI saa nousta esiin,
-    /// - 1 ristiriitapari (kaksi muistoa) tägätään → `conflicted == 2`.
+    /// Seed (importance values chosen to be distinct so ties don't disturb
+    /// ordering):
+    /// - 3 active (importance 0.9, 0.5, 0.2),
+    /// - 1 archived (importance 0.7) — still retrievable, so included in the top list,
+    /// - 1 tombstoned (importance 0.95) — must NOT be surfaced,
+    /// - 1 conflicting pair (two memories) tagged → `conflicted == 2`.
     async fn seed(store: &LocalJsonStore, clock: Timestamp) -> Result<Seeded> {
-        // — Aktiiviset muistot (haettavia, eri tärkeyksillä) ————————————————
+        // — Active memories (retrievable, at different importances) ————————
         let high = add(store, mem("the launch shipped on time", 0.9, clock)).await?;
         add(store, mem("a mid-priority note about testing", 0.5, clock)).await?;
         add(store, mem("a low-priority passing thought", 0.2, clock)).await?;
 
-        // — Arkistoitu (yhä haettava, top-listalle) ——————————————————————————
+        // — Archived (still retrievable, appears in the top list) ——————————
         let archived = add(
             store,
             mem("an older but still relevant decision", 0.7, clock),
@@ -115,32 +114,32 @@ impl WeeklyReviewScenario {
             .await
             .map_err(BenchError::from)?;
 
-        // — Haudattu (korkea tärkeys, mutta EI saa nousta top-listalle) ———————
+        // — Tombstoned (high importance, but must NOT be surfaced in the top list) —
         let tombstoned = add(store, mem("a retracted false claim", 0.95, clock)).await?;
         store
             .set_status(tombstoned, MemoryStatus::Tombstoned)
             .await
             .map_err(BenchError::from)?;
 
-        // — Ristiriitapari (kaksi aktiivista) tägätään ————————————————————————
+        // — Conflicting pair (two active memories) is tagged ————————————————
         let conflict_a = add(store, mem("agent_a is in region one", 0.4, clock)).await?;
         let conflict_b = add(store, mem("agent_a is in region two", 0.3, clock)).await?;
         tag_conflict(store, conflict_a, conflict_b, clock)
             .await
             .map_err(BenchError::from)?;
 
-        // Kylvettyjä yhteensä: 3 aktiivista + 1 arkistoitu + 1 haudattu + 2
-        // ristiriitaista (aktiivisia) = 7.
-        // active = 3 + 2 (ristiriitaparin osapuolet) = 5.
+        // Total seeded: 3 active + 1 archived + 1 tombstoned + 2 conflicting
+        // (active) = 7.
+        // active = 3 + 2 (both sides of the conflicting pair) = 5.
         // archived = 1, tombstoned = 1.
-        // consolidated (haettavat) = active + archived = 6.
-        // conflicted = 2 (tägätyn parin molemmat).
+        // consolidated (retrievable) = active + archived = 6.
+        // conflicted = 2 (both sides of the tagged pair).
         //
-        // Haettavat tärkeys laskevassa järjestyksessä (haudattu jätetään pois):
+        // Retrievable memories in descending importance order (tombstoned excluded):
         //   0.9 launch, 0.7 archived, 0.5 mid, 0.4 conflict_a,
         //   0.3 conflict_b, 0.2 low.
-        // `weekly_review` rajaa top_memories DEFAULT_TOP_N (=5) ensimmäiseen,
-        // joten odotettu järjestys on viisi tärkeintä.
+        // `weekly_review` caps top_memories at the first DEFAULT_TOP_N (=5),
+        // so the expected order is the five most important.
         let _ = (high, conflict_a, conflict_b);
         let expected_top_order = vec![
             "the launch shipped on time".to_string(),
@@ -169,17 +168,18 @@ impl Scenario for WeeklyReviewScenario {
     }
 
     async fn run(&self, subject: &mut dyn Subject, clock: Timestamp) -> Result<ScenarioResult> {
-        // Elävyyskoe: subjektin oma unijakso ei saa kaatua. Tulos kirjataan
-        // huomioksi; auktoritatiiviset mittarit lasketaan alla omistetusta
-        // kylvöstä (katsaus on memory/dream-tason invariantti).
+        // Liveness check: the subject's own sleep cycle must not crash. The
+        // result is recorded as a note; the authoritative metrics are computed
+        // below from a dedicated seed (the review is a memory/dream-level
+        // invariant).
         let subject_summary = subject.sleep_cycle(clock).await?;
 
-        // Kylvä tunnettu tallennus + tägää ristiriitapari injektoidun kellon
-        // suhteen.
+        // Seed a known store + tag a conflicting pair relative to the
+        // injected clock.
         let store = LocalJsonStore::in_memory();
         let seeded = Self::seed(&store, clock).await?;
 
-        // Aja AITO viikkokatsaus injektoidulla hetkellä, sitten arvioi.
+        // Run the REAL weekly review at the injected instant, then evaluate.
         let report = weekly_review(&store, clock)
             .await
             .map_err(BenchError::from)?;
@@ -219,32 +219,33 @@ impl Scenario for WeeklyReviewScenario {
     }
 }
 
-/// Viikkokatsauksen arvio: kaikki S8-mittarit ja läpäisytulos yhdessä paikassa.
+/// Weekly review evaluation: all S8 metrics and the pass result in one place.
 ///
-/// Liput ovat toisistaan riippumattomia diagnostisia tuloksia (laskurit /
-/// järjestys / ristiriidat erikseen), eivät tilakoneen tiloja — siksi neljä
-/// erillistä booleania on selkein esitys (ei `struct_excessive_bools`-uudelleen-
-/// muotoilua kaksiarvoisiksi enumeiksi, joka vain hämärtäisi merkityksen).
+/// The flags are independent diagnostic results (counters / ordering /
+/// conflicts, separately), not states of a state machine — hence four
+/// separate booleans is the clearest representation (not a
+/// `struct_excessive_bools` refactor into two-valued enums, which would only
+/// obscure the meaning).
 #[allow(clippy::struct_excessive_bools)]
 struct Outcome {
-    /// Vastaavatko kaikki tilalaskurit kylvettyä.
+    /// Whether all state counters match the seeded state.
     counts_correct: bool,
-    /// Onko `top_memories` laskevassa tärkeysjärjestyksessä eikä sisällä
-    /// haudattuja, ja vastaako se odotettua sisältöjärjestystä.
+    /// Whether `top_memories` is in descending importance order, contains no
+    /// tombstoned memories, and matches the expected content order.
     top_order_correct: bool,
-    /// Vastaako ristiriitalaskuri kylvettyä paria.
+    /// Whether the conflict counter matches the seeded pair.
     conflicts_correct: bool,
-    /// Haettavien osuus kaikista (`consolidated / total`).
+    /// Retrievable fraction of the total (`consolidated / total`).
     retrievable_ratio: f64,
-    /// Koko skenaarion läpäisytulos.
+    /// The overall scenario pass result.
     passed: bool,
 }
 
 impl Outcome {
-    /// Arvioi viikkokatsauksen vertaamalla raporttia tunnettuun kylvöön.
+    /// Evaluates the weekly review by comparing the report against the known seed.
     ///
     /// # Errors
-    /// [`BenchError`] jos kylvö oli tyhjä (nollajako-suoja).
+    /// [`BenchError`] if the seed was empty (division-by-zero guard).
     fn evaluate(seeded: &Seeded, report: &WeeklyReport) -> Result<Self> {
         if seeded.total == 0 {
             return Err(BenchError::scenario(
@@ -258,8 +259,8 @@ impl Outcome {
             && report.tombstoned == seeded.tombstoned
             && report.consolidated == seeded.consolidated;
 
-        // Top-järjestys: sisällöt vastaavat odotettua laskevaa järjestystä JA
-        // tärkeydet ovat ei-kasvavia (varmuuden vuoksi).
+        // Top ordering: contents match the expected descending order AND
+        // importance values are non-increasing (belt and suspenders).
         let actual_top: Vec<&str> = report
             .top_memories
             .iter()
@@ -295,12 +296,12 @@ impl Outcome {
     }
 }
 
-/// Lisää muiston tallennukseen, kääräisten ydincraten virheen benchin virheeksi.
+/// Adds a memory to the store, wrapping the core crate's error into a bench error.
 async fn add(store: &LocalJsonStore, memory: Memory) -> Result<familyclaw_core::MessageId> {
     store.add(memory).await.map_err(BenchError::from)
 }
 
-/// Muisto annetulla sisällöllä ja tärkeydellä injektoituun kelloon ankkuroituna.
+/// A memory with the given content and importance, anchored to the injected clock.
 fn mem(content: &str, importance: f32, clock: Timestamp) -> Memory {
     Memory::builder(content)
         .factors(ImportanceFactors::new(importance, 0.0, 0.0, 0.0))
@@ -308,7 +309,7 @@ fn mem(content: &str, importance: f32, clock: Timestamp) -> Memory {
         .build()
 }
 
-/// Boolean → mittariluku (`1.0`/`0.0`) determinististä scorecardia varten.
+/// Boolean → metric value (`1.0`/`0.0`) for a deterministic scorecard.
 fn bool_metric(ok: bool) -> f64 {
     if ok {
         1.0
@@ -318,21 +319,21 @@ fn bool_metric(ok: bool) -> f64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unnecessary_literal_bound)] // Stub-toteutus palauttaa literaalin.
-#[allow(clippy::float_cmp)] // Vakiot 0.0/1.0 ovat tarkkoja float-arvoja testeissä.
+#[allow(clippy::unnecessary_literal_bound)] // Stub implementation returns a literal.
+#[allow(clippy::float_cmp)] // Constants 0.0/1.0 are exact float values in these tests.
 mod tests {
     use super::*;
 
     use crate::subject::{CrashPoint, DreamSummary, RecallHit, RestartReport, RunHandle, Task};
 
-    /// Kiinteä injektoitu referenssikello (2026-06-05 12:00 UTC).
+    /// Fixed injected reference clock (2026-06-05 12:00 UTC).
     fn clock() -> Timestamp {
         familyclaw_core::time::from_unix_secs(1_780_660_800).expect("valid clock")
     }
 
-    /// Minimaalinen subjekti-stub joka ei kaadu — skenaario laskee
-    /// auktoritatiiviset mittarit omasta kylvöstään, joten stubin paluuarvot
-    /// eivät vaikuta läpäisyyn.
+    /// Minimal subject stub that never crashes — the scenario computes its
+    /// authoritative metrics from its own seed, so the stub's return values
+    /// do not affect the pass result.
     struct StubSubject;
 
     #[async_trait]
@@ -380,7 +381,7 @@ mod tests {
         assert_eq!(result.metrics.get("counts_correct").copied(), Some(1.0));
         assert_eq!(result.metrics.get("top_order_correct").copied(), Some(1.0));
         assert_eq!(result.metrics.get("conflicts_correct").copied(), Some(1.0));
-        // Haettavat = 6/7.
+        // Retrievable = 6/7.
         let ratio = result
             .metrics
             .get("retrievable_ratio")
@@ -388,10 +389,10 @@ mod tests {
             .expect("ratio metric");
         assert!(
             (ratio - 6.0 / 7.0).abs() < 1e-9,
-            "odotettiin 6/7 haettavaa, sai {ratio}"
+            "expected 6/7 retrievable, got {ratio}"
         );
 
-        assert!(result.passed, "S8 pitäisi läpäistä: {:?}", result.notes);
+        assert!(result.passed, "S8 should pass: {:?}", result.notes);
     }
 
     #[tokio::test]
@@ -401,7 +402,7 @@ mod tests {
         let scenario = WeeklyReviewScenario::new();
         let r1 = scenario.run(&mut s1, clock()).await.expect("r1");
         let r2 = scenario.run(&mut s2, clock()).await.expect("r2");
-        // Sama injektoitu hetki → identtiset mittarit + huomiot (§2.2).
+        // Same injected instant → identical metrics + notes (§2.2).
         assert_eq!(r1.metrics, r2.metrics);
         assert_eq!(r1.notes, r2.notes);
         assert_eq!(r1.passed, r2.passed);
@@ -409,8 +410,9 @@ mod tests {
 
     #[tokio::test]
     async fn buried_memory_is_excluded_from_top() {
-        // Suora todiste: korkein tärkeys (0.95) on haudattu, joten se EI saa
-        // olla top-listan kärjessä — kärjessä on 0.9 aktiivinen.
+        // Direct proof: the highest-importance memory (0.95) is tombstoned,
+        // so it must NOT be at the top of the list — the top should be the
+        // 0.9 active memory instead.
         let store = LocalJsonStore::in_memory();
         WeeklyReviewScenario::seed(&store, clock())
             .await

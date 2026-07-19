@@ -1,4 +1,4 @@
-//! Stdio MCP -integraatiotestit mock-palvelimella.
+//! Stdio MCP integration tests using the mock server.
 
 use familyclaw_actions::facade::ActionRuntime;
 use familyclaw_mcp::{register_mcp_skills, McpClient, McpServerConfig, McpTransportConfig};

@@ -1,85 +1,84 @@
-//! Sandbox-kohtaiset virhetyypit.
+//! Sandbox-specific error types.
 //!
-//! Sandboxilla on oma virhetyyppi [`SandboxError`] joka kantaa
-//! sandbox-domainin tarkat virheluokat (polttoaineen loppuminen,
-//! kyvykkyysrikkomus, backendin puuttuminen). Se muuntuu tarvittaessa
-//! alustan keskitettyyn [`familyclaw_core::FamilyClawError`]-tyyppiin
-//! [`From`]-toteutuksella.
+//! The sandbox has its own error type [`SandboxError`] which carries the
+//! precise error categories of the sandbox domain (fuel exhaustion,
+//! capability violation, missing backend). It converts, when needed, into
+//! the platform's centralized [`familyclaw_core::FamilyClawError`] type via
+//! a [`From`] implementation.
 
 use thiserror::Error;
 
-/// Sandboxin virhetyyppi.
+/// The sandbox's error type.
 ///
-/// `#[non_exhaustive]` jotta uusia variantteja voi lisätä rikkomatta
-/// downstream-koodia (esim. uusia backendejä tai turvaluokkia).
+/// `#[non_exhaustive]` so that new variants can be added without breaking
+/// downstream code (e.g. new backends or trust classes).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SandboxError {
-    /// Polttoaine loppui kesken suorituksen.
+    /// Fuel ran out mid-execution.
     #[error("fuel exhausted: budget {budget}, required {required}")]
     FuelExhausted {
-        /// Käytettävissä ollut polttoainebudjetti.
+        /// The fuel budget that was available.
         budget: u64,
-        /// Kulutus joka olisi tarvittu (ylitti budjetin).
+        /// The consumption that would have been required (exceeded the budget).
         required: u64,
     },
 
-    /// Ajettava koodi rikkoi kyvykkyysrajoitusta tai kyvykkyysjoukko oli
-    /// kelvoton.
+    /// The executed code violated a capability restriction, or the
+    /// capability set was invalid.
     #[error("capability violation: {0}")]
     Capability(String),
 
-    /// Pyydetty toiminto ei ole toteutettu tässä backendissä.
+    /// The requested operation is not implemented in this backend.
     ///
-    /// Oletus-[`NoopSandbox`](crate::NoopSandbox) palauttaa tämän:
-    /// oikea suoritus vaatii `wasmtime`-featuren.
+    /// The default [`NoopSandbox`](crate::NoopSandbox) returns this: real
+    /// execution requires the `wasmtime` feature.
     #[error("not implemented: {0}")]
     NotImplemented(String),
 
-    /// Sandboxin alustus epäonnistui (esim. WASM-moduulin lataus tai
-    /// linkitys).
+    /// Sandbox initialization failed (e.g. WASM module loading or linking).
     #[error("sandbox setup failed: {0}")]
     Setup(String),
 
-    /// Suoritus epäonnistui muusta syystä (esim. WASM-trap, paitsi fuel).
+    /// Execution failed for another reason (e.g. a WASM trap, other than fuel).
     #[error("execution failed: {0}")]
     Execution(String),
 }
 
 impl SandboxError {
-    /// Rakentaa [`SandboxError::FuelExhausted`]-variantin.
+    /// Builds a [`SandboxError::FuelExhausted`] variant.
     #[must_use]
     pub const fn fuel_exhausted(budget: u64, required: u64) -> Self {
         Self::FuelExhausted { budget, required }
     }
 
-    /// Rakentaa [`SandboxError::Capability`]-variantin.
+    /// Builds a [`SandboxError::Capability`] variant.
     pub fn capability(msg: impl Into<String>) -> Self {
         Self::Capability(msg.into())
     }
 
-    /// Rakentaa [`SandboxError::NotImplemented`]-variantin.
+    /// Builds a [`SandboxError::NotImplemented`] variant.
     pub fn not_implemented(msg: impl Into<String>) -> Self {
         Self::NotImplemented(msg.into())
     }
 
-    /// Rakentaa [`SandboxError::Setup`]-variantin.
+    /// Builds a [`SandboxError::Setup`] variant.
     pub fn setup(msg: impl Into<String>) -> Self {
         Self::Setup(msg.into())
     }
 
-    /// Rakentaa [`SandboxError::Execution`]-variantin.
+    /// Builds a [`SandboxError::Execution`] variant.
     pub fn execution(msg: impl Into<String>) -> Self {
         Self::Execution(msg.into())
     }
 
-    /// Onko kyseessä polttoaineen loppuminen.
+    /// Whether this is a fuel exhaustion error.
     #[must_use]
     pub const fn is_fuel_exhausted(&self) -> bool {
         matches!(self, Self::FuelExhausted { .. })
     }
 
-    /// Onko kyseessä toteuttamaton toiminto.
+    /// Whether this is an unimplemented-operation error.
     #[must_use]
     pub const fn is_not_implemented(&self) -> bool {
         matches!(self, Self::NotImplemented(_))
@@ -87,12 +86,13 @@ impl SandboxError {
 }
 
 impl From<SandboxError> for familyclaw_core::FamilyClawError {
-    /// Muuntaa sandbox-virheen alustan keskitettyyn virhetyyppiin.
+    /// Converts a sandbox error into the platform's centralized error type.
     ///
-    /// Kaikki sandbox-virheet kartoittuvat [`familyclaw_core::FamilyClawError::Bus`]:iin tai
-    /// [`familyclaw_core::FamilyClawError::InvalidInput`]:iin sopivimmin: polttoaine ja
-    /// suoritusvirheet ovat ajonaikaisia (Bus), kyvykkyys- ja
-    /// toteutusvirheet kelpaavat syöte-/kelpoisuusvirheiksi.
+    /// All sandbox errors map most naturally onto either
+    /// [`familyclaw_core::FamilyClawError::Bus`] or
+    /// [`familyclaw_core::FamilyClawError::InvalidInput`]: fuel and
+    /// execution errors are runtime errors (Bus), while capability and
+    /// implementation errors qualify as input/validity errors.
     fn from(err: SandboxError) -> Self {
         match err {
             SandboxError::Capability(_) | SandboxError::NotImplemented(_) => {
@@ -103,7 +103,7 @@ impl From<SandboxError> for familyclaw_core::FamilyClawError {
     }
 }
 
-/// Sandboxin tulostyyppi: [`std::result::Result`] jonka virhe on
+/// The sandbox's result type: [`std::result::Result`] whose error is
 /// [`SandboxError`].
 pub type Result<T> = std::result::Result<T, SandboxError>;
 

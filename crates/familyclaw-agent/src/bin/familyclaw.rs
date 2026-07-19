@@ -11,10 +11,10 @@
 //!
 //! Run with: `cargo run -p familyclaw-agent`
 //!
-//! ## Alikomennot
-//! Ilman argumentteja binääri ajaa yllä kuvatun demon. Lisäksi se tarjoaa
-//! `replay`-alikomentoperheen durable-journalien tarkasteluun
-//! (Time Machine — ks. [`familyclaw_agent::replay_cli`]):
+//! ## Subcommands
+//! Without arguments, the binary runs the demo described above. It also
+//! provides the `replay` subcommand family for inspecting durable journals
+//! (Time Machine — see [`familyclaw_agent::replay_cli`]):
 //!
 //! ```text
 //! familyclaw replay inspect --journal <path> [--json]
@@ -23,9 +23,9 @@
 //! familyclaw replay demo    [--dir <path>]
 //! ```
 //!
-//! sekä `import`-alikomennon toisen ajoympäristön datan migraatioon
-//! (ks. [`familyclaw_agent::import_cli`]) — tuodut taidot menevät
-//! **karanteeniin** eivätkä koskaan aktivoidu:
+//! as well as the `import` subcommand for migrating data from another
+//! runtime environment (see [`familyclaw_agent::import_cli`]) — imported
+//! skills go into **quarantine** and are never activated:
 //!
 //! ```text
 //! familyclaw import --from openclaw|hermes --input <path> [--out <dir>] [--json]
@@ -97,16 +97,16 @@ async fn report_memory(name: &str, mem: &ErasedMemoryStore, query: &str) -> Resu
     Ok(())
 }
 
-/// Käsittelee `replay`-alikomennon jos ensimmäinen argumentti on `replay`.
+/// Handles the `replay` subcommand if the first argument is `replay`.
 ///
-/// Palauttaa `Some(exit_code)` kun alikomento tunnistettiin ja suoritettiin
-/// (jolloin kutsuja poistuu ilman että demoa ajetaan), tai `None` kun
-/// argumentteja ei ollut tai ne kuuluvat demolle. Time Machine -polku on
-/// kokonaan synkroninen, joten se ei tarvitse tokio-ajastinta.
+/// Returns `Some(exit_code)` when the subcommand was recognized and
+/// executed (in which case the caller exits without running the demo), or
+/// `None` when there were no arguments or they belong to the demo. The
+/// Time Machine path is entirely synchronous, so it does not need the
+/// tokio runtime.
 ///
-/// Fail-closed: virheellinen syöte tulostaa selkeän virheviestin + usage-
-/// tekstin `stderr`:iin ja palauttaa nollasta poikkeavan paluukoodin. Ei
-/// koskaan paniikkia.
+/// Fail-closed: invalid input prints a clear error message + the usage
+/// text to `stderr` and returns a nonzero return code. Never panics.
 fn try_handle_replay() -> Option<i32> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -115,15 +115,16 @@ fn try_handle_replay() -> Option<i32> {
     }
 }
 
-/// Käsittelee `import`-alikomennon jos ensimmäinen argumentti on `import`.
+/// Handles the `import` subcommand if the first argument is `import`.
 ///
-/// Palauttaa `Some(exit_code)` kun alikomento tunnistettiin ja suoritettiin,
-/// tai `None` muutoin. Migraatiopolku on synkroninen (ei tokio-ajastinta).
+/// Returns `Some(exit_code)` when the subcommand was recognized and
+/// executed, or `None` otherwise. The migration path is synchronous (no
+/// tokio runtime).
 ///
-/// Fail-closed: virheellinen syöte tulostaa selkeän virheviestin + usage-
-/// tekstin `stderr`:iin ja palauttaa nollasta poikkeavan paluukoodin. Ei
-/// koskaan paniikkia. **Turvallisuus:** tuodut taidot menevät karanteeniin
-/// eivätkä koskaan rekisteröidy tai suoritu.
+/// Fail-closed: invalid input prints a clear error message + the usage
+/// text to `stderr` and returns a nonzero return code. Never panics.
+/// **Safety:** imported skills go into quarantine and never register or
+/// execute.
 fn try_handle_import() -> Option<i32> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -132,8 +133,8 @@ fn try_handle_import() -> Option<i32> {
     }
 }
 
-/// Suorittaa `import`-alikomennon jäljellä olevilla argumenteilla ja palauttaa
-/// prosessin paluukoodin (`0` = onnistui).
+/// Executes the `import` subcommand with the remaining arguments and returns
+/// the process's return code (`0` = success).
 fn run_import<I: Iterator<Item = String>>(args: I) -> i32 {
     match import_cli::run(args) {
         Ok(output) => {
@@ -148,8 +149,8 @@ fn run_import<I: Iterator<Item = String>>(args: I) -> i32 {
     }
 }
 
-/// Suorittaa `replay`-alikomennon jäljellä olevilla argumenteilla ja palauttaa
-/// prosessin paluukoodin (`0` = onnistui).
+/// Executes the `replay` subcommand with the remaining arguments and returns
+/// the process's return code (`0` = success).
 fn run_replay<I: Iterator<Item = String>>(args: I) -> i32 {
     match replay_cli::run(args) {
         Ok(output) => {
@@ -167,15 +168,15 @@ fn run_replay<I: Iterator<Item = String>>(args: I) -> i32 {
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Alikomennot ennen demoa: `replay ...` on synkroninen Time Machine -polku.
-    // Ilman argumentteja (tai muilla argumenteilla) ajetaan alla oleva demo
-    // täsmälleen kuten ennen.
+    // Subcommands before the demo: `replay ...` is the synchronous Time
+    // Machine path. Without arguments (or with other arguments) the demo
+    // below runs exactly as before.
     if let Some(code) = try_handle_replay() {
         std::process::exit(code);
     }
 
-    // `import ...` on synkroninen migraatiopolku (OpenClaw/Hermes → FamilyClaw).
-    // Tuodut taidot menevät karanteeniin; muistot saavat matalan luottamuksen.
+    // `import ...` is the synchronous migration path (OpenClaw/Hermes → FamilyClaw).
+    // Imported skills go into quarantine; memories receive low trust.
     if let Some(code) = try_handle_import() {
         std::process::exit(code);
     }

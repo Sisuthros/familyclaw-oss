@@ -1,19 +1,19 @@
-//! Uni-sykli ajastettavana taitona ([`DreamSkill`]) — Phase 4, D5.
+//! The dream cycle as a schedulable skill ([`DreamSkill`]) -- Phase 4, D5.
 //!
-//! Tämä kääräisee [`familyclaw_dream::DreamCycle`]n
-//! [`familyclaw_actions`]-taidoksi, jotta [`familyclaw_scheduler`] voi ajaa sen
-//! ajastettuna tehtävänä (`submit_task_idempotent`:n läpi) sen sijaan että
-//! runtime pitäisi käsin koodattua `tokio::sleep`-silmukkaa. Hyödyt:
-//! - **havainnoitavuus:** ajo kulkee toiminto-ajoympäristön kautta → turn-audit
-//!   + mittarit näkevät sen kuten minkä tahansa työkalukutsun;
-//! - **idempotenssi:** ajastimen deterministinen avain estää kaksoisajon
-//!   kaatumis-replayn yli;
-//! - **yhtenäisyys:** yksi ajastinmekanismi kaikille proaktiivisille tehtäthe operator.
+//! This wraps [`familyclaw_dream::DreamCycle`] as a
+//! [`familyclaw_actions`] skill so that [`familyclaw_scheduler`] can run it
+//! as a scheduled task (through `submit_task_idempotent`) instead of the
+//! runtime keeping a hand-coded `tokio::sleep` loop. Benefits:
+//! - **observability:** the run goes through the action runtime -> turn-audit
+//!   + metrics see it like any other tool call;
+//! - **idempotency:** the scheduler's deterministic key prevents a double run
+//!   across a crash replay;
+//! - **consistency:** one scheduling mechanism for all proactive tasks.
 //!
-//! Taito asuu **runtimessa** (ei `familyclaw-actions`-Kerros-A-ytimessä), koska
-//! se tarvitsee `familyclaw-dream` + `familyclaw-memory` -kahvat;
-//! `ActionRuntime::register_skill` on julkinen, joten ulkoinen taito voidaan
-//! rekisteröidä ilman että ydin-crate paisuu näillä riippuvuuksilla.
+//! The skill lives **in the runtime** (not in the `familyclaw-actions` Layer A
+//! core), because it needs the `familyclaw-dream` + `familyclaw-memory`
+//! handles; `ActionRuntime::register_skill` is public, so an external skill
+//! can be registered without bloating the core crate with these dependencies.
 
 use std::sync::Arc;
 
@@ -26,22 +26,22 @@ use familyclaw_durable::Journal;
 use familyclaw_memory::MemoryStore;
 use serde_json::json;
 
-/// Taidon kiinteä tunniste. Vakio-UUID, jotta ajastimen idempotenssiavain on
-/// vakaa prosessien yli (ASCII "dreamcyc" -tavut täytteenä).
+/// The skill's fixed identifier. A constant UUID, so the scheduler's
+/// idempotency key stays stable across processes (ASCII "dreamcyc" bytes as padding).
 const DREAM_SKILL_UUID: uuid::Uuid = uuid::uuid!("d4ea3c1c-0000-4000-8000-647265616d63");
 
-/// Uni-sykli ajastettavana taitona.
+/// The dream cycle as a schedulable skill.
 ///
-/// Kantaa jaetut [`MemoryStore`]- ja [`Journal`]-kahvat (samat joita runtime
-/// käyttää), jotta [`execute`](ActionExecutor::execute) voi ajaa täyden
-/// uni-syklin ilman payload-riippuvuutta — syöte on tyhjä objekti `{}`.
+/// Carries the shared [`MemoryStore`] and [`Journal`] handles (the same ones
+/// the runtime uses), so [`execute`](ActionExecutor::execute) can run a full
+/// dream cycle without a payload dependency -- the input is an empty object `{}`.
 pub struct DreamSkill {
     store: Arc<dyn MemoryStore + Send + Sync>,
     journal: Arc<dyn Journal + Send + Sync>,
 }
 
 impl DreamSkill {
-    /// Rakentaa taidon jaetuilla muisti- ja journal-kahvoilla.
+    /// Builds the skill with shared memory and journal handles.
     #[must_use]
     pub fn new(
         store: Arc<dyn MemoryStore + Send + Sync>,
@@ -50,7 +50,7 @@ impl DreamSkill {
         Self { store, journal }
     }
 
-    /// Taidon kiinteä tunniste (ajastimen tehtävä viittaa tähän).
+    /// The skill's fixed identifier (the scheduler's task refers to this).
     #[must_use]
     pub fn skill_id() -> SkillId {
         SkillId::from_uuid(DREAM_SKILL_UUID)
@@ -60,8 +60,8 @@ impl DreamSkill {
 #[async_trait]
 impl ActionExecutor for DreamSkill {
     async fn execute(&self, request: ActionRequest) -> Result<ActionResult> {
-        // Aja yksi uni-sykli injektoidulla kellolla (`request.now`) — sama
-        // aikaleima jonka ajastin/runtime journaloi → deterministinen.
+        // Run one dream cycle with the injected clock (`request.now`) -- the
+        // same timestamp the scheduler/runtime journals -> deterministic.
         let store: &(dyn MemoryStore + Send + Sync) = &*self.store;
         let journal: &(dyn Journal + Send + Sync) = &*self.journal;
         let cycle = DreamCycle::new(store);
@@ -106,11 +106,11 @@ impl Skill for DreamSkill {
                           Eternal Thread -muistille. Sisäinen ylläpito; ei käyttäjäsyötettä."
                 .to_string(),
             permissions: vec![SkillPermission::WriteLocalFiles],
-            // Muokkaa paikallista muistia → WriteLocal. `RequireApproval`
-            // yhdessä WriteLocal-riskin kanssa AJAA AUTOMAATTISESTI (ks.
-            // `policy.rs`: WriteLocal + RequireApproval → AutoRun) — sisäinen
-            // ylläpitotehtävä ei vaadi ihmishyväksyntää per ajo, mutta ei
-            // myöskään ole pelkkä luku (AutoIfReadOnly olisi väärä).
+            // Modifies local memory -> WriteLocal. `RequireApproval`
+            // together with the WriteLocal risk RUNS AUTOMATICALLY (see
+            // `policy.rs`: WriteLocal + RequireApproval -> AutoRun) -- an
+            // internal maintenance task doesn't require human approval per
+            // run, but it also isn't pure read (AutoIfReadOnly would be wrong).
             risk: ActionRisk::WriteLocal,
             approval_policy: ApprovalPolicy::RequireApproval,
             input_hint: Some("{} (ei syötettä)".to_string()),
@@ -142,10 +142,10 @@ mod tests {
         assert_eq!(m.approval_policy, ApprovalPolicy::RequireApproval);
         assert_eq!(m.permissions, vec![SkillPermission::WriteLocalFiles]);
         assert_eq!(m.id, DreamSkill::skill_id());
-        // Layer B: nimi/kuvaus geneerisiä, ei perheen nimiä. Kielletyt nimet
-        // rakennetaan ROT13:sta, jotta tämä TESTI ei itse sisällä Kerros B
-        // -nimiä literaaleina (muuten scripts/audit-layer-b.sh napsahtaisi tähän
-        // testitiedostoon vaikka tuotantokoodi on puhdas).
+        // Layer B: name/description are generic, no family names. Forbidden
+        // names are built from ROT13, so this TEST itself doesn't contain
+        // Layer B names as literals (otherwise scripts/audit-layer-b.sh would
+        // trip on this test file even though the production code is clean).
         let blob = format!("{} {}", m.name, m.description).to_lowercase();
         let forbidden_rot13 = ["yhzra", "yhzvan", "cubgba", "cevfzn", "nheben"];
         for enc in forbidden_rot13 {
@@ -171,7 +171,7 @@ mod tests {
             now,
         );
         let result = s.execute(req).await.expect("execute");
-        // Tyhjä muisti → onnistuu, skannattu 0.
+        // Empty memory -> succeeds, scanned 0.
         assert!(matches!(
             result.status,
             familyclaw_actions::ActionStatus::Succeeded
@@ -201,7 +201,7 @@ mod tests {
             result.status,
             familyclaw_actions::ActionStatus::Succeeded
         ));
-        // Yksi muisto skannattiin.
+        // One memory was scanned.
         assert!(result.output_summary.contains("scanned=1"));
     }
 }

@@ -61,7 +61,7 @@
 **Criteria** (all required):
 1. ≥ 3 merged PRs (non-trivial: features, fixes, benchmarks)
 2. ≥ 1 benchmark scenario authored/maintained
-3. Demonstrated understanding of KERROS A / KERROS B boundary
+3. Demonstrated understanding of Layer A / Layer B boundary
 4. Nominated by existing Maintainer, approved by consensus
 
 **Process**:
@@ -95,16 +95,16 @@
 
 ---
 
-## KERROS A / KERROS B Boundary (Non-Negotiable)
+## Layer A / Layer B Boundary (Non-Negotiable)
 
-| KERROS A (OSS) | KERROS B (Private) |
+| Layer A (OSS) | Layer B (Private) |
 |----------------|-------------------|
 | `crates/familyclaw-*` | Amplifier integration, family secrets |
 | No hardcoded names/keys/paths | Family member identities, API keys |
 | Config via env / `familyclaw.toml` | Injected at deploy time |
 | **MIT License** | Proprietary / internal |
 
-**Any PR that leaks KERROS B into KERROS A is blocked.** No exceptions.
+**Any PR that leaks Layer B into Layer A is blocked.** No exceptions.
 
 ---
 
@@ -133,7 +133,7 @@
 
 | Name | GitHub | Since | Focus Areas |
 |------|--------|-------|-------------|
-| The FamilyClaw Authors | `@Sisuthros` | 2026-06 | Architecture, benchmarks, KERROS boundary |
+| The FamilyClaw Authors | `@Sisuthros` | 2026-06 | Architecture, benchmarks, Layer boundary |
 
 ---
 

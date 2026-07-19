@@ -1,30 +1,30 @@
-//! Aito taito: unified-diffin SOVELTAMINEN allowlistatulle tiedostolle (KERROS A).
+//! Real skill: unified-diff APPLICATION to an allowlisted file (Layer A).
 //!
-//! [`FilePatchApply`] on `file_patch`-provider-taidon **aito toteutus** — se
-//! korvaa aiemman deterministisen ehdotus-mockin. Taito **kirjoittaa oikeasti**
-//! sovelletun patchin levylle, mutta vain **allowlistatun juuren alle**, ja
-//! peilaa [`super::file_write::FileWriteAllowlisted`]-taidon tarkkaa
-//! turvallisuusmallia:
+//! [`FilePatchApply`] is the **real implementation** of the `file_patch`-provider
+//! skill — it replaces the earlier deterministic proposal mock. The skill **actually
+//! writes** the applied patch to disk, but only **under an allowlisted root**, and
+//! mirrors the exact security model of the
+//! [`super::file_write::FileWriteAllowlisted`] skill:
 //!
-//! ## Kuormaa kantava turvallisuus: kanonisointi + allowlist
-//! Ennen kirjoitusta kohde **kanonisoidaan** ([`std::fs::canonicalize`], joka
-//! purkaa `..`-segmentit ja seuraa symlinkit todelliseen kohteeseen) ja
-//! varmistetaan että se pysyy jonkin (kanonisoidun) allowlistatun juuren alla.
-//! Kaikki muut kohteet — `..`-pakenemiset ja symlink-pakenemiset — **hylätään**
-//! ennen kirjoitusta. Tyhjä allowlist (oletus) hylkää **kaikki** polut
+//! ## Load-bearing security: canonicalization + allowlist
+//! Before writing, the target is **canonicalized** ([`std::fs::canonicalize`], which
+//! resolves `..` segments and follows symlinks to the real target) and it is
+//! verified that it remains under some (canonicalized) allowlisted root.
+//! Every other target — `..` escapes and symlink escapes — is **rejected**
+//! before writing. An empty allowlist (default) rejects **all** paths
 //! (fail-closed).
 //!
-//! ## Riskiluokka ja hyväksyntä
-//! Riski on [`ActionRisk::WriteLocal`] ja käytäntö
-//! [`ApprovalPolicy::AlwaysRequireApproval`], joten patchin soveltaminen
-//! pysähtyy **aina** ihmisen hyväksyntään ennen suoritusta — putki johtaa
-//! vaatimuksen manifestista, ei payloadista, joten payloadiin upotettu
-//! kehotehyökkäys ei voi ohittaa porttia.
+//! ## Risk class and approval
+//! The risk is [`ActionRisk::WriteLocal`] and the policy is
+//! [`ApprovalPolicy::AlwaysRequireApproval`], so applying a patch **always**
+//! stops for human approval before execution — the pipeline derives the
+//! requirement from the manifest, not the payload, so a prompt injection
+//! embedded in the payload cannot bypass the gate.
 //!
-//! ## Todistepaketti ei sisällä sisältöä
-//! Tulos sisältää vain kanonisen polun **tiivisteen** (SHA-256), sovelluslipun
-//! sekä muutettujen rivien **määrän** — EI koskaan tiedoston tai patchin
-//! sisältöä. Näin todiste ei vuoda kirjoitettua dataa.
+//! ## The evidence package does not contain content
+//! The result contains only a **hash** of the canonical path (SHA-256), the
+//! applied flag, and the **count** of changed lines — NEVER the content of the
+//! file or the patch. This way the evidence does not leak the written data.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -42,74 +42,74 @@ use crate::policy::{ActionRisk, ApprovalPolicy, SkillPermission};
 use super::file_write::FileWriteConfig;
 use super::Skill;
 
-/// Taidon kiinteä tunniste (jaettu aiemman `file_patch`-mockin kanssa, jotta
-/// rekisteröinti ja haku pysyvät taaksepäin-yhteensopivina).
+/// Fixed identifier of the skill (shared with the earlier `file_patch` mock, so
+/// registration and lookup remain backward-compatible).
 const SKILL_UUID: uuid::Uuid = uuid::uuid!("44444444-4444-4444-8444-444444444444");
 
-/// Syöte `file_patch_apply`-taidolle: kohdetiedosto ja unified-diff.
+/// Input for the `file_patch_apply` skill: target file and unified diff.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilePatchApplyInput {
-    /// Kohdetiedoston polku. Kanonisoidaan ja sen on pysyttävä allowlistatun
-    /// juuren alla.
+    /// Path of the target file. Will be canonicalized and must remain under the
+    /// allowlisted root.
     pub path: String,
-    /// Yhtenäinen diff (unified format).
+    /// Unified diff (unified format).
     pub patch: String,
 }
 
-/// Tulos `file_patch_apply`-taidolle: patchin sovelluksen todiste.
+/// Result for the `file_patch_apply` skill: proof that the patch was applied.
 ///
-/// **EI** sisällä tiedoston eikä patchin sisältöä — vain kuormaa kantavat
-/// metatiedot (tiiviste + sovelluslippu + rivimäärä).
+/// **Does NOT** contain the content of the file or the patch — only the
+/// load-bearing metadata (hash + applied flag + line count).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilePatchApplyOutput {
-    /// Kanonisen kohdepolun SHA-256-tiiviste (heksa) — EI raakaa polkua.
+    /// SHA-256 hash of the canonical target path (hex) — NOT the raw path.
     pub path_hash: String,
-    /// `true` jos patch sovellettiin tiedostoon.
+    /// `true` if the patch was applied to the file.
     pub applied: bool,
-    /// Muutettujen rivien lukumäärä (|uusi − vanha|).
+    /// Number of changed lines (|new − old|).
     pub lines_changed: u64,
 }
 
-/// Aito taito: soveltaa unified-diffin allowlistattuun tiedostoon (levykirjoitus).
+/// Real skill: applies a unified diff to an allowlisted file (disk write).
 ///
-/// Riskiluokka on [`ActionRisk::WriteLocal`] ja käytäntö
-/// [`ApprovalPolicy::AlwaysRequireApproval`]: soveltaminen pysähtyy aina
-/// hyväksyntään; allowlistin ulkopuolinen kohde hylätään.
+/// The risk class is [`ActionRisk::WriteLocal`] and the policy is
+/// [`ApprovalPolicy::AlwaysRequireApproval`]: applying always stops for
+/// approval; a target outside the allowlist is rejected.
 #[derive(Debug, Clone, Default)]
 pub struct FilePatchApply {
-    /// Allowlist-kokoonpano (sallitut juuret) — jaettu `file_write`-mallin kanssa.
+    /// Allowlist configuration (allowed roots) — shared with the `file_write` model.
     config: FileWriteConfig,
 }
 
 impl FilePatchApply {
-    /// Luo taidon tyhjällä allowlistilla (hylkää kaikki polut, fail-closed).
+    /// Creates the skill with an empty allowlist (rejects all paths, fail-closed).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Luo taidon annetulla kirjoituskonfiguraatiolla (sallitut juuret).
+    /// Creates the skill with the given write configuration (allowed roots).
     #[must_use]
     pub fn with_config(config: FileWriteConfig) -> Self {
         Self { config }
     }
 
-    /// Taidon kiinteä tunniste.
+    /// Fixed identifier of the skill.
     #[must_use]
     pub fn skill_id() -> SkillId {
         SkillId::from_uuid(SKILL_UUID)
     }
 
-    /// Ratkaisee allowlistatun, kanonisoidun kohdepolun syötteen polusta.
+    /// Resolves the allowlisted, canonicalized target path from the input path.
     ///
     /// # Errors
-    /// [`ActionError::PolicyDenied`] jos allowlist on tyhjä, polkua ei voi
-    /// ratkaista, tai kanoninen kohde ei ole minkään sallitun juuren alla.
+    /// [`ActionError::PolicyDenied`] if the allowlist is empty, the path cannot
+    /// be resolved, or the canonical target is not under any allowed root.
     fn resolve_allowed(&self, requested: &str) -> Result<PathBuf> {
         let roots = self.config.canonical_allow_roots();
         if roots.is_empty() {
             return Err(ActionError::PolicyDenied(
-                "ei sallittuja juuria — patch hylätty (fail-closed)".to_string(),
+                "no allowed roots — patch rejected (fail-closed)".to_string(),
             ));
         }
         let canonical = canonicalize_target(Path::new(requested))?;
@@ -117,16 +117,16 @@ impl FilePatchApply {
             Ok(canonical)
         } else {
             Err(ActionError::PolicyDenied(
-                "patch-kohde on allowlistin ulkopuolella (hylätty)".to_string(),
+                "patch target is outside the allowlist (rejected)".to_string(),
             ))
         }
     }
 
-    /// Soveltaa yksinkertaisen unified-diffin yhteen tiedostoon (puhdas logiikka).
+    /// Applies a simple unified diff to a single file (pure logic).
     ///
-    /// Käsittelee `@@`-hunk-otsakkeet ja niiden sisällä `+` (lisää), `-` (poista)
-    /// ja ` ` (konteksti) rivit. Ei tarvitse tarkkaa rivinumerointia — KERROS A
-    /// -tasolla riittää deterministinen, sisältöpohjainen soveltaminen.
+    /// Handles `@@` hunk headers and, within them, `+` (add), `-` (remove),
+    /// and ` ` (context) lines. Does not need exact line numbering — at the
+    /// Layer A level, deterministic, content-based application is sufficient.
     #[must_use]
     pub fn apply_patch(original: &str, patch: &str) -> String {
         let mut lines: Vec<String> = original.lines().map(ToString::to_string).collect();
@@ -162,21 +162,21 @@ impl FilePatchApply {
     }
 }
 
-/// Onko `path` jonkin annetun juuren alla (tai itse juuri).
+/// Whether `path` is under some given root (or is the root itself).
 fn path_is_under_any(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 
-/// Ratkaisee (mahdollisesti vielä olemattoman) kohdepolun kanonisen muodon.
+/// Resolves the canonical form of the (possibly not-yet-existing) target path.
 ///
-/// Kanonisoi lähimmän olemassa olevan esivanhemman (purkaa `..` ja seuraa
-/// symlinkit) ja liittää siihen jäljellä olevat normaalikomponentit. Torjuu
-/// `..`-segmentit jäljellä olevassa hännässä (ne voisivat paeta juuresta
-/// kulkematta kanonisoinnin kautta).
+/// Canonicalizes the nearest existing ancestor (resolves `..` and follows
+/// symlinks) and appends the remaining normal components to it. Rejects
+/// `..` segments in the remaining tail (they could escape the root without
+/// going through canonicalization).
 ///
 /// # Errors
-/// [`ActionError::PolicyDenied`] jos polku on tyhjä, päättyy `..`:iin, tai jos
-/// yksikään esivanhempi ei kanonisoidu.
+/// [`ActionError::PolicyDenied`] if the path is empty, ends in `..`, or if
+/// no ancestor can be canonicalized.
 fn canonicalize_target(requested: &Path) -> Result<PathBuf> {
     if let Ok(canonical) = std::fs::canonicalize(requested) {
         return Ok(canonical);
@@ -188,11 +188,11 @@ fn canonicalize_target(requested: &Path) -> Result<PathBuf> {
         match existing.parent() {
             Some(parent) => {
                 let file = existing.components().next_back().ok_or_else(|| {
-                    ActionError::PolicyDenied("kohdepolku on tyhjä (hylätty)".to_string())
+                    ActionError::PolicyDenied("target path is empty (rejected)".to_string())
                 })?;
                 if matches!(file, Component::ParentDir) {
                     return Err(ActionError::PolicyDenied(
-                        "'..' kohdepolun lopussa ei sallittu (hylätty)".to_string(),
+                        "'..' at the end of the target path is not allowed (rejected)".to_string(),
                     ));
                 }
                 if matches!(file, Component::Normal(_)) {
@@ -211,15 +211,15 @@ fn canonicalize_target(requested: &Path) -> Result<PathBuf> {
             }
             None => {
                 return Err(ActionError::PolicyDenied(
-                    "kohdepolun esivanhempaa ei voi kanonisoida (hylätty)".to_string(),
+                    "cannot canonicalize an ancestor of the target path (rejected)".to_string(),
                 ));
             }
         }
     }
 }
 
-/// Laskee kanonisen polun SHA-256-tiivisteen heksamerkkijonona (raakapolun
-/// sijasta, jottei mahdollisesti yksityinen polku vuoda todisteeseen).
+/// Computes the SHA-256 hash of the canonical path as a hex string (instead of
+/// the raw path, so that a potentially private path does not leak into the evidence).
 fn hash_path(path: &Path) -> String {
     format!("{:x}", Sha256::digest(path.to_string_lossy().as_bytes()))
 }
@@ -237,8 +237,8 @@ impl ActionExecutor for FilePatchApply {
             }
         };
 
-        // Ratkaise + validoi allowlist. Hylätty kohde → epäonnistunut tulos
-        // (ei virhettä joka kaataisi putken, sama malli kuin file_write).
+        // Resolve + validate the allowlist. A rejected target → a failed result
+        // (not an error that would crash the pipeline, same pattern as file_write).
         let canonical = match self.resolve_allowed(&input.path) {
             Ok(p) => p,
             Err(e) => {
@@ -249,7 +249,7 @@ impl ActionExecutor for FilePatchApply {
             }
         };
 
-        // Lue nykyinen sisältö (puuttuva tiedosto → tyhjä pohja).
+        // Read the current content (missing file → empty base).
         let original = match tokio::fs::read_to_string(&canonical).await {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -277,7 +277,7 @@ impl ActionExecutor for FilePatchApply {
             "lines_changed": lines_changed,
         });
 
-        // Tulos pysyy oletuksena epäluotettavana (ei .trusted()).
+        // The result remains untrusted by default (no .trusted()).
         Ok(ActionResult::success(
             format!("applied unified patch to allowlisted file ({lines_changed} line(s) changed)"),
             output,
@@ -292,10 +292,9 @@ impl Skill for FilePatchApply {
             id: Self::skill_id(),
             name: "file_patch_apply".to_string(),
             version: "2.0.0".to_string(),
-            description:
-                "Soveltaa unified-diffin allowlistatulle tiedostolle (kanonisoitu kohde); \
-                 todiste = polkutiiviste + sovelluslippu + muutettujen rivien määrä, ei sisältöä."
-                    .to_string(),
+            description: "Applies a unified diff to an allowlisted file (canonicalized target); \
+                 proof = path hash + applied flag + number of changed lines, no content."
+                .to_string(),
             permissions: vec![SkillPermission::WriteLocalFiles],
             risk: ActionRisk::WriteLocal,
             approval_policy: ApprovalPolicy::AlwaysRequireApproval,
@@ -306,11 +305,11 @@ impl Skill for FilePatchApply {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Kohdetiedoston polku (kanonisoidaan; on pysyttävä allowlistatun juuren alla)."
+                        "description": "Path of the target file (will be canonicalized; must remain under the allowlisted root)."
                     },
                     "patch": {
                         "type": "string",
-                        "description": "Sovellettava yhtenäinen diff (unified format)."
+                        "description": "The unified diff to apply (unified format)."
                     }
                 },
                 "required": ["path", "patch"],
@@ -333,8 +332,8 @@ mod tests {
         from_unix_secs(secs).expect("valid unix seconds")
     }
 
-    /// Luo eristetyn väliaikaishakemiston (kanonisoituna, jotta macOS
-    /// `/var`→`/private/var`-symlinkit eivät sotke `starts_with`-vertailua).
+    /// Creates an isolated temp directory (canonicalized, so that macOS
+    /// `/var`→`/private/var` symlinks do not mess up the `starts_with` comparison).
     fn temp_dir(tag: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!(
@@ -363,13 +362,13 @@ mod tests {
         assert_eq!(m.risk, ActionRisk::WriteLocal);
         assert_eq!(m.approval_policy, ApprovalPolicy::AlwaysRequireApproval);
         assert_eq!(m.permissions, vec![SkillPermission::WriteLocalFiles]);
-        // AlwaysRequireApproval → policy pakottaa hyväksynnän paikallisellekin
-        // kirjoitukselle.
+        // AlwaysRequireApproval → the policy enforces approval even for a local
+        // write.
         assert_eq!(
             required_approval(m.risk, m.approval_policy),
             ApprovalRequirement::RequireApproval
         );
-        // Geneerinen: ei yksityisiä polkuja manifestissa.
+        // Generic: no private paths in the manifest.
         let rendered = serde_json::to_string(&m).expect("serialize manifest");
         assert!(!rendered.contains(":\\"), "no Windows absolute paths");
         assert!(!rendered.contains("/home/"), "no private home paths");
@@ -424,7 +423,7 @@ mod tests {
             "outside allowlist must be rejected"
         );
         assert!(res.output_summary.contains("rejected"));
-        // Sivuvaikutuksen puuttuminen: tiedostoa ei muutettu.
+        // Absence of side effect: the file was not modified.
         assert_eq!(
             std::fs::read_to_string(&target).expect("read"),
             "seed\n",
@@ -438,7 +437,7 @@ mod tests {
         let file = dir.join("doc.txt");
         std::fs::write(&file, "x\n").expect("seed");
 
-        // Tyhjä allowlist → fail-closed.
+        // Empty allowlist → fail-closed.
         let skill = FilePatchApply::new();
         let res = skill
             .execute(make_request(json!({
@@ -463,8 +462,8 @@ mod tests {
         std::fs::write(base.join("outside.txt"), "orig\n").expect("seed outside");
 
         let skill = FilePatchApply::with_config(FileWriteConfig::new().allow_root(&allowed));
-        // <allowed>/../outside.txt → kanonisoituu <base>/outside.txt (allowlistin
-        // ulkopuolella) → hylätään.
+        // <allowed>/../outside.txt → canonicalizes to <base>/outside.txt (outside
+        // the allowlist) → rejected.
         let traversal = allowed.join("..").join("outside.txt");
         let res = skill
             .execute(make_request(json!({
@@ -484,8 +483,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_symlink_escape() {
-        // Symlink allowlistin SISÄLLÄ joka osoittaa ULKOPUOLELLE — kanonisointi
-        // seuraa linkin ja paljastaa todellisen kohteen ulkopuoliseksi.
+        // A symlink INSIDE the allowlist that points OUTSIDE — canonicalization
+        // follows the link and reveals the real target as being outside.
         let allowed = temp_dir("symlink_allowed");
         let outside = temp_dir("symlink_outside");
         std::fs::write(outside.join("leak.txt"), "orig\n").expect("seed");
@@ -526,14 +525,14 @@ mod tests {
             .expect("execute");
         assert!(res.status.is_success());
 
-        // Tiiviste (64 heksamerkkiä) läsnä, raakaa polkua ei.
+        // Hash (64 hex characters) present, raw path not.
         let hash = res.raw_output_redacted["path_hash"]
             .as_str()
             .expect("path_hash present");
         assert_eq!(hash.len(), 64);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
 
-        // Patchin/tiedoston sisältö EI saa esiintyä todisteessa.
+        // The content of the patch/file must NOT appear in the evidence.
         let rendered = serde_json::to_string(&res.raw_output_redacted).expect("serialize");
         assert!(
             !rendered.contains("must-never-appear-in-proof"),

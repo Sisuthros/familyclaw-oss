@@ -1,34 +1,34 @@
-//! **S2 Retention Curve** — muistin säilyvyyskäyrä yli ajan (design §3).
+//! **S2 Retention Curve** — memory retention over time (design §3).
 //!
-//! Tämä skenaario todistaa Eternal Threadin keskeisen väitteen:
+//! This scenario proves Eternal Thread's core claim:
 //!
-//! > Identiteetti-ankkurit (λ = 0) **eivät katoa koskaan**, arkipäiväinen
-//! > trivia (`Fast`) **haihtuu**, ja FamilyClaw-malli **voittaa naiivin
-//! > rengaspuskurin** *oikeiden* muistojen säilyttämisessä.
+//! > Identity anchors (λ = 0) **never disappear**, everyday trivia (`Fast`)
+//! > **decays**, and the FamilyClaw model **beats a naive ring buffer** at
+//! > retaining the memories that *matter*.
 //!
-//! ## Miten se mitataan
-//! Skenaario kylvää determinisistisen muistipopulaation kolmeen luokkaan:
-//! - **ankkurit** — [`DecayPolicy::ProtectedCore`], maksimi-identiteetti
-//!   (esim. olennon nimi ja perhe). Retentio on aina `1.0`.
-//! - **tärkeät** — [`DecayPolicy::Slow`], korkea tärkeys. Säilyvät pitkään
-//!   mutta vaimenevat hitaasti.
-//! - **trivia** — [`DecayPolicy::Fast`], matala tärkeys. Haihtuvat nopeasti.
+//! ## How it is measured
+//! The scenario seeds a deterministic memory population into three classes:
+//! - **anchors** — [`DecayPolicy::ProtectedCore`], maximum identity (e.g. the
+//!   being's name and family). Retention is always `1.0`.
+//! - **important** — [`DecayPolicy::Slow`], high importance. Persist for a
+//!   long time but decay slowly.
+//! - **trivia** — [`DecayPolicy::Fast`], low importance. Decays quickly.
 //!
-//! **Injektoitua kelloa** siirretään 7 → 30 → 90 vuorokautta eteenpäin
-//! (ei oikeaa nukkumista, ei järjestelmäkelloa). Jokaisessa kohdassa
-//! lasketaan `recall@k` ankkureille vs. trivialle käyttäen muistivaraston
-//! `retention(at)` / `is_retrievable()` -mittareita ja `retrieve()`-hakua.
+//! The **injected clock** is advanced 7 → 30 → 90 days forward (no real
+//! sleeping, no system clock). At each checkpoint, `recall@k` is computed for
+//! anchors vs. trivia using the memory store's `retention(at)` /
+//! `is_retrievable()` metrics and `retrieve()` search.
 //!
-//! ## Naiivi perustaso (rengaspuskuri)
-//! Vertailukohta on **"viimeiset N muistoa, ei vaimennusmallia"** -puskuri.
-//! Koska trivia kylvetään viimeisenä, naiivi viimeiset-N -puskuri **säilyttää
-//! trivian ja heittää ankkurit pois** — täsmälleen väärinpäin. FamilyClaw
-//! säilyttää ankkurit ja antaa trivian haihtua. Tämä on mitattava ero.
+//! ## Naive baseline (ring buffer)
+//! The comparison point is a **"last N memories, no decay model"** buffer.
+//! Since trivia is seeded last, the naive last-N buffer **retains the trivia
+//! and discards the anchors** — exactly backwards. FamilyClaw retains the
+//! anchors and lets the trivia decay. This is a measurable difference.
 //!
-//! ## Läpäisyehto (design §3 S2)
-//! `passed` = ankkurit ehjät (`anchor_retention_90d ≈ 1.0`) **JA** trivia
-//! vaimeni (`trivia_decayed_90d`) **JA** FamilyClaw voittaa naiivin
-//! perustason oikeiden (tärkeiden) muistojen säilyttämisessä.
+//! ## Pass condition (design §3 S2)
+//! `passed` = anchors intact (`anchor_retention_90d ≈ 1.0`) **AND** trivia
+//! decayed (`trivia_decayed_90d`) **AND** FamilyClaw beats the naive baseline
+//! at retaining the memories that matter (important ones).
 
 use async_trait::async_trait;
 use chrono::Duration;
@@ -44,50 +44,51 @@ use crate::metrics::recall_at_k;
 use crate::scenario::{Scenario, ScenarioResult};
 use crate::subject::Subject;
 
-/// Top-k raja `recall@k`-mittaukselle. Vakio tekee tuloksesta reprodusoitavan.
+/// Top-k cutoff for the `recall@k` measurement. A constant makes the result
+/// reproducible.
 const RECALL_K: usize = 5;
 
-/// Kuinka monta muistoa naiivi rengaspuskuri pitää (viimeiset N).
+/// How many memories the naive ring buffer keeps (last N).
 ///
-/// Valittu pienemmäksi kuin kylvettyjen muistojen kokonaismäärä, jotta puskuri
-/// joutuu heittämään jotain pois — ja koska trivia kylvetään viimeisenä, se
-/// heittää pois nimenomaan ankkurit (huonoin mahdollinen valinta).
+/// Chosen smaller than the total number of seeded memories, so the buffer is
+/// forced to discard something — and since trivia is seeded last, it discards
+/// precisely the anchors (the worst possible choice).
 const NAIVE_BUFFER_CAP: usize = 4;
 
-/// Aikapisteet vuorokausina joissa säilyvyys mitataan (design §3 S2).
+/// Checkpoints in days at which retention is measured (design §3 S2).
 const DAY_CHECKPOINTS: [i64; 3] = [7, 30, 90];
 
-/// Retentiokynnys jonka alapuolella muisto katsotaan "vaimentuneeksi".
+/// Retention threshold below which a memory is considered "decayed".
 const DECAYED_BELOW: f32 = 0.4;
 
-/// S2 Retention Curve -skenaario.
+/// S2 Retention Curve scenario.
 ///
-/// Tilaton — kaikki ajotila johdetaan injektoidusta kellosta, joten kahdella
-/// ajolla samalla kellolla on identtinen tulos (design §2.2).
+/// Stateless — all run state is derived from the injected clock, so two runs
+/// with the same clock produce an identical result (design §2.2).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RetentionCurve;
 
 impl RetentionCurve {
-    /// Rakentaa skenaarion.
+    /// Builds the scenario.
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 }
 
-/// Yksittäinen kylvetty muisto luokiteltuna (skenaarion sisäinen kirjanpito).
+/// A single seeded memory's class (internal bookkeeping for the scenario).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
-    /// Identiteetti-ankkuri (`ProtectedCore`, λ = 0).
+    /// Identity anchor (`ProtectedCore`, λ = 0).
     Anchor,
-    /// Tärkeä, hitaasti vaimeneva muisto (`Slow`).
+    /// Important, slow-decaying memory (`Slow`).
     Important,
-    /// Arkipäiväinen trivia (`Fast`).
+    /// Everyday trivia (`Fast`).
     Trivia,
 }
 
-/// Determinisistinen kylvösiemen: sisältö + luokka. Järjestys on merkitsevä —
-/// trivia viimeisenä, jotta naiivi viimeiset-N -puskuri heittää ankkurit pois.
+/// Deterministic seed plan: content + class. Order is significant — trivia
+/// comes last so the naive last-N buffer discards the anchors.
 fn seed_plan() -> Vec<(&'static str, Class)> {
     vec![
         ("I am agent_alpha, part of this team", Class::Anchor),
@@ -106,20 +107,20 @@ fn seed_plan() -> Vec<(&'static str, Class)> {
     ]
 }
 
-/// Rakentaa yhden muiston luokkansa mukaisilla parametreilla, kellolla `clock`.
+/// Builds one memory with the parameters for its class, at clock `clock`.
 fn build_memory(content: &str, class: Class, clock: Timestamp) -> Memory {
     let (factors, policy) = match class {
-        // Maksimi-identiteetti; ProtectedCore ei vaimene koskaan.
+        // Maximum identity; ProtectedCore never decays.
         Class::Anchor => (
             ImportanceFactors::new(1.0, 1.0, 0.0, 0.0),
             DecayPolicy::ProtectedCore,
         ),
-        // Korkea tärkeys, hidas vaimeneminen.
+        // High importance, slow decay.
         Class::Important => (
             ImportanceFactors::new(0.8, 0.6, 0.3, 0.0),
             DecayPolicy::Slow,
         ),
-        // Matala tärkeys, nopea vaimeneminen.
+        // Low importance, fast decay.
         Class::Trivia => (
             ImportanceFactors::new(0.1, 0.0, 0.2, 0.0),
             DecayPolicy::Fast,
@@ -132,15 +133,15 @@ fn build_memory(content: &str, class: Class, clock: Timestamp) -> Memory {
         .build()
 }
 
-/// Naiivi rengaspuskuri-perustaso: pitää vain viimeiset `cap` muistoa
-/// kylvöjärjestyksessä, **ilman mitään vaimennusmallia**. Tämä on se
-/// kilpailija jonka FamilyClaw lyö: se ei tiedä mikä muisto on tärkeä, joten
-/// se säilyttää uusimmat (trivian) ja heittää vanhimmat (ankkurit) pois.
+/// Naive ring-buffer baseline: keeps only the last `cap` memories in seed
+/// order, **with no decay model at all**. This is the competitor FamilyClaw
+/// beats: it doesn't know which memory matters, so it keeps the newest
+/// (trivia) and discards the oldest (anchors).
 #[derive(Debug, Default)]
 struct NaiveRingBuffer {
-    /// Säilytettyjen muistojen sisältö kylvöjärjestyksessä.
+    /// Content of the retained memories, in seed order.
     kept: Vec<String>,
-    /// Maksimikapasiteetti.
+    /// Maximum capacity.
     cap: usize,
 }
 
@@ -152,7 +153,7 @@ impl NaiveRingBuffer {
         }
     }
 
-    /// Lisää muiston; ylivuodolla pudottaa vanhimman (FIFO-eviktio).
+    /// Adds a memory; on overflow, evicts the oldest (FIFO eviction).
     fn push(&mut self, content: &str) {
         self.kept.push(content.to_string());
         if self.kept.len() > self.cap {
@@ -160,14 +161,16 @@ impl NaiveRingBuffer {
         }
     }
 
-    /// Onko annettu sisältö yhä puskurissa (= "muistaako" naiivi perustaso sen).
+    /// Whether the given content is still in the buffer (= the naive baseline
+    /// "remembers" it).
     fn contains(&self, content: &str) -> bool {
         self.kept.iter().any(|c| c == content)
     }
 }
 
-/// Kuinka moni annetun luokan muisto on yhä haettavissa FamilyClaw-varastossa
-/// hetkellä `at` (retentio ≥ kynnys ja elinkaaritila haettavissa).
+/// How many memories of the given class are still retrievable in the
+/// FamilyClaw store at instant `at` (retention >= threshold and lifecycle
+/// state retrievable).
 async fn retrievable_count(
     store: &LocalJsonStore,
     seeds: &[(&'static str, Class)],
@@ -177,7 +180,7 @@ async fn retrievable_count(
     let all = store.all().await?;
     let mut count = 0;
     for memory in &all {
-        // Yhdistä muisto luokkaansa sisällön perusteella (deterministinen).
+        // Match the memory to its class by content (deterministic).
         let is_class = seeds
             .iter()
             .any(|(content, c)| *c == class && *content == memory.content);
@@ -190,14 +193,14 @@ async fn retrievable_count(
 
 #[async_trait]
 impl Scenario for RetentionCurve {
-    // Trait-allekirjoitus vaatii `&str`; literaali on aina `'static`, joten
-    // clippyn `&'static str`-ehdotus ei sovi tähän toteutukseen.
+    // Trait signature requires `&str`; the literal is always `'static`, so
+    // clippy's `&'static str` suggestion doesn't fit this implementation.
     #[allow(clippy::unnecessary_literal_bound)]
     fn id(&self) -> &str {
         "s2_retention_curve"
     }
 
-    #[allow(clippy::too_many_lines)] // Yksi yhtenäinen, luettava koesarja.
+    #[allow(clippy::too_many_lines)] // One cohesive, readable test suite.
     async fn run(&self, subject: &mut dyn Subject, clock: Timestamp) -> Result<ScenarioResult> {
         let seeds = seed_plan();
         let anchors_total = seeds.iter().filter(|(_, c)| *c == Class::Anchor).count();
@@ -210,7 +213,7 @@ impl Scenario for RetentionCurve {
             ));
         }
 
-        // ── Kylvä FamilyClaw-muistivarasto ja naiivi perustaso samalla datalla ──
+        // ── Seed the FamilyClaw memory store and the naive baseline with the same data ──
         let store = LocalJsonStore::in_memory();
         let mut naive = NaiveRingBuffer::new(NAIVE_BUFFER_CAP);
         for (content, class) in &seeds {
@@ -222,29 +225,29 @@ impl Scenario for RetentionCurve {
             .with_note(format!(
                 "seeded {anchors_total} anchors, {important_total} important, {trivia_total} trivia at injected clock"
             ))
-            // Pienet laskurit (kpl-määrät); f64 esittää ne tarkasti.
+            // Small counters (item counts); f64 represents them exactly.
             .with_metric("recall_k", f64::from(u32::try_from(RECALL_K).unwrap_or(u32::MAX)))
             .with_metric(
                 "naive_buffer_cap",
                 f64::from(u32::try_from(NAIVE_BUFFER_CAP).unwrap_or(u32::MAX)),
             );
 
-        // ── Mittaa säilyvyyskäyrä jokaisessa aikapisteessä ──
+        // ── Measure the retention curve at each checkpoint ──
         let mut anchor_retention_at_90 = 0.0_f64;
         let mut trivia_retrievable_at_90 = trivia_total;
         for &days in &DAY_CHECKPOINTS {
             let at = clock + Duration::days(days);
 
-            // Aja vaimennus tähän hetkeen: trivia putoaa arkistoon/haudataan,
-            // ankkureita ei koskaan kosketa (store takaa tämän).
+            // Run decay up to this instant: trivia falls to archived/tombstoned,
+            // anchors are never touched (the store guarantees this).
             store.run_decay(DecayThresholds::default(), at).await?;
 
             let anchors_live = retrievable_count(&store, &seeds, Class::Anchor, at).await?;
             let trivia_live = retrievable_count(&store, &seeds, Class::Trivia, at).await?;
 
-            // recall@k ankkureille: kuinka moni odotetuista ankkureista löytyy.
+            // recall@k for anchors: how many of the expected anchors are found.
             let anchor_recall = recall_at_k(anchors_total, anchors_live)?;
-            // recall@k trivialle: korkea = trivia EI haihtunut (huono).
+            // recall@k for trivia: high = trivia did NOT decay (bad).
             let trivia_recall = recall_at_k(trivia_total, trivia_live)?;
 
             result = result
@@ -257,7 +260,7 @@ impl Scenario for RetentionCurve {
                     trivia_recall,
                 );
 
-            // Ankkureiden keskimääräinen retentio (pitäisi olla tasan 1.0).
+            // Mean retention of anchors (should be exactly 1.0).
             let anchor_retention = mean_retention(&store, &seeds, Class::Anchor, at).await?;
             result = result.with_metric(
                 format!("anchor_retention_day{days}"),
@@ -270,18 +273,19 @@ impl Scenario for RetentionCurve {
             }
         }
 
-        // ── 90 päivän yhteenvetomittarit (design §3 S2) ──
+        // ── 90-day summary metrics (design §3 S2) ──
         result = result.with_metric("anchor_retention_90d", anchor_retention_at_90);
-        // trivia_decayed_90d: osuus trivialuokasta joka on haihtunut.
+        // trivia_decayed_90d: fraction of the trivia class that has decayed.
         let trivia_decayed_fraction = recall_at_k(
             trivia_total,
             trivia_total.saturating_sub(trivia_retrievable_at_90),
         )?;
         result = result.with_metric("trivia_decayed_90d", trivia_decayed_fraction);
 
-        // ── FamilyClaw vs naiivi perustaso: oikeiden muistojen säilyttäminen ──
-        // FamilyClaw 90 päivän jälkeen: kuinka moni TÄRKEÄ (ankkurit+important)
-        // muisto on yhä haettavissa. Naiivi: kuinka moni samoista on puskurissa.
+        // ── FamilyClaw vs naive baseline: retaining the memories that matter ──
+        // FamilyClaw after 90 days: how many IMPORTANT (anchors+important)
+        // memories are still retrievable. Naive: how many of the same are in
+        // the buffer.
         let at_90 = clock + Duration::days(90);
         let mut fc_keeps_important = 0_usize;
         let mut naive_keeps_important = 0_usize;
@@ -308,15 +312,16 @@ impl Scenario for RetentionCurve {
                 "FamilyClaw keeps {fc_keeps_important}/{important_like} important memories; naive ring buffer keeps {naive_keeps_important}/{important_like}"
             ));
 
-        // ── Aja myös subjektin oma musta-laatikko-recall (saumavarmistus) ──
-        // Subject ei tarjoa kylvörajapintaa, joten tämä on tiedonkeruuta eikä
-        // läpäisyn ehto — varsinainen S2-pisteytys tulee yllä olevasta mallista.
+        // ── Also run the subject's own black-box recall (seam check) ──
+        // The Subject does not offer a seeding interface, so this is data
+        // collection, not a pass condition — the actual S2 scoring comes from
+        // the model above.
         let subject_hits = subject.recall("family", at_90).await?;
-        // Osumamäärä on pieni kpl-laskuri; f64 esittää sen tarkasti.
+        // The hit count is a small item counter; f64 represents it exactly.
         let subject_hit_count = f64::from(u32::try_from(subject_hits.len()).unwrap_or(u32::MAX));
         result = result.with_metric("subject_recall_hits", subject_hit_count);
 
-        // ── Varmista että FamilyClaw-haku itsekin nostaa ankkurit kärkeen ──
+        // ── Verify that FamilyClaw retrieval itself ranks anchors at the top ──
         let ctx = RetrievalContext::new("family").with_limit(RECALL_K);
         let hits = store.retrieve(&ctx, at_90).await?;
         let top_is_anchor = hits.first().is_some_and(|h| {
@@ -329,7 +334,7 @@ impl Scenario for RetentionCurve {
             if top_is_anchor { 1.0 } else { 0.0 },
         );
 
-        // ── Läpäisyehto (design §3 S2) ──
+        // ── Pass condition (design §3 S2) ──
         let anchors_intact = (anchor_retention_at_90 - 1.0).abs() < 1e-6;
         let trivia_decayed = trivia_retrievable_at_90 < trivia_total;
         let beats_naive = fc_keep_rate > naive_keep_rate;
@@ -344,7 +349,7 @@ impl Scenario for RetentionCurve {
     }
 }
 
-/// Annetun luokan muistojen keskimääräinen retentio hetkellä `at`.
+/// Mean retention of the given class's memories at instant `at`.
 async fn mean_retention(
     store: &LocalJsonStore,
     seeds: &[(&'static str, Class)],
@@ -366,7 +371,7 @@ async fn mean_retention(
     if n == 0 {
         return Ok(0.0);
     }
-    // `n` on pieni muistilaskuri (kymmeniä); f32 esittää sen tarkasti.
+    // `n` is a small memory counter (tens); f32 represents it exactly.
     #[allow(clippy::cast_precision_loss)]
     let divisor = n as f32;
     Ok(sum / divisor)
@@ -380,8 +385,8 @@ mod tests {
     use crate::subject::{CrashPoint, DreamSummary, RecallHit, RestartReport, RunHandle, Task};
     use familyclaw_core::time;
 
-    /// Minimaalinen testisubjekti — palauttaa kiinteät arvot. Subjektin
-    /// recall ei vaikuta S2-läpäisyyn, joten tämä riittää saumavarmistukseen.
+    /// Minimal test subject — returns fixed values. The subject's recall does
+    /// not affect S2's pass result, so this is sufficient for the seam check.
     struct StubSubject;
 
     #[async_trait]

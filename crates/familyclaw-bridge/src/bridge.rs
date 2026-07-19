@@ -1,12 +1,12 @@
-//! [`FamilyBridge`] — koostava julkisivu agenttirekisterille, tehtävätaululle
-//! ja tapahtumaväylälle.
+//! [`FamilyBridge`] — a composing facade over the agent registry, task board,
+//! and event bus.
 //!
-//! Yksittäiset osat ([`AgentRegistry`], [`TaskBoard`], [`EventBus`]) ovat
-//! käytettävissä myös erikseen, mutta useimmissa tapauksissa halutaan että
-//! tilamuutokset (rekisteröinti, heartbeat, tehtävän luonti, luovutus)
-//! julkaisevat automaattisesti vastaavan [`Event`]in. [`FamilyBridge`] hoitaa
-//! tämän kytkennän ja säilyttää saman säieturvallisuuden (kaikki osat
-//! jakavat tilansa `Arc`:n kautta, joten julkisivun voi kloonata vapaasti).
+//! The individual parts ([`AgentRegistry`], [`TaskBoard`], [`EventBus`]) are
+//! also usable on their own, but in most cases you want state changes
+//! (registration, heartbeat, task creation, handoff) to automatically publish
+//! the corresponding [`Event`]. [`FamilyBridge`] handles this wiring while
+//! preserving the same thread safety (all parts share their state via `Arc`,
+//! so the facade can be cloned freely).
 
 use serde::Serialize;
 
@@ -18,10 +18,10 @@ use crate::agent::{AgentInfo, AgentRegistry, Liveness};
 use crate::event::{Event, EventBus, EventKind, EventSubscriber};
 use crate::task::{Task, TaskBoard, TaskId, TaskStatus};
 
-/// Koostava siltakerroksen julkisivu.
+/// A composing facade over the bridge layer.
 ///
-/// Kapseloi rekisterin, taulun ja väylän, ja julkaisee tapahtumat
-/// tilamuutoksista. Klooni jakaa saman tilan.
+/// Encapsulates the registry, board, and bus, and publishes events for state
+/// changes. A clone shares the same state.
 #[derive(Debug, Clone)]
 pub struct FamilyBridge {
     registry: AgentRegistry,
@@ -35,7 +35,7 @@ impl Default for FamilyBridge {
     }
 }
 
-/// Apurakenne tapahtumahyötykuormille (sarjallistuu JSON-objektiksi).
+/// Helper struct for event payloads (serializes to a JSON object).
 #[derive(Serialize)]
 struct StatusChangePayload {
     task_id: String,
@@ -43,7 +43,7 @@ struct StatusChangePayload {
     to: String,
 }
 
-/// Apurakenne luovutustapahtuman hyötykuormalle.
+/// Helper struct for the handoff event's payload.
 #[derive(Serialize)]
 struct HandoffPayload {
     task_id: String,
@@ -52,7 +52,7 @@ struct HandoffPayload {
 }
 
 impl FamilyBridge {
-    /// Luo uuden sillan oletusasetuksilla.
+    /// Creates a new bridge with default settings.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -62,8 +62,8 @@ impl FamilyBridge {
         }
     }
 
-    /// Rakentaa sillan annetuista osista (esim. mukautettu aikakatkaisu tai
-    /// väyläkapasiteetti).
+    /// Builds a bridge from the given parts (e.g. a custom timeout or bus
+    /// capacity).
     #[must_use]
     pub fn from_parts(registry: AgentRegistry, board: TaskBoard, bus: EventBus) -> Self {
         Self {
@@ -73,36 +73,36 @@ impl FamilyBridge {
         }
     }
 
-    /// Pääsy agenttirekisteriin.
+    /// Access to the agent registry.
     #[must_use]
     pub fn registry(&self) -> &AgentRegistry {
         &self.registry
     }
 
-    /// Pääsy tehtävätauluun.
+    /// Access to the task board.
     #[must_use]
     pub fn board(&self) -> &TaskBoard {
         &self.board
     }
 
-    /// Pääsy tapahtumaväylään.
+    /// Access to the event bus.
     #[must_use]
     pub fn bus(&self) -> &EventBus {
         &self.bus
     }
 
-    /// Tilaa tapahtumaväylän.
+    /// Subscribes to the event bus.
     #[must_use]
     pub fn subscribe(&self) -> EventSubscriber {
         self.bus.subscribe()
     }
 
-    // --- Agentit -----------------------------------------------------------
+    // --- Agents --------------------------------------------------------------
 
-    /// Rekisteröi agentin ja julkaisee [`EventKind::AgentRegistered`].
+    /// Registers an agent and publishes [`EventKind::AgentRegistered`].
     ///
     /// # Errors
-    /// Välittää [`AgentRegistry::register`]in virheet.
+    /// Propagates errors from [`AgentRegistry::register`].
     pub async fn register_agent(&self, info: AgentInfo) -> Result<()> {
         let id = info.id;
         self.registry.register(info).await?;
@@ -111,8 +111,8 @@ impl FamilyBridge {
         Ok(())
     }
 
-    /// Poistaa agentin ja julkaisee [`EventKind::AgentDeregistered`] jos agentti
-    /// oli olemassa.
+    /// Removes an agent and publishes [`EventKind::AgentDeregistered`] if the
+    /// agent existed.
     pub async fn deregister_agent(&self, id: AgentId) -> Option<AgentInfo> {
         let removed = self.registry.deregister(id).await;
         if removed.is_some() {
@@ -122,11 +122,11 @@ impl FamilyBridge {
         removed
     }
 
-    /// Kirjaa heartbeatin hetkellä `at` ja julkaisee
+    /// Records a heartbeat at time `at` and publishes
     /// [`EventKind::AgentHeartbeat`].
     ///
     /// # Errors
-    /// Välittää [`AgentRegistry::heartbeat`]in virheet.
+    /// Propagates errors from [`AgentRegistry::heartbeat`].
     pub async fn heartbeat(&self, id: AgentId, at: Timestamp) -> Result<()> {
         self.registry.heartbeat(id, at).await?;
         self.bus
@@ -134,33 +134,33 @@ impl FamilyBridge {
         Ok(())
     }
 
-    /// Kirjaa heartbeatin nykyhetkellä.
+    /// Records a heartbeat at the current time.
     ///
     /// # Errors
-    /// Välittää [`AgentRegistry::heartbeat`]in virheet.
+    /// Propagates errors from [`AgentRegistry::heartbeat`].
     pub async fn heartbeat_now(&self, id: AgentId) -> Result<()> {
         self.heartbeat(id, time::now()).await
     }
 
-    /// Palauttaa agentin elossaolotilan nykyhetkellä.
+    /// Returns the agent's liveness state at the current time.
     ///
     /// # Errors
-    /// Välittää [`AgentRegistry::liveness`]in virheet.
+    /// Propagates errors from [`AgentRegistry::liveness`].
     pub async fn liveness(&self, id: AgentId) -> Result<Liveness> {
         self.registry.liveness(id).await
     }
 
-    /// Listaa kaikki rekisteröidyt agentit.
+    /// Lists all registered agents.
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
         self.registry.list().await
     }
 
-    // --- Tehtävät ----------------------------------------------------------
+    // --- Tasks -----------------------------------------------------------
 
-    /// Luo tehtävän ja julkaisee [`EventKind::TaskCreated`].
+    /// Creates a task and publishes [`EventKind::TaskCreated`].
     ///
     /// # Errors
-    /// Välittää [`TaskBoard::create`]n virheet.
+    /// Propagates errors from [`TaskBoard::create`].
     pub async fn create_task(
         &self,
         title: impl Into<String>,
@@ -172,11 +172,11 @@ impl FamilyBridge {
         Ok(task)
     }
 
-    /// Vaihtaa tehtävän tilan ja julkaisee [`EventKind::TaskStatusChanged`] jos
-    /// tila tosiasiassa muuttui.
+    /// Changes a task's status and publishes [`EventKind::TaskStatusChanged`]
+    /// if the status actually changed.
     ///
     /// # Errors
-    /// Välittää [`TaskBoard::update_status`]in virheet.
+    /// Propagates errors from [`TaskBoard::update_status`].
     pub async fn update_task_status(&self, id: TaskId, next: TaskStatus) -> Result<Task> {
         let before = self.board.get(id).await.map(|t| t.status);
         let task = self.board.update_status(id, next).await?;
@@ -186,8 +186,8 @@ impl FamilyBridge {
                 from: before.map_or_else(|| "unknown".to_string(), |s| format!("{s:?}")),
                 to: format!("{:?}", task.status),
             };
-            // Hyötykuorman sarjallistus ei voi epäonnistua näille kentille;
-            // virhetilanteessa julkaistaan ilman hyötykuormaa.
+            // Payload serialization cannot fail for these fields; on error,
+            // publish without a payload.
             let event = Event::with_payload(EventKind::TaskStatusChanged, task.assignee, &payload)
                 .unwrap_or_else(|_| Event::new(EventKind::TaskStatusChanged, task.assignee));
             self.bus.publish(event);
@@ -195,11 +195,11 @@ impl FamilyBridge {
         Ok(task)
     }
 
-    /// Luovuttaa tehtävän agentilta `from` agentille `to` ja julkaisee
+    /// Hands off a task from agent `from` to agent `to` and publishes
     /// [`EventKind::TaskHandedOff`].
     ///
     /// # Errors
-    /// Välittää [`TaskBoard::handoff`]in virheet.
+    /// Propagates errors from [`TaskBoard::handoff`].
     pub async fn handoff_task(&self, id: TaskId, from: AgentId, to: AgentId) -> Result<Task> {
         let task = self.board.handoff(id, from, to).await?;
         let payload = HandoffPayload {
@@ -213,7 +213,7 @@ impl FamilyBridge {
         Ok(task)
     }
 
-    /// Listaa kaikki tehtävät.
+    /// Lists all tasks.
     pub async fn list_tasks(&self) -> Vec<Task> {
         self.board.list().await
     }

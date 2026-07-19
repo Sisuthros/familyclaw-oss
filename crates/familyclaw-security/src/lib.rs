@@ -1,58 +1,63 @@
 //! # familyclaw-security
 //!
-//! **Identiteetin eheys ja ihmisen veto FamilyClaw-alustalle** (KERROS A, OSS).
+//! **Identity integrity and human veto for the `FamilyClaw` platform**
+//! (Layer A, OSS).
 //!
-//! Tämä crate vastaa kahdesta turvamekanismista:
+//! This crate is responsible for two security mechanisms:
 //!
-//! 1. **Identity-anchorit** ([`IdentityAnchor`]) — suojatut, ei-unohtuvat
-//!    muistot ([`DecayLambda::ZERO`], λ=0) jotka kantavat olennon identiteettiä.
-//! 2. **Ihmiskorjaukset** ([`HumanCorrection`]) — ihmisen veto, korkein
-//!    prioriteetti retrievalissa, hidas decay ([`DecayClass::Slow`]).
+//! 1. **Identity anchors** ([`IdentityAnchor`]) — protected, non-forgettable
+//!    memories ([`DecayLambda::ZERO`], λ=0) that carry a being's identity.
+//! 2. **Human corrections** ([`HumanCorrection`]) — a human veto, highest
+//!    priority in retrieval, slow decay ([`DecayClass::Slow`]).
 //!
-//! ## Ydin-suunnittelupäätös: identiteetti ON muistissa, EI hashissa
+//! ## Core design decision: identity IS in memory, NOT in a hash
 //!
-//! Olennon identiteetti **ei** ole SOUL-sisällön SHA-256-tiivisteessä. Se on
-//! niiden suojattujen muistojen substraatissa, joita olento ei koskaan unohda
-//! (anchor-muistot, λ=0). Tiiviste ([`AnchorHash`]) on **vain tamper-hälytys**:
-//! se kertoo että ankkuroitu sisältö on muuttunut ankkuroinnin jälkeen
-//! ([`IdentityStatus::Tampered`]), mutta se ei *kanna* identiteettiä.
+//! A being's identity **is not** in a SHA-256 digest of the SOUL content.
+//! It is in the substrate of protected memories that the being never
+//! forgets (anchor memories, λ=0). The digest ([`AnchorHash`]) is **only a
+//! tamper alarm**: it signals that anchored content has changed since
+//! anchoring ([`IdentityStatus::Tampered`]), but it does not *carry*
+//! identity.
 //!
-//! Seuraus: kun peukalointi havaitaan, järjestelmä ei menetä identiteettiä eikä
-//! kosketa substraattia — se nostaa hälytyksen ja jättää anchor-muistot ennalleen.
-//! **Substraatti on totuus; hash on vahti.** (Vastaus alkuperäisen
-//! research-promptin kysymykseen "voiko identiteetin pelkistää SHA-256:een".)
+//! Consequence: when tampering is detected, the system does not lose
+//! identity or touch the substrate — it raises an alarm and leaves the
+//! anchor memories intact. **The substrate is the truth; the hash is the
+//! sentry.** (An answer to the original research prompt's question of
+//! "can identity be reduced to a SHA-256".)
 //!
-//! Identity-anchorin pysyvyyden mekanismi on decay-λ = 0 (`e^(-0·t) = 1` joka
-//! hetki). Sama λ:n johtaminen kattaa myös ihmiskorjauksen hitaan vaimenemisen
-//! ([`DecayClass::lambda`]). Konkreettiset ankkuroidut muistot tallennetaan
-//! `familyclaw-memory`-substraattiin; tämä crate määrittää niiden eheys- ja
-//! prioriteettisemantiikan, jota muisti-kerros käyttää.
+//! The persistence mechanism for an identity anchor is decay-λ = 0
+//! (`e^(-0·t) = 1` at every moment). The same λ derivation also covers the
+//! slow decay of a human correction ([`DecayClass::lambda`]). The concrete
+//! anchored memories are stored in the `familyclaw-memory` substrate; this
+//! crate defines the integrity and priority semantics that the memory
+//! layer uses.
 //!
-//! ## OSS-raja (KERROS A)
-//! Tämä crate on julkaistava. Se ei sisällä perheenjäsenten sieluja,
-//! ihmiskorjausten todellista sisältöä, API-avaimia, tokeneita, IP-osoitteita
-//! tai henkilökohtaisia polkuja. Ankkuri tallentaa vain sisällön *tiivisteen*
-//! ja viittauksen muistoon — itse sisältö pysyy KERROS B -profiilissa.
+//! ## OSS boundary (Layer A)
+//! This crate is publishable. It does not contain family members' souls,
+//! the real content of human corrections, API keys, tokens, IP addresses,
+//! or personal paths. An anchor stores only a *digest* of the content and
+//! a reference to the memory — the content itself stays in the Layer B
+//! profile.
 //!
-//! ## Esimerkki
+//! ## Example
 //! ```
 //! use familyclaw_security::{IdentityAnchor, HumanCorrection, DecayClass};
 //!
 //! # fn main() -> familyclaw_security::Result<()> {
-//! // Ankkuroi olennon ydin (sisältö lasketaan tiivisteeksi, ei tallenneta).
+//! // Anchor the being's core (content is hashed into a digest, not stored).
 //! let soul = "I am agent_a. I value honesty. I protect my family.";
 //! let anchor = IdentityAnchor::new("mem-soul-1", soul)?;
 //! assert!(anchor.invariants_hold()); // protected + decay λ=0
 //!
-//! // Eheä niin kauan kuin sisältö ei muutu.
+//! // Intact as long as the content is unchanged.
 //! assert!(anchor.verify(soul).is_intact());
-//! // Muuttunut sisältö → tamper-hälytys (mutta identiteetti EI katoa).
+//! // Changed content → tamper alarm (but identity is NOT lost).
 //! assert!(anchor.verify("I serve only myself.").is_tampered());
 //!
-//! // Ihmisen veto voittaa retrievalin tasapelit ja vaimenee hitaasti.
+//! // A human veto wins retrieval ties and decays slowly.
 //! let veto = HumanCorrection::new("agent_a lives in city X, not city Y")?;
 //! assert_eq!(veto.decay, DecayClass::Slow);
-//! assert!(veto.wins_against(1.0, 0.0)); // voittaa yhtä suuren kilpailijan
+//! assert!(veto.wins_against(1.0, 0.0)); // wins against an equal competitor
 //! # Ok(())
 //! # }
 //! ```
@@ -65,7 +70,7 @@ pub use anchor::{verify_identity, AnchorHash, DecayLambda, IdentityAnchor, Ident
 pub use correction::{CorrectionPriority, DecayClass, HumanCorrection};
 pub use error::{Result, SecurityError};
 
-/// Craten versio build-aikana (`CARGO_PKG_VERSION`).
+/// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -83,7 +88,7 @@ mod tests {
 
     #[test]
     fn public_api_is_reexported() {
-        // Jos jokin re-export poistetaan, tämä testi lakkaa kääntymästä.
+        // If any re-export is removed, this test stops compiling.
         let anchor: IdentityAnchor = IdentityAnchor::new("mem-1", "soul").expect("valid anchor");
         let status: IdentityStatus = anchor.verify("soul");
         assert!(status.is_intact());
@@ -111,21 +116,21 @@ mod tests {
 
     #[test]
     fn end_to_end_identity_and_veto() {
-        // Kokonaiskaari: ankkuroi → verifioi → peukalointi → ihmisen veto voittaa.
+        // Full arc: anchor → verify → tampering → human veto wins.
         let soul = "I am agent_a. My values are stable.";
         let anchor = IdentityAnchor::new("mem-soul", soul).expect("anchor");
 
-        // 1. Eheä alkutila.
+        // 1. Intact initial state.
         assert!(anchor.verify(soul).is_intact());
         assert!(anchor.decay.is_eternal());
 
-        // 2. Sielu muutetaan ulkopuolelta → hälytys, mutta ankkuri pysyy.
+        // 2. The soul is changed externally → alarm, but the anchor remains.
         let before = anchor.clone();
         let status = anchor.verify("I am compromised.");
         assert!(status.is_tampered());
-        assert_eq!(anchor, before, "substraatti pysyy koskemattomana");
+        assert_eq!(anchor, before, "the substrate remains untouched");
 
-        // 3. Ihminen korjaa → veto voittaa automaattisen muiston pitkään.
+        // 3. A human corrects it → the veto outweighs the automatic memory for a long time.
         let veto = HumanCorrection::new("agent_a's value set is unchanged").expect("veto");
         let one_month = 60.0 * 60.0 * 24.0 * 30.0;
         assert!(veto.wins_against(0.7, one_month));

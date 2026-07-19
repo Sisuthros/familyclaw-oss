@@ -1,35 +1,35 @@
-//! Virhetyypit MCP-asiakkaalle (KERROS A).
+//! Error types for the MCP client (Layer A).
 
 use thiserror::Error;
 
-/// MCP-asiakkaan virhe.
+/// An MCP client error.
 #[derive(Debug, Error)]
 pub enum McpError {
-    /// Ympäristömuuttujan jäsennys epäonnistui.
+    /// Parsing an environment variable failed.
     #[error("ympäristön jäsennys: {0}")]
     EnvParse(String),
-    /// Prosessin käynnistys epäonnistui.
+    /// Spawning a process failed.
     #[error("prosessin käynnistys: {0}")]
     ProcessSpawn(String),
-    /// JSON-RPC-viestin lähetys epäonnistui.
+    /// Sending a JSON-RPC message failed.
     #[error("lähetys: {0}")]
     TransportSend(String),
-    /// JSON-RPC-vastauksen lukeminen epäonnistui.
+    /// Reading a JSON-RPC response failed.
     #[error("vastaanotto: {0}")]
     TransportRecv(String),
-    /// JSON-RPC-vastaus sisälsi virheen.
+    /// The JSON-RPC response contained an error.
     #[error("json-rpc virhe: {0}")]
     JsonRpc(String),
-    /// Odotettu JSON-kenttä puuttui tai oli väärää tyyppiä.
+    /// An expected JSON field was missing or had the wrong type.
     #[error("protokolla: {0}")]
     Protocol(String),
-    /// HTTP-kuljetus ei ole käytössä (feature `http` pois).
+    /// The HTTP transport is not enabled (the `http` feature is off).
     #[error("http-kuljetus ei käytössä (käännä feature http)")]
     HttpDisabled,
-    /// Toimintoajoympäristön rekisteröinti epäonnistui.
+    /// Registering a skill with the action runtime failed.
     #[error("skill-rekisteröinti: {0}")]
     SkillRegister(String),
 }
 
-/// Crate-kohtainen [`Result`].
+/// This crate's [`Result`] alias.
 pub type Result<T> = std::result::Result<T, McpError>;

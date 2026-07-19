@@ -1,44 +1,44 @@
-//! Ajastetun tehtävän määrittely ([`ScheduledTask`]) ja sen tunniste
+//! Definition of a scheduled task ([`ScheduledTask`]) and its identifier
 //! ([`ScheduledTaskId`]).
 //!
-//! Tehtävä on puhdas data-arvo: se kuvaa **mitä** taitoa ajetaan, **millä**
-//! payloadilla, **kuinka usein** (intervalli) ja **kenen** nimissä. Tehtävä ei
-//! itse suorita mitään — erääntyminen ([`crate::decision`]) ja lähetys
-//! ([`crate::dispatch`]) ovat erillisiä.
+//! A task is a pure data value: it describes **what** skill to run, **with
+//! what** payload, **how often** (interval), and **on whose behalf**. The
+//! task doesn't execute anything itself — due-checking ([`crate::decision`])
+//! and dispatch ([`crate::dispatch`]) are separate concerns.
 
 use chrono::Duration;
 use familyclaw_actions::SkillId;
 use serde_json::Value;
 use uuid::Uuid;
 
-/// Ajastetun tehtävän vakaa tunniste.
+/// Stable identifier for a scheduled task.
 ///
-/// Erillinen newtype [`Uuid`]-arvon päällä, jotta kääntäjä estää sekoittamisen
-/// muihin tunnisteisiin. Tunniste on **vakaa**: se on osa idempotenssiavainta
-/// ([`crate::decision::firing_key`]), joten saman loogisen tehtävän on
-/// säilytettävä sama `ScheduledTaskId` yli prosessin restartin, jotta
-/// kaatumiskestävä deduplikointi toimii.
+/// A distinct newtype wrapping a [`Uuid`] value, so the compiler prevents
+/// mixing it up with other identifiers. The identifier is **stable**: it's
+/// part of the idempotency key ([`crate::decision::firing_key`]), so the same
+/// logical task must keep the same `ScheduledTaskId` across a process
+/// restart for crash-resistant deduplication to work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScheduledTaskId(Uuid);
 
 impl ScheduledTaskId {
-    /// Luo uuden satunnaisen (`v4`) tunnisteen.
+    /// Creates a new random (`v4`) identifier.
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
-    /// Kääri olemassa olevan [`Uuid`]-arvon tähän tunnistetyyppiin.
+    /// Wraps an existing [`Uuid`] value into this identifier type.
     ///
-    /// Käytä tätä kun tunniste pitää johtaa vakaasti pysyvästä lähteestä
-    /// (esim. konfiguraatiosta), jotta sama looginen tehtävä saa saman
-    /// tunnisteen yli restartin.
+    /// Use this when the identifier needs to be derived deterministically
+    /// from a persistent source (e.g. configuration), so the same logical
+    /// task gets the same identifier across a restart.
     #[must_use]
     pub const fn from_uuid(uuid: Uuid) -> Self {
         Self(uuid)
     }
 
-    /// Palauttaa sisällä olevan [`Uuid`]-arvon.
+    /// Returns the wrapped [`Uuid`] value.
     #[must_use]
     pub const fn as_uuid(&self) -> &Uuid {
         &self.0
@@ -46,7 +46,7 @@ impl ScheduledTaskId {
 }
 
 impl Default for ScheduledTaskId {
-    /// Oletuksena uusi satunnainen tunniste.
+    /// Defaults to a new random identifier.
     fn default() -> Self {
         Self::new()
     }
@@ -58,61 +58,62 @@ impl std::fmt::Display for ScheduledTaskId {
     }
 }
 
-/// Yksittäinen toistuvasti laukaistava työkalutehtävä.
+/// A single, repeatedly-firing tool task.
 ///
-/// Tehtävä laukeaa kun edellisestä laukaisusta on kulunut vähintään
-/// [`ScheduledTask::interval`] (ks. [`crate::decision`]). Laukaisu reititetään
-/// taidon ([`ScheduledTask::skill_id`]) ja payloadin
-/// ([`ScheduledTask::payload`]) kanssa idempotentin lähetyksen läpi olennon
-/// ([`ScheduledTask::being_id`]) nimissä.
+/// The task fires once at least [`ScheduledTask::interval`] has elapsed
+/// since the previous firing (see [`crate::decision`]). Firing is routed
+/// through idempotent dispatch together with the skill
+/// ([`ScheduledTask::skill_id`]) and payload ([`ScheduledTask::payload`]),
+/// on behalf of the being ([`ScheduledTask::being_id`]).
 #[derive(Debug, Clone)]
 pub struct ScheduledTask {
-    /// Tehtävän vakaa tunniste (osa idempotenssiavainta).
+    /// The task's stable identifier (part of the idempotency key).
     pub id: ScheduledTaskId,
-    /// Suoritettavan taidon tunniste toimintopinon rekisterissä.
+    /// Identifier of the skill to execute, in the action stack's registry.
     pub skill_id: SkillId,
-    /// Taidolle annettava payload (geneerinen JSON-arvo).
+    /// The payload passed to the skill (a generic JSON value).
     pub payload: Value,
-    /// Aikaväli laukaisujen välillä. Oletetaan positiiviseksi; ei-positiivinen
-    /// intervalli kohdellaan "aina erääntyneenä" ([`crate::decision`]).
+    /// The interval between firings. Assumed to be positive; a
+    /// non-positive interval is treated as "always due"
+    /// (see [`crate::decision`]).
     ///
-    /// Ohitetaan kun [`cron_expression`] on asetettu — silloin erääntyminen
-    /// johdetaan cron-lausekkeesta.
+    /// Ignored when [`cron_expression`] is set — in that case, due-checking
+    /// is derived from the cron expression instead.
     pub interval: Duration,
-    /// Valinnainen cron-lauseke (esim. `"0 * * * *"`). Kun asetettu, tehtävä
-    /// laukeaa cron-aikataulun mukaan ([`crate::decision`]); muuten käytetään
-    /// [`interval`]:ia (taaksepäin-yhteensopiva oletus).
+    /// Optional cron expression (e.g. `"0 * * * *"`). When set, the task
+    /// fires according to the cron schedule ([`crate::decision`]); otherwise
+    /// [`interval`] is used (backward-compatible default).
     pub cron_expression: Option<String>,
-    /// Olennon (being) geneerinen tunniste jonka nimissä lähetys tehdään
-    /// (rate-limit-laskentaa varten toimintopinossa).
+    /// Generic identifier of the being on whose behalf dispatch happens
+    /// (used for rate-limit accounting in the action stack).
     pub being_id: String,
-    /// **Perhe-agency-kontrolli (Phase 4): onko tehtävä aktiivinen.**
+    /// **Family-agency control (Phase 4): whether the task is active.**
     ///
-    /// `true` (oletus) = tehtävä laukeaa normaalisti. `false` = ajastin
-    /// **ohittaa** sen ([`crate::decision::decide`] palauttaa `due=false`), kunnes
-    /// se taas otetaan käyttöön. Tämä on **kill-switch / opt-in**: ihminen voi
-    /// pysäyttää proaktiivisen ajastetun tehtävän ajamatta alas koko ajastinta.
-    /// Tila on osa tehtävämäärittelyä, joten operaattoripinta voi kytkeä sen
-    /// päälle/pois ja persistoida valinnan.
+    /// `true` (default) = the task fires normally. `false` = the scheduler
+    /// **skips** it ([`crate::decision::decide`] returns `due=false`) until
+    /// it's re-enabled. This is a **kill switch / opt-in**: a human can stop
+    /// a proactive scheduled task without shutting down the whole scheduler.
+    /// This state is part of the task definition, so an operator surface can
+    /// toggle it on/off and persist the choice.
     pub enabled: bool,
-    /// **Perhe-agency-kontrolli (Phase 4): vanhene-jos-ei-ihmistä.**
+    /// **Family-agency control (Phase 4): expire-if-no-human.**
     ///
-    /// Jos asetettu, tehtävä **lakkaa laukeamasta** kun edellisestä
-    /// ihmisaktiivisuudesta on kulunut yli tämän verran aikaa
-    /// ([`crate::decision::decide`] palauttaa `due=false`). Tämä estää
-    /// proaktiivista agenttia jatkamasta autonomisesti tyhjään huoneeseen:
-    /// kun ihminen ei ole läsnä, ajastetut tehtävät hiljenevät itsestään ja
-    /// heräävät taas kun ihminen palaa (aktiivisuus päivittyy → ei enää
-    /// vanhentunut). `None` (oletus) = ei vanhene koskaan idleen.
+    /// If set, the task **stops firing** once more than this amount of time
+    /// has passed since the last human activity ([`crate::decision::decide`]
+    /// returns `due=false`). This prevents a proactive agent from continuing
+    /// to act autonomously into an empty room: when no human is present,
+    /// scheduled tasks go quiet on their own and wake up again once a human
+    /// returns (activity refreshes -> no longer expired). `None` (default) =
+    /// never expires due to idleness.
     pub expire_after_idle: Option<Duration>,
 }
 
 impl ScheduledTask {
-    /// Rakentaa uuden ajastetun tehtävän satunnaisella tunnisteella.
+    /// Builds a new scheduled task with a random identifier.
     ///
-    /// Käytä [`ScheduledTask::with_id`]:tä jos tarvitset vakaan, yli restartin
-    /// säilyvän tunnisteen (kaatumiskestävä deduplikointi vaatii vakaan
-    /// tunnisteen).
+    /// Use [`ScheduledTask::with_id`] if you need a stable identifier that
+    /// survives a restart (crash-resistant deduplication requires a stable
+    /// identifier).
     #[must_use]
     pub fn new(
         skill_id: SkillId,
@@ -132,10 +133,10 @@ impl ScheduledTask {
         }
     }
 
-    /// Rakentaa uuden ajastetun tehtävän **annetulla vakaalla** tunnisteella.
+    /// Builds a new scheduled task with a **given, stable** identifier.
     ///
-    /// Tämä on suositeltu tapa tuotannossa: vakaa tunniste pitää
-    /// idempotenssiavaimen samana yli prosessin restartin.
+    /// This is the recommended approach in production: a stable identifier
+    /// keeps the idempotency key the same across a process restart.
     #[must_use]
     pub fn with_id(
         id: ScheduledTaskId,
@@ -156,30 +157,30 @@ impl ScheduledTask {
         }
     }
 
-    /// Asettaa cron-lausekkeen ja palauttaa `self` ketjutusta varten.
+    /// Sets the cron expression and returns `self` for chaining.
     ///
-    /// Kun asetettu, [`crate::decision`] käyttää cron-erääntymistä
-    /// [`ScheduledTask::interval`]:in sijaan.
+    /// When set, [`crate::decision`] uses cron-based due-checking instead
+    /// of [`ScheduledTask::interval`].
     #[must_use]
     pub fn with_cron_expression(mut self, cron_expression: impl Into<String>) -> Self {
         self.cron_expression = Some(cron_expression.into());
         self
     }
 
-    /// Asettaa [`ScheduledTask::enabled`]-tilan (perhe-agency-kontrolli).
+    /// Sets the [`ScheduledTask::enabled`] state (family-agency control).
     ///
-    /// `with_enabled(false)` = kill-switch: ajastin ohittaa tehtävän kunnes se
-    /// taas otetaan käyttöön. Palauttaa `self` ketjutusta varten.
+    /// `with_enabled(false)` = kill switch: the scheduler skips the task
+    /// until it's re-enabled. Returns `self` for chaining.
     #[must_use]
     pub const fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
     }
 
-    /// Asettaa [`ScheduledTask::expire_after_idle`]:n (perhe-agency:
-    /// vanhene-jos-ei-ihmistä). Tehtävä lakkaa laukeamasta kun edellisestä
-    /// ihmisaktiivisuudesta on kulunut yli `idle`; herää kun ihminen palaa.
-    /// Palauttaa `self` ketjutusta varten.
+    /// Sets [`ScheduledTask::expire_after_idle`] (family-agency:
+    /// expire-if-no-human). The task stops firing once more than `idle` has
+    /// passed since the last human activity; it wakes up again once a human
+    /// returns. Returns `self` for chaining.
     #[must_use]
     pub const fn with_expire_after_idle(mut self, idle: Duration) -> Self {
         self.expire_after_idle = Some(idle);
@@ -204,7 +205,7 @@ mod tests {
         let raw = Uuid::from_u128(42);
         let id = ScheduledTaskId::from_uuid(raw);
         assert_eq!(id.as_uuid(), &raw);
-        // Sama lähde-uuid → sama tunniste (vakaus yli restartin).
+        // Same source uuid -> same identifier (stability across a restart).
         assert_eq!(id, ScheduledTaskId::from_uuid(raw));
     }
 

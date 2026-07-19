@@ -1,148 +1,150 @@
-//! Kevyt mittarirekisteri ([`MetricsRegistry`]) ja sen mittarityypit
+//! A lightweight metrics registry ([`MetricsRegistry`]) and its metric types
 //! ([`Counter`], [`Gauge`], [`Histogram`]).
 //!
-//! Tämä moduuli toteuttaa **käsin kirjoitetun Prometheus-tekstiviennin** ilman
-//! raskaita `metrics`-/`opentelemetry`-pinoja (sanat tarkoituksella ilman
-//! linkkiä) — `FamilyClaw` arvostaa pieniä
-//! (2–8 MB) binäärejä. Mittarit ovat atomisia (`AtomicU64`/`AtomicI64`) ja
-//! rekisteri jakaa kahvat `Arc`:n kautta, joten useat säikeet voivat päivittää
-//! samaa mittaria lukkojen kanssa kilpailematta päivityspolulla.
+//! This module implements a **hand-written Prometheus text export** without
+//! the heavy `metrics`/`opentelemetry` stacks (deliberately unlinked words) —
+//! `FamilyClaw` values a small
+//! (2-8 MB) binary. Metrics are atomic (`AtomicU64`/`AtomicI64`) and the
+//! registry shares handles via `Arc`, so multiple threads can update the
+//! same metric without lock contention on the update path.
 //!
-//! ## Periaatteet
-//! - **Idempotentit kahvat.** `counter(name)`/`gauge(name)`/`histogram(name)`
-//!   palauttavat *saman* kahvan samalle nimelle (get-or-create). Kahva on
-//!   `Arc`-jaettu, joten klooni näkee samat luvut.
-//! - **Deterministinen vienti.** [`MetricsRegistry::prometheus_export`]
-//!   järjestää mittarit nimen mukaan, joten tuloste on vakaa (helppo
-//!   golden-string-testata).
-//! - **Ei lukkoja kuumalla polulla.** Vain rekisterin nimi→kahva-haku ottaa
-//!   lukon; itse inkrementit ovat lukkovapaita atomeja.
+//! ## Principles
+//! - **Idempotent handles.** `counter(name)`/`gauge(name)`/`histogram(name)`
+//!   return the *same* handle for the same name (get-or-create). The handle
+//!   is `Arc`-shared, so a clone sees the same values.
+//! - **Deterministic export.** [`MetricsRegistry::prometheus_export`]
+//!   orders metrics by name, so the output is stable (easy to
+//!   golden-string test).
+//! - **No locks on the hot path.** Only the registry's name-to-handle lookup
+//!   takes a lock; the increments themselves are lock-free atomics.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-/// Monotonisesti kasvava laskuri.
+/// A monotonically increasing counter.
 ///
-/// Sopii kumulatiivisille tapahtumamäärille (esim. luodut tehtävät,
-/// LLM-kutsut). Arvo on `u64` ja päivitykset ovat atomisia.
+/// Suited to cumulative event counts (e.g. tasks created,
+/// LLM calls). The value is `u64` and updates are atomic.
 #[derive(Debug, Clone, Default)]
 pub struct Counter {
     value: Arc<AtomicU64>,
 }
 
 impl Counter {
-    /// Luo uuden laskurin arvolla `0`.
+    /// Creates a new counter with value `0`.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Kasvattaa laskuria yhdellä.
+    /// Increments the counter by one.
     pub fn inc(&self) {
         self.inc_by(1);
     }
 
-    /// Kasvattaa laskuria annetulla määrällä.
+    /// Increments the counter by the given amount.
     pub fn inc_by(&self, delta: u64) {
         self.value.fetch_add(delta, Ordering::Relaxed);
     }
 
-    /// Palauttaa laskurin nykyarvon.
+    /// Returns the counter's current value.
     #[must_use]
     pub fn get(&self) -> u64 {
         self.value.load(Ordering::Relaxed)
     }
 }
 
-/// Vapaasti kasvava ja laskeva mittari (gauge).
+/// A metric that can freely go up and down (gauge).
 ///
-/// Sopii hetkellisille arvoille jotka voivat nousta ja laskea (esim. online
-/// olevien agenttien määrä). Arvo on etumerkillinen `i64`.
+/// Suited to instantaneous values that can rise and fall (e.g. the number
+/// of online agents). The value is a signed `i64`.
 #[derive(Debug, Clone, Default)]
 pub struct Gauge {
     value: Arc<AtomicI64>,
 }
 
 impl Gauge {
-    /// Luo uuden gaugen arvolla `0`.
+    /// Creates a new gauge with value `0`.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Asettaa gaugen arvon.
+    /// Sets the gauge's value.
     pub fn set(&self, value: i64) {
         self.value.store(value, Ordering::Relaxed);
     }
 
-    /// Lisää gaugeen annetun (positiivisen) määrän.
+    /// Adds the given (positive) amount to the gauge.
     pub fn add(&self, delta: i64) {
         self.value.fetch_add(delta, Ordering::Relaxed);
     }
 
-    /// Vähentää gaugesta annetun määrän.
+    /// Subtracts the given amount from the gauge.
     pub fn sub(&self, delta: i64) {
         self.value.fetch_sub(delta, Ordering::Relaxed);
     }
 
-    /// Palauttaa gaugen nykyarvon.
+    /// Returns the gauge's current value.
     #[must_use]
     pub fn get(&self) -> i64 {
         self.value.load(Ordering::Relaxed)
     }
 }
 
-/// Histogrammin kiinteät yläraja-ämpärit (`le`, "less than or equal").
+/// The histogram's fixed upper-bound buckets (`le`, "less than or equal").
 ///
-/// Arvot ovat sekunteja (Prometheus-konventio kestoille), mutta histogrammia
-/// voi käyttää mille tahansa ei-negatiiviselle suureelle.
+/// Values are in seconds (the Prometheus convention for durations), but the
+/// histogram can be used for any non-negative quantity.
 const DEFAULT_BUCKETS: [f64; 11] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
-/// Histogrammi kiinteillä ämpäreillä.
+/// A histogram with fixed buckets.
 ///
-/// Tallentaa kumulatiivisen `le`-ämpärijakauman, havaintojen summan ja
-/// kokonaismäärän — kaikki Prometheus-yhteensopivassa muodossa. Ämpärirajat
-/// lukitaan luontihetkellä, joten rajat ovat vakaat koko mittarin eliniän.
+/// Stores the cumulative `le`-bucket distribution, the sum of observations,
+/// and the total count — all in Prometheus-compatible form. Bucket bounds
+/// are locked in at creation time, so the bounds stay stable for the
+/// metric's entire lifetime.
 #[derive(Debug, Clone)]
 pub struct Histogram {
-    /// Ämpärien ylärajat nousevassa järjestyksessä (jaettu, muuttumaton).
+    /// Bucket upper bounds in ascending order (shared, immutable).
     bounds: Arc<[f64]>,
-    /// Per-ämpäri-laskurit (ei-kumulatiiviset; vienti kumuloi ne).
+    /// Per-bucket counters (non-cumulative; export cumulates them).
     counts: Arc<[AtomicU64]>,
-    /// Havaintojen summa millihavaintoina skaalattuna (ks. [`Histogram::sum`]).
+    /// Sum of observations, scaled as milli-observations (see [`Histogram::sum`]).
     sum_milli: Arc<AtomicU64>,
-    /// Havaintojen kokonaismäärä.
+    /// Total number of observations.
     count: Arc<AtomicU64>,
 }
 
-/// Summan kiinteäpistemuunnoksen skaala (3 desimaalia).
+/// The fixed-point conversion scale for the sum (3 decimal places).
 ///
-/// `f64`-summaa ei voi tallentaa atomisesti turvallisesti ilman lukkoa, joten
-/// summa pidetään kokonaislukuna (`arvo * 1000`). Tämä riittää Prometheus-
-/// kestoille (millisekuntiresoluutio) ja tekee summasta deterministisen.
+/// An `f64` sum cannot be stored atomically and safely without a lock, so
+/// the sum is kept as an integer (`value * 1000`). This is sufficient for
+/// Prometheus durations (millisecond resolution) and makes the sum
+/// deterministic.
 const SUM_SCALE: f64 = 1000.0;
 
-/// `u64::MAX` lähimpänä `f64`-arvona (≈ 1.8446744e19), käytetään
-/// summan yläleikkaukseen ilman lossy-castia kuumalla polulla.
+/// `u64::MAX` as the nearest `f64` value (~= 1.8446744e19), used to clamp
+/// the sum's upper bound without a lossy cast on the hot path.
 const U64_MAX_AS_F64: f64 = 18_446_744_073_709_551_615.0;
 
 impl Histogram {
-    /// Luo histogrammin oletusämpäreillä (`DEFAULT_BUCKETS`).
+    /// Creates a histogram with the default buckets (`DEFAULT_BUCKETS`).
     #[must_use]
     pub fn new() -> Self {
         Self::with_buckets(&DEFAULT_BUCKETS)
     }
 
-    /// Luo histogrammin annetuilla ämpärirajoilla.
+    /// Creates a histogram with the given bucket bounds.
     ///
-    /// Rajat siivotaan: ei-äärelliset ja ei-positiiviset poistetaan, loput
-    /// järjestetään nousevasti ja duplikaatit poistetaan. Jos jäljelle ei jää
-    /// yhtään rajaa, käytetään yhtä `+Inf`-ekvivalenttia ämpäriä (kaikki
-    /// havainnot menevät `_count`-summaan).
+    /// Bounds are cleaned up: non-finite and non-positive values are
+    /// removed, the rest are sorted ascending and deduplicated. If no
+    /// bounds remain, a single `+Inf`-equivalent bucket is used (all
+    /// observations go into the `_count` sum).
     #[must_use]
     pub fn with_buckets(bounds: &[f64]) -> Self {
         let mut clean: Vec<f64> = bounds
@@ -162,12 +164,12 @@ impl Histogram {
         }
     }
 
-    /// Kirjaa yhden havainnon.
+    /// Records a single observation.
     ///
-    /// Ei-negatiivinen `value` lisätään pienimpään ämpäriin jonka yläraja se
-    /// alittaa tai johon se osuu, kasvattaa kokonaismäärää ja summaa.
-    /// Negatiiviset ja ei-äärelliset arvot ohitetaan hiljaisesti
-    /// (Prometheus-histogrammi ei tue niitä).
+    /// A non-negative `value` is added to the smallest bucket whose upper
+    /// bound it is at or below, and increments the total count and sum.
+    /// Negative and non-finite values are silently ignored (the Prometheus
+    /// histogram model doesn't support them).
     pub fn observe(&self, value: f64) {
         if !value.is_finite() || value < 0.0 {
             return;
@@ -178,25 +180,26 @@ impl Histogram {
             }
         }
         self.count.fetch_add(1, Ordering::Relaxed);
-        // Skaalattu kiinteäpistesumma (millit). Pyöristetään lähimpään.
+        // Fixed-point scaled sum (in milli-units). Rounded to the nearest integer.
         let scaled = (value * SUM_SCALE).round();
-        // Rajaa ettei kaadu cast-aliasointiin valtavilla arvoilla.
-        // `U64_MAX_AS_F64` on `u64::MAX` lähimpänä `f64`-arvona (tarkka cast
-        // ei ole mahdollinen, joten käytämme vakiota välttääksemme lossy-castin
-        // kuumalla polulla).
+        // Clamp so we don't overflow on cast for huge values.
+        // `U64_MAX_AS_F64` is `u64::MAX` as the nearest `f64` value (an exact
+        // cast isn't possible, so we use the constant to avoid a lossy cast
+        // on the hot path).
         let scaled = scaled.clamp(0.0, U64_MAX_AS_F64);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let milli = scaled as u64;
         self.sum_milli.fetch_add(milli, Ordering::Relaxed);
     }
 
-    /// Havaintojen kokonaismäärä (`_count`).
+    /// Total number of observations (`_count`).
     #[must_use]
     pub fn count(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
     }
 
-    /// Havaintojen summa (`_sum`), millihavainnoista palautettuna `f64`:ksi.
+    /// Sum of observations (`_sum`), converted back to `f64` from
+    /// milli-observations.
     #[must_use]
     pub fn sum(&self) -> f64 {
         #[allow(clippy::cast_precision_loss)]
@@ -204,8 +207,8 @@ impl Histogram {
         raw / SUM_SCALE
     }
 
-    /// Palauttaa kumulatiiviset `le`-ämpärit pareina `(yläraja, kumulatiivinen
-    /// määrä)`. Viimeinen pari on aina `(+Inf, kokonaismäärä)`.
+    /// Returns the cumulative `le` buckets as pairs of `(upper bound,
+    /// cumulative count)`. The last pair is always `(+Inf, total count)`.
     #[must_use]
     pub fn cumulative_buckets(&self) -> Vec<(BucketBound, u64)> {
         let mut out = Vec::with_capacity(self.bounds.len() + 1);
@@ -224,17 +227,17 @@ impl Default for Histogram {
     }
 }
 
-/// Histogrammiämpärin yläraja Prometheus-vientiä varten.
+/// A histogram bucket's upper bound, for Prometheus export.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BucketBound {
-    /// Äärellinen yläraja (`le="<arvo>"`).
+    /// A finite upper bound (`le="<value>"`).
     Le(f64),
-    /// Positiivinen ääretön (`le="+Inf"`).
+    /// Positive infinity (`le="+Inf"`).
     PosInf,
 }
 
 impl BucketBound {
-    /// Muotoilee `le`-arvon Prometheus-merkkijonoksi.
+    /// Formats the `le` value as a Prometheus label string.
     #[must_use]
     pub fn label(self) -> String {
         match self {
@@ -244,7 +247,7 @@ impl BucketBound {
     }
 }
 
-/// Mittarin tyyppi rekisterin sisällä.
+/// The kind of metric held inside the registry.
 #[derive(Debug, Clone)]
 enum Metric {
     Counter(Counter),
@@ -252,29 +255,29 @@ enum Metric {
     Histogram(Histogram),
 }
 
-/// Säieturvallinen mittarirekisteri.
+/// A thread-safe metrics registry.
 ///
-/// Pitää nimettyjä mittareita ([`Counter`], [`Gauge`], [`Histogram`]) ja
-/// vie ne deterministisessä Prometheus-tekstiformaatissa. Rekisteri on
-/// `Clone` ja jakaa tilansa `Arc`:n kautta — kaikki kloonit näkevät samat
-/// mittarit.
+/// Holds named metrics ([`Counter`], [`Gauge`], [`Histogram`]) and exports
+/// them in a deterministic Prometheus text format. The registry is `Clone`
+/// and shares its state via `Arc` — all clones see the same metrics.
 #[derive(Debug, Clone, Default)]
 pub struct MetricsRegistry {
     inner: Arc<RwLock<BTreeMap<String, Metric>>>,
 }
 
 impl MetricsRegistry {
-    /// Luo tyhjän rekisterin.
+    /// Creates an empty registry.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Luo rekisterin jossa on monen agentin laivuetta varten esinimetyt
-    /// laskurit ja gaugiet (ks. moduulin dokumentaatio).
+    /// Creates a registry pre-populated with the counters and gauges used
+    /// for a multi-agent fleet (see the module documentation).
     ///
-    /// Tämä takaa että vienti sisältää nämä sarjat alusta asti (arvolla `0`),
-    /// joten dashboardit eivät "katoa" ennen ensimmäistä tapahtumaa.
+    /// This guarantees that the export includes these series from the
+    /// start (with value `0`), so dashboards don't "disappear" before the
+    /// first event occurs.
     #[must_use]
     pub fn with_fleet_defaults() -> Self {
         let reg = Self::new();
@@ -285,11 +288,12 @@ impl MetricsRegistry {
         reg
     }
 
-    /// Hakee tai luo nimetyn laskurin (idempotentti).
+    /// Gets or creates a named counter (idempotent).
     ///
-    /// Sama nimi palauttaa aina saman kahvan. Jos nimi on jo varattu eri
-    /// mittarityypille, palautetaan *uusi irrallinen* laskuri jota ei
-    /// rekisteröidä (tyyppi-ristiriidan turvallinen ohitus).
+    /// The same name always returns the same handle. If the name is
+    /// already registered under a different metric type, a *new,
+    /// detached* counter is returned and is not registered (a safe
+    /// fallback for the type-mismatch case).
     #[must_use]
     pub fn counter(&self, name: &str) -> Counter {
         let mut guard = match self.inner.write() {
@@ -307,7 +311,7 @@ impl MetricsRegistry {
         }
     }
 
-    /// Hakee tai luo nimetyn gaugen (idempotentti).
+    /// Gets or creates a named gauge (idempotent).
     #[must_use]
     pub fn gauge(&self, name: &str) -> Gauge {
         let mut guard = match self.inner.write() {
@@ -325,16 +329,17 @@ impl MetricsRegistry {
         }
     }
 
-    /// Hakee tai luo nimetyn histogrammin oletusämpäreillä (idempotentti).
+    /// Gets or creates a named histogram with the default buckets
+    /// (idempotent).
     #[must_use]
     pub fn histogram(&self, name: &str) -> Histogram {
         self.histogram_with_buckets(name, &DEFAULT_BUCKETS)
     }
 
-    /// Hakee tai luo nimetyn histogrammin annetuilla ämpäreillä.
+    /// Gets or creates a named histogram with the given buckets.
     ///
-    /// Jos histogrammi luotiin jo (millä tahansa ämpäreillä), palautetaan
-    /// olemassa oleva kahva — `buckets` huomioidaan vain ensiluonnissa.
+    /// If the histogram already exists (with any buckets), the existing
+    /// handle is returned — `buckets` is only honored on first creation.
     #[must_use]
     pub fn histogram_with_buckets(&self, name: &str, buckets: &[f64]) -> Histogram {
         let mut guard = match self.inner.write() {
@@ -352,7 +357,7 @@ impl MetricsRegistry {
         }
     }
 
-    /// Rekisteröityjen mittareiden lukumäärä.
+    /// The number of registered metrics.
     #[must_use]
     pub fn len(&self) -> usize {
         let guard = match self.inner.read() {
@@ -362,20 +367,21 @@ impl MetricsRegistry {
         guard.len()
     }
 
-    /// Onko rekisteri tyhjä.
+    /// Whether the registry is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Vie kaikki mittarit deterministisessä Prometheus-tekstiformaatissa.
+    /// Exports all metrics in a deterministic Prometheus text format.
     ///
-    /// - Mittarit järjestetään nimen mukaan (`BTreeMap` takaa tämän).
-    /// - Jokaiselle mittarille tulostetaan `# TYPE`-rivi ja arvot.
-    /// - Histogrammit tulostavat `_bucket{le="…"}`-rivit (kumulatiivinen),
-    ///   `_sum`- ja `_count`-rivit Prometheus-konvention mukaan.
+    /// - Metrics are ordered by name (guaranteed by the `BTreeMap`).
+    /// - Each metric emits a `# TYPE` line followed by its value(s).
+    /// - Histograms emit `_bucket{le="…"}` lines (cumulative), followed by
+    ///   `_sum` and `_count` lines per Prometheus convention.
     ///
-    /// Tuloste päättyy aina rivinvaihtoon (tai on tyhjä jos mittareita ei ole).
+    /// The output always ends with a newline (or is empty if there are no
+    /// metrics).
     #[must_use]
     pub fn prometheus_export(&self) -> String {
         let guard = match self.inner.read() {
@@ -411,36 +417,36 @@ impl MetricsRegistry {
     }
 }
 
-/// Esinimetty laskuri: luodut tehtävät.
+/// Pre-named counter: tasks created.
 pub const COUNTER_TASKS_CREATED: &str = "tasks_created";
-/// Esinimetty laskuri: valmistuneet tehtävät.
+/// Pre-named counter: tasks completed.
 pub const COUNTER_TASKS_COMPLETED: &str = "tasks_completed";
-/// Esinimetty laskuri: tehtävien luovutukset.
+/// Pre-named counter: task handoffs.
 pub const COUNTER_TASK_HANDOFFS: &str = "task_handoffs";
-/// Esinimetty laskuri: ehdotetut sopimukset (contract-net).
+/// Pre-named counter: proposed contracts (contract-net).
 pub const COUNTER_CONTRACT_PROPOSED: &str = "contract_proposed";
-/// Esinimetty laskuri: täytetyt sopimukset.
+/// Pre-named counter: fulfilled contracts.
 pub const COUNTER_CONTRACT_FULFILLED: &str = "contract_fulfilled";
-/// Esinimetty laskuri: rikotut sopimukset.
+/// Pre-named counter: breached contracts.
 pub const COUNTER_CONTRACT_BREACHED: &str = "contract_breached";
-/// Esinimetty laskuri: agenttivuorot.
+/// Pre-named counter: agent turns.
 pub const COUNTER_AGENT_TURNS: &str = "agent_turns";
-/// Esinimetty laskuri: LLM-kutsut.
+/// Pre-named counter: LLM calls.
 pub const COUNTER_LLM_CALLS: &str = "llm_calls";
-/// Esinimetty laskuri: LLM-varamallikutsut (failover).
+/// Pre-named counter: LLM fallback calls (failover).
 pub const COUNTER_LLM_FALLBACKS: &str = "llm_fallbacks";
-/// Esinimetty laskuri: durable-uudelleenajot (replay).
+/// Pre-named counter: durable replays.
 pub const COUNTER_DURABLE_REPLAYS: &str = "durable_replays";
-/// Esinimetty laskuri: valmistuneet workflow-askeleet.
+/// Pre-named counter: completed workflow steps.
 pub const COUNTER_WORKFLOW_STEPS_COMPLETED: &str = "workflow_steps_completed";
 
-/// Esinimetty laskuri: agentin tool-loopissa lähetetyt työkalukutsut.
+/// Pre-named counter: tool calls issued in an agent's tool loop.
 pub const COUNTER_TOOL_CALLS: &str = "tool_calls";
 
-/// Esinimetty gauge: online olevien agenttien määrä.
+/// Pre-named gauge: number of agents currently online.
 pub const GAUGE_AGENTS_ONLINE: &str = "agents_online";
 
-/// Kaikki esinimetyt laskurit laivueen oletuksina.
+/// All pre-named counters used as fleet defaults.
 const FLEET_COUNTERS: [&str; 12] = [
     COUNTER_TASKS_CREATED,
     COUNTER_TASKS_COMPLETED,
@@ -456,13 +462,14 @@ const FLEET_COUNTERS: [&str; 12] = [
     COUNTER_TOOL_CALLS,
 ];
 
-/// Muotoilee `f64`:n vakaaksi (deterministiseksi) Prometheus-merkkijonoksi.
+/// Formats an `f64` as a stable (deterministic) Prometheus string.
 ///
-/// Kokonaisluvut tulostuvat ilman desimaalipistettä (`1` eikä `1.0`), muut
-/// arvot lyhimmällä tarkalla esityksellä (Rustin oletus-`Display`).
+/// Integers are printed without a decimal point (`1` rather than `1.0`),
+/// other values use the shortest exact representation (Rust's default
+/// `Display`).
 fn format_float(v: f64) -> String {
     if v.is_finite() && v.fract() == 0.0 && v.abs() < 1e15 {
-        // Kokonaisluku: tulosta ilman desimaaleja.
+        // Integer value: print without decimals.
         #[allow(clippy::cast_possible_truncation)]
         let as_i = v as i64;
         as_i.to_string()
@@ -546,7 +553,7 @@ mod tests {
 
     #[test]
     fn histogram_bounds_are_cleaned_and_sorted() {
-        // Sekava syöte: lajittelematon, duplikaatti, negatiivinen, NaN.
+        // Messy input: unsorted, duplicate, negative, NaN.
         let h = Histogram::with_buckets(&[5.0, 1.0, 1.0, -3.0, f64::NAN, 2.0]);
         let bounds: Vec<_> = h
             .cumulative_buckets()
@@ -565,7 +572,7 @@ mod tests {
         let a = reg.counter("hits");
         a.inc_by(2);
         let b = reg.counter("hits");
-        // Sama kahva → näkee saman arvon.
+        // Same handle -> sees the same value.
         assert_eq!(b.get(), 2);
         b.inc();
         assert_eq!(a.get(), 3);
@@ -596,12 +603,12 @@ mod tests {
     #[test]
     fn prometheus_export_is_deterministic_and_sorted() {
         let reg = MetricsRegistry::new();
-        // Lisää väärässä aakkosjärjestyksessä.
+        // Added out of alphabetical order.
         reg.counter("zebra").inc_by(2);
         reg.gauge("alpha").set(-3);
 
         let out = reg.prometheus_export();
-        // alpha tulee ennen zebraa (nimijärjestys).
+        // alpha comes before zebra (name ordering).
         let expected = "\
 # TYPE alpha gauge
 alpha -3
@@ -641,14 +648,14 @@ req_seconds_count 3
     #[test]
     fn fleet_defaults_prenames_all_series() {
         let reg = MetricsRegistry::with_fleet_defaults();
-        // 12 laskuria + 1 gauge.
+        // 12 counters + 1 gauge.
         assert_eq!(reg.len(), 13);
         let out = reg.prometheus_export();
         assert!(out.contains("# TYPE tasks_created counter"));
         assert!(out.contains("tasks_created 0"));
         assert!(out.contains("# TYPE agents_online gauge"));
         assert!(out.contains("agents_online 0"));
-        // Tool-call-laskuri esinimetty → näkyy 0:na ennen ensimmäistä kutsua.
+        // Tool-call counter is pre-named -> shows as 0 before the first call.
         assert!(out.contains("# TYPE tool_calls counter"));
         assert!(out.contains("tool_calls 0"));
     }
@@ -665,27 +672,27 @@ req_seconds_count 3
     fn wrong_type_reuse_returns_detached_handle() {
         let reg = MetricsRegistry::new();
         let _c = reg.counter("dup");
-        // Pyydä sama nimi gaugena → ei kaadu, palauttaa irrallisen gaugen.
+        // Request the same name as a gauge -> doesn't panic, returns a detached gauge.
         let g = reg.gauge("dup");
         g.set(99);
-        // Rekisterissä on edelleen vain laskuri; export näyttää sen tyypin.
+        // The registry still holds only the counter; export reflects that type.
         let out = reg.prometheus_export();
         assert!(out.contains("# TYPE dup counter"));
         assert_eq!(reg.len(), 1);
     }
 
-    // --- Rinnakkaisuustodisteet (kilpailutestit, ei ajoituksen varassa) ---
+    // --- Concurrency proofs (race tests, not timing-dependent) ---
 
-    /// Säikeiden lukumäärä rinnakkaisuustesteissä.
+    /// Number of threads used in the concurrency tests.
     const CONCURRENCY_THREADS: usize = 16;
-    /// Inkrementtien lukumäärä per säie.
+    /// Number of increments per thread.
     const CONCURRENCY_ITERS: u64 = 10_000;
 
-    /// `Counter::inc` ei menetä päivityksiä kun monta säiettä kilpailee samasta
-    /// jaetusta kahvasta. Kaikki säikeet vapautetaan yhtä aikaa
-    /// [`std::sync::Barrier`]:lla, jotta kilpailu tapahtuu varmasti. Lopputulos
-    /// on tarkka deterministinen summa (`N * M`), joten testi ei voi olla
-    /// epävakaa (flaky) — joko atomi pitää tai ei.
+    /// `Counter::inc` does not lose updates when many threads race on the
+    /// same shared handle. All threads are released simultaneously via a
+    /// [`std::sync::Barrier`] to guarantee contention actually happens. The
+    /// result is an exact, deterministic sum (`N * M`), so the test can't be
+    /// flaky — either the atomic holds or it doesn't.
     #[test]
     fn counter_inc_no_lost_updates_under_contention() {
         use std::sync::{Arc, Barrier};
@@ -713,10 +720,11 @@ req_seconds_count 3
         assert_eq!(counter.get(), expected);
     }
 
-    /// Sama kilpailutodiste mutta rekisterin kautta haetulle laskurille:
-    /// `MetricsRegistry::counter` palauttaa get-or-create-kahvan ja kaikki
-    /// säikeet inkrementoivat *samaa* atomia. Tarkka summa todistaa ettei
-    /// rekisterin haku eikä atomi-inkrementti menetä päivityksiä.
+    /// The same concurrency proof, but for a counter obtained through the
+    /// registry: `MetricsRegistry::counter` returns a get-or-create handle
+    /// and every thread increments *the same* atomic. The exact sum proves
+    /// that neither the registry lookup nor the atomic increment loses
+    /// updates.
     #[test]
     fn registry_counter_no_lost_updates_under_contention() {
         use std::sync::{Arc, Barrier};
@@ -743,14 +751,14 @@ req_seconds_count 3
 
         let expected = CONCURRENCY_THREADS as u64 * CONCURRENCY_ITERS;
         assert_eq!(reg.counter("shared_hits").get(), expected);
-        // Yksi nimi → yksi rekisteröity mittari, ei duplikaatteja.
+        // One name -> one registered metric, no duplicates.
         assert_eq!(reg.len(), 1);
     }
 
-    /// `Histogram::observe` säilyttää tarkan kokonaismäärän ja per-ämpäri-
-    /// laskurit kilpailun alla. Jokainen havainto (`1.0`) osuu kaikkiin
-    /// äärellisiin ämpäreihin (`>= 1.0`) ja `+Inf`:iin. Summa ja
-    /// kumulatiiviset ämpärit ovat tarkkoja → ei epävakautta.
+    /// `Histogram::observe` preserves an exact total count and per-bucket
+    /// counts under contention. Every observation (`1.0`) falls into all
+    /// finite buckets (`>= 1.0`) and `+Inf`. The sum and cumulative buckets
+    /// are exact -> no flakiness.
     #[test]
     fn histogram_observe_no_lost_updates_under_contention() {
         use std::sync::{Arc, Barrier};
@@ -776,13 +784,13 @@ req_seconds_count 3
 
         let total = CONCURRENCY_THREADS as u64 * CONCURRENCY_ITERS;
         assert_eq!(hist.count(), total);
-        // total * 1.0 = total. Vältetään leveä `u64 as f64` -kasti käyttämällä
-        // tarkkaa `u32`→`f64`-muunnosta (160 000 mahtuu `u32`:een ja on tarkka
-        // `f64`:nä); jokainen havainto on `1.0` joten summa == total.
+        // total * 1.0 = total. We avoid a wide `u64 as f64` cast by using an
+        // exact `u32` -> `f64` conversion (160,000 fits in a `u32` and is
+        // exact as `f64`); every observation is `1.0` so the sum == total.
         let total_u32 = u32::try_from(total).expect("total fits in u32");
         let expected_sum = f64::from(total_u32);
         assert!((hist.sum() - expected_sum).abs() < 1e-6);
-        // 1.0 <= jokainen raja {1,2,5} → jokainen kumulatiivinen ämpäri == total.
+        // 1.0 <= every bound {1,2,5} -> every cumulative bucket == total.
         let buckets = hist.cumulative_buckets();
         assert_eq!(buckets[0], (BucketBound::Le(1.0), total));
         assert_eq!(buckets[1], (BucketBound::Le(2.0), total));
@@ -790,11 +798,11 @@ req_seconds_count 3
         assert_eq!(buckets[3], (BucketBound::PosInf, total));
     }
 
-    // --- Reunatapaukset ---
+    // --- Edge cases ---
 
-    /// `Histogram::observe(0.0)` lasketaan kelvolliseksi havainnoksi: se osuu
-    /// pienimpään ämpäriin (kaikki rajat ovat `> 0.0`), kasvattaa
-    /// kokonaismäärää eikä muuta summaa.
+    /// `Histogram::observe(0.0)` counts as a valid observation: it falls
+    /// into the smallest bucket (all bounds are `> 0.0`), increments the
+    /// total count, and doesn't change the sum.
     #[test]
     fn histogram_observe_zero_lands_in_lowest_bucket_and_counts() {
         let h = Histogram::with_buckets(&[0.5, 1.0, 2.0]);
@@ -804,7 +812,7 @@ req_seconds_count 3
         assert!((h.sum() - 0.0).abs() < 1e-9);
 
         let buckets = h.cumulative_buckets();
-        // 0.0 <= 0.5 → osuu pienimpään (ja kumulatiivisesti kaikkiin) ämpäriin.
+        // 0.0 <= 0.5 -> falls into the smallest (and cumulatively, all) bucket.
         assert_eq!(buckets[0], (BucketBound::Le(0.5), 1));
         assert_eq!(buckets[1], (BucketBound::Le(1.0), 1));
         assert_eq!(buckets[2], (BucketBound::Le(2.0), 1));

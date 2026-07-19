@@ -1,14 +1,15 @@
-//! Sopimusviestit väylän yli: kuljetuksesta riippumaton serde-protokolla.
+//! Contract messages over the bus: a transport-independent serde protocol.
 //!
-//! Tämä moduuli määrittelee [`ContractMessage`]-enumin, jolla sopimuksen
-//! elinkaaren tapahtumat (ehdota/hyväksy/hylkää/täytä/epäonnistu/rikkomus)
-//! voidaan sarjallistaa ja kuljettaa minkä tahansa väylän yli ja julkaista
-//! [`crate::event::EventKind::Custom`]-tapahtumina nimellä
+//! This module defines the [`ContractMessage`] enum, which lets contract
+//! lifecycle events (propose/accept/reject/fulfill/fail/breach) be serialized
+//! and carried over any bus, and published as
+//! [`crate::event::EventKind::Custom`] events under the name
 //! [`CONTRACT_CUSTOM_NAME`].
 //!
-//! **Tärkeä rajaus:** tässä on vain *puhdas serde* — **EI** riippuvuutta
-//! `familyclaw-bus`-cratesta eikä mitään Resonance Bus / Ractor -sidontaa.
-//! Adapteri voi sillata nämä viestit varsinaiseen väylään myöhemmin.
+//! **Important boundary:** this is *pure serde* only — there is **NO**
+//! dependency on the `familyclaw-bus` crate, and no binding to the Resonance
+//! Bus / Ractor layer. An adapter can bridge these messages onto the actual
+//! bus later.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,78 +18,80 @@ use familyclaw_core::ids::{AgentId, MessageId};
 
 use crate::contract::{Contract, ContractStatus, Deliverable};
 
-/// Custom-tapahtuman vakaa nimi jolla sopimusviestit julkaistaan väylälle.
+/// The stable custom-event name under which contract messages are published
+/// to the bus.
 ///
-/// Versioitu (`.v1`) jotta protokollan myöhempi muutos voi rinnastua omaan
-/// nimeensä rikkomatta vanhoja kuluttajia.
+/// Versioned (`.v1`) so a later protocol change can coexist under its own
+/// name without breaking existing consumers.
 pub const CONTRACT_CUSTOM_NAME: &str = "familyclaw.contract.v1";
 
-/// Sopimuksen elinkaaren viesti väylän yli.
+/// A contract lifecycle message carried over the bus.
 ///
-/// Serde-esitys käyttää sisäistä tagia avaimella `op`, jolloin viesti on
-/// luettava ja eteenpäin-yhteensopiva (esim. `{"op":"propose", ...}`).
+/// The serde representation uses an internal tag with the key `op`, making
+/// the message readable and forward-compatible (e.g. `{"op":"propose", ...}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ContractMessage {
-    /// Pyytäjä ehdottaa sopimusta tarjoajalle.
+    /// The requester proposes a contract to the provider.
     Propose {
-        /// Sopimuksen tunniste.
+        /// The contract's identifier.
         contract_id: MessageId,
-        /// Pyytäjä.
+        /// The requester.
         requester: AgentId,
-        /// Tarjoaja.
+        /// The provider.
         provider: AgentId,
-        /// Kyvyn nimi.
+        /// The capability's name.
         capability: String,
-        /// Sopimuksen syöte.
+        /// The contract's input.
         input: Value,
     },
 
-    /// Tarjoaja hyväksyy ehdotuksen.
+    /// The provider accepts the proposal.
     Accept {
-        /// Sopimuksen tunniste.
+        /// The contract's identifier.
         contract_id: MessageId,
-        /// Hyväksyvä tarjoaja.
+        /// The accepting provider.
         provider: AgentId,
     },
 
-    /// Tarjoaja hylkää ehdotuksen annetulla syyllä.
+    /// The provider rejects the proposal with the given reason.
     Reject {
-        /// Sopimuksen tunniste.
+        /// The contract's identifier.
         contract_id: MessageId,
-        /// Hylkäävä tarjoaja.
+        /// The rejecting provider.
         provider: AgentId,
-        /// Hylkäyksen syy.
+        /// The reason for rejection.
         reason: String,
     },
 
-    /// Tarjoaja täyttää sopimuksen toimitteella.
+    /// The provider fulfills the contract with a deliverable.
     Fulfill {
-        /// Sopimuksen tunniste.
+        /// The contract's identifier.
         contract_id: MessageId,
-        /// Toimite.
+        /// The deliverable.
         deliverable: Deliverable,
     },
 
-    /// Tarjoaja ilmoittaa ettei pysty toimittamaan.
+    /// The provider reports that it cannot deliver.
     Fail {
-        /// Sopimuksen tunniste.
+        /// The contract's identifier.
         contract_id: MessageId,
-        /// Epäonnistumisen syy.
+        /// The reason for failure.
         reason: String,
     },
 
-    /// Todentaja ilmoittaa että toimite rikkoi tulosskeeman/jälkiehdon.
+    /// The verifier reports that the deliverable breached the output
+    /// schema/postcondition.
     Breach {
-        /// Sopimuksen tunniste.
+        /// The contract's identifier.
         contract_id: MessageId,
-        /// Rikotun ehdon/skeeman kuvaus.
+        /// A description of the breached condition/schema.
         detail: String,
     },
 }
 
 impl ContractMessage {
-    /// Palauttaa viestin koskeman sopimuksen tunnisteen.
+    /// Returns the identifier of the contract this message concerns.
     #[must_use]
     pub fn contract_id(&self) -> MessageId {
         match self {
@@ -101,7 +104,7 @@ impl ContractMessage {
         }
     }
 
-    /// Palauttaa operaation vakaan nimen (sama kuin serde-tagi).
+    /// Returns the operation's stable name (same as the serde tag).
     #[must_use]
     pub fn op(&self) -> &'static str {
         match self {
@@ -114,7 +117,7 @@ impl ContractMessage {
         }
     }
 
-    /// Rakentaa `Propose`-viestin sopimuksesta.
+    /// Builds a `Propose` message from a contract.
     #[must_use]
     pub fn propose_from(contract: &Contract) -> Self {
         ContractMessage::Propose {
@@ -126,11 +129,12 @@ impl ContractMessage {
         }
     }
 
-    /// Rakentaa tilan mukaisen ilmoitusviestin sopimuksesta, jos sellainen on
-    /// luonteva (esim. `Fulfilled` → `Fulfill`-viesti toimitteen kanssa).
+    /// Builds a status-appropriate notification message from a contract, if
+    /// one is natural (e.g. `Fulfilled` → a `Fulfill` message with the
+    /// deliverable).
     ///
-    /// Palauttaa `None` ei-ilmoitettaville tiloille (`Proposed`, `Accepted`),
-    /// jotka kulkevat omilla viesteillään.
+    /// Returns `None` for states that are not notified this way (`Proposed`,
+    /// `Accepted`), which travel via their own messages.
     #[must_use]
     pub fn from_contract_status(contract: &Contract) -> Option<Self> {
         match contract.status {
@@ -177,7 +181,7 @@ mod tests {
             input: json!({ "script": "s", "duration": 5 }),
         };
         let text = serde_json::to_string(&msg).expect("serialize");
-        // Sisäinen tagi `op`.
+        // Internal tag `op`.
         let v: Value = serde_json::from_str(&text).expect("parse");
         assert_eq!(v["op"], json!("propose"));
 

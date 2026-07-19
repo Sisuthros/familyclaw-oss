@@ -1,28 +1,28 @@
-//! ACP-viestityypit — JSON-serialisoitavat request/response-rakenteet.
+//! ACP message types — JSON-serializable request/response structures.
 //!
-//! ACP (Agent Communication Protocol) käyttää JSON-RPC 2.0 -tyyppistä
-//! viestimuotoa stdin/stdout:n yli. Tämä moduuli määrittelee protokollan
-//! kannalta olennaiset tietorakenteet.
+//! ACP (Agent Communication Protocol) uses a JSON-RPC 2.0-style message
+//! format over stdin/stdout. This module defines the data structures
+//! relevant to the protocol.
 
 use serde::{Deserialize, Serialize};
 
-/// ACP-kutsu agentille.
+/// An ACP call to an agent.
 ///
-/// Vastaa käyttäjän promptia: "tee tämä asia".
+/// Corresponds to a user prompt: "do this thing".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpRequest {
-    /// Prompt-teksti agentille.
+    /// The prompt text for the agent.
     pub prompt: String,
-    /// Käyttöoikeustila (esim. "default", "`bypass_permissions`").
+    /// Permission mode (e.g. "default", "`bypass_permissions`").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
-    /// Työhakemisto.
+    /// Working directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
 }
 
 impl AcpRequest {
-    /// Luo uuden ACP-kutsun promptilla.
+    /// Creates a new ACP call with a prompt.
     #[must_use]
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
@@ -32,7 +32,7 @@ impl AcpRequest {
         }
     }
 
-    /// Asettaa käyttöoikeustilan.
+    /// Sets the permission mode.
     #[must_use]
     pub fn with_permission_mode(mut self, mode: impl Into<String>) -> Self {
         self.permission_mode = Some(mode.into());
@@ -40,46 +40,46 @@ impl AcpRequest {
     }
 }
 
-/// ACP-vastaus agentilta.
+/// An ACP response from an agent.
 ///
-/// Agentti palauttaa tekstimuotoisen vastauksen promptiin.
+/// The agent returns a text-based response to the prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpResponse {
-    /// Agentin tekstivastaus.
+    /// The agent's text response.
     pub content: String,
-    /// Työkalukutsut joita agentti teki (tiedostojen luku, shell-komennot jne.).
+    /// Tool calls the agent made (file reads, shell commands, etc.).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<AcpToolCall>,
-    /// Kuinka monta tokenia käytettiin (jos agentti raportoi).
+    /// How many tokens were used (if the agent reports it).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<AcpTokenUsage>,
-    /// Sessio-ID jatkuvuutta varten.
+    /// Session ID for continuity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
 }
 
-/// Agentin tekemä työkalukutsu.
+/// A tool call made by the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpToolCall {
-    /// Työkalun nimi (esim. "`read_file`", "`execute_command`").
+    /// The tool's name (e.g. "`read_file`", "`execute_command`").
     pub tool: String,
-    /// Työkalun argumentit JSON-muodossa.
+    /// The tool's arguments in JSON form.
     pub arguments: serde_json::Value,
-    /// Työkalun palauttama tulos (jos saatavissa).
+    /// The result returned by the tool (if available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
 }
 
-/// Työkalun palauttama tulos agentille.
+/// The result of a tool call, returned to the agent.
 ///
-/// Lähetetään takaisin agentille kun työkalu on suoritettu.
+/// Sent back to the agent once the tool has been executed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpToolResult {
-    /// Työkalukutsun ID johon tämä on vastaus.
+    /// The ID of the tool call this is a response to.
     pub tool_call_id: String,
-    /// Työkalun tulostama sisältö.
+    /// The content output by the tool.
     pub content: String,
-    /// Oliko suoritus onnistunut.
+    /// Whether the execution succeeded.
     #[serde(default = "default_success")]
     pub success: bool,
 }
@@ -88,12 +88,12 @@ fn default_success() -> bool {
     true
 }
 
-/// Token-käyttötilasto.
+/// Token usage statistics.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AcpTokenUsage {
-    /// Syötetokenien määrä.
+    /// Number of input tokens.
     pub input_tokens: u32,
-    /// Tulostetokenien määrä.
+    /// Number of output tokens.
     pub output_tokens: u32,
 }
 
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn request_serialize_omits_none_options() {
-        // permission_mode + working_dir = None → kentät jätetään pois (skip_serializing_if).
+        // permission_mode + working_dir = None → fields are omitted (skip_serializing_if).
         let req = AcpRequest::new("prompt_text");
         let value: serde_json::Value = serde_json::to_value(&req).expect("serialize request");
         let obj = value.as_object().expect("request is an object");
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn response_serialize_omits_empty_tool_calls_and_none_fields() {
-        // tool_calls tyhjä Vec + token_usage/session_id None → kaikki jätetään pois.
+        // tool_calls is an empty Vec + token_usage/session_id are None → everything is omitted.
         let resp = AcpResponse {
             content: "hello".to_string(),
             tool_calls: Vec::new(),
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn response_deserialize_missing_tool_calls_becomes_empty_vec() {
-        // tool_calls puuttuu → #[serde(default)] tekee tyhjän Vecin.
+        // tool_calls is missing → #[serde(default)] produces an empty Vec.
         let json = r#"{"content": "hi"}"#;
         let resp: AcpResponse = serde_json::from_str(json).expect("deserialize response");
         assert_eq!(resp.content, "hi");
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn tool_result_deserialize_missing_success_defaults_true() {
-        // success puuttuu → default_success() palauttaa true.
+        // success is missing → default_success() returns true.
         let json = r#"{"tool_call_id": "call_1", "content": "output"}"#;
         let result: AcpToolResult = serde_json::from_str(json).expect("deserialize tool result");
         assert_eq!(result.tool_call_id, "call_1");

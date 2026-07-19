@@ -1,45 +1,46 @@
 # familyclaw-security
 
-Identiteetin eheys ja ihmisen veto FamilyClaw-alustalle (KERROS A, OSS).
+Identity integrity and human veto for the FamilyClaw platform (Layer A, OSS).
 
-Kaksi turvamekanismia:
+Two security mechanisms:
 
-1. **Identity-anchorit** (`IdentityAnchor`) — suojattuja, ei-unohtuvia muistoja
-   (decay-λ = 0) jotka kantavat olennon identiteettiä.
-2. **Ihmiskorjaukset** (`HumanCorrection`) — ihmisen veto: korkein prioriteetti
-   muistin haussa, hidas decay (`DecayClass::Slow`).
+1. **Identity anchors** (`IdentityAnchor`) — protected, non-forgettable
+   memories (decay-λ = 0) that carry a being's identity.
+2. **Human corrections** (`HumanCorrection`) — a human veto: highest
+   priority in memory retrieval, slow decay (`DecayClass::Slow`).
 
-## Ydin-suunnittelupäätös: identiteetti ON muistissa, EI hashissa
+## Core design decision: identity IS in memory, NOT in a hash
 
-Olennon identiteetti **ei** ole SOUL-sisällön SHA-256-tiivisteessä. Se on niiden
-suojattujen anchor-muistojen substraatissa, joita olento ei koskaan unohda
-(λ = 0). Tiiviste (`AnchorHash`) on **vain tamper-hälytys** — se varoittaa, jos
-ankkuroitu sisältö on muuttunut ankkuroinnin jälkeen, mutta se ei *kanna*
-identiteettiä.
+A being's identity **is not** in a SHA-256 digest of the SOUL content. It
+is in the substrate of protected anchor memories that the being never
+forgets (λ = 0). The digest (`AnchorHash`) is **only a tamper alarm** — it
+warns if the anchored content has changed since anchoring, but it does not
+*carry* identity.
 
-Kun peukalointi havaitaan (`IdentityStatus::Tampered`), järjestelmä **ei** menetä
-identiteettiä eikä kosketa substraattia — se nostaa hälytyksen ja jättää
-anchor-muistot ennalleen. **Substraatti on totuus; hash on vahti.**
+When tampering is detected (`IdentityStatus::Tampered`), the system
+**does not** lose identity or touch the substrate — it raises an alarm and
+leaves the anchor memories intact. **The substrate is the truth; the hash
+is the sentry.**
 
-## OSS-raja (KERROS A)
+## OSS boundary (Layer A)
 
-Crate on julkaistava. Se ei sisällä perheenjäsenten sieluja, ihmiskorjausten
-todellista sisältöä, avaimia, tokeneita, IP-osoitteita eikä henkilökohtaisia
-polkuja. Ankkuri tallentaa vain sisällön *tiivisteen* + viittauksen muistoon;
-sisältö pysyy KERROS B -profiilissa.
+The crate is publishable. It does not contain family members' souls, the
+real content of human corrections, keys, tokens, IP addresses, or personal
+paths. An anchor stores only a *digest* of the content + a reference to
+the memory; the content stays in the Layer B profile.
 
-## Julkinen API
+## Public API
 
-| Tyyppi / funktio | Vastuu |
+| Type / function | Responsibility |
 |------------------|--------|
-| `IdentityAnchor` | Suojattu ankkuri: `memory_id`, `anchor_hash`, `protected`, `decay`. |
-| `IdentityAnchor::verify` | Vertaa nykyistä sisältöä ankkuroituun tiivisteeseen (ei mutatoi). |
+| `IdentityAnchor` | A protected anchor: `memory_id`, `anchor_hash`, `protected`, `decay`. |
+| `IdentityAnchor::verify` | Compares current content against the anchored digest (does not mutate). |
 | `IdentityStatus` | `Intact` / `Tampered { memory_id, expected, actual }`. |
-| `verify_identity` | Tarkistaa joukon ankkureita sisältölähdettä vasten. |
-| `AnchorHash` | Validoitu SHA-256-heksatiiviste, vakioaikainen vertailu. |
-| `DecayLambda` | Ebbinghaus-λ; `ZERO` = ikuinen ankkuri. |
-| `HumanCorrection` | Ihmisen veto: `content`, `priority` (1.0), `decay` (Slow), `applied_at`. |
-| `HumanCorrection::wins_against` | Voittaako veto kilpailevan retrieval-pistemäärän (tasapelit ihmiselle). |
-| `CorrectionPriority` | Rajattu prioriteetti `0.0..=1.0`; `MAX` = 1.0. |
-| `DecayClass` | Nimetty decay-luokka (`Eternal` / `Slow` / `Normal` / `Fast`) → λ. |
-| `SecurityError`, `Result` | Craten virhetyyppi (muuntuu `FamilyClawError`:ksi). |
+| `verify_identity` | Checks a set of anchors against a content source. |
+| `AnchorHash` | A validated SHA-256 hex digest, constant-time comparison. |
+| `DecayLambda` | Ebbinghaus λ; `ZERO` = an eternal anchor. |
+| `HumanCorrection` | A human veto: `content`, `priority` (1.0), `decay` (Slow), `applied_at`. |
+| `HumanCorrection::wins_against` | Whether the veto beats a competing retrieval score (ties go to the human). |
+| `CorrectionPriority` | A clamped priority `0.0..=1.0`; `MAX` = 1.0. |
+| `DecayClass` | A named decay class (`Eternal` / `Slow` / `Normal` / `Fast`) → λ. |
+| `SecurityError`, `Result` | The crate's error type (converts into `FamilyClawError`). |

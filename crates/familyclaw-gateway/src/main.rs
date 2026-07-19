@@ -1,92 +1,92 @@
 //! # familyclaw-gateway
 //!
-//! **Gateway-binääri** — FamilyClaw-alustan (KERROS A, OSS) pitkäikäinen
-//! prosessi: se sitoo HTTP-portin, tarjoaa elinvoima- ja valmiustarkistukset
-//! (`/healthz`, `/readyz`) sekä Prometheus-mittarit (`/metrics`), käynnistää
-//! [`FamilyRuntime`]:n (bus + agentti + kanava + reply-pumppu) yhdellä
-//! [`build_family`]-kutsulla ja pysyy pystyssä kunnes käyttäjä pyytää siistin
-//! sammutuksen (`Ctrl-C`).
+//! **Gateway binary** — the long-lived process of the `FamilyClaw` platform
+//! (Layer A, OSS): it binds an HTTP port, provides liveness and readiness
+//! checks (`/healthz`, `/readyz`) and Prometheus metrics (`/metrics`), starts
+//! [`FamilyRuntime`] (bus + agent + channel + reply pump) with a single
+//! [`build_family`] call, and stays up until the user requests a clean
+//! shutdown (`Ctrl-C`).
 //!
-//! ## Havainnoitavuus: `GET /metrics` (Prometheus-eksposition tekstiformaatti)
-//! Gateway jakaa [`MetricsRegistry`]:n (rakennettu
-//! [`MetricsRegistry::with_fleet_defaults`]:lla) `GatewayState`-tilaansa ja
-//! tarjoilee sen `GET /metrics`:llä `text/plain`-vastauksena
-//! ([`MetricsRegistry::prometheus_export`], deterministinen nimijärjestys).
-//! Laivueen esinimetyt sarjat (luodut/valmistuneet tehtävät, sopimukset,
-//! agenttivuorot, LLM-kutsut, `agents_online`-gauge, …) ovat viennissä alusta
-//! asti arvolla `0`. **Tapahtumapohjainen täyttö on KYTKETTY:**
-//! [`serve`] tilaa siltakerroksen tapahtumaväylän
-//! ([`FamilyBridge`]) [`EventRecorder`]illa
-//! ja antaa SAMAN [`MetricsRegistry`]:n recorderille ja `GatewayState`:lle.
-//! Ajonaikaiset tapahtumat inkrementoivat siis ne sarjat jotka recorder
-//! kartoittaa: agentin rekisteröinti nostaa `agents_online`-gaugea heti
-//! käynnistyksessä, ja siltakerroksen tehtävä-/sopimus-/LLM-tapahtumat
-//! (`task.*`, `contract.*`, `llm.*`, `agent.turn`, `workflow.*`) kasvattavat
-//! vastaavia laskureita. Sarjat joille ei tuoteta tapahtumaa pysyvät nollassa.
-//! Reitti on suojaamaton — mittarit ovat numeerisia aikasarjoja ilman
-//! salaisuuksia (ks. [`metrics_handler`]).
+//! ## Observability: `GET /metrics` (Prometheus exposition text format)
+//! The gateway shares a [`MetricsRegistry`] (built with
+//! [`MetricsRegistry::with_fleet_defaults`]) in its `GatewayState`, and
+//! serves it on `GET /metrics` as a `text/plain` response
+//! ([`MetricsRegistry::prometheus_export`], deterministic name ordering).
+//! The fleet's pre-named series (created/completed tasks, contracts,
+//! agent turns, LLM calls, the `agents_online` gauge, …) are present in the
+//! export from the start with the value `0`. **Event-driven population is
+//! WIRED UP:** [`serve`] subscribes to the bridge-layer event bus
+//! ([`FamilyBridge`]) with an [`EventRecorder`]
+//! and gives the recorder and `GatewayState` the SAME [`MetricsRegistry`].
+//! Runtime events therefore increment the series the recorder maps:
+//! agent registration bumps the `agents_online` gauge right at startup, and
+//! the bridge layer's task/contract/LLM events
+//! (`task.*`, `contract.*`, `llm.*`, `agent.turn`, `workflow.*`) increment
+//! the corresponding counters. Series for which no event is produced stay at zero.
+//! The route is unprotected — metrics are numeric time series with no
+//! secrets (see [`metrics_handler`]).
 //!
 //! ```bash
 //! curl -s http://127.0.0.1:8787/metrics
 //! # → # TYPE agents_online gauge
-//! #   agents_online 1          # agentti rekisteröitiin käynnistyksessä
+//! #   agents_online 1          # the agent was registered at startup
 //! #   # TYPE tasks_created counter
-//! #   tasks_created 0          # nousee kun siltakerros luo tehtäviä
+//! #   tasks_created 0          # rises when the bridge layer creates tasks
 //! #   ...
 //! ```
 //!
-//! Tämä on C5-saumassa luvattu `build_family`-kokoojan **ohut kuori**:
-//! [`build_family`] (`FamilyRuntime`) korvaa aiemman suoran
-//! `ResonanceBus::start`-kutsun **yhdellä** kutsulla. HTTP-/sammutuskuori
-//! pysyi muuttumattomana — bus-kahva luovutetaan `GatewayState`:lle ja
-//! `Ctrl-C` laukaisee [`FamilyRuntime::shutdown`]:n (entisen `bus.stop()`:n
-//! sijaan).
+//! This is the **thin shell** around the `build_family` composer promised at
+//! the C5 seam: [`build_family`] (`FamilyRuntime`) replaces the former direct
+//! `ResonanceBus::start` call with a **single** call. The HTTP/shutdown shell
+//! stayed unchanged — the bus handle is handed off to `GatewayState`, and
+//! `Ctrl-C` triggers [`FamilyRuntime::shutdown`] (instead of the former
+//! `bus.stop()`).
 //!
-//! ## OSS-raja (KERROS A)
-//! Ei kovakoodattuja perheenjäsenten nimiä, avaimia eikä polkuja. **Kaikki**
-//! ajonaikainen kokoonpano luetaan ympäristöstä (KERROS B):
-//! - `FAMILYCLAW_GATEWAY_ADDR` — kuunteluosoite (oletus `127.0.0.1:8787`),
-//! - `FAMILYCLAW_AGENT_NAME` — agentin näyttönimi (oletus `agent_a`),
-//! - `FAMILYCLAW_AGENT_MODEL` — `"provider/model"` (oletus `provider/model`),
-//! - `FAMILYCLAW_PROFILE_DIR` — sielun profiilihakemiston juuri (valinnainen),
-//! - `FAMILYCLAW_TELEGRAM_CHANNEL_ID` — Telegram-kanavainstanssin tunniste,
-//! - `FAMILYCLAW_REPLY_TARGET` — staattinen reply-kohde (Telegram chat-id),
-//! - `FAMILYCLAW_GATEWAY_TOKEN` — valinnainen bearer-token, joka suojaa
-//!   `POST /inject`:n (asetettuna pyyntö vaatii `Authorization: Bearer <token>`;
-//!   tyhjänä endpoint pysyy loopback-only-avoimena kuten ennen),
-//! - `TELEGRAM_BOT_TOKEN` — Telegram-botin token (vaadittu kanavalle),
-//! - `FAMILYCLAW_PROVIDERS` — provider-taulu resolverille, muoto
-//!   `prefix=base_url=KEY_ENV` puolipistein eroteltuna (valinnainen; ilman
-//!   tätä agentti ajaa ilman LLM:ää).
+//! ## OSS boundary (Layer A)
+//! No hardcoded operator names, keys, or paths. **All** runtime configuration
+//! is read from the environment (Layer B):
+//! - `FAMILYCLAW_GATEWAY_ADDR` — listen address (default `127.0.0.1:8787`),
+//! - `FAMILYCLAW_AGENT_NAME` — the agent's display name (default `agent_a`),
+//! - `FAMILYCLAW_AGENT_MODEL` — `"provider/model"` (default `provider/model`),
+//! - `FAMILYCLAW_PROFILE_DIR` — root of the soul profile directory (optional),
+//! - `FAMILYCLAW_TELEGRAM_CHANNEL_ID` — Telegram channel instance identifier,
+//! - `FAMILYCLAW_REPLY_TARGET` — static reply target (Telegram chat id),
+//! - `FAMILYCLAW_GATEWAY_TOKEN` — optional bearer token that protects
+//!   `POST /inject` (when set, the request requires `Authorization: Bearer <token>`;
+//!   when empty, the endpoint stays loopback-only-open as before),
+//! - `TELEGRAM_BOT_TOKEN` — Telegram bot token (required for the channel),
+//! - `FAMILYCLAW_PROVIDERS` — provider table for the resolver, format
+//!   `prefix=base_url=KEY_ENV` separated by semicolons (optional; without
+//!   this the agent runs without an LLM).
 //!
-//! ## Ajaminen
+//! ## Running
 //! ```bash
 //! TELEGRAM_BOT_TOKEN=... \
 //! FAMILYCLAW_TELEGRAM_CHANNEL_ID=tg-main \
 //! FAMILYCLAW_REPLY_TARGET=123456789 \
 //! cargo run -p familyclaw-gateway
-//! # toinen pääte:
+//! # second terminal:
 //! curl -i http://127.0.0.1:8787/healthz   # 200 OK
-//! curl -i http://127.0.0.1:8787/readyz    # 200 OK (bus käynnissä)
+//! curl -i http://127.0.0.1:8787/readyz    # 200 OK (bus running)
 //! ```
 //!
-//! ## Operaattorin hyväksyntäpinta (suspend/resume-silta, roadmap §6 D2)
-//! Kun agentin tool-loop keskeytyy odottamaan ihmisen hyväksyntää
+//! ## Operator approval surface (suspend/resume bridge, roadmap §6 D2)
+//! When the agent's tool loop suspends to wait for human approval
 //! ([`ThinkOutcome::Suspended`](familyclaw_agent::ThinkOutcome::Suspended)),
-//! käyttäjälle EI lähde vastausta — keskeytys on **operaattorin** asia. Gateway
-//! tarjoaa kaksi bearer-suojattua reittiä (sama [`GATEWAY_TOKEN_ENV`]-token
-//! kuin `/inject`):
-//! - `GET /approvals/pending` — listaa odottavat hyväksynnät **redaktoituina**
-//!   (`approval_id`, `redacted_summary`, `created_at`) — ei koskaan raakaa
-//!   payloadia eikä salaisuuksia.
-//! - `POST /approvals/{approval_id}/approve` — myöntää hyväksynnän ja ajaa
-//!   keskeytyneen toiminnon loppuun (payload-sidottu, kertakäyttöinen).
+//! NO reply is sent to the user — the suspension is the **operator's**
+//! concern. The gateway provides two bearer-protected routes (same
+//! [`GATEWAY_TOKEN_ENV`] token as `/inject`):
+//! - `GET /approvals/pending` — lists pending approvals **redacted**
+//!   (`approval_id`, `redacted_summary`, `created_at`) — never the raw
+//!   payload or secrets.
+//! - `POST /approvals/{approval_id}/approve` — grants the approval and runs
+//!   the suspended action to completion (payload-bound, single-use).
 //!
 //! ```bash
 //! TOKEN=...   # FAMILYCLAW_GATEWAY_TOKEN
 //! curl -s -H "Authorization: Bearer $TOKEN" \
 //!   http://127.0.0.1:8787/approvals/pending
-//! # → [{"approval_id":"…","redacted_summary":"taito '…' odottaa …","created_at":"…"}]
+//! # → [{"approval_id":"…","redacted_summary":"skill '…' awaiting …","created_at":"…"}]
 //! curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 //!   http://127.0.0.1:8787/approvals/<approval_id>/approve
 //! # → {"approval_id":"…","task_id":"…","status":"done","awaiting_further_approval":false}
@@ -124,17 +124,17 @@ use familyclaw_scheduler::{AgencyConfig, ScheduledTaskId, SchedulerHandle};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-/// Ympäristömuuttuja, joka määrää gatewayn kuunteluosoitteen.
+/// Environment variable that sets the gateway's listen address.
 const ADDR_ENV: &str = "FAMILYCLAW_GATEWAY_ADDR";
 
-/// Telegram-botin token (env). Vaadittu kun kanava kytketään.
-/// (Muut env-väliaineet palveluvan kautta `FamilyConfig` — nähdään `config.rs`.)
+/// Telegram bot token (env). Required when the channel is wired up.
+/// (Other env vars are served via `FamilyConfig` — see `config.rs`.)
 const TELEGRAM_TOKEN_ENV: &str = "TELEGRAM_BOT_TOKEN";
 
-/// Provider-taulu resolverille (env). Muoto: `prefix=base_url=KEY_ENV` eroteltuna `;`.
+/// Provider table for the resolver (env). Format: `prefix=base_url=KEY_ENV` separated by `;`.
 const PROVIDERS_ENV: &str = "FAMILYCLAW_PROVIDERS";
 
-/// Env-nimet virheviesteissä (ei lueta suoraan — `FamilyConfig` hoitaa)
+/// Env names used in error messages (not read directly — `FamilyConfig` handles that)
 const DISCORD_WEBHOOK_URL_ENV: &str = "DISCORD_WEBHOOK_URL";
 const DISCORD_BOT_TOKEN_ENV: &str = "DISCORD_BOT_TOKEN";
 const DISCORD_PUBLIC_KEY_ENV: &str = "DISCORD_PUBLIC_KEY";
@@ -142,36 +142,36 @@ const DISCORD_CHANNEL_ID_ENV: &str = "DISCORD_CHANNEL_ID";
 const TELEGRAM_CHANNEL_ID_ENV: &str = "FAMILYCLAW_TELEGRAM_CHANNEL_ID";
 const REPLY_TARGET_ENV: &str = "FAMILYCLAW_REPLY_TARGET";
 
-/// Valinnainen bearer-token, joka suojaa `POST /inject`:n (env). Käytetään
-/// vain virheviesteissä/dokumentaatiossa — varsinainen arvo luetaan
-/// `FamilyConfig`:n kautta. Vrt. `OpenClaw`in `OPENCLAW_GATEWAY_TOKEN`.
+/// Optional bearer token that protects `POST /inject` (env). Used only in
+/// error messages/documentation — the actual value is read via
+/// `FamilyConfig`. Cf. `OpenClaw`'s `OPENCLAW_GATEWAY_TOKEN`.
 const GATEWAY_TOKEN_ENV: &str = "FAMILYCLAW_GATEWAY_TOKEN";
 
-/// `orchestrate`-alikomennon suunnitelma JSON-muodossa. Tyhjä/asettamaton →
-/// pieni sisäänrakennettu savutesti-suunnitelma. Muoto:
+/// The `orchestrate` subcommand's plan in JSON form. Empty/unset →
+/// a small built-in smoke-test plan. Format:
 /// `{"id":"plan","nodes":[{"id":"n1","title":"...","description":"...","input":{...}}]}`.
 const PLAN_ENV: &str = "FAMILYCLAW_PLAN";
 
-/// Valinnainen LLM-output-katto (tokeneina). Ilman tätä LlmConfig-oletus on
-/// 2048, joka katkaisee pitkät vastaukset kesken lauseen. Aseta esim. 8192
-/// jotta agentti (esim. pitkät tutkimusraportit) mahtuu vastaamaan kokonaan.
+/// Optional LLM output cap (in tokens). Without this the `LlmConfig` default is
+/// 2048, which cuts off long responses mid-sentence. Set e.g. 8192 so the
+/// agent (e.g. long research reports) can respond in full.
 const MAX_TOKENS_ENV: &str = "FAMILYCLAW_MAX_TOKENS";
 const REQUEST_TIMEOUT_MS_ENV: &str = "FAMILYCLAW_REQUEST_TIMEOUT_MS";
 
-/// Oletusarvot joita `FamilyConfig` käyttää (KERROS B).
+/// Default values used by `FamilyConfig` (Layer B).
 const DEFAULT_BUS_NAME: &str = "familyclaw-gateway-bus";
 
-/// Oletuskuunteluosoite, kun [`ADDR_ENV`] ei ole asetettu. Sidotaan
-/// silmukkaosoitteeseen oletuksena (turvallinen oletus — ei altista
-/// gatewayta verkolle ilman tietoista valintaa).
+/// Default listen address when [`ADDR_ENV`] is not set. Binds to the
+/// loopback address by default (safe default — does not expose the gateway
+/// to the network without a deliberate choice).
 const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 
-/// FamilyClaw-gatewayn komentorivikäyttöliittymä.
+/// `FamilyClaw` gateway command-line interface.
 ///
-/// Ilman alikomentoa gateway käyttäytyy kuten ennen CLI:tä — käynnistää
-/// palvelimen (`serve`). Tämä säilyttää taaksepäinyhteensopivuuden
-/// `cargo run -p familyclaw-gateway`- ja Docker-`CMD`-kutsuihin, jotka eivät
-/// anna argumentteja.
+/// Without a subcommand, the gateway behaves as it did before the CLI —
+/// it starts the server (`serve`). This preserves backward compatibility
+/// with `cargo run -p familyclaw-gateway` and Docker `CMD` invocations that
+/// pass no arguments.
 #[derive(Parser)]
 #[command(name = "familyclaw-gateway", version, about, long_about = None)]
 struct Cli {
@@ -179,127 +179,128 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// Gatewayn alikomennot.
+/// Gateway subcommands.
 #[derive(Subcommand)]
 enum Command {
-    /// Käynnistä gateway-palvelin (oletus, kun alikomentoa ei anneta).
+    /// Start the gateway server (default when no subcommand is given).
     Serve,
-    /// Kysy käynnissä olevan gatewayn tila (`/healthz` + `/readyz`).
+    /// Query the running gateway's status (`/healthz` + `/readyz`).
     ///
-    /// Lukee [`ADDR_ENV`]:n (tai oletusosoitteen) ja tekee HTTP-pyynnöt.
-    /// Tulostaa tilan ja palaa exit-koodilla `0` vain kun `/readyz` = 200.
+    /// Reads [`ADDR_ENV`] (or the default address) and makes HTTP requests.
+    /// Prints the status and returns exit code `0` only when `/readyz` = 200.
     Status,
-    /// Tarkista kokoonpano käynnistämättä palvelinta (offline-diagnostiikka).
+    /// Check the configuration without starting the server (offline diagnostics).
     Doctor {
-        /// Korjaa automaattisesti mitä voidaan (data-hakemisto, vanhat jumit, …).
+        /// Automatically fix what can be fixed (data directory, stale stuck items, …).
         #[arg(long)]
         fix: bool,
     },
-    /// Aja monivaiheinen orkesterointisuunnitelma kerran ja tulosta raportti.
+    /// Run a multi-step orchestration plan once and print a report.
     ///
-    /// Tämä on multi-agent DAG -ajon **elävä sisäänkäynti**: kokoaa
-    /// [`FamilyBridge`]:n, rekisteröi työntekijät, valitsee mallin
-    /// ([`LiveTurnExecutor`] oikealla LLM-ketjulla [`build_resolver`]:n kautta)
-    /// ja ajaa [`Orchestrator::run_with`]:n. Suunnitelma luetaan
-    /// [`PLAN_ENV`]-ympäristömuuttujasta (JSON) tai käytetään pientä
-    /// sisäänrakennettua oletussuunnitelmaa savutestiksi.
+    /// This is the **live entry point** for a multi-agent DAG run: it
+    /// assembles a [`FamilyBridge`], registers workers, selects the model
+    /// ([`LiveTurnExecutor`] with a real LLM chain via [`build_resolver`])
+    /// and runs [`Orchestrator::run_with`]. The plan is read from the
+    /// [`PLAN_ENV`] environment variable (JSON), or a small built-in default
+    /// plan is used as a smoke test.
     ///
-    /// **Rehellinen rajaus:** ajaa bridgen omalla substraatilla
-    /// (`EventBus` + `AgentRegistry` + `TaskBoard`), EI [`FamilyRuntime`]:n
-    /// ractor-agenteilla/`ResonanceBus`illa. Tämä tekee DAG-orkesteroinnista
-    /// ajettavan oikeilla LLM-kutsuilla; fuusio eläviin runtime-agentteihin on
-    /// erillinen, isompi työ.
-    /// DAG-orkesterointi (bridge-substraatti, ei FamilyRuntime-agentteja).
+    /// **Honest scope note:** runs on the bridge's own substrate
+    /// (`EventBus` + `AgentRegistry` + `TaskBoard`), NOT on [`FamilyRuntime`]'s
+    /// ractor agents/`ResonanceBus`. This makes DAG orchestration runnable
+    /// with real LLM calls; fusing it into live runtime agents is a
+    /// separate, larger effort.
+    /// DAG orchestration (bridge substrate, not `FamilyRuntime` agents).
     Orchestrate,
-    /// Interaktiivinen onboarding-wizard (TOML + data-hakemisto alle 5 min).
+    /// Interactive onboarding wizard (TOML + data directory in under 5 min).
     Init,
 }
 
-/// Gatewayn jaettu ajonaikainen tila, johon HTTP-handlerit viittaavat.
+/// The gateway's shared runtime state, referenced by the HTTP handlers.
 ///
-/// Pidetään tarkoituksella pienenä. `bus` on `Some` kun Resonance Bus on
-/// käynnistetty — `/readyz` raportoi valmiuden tämän perusteella.
+/// Deliberately kept small. `bus` is `Some` when the Resonance Bus has been
+/// started — `/readyz` reports readiness based on this.
 #[derive(Clone)]
 struct GatewayState {
-    /// Resonance Bus -kahva. `Some` = bus käynnissä → valmius OK.
+    /// Resonance Bus handle. `Some` = bus running → readiness OK.
     bus: Option<BusHandle>,
-    /// Discord-kanava inject-handlerille. `Some` kun kanavatyyppi on "discord".
+    /// Discord channel for the inject handler. `Some` when the channel kind is "discord".
     discord_channel: Option<Arc<DiscordChannel>>,
-    /// Valinnainen `POST /inject`-bearer-token. `Some` = endpoint vaatii
-    /// `Authorization: Bearer <token>`:n; `None` = avoin loopback-only-oletus
-    /// (yhteensopiva aiemman käytöksen kanssa). Vrt. `OpenClaw`in
+    /// Optional `POST /inject` bearer token. `Some` = the endpoint requires
+    /// `Authorization: Bearer <token>`; `None` = open loopback-only default
+    /// (compatible with prior behavior). Cf. `OpenClaw`'s
     /// `OPENCLAW_GATEWAY_TOKEN`.
     inject_token: Option<Arc<str>>,
-    /// Discord Interactions Ed25519 public key (hex). `Some` → `/discord/interactions` aktiivinen.
+    /// Discord Interactions Ed25519 public key (hex). `Some` → `/discord/interactions` active.
     discord_public_key: Option<Arc<str>>,
-    /// **Jaettu toimintoajoympäristö** operaattorin hyväksyntäpinnalle
+    /// **Shared action runtime** for the operator approval surface
     /// (`GET /approvals/pending`, `POST /approvals/{id}/approve`).
     ///
-    /// Sama [`Arc<Mutex<ActionRuntime>>`] jonka [`FamilyRuntime`] kytki agentin
-    /// tool-looppiin ([`FamilyRuntime::actions`]) — operaattori ja agentti
-    /// jakavat SAMAN lukitun tilan, joten gateway näkee tarkalleen ne odottavat
-    /// hyväksynnät jotka agentin keskeytynyt vuoro jätti, ja `approve` ajaa
-    /// keskeytyneen toiminnon loppuun samassa tilassa.
+    /// The same [`Arc<Mutex<ActionRuntime>>`] that [`FamilyRuntime`] wired
+    /// into the agent's tool loop ([`FamilyRuntime::actions`]) — the operator
+    /// and the agent share the SAME locked state, so the gateway sees exactly
+    /// the pending approvals left behind by the agent's suspended turn, and
+    /// `approve` runs the suspended action to completion in that same state.
     ///
-    /// `Some` palvelevassa gatewayssa (aina, [`build_family`] luo
-    /// toimintoajoympäristön); `None` vain tiloissa joissa runtimea ei ole
-    /// kytketty (esim. testit, jotka eivät tarvitse hyväksyntäpintaa). Kun
-    /// `None`, hyväksyntäreitit vastaavat `503 Service Unavailable`.
+    /// `Some` in a serving gateway (always, [`build_family`] creates the
+    /// action runtime); `None` only in states where the runtime is not
+    /// wired up (e.g. tests that don't need the approval surface). When
+    /// `None`, the approval routes respond `503 Service Unavailable`.
     actions: Option<Arc<Mutex<ActionRuntime>>>,
-    /// **Jaettu turn-audit-keräin** havainnoitavalle tool-loop-jäljelle
+    /// **Shared turn-audit collector** for the observable tool-loop trace
     /// (`GET /turns/audit`, TURN-AUDIT roadmap §6 D6).
     ///
-    /// Sama [`Arc<AuditCollector>`] jonka [`build_family`] kytki agentin
-    /// tool-looppiin ([`FamilyRuntime::turn_audit`]) — operaattori näkee
-    /// tarkalleen ne tapahtumat jotka agentin vuorot kirjasivat (vuoron alku,
-    /// työkalukutsut **redaktoituina**, suspend/resume, `stop_reason`).
+    /// The same [`Arc<AuditCollector>`] that [`build_family`] wired into the
+    /// agent's tool loop ([`FamilyRuntime::turn_audit`]) — the operator sees
+    /// exactly the events the agent's turns logged (turn start,
+    /// tool calls **redacted**, suspend/resume, `stop_reason`).
     ///
-    /// `Some` palvelevassa gatewayssa; `None` tiloissa joissa runtimea ei ole
-    /// kytketty (esim. testit). Kun `None`, audit-reitti vastaa
+    /// `Some` in a serving gateway; `None` in states where the runtime is not
+    /// wired up (e.g. tests). When `None`, the audit route responds
     /// `503 Service Unavailable`.
     turn_audit: Option<Arc<AuditCollector>>,
-    /// **Jaettu ajastinkahva** perhe-agency-operaattoripinnalle
-    /// (`POST /tasks/{id}/enabled`, Phase 4 kill-switch).
+    /// **Shared scheduler handle** for the family-agency operator surface
+    /// (`POST /tasks/{id}/enabled`, Phase 4 kill switch).
     ///
-    /// Sama [`SchedulerHandle`] jonka [`FamilyRuntime`] altistaa
-    /// ([`FamilyRuntime::scheduler_handle`]) — operaattori voi kytkeä ajastettuja
-    /// tehtäviä päälle/pois saman lukon kautta jota tikkisilmukka käyttää.
-    /// `Some` palvelevassa gatewayssa kun ajastin on käynnissä; `None` kun
-    /// ajastin on pois käytöstä (`FAMILYCLAW_DREAM_DISABLED`) tai runtimea ei
-    /// ole kytketty. Kun `None`, kill-switch-reitti vastaa `503`.
+    /// The same [`SchedulerHandle`] that [`FamilyRuntime`] exposes
+    /// ([`FamilyRuntime::scheduler_handle`]) — the operator can toggle
+    /// scheduled tasks on/off through the same lock the tick loop uses.
+    /// `Some` in a serving gateway when the scheduler is running; `None`
+    /// when the scheduler is disabled (`FAMILYCLAW_DREAM_DISABLED`) or the
+    /// runtime is not wired up. When `None`, the kill-switch route responds `503`.
     scheduler: Option<SchedulerHandle>,
-    /// Perhe-agency-configin polku (`<data_dir>/agency.json`) johon kill-switch-
-    /// muutos persistoidaan (Phase 4). `Some` kun ajastin pyörii persistentillä
-    /// polulla; `None` muistinvaraisessa tilassa → muutos jää vain muistiin
-    /// (häviää restartissa, mikä on oikein in-memory-tilalle).
+    /// Path to the family-agency config (`<data_dir>/agency.json`) to which
+    /// kill-switch changes are persisted (Phase 4). `Some` when the
+    /// scheduler runs on a persistent path; `None` in in-memory mode →
+    /// the change stays in memory only (lost on restart, which is correct
+    /// for in-memory mode).
     agency_config_path: Option<std::path::PathBuf>,
-    /// **Jaettu mittarirekisteri** Prometheus-viennille (`GET /metrics`).
+    /// **Shared metrics registry** for Prometheus export (`GET /metrics`).
     ///
-    /// [`MetricsRegistry`] on `Clone` ja jakaa tilansa `Arc`:n kautta, joten
-    /// tämä kahva näkee tarkalleen samat mittarit kuin se instanssi joka
-    /// kasvattaa niitä. [`serve`] antaa TÄSMÄLLEEN saman rekisterin myös
-    /// [`EventRecorder`]ille (joka
-    /// tilaa siltakerroksen tapahtumaväylän), joten ajonaikaiset tapahtumat
-    /// inkrementoivat näitä sarjoja elävästi. Rakennetaan
-    /// [`MetricsRegistry::with_fleet_defaults`]:lla, joten laivueen sarjat
-    /// (esim. luodut tehtävät, online olevat agentit) ovat viennissä alusta asti
-    /// arvolla `0` — dashboardit eivät "katoa" ennen ensimmäistä tapahtumaa.
+    /// [`MetricsRegistry`] is `Clone` and shares its state via `Arc`, so
+    /// this handle sees exactly the same metrics as the instance that
+    /// increments them. [`serve`] gives the exact same registry to the
+    /// [`EventRecorder`] as well (which
+    /// subscribes to the bridge layer's event bus), so runtime events
+    /// increment these series live. Built with
+    /// [`MetricsRegistry::with_fleet_defaults`], so the fleet's series
+    /// (e.g. created tasks, agents online) are present in the export from
+    /// the start at value `0` — dashboards don't "disappear" before the first event.
     ///
-    /// Vienti on aina turvallinen: [`MetricsRegistry::prometheus_export`]
-    /// palauttaa pelkän `String`:n eikä koskaan vuoda salaisuuksia (mittareilla
-    /// on vain numeeriset arvot, ei payloadia). `None` vain tiloissa joissa
-    /// rekisteriä ei ole kytketty (esim. osa testeistä).
+    /// Export is always safe: [`MetricsRegistry::prometheus_export`]
+    /// returns a plain `String` and never leaks secrets (metrics carry only
+    /// numeric values, no payload). `None` only in states where the
+    /// registry is not wired up (e.g. some tests).
     metrics: Option<MetricsRegistry>,
-    /// Syvä readyz / kanarialintu: LLM-malli, Discord, journal-polku.
+    /// Deep readyz / canary: LLM model, Discord, journal path.
     readiness: readiness::ReadinessProbe,
 }
 
-/// Tyhjä gateway-tila testeihin.
+/// Empty gateway state for tests.
 //
-// Jaettu testifikstuuri: säilytetään testien apuvälineenä, vaikka nykyiset
-// testit rakentavat `GatewayState`:n toistaiseksi inline. `#[cfg(test)]`
-// pitää sen pois tuotantobinääristä; `dead_code`-allow estää varoituksen
-// niin kauan kuin yksikään testi ei vielä kutsu sitä.
+// Shared test fixture: kept as a test helper even though current tests
+// build `GatewayState` inline for now. `#[cfg(test)]` keeps it out of the
+// production binary; the `dead_code` allow suppresses the warning as long
+// as no test calls it yet.
 #[cfg(test)]
 #[allow(dead_code)]
 fn test_gateway_state() -> GatewayState {
@@ -317,32 +318,32 @@ fn test_gateway_state() -> GatewayState {
     }
 }
 
-/// Yhden odottavan hyväksynnän **operaattorille turvallinen, redaktoitu**
-/// esitys `GET /approvals/pending`:n JSON-vastaukseen.
+/// **Operator-safe, redacted** representation of a single pending approval
+/// for the `GET /approvals/pending` JSON response.
 ///
-/// Tämä on tarkoituksella oma tyyppinsä eikä `familyclaw-actions`:n
-/// sisäinen rakenne: se kantaa **vain** kolme salaisuudetonta kenttää jotka
-/// operaattori tarvitsee päättääkseen hyväksynnästä — **ei koskaan raakaa
-/// payloadia, työkaluargumentteja eikä salaisuuksia**. `redacted_summary` tulee
-/// suoraan [`ActionRuntime::pending_summary_for`]:lta (johdettu vain taidon
-/// nimestä + tunnisteista), ja `created_at` on auditointiaikaleima.
+/// This is deliberately its own type rather than `familyclaw-actions`'s
+/// internal structure: it carries **only** the three secret-free fields the
+/// operator needs to decide on the approval — **never the raw
+/// payload, tool arguments, or secrets**. `redacted_summary` comes
+/// directly from [`ActionRuntime::pending_summary_for`] (derived only from
+/// the skill name + identifiers), and `created_at` is the audit timestamp.
 #[derive(serde::Serialize)]
 struct PendingApprovalView {
-    /// Hyväksynnän tunniste (`POST /approvals/{approval_id}/approve` jatkaa).
+    /// Approval identifier (`POST /approvals/{approval_id}/approve` continues it).
     approval_id: String,
-    /// Redaktoitu ihmisluettava tiivistelmä (ei payloadia, ei salaisuuksia).
+    /// Redacted human-readable summary (no payload, no secrets).
     redacted_summary: String,
-    /// Hetki jolloin odottava kirjaus luotiin (RFC 3339 -aikaleima).
+    /// Moment when the pending record was created (RFC 3339 timestamp).
     created_at: String,
 }
 
-/// Elinvoimatarkistus: vastaa aina `200 OK` kun prosessi pystyy palvelemaan
-/// HTTP-pyyntöjä. Ei tarkista riippuvuuksia (vrt. [`readyz`]).
+/// Liveness check: always responds `200 OK` when the process can serve
+/// HTTP requests. Does not check dependencies (cf. [`readyz`]).
 async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Valmiustarkistus: syvä tarkistus (bus + LLM + Discord + journal).
+/// Readiness check: deep check (bus + LLM + Discord + journal).
 async fn readyz(
     axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
 ) -> (StatusCode, axum::Json<readiness::ReadyzResponse>) {
@@ -350,7 +351,7 @@ async fn readyz(
     readiness::deep_readyz(bus_ok, &state.readiness).await
 }
 
-/// Kanarialintu: synteettinen LLM-ping + infratarkistukset.
+/// Canary: synthetic LLM ping + infra checks.
 async fn canary(
     axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
 ) -> std::result::Result<axum::Json<readiness::CanaryResponse>, StatusCode> {
@@ -359,13 +360,14 @@ async fn canary(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// Vakioaikainen tavujonojen vertailu (defense-in-depth bearer-tokenille).
+/// Constant-time byte-string comparison (defense-in-depth for the bearer token).
 ///
-/// Palauttaa `true` vain jos jonot ovat samanpituiset ja tavuittain identtiset.
-/// Suoritusaika riippuu vain pidemmän jonon pituudesta, ei sisällöstä — emme
-/// oikosulje ensimmäisestä eroavasta tavusta, jottei vertailu vuoda
-/// ajoituskanavaa hyökkääjälle (sama idiomi kuin `familyclaw-security`:n
-/// ankkuritiivisteen vertailussa).
+/// Returns `true` only if the strings are the same length and byte-for-byte
+/// identical. Execution time depends only on the length of the longer
+/// string, not its content — we do not short-circuit on the first
+/// differing byte, so the comparison does not leak a timing side channel to
+/// an attacker (same idiom as the anchor-hash comparison in
+/// `familyclaw-security`).
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -377,28 +379,28 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Tarkistaa `POST /inject`:n bearer-token-valtuutuksen.
+/// Checks the bearer-token authorization for `POST /inject`.
 ///
-/// - Jos tokenia **ei** ole konfiguroitu ([`GatewayState::inject_token`] =
-///   `None`), pyyntö hyväksytään sellaisenaan (avoin loopback-only-oletus,
-///   taaksepäinyhteensopiva).
-/// - Jos token **on** konfiguroitu, otsikon `Authorization: Bearer <token>`
-///   on oltava läsnä ja täsmättävä vakioaikaisesti — muuten
+/// - If a token is **not** configured ([`GatewayState::inject_token`] =
+///   `None`), the request is accepted as-is (open loopback-only default,
+///   backward-compatible).
+/// - If a token **is** configured, the `Authorization: Bearer <token>`
+///   header must be present and match in constant time — otherwise
 ///   [`StatusCode::UNAUTHORIZED`].
 ///
-/// Token-arvoja ei koskaan lokiteta (MEMORY.md secret-leak-sääntö).
+/// Token values are never logged (MEMORY.md secret-leak rule).
 ///
-/// Huom: paluutyyppi on `std::result::Result` täsmällisesti, koska tämän
-/// kraatin laajuudessa `Result` viittaa [`familyclaw_core::Result`]-aliakseen.
+/// Note: the return type is `std::result::Result` explicitly, because
+/// within this crate's scope `Result` refers to the [`familyclaw_core::Result`] alias.
 fn check_inject_auth(
     state: &GatewayState,
     headers: &HeaderMap,
 ) -> std::result::Result<(), StatusCode> {
     let Some(expected) = state.inject_token.as_deref() else {
-        // Ei tokenia konfiguroitu → avoin oletus (loopback-only).
+        // No token configured → open default (loopback-only).
         return Ok(());
     };
-    // Pura `Authorization: Bearer <token>` — puuttuva/virheellinen otsikko = 401.
+    // Parse `Authorization: Bearer <token>` — missing/invalid header = 401.
     let presented = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -413,11 +415,11 @@ fn check_inject_auth(
     }
 }
 
-/// Injektoi ulkopuolisen viestin Discord-kanavaan.
+/// Injects an external message into the Discord channel.
 /// `POST /inject` — JSON: `{"sender": "...", "chat_id": "...", "body": "..."}`
 ///
-/// Jos [`GATEWAY_TOKEN_ENV`] on konfiguroitu, pyyntö vaatii otsikon
-/// `Authorization: Bearer <token>` (vakioaikainen täsmäys), muuten `401`.
+/// If [`GATEWAY_TOKEN_ENV`] is configured, the request requires the header
+/// `Authorization: Bearer <token>` (constant-time match), otherwise `401`.
 async fn inject_discord(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -461,7 +463,7 @@ async fn inject_discord(
     }
 }
 
-/// Discord Interactions endpoint — Ed25519-verify + inject + deferred vastaus.
+/// Discord Interactions endpoint — Ed25519 verify + inject + deferred response.
 async fn handle_discord_interaction(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -574,25 +576,25 @@ async fn handle_discord_interaction(
     )
 }
 
-/// `GET /approvals/pending` — listaa operaattorille **redaktoituina** ne vuorot
-/// jotka odottavat ihmisen hyväksyntää (suspend/resume-silta, roadmap §6 D2).
+/// `GET /approvals/pending` — lists for the operator, **redacted**, the turns
+/// that are awaiting human approval (suspend/resume bridge, roadmap §6 D2).
 ///
-/// Vastaus on JSON-lista [`PendingApprovalView`]-objekteja, kukin sisältäen
-/// **vain** kolme salaisuudetonta kenttää: `approval_id`, `redacted_summary` ja
-/// `created_at`. **Raakaa payloadia, työkaluargumentteja tai salaisuuksia ei
-/// koskaan palauteta** — lähde on [`ActionRuntime::try_pending_approvals`] +
+/// The response is a JSON list of [`PendingApprovalView`] objects, each
+/// containing **only** three secret-free fields: `approval_id`, `redacted_summary`,
+/// and `created_at`. **The raw payload, tool arguments, or secrets are
+/// never returned** — the source is [`ActionRuntime::try_pending_approvals`] +
 /// [`ActionRuntime::pending_summary_for`]/[`ActionRuntime::pending_created_at_for`],
-/// jotka kaikki johtavat tiedon vain redaktoidusta `PendingRecord`:stä
-/// (actions-kerroksen salaisuudeton tallennusmuoto).
+/// all of which derive the data only from the redacted `PendingRecord`
+/// (the actions layer's secret-free storage form).
 ///
-/// Suojaus on sama kuin `POST /inject`:llä: jos [`GATEWAY_TOKEN_ENV`] on
-/// konfiguroitu, pyyntö vaatii otsikon `Authorization: Bearer <token>`
-/// (vakioaikainen täsmäys), muuten `401`.
+/// Protection is the same as `POST /inject`: if [`GATEWAY_TOKEN_ENV`] is
+/// configured, the request requires the header `Authorization: Bearer <token>`
+/// (constant-time match), otherwise `401`.
 ///
-/// Tilakoodit:
-/// - `200 OK` + JSON-lista (myös tyhjä lista, jos mikään ei odota),
-/// - `401 Unauthorized` jos bearer-token vaaditaan eikä se täsmää,
-/// - `503 Service Unavailable` jos toimintoajoympäristöä ei ole kytketty
+/// Status codes:
+/// - `200 OK` + JSON list (also an empty list if nothing is pending),
+/// - `401 Unauthorized` if a bearer token is required and doesn't match,
+/// - `503 Service Unavailable` if the action runtime is not wired up
 ///   ([`GatewayState::actions`] = `None`).
 async fn list_pending_approvals(
     State(state): State<Arc<GatewayState>>,
@@ -611,15 +613,16 @@ async fn list_pending_approvals(
         );
     };
 
-    // Lukko vain listauksen ajaksi. `try_pending_approvals` palauttaa vain
-    // (approval_id, task_id); rikastamme sen redaktoidulla tiivistelmällä ja
-    // luontihetkellä SAMAN lukon alla, jottei tila ehdi muuttua välissä.
+    // Lock only for the duration of the listing. `try_pending_approvals`
+    // returns only (approval_id, task_id); we enrich it with the redacted
+    // summary and creation time under the SAME lock, so the state can't
+    // change in between.
     let rt = actions.lock().await;
     let pending = match rt.try_pending_approvals() {
         Ok(p) => p,
         Err(e) => {
-            // Tallennuspinnan lukuvirhe (käytännössä vain kaatumiskestävällä
-            // pinnalla). Ei vuoda yksityiskohtia operaattorin ulkopuolelle.
+            // Storage-surface read error (in practice only with the
+            // crash-resilient surface). Do not leak details beyond the operator.
             warn!("approvals: pending-listan luku epäonnistui: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -630,9 +633,9 @@ async fn list_pending_approvals(
     let views: Vec<PendingApprovalView> = pending
         .iter()
         .map(|p| {
-            // Redaktoitu tiivistelmä + luontihetki samalta tallennuspinnalta.
-            // `None` (kilpa: kulutettiin lukon ulkopuolella) → neutraali oletus,
-            // ei koskaan raakaa dataa.
+            // Redacted summary + creation time from the same storage surface.
+            // `None` (race: consumed outside the lock) → neutral default,
+            // never raw data.
             let redacted_summary = rt
                 .pending_summary_for(p.approval_id)
                 .unwrap_or_else(|| "odottaa ihmisen hyväksyntää".to_string());
@@ -656,52 +659,53 @@ async fn list_pending_approvals(
     (StatusCode::OK, Json(body))
 }
 
-/// `POST /approvals/{approval_id}/approve` — **hyväksyy** annetun
-/// `approval_id`:n ja **välittää jatkon vuoron OMISTAVALLE agentille** bussin
-/// [`BusMessage::ResumeApproval`]-ohjaussignaalilla (suspend/resume-silta,
-/// roadmap §6 D2).
+/// `POST /approvals/{approval_id}/approve` — **approves** the given
+/// `approval_id` and **hands off the continuation to the turn's OWNING agent**
+/// via the bus's [`BusMessage::ResumeApproval`] control signal (suspend/resume
+/// bridge, roadmap §6 D2).
 ///
-/// ## Yksi kuluttaja kertakäyttöiselle hyväksynnälle (Option A)
-/// Hyväksyntä on **kertakäyttöinen**: sen kuluttaa (ajaa sivuvaikutuksen +
-/// poistaa odottavista) tasan yksi taho. Tässä mallissa kuluttaja on
-/// **agentti**, ei gateway. Gateway VALIDOI (auth + esitarkistus 400/404/410)
-/// ja sitten **julkaisee** `ResumeApproval`-signaalin; vuoron omistava agentti
-/// jatkaa [`handle_resume_signal`](familyclaw_agent::Agent::handle_resume_signal)
-/// → [`resume_approved`](familyclaw_agent::Agent::resume_approved)-polulle, ajaa
-/// payload-sidotun sivuvaikutuksen **TASAN KERRAN** ja reitittää lopullisen
-/// vastauksen alkuperäiselle kanavalle — **ilman uutta LLM-vuoroa**. Gateway EI
-/// kuluta hyväksyntää (kaksi kuluttajaa yhdelle kertakäyttöiselle hyväksynnälle
-/// olisi mahdoton: jälkimmäinen näkisi `ApprovalMissing`).
+/// ## Single consumer for a single-use approval (Option A)
+/// The approval is **single-use**: it is consumed (runs the side effect +
+/// removed from pending) by exactly one party. In this model the consumer is
+/// the **agent**, not the gateway. The gateway VALIDATES (auth + pre-check
+/// 400/404/410) and then **publishes** the `ResumeApproval` signal; the
+/// owning agent continues on the
+/// [`handle_resume_signal`](familyclaw_agent::Agent::handle_resume_signal)
+/// → [`resume_approved`](familyclaw_agent::Agent::resume_approved) path, runs
+/// the payload-bound side effect **EXACTLY ONCE**, and routes the final
+/// response to the originating channel — **without a new LLM turn**. The
+/// gateway does NOT consume the approval (two consumers for one single-use
+/// approval would be impossible: the later one would see `ApprovalMissing`).
 ///
-/// ## Asynkroninen semantiikka
-/// `200 OK` tarkoittaa **hyväksyntä otettu vastaan ja välitetty omistaja-
-/// agentille** — EI että sivuvaikutus on jo ajettu. Sivuvaikutus ajetaan ja
-/// vastaus toimitetaan **asynkronisesti** kanavalle (oikea UX). Vastausrunko ei
-/// siksi voi sisältää tehtävän lopputulosta; se sisältää vain tunnisteen + tilan
-/// `resuming`.
+/// ## Asynchronous semantics
+/// `200 OK` means **the approval was received and handed off to the owning
+/// agent** — NOT that the side effect has already run. The side effect runs
+/// and the response is delivered **asynchronously** to the channel (correct
+/// UX). The response body therefore cannot contain the task's outcome; it
+/// contains only the identifier + the `resuming` status.
 ///
-/// Rungolla ei ole pakollista sisältöä (valinnainen). Esitarkistus on
-/// **READ-ONLY** ([`ActionRuntime::pending_expiry_for`]) eikä kuluta
-/// hyväksyntää; payload-sidonta + kertakäyttö tapahtuu agentin
-/// [`ActionRuntime::approve`]-kutsussa, joten muutettu runko ei voi käyttää
-/// hyväksyntää eikä vuotaa salaisuuksia suoritukseen.
+/// The body has no required content (optional). The pre-check is
+/// **READ-ONLY** ([`ActionRuntime::pending_expiry_for`]) and does not consume
+/// the approval; payload binding + single-use enforcement happen in the
+/// agent's [`ActionRuntime::approve`] call, so a modified body cannot spend
+/// the approval or leak secrets into execution.
 ///
-/// Suojaus on sama kuin `POST /inject`:llä (bearer-token jos konfiguroitu).
+/// Protection is the same as `POST /inject` (bearer token if configured).
 ///
-/// Tilakoodit (**fail-closed, ei paniikkia**):
-/// - `200 OK` + `{ approval_id, status: "resuming", note }` — hyväksyntä
-///   otettu vastaan ja välitetty agentille; sivuvaikutus + vastaus asynkronisesti
-///   kanavalle,
-/// - `400 Bad Request` jos `approval_id` ei jäsenny kelvolliseksi tunnisteeksi,
-/// - `401 Unauthorized` jos bearer-token vaaditaan eikä täsmää,
-/// - `404 Not Found` jos tunnistetta ei (enää) odota hyväksyntä (tuntematon tai
-///   jo kulutettu),
-/// - `410 Gone` jos hyväksyntä on vanhentunut (TTL umpeutunut),
-/// - `503 Service Unavailable` jos (a) toimintoajoympäristöä ei ole kytketty, (b)
-///   bussia ei ole kytketty (Option A vaatii serve-tilan, jossa agentti
-///   kuuntelee bussia — ilman bussia jatkoa ei voi koskaan tapahtua), tai (c)
-///   signaalin julkaisu epäonnistui. Kaikissa kolmessa tapauksessa hyväksyntää
-///   EI kulutettu → pyynnön voi turvallisesti yrittää uudelleen.
+/// Status codes (**fail-closed, no panics**):
+/// - `200 OK` + `{ approval_id, status: "resuming", note }` — approval
+///   received and handed off to the agent; side effect + response asynchronously
+///   to the channel,
+/// - `400 Bad Request` if `approval_id` does not parse as a valid identifier,
+/// - `401 Unauthorized` if a bearer token is required and doesn't match,
+/// - `404 Not Found` if the identifier is not (or no longer) awaiting
+///   approval (unknown or already consumed),
+/// - `410 Gone` if the approval has expired (TTL elapsed),
+/// - `503 Service Unavailable` if (a) the action runtime is not wired up, (b)
+///   the bus is not wired up (Option A requires serve mode, where the agent
+///   listens on the bus — without the bus, the continuation can never
+///   happen), or (c) publishing the signal failed. In all three cases the
+///   approval was NOT consumed → the request can be safely retried.
 async fn approve_pending(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -720,7 +724,7 @@ async fn approve_pending(
         );
     };
 
-    // Jäsennä tunniste (UUID). Kelvoton muoto = 400, ei 404 — eri syy.
+    // Parse the identifier (UUID). Invalid form = 400, not 404 — a different reason.
     let Ok(id) = ApprovalId::from_str(approval_id.trim()) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -728,19 +732,20 @@ async fn approve_pending(
         );
     };
 
-    // Determinismi (D1): aikaleima injektoidaan tähän yhteen pisteeseen ja ohjaa
-    // sekä vanhentumistarkistuksen että keskeytyneen toiminnon suorituksen.
+    // Determinism (D1): the timestamp is injected at this one point and
+    // drives both the expiry check and the execution of the suspended action.
     let now = familyclaw_core::time::now();
 
-    // **Read-only esitarkistus** (Option A): erotellaan "tuntematon" (404) ja
-    // "vanhentunut" (410) ennen kuin välitämme jatkon agentille. Tämä EI kuluta
-    // hyväksyntää ([`ActionRuntime::pending_expiry_for`] on read-only) — kuluttaja
-    // on agentti. Ilman tätä erottelua 404 ja 410 näyttäisivät samalta agentin
-    // resume-polulla, emmekä voisi antaa operaattorille fail-closed-tarkkaa syytä.
+    // **Read-only pre-check** (Option A): distinguishes "unknown" (404) from
+    // "expired" (410) before we hand the continuation off to the agent. This
+    // does NOT consume the approval ([`ActionRuntime::pending_expiry_for`] is
+    // read-only) — the consumer is the agent. Without this distinction, 404
+    // and 410 would look the same on the agent's resume path, and we
+    // couldn't give the operator a fail-closed, precise reason.
     let rt = actions.lock().await;
     match rt.pending_expiry_for(id) {
         None => {
-            // Tunnistetta ei odota hyväksyntä (tuntematon tai jo kulutettu).
+            // No approval is pending for the identifier (unknown or already consumed).
             warn!(approval = %id, "approvals: approve hylätty 404 — tuntematon tai kulutettu");
             return (
                 StatusCode::NOT_FOUND,
@@ -748,7 +753,7 @@ async fn approve_pending(
             );
         }
         Some(expires_at) if now > expires_at => {
-            // Vanhentunut → 410 Gone (fail-closed, ei kuluteta sivuvaikutusta).
+            // Expired → 410 Gone (fail-closed, the side effect is not consumed).
             warn!(approval = %id, "approvals: approve hylätty 410 — hyväksyntä vanhentunut");
             return (
                 StatusCode::GONE,
@@ -758,31 +763,31 @@ async fn approve_pending(
         Some(_) => {}
     }
 
-    // Esitarkistus läpäisty: hyväksyntä on olemassa eikä vanhentunut. EMME
-    // kuluta sitä gatewayssä (Option A) — vapauta toiminto-lukko ja siirrä
-    // jatko vuoron omistavalle agentille bussin kautta. Vain agentti kuluttaa
-    // kertakäyttöisen hyväksynnän (ajaa sivuvaikutuksen + reitittää vastauksen),
-    // joten emme pidä lukkoa kun julkaisemme.
+    // Pre-check passed: the approval exists and is not expired. We do NOT
+    // consume it in the gateway (Option A) — release the action lock and
+    // hand the continuation off to the owning agent via the bus. Only the
+    // agent consumes the single-use approval (runs the side effect + routes
+    // the response), so we don't hold the lock while we publish.
     drop(rt);
 
-    // **Resume-silta (Phase 1 §6 manuaaliportti, Option A):** julkaise
-    // ohjaussignaali `ResumeApproval` bussiin, jotta vuoron OMISTAVA agentti
-    // jatkaa `handle_resume_signal` → `resume_approved` → `route_reply`-polulle
-    // (kuluttaa hyväksynnän, ajaa sivuvaikutuksen TASAN KERRAN, reitittää
-    // lopullisen vastauksen kanavaan) ILMAN uutta LLM-vuoroa.
+    // **Resume bridge (Phase 1 §6 manual gate, Option A):** publish the
+    // `ResumeApproval` control signal to the bus, so that the turn's OWNING
+    // agent continues on the `handle_resume_signal` → `resume_approved` →
+    // `route_reply` path (consumes the approval, runs the side effect
+    // EXACTLY ONCE, routes the final response to the channel) WITHOUT a new LLM turn.
     //
-    // `publish` on **broadcast** (ei point-to-point) — ja se on tässä
-    // turvallista: vain omistava agentti kuluttaa resumen (omistajatarkistus
-    // `resume_approved`:ssa epäonnistuu suljettuna muille), joten muut olennot
-    // no-oppaavat. `from`-tunniste vaikuttaa vain itse-kaiun ohitukseen; gateway
-    // ei ole rekisteröity olento, joten tuore `BeingId::new()` riittää (ei voi
-    // osua kehenkään).
+    // `publish` is **broadcast** (not point-to-point) — and that's safe
+    // here: only the owning agent consumes the resume (the ownership check
+    // in `resume_approved` fails closed for everyone else), so other beings
+    // no-op. The `from` identifier only affects self-echo suppression; the
+    // gateway is not a registered being, so a fresh `BeingId::new()` is
+    // sufficient (it cannot collide with anyone).
     let Some(bus) = state.bus.as_ref() else {
-        // **Ei bussia → 503, EI hiljaista onnistumista.** Option A:ssa
-        // sivuvaikutus ajetaan VAIN agentin resume-polulla; ilman bussia
-        // (esim. CLI / ei-serve-konteksti) yhtään agenttia ei kuuntele, joten
-        // jatkoa ei voi koskaan tapahtua. Hyväksyntää EI kulutettu → rehellinen
-        // 503: operaattori-approve vaatii serve-tilan (bussilla ajava agentti).
+        // **No bus → 503, NOT a silent success.** In Option A the side
+        // effect runs ONLY on the agent's resume path; without a bus
+        // (e.g. CLI / non-serve context) no agent is listening, so the
+        // continuation can never happen. The approval was NOT consumed →
+        // an honest 503: operator approve requires serve mode (an agent running on the bus).
         warn!(
             approval = %id,
             "approvals: approve hylätty 503 — bussia ei kytketty (Option A vaatii serve-tilan, \
@@ -801,9 +806,9 @@ async fn approve_pending(
         approval_id: approval_id.clone(),
     };
     if let Err(e) = bus.publish(BeingId::new(), signal) {
-        // **Julkaisu epäonnistui → 503, hyväksyntää EI kulutettu.** Jos emme voi
-        // ilmoittaa agentille, jatkoa ei tapahdu. Älä palauta valheellista 200:aa
-        // — palauta rehellinen 503 (yhä odottava, voi yrittää uudelleen).
+        // **Publish failed → 503, approval NOT consumed.** If we can't
+        // notify the agent, no continuation happens. Don't return a false
+        // 200 — return an honest 503 (still pending, can be retried).
         warn!(
             approval = %id,
             error = %e,
@@ -824,9 +829,9 @@ async fn approve_pending(
         "approvals: hyväksyntä otettu vastaan ja ResumeApproval julkaistu — omistava agentti \
          ajaa sivuvaikutuksen + vastaa kanavalle asynkronisesti"
     );
-    // **200 = hyväksyntä otettu vastaan ja välitetty agentille.** EI lopputulosta:
-    // sivuvaikutus + vastaus ajetaan asynkronisesti agentin resume-polulla, joten
-    // emme palauta task_id/status-pakettia (ei payloadia, ei salaisuuksia).
+    // **200 = the approval was received and handed off to the agent.** No outcome:
+    // the side effect + response run asynchronously on the agent's resume path, so
+    // we don't return a task_id/status bundle (no payload, no secrets).
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -837,7 +842,7 @@ async fn approve_pending(
     )
 }
 
-/// `POST /approvals/{approval_id}/deny` — hylkää odottavan hyväksynnän ja peruuttaa tehtävän.
+/// `POST /approvals/{approval_id}/deny` — denies the pending approval and cancels the task.
 async fn deny_pending(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -881,21 +886,21 @@ async fn deny_pending(
     }
 }
 
-/// `POST /tasks/{task_id}/enabled` — **perhe-agency kill-switch** (Phase 4):
-/// kytkee ajastetun tehtävän päälle tai pois.
+/// `POST /tasks/{task_id}/enabled` — **family-agency kill switch** (Phase 4):
+/// toggles a scheduled task on or off.
 ///
-/// Runko: JSON `{"enabled": true|false}`. `enabled=false` = ajastin ohittaa
-/// tehtävän seuraavissa tikeissä (kill-switch); `true` = ottaa taas käyttöön.
-/// Mutaatio menee saman lukon kautta jota tikkisilmukka käyttää, joten kilpailu
-/// ratkeaa lukolla.
+/// Body: JSON `{"enabled": true|false}`. `enabled=false` = the scheduler
+/// skips the task on subsequent ticks (kill switch); `true` = re-enables it.
+/// The mutation goes through the same lock the tick loop uses, so races are
+/// resolved by the lock.
 ///
-/// Vastaa:
-/// - `200 OK` + uusi tila kun tehtävä löytyi ja kytkettiin,
-/// - `400 Bad Request` jos tunniste on epäkelpo UUID tai runko puuttuu `enabled`,
-/// - `401` jos bearer-auth vaaditaan eikä täsmää,
-/// - `404 Not Found` jos tunnistetta ei ole rekisteröity ajastimeen,
-/// - `503 Service Unavailable` jos ajastin ei ole kytketty (esim. dream pois
-///   käytöstä tai runtimea ei ole).
+/// Responds:
+/// - `200 OK` + the new state when the task was found and toggled,
+/// - `400 Bad Request` if the identifier is an invalid UUID or the body is missing `enabled`,
+/// - `401` if bearer auth is required and doesn't match,
+/// - `404 Not Found` if the identifier is not registered with the scheduler,
+/// - `503 Service Unavailable` if the scheduler is not wired up (e.g. dream
+///   disabled or the runtime is absent).
 async fn set_task_enabled_route(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -930,12 +935,13 @@ async fn set_task_enabled_route(
 
     let mut sched = scheduler.lock().await;
     if sched.set_task_enabled(id, enabled) {
-        drop(sched); // vapauta lukko ennen tiedosto-I/O:ta
-                     // Persistoi muutos config-tiedostoon, jotta kill-switch
-                     // säilyy yli restartin (Phase 4). Best-effort: persistenssin
-                     // epäonnistuminen ei kumoa live-muutosta (joka jo tehtiin),
-                     // mutta se lokitetaan — muistinvaraisessa tilassa polkua ei
-                     // ole, jolloin muutos jää vain muistiin (oikein in-memorylle).
+        drop(sched); // release the lock before file I/O
+                     // Persist the change to the config file, so the kill
+                     // switch survives a restart (Phase 4). Best-effort:
+                     // a persistence failure does not undo the live change
+                     // (already applied), but it is logged — in in-memory
+                     // mode there is no path, so the change stays in memory
+                     // only (correct for in-memory mode).
         if let Some(path) = state.agency_config_path.as_ref() {
             match AgencyConfig::load(path) {
                 Ok(mut cfg) => {
@@ -961,30 +967,30 @@ async fn set_task_enabled_route(
     }
 }
 
-/// `GET /turns/audit` — palauttaa **havainnoitavan tool-loop-jäljen**
-/// operaattorille (TURN-AUDIT, roadmap §6 D6).
+/// `GET /turns/audit` — returns the **observable tool-loop trace**
+/// for the operator (TURN-AUDIT, roadmap §6 D6).
 ///
-/// Vastaus on JSON-lista [`familyclaw_actions::ExecAuditEvent`]-tapahtumia
-/// lisäysjärjestyksessä: kukin kantaa vuoron korrelaatiotunnisteen
-/// (`action_id`), tapahtumatyypin (`kind`: `turn_started` / `tool_dispatched`
+/// The response is a JSON list of [`familyclaw_actions::ExecAuditEvent`]
+/// events in insertion order: each carries the turn's correlation
+/// identifier (`action_id`), the event type (`kind`: `turn_started` / `tool_dispatched`
 /// / `turn_suspended` / `turn_resumed` / `turn_answered` /
-/// `turn_max_iterations`), aikaleiman (`at`) ja **redaktoidun** selitteen
-/// (`detail`). **Raakaa payloadia, työkaluargumentteja tai salaisuuksia ei
-/// koskaan palauteta** — `detail` redaktoitiin jo agentin kirjaushetkellä.
+/// `turn_max_iterations`), a timestamp (`at`), and a **redacted** explanation
+/// (`detail`). **The raw payload, tool arguments, or secrets are
+/// never returned** — `detail` was already redacted at the moment the agent logged it.
 ///
-/// Operaattori voi ryhmitellä jäljen `action_id`:n mukaan saadakseen yhden
-/// vuoron koko elinkaaren (alku → työkalukutsut → suspend/resume →
-/// `stop_reason`). Suuremmalla volyymilla suodatus/sivutus kuuluu myöhempään
-/// laajennukseen — tämä reitti palauttaa nykyisen kirjatun jäljen sellaisenaan.
+/// The operator can group the trace by `action_id` to get one
+/// turn's entire lifecycle (start → tool calls → suspend/resume →
+/// `stop_reason`). At larger volume, filtering/pagination belongs to a later
+/// extension — this route returns the currently logged trace as-is.
 ///
-/// Suojaus on sama kuin `POST /inject`:llä: jos [`GATEWAY_TOKEN_ENV`] on
-/// konfiguroitu, pyyntö vaatii otsikon `Authorization: Bearer <token>`
-/// (vakioaikainen täsmäys), muuten `401`.
+/// Protection is the same as `POST /inject`: if [`GATEWAY_TOKEN_ENV`] is
+/// configured, the request requires the header `Authorization: Bearer <token>`
+/// (constant-time match), otherwise `401`.
 ///
-/// Tilakoodit:
-/// - `200 OK` + JSON-lista (myös tyhjä, jos mitään ei ole vielä kirjattu),
-/// - `401 Unauthorized` jos bearer-token vaaditaan eikä se täsmää,
-/// - `503 Service Unavailable` jos turn-auditia ei ole kytketty
+/// Status codes:
+/// - `200 OK` + JSON list (also empty if nothing has been logged yet),
+/// - `401 Unauthorized` if a bearer token is required and doesn't match,
+/// - `503 Service Unavailable` if turn audit is not wired up
 ///   ([`GatewayState::turn_audit`] = `None`).
 async fn list_turn_audit(
     State(state): State<Arc<GatewayState>>,
@@ -1003,8 +1009,8 @@ async fn list_turn_audit(
         );
     };
 
-    // Tapahtumat ovat jo redaktoituja (agentti redaktoi `detail`:n
-    // kirjaushetkellä). Serialisoidaan sellaisenaan — ei lisäkäsittelyä.
+    // Events are already redacted (the agent redacted `detail` at the
+    // moment it was logged). Serialized as-is — no further processing.
     let events = audit.list();
     info!(
         count = events.len(),
@@ -1014,55 +1020,55 @@ async fn list_turn_audit(
     (StatusCode::OK, Json(body))
 }
 
-/// Prometheus-vastauksen sisältötyyppi (eksposition tekstiformaatti).
+/// Content type for the Prometheus response (exposition text format).
 ///
-/// Käytämme `version=0.0.4`-eksposition vakiotyyppiä (`text/plain`), jonka
-/// Prometheus-keräin ymmärtää suoraan. Charset on `utf-8` (mittarinimet ovat
-/// ASCII, mutta eksplisiittinen charset on eksposition suositus).
+/// We use the `version=0.0.4` exposition standard type (`text/plain`), which
+/// the Prometheus scraper understands directly. Charset is `utf-8` (metric
+/// names are ASCII, but an explicit charset is the exposition recommendation).
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// `GET /metrics` — vie jaetun [`MetricsRegistry`]:n **deterministisessä**
-/// Prometheus-eksposition tekstiformaatissa (`prometheus_export`).
+/// `GET /metrics` — exports the shared [`MetricsRegistry`] in the
+/// **deterministic** Prometheus exposition text format (`prometheus_export`).
 ///
-/// Vastauksen sisältötyyppi on [`PROMETHEUS_CONTENT_TYPE`] (`text/plain`),
-/// jonka Prometheus-keräin osaa jäsentää. Runko järjestetään mittarinimen mukaan
-/// ([`MetricsRegistry`] perustuu `BTreeMap`:iin), joten tuloste on vakaa eikä
-/// vaihtele pyyntöjen välillä — sama panos tuottaa saman tulosteen.
+/// The response content type is [`PROMETHEUS_CONTENT_TYPE`] (`text/plain`),
+/// which the Prometheus scraper can parse. The body is ordered by metric name
+/// ([`MetricsRegistry`] is backed by a `BTreeMap`), so the output is stable and
+/// doesn't vary between requests — the same input produces the same output.
 ///
-/// **Mitkä mittarit ovat "eläviä" — tarkka, rehellinen tila:** rekisteri
-/// rakennetaan [`MetricsRegistry::with_fleet_defaults`]:lla, joten kaikki
-/// laivueen esinimetyt laskurit ja `agents_online`-gauge ovat viennissä alusta
-/// asti (arvolla `0`). [`serve`] tilaa siltakerroksen tapahtumaväylän
-/// [`EventRecorder`]illa ja antaa SAMAN rekisterin sekä recorderille että tälle
-/// handlerille — joten **mekanismi** (tapahtuma → laskurin inkrementti →
-/// `/metrics`) on kytketty ja e2e-testattu.
+/// **Which metrics are "live" — the precise, honest state:** the registry
+/// is built with [`MetricsRegistry::with_fleet_defaults`], so all of the
+/// fleet's pre-named counters and the `agents_online` gauge are present in
+/// the export from the start (value `0`). [`serve`] subscribes to the
+/// bridge layer's event bus with an [`EventRecorder`] and gives the SAME
+/// registry to both the recorder and this handler — so the **mechanism**
+/// (event → counter increment → `/metrics`) is wired up and e2e-tested.
 ///
-/// **MUTTA tuotannon ajavassa gatewayssä vain YKSI sarja todella liikkuu tällä
-/// hetkellä:**
-/// - ✅ `agents_online` (gauge) — `build_family` julkaisee `AgentRegistered`:n
-///   käynnistyksessä tarjoiltuun väylään → `1`.
-/// - ⏳ `tasks_created`, `task_handoffs`, `tasks_completed`, `contract_*`,
-///   `agent_turns`, `llm_*`, `durable_replays`, `workflow_steps_completed` ovat
-///   **kytketty mutta ruokkimatta** (wired-but-unfed): recorder kartoittaa ne,
-///   mutta mikään live-gateway/agentti/orkestrointipolku ei vielä julkaise
-///   vastaavia tapahtumia (`TaskCreated` / `Custom("task.completed" |
-///   "contract.*" | "llm.*" | …)`) TÄHÄN tarjoiltuun väylään (`orchestrate`
-///   käyttää erillistä, kytkemätöntä väylää). Ne pysyvät siis `0`:na kunnes
-///   tool-loop/orkestrointi/contract/llm-kerrokset julkaisevat tarjoiltuun
-///   väylään — se on seuraava kytkentätyö, ei tämän reitin vika.
+/// **BUT in the gateway as it currently runs in production, only ONE series
+/// is actually moving right now:**
+/// - checked `agents_online` (gauge) — `build_family` publishes `AgentRegistered`
+///   to the served bus at startup → `1`.
+/// - pending `tasks_created`, `task_handoffs`, `tasks_completed`, `contract_*`,
+///   `agent_turns`, `llm_*`, `durable_replays`, `workflow_steps_completed` are
+///   **wired but unfed**: the recorder maps them,
+///   but no live gateway/agent/orchestration path yet publishes the
+///   corresponding events (`TaskCreated` / `Custom("task.completed" |
+///   "contract.*" | "llm.*" | …)`) to THIS served bus (`orchestrate`
+///   uses a separate, unwired bus). They therefore stay at `0` until
+///   the tool-loop/orchestration/contract/llm layers publish to the served
+///   bus — that is the next wiring task, not a fault of this route.
 ///
-/// `prometheus_export` palauttaa aina TODELLISET luvut, ei arvauksia — nolla
-/// tarkoittaa rehellisesti "ei vielä tapahtumia", ei "rikki".
+/// `prometheus_export` always returns the ACTUAL numbers, never guesses — zero
+/// honestly means "no events yet", not "broken".
 ///
-/// Tilakoodit:
-/// - `200 OK` + Prometheus-teksti (myös enimmäkseen nollainen runko on validi),
-/// - `503 Service Unavailable` jos rekisteriä ei ole kytketty
+/// Status codes:
+/// - `200 OK` + Prometheus text (even a mostly-zero body is valid),
+/// - `503 Service Unavailable` if the registry is not wired up
 ///   ([`GatewayState::metrics`] = `None`).
 ///
-/// Reitti on **suojaamaton** (ei bearer-tokenia): mittarit ovat numeerisia
-/// aikasarjoja ilman salaisuuksia, ja keräimet (Prometheus) eivät tyypillisesti
-/// lähetä `Authorization`-otsikkoa. Verkkotason rajaus (loopback-sidonta /
-/// palomuuri) on oikea suojakerros tälle endpointille.
+/// The route is **unprotected** (no bearer token): metrics are numeric
+/// time series with no secrets, and scrapers (Prometheus) typically don't
+/// send an `Authorization` header. Network-level restriction (loopback
+/// binding / firewall) is the right protection layer for this endpoint.
 async fn metrics_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> (
@@ -1081,36 +1087,36 @@ async fn metrics_handler(
     (StatusCode::OK, [content_type], registry.prometheus_export())
 }
 
-/// Rakentaa gatewayn HTTP-reitityksen jaetulla tilalla.
+/// Builds the gateway's HTTP router with shared state.
 fn build_router(state: Arc<GatewayState>) -> Router {
     use axum::routing::post;
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/canary", post(canary))
-        // Prometheus-mittarit (jaettu MetricsRegistry, with_fleet_defaults).
-        // Rekisteröidään aina; kun rekisteriä ei ole kytketty
-        // ([`GatewayState::metrics`] = `None`), handler vastaa 503. Suojaamaton
-        // (numeerisia aikasarjoja ilman salaisuuksia) — ks. metrics_handler.
+        // Prometheus metrics (shared MetricsRegistry, with_fleet_defaults).
+        // Always registered; when the registry is not wired up
+        // ([`GatewayState::metrics`] = `None`), the handler responds 503. Unprotected
+        // (numeric time series with no secrets) — see metrics_handler.
         .route("/metrics", get(metrics_handler))
         .route("/inject", post(inject_discord))
-        // Operaattorin hyväksyntäpinta (suspend/resume-silta, roadmap §6 D2).
-        // Rekisteröidään aina; kun toimintoajoympäristöä ei ole kytketty
-        // ([`GatewayState::actions`] = `None`), handlerit vastaavat 503.
-        // Bearer-suojaus on sama kuin /inject:llä (`check_inject_auth`).
+        // Operator approval surface (suspend/resume bridge, roadmap §6 D2).
+        // Always registered; when the action runtime is not wired up
+        // ([`GatewayState::actions`] = `None`), the handlers respond 503.
+        // Bearer protection is the same as /inject (`check_inject_auth`).
         .route("/approvals/pending", get(list_pending_approvals))
-        // axum 0.7 (matchit 0.7) käyttää `:param`-syntaksia polkukaappaukseen;
-        // `{approval_id}` tulkittaisiin LITERAALIksi segmentiksi → 404 HTTP:n yli.
+        // axum 0.7 (matchit 0.7) uses `:param` syntax for path capture;
+        // `{approval_id}` would be interpreted as a LITERAL segment → 404 over HTTP.
         .route("/approvals/:approval_id/approve", post(approve_pending))
         .route("/approvals/:approval_id/deny", post(deny_pending))
-        // Perhe-agency kill-switch (Phase 4): kytkee ajastetun tehtävän
-        // päälle/pois. Rekisteröidään aina; kun ajastinta ei ole kytketty
-        // ([`GatewayState::scheduler`] = `None`), handler vastaa 503. Bearer-
-        // suojaus on sama kuin /inject:llä.
+        // Family-agency kill switch (Phase 4): toggles a scheduled task
+        // on/off. Always registered; when the scheduler is not wired up
+        // ([`GatewayState::scheduler`] = `None`), the handler responds 503. Bearer
+        // protection is the same as /inject.
         .route("/tasks/:task_id/enabled", post(set_task_enabled_route))
-        // Havainnoitava tool-loop-jälki (TURN-AUDIT, roadmap §6 D6). Rekisteröidään
-        // aina; kun turn-auditia ei ole kytketty ([`GatewayState::turn_audit`] =
-        // `None`), handler vastaa 503. Bearer-suojaus on sama kuin /inject:llä.
+        // Observable tool-loop trace (TURN-AUDIT, roadmap §6 D6). Always
+        // registered; when turn audit is not wired up ([`GatewayState::turn_audit`] =
+        // `None`), the handler responds 503. Bearer protection is the same as /inject.
         .route("/turns/audit", get(list_turn_audit));
     if state.discord_public_key.is_some() && state.discord_channel.is_some() {
         router = router.route("/discord/interactions", post(handle_discord_interaction));
@@ -1118,33 +1124,33 @@ fn build_router(state: Arc<GatewayState>) -> Router {
     router.with_state(state)
 }
 
-/// Ratkaisee kuunteluosoitteen ympäristömuuttujasta tai oletuksesta.
+/// Resolves the listen address from an environment variable or the default.
 ///
 /// # Errors
-/// [`FamilyClawError::Config`] jos osoite on jäsentymätön `SocketAddr`.
+/// [`FamilyClawError::Config`] if the address does not parse as a `SocketAddr`.
 fn resolve_addr() -> Result<SocketAddr> {
     let raw = std::env::var(ADDR_ENV).unwrap_or_else(|_| DEFAULT_ADDR.to_string());
     raw.parse::<SocketAddr>()
         .map_err(|e| FamilyClawError::config(format!("invalid {ADDR_ENV} '{raw}': {e}")))
 }
 
-/// Rakentaa LLM-resolverin [`PROVIDERS_ENV`]-muuttujasta (KERROS B).
+/// Builds the LLM resolver from the [`PROVIDERS_ENV`] variable (Layer B).
 ///
-/// Muoto: `prefix=base_url=KEY_ENV` puolipistein eroteltuna, esim.
+/// Format: `prefix=base_url=KEY_ENV` separated by semicolons, e.g.
 /// `openai=https://api.openai.com/v1=OPENAI_API_KEY;deepseek=https://api.deepseek.com/v1=DEEPSEEK_API_KEY`.
 ///
-/// **Key-pool (failover gap #1 step 3):** `KEY_ENV`-kenttä voi olla
-/// **pilkulla eroteltu lista** env-muuttujia, jolloin avaimet kierrätetään
-/// round-robinilla `AuthFailed`-tilanteessa ennen koko providerin jäähdytystä,
-/// esim. `openai=https://api.openai.com/v1=OPENAI_API_KEY_1,OPENAI_API_KEY_2`.
-/// Yhden avaimen syntaksi (`=OPENAI_API_KEY`) on yhä taaksepäin-yhteensopiva.
+/// **Key pool (failover gap #1 step 3):** the `KEY_ENV` field can be a
+/// **comma-separated list** of env vars, so keys are rotated round-robin
+/// on `AuthFailed` before the whole provider is cooled down,
+/// e.g. `openai=https://api.openai.com/v1=OPENAI_API_KEY_1,OPENAI_API_KEY_2`.
+/// The single-key syntax (`=OPENAI_API_KEY`) remains backward-compatible.
 ///
-/// Tyhjä/asettamaton muuttuja → tyhjä resolveri (agentti ajaa ilman LLM:ää).
-/// Virheelliset rivit ohitetaan varoituksella — yksi typo ei kaada gatewayta.
+/// Empty/unset variable → an empty resolver (the agent runs without an LLM).
+/// Invalid lines are skipped with a warning — one typo does not bring down the gateway.
 fn build_resolver() -> EnvEndpointResolver {
     let mut resolver = EnvEndpointResolver::new();
-    // Valinnainen output-token-katto envistä. Sovelletaan KAIKKIIN ratkaistuihin
-    // malleihin (apply_tunings). Ilman tätä oletus 2048 katkaisee pitkät vastaukset.
+    // Optional output-token cap from env. Applied to ALL resolved
+    // models (apply_tunings). Without this, the default of 2048 cuts off long responses.
     if let Ok(raw) = std::env::var(MAX_TOKENS_ENV) {
         match raw.trim().parse::<u32>() {
             Ok(max) if max > 0 => {
@@ -1181,7 +1187,7 @@ fn build_resolver() -> EnvEndpointResolver {
     for entry in spec.split(';').filter(|s| !s.trim().is_empty()) {
         let parts: Vec<&str> = entry.splitn(3, '=').map(str::trim).collect();
         if let [prefix, base_url, key_field] = parts.as_slice() {
-            // Avain-kenttä voi olla pilkulla eroteltu pool (round-robin-rotaatio).
+            // The key field can be a comma-separated pool (round-robin rotation).
             let key_envs: Vec<String> = key_field
                 .split(',')
                 .map(str::trim)
@@ -1201,8 +1207,8 @@ fn build_resolver() -> EnvEndpointResolver {
     resolver
 }
 
-/// Lataa agentin sielun profiilihakemistosta jos [`FAMILYCLAW_PROFILE_DIR`]
-/// on asetettu; muuten paljas runko (geneerinen ydin, ei perhe-sielua).
+/// Loads the agent's soul from the profile directory if [`FAMILYCLAW_PROFILE_DIR`]
+/// is set; otherwise a bare shell (generic core, no operator soul).
 ///
 /// [`FAMILYCLAW_PROFILE_DIR`]: familyclaw_agent::PROFILE_DIR_ENV
 fn load_agent_soul(agent_name: &str) -> Soul {
@@ -1221,24 +1227,24 @@ fn load_agent_soul(agent_name: &str) -> Soul {
     }
 }
 
-/// Jaettu-instanssi-adapteri: käärii `Arc<DiscordChannel>`:n `Channel`-trait-
-/// olioksi delegoimalla kaikki kutsut SAMAAN instanssiin.
+/// Shared-instance adapter: wraps an `Arc<DiscordChannel>` as a `Channel`
+/// trait object by delegating all calls to the SAME instance.
 ///
-/// **Miksi tämä on olemassa (dual-instance-bugin korjaus):** bus-pumppu
-/// ([`build_family`] → `channel.receive()`) ja inject-polut (`/inject`,
-/// `/discord/interactions` → `Arc<DiscordChannel>::inject`) on aiemmin
-/// rakennettu KAHDESTA erillisestä [`DiscordChannel::from_webhook`]-kutsusta.
-/// Kukin kutsu luo oman `mpsc`-parin (`inbound_tx`/`inbound_rx`), joten
-/// injektoidut viestit työnnettiin instanssiin #1:n `inbound_tx`:ään, jonka
-/// `inbound_rx`:ää kukaan ei koskaan kuluttanut — webhook-injektointi katosi
-/// mustaan aukkoon.
+/// **Why this exists (dual-instance bug fix):** the bus pump
+/// ([`build_family`] → `channel.receive()`) and the inject paths (`/inject`,
+/// `/discord/interactions` → `Arc<DiscordChannel>::inject`) were previously
+/// built from TWO separate [`DiscordChannel::from_webhook`] calls.
+/// Each call creates its own `mpsc` pair (`inbound_tx`/`inbound_rx`), so
+/// injected messages were pushed into instance #1's `inbound_tx`, whose
+/// `inbound_rx` was never consumed by anyone — webhook injection disappeared
+/// into a black hole.
 ///
-/// Tämä adapteri antaa rakentaa kanavan **kerran** (`Arc<DiscordChannel>`) ja
-/// jakaa SAMAN instanssin: bus saa adapterin (`Box<dyn Channel>`), inject saa
-/// `Arc`-kahvan. `receive()`/`send()`/`inject()` ottavat kaikki `&self`, joten
-/// ne operoivat yhden instanssin samaa `inbound_tx`/`inbound_rx`-paria
-/// vasten — juuri se yksi-virta-malli, jonka `DiscordChannel::inject`:n
-/// dokumentaatio jo lupaa.
+/// This adapter lets the channel be built **once** (`Arc<DiscordChannel>`) and
+/// shares the SAME instance: the bus gets the adapter (`Box<dyn Channel>`),
+/// inject gets an `Arc` handle. `receive()`/`send()`/`inject()` all take
+/// `&self`, so they operate on one instance's same
+/// `inbound_tx`/`inbound_rx` pair — exactly the single-stream model that
+/// `DiscordChannel::inject`'s documentation already promises.
 struct SharedDiscordChannel(Arc<DiscordChannel>);
 
 impl Channel for SharedDiscordChannel {
@@ -1259,23 +1265,23 @@ impl Channel for SharedDiscordChannel {
     }
 }
 
-/// Käynnistää [`FamilyRuntime`]:n ympäristöstä luetulla kokoonpanolla
-/// (KERROS B). Lukee agentin nimen, mallin, sielun, Telegram-kanavan ja
-/// reply-kohteen env-muuttujista — mitään ei kovakoodata (KERROS A).
+/// Starts [`FamilyRuntime`] with configuration read from the environment
+/// (Layer B). Reads the agent's name, model, soul, Telegram channel, and
+/// reply target from env vars — nothing is hardcoded (Layer A).
 ///
 /// # Errors
-/// - [`FamilyClawError::InvalidInput`] jos vaadittu env-muuttuja
+/// - [`FamilyClawError::InvalidInput`] if a required env var
 ///   ([`TELEGRAM_TOKEN_ENV`], [`TELEGRAM_CHANNEL_ID_ENV`],
-///   [`REPLY_TARGET_ENV`]) puuttuu tai kanavan rakennus epäonnistuu.
+///   [`REPLY_TARGET_ENV`]) is missing or building the channel fails.
 ///
-/// `bridge` on jaettu siltakerroksen tapahtumaväylä havainnoitavuutta varten:
-/// se annetaan [`build_family`]:lle, joka julkaisee sille agentin rekisteröinnin
-/// (→ `agents_online`-gauge). Kutsujan (serve) on jo tilattava se
-/// [`EventRecorder`]illa ennen tätä kutsua, jotta tapahtuma ei huku.
+/// `bridge` is the shared bridge-layer event bus for observability:
+/// it is given to [`build_family`], which publishes the agent registration
+/// to it (→ `agents_online` gauge). The caller (serve) must already have
+/// subscribed to it with an [`EventRecorder`] before this call, so the event isn't lost.
 ///
-/// Resolvoi `/inject`-suojaustokenin konfiguraatiosta. Tyhjä token = avoin
-/// loopback-only-oletus (varoitus); asetettu token = pakollinen bearer-täsmäys.
-/// Arvoa ei koskaan lokiteta.
+/// Resolves the `/inject` protection token from the configuration. An empty
+/// token = open loopback-only default (warning); a set token = mandatory
+/// bearer match. The value is never logged.
 fn resolve_inject_token(cfg: &FamilyConfig) -> Option<Arc<str>> {
     let raw = cfg.gateway_token().trim();
     if raw.is_empty() {
@@ -1306,9 +1312,9 @@ fn build_extra_agent_specs(cfg: &FamilyConfig, model_cfg: &ModelConfig) -> Vec<A
         .collect()
 }
 
-/// Palauttaa runtimen, Discord-kanavan (inject/interactions), inject-tokenin ja public keyn.
-// Kolme kanavahaaraa (none / discord / telegram), joista kukin kokoaa runtimen
-// omalla polullaan — pitkä mutta lineaarinen; jakaminen hämärtäisi luettavuutta.
+/// Returns the runtime, the Discord channel (inject/interactions), the inject token, and the public key.
+// Three channel branches (none / discord / telegram), each assembling the
+// runtime on its own path — long but linear; splitting it up would hurt readability.
 #[allow(clippy::too_many_lines)]
 async fn start_runtime(
     bridge: FamilyBridge,
@@ -1332,13 +1338,13 @@ async fn start_runtime(
 
     let inject_token: Option<Arc<str>> = resolve_inject_token(&cfg);
 
-    // KANAVATON JULKAISUTILA (`FAMILYCLAW_CHANNEL_KIND=none`): käynnistä gateway
-    // ILMAN yhtään perhe-avainta, -sielua tai reply-kohdetta. Kokoaa runtimen
-    // taustalle [`MockChannel`]illä (muistinvarainen, ei ulkoista SDK:ta), joten
-    // tuore `cargo install` -käyttäjä voi `serve` + `status`-varmistaa HTTP-pinnan
-    // (`/healthz`, `/readyz`, `/metrics`) ENNEN kuin kytkee oikean kanavan. Tämä
-    // on julkaistavuuden edellytys: OSS-raja (KERROS A) tarkoittaa että alusta
-    // toimii tyhjällä profiililla — Telegram/Discord ovat KERROS B -lisukkeita.
+    // CHANNEL-LESS PUBLISH MODE (`FAMILYCLAW_CHANNEL_KIND=none`): start the
+    // gateway WITHOUT any operator key, soul, or reply target. Assembles the
+    // runtime on top of a [`MockChannel`] (in-memory, no external SDK), so
+    // a fresh `cargo install` user can `serve` + `status`-verify the HTTP surface
+    // (`/healthz`, `/readyz`, `/metrics`) BEFORE wiring up a real channel. This
+    // is a prerequisite for publishability: the OSS boundary (Layer A) means
+    // the platform works with an empty profile — Telegram/Discord are Layer B add-ons.
     if channel_kind == "none" {
         info!(
             "kanavaton julkaisutila (FAMILYCLAW_CHANNEL_KIND=none) — MockChannel, ei perhe-avaimia"
@@ -1346,9 +1352,9 @@ async fn start_runtime(
         let mock = familyclaw_channels::MockChannel::new("familyclaw-none")
             .map_err(FamilyClawError::from)?;
         let channel: Box<dyn Channel> = Box::new(mock);
-        // Reply-kohdetta ei vaadita kanavattomassa tilassa — MockChannel nielee
-        // vastaukset outboxiinsa. Käytämme neutraalia paikanpitäjää joka ei
-        // reititä minnekään ulos.
+        // A reply target is not required in channel-less mode — MockChannel
+        // swallows responses into its outbox. We use a neutral placeholder
+        // that does not route anywhere outbound.
         let reply_target = "none".to_string();
         let agent_cfg = AgentConfig::new_with_stable_id(&agent_name, model_cfg.clone());
         let soul = load_agent_soul(&agent_name);
@@ -1372,12 +1378,12 @@ async fn start_runtime(
     {
         let bot_token = cfg.discord_bot_token();
         let ch_id = cfg.discord_channel_id();
-        // KAKSISUUNTAINEN bot-moodi, jos DISCORD_BOT_TOKEN on asetettu: serenity-
-        // gateway kuuntelee (MESSAGE_CONTENT) JA postaa. Muuten fallback
-        // yksisuuntaiseen webhook-postaukseen (DISCORD_WEBHOOK_URL).
-        // Rakenna DiscordChannel TÄSMÄLLEEN KERRAN ja jaa sama instanssi: bus-pumppu
-        // saa `SharedDiscordChannel`-adapterin, inject-polut `Arc`-kahvan — molemmat
-        // samaan `inbound_tx`/`inbound_rx`-pariin (ks. SharedDiscordChannel-dokumentaatio).
+        // TWO-WAY bot mode if DISCORD_BOT_TOKEN is set: the serenity
+        // gateway listens (MESSAGE_CONTENT) AND posts. Otherwise fall back
+        // to one-way webhook posting (DISCORD_WEBHOOK_URL).
+        // Build the DiscordChannel EXACTLY ONCE and share the same instance: the bus pump
+        // gets the `SharedDiscordChannel` adapter, the inject paths get an `Arc` handle — both
+        // to the same `inbound_tx`/`inbound_rx` pair (see SharedDiscordChannel's documentation).
         let dc = if bot_token.is_empty() {
             let webhook_url = cfg.discord_webhook_url();
             if webhook_url.is_empty() {
@@ -1394,10 +1400,10 @@ async fn start_runtime(
                     "DISCORD_CHANNEL_ID must be a numeric id for bot mode, got: {ch_id:?}"
                 ))
             })?;
-            // owner_id konfigista (TOML + env FAMILYCLAW_OWNER_ID config-rajalla); 0 = DM:t pois.
+            // owner_id from config (TOML + env FAMILYCLAW_OWNER_ID at the config boundary); 0 = DMs off.
             let dc = DiscordChannel::new(bot_token.to_string(), cid, cfg.discord_owner_id())
                 .map_err(FamilyClawError::from)?;
-            // Käynnistä gateway-yhteys: palaa vasta kun `ready` tai virhe.
+            // Start the gateway connection: returns only once `ready` or an error.
             dc.start().await.map_err(FamilyClawError::from)?;
             info!("Discord: kaksisuuntainen bot-moodi (kanava {cid})");
             dc
@@ -1432,17 +1438,18 @@ async fn start_runtime(
     }
     let reply_target = reply_target.to_string();
 
-    // VAKAA olennotunniste: johdetaan deterministisesti agentin nimestä, EI
-    // arvota satunnaisesti. `AgentConfig::new` arpoo id:n joka prosessin
-    // käynnistyksessä — silloin agentin `being_id` muuttuisi joka restartissa,
-    // ja kaatumiskestävälle pinnalle ennen kaatumista tallennettu jatkettava
-    // vuoro EI enää täsmäisi heränneen agentin omistajuustarkistukseen (oma
-    // suspendoitu vuoro näyttäisi "toiselle olennolle kuuluvalta" eikä sitä
-    // voisi koskaan jatkaa). Nimestä johdettu id pysyy vakaana yli restartin.
-    // Mallikonfiguraatio: primary + valinnaiset varamallit
-    // (FAMILYCLAW_FALLBACK_MODELS). Ilman fallbackeja agentti ajaa VAIN
-    // primaryllä — jos se on alhaalla/quota loppu, koko olento on hiljaa.
-    // LlmFailover (llm_chain.rs) siirtyy seuraavaan kun primary epäonnistuu.
+    // STABLE being identifier: derived deterministically from the agent's
+    // name, NOT randomly assigned. `AgentConfig::new` rolls a random id on
+    // every process startup — in that case the agent's `being_id` would
+    // change on every restart, and a resumable turn saved to the
+    // crash-resilient surface before a crash would NO LONGER match the
+    // waking agent's ownership check (its own suspended turn would look
+    // like it "belongs to another being" and could never be resumed).
+    // An id derived from the name stays stable across a restart.
+    // Model configuration: primary + optional fallback models
+    // (FAMILYCLAW_FALLBACK_MODELS). Without fallbacks the agent runs ONLY
+    // on the primary — if it's down/out of quota, the whole being is silent.
+    // LlmFailover (llm_chain.rs) moves to the next one when the primary fails.
     if cfg.fallback_models().is_empty() {
         info!(agent = %agent_name, "malli: vain primary (ei FAMILYCLAW_FALLBACK_MODELS)");
     } else {
@@ -1487,7 +1494,7 @@ async fn start_runtime(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Tracing: oletustaso info, ohitettavissa RUST_LOG-muuttujalla.
+    // Tracing: default level info, overridable with the RUST_LOG variable.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1496,7 +1503,7 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    // Ilman alikomentoa = serve (taaksepäinyhteensopivuus).
+    // No subcommand = serve (backward compatibility).
     match Cli::parse().command.unwrap_or(Command::Serve) {
         Command::Serve => serve().await,
         Command::Status => status().await,
@@ -1506,63 +1513,66 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Käynnistää gateway-palvelimen ja pysyy pystyssä `Ctrl-C`:hen asti.
+/// Starts the gateway server and stays up until `Ctrl-C`.
 ///
-/// Tämä on entinen `main`-runko muuttumattomana: yksi [`build_family`]-kutsu
-/// kokoaa busin + agentin + kanavan + reply-pumpun (`FamilyRuntime`), HTTP-kuori
-/// sitoo portin ja siisti sammutus pysäyttää runtimen.
+/// This is the former `main` body, unchanged: one [`build_family`] call
+/// assembles the bus + agent + channel + reply pump (`FamilyRuntime`), the
+/// HTTP shell binds the port, and a clean shutdown stops the runtime.
 ///
 /// # Errors
-/// [`FamilyClawError`] jos kokoonpano, sidonta tai palvelu epäonnistuu.
+/// [`FamilyClawError`] if configuration, binding, or serving fails.
 async fn serve() -> Result<()> {
     let addr = resolve_addr()?;
     info!(%addr, "familyclaw-gateway käynnistyy");
 
-    // Prometheus-mittarit (GET /metrics): rakennetaan laivueen oletuksilla, ja
-    // jaetaan SAMA instanssi sekä havainnoitavuus-tallentimelle (joka kasvattaa
-    // sarjoja) että GatewayState:lle (joka tarjoilee ne) — `MetricsRegistry` on
-    // `Clone` + `Arc`-jaettu, joten molemmat näkevät samat luvut.
+    // Prometheus metrics (GET /metrics): built with the fleet defaults, and
+    // the SAME instance is shared with both the observability recorder
+    // (which increments series) and GatewayState (which serves them) —
+    // `MetricsRegistry` is `Clone` + `Arc`-shared, so both see the same numbers.
     let metrics = MetricsRegistry::with_fleet_defaults();
 
-    // Havainnoitavuussilta: tilaa siltakerroksen tapahtumaväylä EventRecorderilla
-    // ENNEN runtimen kokoamista (EventBus toimittaa vain tilauksen jälkeen
-    // julkaistut tapahtumat). Sama `bridge` annetaan build_family:lle, joka
-    // julkaisee agentin rekisteröinnin → recorder kasvattaa jaettua rekisteriä
-    // (agents_online). Taustatehtävä valuttaa tapahtumat jatkuvasti (run = estävä
-    // silmukka kunnes silta sulkeutuu).
+    // Observability bridge: subscribes to the bridge layer's event bus with
+    // an EventRecorder BEFORE assembling the runtime (EventBus only
+    // delivers events published after the subscription). The same `bridge`
+    // is given to build_family, which publishes the agent registration →
+    // the recorder increments the shared registry (agents_online). The
+    // background task drains events continuously (run = a blocking loop
+    // until the bridge closes).
     let bridge = FamilyBridge::new();
     let recorder = EventRecorder::new(&bridge, metrics.clone());
     tokio::spawn(recorder.run());
 
-    // C5-sauma: yksi build_family-kutsu kokoaa bus + agentti + kanava +
-    // reply-pumppu (FamilyRuntime). Bus-kahva luovutetaan GatewayState:lle;
-    // HTTP-/sammutuskuori pysyy ennallaan (vain bus.stop() → runtime.shutdown()).
-    // Sama `bridge` viedään runtimeen, joka julkaisee sille agentin
-    // rekisteröinnin (EventRecorder jo tilannut yllä).
+    // C5 seam: one build_family call assembles the bus + agent + channel +
+    // reply pump (FamilyRuntime). The bus handle is handed off to
+    // GatewayState; the HTTP/shutdown shell stays unchanged (just
+    // bus.stop() → runtime.shutdown()). The same `bridge` is passed into
+    // the runtime, which publishes the agent registration to it
+    // (EventRecorder already subscribed above).
     let (runtime, discord_ch, inject_token, discord_public_key) = start_runtime(bridge).await?;
     info!("FamilyRuntime käynnissä (bus + agentti + kanava)");
 
-    // Operaattorin hyväksyntäpinta jakaa SAMAN Arc<Mutex<ActionRuntime>>-kahvan
-    // jonka build_family kytki agentin tool-looppiin — odottavat hyväksynnät
-    // (suspend) ja niiden myöntäminen (resume) tapahtuvat samassa lukitussa
-    // tilassa. Vrt. roadmap §6 D2.
+    // The operator approval surface shares the SAME Arc<Mutex<ActionRuntime>>
+    // handle that build_family wired into the agent's tool loop — pending
+    // approvals (suspend) and granting them (resume) happen in the same
+    // locked state. Cf. roadmap §6 D2.
     let actions = Some(runtime.actions());
-    // Havainnoitava tool-loop-jälki (TURN-AUDIT, roadmap §6 D6): sama
-    // Arc<AuditCollector> jonka build_family kytki agentin tool-looppiin.
+    // Observable tool-loop trace (TURN-AUDIT, roadmap §6 D6): the same
+    // Arc<AuditCollector> that build_family wired into the agent's tool loop.
     let turn_audit = Some(runtime.turn_audit());
-    // Ajastinkahva (perhe-agency, Phase 4): sama SchedulerHandle jonka runtime
-    // altistaa → kill-switch-reitti kytkee tehtäviä päälle/pois. None jos
-    // ajastin ei ole käynnissä.
+    // Scheduler handle (family agency, Phase 4): the same SchedulerHandle
+    // the runtime exposes → the kill-switch route toggles tasks on/off. None if
+    // the scheduler is not running.
     let scheduler = runtime.scheduler_handle();
-    // Agency-configin polku: kill-switch-muutos persistoidaan tähän (Phase 4).
+    // Agency config path: the kill-switch change is persisted here (Phase 4).
     let agency_config_path = runtime.agency_config_path();
 
-    // Mittarirekisteri (GET /metrics): SAMA instanssi jonka EventRecorder yllä
-    // sai (metrics.clone()). Tapahtumapohjainen täyttö on nyt KYTKETTY — agentin
-    // rekisteröinti (build_family → bridge) nosti `agents_online`-gaugea, ja
-    // siltakerroksen `task.*`/`contract.*`/`llm.*`/… -tapahtumat kasvattavat
-    // vastaavia sarjoja recorderin kautta. Rekisteri jaetaan GatewayState:lle
-    // Arc-jako-mallilla → /metrics näkee tarkalleen recorderin kasvattamat luvut.
+    // Metrics registry (GET /metrics): the SAME instance the EventRecorder
+    // above got (metrics.clone()). Event-driven population is now WIRED UP —
+    // the agent registration (build_family → bridge) bumped the
+    // `agents_online` gauge, and the bridge layer's `task.*`/`contract.*`/`llm.*`/…
+    // events increment the corresponding series via the recorder. The
+    // registry is shared with GatewayState via the Arc-sharing pattern →
+    // /metrics sees exactly the numbers the recorder incremented.
     let discord_probe = discord_ch.as_ref().and_then(|dc| {
         let token_set = !std::env::var("DISCORD_BOT_TOKEN")
             .unwrap_or_default()
@@ -1606,13 +1616,13 @@ async fn serve() -> Result<()> {
         .map_err(|e| FamilyClawError::bus(format!("gateway local_addr failed: {e}")))?;
     info!(%bound, "gateway kuuntelee — /healthz ja /readyz valmiina");
 
-    // Palvele kunnes Ctrl-C pyytää siistiä sammutusta.
+    // Serve until Ctrl-C requests a clean shutdown.
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await;
 
-    // Sammutus: pysäytä runtime siististi (keskeyttää taskit + pysäyttää busin)
-    // riippumatta palvelun lopputuloksesta.
+    // Shutdown: stop the runtime cleanly (cancels tasks + stops the bus)
+    // regardless of the serve outcome.
     info!("gateway sammuu — pysäytetään FamilyRuntime");
     runtime.shutdown().await;
 
@@ -1621,38 +1631,38 @@ async fn serve() -> Result<()> {
     Ok(())
 }
 
-/// Muodostaa `http://<addr><path>`-URL:n kuunteluosoitteesta.
+/// Builds an `http://<addr><path>` URL from the listen address.
 ///
-/// Käynnissä oleva gateway sitoutuu oletuksena loopbackiin, joten `status`
-/// olettaa `http`-skeeman (ei TLS:ää) — sama oletus kuin palvelimen sidonnassa.
+/// A running gateway binds to loopback by default, so `status`
+/// assumes the `http` scheme (no TLS) — the same assumption as the server's binding.
 fn health_url(addr: SocketAddr, path: &str) -> String {
     format!("http://{addr}{path}")
 }
 
-/// Kestävyystilan tiivistelmä jonka `status`/`doctor` näyttää operaattorille.
+/// Durability-state summary that `status`/`doctor` shows the operator.
 ///
-/// Kentät kertovat **mitä [`build_family`] kytkee** nykyisellä
-/// `FAMILYCLAW_DATA_DIR`-ympäristöllä, ilman salaisuuksia tai tiedostopolkuja:
-/// onko prosessi kaatumiskestävässä (persistentissä) vai muistinvaraisessa
-/// tilassa, sekä kytkettyjen [`ActionRuntime`]-pintojen lajitunnisteet.
+/// The fields report **what [`build_family`] wires up** with the current
+/// `FAMILYCLAW_DATA_DIR` environment, without secrets or file paths:
+/// whether the process is in crash-resilient (persistent) or in-memory
+/// mode, and the kind tags of the wired-up [`ActionRuntime`] surfaces.
 struct DurabilityReport {
-    /// `true` kun `FAMILYCLAW_DATA_DIR` on asetettu (persistentti, kaatumiskestävä).
+    /// `true` when `FAMILYCLAW_DATA_DIR` is set (persistent, crash-resilient).
     persistent: bool,
-    /// Lähetys-outboxin lajitunniste ([`ActionRuntime::dispatch_outbox_kind`]),
-    /// `"journal"` tai `"in-memory"`.
+    /// Kind tag of the dispatch outbox ([`ActionRuntime::dispatch_outbox_kind`]),
+    /// `"journal"` or `"in-memory"`.
     dispatch_outbox_kind: &'static str,
-    /// Odottavien hyväksyntöjen pinnan lajitunniste
-    /// ([`ActionRuntime::pending_store_kind`]), `"journal"` tai `"in-memory"`.
+    /// Kind tag of the pending-approvals surface
+    /// ([`ActionRuntime::pending_store_kind`]), `"journal"` or `"in-memory"`.
     pending_store_kind: &'static str,
 }
 
 impl DurabilityReport {
-    /// Muotoilee yksirivisen kestävyysyhteenvedon ilman tilaetuliitettä.
+    /// Formats a one-line durability summary with no status prefix.
     ///
-    /// Esim. `persistent (data_dir set); dispatch_outbox=journal;
-    /// pending_store=journal` tai `in-memory (no FAMILYCLAW_DATA_DIR) —
+    /// E.g. `persistent (data_dir set); dispatch_outbox=journal;
+    /// pending_store=journal` or `in-memory (no FAMILYCLAW_DATA_DIR) —
     /// crash-survival OFF; dispatch_outbox=in-memory; pending_store=in-memory`.
-    /// Tiedostopolkua **ei** paljasteta (vain `set`-läsnäolo).
+    /// The file path is **not** exposed (only `set` presence).
     fn summary(&self) -> String {
         let mode = if self.persistent {
             "persistent (data_dir set)".to_string()
@@ -1666,15 +1676,15 @@ impl DurabilityReport {
     }
 }
 
-/// Kokoaa [`DurabilityReport`]:n rakentamalla saman [`ActionRuntime`]:n kuin
-/// [`build_family`] valitsisi nykyisellä `FAMILYCLAW_DATA_DIR`-ympäristöllä.
+/// Assembles a [`DurabilityReport`] by building the same [`ActionRuntime`]
+/// that [`build_family`] would choose with the current `FAMILYCLAW_DATA_DIR` environment.
 ///
-/// Ohut kuori [`durability_report_for`]:lle: lukee `FAMILYCLAW_DATA_DIR`:n
-/// prosessin ympäristöstä (tyhjä = unset = muistinvarainen) ja delegoi.
+/// A thin shell around [`durability_report_for`]: reads `FAMILYCLAW_DATA_DIR`
+/// from the process environment (empty = unset = in-memory) and delegates.
 ///
 /// # Errors
-/// [`FamilyClawError::config`] jos persistentin polun journal-pintojen avaus
-/// epäonnistuu (sama virhe jonka käynnistys antaisi).
+/// [`FamilyClawError::config`] if opening the journal surfaces for the
+/// persistent path fails (the same error startup would give).
 async fn build_durability_report() -> Result<DurabilityReport> {
     let data_dir = std::env::var("FAMILYCLAW_DATA_DIR")
         .ok()
@@ -1682,42 +1692,43 @@ async fn build_durability_report() -> Result<DurabilityReport> {
     durability_report_for(data_dir.as_deref()).await
 }
 
-/// Kokoaa [`DurabilityReport`]:n annetulle data-hakemistolle (env-vapaa ydin).
+/// Assembles a [`DurabilityReport`] for the given data directory (env-free core).
 ///
 /// `data_dir`:
-/// - `Some(dir)` → persistentti polku: avaa samat journal-pinnat kuin
-///   [`build_family`] (durable pending + task + dispatch outbox) ja lukee niiden
-///   **todelliset** lajitunnisteet — ei kovakoodausta.
-/// - `None` → muistinvarainen polku: kaikki pinnat oletuksissaan, ei levy-I/O:ta.
+/// - `Some(dir)` → persistent path: opens the same journal surfaces as
+///   [`build_family`] (durable pending + task + dispatch outbox) and reads their
+///   **actual** kind tags — no hardcoding.
+/// - `None` → in-memory path: all surfaces at their defaults, no disk I/O.
 ///
-/// Lukemalla lajitunnisteet kytketyistä pinnoista
+/// By reading the kind tags from the wired-up surfaces
 /// ([`ActionRuntime::dispatch_outbox_kind`] + [`ActionRuntime::pending_store_kind`])
-/// raportti vastaa täsmälleen sitä kestävyyspolkua jonka palvelin saisi.
-/// Persistentillä polulla journal-tiedostot avataan (idempotentti append-loki,
-/// sama kuin käynnistyksessä). Haaroitus on env-vapaa → deterministisesti
-/// testattavissa eksplisiittisellä hakemistolla.
+/// the report matches exactly the durability path the server would get.
+/// On the persistent path the journal files are opened (idempotent append
+/// log, same as at startup). The branching is env-free → deterministically
+/// testable with an explicit directory.
 ///
 /// # Errors
-/// [`FamilyClawError::config`] jos persistentin polun journal-pintojen avaus
-/// epäonnistuu (sama virhe jonka käynnistys antaisi).
+/// [`FamilyClawError::config`] if opening the journal surfaces for the
+/// persistent path fails (the same error startup would give).
 async fn durability_report_for(data_dir: Option<&str>) -> Result<DurabilityReport> {
-    // Sama haaroitus kuin build_familyssa: data-hakemisto ratkaisee persistentin
-    // (journal) vs. muistinvaraisen (in-memory) polun.
+    // Same branching as in build_family: the data directory decides the
+    // persistent (journal) vs. in-memory path.
     let runtime = if let Some(dir) = data_dir {
         let dir = std::path::PathBuf::from(dir);
         let pending_path = dir.join("pending_approvals.jsonl");
         let task_path = dir.join("action_tasks.jsonl");
         let dispatch_path = dir.join("dispatch_outbox.jsonl");
-        // `with_durable_stores` avaa nyt itse kaatumiskestävän dispatch-outboxin
-        // kolmannesta polusta — sama yhden kutsun kokoonpano kuin build_familyssa,
-        // ei erillistä with_dispatch_outbox-ketjutusta eikä outboxin kaksoisavausta.
+        // `with_durable_stores` now itself opens the crash-resilient dispatch
+        // outbox from a third path — the same single-call assembly as in
+        // build_family, no separate with_dispatch_outbox chaining and no
+        // double-opening of the outbox.
         ActionRuntime::with_durable_stores(pending_path, task_path, dispatch_path)
             .await
             .map_err(|e| {
                 FamilyClawError::config(format!("durable action stores open failed: {e}"))
             })?
     } else {
-        // Muistinvarainen polku: kaikki pinnat oletuksissaan, ei levyä.
+        // In-memory path: all surfaces at their defaults, no disk.
         ActionRuntime::with_default_skills()
             .map_err(|e| FamilyClawError::config(format!("action runtime build failed: {e}")))?
     };
@@ -1729,28 +1740,28 @@ async fn durability_report_for(data_dir: Option<&str>) -> Result<DurabilityRepor
     })
 }
 
-/// Palauttaa hiekkalaatikon (sandbox) saatavuus-etiketin.
+/// Returns the sandbox availability label.
 ///
-/// Delegoituu [`familyclaw_sandbox::sandbox_availability`]:lle, joka raportoi
-/// **todellisen käännetyn backendin**: `wasmtime (host-import denial + fuel
-/// cap)` kun `wasmtime`-passthrough-piirre on aktiivinen, muuten `none (noop)`.
-/// Lukemalla saatavuuden suoraan sandbox-cratesta (eikä gatewayn omasta
-/// irrallisesta lipusta) raportti ei voi valehdella: jos label sanoo
-/// `wasmtime`, oikea backend on oikeasti käännetty mukaan. Deterministinen ja
-/// salaisuudeton → sopii sekä `status`- että `doctor`-tulosteeseen.
+/// Delegates to [`familyclaw_sandbox::sandbox_availability`], which reports
+/// the **actual compiled backend**: `wasmtime (host-import denial + fuel
+/// cap)` when the `wasmtime` passthrough feature is active, otherwise `none (noop)`.
+/// By reading availability directly from the sandbox crate (rather than the
+/// gateway's own separate flag), the report cannot lie: if the label says
+/// `wasmtime`, the real backend is actually compiled in. Deterministic and
+/// secret-free → suitable for both `status` and `doctor` output.
 fn sandbox_label() -> &'static str {
     familyclaw_sandbox::sandbox_availability()
 }
 
-/// Palauttaa aktiivisen muistin upotustarjoajan etiketin (Phase 3, D4).
+/// Returns the label of the active memory embedding provider (Phase 3, D4).
 ///
-/// Runtime kääräisee muistin `EmbeddingMemoryStore`:lla
-/// [`DeterministicEmbedder`](familyclaw_embeddings::DeterministicEmbedder)-
-/// oletustarjoajalla (riippuvuudeton, köyhyys-yhteensopiva). Raportoi tarjoajan
-/// vakaan id:n + ulottuvuuden, jotta operaattori näkee mikä upotus on todella
-/// käytössä. Deterministinen ja salaisuudeton → sopii `status`/`doctor`-
-/// tulosteeseen. Kun feature-gated mallintarjoaja lisätään, tämä päivitetään
-/// raportoimaan todellinen käännetty tarjoaja (kuten [`sandbox_label`]).
+/// The runtime wraps memory with `EmbeddingMemoryStore` using the
+/// [`DeterministicEmbedder`](familyclaw_embeddings::DeterministicEmbedder)
+/// default provider (dependency-free, poverty-compatible). Reports the
+/// provider's stable id + dimensionality so the operator sees which
+/// embedding is actually in use. Deterministic and secret-free → suitable
+/// for `status`/`doctor` output. When a feature-gated model provider is
+/// added, this will be updated to report the actual compiled provider (like [`sandbox_label`]).
 fn embedder_label() -> String {
     use familyclaw_embeddings::DeterministicEmbedder;
     format!(
@@ -1760,22 +1771,21 @@ fn embedder_label() -> String {
     )
 }
 
-/// Kysyy käynnissä olevan gatewayn tilan (`/healthz` + `/readyz`).
+/// Queries the running gateway's status (`/healthz` + `/readyz`).
 ///
-/// Lukee kuunteluosoitteen [`resolve_addr`]:n kautta ja tekee kaksi HTTP
-/// GET -pyyntöä. Tulostaa kummankin endpointin tilan sekä **kestävyystilan**
-/// ([`build_durability_report`]) ja **hiekkalaatikon saatavuuden**
-/// ([`sandbox_label`]), jotta operaattori näkee mikä taustapinta on oikeasti
-/// kytkettynä. Palaa `Ok(())` vain kun `/readyz` vastaa `200 OK`; muuten
-/// [`FamilyClawError::bus`], jolloin prosessi päättyy nollasta poikkeavalla
-/// exit-koodilla.
+/// Reads the listen address via [`resolve_addr`] and makes two HTTP
+/// GET requests. Prints the status of each endpoint plus the **durability state**
+/// ([`build_durability_report`]) and **sandbox availability**
+/// ([`sandbox_label`]), so the operator sees which backing surface is actually
+/// wired up. Returns `Ok(())` only when `/readyz` responds `200 OK`; otherwise
+/// [`FamilyClawError::bus`], in which case the process exits with a non-zero exit code.
 ///
 /// # Errors
-/// - [`FamilyClawError::config`] jos kuunteluosoite on jäsentymätön.
-/// - [`FamilyClawError::config`] jos persistentin polun journal-pintojen avaus
-///   epäonnistuu kestävyysraporttia koottaessa.
-/// - [`FamilyClawError::bus`] jos gatewayyn ei saada yhteyttä tai `/readyz`
-///   ei ole `200`.
+/// - [`FamilyClawError::config`] if the listen address does not parse.
+/// - [`FamilyClawError::config`] if opening the journal surfaces for the
+///   persistent path fails while assembling the durability report.
+/// - [`FamilyClawError::bus`] if the gateway cannot be reached or `/readyz`
+///   is not `200`.
 async fn status() -> Result<()> {
     let addr = resolve_addr()?;
     let client = reqwest::Client::new();
@@ -1796,8 +1806,8 @@ async fn status() -> Result<()> {
     let ready_status = ready.status();
     println!("readyz  {addr} -> {ready_status}");
 
-    // Kestävä taustapinta + hiekkalaatikko: operaattori näkee mikä on
-    // oikeasti kytkettynä (ei vain HTTP-elossaolo).
+    // Durable backing surface + sandbox: the operator sees what's
+    // actually wired up (not just HTTP liveness).
     let durability = build_durability_report().await?;
     println!("durability: {}", durability.summary());
     println!("sandbox: {}", sandbox_label());
@@ -1813,31 +1823,31 @@ async fn status() -> Result<()> {
     }
 }
 
-/// Tarkistaa gatewayn kokoonpannon offline (käynnistämättä palvelinta).
+/// Checks the gateway's configuration offline (without starting the server).
 ///
-/// Suorittaa kolme tarkistusta ja tulostaa kunkin tuloksen:
-/// 1. **addr** — [`resolve_addr`] jäsentää kuunteluosoitteen,
-/// 2. **port** — osoite saadaan väliaikaisesti sidottua (portti vapaa),
-/// 3. **env** — vaaditut ympäristömuuttujat ovat asetettu.
+/// Performs three checks and prints each result:
+/// 1. **addr** — [`resolve_addr`] parses the listen address,
+/// 2. **port** — the address can be temporarily bound (port free),
+/// 3. **env** — the required environment variables are set.
 ///
-/// Salaisuuksista (esim. [`TELEGRAM_TOKEN_ENV`]) raportoidaan **vain läsnäolo**
-/// (`set`/`MISSING`) — arvoja ei tulosteta (MEMORY.md secret-leak-sääntö).
+/// For secrets (e.g. [`TELEGRAM_TOKEN_ENV`]) only **presence** is reported
+/// (`set`/`MISSING`) — values are not printed (MEMORY.md secret-leak rule).
 ///
 /// # Errors
-/// [`FamilyClawError::invalid_input`] jos jokin tarkistus epäonnistuu, jolloin
-/// prosessi päättyy nollasta poikkeavalla exit-koodilla.
-// Peräkkäisiä tarkistuslohkoja (addr/port/env/durability/sandbox/…), kukin
-// tulostaa oman rivinsä — pitkä mutta suoraviivainen diagnostiikkasekvenssi.
+/// [`FamilyClawError::invalid_input`] if any check fails, in which case the
+/// process exits with a non-zero exit code.
+// Sequential check blocks (addr/port/env/durability/sandbox/…), each
+// printing its own line — long but a straightforward diagnostic sequence.
 #[allow(clippy::too_many_lines)]
 async fn doctor(fix: bool) -> Result<()> {
     let cfg = FamilyConfig::load()?;
     let mut ok = true;
 
-    // 1. Kuunteluosoite jäsentyy.
+    // 1. The listen address parses.
     match resolve_addr() {
         Ok(addr) => {
             println!("[OK]      addr      {addr}");
-            // 2. Portti vapaa — kokeile väliaikaista sidontaa.
+            // 2. Port free — try a temporary bind.
             match TcpListener::bind(addr).await {
                 Ok(listener) => {
                     println!("[OK]      port      {addr} bindable");
@@ -1855,13 +1865,13 @@ async fn doctor(fix: bool) -> Result<()> {
         }
     }
 
-    // 3. Vaaditut env-muuttujat — vain läsnäolo, ei arvoja.
-    //    (TELEGRAM_TOKEN on salaisuus → ehdottomasti vain set/MISSING.)
+    // 3. Required env vars — presence only, no values.
+    //    (TELEGRAM_TOKEN is a secret → strictly set/MISSING only.)
     let channel_kind = cfg.channel_kind().to_string();
-    // Kanavaton julkaisutila (`none`): ei vaadittuja kanava-envejä eikä reply-
-    // kohdetta — gateway ajaa MockChannelillä (HTTP-pinta + /metrics toimivat).
-    // Tämä on tuoreen `cargo install`in savutesti-tila: `serve` + `status`
-    // ilman perhe-avaimia. Ohitetaan kanavakohtaiset env-tarkistukset kokonaan.
+    // Channel-less publish mode (`none`): no required channel envs or reply
+    // target — the gateway runs on MockChannel (HTTP surface + /metrics work).
+    // This is the fresh-`cargo install` smoke-test mode: `serve` + `status`
+    // without operator keys. Channel-specific env checks are skipped entirely.
     let channel_keys: &[&str] = if channel_kind == "none" {
         &[]
     } else if channel_kind == "discord" {
@@ -1888,7 +1898,7 @@ async fn doctor(fix: bool) -> Result<()> {
     }
 
     if channel_kind == "discord" {
-        // Discord vaatii JOKO bot-tokenin (kaksisuuntainen) TAI webhookin (postaus).
+        // Discord requires EITHER a bot token (two-way) OR a webhook (posting).
         let has_bot = std::env::var_os(DISCORD_BOT_TOKEN_ENV).is_some_and(|v| !v.is_empty());
         let has_webhook = std::env::var_os(DISCORD_WEBHOOK_URL_ENV).is_some_and(|v| !v.is_empty());
         if has_bot {
@@ -1917,10 +1927,10 @@ async fn doctor(fix: bool) -> Result<()> {
         println!("[WARN]    env       FAMILYCLAW_DATA_DIR unset — in-memory memory only");
     }
 
-    // Kestävä taustapinta: raportoi todelliset lajitunnisteet jotka build_family
-    // kytkisi, ja varoita REHELLISESTI jos prosessi olisi muistinvaraisessa
-    // tilassa — at-most-once-takuu kaatumisen yli vaatii journal-taustapinnan.
-    // Varoitus ≠ virhe (ei kaada doctoria), mutta operaattorin pitää tietää.
+    // Durable backing surface: reports the actual kind tags that build_family
+    // would wire up, and warns HONESTLY if the process would be in in-memory
+    // mode — the at-most-once-under-crash guarantee needs the journal backing surface.
+    // Warning != error (doesn't fail doctor), but the operator needs to know.
     let durability = build_durability_report().await?;
     println!("[INFO]     durability {}", durability.summary());
     if !durability.persistent {
@@ -1938,9 +1948,9 @@ async fn doctor(fix: bool) -> Result<()> {
         println!("[WARN]    env       FAMILYCLAW_PROFILE_DIR unset — generic soul");
     }
 
-    // /inject-suojaus: valinnainen, joten ei kaada doctoria. Vain läsnäolo —
-    // token on salaisuus, arvoa ei tulosteta. Puuttuva = varoitus avoimesta
-    // endpointista, ei virhe.
+    // /inject protection: optional, so it doesn't fail doctor. Presence only —
+    // the token is a secret, the value is not printed. Missing = a warning about
+    // an open endpoint, not an error.
     if cfg.gateway_token().trim().is_empty() {
         println!(
             "[WARN]    inject    {GATEWAY_TOKEN_ENV} unset — POST /inject open (loopback-only)"
@@ -1995,7 +2005,7 @@ async fn doctor(fix: bool) -> Result<()> {
     }
 }
 
-/// Interaktiivinen onboarding-wizard: luo TOML + data-hakemisto.
+/// Interactive onboarding wizard: creates the TOML + data directory.
 fn init_wizard() -> Result<()> {
     println!("FamilyClaw init — alle 5 min onboarding\n");
 
@@ -2032,18 +2042,18 @@ fn init_wizard() -> Result<()> {
     Ok(())
 }
 
-/// Jäsentää [`PLAN_ENV`]-suunnitelman tai palauttaa savutesti-oletuksen.
+/// Parses the [`PLAN_ENV`] plan or returns the smoke-test default.
 ///
-/// JSON-muoto on tarkoituksella pelkistetty: lista solmuja, joista kukin saa
-/// `id`/`title`/`description` ja valinnaisen `input`-objektin. Riippuvuudet,
-/// roolit ja kyvyt jätetään oletusarvoihin (yksinkertainen lineaarinen ajo),
-/// jotta sisäänkäynti pysyy ohuena — monimutkaisempi suunnittelu kuuluu
-/// kirjasto-API:lle ([`OrchestrationPlan`]).
+/// The JSON format is deliberately minimal: a list of nodes, each with
+/// `id`/`title`/`description` and an optional `input` object. Dependencies,
+/// roles, and capabilities are left at their defaults (a simple linear run),
+/// so the entry point stays thin — more complex design belongs to the
+/// library API ([`OrchestrationPlan`]).
 fn load_orchestration_plan() -> OrchestrationPlan {
     let raw = std::env::var(PLAN_ENV).unwrap_or_default();
     if raw.trim().is_empty() {
-        // Sisäänrakennettu savutesti: yksi solmu joka todistaa että ajo kulkee
-        // worker-valinnan + LiveTurnExecutorin läpi.
+        // Built-in smoke test: a single node that proves the run passes
+        // through worker selection + the LiveTurnExecutor.
         return OrchestrationPlan::new(
             "smoke",
             vec![TaskNode::new(
@@ -2098,26 +2108,25 @@ fn load_orchestration_plan() -> OrchestrationPlan {
     }
 }
 
-/// Ajaa monivaiheisen orkesterointisuunnitelman kerran ja tulostaa raportin.
+/// Runs a multi-step orchestration plan once and prints a report.
 ///
-/// Kokoaa bridgen, rekisteröi yhden Executor-työntekijän (online heartbeatilla),
-/// rakentaa [`LiveTurnExecutor`]:n env-resolverista ja ajaa
-/// [`Orchestrator::run_with`]:n. Tulostaa `RunReport`:n JSON-muodossa.
+/// Assembles the bridge, registers one Executor worker (online with a heartbeat),
+/// builds a [`LiveTurnExecutor`] from the env resolver, and runs
+/// [`Orchestrator::run_with`]. Prints the `RunReport` in JSON form.
 ///
 /// # Errors
-/// [`FamilyClawError`] jos mallin ratkaisu, työntekijän rekisteröinti tai ajo
-/// epäonnistuu.
+/// [`FamilyClawError`] if model resolution, worker registration, or the run fails.
 async fn orchestrate() -> Result<()> {
     let cfg = FamilyConfig::load()?;
     let model = cfg.model().to_string();
     info!(%model, "orchestrate: kootaan bridge + LiveTurnExecutor");
 
-    // 1. Bridge-substraatti (oma EventBus/AgentRegistry/TaskBoard).
+    // 1. Bridge substrate (own EventBus/AgentRegistry/TaskBoard).
     let bridge = FamilyBridge::new();
     let now = familyclaw_core::time::now();
 
-    // 2. Rekisteröi yksi Executor-työntekijä ja tee siitä online (heartbeat),
-    //    jotta select_worker näkee sen. Geneerinen nimi (KERROS A).
+    // 2. Register one Executor worker and make it online (heartbeat),
+    //    so select_worker sees it. Generic name (Layer A).
     let worker_id = familyclaw_core::AgentId::new();
     let worker = AgentInfo::new(worker_id, "worker-a", AgentRole::Executor, HostKind::Local);
     bridge.register_agent(worker).await.map_err(|e| {
@@ -2127,19 +2136,19 @@ async fn orchestrate() -> Result<()> {
         FamilyClawError::invalid_input(format!("orchestrate: heartbeat failed: {e}"))
     })?;
 
-    // 3. LiveTurnExecutor oikealla LLM-ketjulla (sama resolver kuin serve).
+    // 3. LiveTurnExecutor with a real LLM chain (same resolver as serve).
     let resolver = build_resolver();
     let executor = LiveTurnExecutor::from_model(&ModelConfig::new(&model), &resolver)?;
     info!(primary = %executor.primary_model(), "LiveTurnExecutor valmis");
 
-    // 4. Aja suunnitelma.
+    // 4. Run the plan.
     let plan = load_orchestration_plan();
     let orchestrator = Orchestrator::new(bridge);
     let report = orchestrator.run_with(&plan, now, &executor).await?;
 
-    // 5. Raportti stdoutiin. RunReport ei johda Serializea (bridge-tyyppi,
-    //    jota emme muuta cross-crate), joten käytetään Debug-tulostusta +
-    //    pieni JSON-yhteenveto valmistuneista solmuista.
+    // 5. Report to stdout. RunReport does not derive Serialize (a bridge
+    //    type we don't change cross-crate), so we use Debug printing +
+    //    a small JSON summary of completed nodes.
     println!("{report:#?}");
     info!(
         plan = %report.plan_id,
@@ -2148,8 +2157,8 @@ async fn orchestrate() -> Result<()> {
     Ok(())
 }
 
-/// Odottaa sammutussignaalia (`Ctrl-C`). Palaa kun signaali saapuu, mikä
-/// laukaisee axumin siistin sammutuksen.
+/// Waits for the shutdown signal (`Ctrl-C`). Returns when the signal
+/// arrives, which triggers axum's graceful shutdown.
 async fn shutdown_signal() {
     match tokio::signal::ctrl_c().await {
         Ok(()) => info!("Ctrl-C vastaanotettu — aloitetaan siisti sammutus"),
@@ -2163,7 +2172,7 @@ mod tests {
 
     #[test]
     fn default_addr_parses_to_expected_port() {
-        // Varmista että oletusosoite jäsentyy SocketAddriksi oikealle portille.
+        // Make sure the default address parses as a SocketAddr on the right port.
         let parsed: SocketAddr = DEFAULT_ADDR.parse().expect("default addr parses");
         assert_eq!(parsed.port(), 8787);
         assert!(parsed.ip().is_loopback(), "oletus sitoutuu loopbackiin");
@@ -2234,14 +2243,14 @@ mod tests {
 
     #[test]
     fn cli_definition_is_valid() {
-        // clap-määrittely on sisäisesti ehjä (paljastaa derive-virheet).
+        // The clap definition is internally consistent (surfaces derive errors).
         use clap::CommandFactory;
         Cli::command().debug_assert();
     }
 
     #[test]
     fn cli_no_args_defaults_to_serve() {
-        // Ilman alikomentoa = serve (taaksepäinyhteensopivuus).
+        // No subcommand = serve (backward compatibility).
         let cli = Cli::parse_from(["familyclaw-gateway"]);
         assert!(
             matches!(cli.command.unwrap_or(Command::Serve), Command::Serve),
@@ -2251,7 +2260,7 @@ mod tests {
 
     #[test]
     fn cli_parses_each_subcommand() {
-        // serve/status/doctor jäsentyvät odotetuiksi varianteiksi.
+        // serve/status/doctor parse into the expected variants.
         let serve = Cli::parse_from(["familyclaw-gateway", "serve"]);
         assert!(matches!(serve.command, Some(Command::Serve)));
 
@@ -2267,21 +2276,21 @@ mod tests {
 
     #[test]
     fn plan_load_env_fallback_and_json_parsing() {
-        // YHDISTETTY testi: [`PLAN_ENV`] on PROSESSIN-LAAJUINEN ympäristömuuttuja,
-        // joten kaksi erillistä testifunktiota (toinen `remove_var`, toinen
-        // `set_var`) kilpailisivat rinnakkain ajettuna ja vuorottelisivat
-        // toistensa tilan päälle. Tehdään molemmat tarkistukset PERÄKKÄIN saman
-        // funktion sisällä — silloin env-muuttujaa ei jaeta säikeiden yli eikä
-        // tulos riipu ajojärjestyksestä.
+        // COMBINED test: [`PLAN_ENV`] is a PROCESS-WIDE environment variable,
+        // so two separate test functions (one `remove_var`, another
+        // `set_var`) would race when run in parallel and stomp on each
+        // other's state. Both checks are done SEQUENTIALLY within the same
+        // function — that way the env var isn't shared across threads and
+        // the result doesn't depend on run order.
 
-        // (a) Ilman PLAN_ENV:iä → sisäänrakennettu yhden solmun savutesti.
+        // (a) Without PLAN_ENV -> the built-in single-node smoke test.
         std::env::remove_var(PLAN_ENV);
         let plan = load_orchestration_plan();
         assert_eq!(plan.id, "smoke");
         assert_eq!(plan.nodes.len(), 1);
         assert_eq!(plan.nodes[0].id.as_str(), "n1");
 
-        // (b) PLAN_ENV asetettuna → JSON jäsentyy solmuiksi.
+        // (b) With PLAN_ENV set -> the JSON parses into nodes.
         let json = r#"{"id":"p","nodes":[
             {"id":"a","title":"A","description":"da"},
             {"id":"b","title":"B","description":"db"}
@@ -2293,8 +2302,8 @@ mod tests {
         assert_eq!(plan.nodes[1].id.as_str(), "b");
         assert_eq!(plan.nodes[1].title, "B");
 
-        // (c) Siivous: palauta prosessin tila ennalleen, jotta mahdolliset muut
-        //     samaa muuttujaa lukevat testit eivät näe roskaa.
+        // (c) Cleanup: restore the process state, so any other tests
+        //     reading the same variable don't see leftover garbage.
         std::env::remove_var(PLAN_ENV);
         let plan = load_orchestration_plan();
         assert_eq!(plan.id, "smoke");
@@ -2302,13 +2311,13 @@ mod tests {
 
     #[test]
     fn cli_rejects_unknown_subcommand() {
-        // Tuntematon alikomento ei jäsenny (clap palauttaa virheen).
+        // An unknown subcommand does not parse (clap returns an error).
         assert!(Cli::try_parse_from(["familyclaw-gateway", "bogus"]).is_err());
     }
 
     #[test]
     fn health_url_builds_http_scheme() {
-        // status-apuri muodostaa http-URL:n oikein osoitteesta + polusta.
+        // The status helper correctly builds an http URL from the address + path.
         let addr: SocketAddr = "127.0.0.1:8787".parse().expect("addr");
         assert_eq!(
             health_url(addr, "/healthz"),
@@ -2319,15 +2328,15 @@ mod tests {
 
     #[test]
     fn constant_time_eq_matches_only_identical_bytes() {
-        // Vakioaikainen vertailu täsmää vain samanpituisiin, tavuittain
-        // identtisiin jonoihin (ei oikosulkua ensimmäisestä erosta).
+        // Constant-time comparison matches only same-length, byte-for-byte
+        // identical strings (no short-circuit on the first difference).
         assert!(constant_time_eq(b"s3cret", b"s3cret"));
         assert!(!constant_time_eq(b"s3cret", b"s3crXt"));
-        assert!(!constant_time_eq(b"s3cret", b"s3cre")); // eri pituus
+        assert!(!constant_time_eq(b"s3cret", b"s3cre")); // different length
         assert!(constant_time_eq(b"", b""));
     }
 
-    /// Apuri: rakentaa `Authorization`-otsikon sisältävän [`HeaderMap`]:n.
+    /// Helper: builds a [`HeaderMap`] containing an `Authorization` header.
     fn headers_with_auth(value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(
@@ -2339,8 +2348,8 @@ mod tests {
 
     #[test]
     fn inject_auth_no_token_configured_accepts() {
-        // (c) Tokenia ei konfiguroitu → pyyntö hyväksytään ilman otsikkoa
-        //     (taaksepäinyhteensopiva avoin loopback-oletus).
+        // (c) No token configured -> the request is accepted without a header
+        //     (backward-compatible open loopback default).
         let state = GatewayState {
             bus: None,
             discord_channel: None,
@@ -2354,13 +2363,13 @@ mod tests {
             readiness: readiness::ReadinessProbe::default(),
         };
         assert!(check_inject_auth(&state, &HeaderMap::new()).is_ok());
-        // Ylimääräinen otsikko ei haittaa kun suojausta ei ole.
+        // An extra header doesn't hurt when there's no protection.
         assert!(check_inject_auth(&state, &headers_with_auth("Bearer whatever")).is_ok());
     }
 
     #[test]
     fn inject_auth_token_configured_correct_bearer_accepts() {
-        // (a) Token konfiguroitu + oikea Bearer → hyväksytään.
+        // (a) Token configured + correct Bearer -> accepted.
         let state = GatewayState {
             bus: None,
             discord_channel: None,
@@ -2378,7 +2387,7 @@ mod tests {
 
     #[test]
     fn inject_auth_token_configured_wrong_or_missing_rejects_401() {
-        // (b) Token konfiguroitu + väärä/puuttuva Bearer → 401.
+        // (b) Token configured + wrong/missing Bearer -> 401.
         let state = GatewayState {
             bus: None,
             discord_channel: None,
@@ -2391,32 +2400,32 @@ mod tests {
             metrics: None,
             readiness: readiness::ReadinessProbe::default(),
         };
-        // Väärä token.
+        // Wrong token.
         assert_eq!(
             check_inject_auth(&state, &headers_with_auth("Bearer wrong-token")),
             Err(StatusCode::UNAUTHORIZED)
         );
-        // Otsikko kokonaan puuttuu.
+        // Header missing entirely.
         assert_eq!(
             check_inject_auth(&state, &HeaderMap::new()),
             Err(StatusCode::UNAUTHORIZED)
         );
-        // Bearer-prefiksi puuttuu (paljas token).
+        // Bearer prefix missing (bare token).
         assert_eq!(
             check_inject_auth(&state, &headers_with_auth("s3cret-token")),
             Err(StatusCode::UNAUTHORIZED)
         );
-        // Oikea prefiksi mutta tyhjä token.
+        // Correct prefix but empty token.
         assert_eq!(
             check_inject_auth(&state, &headers_with_auth("Bearer ")),
             Err(StatusCode::UNAUTHORIZED)
         );
     }
 
-    // ---- Operaattorin hyväksyntäpinta (suspend/resume-silta, roadmap §6 D2) ----
+    // ---- Operator approval surface (suspend/resume bridge, roadmap §6 D2) ----
 
-    /// Apuri: gateway-tila jossa on **kytketty** toimintoajoympäristö (oletustaidot)
-    /// eikä bearer-suojausta. Palauttaa myös jaetun kahvan tehtävien lähetykseen.
+    /// Helper: gateway state with a **wired-up** action runtime (default skills)
+    /// and no bearer protection. Also returns the shared handle for task submission.
     fn state_with_actions() -> (Arc<GatewayState>, Arc<Mutex<ActionRuntime>>) {
         let rt = ActionRuntime::with_default_skills().expect("default skills");
         let actions = Arc::new(Mutex::new(rt));
@@ -2435,8 +2444,8 @@ mod tests {
         (state, actions)
     }
 
-    /// Apuri: lähettää write-external-tehtävän → odottava hyväksyntä syntyy.
-    /// Palauttaa myönnetyn hyväksynnän tunnisteen merkkijonona (route-muoto).
+    /// Helper: submits a write-external task -> a pending approval is created.
+    /// Returns the granted approval's identifier as a string (route form).
     async fn submit_pending(actions: &Arc<Mutex<ActionRuntime>>) -> String {
         use familyclaw_actions::GithubIssueDraftMock;
         let now = familyclaw_core::time::now();
@@ -2455,13 +2464,13 @@ mod tests {
             .to_string()
     }
 
-    /// Apuri: lähettää odottavan hyväksynnän **injektoidulla `now`-hetkellä**,
-    /// jotta vanhentumisraja saadaan testissä determinismillä haltuun.
+    /// Helper: submits a pending approval with an **injected `now` moment**,
+    /// so the expiry boundary can be controlled deterministically in the test.
     ///
-    /// Hyväksynnän `expires_at` lasketaan `now + TTL`:nä lähetyshetkellä, joten
-    /// kaukana menneisyydessä oleva `now` tuottaa hyväksynnän joka on jo
-    /// vanhentunut suhteessa todelliseen nykyhetkeen — juuri tällä `approve`
-    /// päätyy `410 Gone` -haaraan ilman kelloa väärentäviä globaaleja tiloja.
+    /// The approval's `expires_at` is computed as `now + TTL` at submission
+    /// time, so a `now` far in the past produces an approval that is already
+    /// expired relative to the real current time — exactly what makes
+    /// `approve` land in the `410 Gone` branch, without any clock-faking global state.
     async fn submit_pending_at(
         actions: &Arc<Mutex<ActionRuntime>>,
         now: familyclaw_core::time::Timestamp,
@@ -2484,7 +2493,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_route_503_without_action_runtime() {
-        // Ilman kytkettyä toimintoajoympäristöä → 503 (ei paniikkia).
+        // Without a wired-up action runtime -> 503 (no panic).
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
@@ -2511,14 +2520,14 @@ mod tests {
         let arr = body.as_array().expect("array body");
         assert_eq!(arr.len(), 1, "yksi odottava hyväksyntä");
         let item = &arr[0];
-        // Vain kolme salaisuudetonta kenttää.
+        // Only the three secret-free fields.
         assert!(item.get("approval_id").and_then(|v| v.as_str()).is_some());
         assert!(item
             .get("redacted_summary")
             .and_then(|v| v.as_str())
             .is_some());
         assert!(item.get("created_at").and_then(|v| v.as_str()).is_some());
-        // EI raakaa payloadia ("bug_report"/"Button does nothing") eikä payload-kenttää.
+        // NO raw payload ("bug_report"/"Button does nothing") and no payload field.
         let rendered = serde_json::to_string(&body).expect("serialize");
         assert!(!rendered.contains("bug_report"));
         assert!(!rendered.contains("Button does nothing"));
@@ -2527,10 +2536,10 @@ mod tests {
 
     #[tokio::test]
     async fn pending_route_requires_bearer_when_configured() {
-        // Token konfiguroitu mutta ei otsikkoa → 401, ei vuoda listaa.
+        // Token configured but no header -> 401, the list is not leaked.
         let (mut_state, actions) = state_with_actions();
         submit_pending(&actions).await;
-        // Rakenna uusi tila samalla runtimella mutta token päällä.
+        // Build a new state with the same runtime but with the token turned on.
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
@@ -2562,7 +2571,7 @@ mod tests {
     #[tokio::test]
     async fn approve_route_unknown_id_is_404() {
         let (state, _actions) = state_with_actions();
-        // Kelvollinen UUID mutta ei odottavaa hyväksyntää → 404 (fail-closed).
+        // A valid UUID but no pending approval -> 404 (fail-closed).
         let unknown = ApprovalId::new().to_string();
         let (status, _) = approve_pending(State(state), HeaderMap::new(), Path(unknown)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -2570,12 +2579,12 @@ mod tests {
 
     #[tokio::test]
     async fn approve_route_expired_id_is_410() {
-        // Vanhentunut hyväksyntä → 410 Gone (eri syy kuin tuntematon = 404).
-        // Lähetetään odottava hyväksyntä kaukana menneisyydessä olevalla
-        // `now`-hetkellä (epoch), jolloin `expires_at = epoch + TTL` on jo
-        // todellisen nykyhetken takana. `approve_pending` lukee oikean
-        // `familyclaw_core::time::now()`:n → `now > expires_at` → 410, ilman
-        // että hyväksyntää kulutetaan (fail-closed, ei sivuvaikutusta).
+        // An expired approval -> 410 Gone (a different reason than unknown = 404).
+        // Submits a pending approval with a `now` moment far in the past
+        // (epoch), so `expires_at = epoch + TTL` is already behind the real
+        // current time. `approve_pending` reads the real
+        // `familyclaw_core::time::now()` -> `now > expires_at` -> 410, without
+        // the approval being consumed (fail-closed, no side effect).
         let (state, actions) = state_with_actions();
         let past = familyclaw_core::time::from_unix_secs(0).expect("epoch is a valid timestamp");
         let id = submit_pending_at(&actions, past).await;
@@ -2607,7 +2616,7 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    // ── Phase 4: kill-switch -reitti (POST /tasks/{id}/enabled) ──────────────
+    // ── Phase 4: kill-switch route (POST /tasks/{id}/enabled) ──────────────
 
     fn state_without_scheduler() -> Arc<GatewayState> {
         Arc::new(GatewayState {
@@ -2653,7 +2662,7 @@ mod tests {
             metrics: None,
             readiness: readiness::ReadinessProbe::default(),
         });
-        // Epäkelpo UUID → 400.
+        // Invalid UUID -> 400.
         let (status, _) = set_task_enabled_route(
             State(Arc::clone(&state)),
             HeaderMap::new(),
@@ -2663,7 +2672,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
-        // Puuttuva `enabled` → 400.
+        // Missing `enabled` -> 400.
         let (status, _) = set_task_enabled_route(
             State(state),
             HeaderMap::new(),
@@ -2701,7 +2710,7 @@ mod tests {
             readiness: readiness::ReadinessProbe::default(),
         });
 
-        // Tunnettu tehtävä → 200, tila päivittyy.
+        // Known task -> 200, the state updates.
         let (status, _) = set_task_enabled_route(
             State(Arc::clone(&state)),
             HeaderMap::new(),
@@ -2718,7 +2727,7 @@ mod tests {
             Some(false)
         );
 
-        // Tuntematon tehtävä → 404.
+        // Unknown task -> 404.
         let (status, _) = set_task_enabled_route(
             State(state),
             HeaderMap::new(),
@@ -2745,7 +2754,7 @@ mod tests {
         ));
         let sched = Arc::new(tokio::sync::Mutex::new(s));
 
-        // Eristetty config-polku tälle testille.
+        // Isolated config path for this test.
         let dir = std::env::temp_dir().join("familyclaw-gw-agency-persist-test");
         let path = dir.join("agency.json");
         let _ = std::fs::remove_file(&path);
@@ -2763,7 +2772,7 @@ mod tests {
             readiness: readiness::ReadinessProbe::default(),
         });
 
-        // Disabloi reitin kautta → pitää persistoitua tiedostoon.
+        // Disable via the route -> must be persisted to the file.
         let (status, _) = set_task_enabled_route(
             State(Arc::clone(&state)),
             HeaderMap::new(),
@@ -2773,11 +2782,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        // Tiedostoon kirjoittui disabled-merkintä.
+        // The disabled entry was written to the file.
         let cfg = AgencyConfig::load(&path).expect("load persisted");
         assert!(cfg.is_disabled(id), "kill-switch persistoitui configiin");
 
-        // Käyttöön otto reitin kautta → poistuu configista.
+        // Re-enable via the route -> removed from the config.
         let (status, _) = set_task_enabled_route(
             State(state),
             HeaderMap::new(),
@@ -2794,10 +2803,11 @@ mod tests {
 
     #[tokio::test]
     async fn approve_route_without_bus_is_503_and_does_not_consume() {
-        // **Option A:** ilman bussia gateway ei voi välittää jatkoa agentille
-        // (yhtään agenttia ei kuuntele) → rehellinen 503, EI hiljaista
-        // onnistumista. Esitarkistus on read-only → hyväksyntää EI kuluteta:
-        // se on yhä odottavissa pyynnön jälkeen (voi yrittää uudelleen).
+        // **Option A:** without a bus the gateway cannot hand the
+        // continuation off to the agent (no agent is listening) -> an
+        // honest 503, NOT a silent success. The pre-check is read-only ->
+        // the approval is NOT consumed: it is still pending after the
+        // request (can be retried).
         let (state, actions) = state_with_actions(); // bus: None
         let id = submit_pending(&actions).await;
 
@@ -2819,7 +2829,7 @@ mod tests {
             "503-virheviesti mainitsee serve-tilan, oli: {body}"
         );
 
-        // Hyväksyntää EI kulutettu: se näkyy yhä /approvals/pending-listalla.
+        // The approval was NOT consumed: it still shows up on the /approvals/pending list.
         let (list_status, Json(list_body)) =
             list_pending_approvals(State(state), HeaderMap::new()).await;
         assert_eq!(list_status, StatusCode::OK);
@@ -2838,11 +2848,11 @@ mod tests {
 
     #[tokio::test]
     async fn approve_route_with_bus_publishes_and_does_not_consume() {
-        // **Option A onnistunut polku:** bussin kanssa gateway VALIDOI +
-        // JULKAISEE `ResumeApproval`-signaalin → 200 `status: "resuming"`. Gateway
-        // EI kuluta hyväksyntää (sen kuluttaa agentti); ilman agenttia tässä
-        // testissä hyväksyntä jää odottavaksi → todiste että gateway ei tee
-        // sivuvaikutusta eikä kuluta lupaa.
+        // **Option A success path:** with a bus, the gateway VALIDATES +
+        // PUBLISHES the `ResumeApproval` signal -> 200 `status: "resuming"`. The
+        // gateway does NOT consume the approval (the agent consumes it);
+        // without an agent in this test, the approval stays pending ->
+        // proof that the gateway does not perform the side effect or consume the grant.
         use familyclaw_bus::ResonanceBus;
 
         let rt = ActionRuntime::with_default_skills().expect("default skills");
@@ -2874,13 +2884,13 @@ mod tests {
             Some("resuming"),
             "200-runko ilmoittaa asynkronisen jatkon (resuming), oli: {body}"
         );
-        // EI lopputulosta gatewayssä (Option A): ei task_id/awaiting-kenttiä.
+        // NO outcome in the gateway (Option A): no task_id/awaiting fields.
         assert!(
             body.get("task_id").is_none() && body.get("awaiting_further_approval").is_none(),
             "Option A: gateway ei palauta lopputulosta (asynkroninen), oli: {body}"
         );
 
-        // Gateway EI kuluttanut hyväksyntää — ilman agenttia se on yhä odottavissa.
+        // The gateway did NOT consume the approval — without an agent it is still pending.
         let (list_status, Json(list_body)) =
             list_pending_approvals(State(state), HeaderMap::new()).await;
         assert_eq!(list_status, StatusCode::OK);
@@ -2894,10 +2904,10 @@ mod tests {
         bus.stop();
     }
 
-    // ---- Prometheus-mittarit (GET /metrics) ----
+    // ---- Prometheus metrics (GET /metrics) ----
 
-    /// Apuri: poimii `Content-Type`-otsikon arvon handlerin palauttamasta
-    /// otsikkotaulukosta merkkijonona (testin luettavuuden vuoksi).
+    /// Helper: extracts the `Content-Type` header value from the header
+    /// array returned by the handler, as a string (for test readability).
     fn content_type_of(headers: &[(axum::http::header::HeaderName, &'static str)]) -> &'static str {
         headers
             .iter()
@@ -2907,8 +2917,8 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_route_503_without_registry() {
-        // Ilman kytkettyä rekisteriä → 503 (ei paniikkia). Sisältötyyppi
-        // pysyy text/plain myös virhevastauksessa.
+        // Without a wired-up registry -> 503 (no panic). The content type
+        // stays text/plain even in the error response.
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
@@ -2929,9 +2939,9 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_route_200_text_plain_prometheus_body() {
-        // Kytketään laivueen oletusrekisteri ja kasvatetaan yksi laskuri, jotta
-        // runko sisältää sekä TYPE-rivin että ei-nollaisen arvon. Vienti on
-        // deterministinen (nimijärjestys), joten testi ei voi olla epävakaa.
+        // Wire up the fleet default registry and increment one counter, so
+        // the body contains both a TYPE line and a non-zero value. The export
+        // is deterministic (name order), so the test cannot be flaky.
         let registry = MetricsRegistry::with_fleet_defaults();
         registry
             .counter(familyclaw_observability::COUNTER_TASKS_CREATED)
@@ -2951,7 +2961,7 @@ mod tests {
 
         let (status, headers, body) = metrics_handler(State(state)).await;
 
-        // 200 + text/plain (Prometheus-eksposition sisältötyyppi).
+        // 200 + text/plain (the Prometheus exposition content type).
         assert_eq!(status, StatusCode::OK);
         assert!(
             content_type_of(&headers).starts_with("text/plain"),
@@ -2959,14 +2969,14 @@ mod tests {
             content_type_of(&headers)
         );
 
-        // Runko jäsentyy Prometheus-ekspositioksi: vähintään yksi TYPE-rivi ja
-        // laivueen oletuksista tunnettu mittaririvi.
+        // The body parses as a Prometheus exposition: at least one TYPE line
+        // and a known metric line from the fleet defaults.
         assert!(body.contains("# TYPE tasks_created counter"));
         assert!(body.contains("tasks_created 1"));
         assert!(body.contains("# TYPE agents_online gauge"));
         assert!(body.contains("agents_online 0"));
-        // Determinismi: vienti on nimijärjestyksessä → agents_online ennen
-        // tasks_created (aakkosjärjestys), joten tulosteen järjestys on vakaa.
+        // Determinism: the export is in name order -> agents_online before
+        // tasks_created (alphabetical order), so the output order is stable.
         let agents_at = body.find("agents_online").expect("agents_online present");
         let tasks_at = body.find("tasks_created").expect("tasks_created present");
         assert!(
@@ -2975,12 +2985,12 @@ mod tests {
         );
     }
 
-    /// **Aito HTTP-integraatiotesti:** sitoo [`build_router`]:lla kootun
-    /// reitityksen väliaikaiseen loopback-porttiin (sama malli kuin [`serve`]),
-    /// tarjoilee sen taustatehtävässä ja hakee `GET /metrics`:n oikealla
-    /// HTTP-asiakkaalla ([`reqwest`], jo riippuvuutena). Tämä testaa koko ketjun:
-    /// Router → reitti → handler → `Content-Type`-otsikko → Prometheus-runko
-    /// aidon socketin yli, ei vain handler-funktiota suoraan.
+    /// **Real HTTP integration test:** binds the router assembled by
+    /// [`build_router`] to a temporary loopback port (same pattern as
+    /// [`serve`]), serves it in a background task, and fetches `GET /metrics`
+    /// with a real HTTP client ([`reqwest`], already a dependency). This
+    /// tests the whole chain: Router → route → handler → `Content-Type`
+    /// header → Prometheus body over a real socket, not just the handler function directly.
     #[tokio::test]
     async fn metrics_route_http_integration_returns_prometheus_text() {
         let registry = MetricsRegistry::with_fleet_defaults();
@@ -2998,14 +3008,14 @@ mod tests {
         });
         let app = build_router(state);
 
-        // Sido portti 0 → käyttöjärjestelmä antaa vapaan portin (rinnakkais-
-        // turvallinen, ei kovakoodattua porttia).
+        // Bind port 0 -> the OS assigns a free port (parallel-safe, no
+        // hardcoded port).
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
         let addr = listener.local_addr().expect("local addr");
 
-        // Tarjoile reititin taustalla; abortoi testin lopuksi.
+        // Serve the router in the background; abort at the end of the test.
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -3019,7 +3029,7 @@ mod tests {
 
         // 200 OK.
         assert_eq!(resp.status().as_u16(), 200);
-        // text/plain (Prometheus-eksposition sisältötyyppi).
+        // text/plain (the Prometheus exposition content type).
         let content_type = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -3030,7 +3040,7 @@ mod tests {
             "Content-Type pitää olla text/plain, oli: {content_type}"
         );
 
-        // Runko jäsentyy Prometheus-ekspositioksi (TYPE-rivi + tunnettu mittari).
+        // The body parses as a Prometheus exposition (TYPE line + a known metric).
         let body = resp.text().await.expect("body");
         assert!(
             body.contains("# TYPE"),
@@ -3044,28 +3054,28 @@ mod tests {
         server.abort();
     }
 
-    /// **End-to-end-todiste:** elävä siltatapahtuma liikuttaa laskuria JAETUSSA
-    /// rekisterissä, ja `GET /metrics` heijastaa sen (>0).
+    /// **End-to-end proof:** a live bridge event moves a counter on the SHARED
+    /// registry, and `GET /metrics` reflects it (>0).
     ///
-    /// Tämä sulkee katselmoinnin lipittämän aukon ("ei pää-päähän-testiä että
-    /// elävä tehtävä liikuttaa laskuria"): sama kytkentä kuin [`serve`]:ssä —
-    /// [`EventRecorder`] tilaa [`FamilyBridge`]:n ENNEN tapahtumaa ja kasvattaa
-    /// `metrics.clone()`-rekisteriä, ja TÄSMÄLLEEN sama rekisteri annetaan
-    /// [`GatewayState`]:lle. Julkaistaan tapahtuma (`create_task` +
-    /// `Custom("task.completed")`), valutetaan recorder, ja todistetaan että
-    /// (a) jaetun rekisterin laskuri kasvoi ja (b) `GET /metrics` -runko näyttää
-    /// laskuririvin arvolla > 0.
+    /// This closes the gap flagged in review ("no end-to-end test that a
+    /// live task moves a counter"): the same wiring as in [`serve`] —
+    /// [`EventRecorder`] subscribes to [`FamilyBridge`] BEFORE the event and increments the
+    /// `metrics.clone()` registry, and the EXACT same registry is given to
+    /// [`GatewayState`]. An event is published (`create_task` +
+    /// `Custom("task.completed")`), the recorder is drained, and it's proven that
+    /// (a) the shared registry's counter increased and (b) the `GET /metrics` body shows
+    /// the counter line with a value > 0.
     #[tokio::test]
     async fn live_bridge_event_moves_counter_on_shared_registry_and_metrics_reflects_it() {
-        // 1. SAMA jako-malli kuin serve():ssä: yksi rekisteri, kloonataan
-        //    recorderille; alkuperäinen menee GatewayState:lle.
+        // 1. The SAME sharing pattern as in serve(): one registry, cloned
+        //    for the recorder; the original goes to GatewayState.
         let metrics = MetricsRegistry::with_fleet_defaults();
         let bridge = FamilyBridge::new();
-        // Tilaa ENNEN tapahtumaa (EventBus toimittaa vain tilauksen jälkeiset).
+        // Subscribe BEFORE the event (EventBus only delivers post-subscription events).
         let mut recorder = EventRecorder::new(&bridge, metrics.clone());
 
-        // 2. Elävä siltatapahtuma: tehtävän luonti (→ tasks_created) ja
-        //    valmistuminen (→ tasks_completed Custom-etiketillä).
+        // 2. Live bridge event: task creation (-> tasks_created) and
+        //    completion (-> tasks_completed with the Custom label).
         bridge
             .create_task("live-task", None)
             .await
@@ -3075,11 +3085,11 @@ mod tests {
             None,
         ));
 
-        // 3. Valuta tapahtumat → jaettuun rekisteriin.
+        // 3. Drain the events -> into the shared registry.
         let drained = recorder.drain_once().await;
         assert_eq!(drained, 2, "kaksi tapahtumaa käsiteltiin");
 
-        // 4a. Jaetun rekisterin laskuri kasvoi (sama instanssi).
+        // 4a. The shared registry's counter increased (same instance).
         assert_eq!(
             metrics
                 .counter(familyclaw_observability::COUNTER_TASKS_CREATED)
@@ -3093,7 +3103,7 @@ mod tests {
             1
         );
 
-        // 4b. GET /metrics (sama rekisteri GatewayState:ssa) näyttää >0.
+        // 4b. GET /metrics (the same registry in GatewayState) shows >0.
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
@@ -3118,11 +3128,11 @@ mod tests {
         );
     }
 
-    /// Luo prosessikohtaisen uniikin väliaikaishakemiston journal-testeille.
+    /// Creates a process-unique temporary directory for journal tests.
     ///
-    /// Ei riipu `tempfile`-kratesta (sitä ei ole dev-deppeissä): yhdistää
-    /// prosessi-ID:n + nanosekuntileiman, jotta rinnakkaiset testit eivät
-    /// törmää. Kutsuja vastaa siivouksesta.
+    /// Does not depend on the `tempfile` crate (not a dev-dep here):
+    /// combines the process id + a nanosecond timestamp, so parallel tests
+    /// don't collide. The caller is responsible for cleanup.
     fn unique_data_dir(tag: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3137,7 +3147,7 @@ mod tests {
 
     #[tokio::test]
     async fn durability_report_in_memory_reflects_default_kinds() {
-        // Ilman data-hakemistoa: muistinvarainen tila, molemmat pinnat in-memory.
+        // Without a data directory: in-memory mode, both surfaces in-memory.
         let report = durability_report_for(None)
             .await
             .expect("in-memory report builds");
@@ -3148,7 +3158,7 @@ mod tests {
 
     #[tokio::test]
     async fn durability_report_persistent_reflects_journal_kinds() {
-        // Data-hakemiston kanssa: persistentti tila, molemmat pinnat journal.
+        // With a data directory: persistent mode, both surfaces journal.
         let dir = unique_data_dir("persistent");
         let dir_str = dir.to_str().expect("polku on UTF-8");
         let report = durability_report_for(Some(dir_str))
@@ -3162,8 +3172,8 @@ mod tests {
 
     #[test]
     fn durability_summary_in_memory_contains_crash_survival_off() {
-        // status/doctor näyttävät tämän rivin — in-memory tilassa sen pitää
-        // sisältää "crash-survival OFF" + molempien pintojen lajitunnisteet.
+        // status/doctor display this line — in in-memory mode it must
+        // contain "crash-survival OFF" + both surfaces' kind tags.
         let report = DurabilityReport {
             persistent: false,
             dispatch_outbox_kind: "in-memory",
@@ -3186,7 +3196,7 @@ mod tests {
 
     #[test]
     fn durability_summary_persistent_contains_journal_kinds() {
-        // status/doctor-rivi persistentissä tilassa: ei OFF-varoitusta, journal-pinnat.
+        // status/doctor line in persistent mode: no OFF warning, journal surfaces.
         let report = DurabilityReport {
             persistent: true,
             dispatch_outbox_kind: "journal",
@@ -3204,9 +3214,10 @@ mod tests {
         );
     }
 
-    /// Apuri: rakentaa doctorin näyttämät kestävyysrivit raportista — sama
-    /// muotoilu kuin `doctor()`-funktiossa, jotta varoituslogiikka on testattava
-    /// ilman täyttä `doctor()`-ajoa (joka lukee prosessin globaalia ympäristöä).
+    /// Helper: builds the durability lines doctor shows from the report —
+    /// the same formatting as in the `doctor()` function, so the warning
+    /// logic is testable without a full `doctor()` run (which reads the
+    /// process's global environment).
     fn doctor_durability_lines(report: &DurabilityReport) -> Vec<String> {
         let mut lines = vec![format!("[INFO]     durability {}", report.summary())];
         if !report.persistent {
@@ -3221,7 +3232,7 @@ mod tests {
 
     #[test]
     fn doctor_in_memory_emits_crash_survival_warning() {
-        // doctor muistinvaraisessa tilassa: REHELLINEN varoitus (ei kaada doctoria).
+        // doctor in in-memory mode: an HONEST warning (doesn't fail doctor).
         let report = DurabilityReport {
             persistent: false,
             dispatch_outbox_kind: "in-memory",
@@ -3241,7 +3252,7 @@ mod tests {
 
     #[test]
     fn doctor_persistent_emits_no_crash_survival_warning() {
-        // doctor persistentissä tilassa: vain INFO-rivi, ei kaatumisvaroitusta.
+        // doctor in persistent mode: only an INFO line, no crash warning.
         let report = DurabilityReport {
             persistent: true,
             dispatch_outbox_kind: "journal",
@@ -3261,7 +3272,7 @@ mod tests {
 
     #[test]
     fn sandbox_label_matches_compiled_feature() {
-        // sandbox-etiketti seuraa käännösaikaista wasmtime-piirrettä.
+        // The sandbox label follows the compile-time wasmtime feature.
         let label = sandbox_label();
         if cfg!(feature = "wasmtime") {
             assert_eq!(label, "wasmtime (host-import denial + fuel cap)");
@@ -3272,7 +3283,7 @@ mod tests {
 
     #[test]
     fn embedder_label_reports_active_provider() {
-        // Phase 3: status/doctor näyttää aktiivisen upotustarjoajan id + dim.
+        // Phase 3: status/doctor shows the active embedding provider's id + dim.
         let label = embedder_label();
         assert!(
             label.contains("deterministic-hash-v1"),
@@ -3281,12 +3292,12 @@ mod tests {
         assert!(label.contains("dim=256"), "ulottuvuus: {label}");
     }
 
-    // ---- E2E: suspend → approve → resume → reply (Phase 1 §6, RED-todiste) ----
+    // ---- E2E: suspend → approve → resume → reply (Phase 1 §6, RED proof) ----
 
-    /// **Skriptattu fake-LLM** (raaka TCP, OpenAI-yhteensopiva endpoint): palauttaa
-    /// annetut JSON-rungot järjestyksessä, yksi per pyyntö. Sama kuvio kuin
-    /// `familyclaw-agent`:n tool-loop-testeissä — ei ulkoista mock-kirjastoa, ei
-    /// verkkoa ulospäin. Palauttaa base-URL:n (`http://127.0.0.1:PORT/v1`).
+    /// **Scripted fake LLM** (raw TCP, OpenAI-compatible endpoint): returns
+    /// the given JSON bodies in order, one per request. Same pattern as in
+    /// `familyclaw-agent`'s tool-loop tests — no external mock library, no
+    /// outbound network. Returns the base URL (`http://127.0.0.1:PORT/v1`).
     async fn spawn_scripted_llm_e2e(bodies: Vec<String>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -3312,9 +3323,9 @@ mod tests {
         format!("http://{addr}/v1")
     }
 
-    /// OpenAI-vastausrunko: **yksi työkalukutsu** chat-completions-johdon
-    /// muodossa — `type:"function"` + sisäkkäinen `function`, jonka `arguments`
-    /// on **JSON-merkkijono**, ja `content` on `null`. Peilaa oikeaa provideria.
+    /// `OpenAI` response body: **one tool call** in chat-completions wire
+    /// form — `type:"function"` + a nested `function` whose `arguments`
+    /// is a **JSON string**, and `content` is `null`. Mirrors a real provider.
     fn e2e_body_tool_call(id: &str, name: &str, arguments: &serde_json::Value) -> String {
         let arguments_str =
             serde_json::to_string(arguments).expect("arguments serialize to JSON string");
@@ -3335,20 +3346,21 @@ mod tests {
         .to_string()
     }
 
-    /// OpenAI-vastausrunko: **pelkkä teksti** → tool-loop pysähtyy (lopullinen vastaus).
+    /// `OpenAI` response body: **plain text only** -> the tool loop stops (final response).
     fn e2e_body_text(text: &str) -> String {
         serde_json::json!({ "choices": [ { "message": { "content": text } } ] }).to_string()
     }
 
-    /// Hyväksyntää vaativa **laskeva** testitaito: kasvattaa jaettua atomista
-    /// laskuria joka suorituksella → sivuvaikutuksen suorituskertojen suora
-    /// mittari. Nimi `approval_skill` (LLM-työkalukutsu viittaa nimeen).
+    /// An approval-gated **counting** test skill: increments a shared atomic
+    /// counter on every execution -> a direct metric of how many times the
+    /// side effect ran. Named `approval_skill` (the LLM tool call refers to
+    /// the name).
     #[derive(Debug, Clone)]
     struct E2eCountingApprovalSkill {
         count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    /// Testitaidon kiinteä, deterministinen UUID (ei `uuid!`-makroa).
+    /// The test skill's fixed, deterministic UUID (no `uuid!` macro).
     const E2E_APPROVAL_SKILL_UUID: u128 = 0x7e57_0000_0000_4000_8000_0000_0000_0001;
 
     #[async_trait::async_trait]
@@ -3389,27 +3401,30 @@ mod tests {
         }
     }
 
-    /// **End-to-end RED-todiste (Phase 1 §6 manuaaliportin aukko):** todistaa että
-    /// operaattorin `POST /approvals/{id}/approve` **ajaa toiminnon sivuvaikutuksen
-    /// mutta EI aja agenttia lopulliseen vastaukseen** — vuoro ei jatku
-    /// (`turn_resumed`/`turn_answered` puuttuvat) eikä reply tavoita kanavaa.
+    /// **End-to-end RED proof (Phase 1 §6 manual-gate gap):** proves that the
+    /// operator's `POST /approvals/{id}/approve` **runs the action's side
+    /// effect but does NOT drive the agent to a final response** — the turn
+    /// does not resume (`turn_resumed`/`turn_answered` are missing) and no
+    /// reply reaches the channel.
     ///
-    /// Harness kokoaa **aidon agentin** in-crate (skriptattu LLM + jaettu
-    /// `ActionRuntime` laskevalla hyväksyntätaidolla + jaettu `AuditCollector` +
-    /// captattu reply-sink). Sama `Arc<Mutex<ActionRuntime>>` ja sama
-    /// `Arc<AuditCollector>` annetaan sekä agentille (`with_actions` /
-    /// `with_turn_audit`) että `GatewayState`:lle — operaattori ja agentti jakavat
-    /// TÄSMÄLLEEN saman lukitun tilan, kuten tuotannon `build_family`-kytkennässä.
+    /// The harness assembles a **real agent** in-crate (scripted LLM + a
+    /// shared `ActionRuntime` with the counting approval skill + a shared
+    /// `AuditCollector` + a captured reply sink). The same
+    /// `Arc<Mutex<ActionRuntime>>` and the same `Arc<AuditCollector>` are given
+    /// to both the agent (`with_actions` / `with_turn_audit`) and
+    /// `GatewayState` — the operator and the agent share EXACTLY the same
+    /// locked state, as in production's `build_family` wiring.
     ///
-    /// Vuoro suspendataan kutsumalla `agent.think()` suoraan (deterministinen,
-    /// sama kuvio kuin `resume_approved_completes_turn_side_effect_runs_once`);
-    /// agentti spawnataan sen jälkeen actoriksi ja bus annetaan `GatewayState`:lle,
-    /// jotta myöhempi korjaus (`BusMessage::ResumeApproval` → actor-handler →
-    /// `resume_approved` → reply-sink) voi tehdä väitteestä (e) vihreän
-    /// koskematta tähän harnessiin.
+    /// The turn is suspended by calling `agent.think()` directly
+    /// (deterministic, the same pattern as
+    /// `resume_approved_completes_turn_side_effect_runs_once`); the agent is
+    /// then spawned as an actor and the bus is given to `GatewayState`, so a
+    /// later fix (`BusMessage::ResumeApproval` → actor handler →
+    /// `resume_approved` → reply sink) can turn assertion (e) green without
+    /// touching this harness.
     ///
-    /// Väitteet (a)-(d) menevät LÄPI; (e) EPÄONNISTUU koska reply ei koskaan saavu
-    /// eikä `turn_resumed`/`turn_answered` synny — tämä on aukon todiste.
+    /// Assertions (a)-(d) PASS; (e) FAILS because the reply never arrives
+    /// and `turn_resumed`/`turn_answered` never occur — this is the proof of the gap.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn e2e_suspend_approve_resume_reply() {
@@ -3419,15 +3434,15 @@ mod tests {
         use familyclaw_memory::LocalJsonStore;
         use std::sync::atomic::Ordering::SeqCst;
 
-        // 1. Bus (sama instanssi GatewayState:lle — tuleva ResumeApproval-julkaisu).
+        // 1. Bus (same instance for GatewayState — the upcoming ResumeApproval publish).
         let bus = ResonanceBus::start(None).await.expect("bus");
 
-        // 2. Skriptattu LLM: ensin hyväksyntää vaativa työkalukutsu (suspend),
-        //    sitten (resumen aikana) lopullinen teksti. Toista runkoa EI lueta
-        //    tässä RED-testissä, koska gateway ei aja resumea — se on tarkoitus.
-        // Payload sisältää SENTINEL-merkkijonon (tekosalaisuus, EI oikea avain eikä
-        //    perheen nimi) jonka redaktoidun tiivistelmän pitää KARSIA — todistaa (b):ssä
-        //    että /approvals/pending ei vuoda raakaa payloadia/salaisuuksia.
+        // 2. Scripted LLM: first an approval-requiring tool call (suspend),
+        //    then (during resume) the final text. The second body is NOT read
+        //    in this RED test, because the gateway does not run the resume — that's the point.
+        // The payload contains a SENTINEL string (a fake secret, NOT a real key or
+        //    operator name) whose redacted summary must STRIP it — proves in (b)
+        //    that /approvals/pending does not leak the raw payload/secrets.
         let api = spawn_scripted_llm_e2e(vec![
             e2e_body_tool_call(
                 "call_approve",
@@ -3438,7 +3453,7 @@ mod tests {
         ])
         .await;
 
-        // 3. Jaettu ActionRuntime laskevalla hyväksyntätaidolla.
+        // 3. Shared ActionRuntime with the counting approval skill.
         let side_effect_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut rt = ActionRuntime::new();
         rt.register_skill(E2eCountingApprovalSkill {
@@ -3447,15 +3462,16 @@ mod tests {
         .expect("register approval_skill");
         let actions: Arc<Mutex<ActionRuntime>> = Arc::new(Mutex::new(rt));
 
-        // 4. Jaettu turn-audit-keräin.
+        // 4. Shared turn-audit collector.
         let turn_audit: Arc<AuditCollector> = Arc::new(AuditCollector::new());
 
-        // 5. Captattu reply-sink: tällä HAVAINNOIMME tavoittaako lopullinen vastaus
-        //    kanavan. Tuotannossa runtime omistaa recv-pään ja pumppaa Channel::send.
+        // 5. Captured reply sink: this is how we OBSERVE whether the final
+        //    response reaches the channel. In production the runtime owns the
+        //    recv end and pumps Channel::send.
         let (sink, mut reply_rx) = new_reply_channel();
 
-        // 6. Aito agentti skriptatulla LLM:llä + jaetut kahvat (sama kytkentä kuin
-        //    build_family). Reply-kohde on staattinen fallback.
+        // 6. A real agent with the scripted LLM + shared handles (same
+        //    wiring as build_family). The reply target is a static fallback.
         let config = AgentConfig::new("e2e_agent", ModelConfig::new("scripted/model"));
         let soul = Soul::from_essence("I am the E2E agent.".to_string());
         let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
@@ -3479,9 +3495,9 @@ mod tests {
         .with_reply_sink(sink)
         .with_reply_target("e2e-channel");
 
-        // 7. Aja vuoro → tool-loop suspendoituu hyväksyntää vaativaan työkaluun.
-        //    Tämä synnyttää AIDON turn_suspended-auditin + odottavan hyväksynnän
-        //    JAETTUUN ActionRuntimeen + jatkettavan vuoron resumable-pinnalle.
+        // 7. Run the turn -> the tool loop suspends on the approval-requiring tool.
+        //    This produces a REAL turn_suspended audit + a pending approval
+        //    on the SHARED ActionRuntime + a resumable turn on the resumable surface.
         let out = agent
             .think(&BusMessage::text("ship it"))
             .await
@@ -3490,19 +3506,19 @@ mod tests {
             ThinkOutcome::Suspended { approval_id, .. } => approval_id,
             other => panic!("odotettiin Suspended, sai: {other:?}"),
         };
-        // Sivuvaikutus EI ole vielä ajettu (hyväksyntää ei myönnetty).
+        // The side effect has NOT run yet (approval not granted).
         assert_eq!(
             side_effect_count.load(SeqCst),
             0,
             "approval-gated side effect must NOT run before approve"
         );
 
-        // 8. Spawnaa agentti actoriksi (pidetään elossa) — tuleva ResumeApproval-
-        //    bus-signaali tavoittaa juuri tämän postilaatikon. RED-testi ei sitä
-        //    vielä lähetä; pidämme actorin elossa harnessin uskollisuuden vuoksi.
+        // 8. Spawn the agent as an actor (kept alive) — the upcoming
+        //    ResumeApproval bus signal reaches exactly this mailbox. The RED
+        //    test does not send it yet; we keep the actor alive for the harness's fidelity.
         let _actor = agent.spawn().await.expect("spawn agent actor");
 
-        // 9. GatewayState jakaa SAMAN actions- + turn_audit-kahvan ja saman busin.
+        // 9. GatewayState shares the SAME actions + turn_audit handles and the same bus.
         let state = Arc::new(GatewayState {
             bus: Some(bus.clone()),
             discord_channel: None,
@@ -3526,8 +3542,8 @@ mod tests {
         let client = reqwest::Client::new();
         let base = format!("http://{addr}");
 
-        // (a) Vuoro suspendattiin: ei vielä replyä, ja /turns/audit sisältää
-        //     turn_suspended-tapahtuman.
+        // (a) The turn was suspended: no reply yet, and /turns/audit contains
+        //     the turn_suspended event.
         assert!(
             reply_rx.try_recv().is_err(),
             "(a) suspendin jälkeen ei saa olla replyä reply-sinkissä"
@@ -3545,9 +3561,9 @@ mod tests {
             "(a) audit-jälki sisältää turn_suspended:n, oli:\n{audit_body}"
         );
 
-        // (b) /approvals/pending palauttaa approval_id:n + redaktoidun
-        //     tiivistelmän, EIKÄ vuoda salaisuuksia / perheen nimiä / yksityisiä
-        //     absoluuttisia polkuja (Layer-B-henki).
+        // (b) /approvals/pending returns the approval_id + a redacted
+        //     summary, and does NOT leak secrets / operator names / private
+        //     absolute paths (Layer B spirit).
         let pending_resp = client
             .get(format!("{base}/approvals/pending"))
             .send()
@@ -3559,20 +3575,20 @@ mod tests {
             pending_body.contains(&approval_id.to_string()),
             "(b) pending sisältää approval_id:n, oli:\n{pending_body}"
         );
-        // POSITIIVINEN redaktio-väite: tiivistelmä on TÄSMÄLLEEN
-        // `ActionRuntime::pending_summary`:n redaktoima muoto (vain taidon nimi),
-        // EI raaka payload. Tämä on sekä lähdekoodissa vuotamaton (ei perheen
-        // nimiä literaaleina) että merkityksellisempi kuin pelkkä negatiivinen
-        // tarkistus: se sitoo testin redaktoituun esitykseen.
+        // POSITIVE redaction assertion: the summary is EXACTLY the redacted
+        // form from `ActionRuntime::pending_summary` (skill name only),
+        // NOT the raw payload. This is both leak-free in the source (no
+        // operator names as literals) and more meaningful than a mere
+        // negative check: it ties the test to the redacted representation.
         assert!(
             pending_body.contains("taito 'approval_skill' odottaa ihmisen hyväksyntää"),
             "(b) pending sisältää redaktoidun tiivistelmän (vain taidon nimi), oli:\n{pending_body}"
         );
-        // Negatiiviset vuototarkistukset: ei avain-muotoista salaisuutta
-        // (sk-/Bearer/test-key), ei SENTINEL-tekosalaisuutta, ei raakaa payloadia
-        // (arvo `ship`, avain `"q"`/`"secret"`), ei yksityistä absoluuttista polkua.
-        // SENTINEL todistaa AKTIIVISESTI että redaktio karsii payloadiin upotetut
-        // salaisuudet — ei kosmeettinen tarkistus.
+        // Negative leak checks: no key-shaped secret
+        // (sk-/Bearer/test-key), no SENTINEL fake secret, no raw payload
+        // (value `ship`, key `"q"`/`"secret"`), no private absolute path.
+        // SENTINEL ACTIVELY proves that redaction strips secrets embedded in
+        // the payload — not a cosmetic check.
         let lowered = pending_body.to_lowercase();
         assert!(
             !lowered.contains("sk-")
@@ -3595,10 +3611,11 @@ mod tests {
             "(b) ei yksityistä absoluuttista polkua: {pending_body}"
         );
 
-        // (c) POST /approvals/{id}/approve → 200. **Option A:** 200 tarkoittaa
-        //     "hyväksyntä otettu vastaan ja välitetty agentille" — EI että jatko on
-        //     jo valmis. Sivuvaikutus + vastaus ajetaan asynkronisesti agentin
-        //     resume-polulla (ResumeApproval-bus-signaali → handle_resume_signal).
+        // (c) POST /approvals/{id}/approve -> 200. **Option A:** 200 means
+        //     "the approval was received and handed off to the agent" — NOT
+        //     that the continuation is already complete. The side effect +
+        //     response run asynchronously on the agent's resume path
+        //     (the ResumeApproval bus signal -> handle_resume_signal).
         let approve_resp = client
             .post(format!("{base}/approvals/{approval_id}/approve"))
             .send()
@@ -3613,18 +3630,18 @@ mod tests {
             "(c) 200-runko ilmoittaa asynkronisen jatkon (resuming), oli:\n{approve_body}"
         );
 
-        // (d)+(e) **Asynkroninen, rajattu poll:** koska side-effect + vastaus
-        //     ajetaan nyt agentissa 200:n palautumisen JÄLKEEN (Option A), emme voi
-        //     väittää synkronisesti. Pollataan enintään ~3 s (60 × 50 ms) kunnes
-        //     KAIKKI toteutuvat: lopullinen reply saapuu reply-sinkkiin, side-effect-
-        //     laskuri == 1, ja /turns/audit sisältää turn_resumed:n + turn_answered:n.
-        //     Rajattu (ei loputon) → testi pysyy deterministisenä ja nopeana.
+        // (d)+(e) **Asynchronous, bounded poll:** because the side effect +
+        //     response now run in the agent AFTER the 200 returns (Option A), we
+        //     cannot assert synchronously. Poll for at most ~3s (60 × 50ms) until
+        //     ALL of these are true: the final reply arrives at the reply sink,
+        //     the side-effect counter == 1, and /turns/audit contains turn_resumed and turn_answered.
+        //     Bounded (not infinite) -> the test stays deterministic and fast.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut reply_body: Option<String> = None;
         let mut final_audit;
         loop {
-            // Ime reply-sinkki ei-blokkaavasti (agentti työntää tänne kun resume
-            // valmistuu). Säilytä ensimmäinen saapunut vastaus.
+            // Drain the reply sink non-blockingly (the agent pushes here when
+            // the resume completes). Keep the first response that arrives.
             if reply_body.is_none() {
                 if let Ok(msg) = reply_rx.try_recv() {
                     reply_body = Some(msg.body);
@@ -3644,14 +3661,14 @@ mod tests {
                 && final_audit.contains("turn_resumed")
                 && final_audit.contains("turn_answered");
             if done || std::time::Instant::now() >= deadline {
-                break; // valmis tai timeout → väitteet alla raportoivat havainnon
+                break; // done or timeout -> the assertions below report the observation
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        // Nämä väitteet ovat se ENTINEN RED-rivi: ne ovat nyt VIHREÄT, koska
-        // operaattori-approve julkaisee ResumeApprovalin ja agentti jatkaa vuoron
-        // loppuun (resume_approved → reply-sink). Älä löysennä niitä.
+        // These assertions are the FORMER RED line: they are now GREEN,
+        // because operator-approve publishes the ResumeApproval and the agent
+        // resumes the turn to completion (resume_approved -> reply sink). Do not weaken them.
         assert_eq!(
             reply_body.as_deref(),
             Some("hyväksytty toiminto valmis"),
@@ -3659,7 +3676,7 @@ mod tests {
              (sai: {reply_body:?}); side_effect={}, audit:\n{final_audit}",
             side_effect_count.load(SeqCst)
         );
-        // (d) Sivuvaikutus ajettiin TASAN KERRAN (eventually-exactly-once).
+        // (d) The side effect ran EXACTLY ONCE (eventually-exactly-once).
         assert_eq!(
             side_effect_count.load(SeqCst),
             1,
@@ -3674,9 +3691,9 @@ mod tests {
             "(e) audit-jäljen pitää sisältää turn_answered approven jälkeen, oli:\n{final_audit}"
         );
 
-        // **Ei kaksoislaukaisua:** odota muutama lisäsykli ja varmista että
-        // side-effect pysyy 1:ssä eikä toista vastausta saavu (hyväksyntä on
-        // kertakäyttöinen → agentti ei voi ajaa sitä kahdesti).
+        // **No double-firing:** wait a few more cycles and verify that the
+        // side effect stays at 1 and no second response arrives (the approval
+        // is single-use -> the agent cannot run it twice).
         for _ in 0..5 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             assert_eq!(
@@ -3694,11 +3711,11 @@ mod tests {
         bus.stop();
     }
 
-    /// SF1 (GPT-5.5 review): **kaksi YHTÄAIKAISTA** `POST /approvals/{id}/approve`
-    /// -pyyntöä samalle hyväksynnälle saa laukaista sivuvaikutuksen **korkeintaan
-    /// kerran**. Aiempi `e2e_suspend_approve_resume_reply` todisti sekventiaalisen
-    /// ei-kaksoislaukaisun; tämä todistaa että kilpa kahden samanaikaisen HTTP-
-    /// pyynnön välillä ei riko kertakäyttöistä hyväksyntää.
+    /// SF1 (GPT-5.5 review): **two CONCURRENT** `POST /approvals/{id}/approve`
+    /// requests for the same approval may trigger the side effect **at most
+    /// once**. The earlier `e2e_suspend_approve_resume_reply` proved
+    /// sequential no-double-firing; this proves that a race between two
+    /// simultaneous HTTP requests does not break the single-use approval.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn concurrent_double_approve_fires_side_effect_at_most_once() {
@@ -3788,17 +3805,17 @@ mod tests {
         let client = reqwest::Client::new();
         let url = format!("http://{addr}/approvals/{approval_id}/approve");
 
-        // Kaksi YHTÄAIKAISTA approve-pyyntöä samalle id:lle.
+        // Two CONCURRENT approve requests for the same id.
         let (r1, r2) = tokio::join!(client.post(&url).send(), client.post(&url).send(),);
         let s1 = r1.expect("POST approve #1").status().as_u16();
         let s2 = r2.expect("POST approve #2").status().as_u16();
-        // Tasan yksi pyyntö saa kuluttaa kertakäyttöisen hyväksynnän (200); toinen
-        // näkee sen jo kulutettuna (404 Not Found) tai myös 200 jos serialisointi
-        // sallii — mutta sivuvaikutus alla on JOKA TAPAUKSESSA korkeintaan 1.
+        // Exactly one request may consume the single-use approval (200); the
+        // other sees it already consumed (404 Not Found) or also 200 if
+        // serialization allows it — but the side effect below is AT MOST 1 in EVERY case.
         let oks = u8::from(s1 == 200) + u8::from(s2 == 200);
         assert!(oks >= 1, "ainakin yksi approve onnistuu (sai {s1}/{s2})");
 
-        // Odota että resume valmistuu, sitten varmista side-effect == 1 EIKÄ enää nouse.
+        // Wait for the resume to complete, then verify side-effect == 1 and it doesn't rise further.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             if side_effect_count.load(SeqCst) >= 1 || std::time::Instant::now() >= deadline {
@@ -3819,7 +3836,7 @@ mod tests {
             1,
             "sivuvaikutus ajetaan tasan kerran myös samanaikaisen kaksois-approven alla"
         );
-        // Vain yksi lopullinen vastaus (ei kaksoislaukaisua reply-polulla).
+        // Only one final response (no double-firing on the reply path).
         let mut replies = 0u8;
         while reply_rx.try_recv().is_ok() {
             replies += 1;
@@ -3830,20 +3847,20 @@ mod tests {
         bus.stop();
     }
 
-    /// SF2 (GPT-5.5 review): negatiivinen reitti-regressio joka VARTIOI axum 0.7
-    /// -korjausta (`{approval_id}` → `:approval_id`). Jos joku palauttaisi reitin
-    /// brace-syntaksiin, kirjaimellinen polkusegmentti tulkittaisiin literaaliksi
-    /// eikä kaappaisi mielivaltaista id:tä → tämä testi punaistuisi.
+    /// SF2 (GPT-5.5 review): a negative route regression test that GUARDS the
+    /// axum 0.7 fix (`{approval_id}` → `:approval_id`). If someone reverted the
+    /// route to brace syntax, the literal path segment would be interpreted
+    /// as a literal and would not capture an arbitrary id -> this test would fail.
     ///
-    /// Todistus: POST mielivaltaiseen `:approval_id`-arvoon EI palauta 404
-    /// "route not found" (reitti matchaa ja handler ajaa → 400/404/503 sen oman
-    /// validoinnin mukaan), kun taas tuntematon polku palauttaa 404. Käytämme
-    /// 503-erottelua: ilman actions-runtimea handler vastaa 503, joten matchannut
-    /// reitti tuottaa 503 ja matchaamaton 404.
+    /// Proof: POST to an arbitrary `:approval_id` value does NOT return 404
+    /// "route not found" (the route matches and the handler runs -> 400/404/503
+    /// per its own validation), whereas an unknown path returns 404. We use
+    /// the 503 distinction: without an action runtime the handler responds
+    /// 503, so a matched route produces 503 and an unmatched one 404.
     #[tokio::test]
     async fn approve_route_captures_arbitrary_id_not_literal_braces() {
-        // GatewayState ILMAN actions-runtimea → approve_pending vastaa 503 KUN
-        // reitti matchaa. (Bearer-tarkistus ohitetaan kun inject_token = None.)
+        // GatewayState WITHOUT an action runtime -> approve_pending responds
+        // 503 WHEN the route matches. (The bearer check is skipped since inject_token = None.)
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
@@ -3865,9 +3882,9 @@ mod tests {
         let client = reqwest::Client::new();
         let base = format!("http://{addr}");
 
-        // (1) Mielivaltainen id matchaa `:approval_id`-kaappauksen → handler ajaa →
-        //     503 (ei actions-runtimea). Jos reitti olisi literaali `{approval_id}`,
-        //     tämä EI matchaisi → 404. 503 todistaa että kaappaus toimii.
+        // (1) An arbitrary id matches the `:approval_id` capture -> the handler
+        //     runs -> 503 (no action runtime). If the route were the literal
+        //     `{approval_id}`, this would NOT match -> 404. 503 proves the capture works.
         let captured = client
             .post(format!("{base}/approvals/any-arbitrary-id-123/approve"))
             .send()
@@ -3880,8 +3897,8 @@ mod tests {
              404 tarkoittaisi paluuta literaaliin {{approval_id}}-bugiin"
         );
 
-        // (2) Kontrolli: täysin tuntematon polku palauttaa 404 (router toimii
-        //     oikein, ei matchaa kaikkea).
+        // (2) Control: a completely unknown path returns 404 (the router
+        //     works correctly, doesn't match everything).
         let unknown = client
             .post(format!("{base}/nonexistent/path"))
             .send()
@@ -3896,24 +3913,24 @@ mod tests {
         server.abort();
     }
 
-    /// **P0 approval-regressio (kilpa):** kaksi YHTÄAIKAISTA HTTP-tason
-    /// `POST /approvals/{id}/approve` -pyyntöä samalle hyväksynnälle saavat laukaista
-    /// ulkoisen sivuvaikutuksen **TASAN KERRAN**. Käyttää SAMAA aitoa E2E-harnessia
-    /// kuin [`e2e_suspend_approve_resume_reply`] (aito axum-reititin + soketti +
-    /// jaettu `ActionRuntime` laskevalla hyväksyntätaidolla + captattu reply-sink +
-    /// jaettu `AuditCollector`).
+    /// **P0 approval regression (race):** two SIMULTANEOUS HTTP-level
+    /// `POST /approvals/{id}/approve` requests for the same approval must trigger
+    /// the external side effect **EXACTLY ONCE**. Uses the SAME genuine E2E harness
+    /// as [`e2e_suspend_approve_resume_reply`] (a real axum router + socket +
+    /// shared `ActionRuntime` with a counting approval skill + captured reply sink +
+    /// shared `AuditCollector`).
     ///
-    /// **Dokumentoitu semantiikka (Option A, sama kuin tuotanto):** hyväksyntä on
-    /// kertakäyttöinen; ensimmäinen pyyntö kuluttaa sen ja palauttaa `200 resuming`
-    /// (sivuvaikutus + vastaus ajetaan asynkronisesti agentin resume-polulla). Toinen
-    /// rinnakkainen pyyntö joko (a) näkee hyväksynnän jo kulutettuna ja palauttaa
-    /// turvallisen ei-onnistumisen (404), TAI (b) palauttaa myös 200 jos se ehtii
-    /// ennen kulutusta — mutta kummassakin tapauksessa ulkoinen sivuvaikutus
-    /// dispatchataan KORKEINTAAN KERRAN (kertakäyttöinen hyväksyntä serialisoituu
-    /// jaetun `Mutex<ActionRuntime>`-lukon takana). Testi vahvistaa: tasan yksi 200
-    /// EI ole pakollinen (rinnakkaisuus voi tuottaa 1 tai 2 × 200), mutta sivuvaikutus
-    /// == 1, tasan yksi `turn_resumed`/`turn_answered`, korkeintaan yksi lopullinen reply,
-    /// eikä actor kaadu/paniikkaa.
+    /// **Documented semantics (Option A, same as production):** the approval is
+    /// single-use; the first request consumes it and returns `200 resuming`
+    /// (the side effect + response run asynchronously on the agent's resume path). The
+    /// second concurrent request either (a) sees the approval already consumed and
+    /// returns a safe non-success (404), OR (b) also returns 200 if it arrives
+    /// before consumption — but in either case the external side effect
+    /// is dispatched AT MOST ONCE (the single-use approval is serialized behind
+    /// the shared `Mutex<ActionRuntime>` lock). The test confirms: exactly one 200
+    /// is NOT required (concurrency can produce 1 or 2 × 200), but the side effect
+    /// == 1, exactly one `turn_resumed`/`turn_answered`, at most one final reply,
+    /// and the actor does not crash/panic.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn approval_double_post_race_runs_side_effect_once() {
@@ -3923,8 +3940,8 @@ mod tests {
         use familyclaw_memory::LocalJsonStore;
         use std::sync::atomic::Ordering::SeqCst;
 
-        // 1. Bus + skriptattu LLM (suspend-työkalukutsu → lopullinen teksti) — sama
-        //    kuvio kuin e2e_suspend_approve_resume_reply.
+        // 1. Bus + scripted LLM (suspend tool call → final text) — the same
+        //    pattern as e2e_suspend_approve_resume_reply.
         let bus = ResonanceBus::start(None).await.expect("bus");
         let api = spawn_scripted_llm_e2e(vec![
             e2e_body_tool_call(
@@ -3936,7 +3953,7 @@ mod tests {
         ])
         .await;
 
-        // 2. Jaettu ActionRuntime laskevalla hyväksyntätaidolla (sivuvaikutusmittari).
+        // 2. Shared ActionRuntime with a counting approval skill (side-effect meter).
         let side_effect_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut rt = ActionRuntime::new();
         rt.register_skill(E2eCountingApprovalSkill {
@@ -3947,7 +3964,7 @@ mod tests {
         let turn_audit: Arc<AuditCollector> = Arc::new(AuditCollector::new());
         let (sink, mut reply_rx) = new_reply_channel();
 
-        // 3. Aito agentti jaetuilla kahvoilla (sama kytkentä kuin build_family).
+        // 3. A real agent with shared handles (the same wiring as build_family).
         let config = AgentConfig::new("e2e_agent", ModelConfig::new("scripted/model"));
         let soul = Soul::from_essence("I am the E2E agent.".to_string());
         let memory: ErasedMemoryStore = Arc::new(LocalJsonStore::in_memory());
@@ -3971,23 +3988,23 @@ mod tests {
         .with_reply_sink(sink)
         .with_reply_target("e2e-channel");
 
-        // 4. Aja vuoro → suspendoituu yhteen odottavaan hyväksyntään.
+        // 4. Run the turn → suspends on one pending approval.
         let out = agent
             .think(&BusMessage::text("ship it"))
             .await
             .expect("think suspends");
         let approval_id = match out {
             ThinkOutcome::Suspended { approval_id, .. } => approval_id,
-            other => panic!("odotettiin Suspended, sai: {other:?}"),
+            other => panic!("expected Suspended, got: {other:?}"),
         };
         assert_eq!(
             side_effect_count.load(SeqCst),
             0,
-            "sivuvaikutus EI saa ajaa ennen approvea"
+            "the side effect must NOT run before approval"
         );
 
-        // 5. Spawnaa agentti actoriksi (ResumeApproval-signaali tavoittaa sen
-        //    postilaatikon) + GatewayState jakaa SAMAN actions/turn_audit/bus-kahvan.
+        // 5. Spawn the agent as an actor (the ResumeApproval signal reaches its
+        //    mailbox) + GatewayState shares the SAME actions/turn_audit/bus handle.
         let _actor = agent.spawn().await.expect("spawn agent actor");
         let state = Arc::new(GatewayState {
             bus: Some(bus.clone()),
@@ -4012,12 +4029,12 @@ mod tests {
         let client = reqwest::Client::new();
         let url = format!("http://{addr}/approvals/{approval_id}/approve");
 
-        // 6. KAKSI YHTÄAIKAISTA approve-pyyntöä samalle id:lle (aito soketti).
+        // 6. TWO SIMULTANEOUS approve requests for the same id (a real socket).
         let (r1, r2) = tokio::join!(client.post(&url).send(), client.post(&url).send());
         let s1 = r1.expect("POST approve #1").status().as_u16();
         let s2 = r2.expect("POST approve #2").status().as_u16();
-        // Semantiikka (dokumentoitu yllä): ainakin yksi 200 (resuming); toinen joko
-        // 200 (ehti ennen kulutusta) tai 404 (jo kulutettu). Kumpikaan EI 5xx.
+        // Semantics (documented above): at least one 200 (resuming); the other either
+        // 200 (arrived before consumption) or 404 (already consumed). Neither is 5xx.
         let oks = u8::from(s1 == 200) + u8::from(s2 == 200);
         assert!(
             oks >= 1,
@@ -4034,7 +4051,7 @@ mod tests {
             );
         }
 
-        // 7. Odota että asynkroninen resume valmistuu, sitten todista invariantit.
+        // 7. Wait for the asynchronous resume to finish, then verify the invariants.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut reply_count = 0u8;
         loop {
@@ -4058,8 +4075,8 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        // 8. **Kovat väitteet.** Sivuvaikutus ajettiin TASAN KERRAN — kilpa kahden
-        //    HTTP-pyynnön välillä ei riko kertakäyttöistä hyväksyntää.
+        // 8. **Hard assertions.** The side effect ran EXACTLY ONCE — a race between two
+        //    HTTP requests does not break the single-use approval.
         assert_eq!(
             side_effect_count.load(SeqCst),
             1,
@@ -4067,8 +4084,8 @@ mod tests {
              kaksois-approven alla (sai {})",
             side_effect_count.load(SeqCst)
         );
-        // Auditin pitää näyttää TASAN yksi tehokas jatkettu vuoro (yksi turn_resumed
-        // + yksi turn_answered) — ei kahta jatkoa.
+        // The audit must show EXACTLY one effective resumed turn (one turn_resumed
+        // + one turn_answered) — not two continuations.
         let final_audit = client
             .get(format!("http://{addr}/turns/audit"))
             .send()
@@ -4088,11 +4105,11 @@ mod tests {
             "tasan yksi turn_answered (yksi lopullinen vastaus), audit:\n{final_audit}"
         );
 
-        // 9. Imuroi reply-sinkki muutaman lisäsyklin ajan: odota että TASAN yksi
-        //    lopullinen reply saapuu (auditissa on jo yksi turn_answered), ja
-        //    varmista ettei sivuvaikutus enää nouse eikä toista vastausta saavu.
-        //    `turn_answered == 1` (yllä) takaa että vastaus tuotettiin; tässä
-        //    odotetaan että se myös tavoittaa reply-sinkin tasan kerran.
+        // 9. Drain the reply sink for a few more cycles: wait until EXACTLY one
+        //    final reply arrives (the audit already shows one turn_answered), and
+        //    confirm the side effect does not fire again and no second reply arrives.
+        //    `turn_answered == 1` (above) guarantees the response was produced; here
+        //    we wait for it to also reach the reply sink exactly once.
         for _ in 0..40 {
             while reply_rx.try_recv().is_ok() {
                 reply_count += 1;
@@ -4107,8 +4124,8 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        // Tyhjennä mahdolliset jälkijunan replyt ja vaadi TASAN yksi: ei nollaa
-        // (vastaus on tuotettu) eikä kahta (ei kaksoislaukaisua).
+        // Drain any trailing replies and require EXACTLY one: not zero
+        // (the response was produced) and not two (no double-fire).
         while reply_rx.try_recv().is_ok() {
             reply_count += 1;
         }
@@ -4121,27 +4138,27 @@ mod tests {
         bus.stop();
     }
 
-    /// **P0 approval-regressio (reitti-syntaksi axum 0.7):** vartioi että hyväksyntä-
-    /// reitti on rekisteröity `:approval_id`-kaappauksena EIKÄ kirjaimellisena
-    /// brace-segmenttinä. axum 0.7 / matchit 0.7 tulkitsee brace-muotoisen segmentin
-    /// literaaliksi polkusegmentiksi, joten brace-reitti EI matchaa todellisia id:itä.
+    /// **P0 approval regression (route syntax, axum 0.7):** guards that the approval
+    /// route is registered as a `:approval_id` capture and NOT as a literal
+    /// brace segment. axum 0.7 / matchit 0.7 interprets a brace-form segment
+    /// as a literal path segment, so a brace route does NOT match real ids.
     ///
-    /// **Empiirisesti todettu semantiikka (tämä repo, axum 0.7.9 / matchit 0.7.3):**
-    /// - Oikea reitti `:approval_id`: mielivaltainen id (ml. oikea UUID) MATCHAA →
-    ///   handler ajaa → 503 (ilman actions-runtimea). Myös kirjaimellinen brace-
-    ///   segmentti matchaa, koska se on vain yksi kaapattu arvo → 503.
-    /// - BUGATTU brace-reitti (literaali): KAIKKI pyynnöt — sekä oikea UUID ETTÄ
-    ///   kirjaimellinen brace-polku — palauttavat 404 (literaali ei matchaa oikeaa
-    ///   id:tä; empiirisesti todennettu probella ennen tämän testin kirjoittamista).
+    /// **Empirically confirmed semantics (this repo, axum 0.7.9 / matchit 0.7.3):**
+    /// - The correct `:approval_id` route: an arbitrary id (including a real UUID) MATCHES →
+    ///   the handler runs → 503 (no actions runtime). A literal brace
+    ///   segment also matches, since it is just one captured value → 503.
+    /// - The BUGGY brace route (literal): ALL requests — both a real UUID AND
+    ///   a literal brace path — return 404 (the literal doesn't match a real
+    ///   id; empirically verified with a probe before writing this test).
     ///
-    /// Ratkaiseva erotin regression havaitsemiseksi on siis **OIKEA UUID matchaa
-    /// (503, ei 404)**. Jos joku palauttaa reitin brace-muotoon, oikea UUID alkaa
-    /// palauttaa 404 → tämä testi punaistuu (todennettu temp-revertillä). Brace-polun
-    /// käytös dokumentoidaan ja varmistetaan ettei se tuota onnistunutta hyväksyntää.
+    /// The decisive discriminator for detecting the regression is therefore **a REAL UUID
+    /// matches (503, not 404)**. If someone reverts the route to the brace form, a real UUID
+    /// starts returning 404 → this test goes red (verified via a temp revert). The brace route's
+    /// behavior is documented and it is confirmed it does not produce a successful approval.
     #[tokio::test]
     async fn approval_literal_braces_route_does_not_match_on_axum_07() {
-        // GatewayState ILMAN actions-runtimea → matchannut reitti vastaa 503,
-        // matchaamaton reitti vastaa 404. (Bearer ohitetaan kun inject_token = None.)
+        // GatewayState WITHOUT an actions runtime → a matched route responds 503,
+        // an unmatched route responds 404. (Bearer is bypassed when inject_token = None.)
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
@@ -4163,9 +4180,9 @@ mod tests {
         let client = reqwest::Client::new();
         let base = format!("http://{addr}");
 
-        // (1) RATKAISEVA: oikea UUID tavoittaa hyväksyntä-handlerin → 503 (ei runtimea).
-        //     Jos reitti olisi literaali brace-muoto, tämä palauttaisi 404 ja testi
-        //     punaistuisi. TÄMÄ rivi pakottaa `:approval_id`-syntaksin.
+        // (1) DECISIVE: a real UUID reaches the approval handler → 503 (no runtime).
+        //     If the route were a literal brace form, this would return 404 and the test
+        //     would go red. THIS line enforces the `:approval_id` syntax.
         let real_uuid = "11111111-1111-4111-8111-111111111111";
         let real = client
             .post(format!("{base}/approvals/{real_uuid}/approve"))
@@ -4179,11 +4196,11 @@ mod tests {
              tarkoittaisi paluuta literaaliin brace-reittiin (axum 0.7 -bugi)"
         );
 
-        // (2) Kirjaimellinen brace-polku `/approvals/{{approval_id}}/approve` EI saa
-        //     tuottaa ONNISTUNUTTA hyväksyntää. Oikean `:approval_id`-reitin alla se
-        //     matchaa kaapattuna arvona ja päätyy 503:een (ei runtimea) — EI 2xx.
-        //     Tämä todistaa ettei kirjaimellinen brace ole erikoiskäsitelty
-        //     onnistumispolku.
+        // (2) The literal brace path `/approvals/{{approval_id}}/approve` must NOT
+        //     produce a SUCCESSFUL approval. Under the correct `:approval_id` route it
+        //     matches as a captured value and ends up at 503 (no runtime) — NOT 2xx.
+        //     This proves the literal brace is not a specially-handled
+        //     success path.
         let braces = client
             .post(format!("{base}/approvals/{{approval_id}}/approve"))
             .send()
@@ -4195,9 +4212,9 @@ mod tests {
             "kirjaimellinen brace-polku ei saa tuottaa onnistunutta hyväksyntää (oli {braces_status})"
         );
 
-        // (3) Kontrolli: täysin tuntematon polku palauttaa 404 (router ei matchaa
-        //     sokeasti kaikkea) — varmistaa että 503 yllä on aito reitti-match eikä
-        //     catch-all.
+        // (3) Control: a completely unknown path returns 404 (the router doesn't
+        //     blindly match everything) — confirms the 503 above is a genuine route
+        //     match and not a catch-all.
         let unknown = client
             .post(format!("{base}/nonexistent/path"))
             .send()

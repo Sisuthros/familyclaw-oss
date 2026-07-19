@@ -1,17 +1,17 @@
-//! Lokiviestien salaisuuksien redaktointi (KERROS A).
+//! Redaction of secrets in log messages (Layer A).
 
 use familyclaw_actions::proof::redact_free_text;
 
-/// Redaktoi merkkijonon ennen lokitusta.
+/// Redacts a string before it is logged.
 ///
-/// Käyttää [`familyclaw_actions::proof::redact_free_text`]:ia — sama heuristiikka
-/// kuin todistepaketeissa.
+/// Uses [`familyclaw_actions::proof::redact_free_text`] — the same heuristic
+/// used for proof bundles.
 #[must_use]
 pub fn redact_for_log(message: &str) -> String {
     redact_free_text(message).0
 }
 
-/// Muodostaa lokiviestin komentorivista redaktoiden salaisuudelta näyttävät osat.
+/// Builds a log message from a command line, redacting parts that look like secrets.
 #[must_use]
 pub fn redact_command_line(parts: &[String]) -> String {
     let joined = parts.join(" ");

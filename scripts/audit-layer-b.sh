@@ -14,7 +14,20 @@ echo ""
 FAIL=0
 
 # Forbidden real Layer B names (must never appear in publishable content)
-FORBIDDEN_NAMES="agent_alpha agent_beta agent_delta agent_gamma agent_epsilon assistant \"agent_gamma Jr\" \"agent_gamma\" \"agent_gamma-jr\""
+# Nova/Vega: private sibling-persona names (Nova = operator's agent persona,
+# Vega = sibling persona) found leaked into identity.rs canned replies and
+# roleplay-noise filter fixtures. Both are common English/astronomy words
+# ("nova", "vega" the star), so the existing -w word-boundary match plus the
+# embedded-word post-filter below (which already drops e.g. "innovation") is
+# what keeps this from drowning in false positives — no additional filtering
+# needed beyond what checks already do for every other forbidden name.
+FORBIDDEN_NAMES="agent_alpha agent_beta agent_delta agent_gamma agent_epsilon assistant \"agent_gamma Jr\" \"agent_gamma\" \"agent_gamma-jr\" The FamilyClaw Authors viltsu Nova Vega"
+
+# Explicit allowlist for the email-address check (§9). Empty by default —
+# populate only with specific, deliberately-public addresses that would
+# otherwise false-positive (e.g. a documented public contact address).
+# Format: bare email strings, one concern per entry, space-separated.
+EMAIL_ALLOWLIST=""
 
 check_dir() {
     local dir_name="$1"
@@ -49,10 +62,26 @@ else
 fi
 
 # 3. No hardcoded secrets (actual values, not field names)
+# Widened repo-wide (was crates/-only, which missed secrets leaking into
+# top-level scripts, docs, or config). Scans all git-TRACKED files of the
+# given extensions, repo-wide, excluding docs/archive/ (quarantined historical
+# content, consistent with the §8 scan below) and test-fixture patterns that
+# are already handled by more specific excludes elsewhere in this script.
 echo "3️⃣  Checking for hardcoded secrets..."
-if grep -rE "(api_key|API_KEY|secret|token)\s*=\s*[\"']{1}[^\"']{10,}" --include="*.rs" --include="*.toml" --include="*.json" crates/ 2>/dev/null | grep -q .; then
+SECRET_SCAN_FILES=$(git ls-files 2>/dev/null \
+    | grep -vE '(^|/)(target)/' \
+    | grep -vE '(^|/)docs/archive/' \
+    | grep -E '\.(rs|toml|json|md|sh|ps1|py)$' || true)
+SECRET_PATTERN="(api_key|API_KEY|secret|token)\s*=\s*[\"']{1}[^\"']{10,}"
+# Obvious documentation placeholders are not secrets: values that literally say
+# placeholder/example/demo/dummy/changeme, angle-bracket fill-ins ("<your-key>"),
+# and the repo's known safe test fixtures. Anything else that matches the
+# pattern is treated as a real leak.
+SECRET_PLACEHOLDER_FILTER='placeholder|example|local-demo|demo-token|dummy|changeme|your[-_]|<[^\"'"'"']*>|s3cret-token|sk-livelivelive'
+SECRET_MATCHES=$(echo "$SECRET_SCAN_FILES" | xargs -r grep -nE "$SECRET_PATTERN" 2>/dev/null | grep -viE "$SECRET_PLACEHOLDER_FILTER" || true)
+if [ -n "$SECRET_MATCHES" ]; then
     echo "   ❌ FAIL: Hardcoded secrets found in source"
-    grep -rE "(api_key|API_KEY|secret|token)\s*=\s*[\"']{1}[^\"']{10,}" --include="*.rs" --include="*.toml" --include="*.json" crates/ 2>/dev/null
+    echo "$SECRET_MATCHES"
     FAIL=1
 else
     echo "   ✅ PASS: No hardcoded secrets in source"
@@ -78,7 +107,7 @@ check_dir "hearth" "hearth"
 check_dir "keys" "keys"
 
 # 8. No real agent names in publishable content
-echo "8️⃣  Checking for real Layer B names in publishable content..."
+echo "8️⃣ Checking for real Layer B names in publishable content..."
 # Scan EVERY git-tracked TEXT file instead of an extension allowlist. An
 # extension allowlist ('*.md' '*.rs' …) silently missed tracked text files in
 # other formats — .txt/.html/.csv/.xml/.sql/.ini/.cfg as well as extensionless
@@ -122,6 +151,17 @@ while IFS= read -r f; do
     fi
 done <<< "$ALL_TRACKED"
 SCAN_FILES=$(printf '%s' "$SCAN_FILES")
+# Precise exclusion for the copyright/maintainer-attribution surface: the
+# repo's LICENSE and GOVERNANCE.md legitimately carry the maintainer's real
+# name once each (copyright line, maintainer table) — that is not a leak.
+# Everything else must be free of it. A blanket line-filter like
+# `grep -vi "maintainer|operator|user"` is too broad: it silently swallows
+# any line merely containing those common English words (e.g. "the operator
+# runs this command") regardless of which file it's in, which can mask a
+# genuine leak elsewhere. Instead we exclude by FILE PATH (only LICENSE and
+# GOVERNANCE.md), not by line content, for the maintainer's own name — and
+# keep a narrow, still content-based allowance only for the known example
+# agent identifiers used throughout Layer A sample content.
 NAME_FOUND=0
 for name in $FORBIDDEN_NAMES; do
     # Remove quotes for grep
@@ -129,16 +169,33 @@ for name in $FORBIDDEN_NAMES; do
     [ -z "$SCAN_FILES" ] && continue
     # Case-INSENSITIVE: real names leaked lowercase (agent_epsilon/agent_beta/agent_gamma in a
     # docs table) slipped past a case-sensitive scan. -i closes that gap.
-    if echo "$SCAN_FILES" | xargs grep -il "$clean_name" 2>/dev/null \
-        | xargs -r grep -Hi "$clean_name" 2>/dev/null \
+    # -w (word boundary): required because e.g. "the operator" is a substring of common
+    # Finnish word endings ("riville", "tehtäthe operator") — substring matching would
+    # drown the audit in false positives.
+    MATCHES=$(echo "$SCAN_FILES" | xargs grep -ilw "$clean_name" 2>/dev/null \
+        | xargs -r grep -Hniw "$clean_name" 2>/dev/null \
         | grep -v "\.example" \
-        | grep -vi "agent_alpha\|agent_beta\|agent_gamma\|agent_delta\|agent_epsilon\|maintainer\|operator\|user" \
-        | grep -q .; then
+        | grep -vi "agent_alpha\|agent_beta\|agent_gamma\|agent_delta\|agent_epsilon" || true)
+    # grep -w treats non-ASCII letters (ä/ö) as word boundaries in the C locale,
+    # so Finnish word endings like "tehtäthe operator"/"riville" false-positive on
+    # "the operator". Drop lines where the name only appears embedded in a longer word
+    # (immediately preceded/followed by a letter incl. ä/ö/å).
+    if [ -n "$MATCHES" ]; then
+        MATCHES=$(echo "$MATCHES" | grep -viE "[a-zA-ZäöåÄÖÅ]${clean_name}|${clean_name}[a-zA-ZäöåÄÖÅ]" || true)
+    fi
+    # Maintainer-name exception: ONLY the LICENSE and GOVERNANCE.md files may
+    # legitimately carry the real maintainer name (copyright holder /
+    # maintainer-of-record attribution). Filter by path, not by a generic
+    # word — this cannot mask a leak in any other file.
+    if [ -n "$MATCHES" ]; then
+        MATCHES=$(echo "$MATCHES" | grep -vE '^(LICENSE|GOVERNANCE\.md):' || true)
+        # A copyright/attribution line (©/Copyright) carrying the maintainer name
+        # is legitimate attribution, not a Layer B leak, wherever it appears.
+        MATCHES=$(echo "$MATCHES" | grep -viE '©|copyright' || true)
+    fi
+    if [ -n "$MATCHES" ]; then
         echo "   ❌ FAIL: Real agent name '$clean_name' found in publishable content"
-        echo "$SCAN_FILES" | xargs grep -il "$clean_name" 2>/dev/null \
-            | xargs -r grep -Hni "$clean_name" 2>/dev/null \
-            | grep -v "\.example" \
-            | grep -vi "agent_alpha\|agent_beta\|agent_gamma\|agent_delta\|agent_epsilon\|maintainer\|operator\|user"
+        echo "$MATCHES"
         NAME_FOUND=1
         FAIL=1
     fi
@@ -147,8 +204,38 @@ if [ $NAME_FOUND -eq 0 ]; then
     echo "   ✅ PASS: No real Layer B names in publishable content"
 fi
 
-# 9. Check example agent names specifically (must be agent_a, agent_b, example_family)
-echo "9️⃣  Checking example agent names..."
+# 9. No leaked personal email addresses in publishable content
+echo "9️⃣ Checking for personal email addresses..."
+# Generic personal-email-provider pattern. Legitimate, non-personal addresses
+# (GitHub noreply, example.com placeholders) are excluded by pattern; specific
+# deliberate exceptions can be added to EMAIL_ALLOWLIST above.
+EMAIL_PATTERN='[A-Za-z0-9._%+-]+@(gmail|hotmail|outlook|proton|icloud)\.[A-Za-z.]+'
+EMAIL_FOUND=0
+if [ -n "$SCAN_FILES" ]; then
+    RAW_EMAIL_MATCHES=$(echo "$SCAN_FILES" | xargs -r grep -nEi "$EMAIL_PATTERN" 2>/dev/null || true)
+    if [ -n "$RAW_EMAIL_MATCHES" ]; then
+        FILTERED_EMAIL_MATCHES="$RAW_EMAIL_MATCHES"
+        # Always-allowed non-personal patterns regardless of provider domain.
+        FILTERED_EMAIL_MATCHES=$(echo "$FILTERED_EMAIL_MATCHES" | grep -vi "noreply@\|users\.noreply\|example\.com" || true)
+        # Apply explicit allowlist entries, if any.
+        for allowed in $EMAIL_ALLOWLIST; do
+            [ -z "$allowed" ] && continue
+            FILTERED_EMAIL_MATCHES=$(echo "$FILTERED_EMAIL_MATCHES" | grep -vFi "$allowed" || true)
+        done
+        if [ -n "$FILTERED_EMAIL_MATCHES" ]; then
+            echo "   ❌ FAIL: Personal email address found in publishable content"
+            echo "$FILTERED_EMAIL_MATCHES"
+            EMAIL_FOUND=1
+            FAIL=1
+        fi
+    fi
+fi
+if [ $EMAIL_FOUND -eq 0 ]; then
+    echo "   ✅ PASS: No personal email addresses in publishable content"
+fi
+
+# 10. Check example agent names specifically (must be agent_a, agent_b, example_family)
+echo "🔟 Checking example agent names..."
 EXAMPLE_REAL_NAMES="agent_alpha agent_beta agent_delta agent_gamma agent_epsilon the operator"
 EXAMPLE_NAME_FOUND=0
 for name in $EXAMPLE_REAL_NAMES; do
@@ -160,9 +247,35 @@ for name in $EXAMPLE_REAL_NAMES; do
     fi
 done
 # Use this check's OWN counter — NOT NAME_FOUND (which belongs to check #8) — so a
-# real example leak cannot be masked by a clean #8 result.
+# real example leak cannot be masked by a clean #8 result. (Renumbered: this is
+# now check #10; personal-email check is #9.)
 if [ $EXAMPLE_NAME_FOUND -eq 0 ]; then
     echo "   ✅ PASS: No real agent names in examples"
+fi
+
+# 11. No private home-drive path patterns (persona home paths are Layer B
+# regardless of what name is used — a leak like `E:\Nova\home\research\...`
+# is disqualifying even if "Nova" itself were renamed to something innocuous,
+# because the drive-letter + `\home\` shape itself reveals a private local
+# deployment layout). Scan tracked *.rs/*.md/*.toml (source + docs + config),
+# excluding docs/archive/ (quarantined historical content, same rationale as
+# the §8 scan above) since this check is about what's live/publishable today.
+echo "1️⃣1️⃣ Checking for private home-drive path patterns..."
+HOME_PATH_PATTERN='[A-Z]:\\[A-Za-z]+\\home\\'
+HOME_PATH_FILES=$(git ls-files 2>/dev/null \
+    | grep -vE '(^|/)(target)/' \
+    | grep -vE '(^|/)docs/archive/' \
+    | grep -E '\.(rs|md|toml)$' || true)
+HOME_PATH_MATCHES=""
+if [ -n "$HOME_PATH_FILES" ]; then
+    HOME_PATH_MATCHES=$(echo "$HOME_PATH_FILES" | xargs -r grep -nE "$HOME_PATH_PATTERN" 2>/dev/null || true)
+fi
+if [ -n "$HOME_PATH_MATCHES" ]; then
+    echo "   ❌ FAIL: Private home-drive path pattern found in publishable content"
+    echo "$HOME_PATH_MATCHES"
+    FAIL=1
+else
+    echo "   ✅ PASS: No private home-drive path patterns in publishable content"
 fi
 
 echo ""

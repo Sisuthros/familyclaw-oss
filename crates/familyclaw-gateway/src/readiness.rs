@@ -1,4 +1,4 @@
-//! Syvä valmiustarkistus (`/readyz`) ja kanarialintu (`POST /canary`).
+//! Deep readiness check (`/readyz`) and canary (`POST /canary`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,18 +15,18 @@ use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
-/// Jaettu valmiusprobes-tila gatewaylle.
+/// Shared readiness-probe state for the gateway.
 #[derive(Clone, Default)]
 pub struct ReadinessProbe {
-    /// LLM-ketju (primary + fallbacks) — sama kuin agentin runtime.
+    /// LLM chain (primary + fallbacks) — same as the agent runtime.
     pub model: Option<ModelConfig>,
-    /// Discord-kanava webhook/bot-tilassa.
+    /// Discord channel in webhook/bot mode.
     pub discord: Option<Arc<DiscordChannel>>,
-    /// Durable-journalin kirjoituskelpoinen hakemisto.
+    /// Writable directory for the durable journal.
     pub data_dir: Option<PathBuf>,
 }
 
-/// Yksittäisen tarkistuksen tulos.
+/// Result of a single check.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckResult {
     pub name: &'static str,
@@ -34,14 +34,14 @@ pub struct CheckResult {
     pub detail: String,
 }
 
-/// Syvän `/readyz`:n JSON-vastaus.
+/// JSON response for the deep `/readyz`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReadyzResponse {
     pub ready: bool,
     pub checks: Vec<CheckResult>,
 }
 
-/// Kanarialinnun JSON-vastaus.
+/// JSON response for the canary.
 #[derive(Debug, Clone, Serialize)]
 pub struct CanaryResponse {
     pub ok: bool,
@@ -49,7 +49,7 @@ pub struct CanaryResponse {
     pub checks: Vec<CheckResult>,
 }
 
-/// Tarkistaa journal-hakemiston kirjoitettavuuden.
+/// Checks whether the journal directory is writable.
 pub async fn check_journal_writable(data_dir: &std::path::Path) -> CheckResult {
     let probe = data_dir.join(".readyz_probe");
     match tokio::fs::OpenOptions::new()
@@ -81,25 +81,25 @@ pub async fn check_journal_writable(data_dir: &std::path::Path) -> CheckResult {
     }
 }
 
-/// Kokonaisdeadline koko `llm_ping`-probelle. Per-yritys-timeout on 8s
-/// (`probe_resolver_from_env`), mutta ilman KOKONAIS-deadlinea failover kävelee
-/// 4 mallia x 2 pass = pahimmillaan 8x8s = 64s (audit-löytö [1]: mitattu 3.5-19.7s).
-/// 20s katkaisee failover-jumin MUTTA päästää hitaan yksittäisen LLM-pingin läpi
-/// (canary-mittaus 3.9-8s NIM-reitillä). watchdog.ps1 readyz-timeout on 60s, joten
-/// 20s on turvallisesti sen alla eikä katkaise kelvollisia pingejä (10s oli liian
-/// tiukka: ~40% pingeistä osui siihen, mitattu tuotantoagentilla 2026-07-09).
+/// Overall deadline for the entire `llm_ping` probe. The per-attempt timeout is 8s
+/// (`probe_resolver_from_env`), but without an OVERALL deadline, failover can walk
+/// 4 models x 2 passes = worst case 8x8s = 64s (audit finding [1]: measured 3.5-19.7s).
+/// 20s cuts off a failover stall WHILE still letting a single slow LLM ping through
+/// (canary measurement 3.9-8s on the NIM route). watchdog.ps1's readyz timeout is 60s,
+/// so 20s stays safely under it without cutting off valid pings (10s was too
+/// tight: ~40% of pings hit it, measured on a production agent on 2026-07-09).
 const LLM_PING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 const LLM_TOOLS_PING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// Kevyt LLM-ping (yksi lyhyt completion) — käyttää samaa provider-resolveria kuin serve.
+/// Lightweight LLM ping (one short completion) — uses the same provider resolver as serve.
 pub async fn check_llm_ping(model_cfg: &ModelConfig) -> CheckResult {
     let resolver = probe_resolver_from_env();
     match build_llm_chain(model_cfg, &resolver) {
         Ok(chain) => {
             let messages = [LlmMessage::user("ping")];
-            // TURVAKORJAUS 2026-07-09 (audit [1]): kokonaisdeadline koko
-            // failover-kävelyn ympärille — muuten readyz aikakatkeaa kun useampi
-            // malli timeouttaa 8s peräkkäin.
+            // SAFETY FIX 2026-07-09 (audit [1]): an overall deadline around the
+            // whole failover walk — otherwise readyz times out when several
+            // models time out 8s in a row.
             match tokio::time::timeout(LLM_PING_DEADLINE, chain.complete(&messages)).await {
                 Ok(Ok(_)) => CheckResult {
                     name: "llm_ping",
@@ -129,7 +129,7 @@ pub async fn check_llm_ping(model_cfg: &ModelConfig) -> CheckResult {
     }
 }
 
-/// LLM tool-calling probe — varmistaa että primary palauttaa `tool_calls`.
+/// LLM tool-calling probe — verifies that the primary returns `tool_calls`.
 pub async fn check_llm_tools_ping(model_cfg: &ModelConfig) -> CheckResult {
     let resolver = probe_resolver_from_env();
     match build_llm_chain(model_cfg, &resolver) {
@@ -188,7 +188,7 @@ pub async fn check_llm_tools_ping(model_cfg: &ModelConfig) -> CheckResult {
     }
 }
 
-/// Discord-gateway-yhteyden tila.
+/// State of the Discord gateway connection.
 pub async fn check_discord(dc: &DiscordChannel) -> CheckResult {
     let connected = dc.is_gateway_connected().await;
     CheckResult {
@@ -202,7 +202,7 @@ pub async fn check_discord(dc: &DiscordChannel) -> CheckResult {
     }
 }
 
-/// Syvä readyz: bus + LLM + Discord + journal.
+/// Deep readyz: bus + LLM + Discord + journal.
 pub async fn deep_readyz(
     bus_ok: bool,
     probe: &ReadinessProbe,
@@ -236,7 +236,7 @@ pub async fn deep_readyz(
     (status, Json(ReadyzResponse { ready, checks }))
 }
 
-/// Kanarialintu: synteettinen LLM-vuoro + infratarkistukset.
+/// Canary: synthetic LLM turn + infra checks.
 pub async fn run_canary(probe: &ReadinessProbe) -> Result<Json<CanaryResponse>> {
     let started = Instant::now();
     let mut checks = Vec::new();
@@ -271,7 +271,7 @@ pub async fn run_canary(probe: &ReadinessProbe) -> Result<Json<CanaryResponse>> 
     }))
 }
 
-/// Rakentaa valmiusproben serve()-käynnistyksessä.
+/// Builds the readiness probe at `serve()` startup.
 pub fn build_probe(
     model: Option<ModelConfig>,
     discord: Option<Arc<DiscordChannel>>,
@@ -284,15 +284,15 @@ pub fn build_probe(
     }
 }
 
-/// Provider-resolver readyz/canary-probeille (`FAMILYCLAW_PROVIDERS`).
+/// Provider resolver for the readyz/canary probes (`FAMILYCLAW_PROVIDERS`).
 fn probe_resolver_from_env() -> EnvEndpointResolver {
     const PROVIDERS_ENV: &str = "FAMILYCLAW_PROVIDERS";
-    // Probe-viritys (Fable 5 -diagnoosi 2026-07-09): ping tarvitsee vain pari
-    // tokenia. Ilman näitä probe perii llm.rs:n oletukset (max_tokens 2048,
-    // timeout 60s), jolloin reasoning-malli (v4-pro/nemotron) polttaa koko 2048
-    // tokenin budjetin thinking-jaaritteluun "ping"-viestille = 29-62s, ja
-    // readyz:n ~25s budjetti ylittyy. Katkaise reasoning 32 tokeniin ja rajaa
-    // yksi yritys 8s:iin, jotta täysi 4 mallin fallback-kävelykin mahtuu budjettiin.
+    // Probe tuning (Fable 5 diagnosis 2026-07-09): the ping only needs a couple
+    // of tokens. Without this, the probe inherits llm.rs's defaults (max_tokens
+    // 2048, timeout 60s), so a reasoning model (v4-pro/nemotron) burns the
+    // whole 2048-token budget on thinking rambling for the "ping" message = 29-62s,
+    // blowing readyz's ~25s budget. Cap reasoning at 32 tokens and limit
+    // one attempt to 8s, so that even a full 4-model fallback walk fits the budget.
     let mut resolver = EnvEndpointResolver::new()
         .with_max_tokens(32)
         .with_request_timeout_ms(8_000)
@@ -317,8 +317,8 @@ fn probe_resolver_from_env() -> EnvEndpointResolver {
     resolver
 }
 
-/// Peruuttaa `needs_approval`-tehtävät jotka ovat vähintään `min_age_days` vanhoja.
-/// Kun `min_age_days == 0`, peruutetaan kaikki odottavat hyväksynnät (doctor --fix).
+/// Cancels `needs_approval` tasks that are at least `min_age_days` old.
+/// When `min_age_days == 0`, all pending approvals are cancelled (doctor --fix).
 pub async fn cleanup_stale_approval_tasks(
     data_dir: &std::path::Path,
     min_age_days: i64,

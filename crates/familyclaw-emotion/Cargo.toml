@@ -1,12 +1,15 @@
 [package]
 name = "familyclaw-emotion"
-description = "19-dim VAD emotion engine CORE (empty calibration)"
+description = "19-dimensional VAD (valence-arousal-dominance) emotion model core, providing structure and decay mechanics without any pre-baked calibration"
 version.workspace = true
 edition = "2021"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["emotion", "agent", "vad", "affective-computing", "simulation"]
+categories = ["science", "simulation"]
 
 [lints]
 workspace = true

@@ -1,13 +1,13 @@
-//! ACP-agentin konfiguraatio.
+//! ACP agent configuration.
 //!
-//! Määrittelee CLI-agentin binääripolun, argumentit ja käyttäytymisen.
-//! Kaikki ladataan ajonaikaisesti — ei kovakoodattuja arvoja.
+//! Defines the CLI agent's binary path, arguments, and behavior.
+//! Everything is loaded at runtime — no hardcoded values.
 
 use std::path::PathBuf;
 
-/// ACP-agentin konfiguraatio.
+/// ACP agent configuration.
 ///
-/// # Esimerkki
+/// # Example
 /// ```
 /// use familyclaw_acp::AcpAgentConfig;
 ///
@@ -16,22 +16,22 @@ use std::path::PathBuf;
 /// ```
 #[derive(Debug, Clone)]
 pub struct AcpAgentConfig {
-    /// CLI-binäärin polku (esim. `claude`, `gemini`, `qodercli`).
+    /// Path to the CLI binary (e.g. `claude`, `gemini`, `qodercli`).
     pub binary: PathBuf,
-    /// Lisäargumentit binäärille (esim. `--model`, `--yolo`).
+    /// Additional arguments for the binary (e.g. `--model`, `--yolo`).
     pub args: Vec<String>,
-    /// Työhakemisto agentille.
+    /// Working directory for the agent.
     pub working_dir: Option<PathBuf>,
-    /// Agentin nimi (esim. "claude", "gemini", "qoder").
+    /// The agent's name (e.g. "claude", "gemini", "qoder").
     pub name: String,
-    /// Aika sekunneissa jonka jälkeen agentti tapetaan jos se ei vastaa.
+    /// Time in seconds after which the agent is killed if it doesn't respond.
     pub timeout_secs: u64,
 }
 
 impl AcpAgentConfig {
-    /// Luo uuden konfiguraation annetulle binäärille.
+    /// Creates a new configuration for the given binary.
     ///
-    /// `binary` voi olla pelkkä nimi (katsotaan PATH:sta) tai absoluuttinen polku.
+    /// `binary` can be a plain name (looked up via PATH) or an absolute path.
     #[must_use]
     pub fn new(binary: impl Into<PathBuf>) -> Self {
         let bin: PathBuf = binary.into();
@@ -50,35 +50,35 @@ impl AcpAgentConfig {
         }
     }
 
-    /// Lisää argumentin binäärille.
+    /// Adds an argument for the binary.
     #[must_use]
     pub fn with_arg(mut self, arg: impl Into<String>) -> Self {
         self.args.push(arg.into());
         self
     }
 
-    /// Asettaa käyttöoikeustilan (`default`, `accept_edits`, `bypass_permissions`, `plan`).
+    /// Sets the permission mode (`default`, `accept_edits`, `bypass_permissions`, `plan`).
     #[must_use]
     pub fn with_permission_mode(mut self, mode: impl Into<String>) -> Self {
         self.args.push(format!("--permission-mode={}", mode.into()));
         self
     }
 
-    /// Asettaa mallin.
+    /// Sets the model.
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.args.push(format!("--model={}", model.into()));
         self
     }
 
-    /// Asettaa työhakemiston.
+    /// Sets the working directory.
     #[must_use]
     pub fn with_working_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.working_dir = Some(dir.into());
         self
     }
 
-    /// Asettaa aikakatkaisun sekunneissa.
+    /// Sets the timeout in seconds.
     #[must_use]
     pub fn with_timeout(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
@@ -109,13 +109,13 @@ mod tests {
         path.push("agent_a.exe");
         let config = AcpAgentConfig::new(path.clone());
         assert_eq!(config.name, "agent_a");
-        // binary säilyttää koko polun, vain name on file_stem.
+        // binary keeps the full path, only name is the file_stem.
         assert_eq!(config.binary, path);
     }
 
     #[test]
     fn new_falls_back_to_agent_when_no_file_stem() {
-        // Tyhjä polku ei tuota file_stemiä → fallback "agent".
+        // An empty path doesn't produce a file_stem → fallback "agent".
         let config = AcpAgentConfig::new("");
         assert_eq!(config.name, "agent");
     }

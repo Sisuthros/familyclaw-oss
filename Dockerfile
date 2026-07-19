@@ -17,15 +17,15 @@
 # release build of the gateway compiles those channels in — no extra
 # --features flags are needed here.
 #
-# MSRV (verified from workspace Cargo.toml): rust-version = "1.85", edition 2021.
+# MSRV (verified from workspace Cargo.toml): rust-version = "1.88", edition 2021.
 
 # ---------------------------------------------------------------------------
 # Stage 1 — builder
 # ---------------------------------------------------------------------------
-# rust:1.85-bookworm matches the workspace MSRV (1.85) and gives a glibc
+# rust:1.88-bookworm matches the workspace MSRV (1.88) and gives a glibc
 # (Debian bookworm) toolchain that links cleanly against the bookworm-slim
 # runtime stage below.
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /build
 
@@ -38,10 +38,11 @@ COPY . .
 # Cargo.toml pulls in familyclaw-channels with the telegram + discord
 # features, so this single command yields the "living" gateway.
 #
-# TURVAKORJAUS 2026-07-09 (audit [4], Layer 6): wasmtime-sandbox on POIS
-# oletuksena (iso Cranelift+JIT-dep, kasvattaa build-aikaa/imagea). Ilman sita
-# 3rd-party-skillit ovat fail-closed (NoopSandbox = NotImplemented, ei aja).
-# Ota kayttoon kun rekisteroit ensimmaisen 3rd-party-skillin:
+# SECURITY FIX 2026-07-09 (audit [4], Layer 6): the wasmtime sandbox is OFF
+# by default (large Cranelift+JIT dependency, increases build time/image
+# size). Without it, 3rd-party skills fail closed (NoopSandbox =
+# NotImplemented, does not run). Enable it once you register the first
+# 3rd-party skill:
 #   docker build --build-arg FAMILYCLAW_FEATURES=wasmtime ...
 ARG FAMILYCLAW_FEATURES=""
 RUN if [ -n "$FAMILYCLAW_FEATURES" ]; then \

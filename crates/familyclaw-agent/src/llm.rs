@@ -3,7 +3,7 @@
 //! Generic client that calls any OpenAI-compatible endpoint (e.g., `OpenAI`,
 //! local LLM servers). Configuration is loaded at runtime — never hardcoded.
 //!
-//! **KERROS A only:** No family-specific names, souls, or private data.
+//! **Layer A only:** No family-specific names, souls, or private data.
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -13,16 +13,16 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-/// Oletus **request**-timeout (koko pyyntö, ml. vastauksen luku) jos
-/// [`LlmConfig::request_timeout_ms`] ei ole asetettu. 60 s on järkevä yläraja
-/// LLM-completionille: tarpeeksi väljä hitaalle mallille, mutta riittävän
-/// tiukka ettei jumittunut primary blokkaa failoveria ikuisesti (F1).
+/// Default **request** timeout (the whole request, incl. reading the
+/// response) if [`LlmConfig::request_timeout_ms`] is not set. 60 s is a
+/// sensible upper bound for an LLM completion: loose enough for a slow model,
+/// but tight enough that a stuck primary doesn't block failover forever (F1).
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 60_000;
 
-/// Oletus **connect**-timeout (TCP/TLS-kättely) jos
-/// [`LlmConfig::connect_timeout_ms`] ei ole asetettu. 10 s erottaa "endpoint
-/// ei vastaa lainkaan" -tilanteen hitaasta generoinnista — connect-vaihe ei
-/// saa nojata koko 60 s request-budjettiin.
+/// Default **connect** timeout (TCP/TLS handshake) if
+/// [`LlmConfig::connect_timeout_ms`] is not set. 10 s distinguishes an
+/// "endpoint not responding at all" situation from slow generation — the
+/// connect phase must not lean on the full 60 s request budget.
 pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
 
 /// LLM configuration — loaded at runtime from env/file (never hardcoded).
@@ -36,17 +36,17 @@ pub struct LlmConfig {
     pub model: String,
     /// Maximum tokens in response
     pub max_tokens: u32,
-    /// Koko pyynnön (request + vastauksen luku) timeout millisekunteina.
-    /// `None` → [`DEFAULT_REQUEST_TIMEOUT_MS`]. KERROS B voi virittää tämän
-    /// per provider (esim. nopealle endpointille tiukempi, hitaalle väljempi).
-    /// **F1:** ilman timeoutia jumittunut primary blokkaisi
-    /// [`crate::llm_chain::LlmFailover::complete`]:n ikuisesti — timeout
-    /// pakottaa kuolleen primaryn antautumaan, jolloin failover laukeaa.
+    /// Timeout for the whole request (request + reading the response) in
+    /// milliseconds. `None` → [`DEFAULT_REQUEST_TIMEOUT_MS`]. Layer B can tune
+    /// this per provider (e.g. tighter for a fast endpoint, looser for a slow
+    /// one). **F1:** without a timeout, a stuck primary would block
+    /// [`crate::llm_chain::LlmFailover::complete`] forever — the timeout
+    /// forces a dead primary to give up, which triggers failover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_ms: Option<u64>,
-    /// TCP/TLS-yhteyden muodostuksen timeout millisekunteina. `None` →
-    /// [`DEFAULT_CONNECT_TIMEOUT_MS`]. Erottaa "ei kuuntele / ei reititystä"
-    /// -tilanteen hitaasta generoinnista.
+    /// Timeout for establishing the TCP/TLS connection, in milliseconds.
+    /// `None` → [`DEFAULT_CONNECT_TIMEOUT_MS`]. Distinguishes a
+    /// "not listening / no route" situation from slow generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_timeout_ms: Option<u64>,
 }
@@ -76,23 +76,23 @@ impl LlmConfig {
         self
     }
 
-    /// Asettaa koko pyynnön timeoutin (millisekunteina). KERROS B -viritys per
-    /// provider. Ks. [`DEFAULT_REQUEST_TIMEOUT_MS`].
+    /// Sets the whole-request timeout (in milliseconds). Layer B tuning per
+    /// provider. See [`DEFAULT_REQUEST_TIMEOUT_MS`].
     #[must_use]
     pub fn with_request_timeout_ms(mut self, ms: u64) -> Self {
         self.request_timeout_ms = Some(ms);
         self
     }
 
-    /// Asettaa yhteyden muodostuksen timeoutin (millisekunteina). KERROS B
-    /// -viritys per provider. Ks. [`DEFAULT_CONNECT_TIMEOUT_MS`].
+    /// Sets the connection-establishment timeout (in milliseconds). Layer B
+    /// tuning per provider. See [`DEFAULT_CONNECT_TIMEOUT_MS`].
     #[must_use]
     pub fn with_connect_timeout_ms(mut self, ms: u64) -> Self {
         self.connect_timeout_ms = Some(ms);
         self
     }
 
-    /// Efektiivinen request-timeout [`Duration`]:na (oletus täytetty).
+    /// The effective request timeout as a [`Duration`] (default filled in).
     #[must_use]
     pub fn request_timeout(&self) -> Duration {
         Duration::from_millis(
@@ -101,7 +101,7 @@ impl LlmConfig {
         )
     }
 
-    /// Efektiivinen connect-timeout [`Duration`]:na (oletus täytetty).
+    /// The effective connect timeout as a [`Duration`] (default filled in).
     #[must_use]
     pub fn connect_timeout(&self) -> Duration {
         Duration::from_millis(
@@ -437,19 +437,19 @@ pub struct LlmClient {
 impl LlmClient {
     /// Creates a new LLM client with the given config.
     ///
-    /// **F1:** rakentaa `reqwest::Client`:n **request- ja connect-timeoutilla**
-    /// ([`LlmConfig::request_timeout`] / [`LlmConfig::connect_timeout`]). Ilman
-    /// timeoutia jumittunut primary (yhteys hyväksytään mutta vastaus ei tule)
-    /// blokkaisi [`crate::llm_chain::LlmFailover::complete`]:n ikuisesti, eikä
-    /// failover laukeaisi koskaan. Timeout muuttaa hyytyneen primaryn
-    /// **retryable** [`LlmError::Timeout`]-virheeksi, jolloin ketju siirtyy
-    /// fallbackiin.
+    /// **F1:** builds the `reqwest::Client` with the **request and connect timeout**
+    /// ([`LlmConfig::request_timeout`] / [`LlmConfig::connect_timeout`]). Without a
+    /// timeout, a stuck primary (connection accepted but no response ever comes)
+    /// would block [`crate::llm_chain::LlmFailover::complete`] forever, and
+    /// failover would never trigger. The timeout turns a hung primary into a
+    /// **retryable** [`LlmError::Timeout`] error, so the chain moves on to the
+    /// fallback.
     ///
-    /// Jos `reqwest::Client`:n rakennus epäonnistuu (epätavallista — esim.
-    /// TLS-backendin alustus), palataan oletusklienttiin ilman timeoutteja,
-    /// jotta konstruktori pysyy infallible-rajapinnaltaan (`#[must_use]`, ei
-    /// `Result`). Tämä on turvallinen degradaatio: failover toimii yhä
-    /// connection-virheillä, vain hang-suoja menetetään äärimmäistapauksessa.
+    /// If building the `reqwest::Client` fails (unusual — e.g. TLS backend
+    /// initialization), this falls back to a default client with no timeouts,
+    /// so the constructor stays infallible in its interface (`#[must_use]`, not
+    /// `Result`). This is a safe degradation: failover still works on
+    /// connection errors, only the hang protection is lost in the extreme case.
     #[must_use]
     pub fn new(config: LlmConfig) -> Self {
         let client = Client::builder()
@@ -480,12 +480,12 @@ impl LlmClient {
         format!("{}/chat/completions", api_base.trim_end_matches('/'))
     }
 
-    /// **Failover gap #1, step 1.** Luokittelee ei-onnistuneen HTTP-vastauksen
-    /// oikeaan [`LlmError`]-varianttiin. Kutsutaan VAIN kun
-    /// `response.status().is_success()` on `false`. Poimii `Retry-After`-headerin
-    /// (429:lle), redaktoi bodyn auth-virheissä (401/403) avainvuotojen
-    /// estämiseksi, ja delegoi luokittelun puhtaalle [`LlmError::from_status`]:lle
-    /// joka on suoraan yksikkötestattavissa ilman verkkoa.
+    /// **Failover gap #1, step 1.** Classifies an unsuccessful HTTP response
+    /// into the correct [`LlmError`] variant. Called ONLY when
+    /// `response.status().is_success()` is `false`. Extracts the `Retry-After` header
+    /// (for 429s), redacts the body on auth errors (401/403) to prevent
+    /// key leaks, and delegates classification to the pure [`LlmError::from_status`],
+    /// which is directly unit-testable without a network.
     async fn error_from_response(response: reqwest::Response) -> LlmError {
         let status = response.status().as_u16();
         let retry_after = LlmError::parse_retry_after(
@@ -536,8 +536,8 @@ impl LlmClient {
         }
 
         let chat_response: ChatCompletionsResponse = response.json().await.map_err(|e| {
-            // Body-luvun timeout (koko-request-budjetti ylittyi vastausta
-            // luettaessa) → retryable Timeout (F1); aito dekoodausvirhe → Parse.
+            // Body-read timeout (the whole-request budget was exceeded while
+            // reading the response) -> retryable Timeout (F1); a genuine decode error -> Parse.
             if e.is_timeout() {
                 LlmError::Timeout(format!("response read timed out: {e}"))
             } else {
@@ -557,10 +557,10 @@ impl LlmClient {
             .ok_or(LlmError::NoContent)
     }
 
-    /// Avaa SSE-striimauksen (`stream: true`) ja palauttaa tekstipätkien virran.
+    /// Opens an SSE stream (`stream: true`) and returns a stream of text chunks.
     ///
     /// # Errors
-    /// Palauttaa virheen jos HTTP-pyyntö epäonnistuu ennen striimin avaamista.
+    /// Returns an error if the HTTP request fails before the stream is opened.
     pub async fn complete_stream(
         &self,
         messages: &[LlmMessage],
@@ -678,8 +678,8 @@ impl LlmClient {
         }
 
         let chat_response: ChatCompletionsResponse = response.json().await.map_err(|e| {
-            // Body-luvun timeout (koko-request-budjetti ylittyi vastausta
-            // luettaessa) → retryable Timeout (F1); aito dekoodausvirhe → Parse.
+            // Body-read timeout (the whole-request budget was exceeded while
+            // reading the response) -> retryable Timeout (F1); a genuine decode error -> Parse.
             if e.is_timeout() {
                 LlmError::Timeout(format!("response read timed out: {e}"))
             } else {
@@ -738,49 +738,49 @@ impl CompletionResult {
     }
 }
 
-/// Striimattujen tekstipätkien virta ([`LlmClient::complete_stream`]).
+/// A stream of streamed text chunks ([`LlmClient::complete_stream`]).
 pub type LlmChunkStream = Pin<Box<dyn Stream<Item = std::result::Result<String, LlmError>> + Send>>;
 
 /// LLM error types.
 ///
-/// **Failover gap #1, step 1 — error taxonomy.** Aiemmin *kaikki* ei-onnistuneet
-/// HTTP-statukset romahtivat yhteen [`LlmError::Http`]-luokkaan, jolloin 429
-/// (rate limit), 401/403 (auth/billing) ja 503/529 (overloaded) eivät
-/// erottuneet toisistaan — eriytetty backoff/rotation oli rakenteellisesti
-/// mahdotonta. Nämä variantit *erottavat* failoverille kriittiset tapaukset,
-/// jotta tuleva cooldown/key-rotation -kerros voi haaroittua niihin
-/// ([`LlmError::cooldown_hint`] tarjoaa siemenen). Tämä askel ei vielä rakenna
-/// itse backoff-tilakonetta — vain taksonomian ja sen propagoinnin.
+/// **Failover gap #1, step 1 — error taxonomy.** Previously *all* unsuccessful
+/// HTTP statuses collapsed into a single [`LlmError::Http`] class, so 429
+/// (rate limit), 401/403 (auth/billing), and 503/529 (overloaded) could not
+/// be distinguished from one another — a differentiated backoff/rotation was structurally
+/// impossible. These variants *separate out* the cases critical to failover,
+/// so that a future cooldown/key-rotation layer can branch on them
+/// ([`LlmError::cooldown_hint`] provides the seed). This step does not yet build
+/// the backoff state machine itself — only the taxonomy and its propagation.
 #[derive(Debug, Clone)]
 pub enum LlmError {
-    /// HTTP request failed (yhteysvirhe tai muu ei-onnistunut statuskoodi joka
-    /// ei kuulu tarkempaan luokkaan: yleinen 4xx/5xx, ECONNREFUSED yms.).
+    /// HTTP request failed (a connection error or another unsuccessful status code that
+    /// does not belong to a more specific class: a generic 4xx/5xx, ECONNREFUSED, etc.).
     Http(String),
-    /// Pyyntö aikakatkaistiin (request- tai connect-timeout). **F1:** tämä on
-    /// **retryable** — jumittunut primary antautuu timeoutilla, ja
-    /// [`crate::llm_chain::LlmFailover`] siirtyy seuraavaan fallbackiin.
+    /// The request timed out (request or connect timeout). **F1:** this is
+    /// **retryable** — a stuck primary gives up via the timeout, and
+    /// [`crate::llm_chain::LlmFailover`] moves on to the next fallback.
     Timeout(String),
-    /// HTTP 429 — provider rate-limited tämän avaimen/mallin. Retryable, mutta
-    /// **erotettu** [`LlmError::Http`]:sta tarkoituksella: tuleva backoff-kerros
-    /// kohtelee tätä erikseen (odota `retry_after` sekuntia ja/tai kierrätä
-    /// avain-pool). `retry_after` poimitaan `Retry-After`-headerista (sekunteja)
-    /// jos provider sen antaa. [Failover gap #1, step 1]
+    /// HTTP 429 — the provider rate-limited this key/model. Retryable, but
+    /// **intentionally separated** from [`LlmError::Http`]: a future backoff layer
+    /// treats this differently (wait `retry_after` seconds and/or rotate the
+    /// key pool). `retry_after` is extracted from the `Retry-After` header (in seconds)
+    /// if the provider supplies it. [Failover gap #1, step 1]
     RateLimited {
-        /// Provider-viesti / -konteksti (lokeja varten).
+        /// Provider message / context (for logs).
         message: String,
-        /// `Retry-After`-headerin arvo sekunteina, jos provider antoi sen.
+        /// The `Retry-After` header's value in seconds, if the provider supplied it.
         retry_after: Option<u64>,
     },
-    /// HTTP 401/403 — avain on virheellinen, vanhentunut tai laskutus on
-    /// loppunut. **Avain-poolin rotaatiosignaali, EI mallin-fallback-signaali:**
-    /// sama avain epäonnistuu jokaisella mallilla, joten tuleva kerros vaihtaa
-    /// avainta (ei mallia). Body redaktoidaan vuotojen estämiseksi.
+    /// HTTP 401/403 — the key is invalid, expired, or billing has
+    /// run out. **A key-pool rotation signal, NOT a model-fallback signal:**
+    /// the same key fails on every model, so a future layer swaps the
+    /// key (not the model). The body is redacted to prevent leaks.
     /// [Failover gap #1, step 1]
     AuthFailed(String),
-    /// HTTP 503/529 — provider on hetkellisesti ylikuormitettu. Retryable
-    /// backoffilla; **erotettu** [`LlmError::Http`]:sta jotta tuleva kerros voi
-    /// odottaa eskaloituvalla viiveellä saman providerin sijaan kuin jysäyttää
-    /// ketjun läpi. [Failover gap #1, step 1]
+    /// HTTP 503/529 — the provider is momentarily overloaded. Retryable
+    /// with backoff; **separated** from [`LlmError::Http`] so that a future layer can
+    /// wait with an escalating delay on the same provider instead of slamming
+    /// through the whole chain. [Failover gap #1, step 1]
     Overloaded(String),
     /// Response parsing failed
     Parse(String),
@@ -792,38 +792,38 @@ pub enum LlmError {
 }
 
 impl LlmError {
-    /// Onko virhe **uudelleenyritettävä** (failover saa kokeilla seuraavaa
-    /// klienttiä)?
+    /// Is the error **retryable** (may failover try the next
+    /// client)?
     ///
-    /// **F1-ydin:** [`LlmError::Timeout`] (jumittunut/hyytynyt primary) on
-    /// retryable, samoin [`LlmError::Http`] (yhteysvirhe tai 5xx/429 -tyyppinen
-    /// hetkellinen häiriö) ja [`LlmError::NoContent`] (toinen malli voi tuottaa
-    /// sisällön). Vain [`LlmError::Parse`] **ei** ole retryable: sama vastaus
-    /// jäsentyisi seuraavallakin yrityksellä samalla mallilla samaan virheeseen,
-    /// joten se on deterministinen — mutta koska failover kokeilee *eri*
-    /// klienttejä (eri malli/endpoint), parse-virhe yhdellä mallilla ei kerro
-    /// mitään seuraavasta. Konservatiivisesti: kohtele parse-virhettä
-    /// **ei-retryable**:na, jotta ilmeisen rikkinäinen pyyntö (esim. väärä
-    /// request-muoto) ei jauha koko ketjua turhaan; verkko-/timeout-/sisältö-
-    /// luokat ovat retryable.
-    /// **Failover gap #1, step 1 — taksonomian propagointi:** uudet variantit
-    /// [`LlmError::RateLimited`], [`LlmError::AuthFailed`] ja
-    /// [`LlmError::Overloaded`] ovat KAIKKI tällä hetkellä retryable, jotta
-    /// ketju etenee *tänään* täsmälleen kuten ennen (yksikään näistä ei ole
-    /// terminaalinen). Ero on että variantit ovat nyt **erillisiä**, joten
-    /// tuleva cooldown/key-rotation -kerros voi haaroittua niihin:
-    /// `RateLimited` → odota `retry_after` ([`Self::cooldown_hint`]),
-    /// `AuthFailed` → kierrätä avain (ei mallia), `Overloaded` → eskaloituva
-    /// backoff. Vain [`LlmError::Parse`] ja [`LlmError::InvalidTool`] ovat
-    /// deterministisesti ei-retryable.
+    /// **F1 core:** [`LlmError::Timeout`] (a stuck/hung primary) is
+    /// retryable, as is [`LlmError::Http`] (a connection error or a 5xx/429-type
+    /// transient disruption) and [`LlmError::NoContent`] (another model may produce
+    /// content). Only [`LlmError::Parse`] is **not** retryable: the same response
+    /// would parse into the same error again on the next attempt with the same model,
+    /// so it is deterministic — but because failover tries *different*
+    /// clients (a different model/endpoint), a parse error on one model doesn't say
+    /// anything about the next. Conservatively: treat a parse error as
+    /// **non-retryable**, so an obviously broken request (e.g. the wrong
+    /// request shape) doesn't grind the whole chain for nothing; the network/timeout/content
+    /// classes are retryable.
+    /// **Failover gap #1, step 1 — taxonomy propagation:** the new variants
+    /// [`LlmError::RateLimited`], [`LlmError::AuthFailed`], and
+    /// [`LlmError::Overloaded`] are ALL currently retryable, so that
+    /// the chain proceeds *today* exactly as before (none of these are
+    /// terminal). The difference is that the variants are now **distinct**, so
+    /// a future cooldown/key-rotation layer can branch on them:
+    /// `RateLimited` -> wait `retry_after` ([`Self::cooldown_hint`]),
+    /// `AuthFailed` -> rotate the key (not the model), `Overloaded` -> escalating
+    /// backoff. Only [`LlmError::Parse`] and [`LlmError::InvalidTool`] are
+    /// deterministically non-retryable.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
             LlmError::Timeout(_)
             | LlmError::Http(_)
             | LlmError::NoContent
-            // RateLimited/AuthFailed/Overloaded: distinct variants, mutta tänään
-            // yhä retryable jotta ketju etenee (cooldown-kerros tulee myöhemmin).
+            // RateLimited/AuthFailed/Overloaded: distinct variants, but today
+            // still retryable so the chain proceeds (a cooldown layer comes later).
             | LlmError::RateLimited { .. }
             | LlmError::AuthFailed(_)
             | LlmError::Overloaded(_) => true,
@@ -833,18 +833,18 @@ impl LlmError {
         }
     }
 
-    /// **Failover gap #1, step 1 — siemen tulevalle backoff-tilakoneelle.**
-    /// Palauttaa *ehdotetun* odotusajan ennen kuin sama provider/avain kannattaa
-    /// uudelleenyrittää. Tämä on PUHDAS vihje (ei nuku, ei mutatoi tilaa): tuleva
-    /// cooldown/rotation -kerros kuluttaa sen — nykyinen [`LlmFailover`] ei vielä
-    /// käytä sitä, joten käytös ei muutu.
+    /// **Failover gap #1, step 1 — seed for a future backoff state machine.**
+    /// Returns the *suggested* wait time before it's worth retrying the same
+    /// provider/key. This is a PURE hint (does not sleep, does not mutate state): a future
+    /// cooldown/rotation layer will consume it — the current [`LlmFailover`] does not yet
+    /// use it, so behavior does not change.
     ///
-    /// - [`LlmError::RateLimited`] → `Retry-After`-arvo jos provider antoi sen
-    ///   (sekunteina), muuten oletus [`Self::DEFAULT_RATE_LIMIT_COOLDOWN`].
-    /// - [`LlmError::Overloaded`] → oletus [`Self::DEFAULT_OVERLOAD_COOLDOWN`]
-    ///   (provider toipuu — odota ennen samalle providerille palaamista).
-    /// - Kaikki muut → `None` (ei luonteva cooldown; failover vaihtaa
-    ///   klienttiä välittömästi).
+    /// - [`LlmError::RateLimited`] -> the `Retry-After` value if the provider supplied it
+    ///   (in seconds), otherwise the default [`Self::DEFAULT_RATE_LIMIT_COOLDOWN`].
+    /// - [`LlmError::Overloaded`] -> the default [`Self::DEFAULT_OVERLOAD_COOLDOWN`]
+    ///   (the provider is recovering — wait before returning to the same provider).
+    /// - Everything else -> `None` (no natural cooldown; failover switches
+    ///   clients immediately).
     ///
     /// [`LlmFailover`]: crate::llm_chain::LlmFailover
     #[must_use]
@@ -863,23 +863,23 @@ impl LlmError {
         }
     }
 
-    /// Oletus-cooldown 429:lle kun provider EI anna `Retry-After`-headeria.
-    /// Maltillinen 5 s — tulevan backoff-kerroksen lähtöarvo, ei lopullinen.
+    /// Default cooldown for 429 when the provider does NOT give a `Retry-After` header.
+    /// A moderate 5s — a starting value for a future backoff layer, not final.
     pub const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5);
 
-    /// Oletus-cooldown 503/529 (overloaded) -tapaukselle. 2 s: provider on
-    /// elossa mutta tukkoinen, lyhyempi odotus kuin rate-limitissä riittää.
+    /// Default cooldown for the 503/529 (overloaded) case. 2s: the provider is
+    /// alive but congested, so a shorter wait than for rate-limit is enough.
     pub const DEFAULT_OVERLOAD_COOLDOWN: Duration = Duration::from_secs(2);
 
-    /// **Failover gap #1, step 1 — testattava seam.** Kuvaa ei-onnistuneen
-    /// HTTP-statuskoodin oikeaan [`LlmError`]-varianttiin. `detail` on jo
-    /// (auth-tapauksessa redaktoitu) body/konteksti-viesti; `retry_after` on
-    /// `Retry-After`-headerista parsittu sekuntimäärä jos läsnä.
+    /// **Failover gap #1, step 1 — testable seam.** Maps an unsuccessful
+    /// HTTP status code to the correct [`LlmError`] variant. `detail` is already
+    /// (redacted, in the auth case) the body/context message; `retry_after` is the
+    /// second count parsed from the `Retry-After` header if present.
     ///
-    /// - 429 → [`LlmError::RateLimited`] (`retry_after` mukaan).
-    /// - 401/403 → [`LlmError::AuthFailed`] (avain-rotaatiosignaali).
-    /// - 503/529 → [`LlmError::Overloaded`] (provider ylikuormitettu).
-    /// - muut → [`LlmError::Http`].
+    /// - 429 -> [`LlmError::RateLimited`] (with `retry_after`).
+    /// - 401/403 -> [`LlmError::AuthFailed`] (key rotation signal).
+    /// - 503/529 -> [`LlmError::Overloaded`] (provider overloaded).
+    /// - other -> [`LlmError::Http`].
     #[must_use]
     fn from_status(status: u16, detail: &str, retry_after: Option<u64>) -> Self {
         match status {
@@ -893,22 +893,22 @@ impl LlmError {
         }
     }
 
-    /// Parsii `Retry-After`-headerin **sekunneiksi**. OpenAI-yhteensopivat
-    /// providerit antavat tyypillisesti kokonaisluvun (delta-seconds); HTTP-date
-    /// -muotoa EI tueta tässä (palautuu `None`, jolloin oletus-cooldown astuu
-    /// voimaan). Puhdas funktio → suoraan testattavissa.
+    /// Parses the `Retry-After` header into **seconds**. OpenAI-compatible
+    /// providers typically send an integer (delta-seconds); the HTTP-date
+    /// format is NOT supported here (returns `None`, so the default cooldown takes
+    /// effect). A pure function -> directly testable.
     #[must_use]
     fn parse_retry_after(value: Option<&str>) -> Option<u64> {
         value?.trim().parse::<u64>().ok()
     }
 
-    /// Kuvaa `reqwest::Error`:n oikeaan [`LlmError`]-luokkaan: aito timeout →
-    /// [`LlmError::Timeout`] (retryable, F1); kaikki muut (ml. ECONNREFUSED
-    /// `is_connect()`) → [`LlmError::Http`], joka on niin ikään retryable.
-    /// Näin sekä jumittunut primary (timeout) että kuollut primary
-    /// (yhteysvirhe) laukaisevat failoverin, mutta virheluokat erottuvat
-    /// lokeissa ja [`is_retryable`](LlmError::is_retryable):n semantiikassa.
-    /// `context` etuliittää viestin (esim. `"request failed"`).
+    /// Maps a `reqwest::Error` to the correct [`LlmError`] class: a genuine timeout ->
+    /// [`LlmError::Timeout`] (retryable, F1); everything else (incl. ECONNREFUSED
+    /// `is_connect()`) -> [`LlmError::Http`], which is likewise retryable.
+    /// This way both a stuck primary (timeout) and a dead primary
+    /// (connection error) trigger failover, but the error classes stay distinct
+    /// in the logs and in [`is_retryable`](LlmError::is_retryable)'s semantics.
+    /// `context` prefixes the message (e.g. `"request failed"`).
     #[must_use]
     fn from_reqwest(context: &str, e: &reqwest::Error) -> Self {
         if e.is_timeout() {
@@ -1001,7 +1001,7 @@ struct StreamChunk {
     choices: Vec<StreamChoice>,
 }
 
-/// Poimii yhden SSE-`data:`-rivin delta-sisällön. Palauttaa `None` `[DONE]`-riveille.
+/// Extracts one SSE `data:` line's delta content. Returns `None` for `[DONE]` lines.
 fn parse_sse_delta_line(line: &str) -> Option<String> {
     let payload = line.strip_prefix("data:")?.trim();
     if payload == "[DONE]" {
@@ -1310,11 +1310,11 @@ mod tests {
         assert_eq!(endpoint, "http://localhost:8080/v1/chat/completions");
     }
 
-    // ---- F1 timeout + retryable-luokittelu ------------------------------
+    // ---- F1 timeout + retryable classification ------------------------------
 
     #[test]
     fn config_defaults_timeouts_when_unset() {
-        // Oletukset: ei null-timeoutia → request 60s, connect 10s.
+        // Defaults: no null timeout -> request 60s, connect 10s.
         let cfg = LlmConfig::new("http://x/v1", "k", "m");
         assert_eq!(cfg.request_timeout_ms, None);
         assert_eq!(cfg.connect_timeout_ms, None);
@@ -1330,7 +1330,7 @@ mod tests {
 
     #[test]
     fn config_timeouts_are_configurable_per_llmconfig() {
-        // KERROS B voi virittää per provider.
+        // Layer B can tune this per provider.
         let cfg = LlmConfig::new("http://x/v1", "k", "m")
             .with_request_timeout_ms(2_500)
             .with_connect_timeout_ms(500);
@@ -1340,15 +1340,15 @@ mod tests {
 
     #[test]
     fn config_timeout_serde_roundtrip_and_backward_compat() {
-        // Uudet kentät sarjallistuvat; vanha JSON ilman niitä yhä deserialisoituu
-        // (serde default → None → oletus voimassa). Taaksepäin-yhteensopiva.
+        // The new fields serialize; old JSON without them still deserializes
+        // (serde default -> None -> the default applies). Backward-compatible.
         let cfg = LlmConfig::new("http://x/v1", "k", "m").with_request_timeout_ms(1234);
         let json = serde_json::to_string(&cfg).expect("ser");
         assert!(json.contains("request_timeout_ms"));
         let back: LlmConfig = serde_json::from_str(&json).expect("de");
         assert_eq!(back.request_timeout_ms, Some(1234));
 
-        // Vanha JSON ilman timeout-kenttiä → None (ei kaadu).
+        // Old JSON without timeout fields -> None (does not crash).
         let legacy = r#"{"api_base":"http://x/v1","api_key":"k","model":"m","max_tokens":2048}"#;
         let legacy_cfg: LlmConfig = serde_json::from_str(legacy).expect("legacy de");
         assert_eq!(legacy_cfg.request_timeout_ms, None);
@@ -1357,20 +1357,20 @@ mod tests {
 
     #[test]
     fn timeout_error_is_retryable() {
-        // F1-ydin: timeout (jumittunut primary) on retryable → failover laukeaa.
+        // F1 core: a timeout (stuck primary) is retryable -> failover triggers.
         assert!(LlmError::Timeout("slow primary".into()).is_retryable());
     }
 
     #[test]
     fn http_and_nocontent_errors_are_retryable() {
-        // Yhteysvirhe (kuollut primary) ja tyhjä sisältö → kokeile fallbackia.
+        // A connection error (dead primary) and empty content -> try the fallback.
         assert!(LlmError::Http("connection refused".into()).is_retryable());
         assert!(LlmError::NoContent.is_retryable());
     }
 
     #[test]
     fn parse_error_is_not_retryable() {
-        // Deterministinen jäsennysvirhe ei hyödy ketjun jauhamisesta.
+        // A deterministic parse error gains nothing from grinding the chain.
         assert!(!LlmError::Parse("bad json".into()).is_retryable());
     }
 
@@ -1385,8 +1385,8 @@ mod tests {
 
     #[test]
     fn new_variants_are_retryable_today() {
-        // Taksonomia erottaa variantit, mutta tänään kaikki kolme ovat yhä
-        // retryable jotta ketju etenee kuten ennen (cooldown-kerros tulee myöhemmin).
+        // The taxonomy separates the variants, but today all three are still
+        // retryable so the chain proceeds as before (a cooldown layer comes later).
         assert!(LlmError::RateLimited {
             message: "429".into(),
             retry_after: Some(3),
@@ -1450,7 +1450,7 @@ mod tests {
 
     #[test]
     fn from_status_falls_back_to_http_for_other_codes() {
-        // 400/404/500 yms. eivät kuulu tarkkaan luokkaan → yleinen Http.
+        // 400/404/500 etc. do not belong to a specific class -> generic Http.
         for code in [400_u16, 404, 418, 500, 502] {
             assert!(
                 matches!(LlmError::from_status(code, "x", None), LlmError::Http(_)),
@@ -1467,7 +1467,7 @@ mod tests {
 
     #[test]
     fn parse_retry_after_rejects_non_integer_and_missing() {
-        // HTTP-date-muotoa ei tueta → None (oletus-cooldown astuu voimaan).
+        // The HTTP-date format is not supported -> None (the default cooldown takes effect).
         assert_eq!(
             LlmError::parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
             None
@@ -1537,20 +1537,20 @@ mod tests {
 
     #[tokio::test]
     async fn client_request_times_out_against_a_hanging_endpoint() {
-        // Slow-loris: endpoint hyväksyy TCP-yhteyden mutta EI vastaa koskaan.
-        // Lyhyellä request-timeoutilla complete() palauttaa retryable Timeout-
-        // virheen (ei jää roikkumaan ikuisesti). Tämä on F1:n yksikkötaso:
-        // "yhteys hyväksytään mutta nukutaan yli timeoutin".
+        // Slow-loris: the endpoint accepts the TCP connection but NEVER responds.
+        // With a short request timeout, complete() returns a retryable Timeout
+        // error (it does not hang forever). This is F1's unit-test level:
+        // "the connection is accepted but we sleep past the timeout".
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
 
-        // Hyväksy yhteydet mutta älä koskaan vastaa (pidä socketit auki).
+        // Accept connections but never respond (keep the sockets open).
         tokio::spawn(async move {
             let mut held = Vec::new();
-            // Hyväksy kunnes listener sulkeutuu; socketit pidetään `held`:ssä
-            // auki (ei vastausta) → asiakas hyytyy kunnes oma timeout laukeaa.
+            // Accept until the listener closes; sockets are kept open in `held`
+            // (no response) -> the client hangs until its own timeout triggers.
             while let Ok((sock, _)) = listener.accept().await {
                 held.push(sock);
             }

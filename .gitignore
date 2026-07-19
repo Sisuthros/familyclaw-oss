@@ -160,3 +160,12 @@ docs/FIRST_30_DAYS.md
 # Booth export (git-archive of tracked tree + prebuilt binaries; regenerated, never committed)
 booth/
 mcps/
+
+# Internal GTM/ops collateral — Layer B, never track (untracked 2026-07-18)
+docs/EXPO_*.md
+docs/COMMERCIAL_OFFER.md
+docs/HOMEPAGE_FACTORY.md
+docs/GIT_CONSOLIDATION.md
+MASTERPLAN.md
+# Internal dev tool — MASTERPLAN §7: not part of the publishable workspace
+crates/familyclaw-gemu/
