@@ -5,7 +5,7 @@
 > `familyclaw serve` in their own environment and reports back (see
 > [USERS.md](USERS.md)).
 
-**Strategy:** [MASTERPLAN.md](../MASTERPLAN.md) · **Technical truth:** [STATUS.md](../STATUS.md)
+**Technical truth:** [STATUS.md](../STATUS.md)
 
 ---
 

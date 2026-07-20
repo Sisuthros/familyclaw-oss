@@ -11,8 +11,7 @@ durable replay, persistent memory, actor-based coordination, sleep-time consolid
 and private runtime profiles that never enter the repository.
 
 > 📍 **[STATUS.md](STATUS.md)** — what works today, what is deferred, release (`v1.2.0`).
-> **[MASTERPLAN.md](MASTERPLAN.md)** — strategy, horizons, and priorities (one consolidated plan).
-> Start with STATUS for technical truth; MASTERPLAN for where we're going.
+> Start with STATUS for technical truth.
 
 ## How FamilyClaw compares
 
@@ -65,7 +64,6 @@ bash scripts/expo-demo.sh
 ```
 
 **Where the proof lives:** [STATUS.md](STATUS.md) ·
-[docs/EXPO_BRIEF.md](docs/EXPO_BRIEF.md) ·
 [docs/CRASH_SAFE_DISPATCH_CASE_STUDY.md](docs/CRASH_SAFE_DISPATCH_CASE_STUDY.md) ·
 [bench-competitors/langgraph/RESULTS.md](bench-competitors/langgraph/RESULTS.md)
 
