@@ -14,8 +14,9 @@
 //! - [`Channel::receive`] hands out the inbound stream **once**: messages
 //!   received by the gateway are forwarded into this stream via `inbound_tx`.
 //! - [`Channel::send`] sends a message through Discord's REST API via
-//!   `Arc<Http>`, split to Discord's 2000-character limit
-//!   ([`split::split_message`]).
+//!   `Arc<Http>`, split to stay under Discord's 2000-character limit AND
+//!   under a newline-count budget that avoids the client's "Show more"
+//!   fold ([`split::split_message`]).
 //! - [`DiscordChannel::stop`] shuts down the gateway cleanly (`shutdown_all`).
 //!
 //! ## Helper modules (Layer B)
@@ -58,8 +59,23 @@ use crate::message::{ChannelKind, InboundEnvelope, OutboundMessage};
 use map::map_message;
 use split::split_message;
 
-/// Discord's maximum message length in characters (Unicode scalar count).
-const DISCORD_MAX_MESSAGE_CHARS: usize = 2000;
+/// The character-count chunk boundary used when sending an outbound message
+/// (see `send_body` below). Discord's hard API limit is 2000 characters
+/// (Unicode scalar count, `MESSAGE_CODE_LIMIT` in serenity); this is kept
+/// below that to leave headroom rather than cutting exactly on the limit.
+const DISCORD_CHUNK_MAX_CHARS: usize = 1900;
+
+/// Maximum number of newline (`\n`) characters permitted within a single
+/// outbound chunk. Discord's client visually collapses a message behind
+/// "Show more" based on its rendered height (line count), independent of
+/// the 2000-character API limit — a long bug report or analysis with many
+/// short lines (bullet lists, headers) can trigger the fold well under 2000
+/// characters. Splitting on this budget in addition to
+/// [`DISCORD_CHUNK_MAX_CHARS`] keeps such replies fully visible across
+/// multiple messages instead of hidden behind a click. Discord does not
+/// document the exact fold threshold; this value is a conservative
+/// heuristic.
+const DISCORD_CHUNK_MAX_NEWLINES: usize = 15;
 
 /// How long [`DiscordChannel::start`] waits for the `ready` event before
 /// giving up and returning an error (e.g. an invalid token would otherwise
@@ -321,8 +337,9 @@ impl DiscordChannel {
             .map_err(|e| ChannelError::receive(&self.channel_id, e.to_string()))
     }
 
-    /// Splits an outbound message at Discord's character limit and sends the
-    /// chunks in order via `Arc<Http>`.
+    /// Splits an outbound message at Discord's character limit and at a
+    /// newline-count budget (to avoid the client's "Show more" fold), and
+    /// sends the chunks in order via `Arc<Http>`.
     async fn send_body(
         http: &Http,
         channel: ChannelId,
@@ -333,7 +350,7 @@ impl DiscordChannel {
         // Without this guard the loop sends nothing yet still logs "message sent"
         // — a silent drop that lies in the logs. Reject it with a clear error so
         // an empty outbound is impossible to mistake for success.
-        let chunks = split_message(body, DISCORD_MAX_MESSAGE_CHARS);
+        let chunks = split_message(body, DISCORD_CHUNK_MAX_CHARS, DISCORD_CHUNK_MAX_NEWLINES);
         if chunks.is_empty() {
             return Err(ChannelError::invalid_input(format!(
                 "refusing to send empty/whitespace-only message body to '{channel_id}'"
