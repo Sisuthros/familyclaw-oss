@@ -18,6 +18,8 @@
 //! profile directory. Examples use generic names.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -156,8 +158,30 @@ const HISTORY_MAX_MESSAGES: usize = 20;
 
 /// Character cap for a single history message. A long message is truncated
 /// to this before being saved to history — prevents one giant message from
-/// consuming the entire window.
+/// consuming the entire window. Default; overridable via
+/// `FAMILYCLAW_HISTORY_MAX_CHARS` (see [`history_max_chars_per_msg`]) — a
+/// low default here stunts the agent's memory of its own longer replies once
+/// [`crate::llm::DEFAULT_MAX_TOKENS`] is raised, so deployments generating
+/// long replies routinely can raise this too.
 const HISTORY_MAX_CHARS_PER_MSG: usize = 1500;
+
+/// Minimum accepted value for `FAMILYCLAW_HISTORY_MAX_CHARS` — guards against
+/// a misconfigured tiny value truncating history into uselessness.
+const HISTORY_MAX_CHARS_MIN: usize = 200;
+
+/// Reads the `FAMILYCLAW_HISTORY_MAX_CHARS` environment variable, or returns
+/// [`HISTORY_MAX_CHARS_PER_MSG`]. Follows the same env-var-reader shape as
+/// [`crate::watchdog::turn_watchdog_secs`]: parse, filter to a valid range,
+/// default on anything else (missing, unparseable, or below
+/// [`HISTORY_MAX_CHARS_MIN`]).
+#[must_use]
+fn history_max_chars_per_msg() -> usize {
+    std::env::var("FAMILYCLAW_HISTORY_MAX_CHARS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&n: &usize| n >= HISTORY_MAX_CHARS_MIN)
+        .unwrap_or(HISTORY_MAX_CHARS_PER_MSG)
+}
 
 /// Memory layer tag for a user's chat message (session-scoped hydration).
 const CHAT_USER_TAG: &str = "chat:user";
@@ -3945,13 +3969,16 @@ fn build_message_stack(
     messages
 }
 
-/// Truncates the text to [`HISTORY_MAX_CHARS_PER_MSG`] respecting the UTF-8
-/// boundary, for storage in short-term memory. Short texts are returned as-is.
+/// Truncates the text to [`history_max_chars_per_msg`] (default
+/// [`HISTORY_MAX_CHARS_PER_MSG`], overridable via
+/// `FAMILYCLAW_HISTORY_MAX_CHARS`) respecting the UTF-8 boundary, for storage
+/// in short-term memory. Short texts are returned as-is.
 fn truncate_for_history(text: &str) -> String {
-    if text.len() <= HISTORY_MAX_CHARS_PER_MSG {
+    let max = history_max_chars_per_msg();
+    if text.len() <= max {
         return text.to_string();
     }
-    let mut end = HISTORY_MAX_CHARS_PER_MSG;
+    let mut end = max;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -4180,6 +4207,64 @@ fn record_turn_audit_into(
     audit.record(ExecAuditEvent::new(kind, turn_id, at, safe_detail));
 }
 
+/// Awaits `fut` in two stages against a soft/hard watchdog deadline pair: up
+/// to `soft_secs`, then — if not finished — invokes `on_soft_deadline` once
+/// and keeps awaiting the **same** future for the remaining time up to
+/// `hard_secs`. Only past `hard_secs` is `fut` actually abandoned
+/// (`Err(())`); a completion anywhere in between is delivered as `Ok(value)`
+/// (late, but not discarded).
+///
+/// `fut` is heap-pinned (`Pin<Box<F>>`, not the stack-pinning `tokio::pin!`)
+/// specifically so it is a plain, ownable value that can be `drop`ped
+/// explicitly on every exit path. Dropping it is what releases whatever it
+/// borrowed for its lifetime — in the caller below, `agent`'s exclusive
+/// borrow via `handle_turn_with_origin(&mut self, ...)` — mirroring the
+/// implicit drop that the old single-stage `tokio::time::timeout(...).await`
+/// performed when it elapsed. The difference is that here, that drop only
+/// happens at the hard cap: hitting the soft deadline no longer discards any
+/// in-flight work.
+async fn watchdog_two_stage<F, T>(
+    mut fut: Pin<Box<F>>,
+    soft_secs: u64,
+    hard_secs: u64,
+    on_soft_deadline: impl FnOnce(),
+) -> std::result::Result<T, ()>
+where
+    F: Future<Output = T>,
+{
+    if let Ok(value) = tokio::time::timeout(Duration::from_secs(soft_secs), &mut fut).await {
+        drop(fut);
+        return Ok(value);
+    }
+    on_soft_deadline();
+    let remaining = hard_secs.saturating_sub(soft_secs);
+    let result = tokio::time::timeout(Duration::from_secs(remaining), &mut fut).await;
+    drop(fut);
+    result.map_err(|_| ())
+}
+
+/// Sends the watchdog "still working" interim notice directly through a
+/// pre-cloned reply sink + pre-resolved reply target, **without** going
+/// through [`Agent::force_watchdog_reply`]. This is required because at the
+/// point this fires, the turn future in [`AgentActor::handle`] still holds
+/// `agent`'s exclusive borrow (`handle_turn_with_origin(&mut self, ...)`) —
+/// no method on `agent` can be called until that future is dropped. Mirrors
+/// `force_watchdog_reply`'s target-resolution + sink-send exactly, just
+/// using values captured before the borrow started.
+fn send_watchdog_notice(sink: Option<&ReplySink>, target: Option<&str>, body: &str) {
+    let (Some(sink), Some(target)) = (sink, target) else {
+        return;
+    };
+    match OutboundMessage::new(target, body) {
+        Ok(msg) => {
+            let _ = sink.send(msg);
+        }
+        Err(e) => {
+            warn!(error = %e, "watchdog still-working notice build failed");
+        }
+    }
+}
+
 /// Type-erased agent for actor (no generics).
 type ErasedAgent = Agent;
 
@@ -4254,10 +4339,37 @@ impl Actor for AgentActor {
         let origin = envelope.origin.clone();
         let payload = envelope.payload.clone();
         let watchdog_secs = watchdog::turn_watchdog_secs();
-        let turn_result = tokio::time::timeout(
-            std::time::Duration::from_secs(watchdog_secs),
-            agent.handle_turn_with_origin(sender, &payload, origin.as_ref()),
-        )
+        let hard_secs = watchdog::turn_watchdog_hard_secs(watchdog_secs);
+
+        // Precompute the reply route now: once `turn_future` below captures
+        // `agent`'s exclusive borrow for the turn's lifetime (via
+        // `handle_turn_with_origin(&mut self, ...)`), `agent` cannot be
+        // touched again — not even for a shared read — until that future is
+        // dropped. An interim notice sent *while* the turn is still running
+        // therefore has to use values resolved up front, not `agent` itself.
+        let notice_sink = agent.reply_sink.clone();
+        let notice_target = agent.reply_target_for_origin(origin.as_ref());
+        let agent_label = agent.name().to_string();
+
+        let turn_future =
+            Box::pin(agent.handle_turn_with_origin(sender, &payload, origin.as_ref()));
+        // Soft deadline (`watchdog_secs`): send an interim "still working"
+        // notice but keep awaiting the same future. Hard cap (`hard_secs`):
+        // give up for good — this is the only point work is now discarded,
+        // vs. the old behavior of dropping at the soft deadline every time.
+        let turn_result = watchdog_two_stage(turn_future, watchdog_secs, hard_secs, || {
+            warn!(
+                agent = agent_label.as_str(),
+                soft_secs = watchdog_secs,
+                hard_secs,
+                "turn-watchdog: soft deadline reached, turn still running — sending interim notice"
+            );
+            send_watchdog_notice(
+                notice_sink.as_ref(),
+                notice_target.as_deref(),
+                &watchdog::watchdog_still_working_msg(hard_secs),
+            );
+        })
         .await;
 
         match turn_result {
@@ -4280,12 +4392,13 @@ impl Actor for AgentActor {
                     warn!(agent = agent.name(), error = %e, "turn-watchdog error reply failed");
                 }
             }
-            Err(_) => {
+            Err(()) => {
                 agent.clear_typing_heartbeat();
                 warn!(
                     agent = agent.name(),
-                    secs = watchdog_secs,
-                    "turn-watchdog: vuoro ylitti aikarajan"
+                    soft_secs = watchdog_secs,
+                    hard_secs,
+                    "turn-watchdog: vuoro ylitti kovan aikarajan"
                 );
                 if let Err(e) =
                     agent.force_watchdog_reply(origin.as_ref(), watchdog::WATCHDOG_TIMEOUT_MSG)
@@ -4322,6 +4435,71 @@ mod tests {
             DurableContext::new(Arc::new(InMemoryJournal::new()) as Arc<dyn Journal + Send + Sync>)
                 .expect("durable ctx");
         Agent::new(config, soul, memory, durable, bus, None, None)
+    }
+
+    // --- Soft/hard watchdog two-stage timeout ------------------------------
+    //
+    // Exercised directly against `watchdog_two_stage` (not through a full
+    // Ractor actor + bus round trip): `handle_turn_with_origin` itself can't
+    // be made artificially slow without touching it (out of scope for this
+    // change), so the wrapper — the actual new logic — is what's tested here.
+
+    #[tokio::test]
+    async fn watchdog_two_stage_delivers_late_completion_between_soft_and_hard() {
+        let notified = Arc::new(AtomicBool::new(false));
+        let notified2 = notified.clone();
+        // Finishes at ~1.3s: past the 1s soft deadline, before the 3s hard cap.
+        let fut = Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(1300)).await;
+            7_u32
+        });
+        let result = watchdog_two_stage(fut, 1, 3, move || {
+            notified2.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(result, Ok(7));
+        assert!(
+            notified.load(Ordering::SeqCst),
+            "soft-deadline callback (the interim-notice hook) must fire once the turn runs past the soft deadline"
+        );
+    }
+
+    /// Marks `flag` true when dropped — lets a test observe that the turn
+    /// future (and whatever it borrowed, e.g. `&mut Agent` in the real
+    /// caller) is actually released at the hard cap.
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn watchdog_two_stage_aborts_and_drops_future_past_hard_cap() {
+        let notified = Arc::new(AtomicBool::new(false));
+        let notified2 = notified.clone();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped2 = dropped.clone();
+
+        let fut = Box::pin(async move {
+            let _flag = DropFlag(dropped2);
+            // Long enough to never finish within the 2s hard cap below.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            99_u32
+        });
+        let result = watchdog_two_stage(fut, 1, 2, move || {
+            notified2.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(result, Err(()));
+        assert!(
+            notified.load(Ordering::SeqCst),
+            "soft-deadline callback must still fire before the hard cap gives up"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "future must be dropped at the hard cap — this is what releases `agent` for the fallback reply"
+        );
     }
 
     #[tokio::test]
@@ -7725,6 +7903,71 @@ mod tests {
         assert!(body.len() <= HISTORY_MAX_CHARS_PER_MSG);
         // Every byte is a valid UTF-8 boundary (no broken 'ä').
         assert!(body.is_char_boundary(body.len()));
+    }
+
+    // Env vars are process-global; serialize tests that touch them so they
+    // don't race each other (same pattern as `watchdog.rs` / `identity.rs`).
+    static HISTORY_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn history_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        HISTORY_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// RAII guard: sets `key` to `value` on construction, restores whatever
+    /// was there before on drop (even on panic).
+    struct HistoryEnvVarGuard {
+        key: &'static str,
+        prior: Option<String>,
+    }
+
+    impl HistoryEnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for HistoryEnvVarGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn history_max_chars_per_msg_reads_env_override() {
+        const ENV: &str = "FAMILYCLAW_HISTORY_MAX_CHARS";
+        let _lock = history_env_test_lock();
+
+        {
+            let _guard = HistoryEnvVarGuard::set(ENV, "500");
+            assert_eq!(history_max_chars_per_msg(), 500);
+            let long = "x".repeat(1000);
+            let out = truncate_for_history(&long);
+            let body = out.trim_end_matches('…');
+            assert_eq!(body.len(), 500, "truncate_for_history must respect the env override");
+        }
+
+        // Below the minimum -> falls back to the default (not a truncation trap).
+        {
+            let _guard = HistoryEnvVarGuard::set(ENV, "50");
+            assert_eq!(
+                history_max_chars_per_msg(),
+                HISTORY_MAX_CHARS_PER_MSG,
+                "a value below HISTORY_MAX_CHARS_MIN must fall back to the default"
+            );
+        }
+
+        // Unset / garbage -> default.
+        std::env::remove_var(ENV);
+        assert_eq!(history_max_chars_per_msg(), HISTORY_MAX_CHARS_PER_MSG);
+        let _guard = HistoryEnvVarGuard::set(ENV, "not-a-number");
+        assert_eq!(history_max_chars_per_msg(), HISTORY_MAX_CHARS_PER_MSG);
     }
 
     #[tokio::test]
