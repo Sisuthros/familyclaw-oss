@@ -1086,9 +1086,10 @@ fn resolve_fs_read_config() -> Option<FsReadConfig> {
     for root in &allow_roots {
         let path = std::path::Path::new(root);
         if !path.exists() {
-            let last_segment = path
-                .file_name()
-                .map_or_else(|| "<root>".to_string(), |s| s.to_string_lossy().into_owned());
+            let last_segment = path.file_name().map_or_else(
+                || "<root>".to_string(),
+                |s| s.to_string_lossy().into_owned(),
+            );
             tracing::warn!(
                 target: "familyclaw::actions",
                 root_last_segment = %last_segment,

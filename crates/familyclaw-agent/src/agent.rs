@@ -7950,7 +7950,11 @@ mod tests {
             let long = "x".repeat(1000);
             let out = truncate_for_history(&long);
             let body = out.trim_end_matches('…');
-            assert_eq!(body.len(), 500, "truncate_for_history must respect the env override");
+            assert_eq!(
+                body.len(),
+                500,
+                "truncate_for_history must respect the env override"
+            );
         }
 
         // Below the minimum -> falls back to the default (not a truncation trap).

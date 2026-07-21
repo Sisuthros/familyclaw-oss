@@ -165,7 +165,11 @@ mod tests {
         let _guard = EnvVarGuard::set(ENV, "3");
         assert_eq!(turn_watchdog_hard_secs(80), 240);
         let _guard2 = EnvVarGuard::set(ENV, "1");
-        assert_eq!(turn_watchdog_hard_secs(80), 80, "multiplier of 1 = hard == soft");
+        assert_eq!(
+            turn_watchdog_hard_secs(80),
+            80,
+            "multiplier of 1 = hard == soft"
+        );
     }
 
     #[test]
@@ -173,6 +177,9 @@ mod tests {
         let msg = watchdog_still_working_msg(240);
         assert!(msg.contains("240s"));
         assert!(!msg.contains("{hard}"), "placeholder must be substituted");
-        assert!(msg.contains("Työstän"), "message should be in Finnish, matching the rest of watchdog.rs");
+        assert!(
+            msg.contains("Työstän"),
+            "message should be in Finnish, matching the rest of watchdog.rs"
+        );
     }
 }

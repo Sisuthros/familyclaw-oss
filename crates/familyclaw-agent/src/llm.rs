@@ -1944,8 +1944,7 @@ mod tests {
             FinishReason::Length
         );
 
-        let body2 =
-            r#"{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
+        let body2 = r#"{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
         let resp2: ChatCompletionsResponse = serde_json::from_str(body2).expect("decodes");
         let choice2 = resp2.choices.into_iter().next().expect("one choice");
         assert_eq!(
@@ -1971,7 +1970,10 @@ mod tests {
 
     #[test]
     fn finish_reason_tool_calls_and_unknown() {
-        assert_eq!(FinishReason::from_wire(Some("tool_calls")), FinishReason::ToolCalls);
+        assert_eq!(
+            FinishReason::from_wire(Some("tool_calls")),
+            FinishReason::ToolCalls
+        );
         assert_eq!(
             FinishReason::from_wire(Some("content_filter")),
             FinishReason::Other("content_filter".to_string())

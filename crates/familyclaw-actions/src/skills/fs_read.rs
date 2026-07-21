@@ -905,7 +905,9 @@ mod tests {
             res.output_summary
         );
         // No raw path (private) or raw root path leaks into the denial text.
-        assert!(!res.output_summary.contains(&dir.to_string_lossy().to_string()));
+        assert!(!res
+            .output_summary
+            .contains(&dir.to_string_lossy().to_string()));
     }
 
     /// ADVERSARIAL diagnostics: the denial for a path that canonicalizes but
@@ -983,14 +985,19 @@ mod tests {
             "outside-allowlist and missing-file denials must differ"
         );
         assert!(
-            !denial_missing.output_summary.contains("allowlisted root(s)"),
+            !denial_missing
+                .output_summary
+                .contains("allowlisted root(s)"),
             "missing-file denial must not read like the outside-allowlist denial"
         );
 
         // Redaction: neither denial leaks the raw requested path or the raw
         // allowlisted root paths (only the path hash is ever carried, and
         // only on success — these are both failures, so no hash either).
-        for summary in [&denial_outside.output_summary, &denial_missing.output_summary] {
+        for summary in [
+            &denial_outside.output_summary,
+            &denial_missing.output_summary,
+        ] {
             assert!(!summary.contains(&other.to_string_lossy().to_string()));
             assert!(!summary.contains(&allowed_a.to_string_lossy().to_string()));
             assert!(!summary.contains(&allowed_b.to_string_lossy().to_string()));
@@ -1065,7 +1072,10 @@ mod tests {
             at(1),
         );
         let res = skill.execute(req).await.expect("execute");
-        assert!(res.status.is_success(), "large directory listing must succeed");
+        assert!(
+            res.status.is_success(),
+            "large directory listing must succeed"
+        );
 
         // The proof SUMMARY stays small — the load-bearing invariant.
         let summary = res.raw_output_redacted["summary"]
