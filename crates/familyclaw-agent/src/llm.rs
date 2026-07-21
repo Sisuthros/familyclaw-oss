@@ -25,6 +25,103 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 60_000;
 /// connect phase must not lean on the full 60 s request budget.
 pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
 
+/// Default max output tokens per completion if [`LlmConfig::max_tokens`] is not
+/// otherwise set. Raised from 2048 -> 4096: 2048 was cutting off longer replies
+/// mid-sentence (agent replies routinely exceed it). Layer B can still raise
+/// this further per deployment via `FAMILYCLAW_MAX_TOKENS`
+/// (`familyclaw-gateway/src/main.rs`) or [`LlmConfig::with_max_tokens`].
+pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+
+/// Default max number of auto-continuation rounds when a completion is cut
+/// off by the token limit (`finish_reason == "length"`). Each round appends
+/// the partial reply + a "continue" nudge and calls again, concatenating the
+/// result — this is what actually fixes replies getting cut mid-sentence
+/// (raising `max_tokens` alone only raises the ceiling, it doesn't guarantee
+/// the model stops cleanly under it). `0` disables continuation entirely.
+/// Overridable via `FAMILYCLAW_MAX_CONTINUATIONS`.
+pub const DEFAULT_MAX_CONTINUATIONS: u32 = 3;
+
+/// Safety cap on the total accumulated reply length (bytes) across all
+/// continuation rounds. Bounds worst-case cost/latency even if
+/// `FAMILYCLAW_MAX_CONTINUATIONS` is set very high — continuation stops once
+/// the accumulated text reaches this size, regardless of remaining rounds.
+pub const MAX_CONTINUATION_OUTPUT_CHARS: usize = 64_000;
+
+/// Reads the `FAMILYCLAW_MAX_CONTINUATIONS` environment variable, or returns
+/// [`DEFAULT_MAX_CONTINUATIONS`]. Unlike most env-var readers in this crate,
+/// `0` is a valid, meaningful value ("continuation disabled") and is NOT
+/// treated as "unset" — only a missing/unparseable value falls back to the
+/// default (same shape as [`crate::watchdog::turn_watchdog_secs`], minus the
+/// `> 0` filter).
+#[must_use]
+pub fn max_continuations() -> u32 {
+    std::env::var("FAMILYCLAW_MAX_CONTINUATIONS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(DEFAULT_MAX_CONTINUATIONS)
+}
+
+/// The user-turn nudge appended before each continuation call.
+const CONTINUATION_NUDGE: &str = "Continue exactly where you left off. Do not repeat or summarize.";
+
+/// Truncates `s` to at most `max_bytes`, respecting the UTF-8 char boundary
+/// (never splits a multi-byte character). Mirrors the boundary-safe pattern
+/// used by `familyclaw_agent::agent::truncate_for_history`.
+fn safe_truncate_to(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Why the model stopped generating (`OpenAI` chat-completions
+/// `choices[].finish_reason`).
+///
+/// Captured so callers (the auto-continuation loop in [`LlmClient::complete`])
+/// can react to a `length` stop instead of silently shipping a truncated
+/// reply. An absent or unrecognized value defaults to [`FinishReason::Stop`]
+/// (the safe assumption — "the model appears to be done", not "something
+/// broke"), so older fixtures / providers that omit the field keep working
+/// exactly as before this field existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishReason {
+    /// The model completed its response normally.
+    Stop,
+    /// The response was cut off by the `max_tokens` limit — the caller may
+    /// want to continue the generation.
+    Length,
+    /// The model chose to call one or more tools instead of replying with
+    /// text.
+    ToolCalls,
+    /// A provider-specific value this crate doesn't special-case (e.g.
+    /// `"content_filter"`). Treated like `Stop` for continuation purposes.
+    Other(String),
+}
+
+impl FinishReason {
+    /// Maps the wire's `finish_reason` string (or its absence) to a
+    /// [`FinishReason`]. `None`/unrecognized -> [`FinishReason::Stop`].
+    fn from_wire(raw: Option<&str>) -> Self {
+        match raw {
+            Some("stop") | None => FinishReason::Stop,
+            Some("length") => FinishReason::Length,
+            Some("tool_calls") => FinishReason::ToolCalls,
+            Some(other) => FinishReason::Other(other.to_string()),
+        }
+    }
+
+    /// True only for [`FinishReason::Length`] — the sole trigger for
+    /// auto-continuation.
+    #[must_use]
+    pub const fn is_length(&self) -> bool {
+        matches!(self, FinishReason::Length)
+    }
+}
+
 /// LLM configuration — loaded at runtime from env/file (never hardcoded).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
@@ -63,7 +160,7 @@ impl LlmConfig {
             api_base: api_base.into(),
             api_key: api_key.into(),
             model: model.into(),
-            max_tokens: 2048, // default
+            max_tokens: DEFAULT_MAX_TOKENS,
             request_timeout_ms: None,
             connect_timeout_ms: None,
         }
@@ -506,9 +603,79 @@ impl LlmClient {
 
     /// Completes a chat conversation, returning the response text.
     ///
+    /// **Auto-continuation on `finish_reason == "length"`:** a single
+    /// completion call can be cut off mid-sentence by the `max_tokens` limit.
+    /// When that happens, this appends the partial reply plus a "continue"
+    /// nudge ([`CONTINUATION_NUDGE`]) and calls again, concatenating the
+    /// result — bounded by [`max_continuations`] rounds (env
+    /// `FAMILYCLAW_MAX_CONTINUATIONS`, default [`DEFAULT_MAX_CONTINUATIONS`],
+    /// `0` disables) and by [`MAX_CONTINUATION_OUTPUT_CHARS`] total
+    /// accumulated size. If a continuation call itself fails, the
+    /// **already-accumulated** partial text is returned as `Ok` rather than
+    /// discarding it — losing a partial reply is worse than returning one
+    /// that ends slightly early. Tool-call responses
+    /// ([`FinishReason::ToolCalls`]) are never produced on this path (this
+    /// method never advertises tools — see [`Self::complete_with_tools`]) so
+    /// they are unaffected by construction.
+    ///
+    /// # Errors
+    /// Returns an error if the *first* HTTP request fails or its response is
+    /// invalid. Failures on continuation rounds do not surface as `Err` (see
+    /// above) — they end the loop and return the partial text accumulated so far.
+    pub async fn complete(&self, messages: &[LlmMessage]) -> Result<String, LlmError> {
+        let (mut text, mut finish_reason) = self.complete_once(messages).await?;
+
+        let max_rounds = max_continuations();
+        let mut round: u32 = 0;
+        while finish_reason.is_length()
+            && round < max_rounds
+            && text.len() < MAX_CONTINUATION_OUTPUT_CHARS
+        {
+            round += 1;
+            let mut continuation_messages = messages.to_vec();
+            continuation_messages.push(LlmMessage::assistant(text.clone()));
+            continuation_messages.push(LlmMessage::user(CONTINUATION_NUDGE));
+
+            match self.complete_once(&continuation_messages).await {
+                Ok((more, next_finish_reason)) => {
+                    text.push_str(&more);
+                    finish_reason = next_finish_reason;
+                    tracing::info!(
+                        round,
+                        accumulated_chars = text.len(),
+                        "llm: auto-continuation round completed (finish_reason=length)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        round,
+                        accumulated_chars = text.len(),
+                        error = %e,
+                        "llm: continuation call failed — returning accumulated partial text instead of losing it"
+                    );
+                    break;
+                }
+            }
+        }
+
+        if text.len() > MAX_CONTINUATION_OUTPUT_CHARS {
+            let cut = safe_truncate_to(&text, MAX_CONTINUATION_OUTPUT_CHARS).len();
+            text.truncate(cut);
+        }
+
+        Ok(text)
+    }
+
+    /// One raw chat-completions call: sends `messages` (no tools) and
+    /// returns the response text plus its [`FinishReason`]. Shared by
+    /// [`Self::complete`]'s first call and each of its continuation rounds.
+    ///
     /// # Errors
     /// Returns an error if the HTTP request fails or the response is invalid.
-    pub async fn complete(&self, messages: &[LlmMessage]) -> Result<String, LlmError> {
+    async fn complete_once(
+        &self,
+        messages: &[LlmMessage],
+    ) -> Result<(String, FinishReason), LlmError> {
         let endpoint = Self::build_endpoint(&self.config.api_base);
 
         let request_body = ChatCompletionsRequest {
@@ -545,16 +712,19 @@ impl LlmClient {
             }
         })?;
 
-        chat_response
+        let choice = chat_response
             .choices
             .into_iter()
             .next()
-            .and_then(|c| c.message.content)
-            // Empty choices / null content = the model produced nothing this turn.
-            // That is RETRYABLE (another model in the chain may produce content),
-            // so classify it as NoContent — NOT Parse (which is terminal and would
-            // defeat failover). [F1 invariant: see LlmError::is_retryable]
-            .ok_or(LlmError::NoContent)
+            // Empty choices = the model produced nothing this turn. That is
+            // RETRYABLE (another model in the chain may produce content), so
+            // classify it as NoContent — NOT Parse (which is terminal and
+            // would defeat failover). [F1 invariant: see LlmError::is_retryable]
+            .ok_or(LlmError::NoContent)?;
+
+        let finish_reason = FinishReason::from_wire(choice.finish_reason.as_deref());
+        let content = choice.message.content.ok_or(LlmError::NoContent)?;
+        Ok((content, finish_reason))
     }
 
     /// Opens an SSE stream (`stream: true`) and returns a stream of text chunks.
@@ -978,6 +1148,11 @@ struct ChatCompletionsResponse {
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatMessage,
+    /// `"stop" | "length" | "tool_calls" | ...`. `#[serde(default)]` tolerates
+    /// providers/fixtures that omit it (-> `None` -> [`FinishReason::Stop`]
+    /// via [`FinishReason::from_wire`]).
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1025,7 +1200,8 @@ mod tests {
         let config = LlmConfig::new("https://api.openai.com/v1", "sk-test123", "gpt-4o");
         assert_eq!(config.api_base, "https://api.openai.com/v1");
         assert_eq!(config.model, "gpt-4o");
-        assert_eq!(config.max_tokens, 2048);
+        assert_eq!(config.max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(config.max_tokens, 4096);
 
         let config_with_tokens =
             LlmConfig::new("https://api.openai.com/v1", "key", "model").with_max_tokens(4096);
@@ -1719,6 +1895,265 @@ mod tests {
         assert!(
             err.is_retryable(),
             "NoContent must be retryable for failover"
+        );
+    }
+
+    // ── finish_reason parsing + auto-continuation ───────────────────────────
+
+    // Env vars are process-global; serialize tests that touch them so they
+    // don't race each other (same pattern as `watchdog.rs` / `identity.rs`).
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// RAII guard: sets `key` to `value` on construction, restores whatever
+    /// was there before on drop (even on panic).
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn deserializes_finish_reason_length_and_stop() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"length"}]}"#;
+        let resp: ChatCompletionsResponse = serde_json::from_str(body).expect("decodes");
+        let choice = resp.choices.into_iter().next().expect("one choice");
+        assert_eq!(
+            FinishReason::from_wire(choice.finish_reason.as_deref()),
+            FinishReason::Length
+        );
+
+        let body2 =
+            r#"{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
+        let resp2: ChatCompletionsResponse = serde_json::from_str(body2).expect("decodes");
+        let choice2 = resp2.choices.into_iter().next().expect("one choice");
+        assert_eq!(
+            FinishReason::from_wire(choice2.finish_reason.as_deref()),
+            FinishReason::Stop
+        );
+    }
+
+    #[test]
+    fn finish_reason_absent_defaults_to_stop_backward_compat() {
+        // Backward compat: fixtures/providers that omit finish_reason (like the
+        // pre-existing fixtures in this file) must still decode.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
+        let resp: ChatCompletionsResponse =
+            serde_json::from_str(body).expect("decodes without finish_reason");
+        let choice = resp.choices.into_iter().next().expect("one choice");
+        assert!(choice.finish_reason.is_none());
+        assert_eq!(
+            FinishReason::from_wire(choice.finish_reason.as_deref()),
+            FinishReason::Stop
+        );
+    }
+
+    #[test]
+    fn finish_reason_tool_calls_and_unknown() {
+        assert_eq!(FinishReason::from_wire(Some("tool_calls")), FinishReason::ToolCalls);
+        assert_eq!(
+            FinishReason::from_wire(Some("content_filter")),
+            FinishReason::Other("content_filter".to_string())
+        );
+        assert!(!FinishReason::Other("content_filter".to_string()).is_length());
+        assert!(FinishReason::Length.is_length());
+    }
+
+    #[test]
+    fn max_continuations_reads_env_override_and_allows_zero() {
+        let _lock = env_test_lock();
+        {
+            let _guard = EnvVarGuard::set("FAMILYCLAW_MAX_CONTINUATIONS", "7");
+            assert_eq!(max_continuations(), 7);
+        }
+        {
+            // 0 is a meaningful value ("disabled"), not "unset".
+            let _guard = EnvVarGuard::set("FAMILYCLAW_MAX_CONTINUATIONS", "0");
+            assert_eq!(max_continuations(), 0);
+        }
+        std::env::remove_var("FAMILYCLAW_MAX_CONTINUATIONS");
+        assert_eq!(max_continuations(), DEFAULT_MAX_CONTINUATIONS);
+    }
+
+    /// Minimal blocking HTTP/1.1 mock (no axum dependency) that replies with
+    /// the i-th canned body (saturating at the last) for the i-th request
+    /// received. Same hand-rolled shape as
+    /// `empty_choices_is_retryable_nocontent_not_parse` above and the
+    /// `MockLlm` harness in `llm_chain.rs`'s cooldown tests (kept local here
+    /// since that one is private to its own module).
+    fn spawn_scripted_mock(
+        bodies: Vec<String>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind");
+        let addr = listener.local_addr().expect("mock addr");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_t = Arc::clone(&calls);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let n = calls_t.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0_u8; 4096];
+                let _ = stream.read(&mut buf);
+                let idx = n.min(bodies.len().saturating_sub(1));
+                let body = bodies.get(idx).cloned().unwrap_or_default();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        (addr, calls)
+    }
+
+    // NOTE: these two env-sensitive tests are deliberately plain `#[test]` (not
+    // `#[tokio::test]`) driving their own current-thread runtime via
+    // `block_on`. That keeps the `_lock`/`_guard` env-serialization guards
+    // entirely in synchronous scope (never alive across an `.await` inside an
+    // async fn/block), satisfying `clippy::await_holding_lock` — the guards
+    // still cover the whole test body since `block_on` blocks synchronously
+    // until the future completes.
+
+    #[test]
+    fn continuation_concatenates_length_then_stop() {
+        let _lock = env_test_lock();
+        std::env::remove_var("FAMILYCLAW_MAX_CONTINUATIONS"); // use the default (3)
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        rt.block_on(async {
+            let body1 = r#"{"choices":[{"message":{"role":"assistant","content":"partial-one "},"finish_reason":"length"}]}"#.to_string();
+            let body2 = r#"{"choices":[{"message":{"role":"assistant","content":"final-part"},"finish_reason":"stop"}]}"#.to_string();
+            let (addr, calls) = spawn_scripted_mock(vec![body1, body2]);
+
+            let cfg = LlmConfig::new(format!("http://{addr}/v1"), "k", "m")
+                .with_request_timeout_ms(2000)
+                .with_connect_timeout_ms(2000);
+            let client = LlmClient::new(cfg);
+
+            let text = client
+                .complete(&[LlmMessage::user("hi")])
+                .await
+                .expect("completes");
+            assert_eq!(text, "partial-one final-part");
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "exactly one continuation round (length -> stop)"
+            );
+        });
+    }
+
+    #[test]
+    fn continuation_disabled_when_max_continuations_zero() {
+        let _lock = env_test_lock();
+        let _guard = EnvVarGuard::set("FAMILYCLAW_MAX_CONTINUATIONS", "0");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        rt.block_on(async {
+            let body1 = r#"{"choices":[{"message":{"role":"assistant","content":"only-part"},"finish_reason":"length"}]}"#.to_string();
+            let (addr, calls) = spawn_scripted_mock(vec![body1]);
+
+            let cfg = LlmConfig::new(format!("http://{addr}/v1"), "k", "m")
+                .with_request_timeout_ms(2000)
+                .with_connect_timeout_ms(2000);
+            let client = LlmClient::new(cfg);
+
+            let text = client
+                .complete(&[LlmMessage::user("hi")])
+                .await
+                .expect("completes even without continuation");
+            assert_eq!(text, "only-part");
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "FAMILYCLAW_MAX_CONTINUATIONS=0 must disable continuation entirely"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn continuation_failure_returns_accumulated_partial_not_error() {
+        // Only ONE canned body is provided but the mock server itself stays up
+        // (listener still accepting) — the continuation round's connection
+        // will be answered with the same (already-"length") body again and
+        // again up to max_continuations, OR we simulate a hard failure by
+        // pointing the continuation at a closed port. Simplest deterministic
+        // approach: bind a listener, accept exactly one connection (the first
+        // call), then drop the listener so the second connection is refused.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock bind");
+        let addr = listener.local_addr().expect("mock addr");
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0_u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"choices":[{"message":{"role":"assistant","content":"partial-only"},"finish_reason":"length"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+            // Listener is dropped here — the port closes, so the
+            // continuation's connection attempt fails (connection refused).
+        });
+
+        let cfg = LlmConfig::new(format!("http://{addr}/v1"), "k", "m")
+            .with_request_timeout_ms(2000)
+            .with_connect_timeout_ms(2000);
+        let client = LlmClient::new(cfg);
+
+        let text = client
+            .complete(&[LlmMessage::user("hi")])
+            .await
+            .expect("must return the accumulated partial, not an error");
+        assert_eq!(
+            text, "partial-only",
+            "a failed continuation call must not lose the already-accumulated partial text"
         );
     }
 }

@@ -153,8 +153,11 @@ const GATEWAY_TOKEN_ENV: &str = "FAMILYCLAW_GATEWAY_TOKEN";
 const PLAN_ENV: &str = "FAMILYCLAW_PLAN";
 
 /// Optional LLM output cap (in tokens). Without this the `LlmConfig` default is
-/// 2048, which cuts off long responses mid-sentence. Set e.g. 8192 so the
-/// agent (e.g. long research reports) can respond in full.
+/// [`familyclaw_agent::llm::DEFAULT_MAX_TOKENS`] (4096). Set e.g. 8192 so the
+/// agent (e.g. long research reports) can respond in full. Independently of
+/// this cap, a response cut off mid-generation (`finish_reason == "length"`)
+/// is auto-continued — see `FAMILYCLAW_MAX_CONTINUATIONS`
+/// (`familyclaw_agent::llm::max_continuations`).
 const MAX_TOKENS_ENV: &str = "FAMILYCLAW_MAX_TOKENS";
 const REQUEST_TIMEOUT_MS_ENV: &str = "FAMILYCLAW_REQUEST_TIMEOUT_MS";
 
@@ -1150,7 +1153,8 @@ fn resolve_addr() -> Result<SocketAddr> {
 fn build_resolver() -> EnvEndpointResolver {
     let mut resolver = EnvEndpointResolver::new();
     // Optional output-token cap from env. Applied to ALL resolved
-    // models (apply_tunings). Without this, the default of 2048 cuts off long responses.
+    // models (apply_tunings). Without this, the LlmConfig default
+    // (familyclaw_agent::llm::DEFAULT_MAX_TOKENS, 4096) applies.
     if let Ok(raw) = std::env::var(MAX_TOKENS_ENV) {
         match raw.trim().parse::<u32>() {
             Ok(max) if max > 0 => {

@@ -289,10 +289,11 @@ fn probe_resolver_from_env() -> EnvEndpointResolver {
     const PROVIDERS_ENV: &str = "FAMILYCLAW_PROVIDERS";
     // Probe tuning (Fable 5 diagnosis 2026-07-09): the ping only needs a couple
     // of tokens. Without this, the probe inherits llm.rs's defaults (max_tokens
-    // 2048, timeout 60s), so a reasoning model (v4-pro/nemotron) burns the
-    // whole 2048-token budget on thinking rambling for the "ping" message = 29-62s,
-    // blowing readyz's ~25s budget. Cap reasoning at 32 tokens and limit
-    // one attempt to 8s, so that even a full 4-model fallback walk fits the budget.
+    // DEFAULT_MAX_TOKENS = 4096, timeout 60s), so a reasoning model
+    // (v4-pro/nemotron) burns the whole token budget on thinking rambling for
+    // the "ping" message = 29-62s, blowing readyz's ~25s budget. Cap reasoning
+    // at 32 tokens and limit one attempt to 8s, so that even a full 4-model
+    // fallback walk fits the budget.
     let mut resolver = EnvEndpointResolver::new()
         .with_max_tokens(32)
         .with_request_timeout_ms(8_000)
