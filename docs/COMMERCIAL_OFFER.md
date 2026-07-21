@@ -190,7 +190,7 @@ Both offers are **anchored at the top of their range** with fully defined scope:
 
 ## Contact
 
-<!-- TODO(the operator): fill in the public-facing contact you want on this document.
+<!-- TODO(maintainer): fill in the public-facing contact you want on this document.
      The original file used a personal name + personal email, which is why it
      was pulled from the repo (audit-layer-b.sh treats real personal names/
      emails as a Layer B leak). Pick whichever you actually want prospects to
