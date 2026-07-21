@@ -22,6 +22,12 @@
 # Display name of the agent this gateway serves. Generic placeholder only.
 # Env override: FAMILYCLAW_AGENT_NAME
 name = "agent_a"
+# Turn watchdog: soft deadline (seconds) before the user gets an interim
+# "still working" notice (the turn itself keeps running, not dropped).
+# Env override: FAMILYCLAW_TURN_WATCHDOG_SECS (default 120; try 240 for
+# heavy introspection prompts that legitimately run long).
+# Hard cap = this value * FAMILYCLAW_TURN_WATCHDOG_HARD_MULTIPLIER (default
+# 3, minimum 1) — past the hard cap the turn is abandoned for good.
 
 [channel]
 # Active channel adapter: "telegram" | "discord".
@@ -59,6 +65,16 @@ model = "openai/gpt-4.1-mini"
 # API key — ALWAYS leave empty in committed config. Supply at runtime via
 # env override: FAMILYCLAW_PROVIDER_API_KEY
 api_key = ""
+# Max output tokens per completion. Default 4096, applied to ALL resolved
+# models (primary + fallbacks). Env override: FAMILYCLAW_MAX_TOKENS
+# Auto-continuation rounds when a reply is cut off by the token limit
+# (finish_reason == "length"): appends the partial reply + a "continue" nudge
+# and calls again, concatenating the result. Default 3, 0 disables. Env
+# override: FAMILYCLAW_MAX_CONTINUATIONS
+# Character cap per short-term-history message (default 1500, min 200) — raise
+# alongside the max-tokens setting above if long agent replies should stay in
+# conversational memory instead of being stunted. Env override:
+# FAMILYCLAW_HISTORY_MAX_CHARS
 
 [memory]
 # How long working memories are retained before decay (hours). 168 = 7 days.
