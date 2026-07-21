@@ -42,6 +42,14 @@ the full pipeline against real integration surfaces:
 | `fs_read` (`crates/familyclaw-actions/src/skills/fs_read.rs`) | Reads a local file through a canonicalized allowlist: resolves `..`, follows symlinks to their real target, and rejects any path that escapes the allowlisted root. The proof records only a SHA-256 path hash + file size + short summary — never the full file body. |
 | `web_fetch` (`crates/familyclaw-actions/src/skills/web_fetch.rs`) | A real read-only HTTP GET with structural SSRF guards (rejects non-`http(s)` schemes, `localhost`, private/loopback/link-local/CGNAT ranges including the cloud metadata address) and no redirect following. |
 
+`fs_read` denials are diagnosable without leaking any path: the agent-visible
+error distinguishes an empty allowlist, a path that doesn't exist/canonicalize,
+and a path that resolves fine but is outside every allowlisted root (the
+latter states the configured root **count**, e.g. "outside all 3 allowlisted
+root(s)"). When the target is a directory, the full entry-name listing (up to
+64 names, with a "… and N more" tail) is returned in the tool-result `content`
+field by default — the 120-byte proof `summary` stays a short, truncated copy.
+
 The remaining bundled skills (`email_triage`, `github_issue_draft`,
 `file_patch`, `discord_thread_summary`) are **example patterns**: complete,
 tested implementations of the skill *contract* using deterministic in-memory

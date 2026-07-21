@@ -565,6 +565,17 @@ pub async fn build_family(
     // skill stays in an empty fail-closed state (rejects all paths), so this
     // is the switch that makes FILE RESEARCH actually work.
     let fs_read_config = resolve_fs_read_config();
+    if fs_read_config.is_none() {
+        // Boot-time sanity: an agent that later gets a mysterious fs_read
+        // denial should be diagnosable from the logs, not just the error
+        // text. `None` here means the skill registers with its default
+        // empty allowlist (fail-closed) — every read is rejected.
+        tracing::warn!(
+            target: "familyclaw::actions",
+            "fs_read is fail-closed with an empty allowlist — agents cannot read any files; \
+             configure allowed roots (FAMILYCLAW_FS_READ_ALLOW)"
+        );
+    }
     // Write skill (file_write) allowlist from the same LAYER B environment.
     // Without it, file_write stays fail-closed (rejects all writes) -- this is
     // the switch that makes FILE WRITING actually possible (a write within the
@@ -1065,6 +1076,26 @@ fn resolve_fs_read_config() -> Option<FsReadConfig> {
         trusted_roots = trusted_roots.len(),
         "fs_read research skill allowlist configured from environment"
     );
+    // Boot-time sanity: warn (don't fail) for each configured root that
+    // does not currently exist on disk yet -- a common misconfiguration
+    // (typo, not-yet-mounted volume) that otherwise only surfaces later as
+    // a confusing per-request denial. Only the root's LAST PATH SEGMENT is
+    // logged (matching this function's existing counts-only convention
+    // above -- the full operator-provided root path is never put in logs
+    // here), so the warning stays redaction-safe.
+    for root in &allow_roots {
+        let path = std::path::Path::new(root);
+        if !path.exists() {
+            let last_segment = path
+                .file_name()
+                .map_or_else(|| "<root>".to_string(), |s| s.to_string_lossy().into_owned());
+            tracing::warn!(
+                target: "familyclaw::actions",
+                root_last_segment = %last_segment,
+                "fs_read configured allow_root does not currently exist on disk yet — reads under it will fail"
+            );
+        }
+    }
     Some(config)
 }
 

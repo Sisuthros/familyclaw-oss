@@ -85,6 +85,13 @@ pub struct FsReadOutput {
     pub summary: String,
     /// Whether the content is a trusted project file (affects taint state).
     pub trusted: bool,
+    /// For a directory target: the full entry-name listing (up to
+    /// [`DIR_LIST_MAX_ENTRIES`] names, with a truncation tail). This is
+    /// metadata (file names), NOT file content — it is surfaced in the
+    /// tool-result `content` field (same channel as `read_full_content`)
+    /// so the agent can actually see the listing, while the `summary`
+    /// above stays within the small proof-size budget. `None` for a file.
+    pub dir_listing: Option<String>,
 }
 
 /// Allowlist configuration: allowed roots and their trusted subset.
@@ -192,30 +199,44 @@ impl FsReadAllowlisted {
     /// outside.
     ///
     /// # Errors
-    /// - [`ActionError::PolicyDenied`] if the path does not canonicalize
-    ///   (e.g. the file doesn't exist) or if the canonical path is not under
-    ///   any allowed root.
+    /// - [`ActionError::PolicyDenied`] with one of three distinguishable
+    ///   messages (never containing the raw requested path or any raw
+    ///   allowlisted root path — proof redaction stays intact):
+    ///   1. the allowlist itself is empty (fail-closed default),
+    ///   2. the path does not exist / could not be canonicalized,
+    ///   3. the path canonicalizes fine but lands outside every configured
+    ///      root — the message states the root COUNT so the agent can tell
+    ///      "ask the operator to widen the allowlist" from "the file is
+    ///      missing", without ever learning the allowlisted paths.
     fn resolve_allowed(&self, requested: &str) -> Result<PathBuf> {
         let roots = self.config.canonical_allow_roots();
         if roots.is_empty() {
             return Err(ActionError::PolicyDenied(
-                "no allowed roots — all paths rejected (fail-closed)".to_string(),
+                "fs_read allowlist is empty (fail-closed default) — the operator must configure \
+                 allowed roots"
+                    .to_string(),
             ));
         }
 
         // Canonicalization resolves `..` segments and follows symlinks to
         // their real target. This is load-bearing security: an escape
         // attempt (../ or a symlink pointing out) is revealed here.
+        // NOTE: `e` (the OS error) never embeds the path itself (e.g. "No
+        // such file or directory (os error 2)"), so this stays redaction-safe.
         let canonical = std::fs::canonicalize(requested).map_err(|e| {
-            ActionError::PolicyDenied(format!("path could not be canonicalized (rejected): {e}"))
+            ActionError::PolicyDenied(format!(
+                "path does not exist or could not be resolved (rejected): {e}"
+            ))
         })?;
 
         if path_is_under_any(&canonical, &roots) {
             Ok(canonical)
         } else {
-            Err(ActionError::PolicyDenied(
-                "canonical path is outside the allowlist (rejected)".to_string(),
-            ))
+            Err(ActionError::PolicyDenied(format!(
+                "path is outside all {} allowlisted root(s) — ask the operator to extend the \
+                 fs_read allowlist",
+                roots.len()
+            )))
         }
     }
 
@@ -250,9 +271,19 @@ impl FsReadAllowlisted {
             size,
             summary,
             trusted,
+            dir_listing: None,
         })
     }
 
+    /// Builds the proof for a directory target.
+    ///
+    /// The **full** entry-name listing (up to [`DIR_LIST_MAX_ENTRIES`]
+    /// names, with a "… and N more" truncation tail) is metadata, not file
+    /// content, so it is returned via [`FsReadOutput::dir_listing`] — the
+    /// caller surfaces it in the tool-result `content` field so the agent
+    /// can actually see the listing. The proof `summary` stays a truncated
+    /// (≤ [`SUMMARY_MAX_BYTES`]-byte) copy of the same listing — proofs must
+    /// stay small.
     async fn read_directory_proof(&self, canonical: &Path) -> Result<FsReadOutput> {
         let mut read_dir = tokio::fs::read_dir(canonical)
             .await
@@ -277,15 +308,20 @@ impl FsReadAllowlisted {
             names.push(if is_dir { format!("{name}/") } else { name });
         }
 
-        let mut summary = if names.is_empty() {
+        // The FULL listing — this is what the agent gets in `content`.
+        let mut listing = if names.is_empty() {
             "[empty directory]".to_string()
         } else {
             format!("dir: {}", names.join(", "))
         };
         if total > DIR_LIST_MAX_ENTRIES {
-            let _ = write!(summary, " … (+{} more)", total - DIR_LIST_MAX_ENTRIES);
+            let _ = write!(listing, " … and {} more", total - DIR_LIST_MAX_ENTRIES);
         }
-        truncate_utf8(&mut summary, SUMMARY_MAX_BYTES * 4);
+
+        // The proof SUMMARY is a truncated copy — kept within the small
+        // proof-size budget (never the full listing for large directories).
+        let mut summary = listing.clone();
+        truncate_utf8(&mut summary, SUMMARY_MAX_BYTES);
 
         let path_hash = hash_path(canonical);
         let trusted = path_is_under_any(canonical, &self.config.canonical_trusted_roots());
@@ -295,6 +331,7 @@ impl FsReadAllowlisted {
             size: total as u64,
             summary,
             trusted,
+            dir_listing: Some(listing),
         })
     }
 }
@@ -401,7 +438,17 @@ impl ActionExecutor for FsReadAllowlisted {
             "trusted": out.trusted,
         });
 
-        if input.read_full_content && !canonical.is_dir() {
+        if canonical.is_dir() {
+            // Directory listings are metadata (file names), not file
+            // content: surface them by default in the same `content` field
+            // used for `read_full_content` on files, so the agent can
+            // actually see the listing instead of a crushed summary.
+            if let Some(listing) = &out.dir_listing {
+                if let Some(obj) = output.as_object_mut() {
+                    obj.insert("content".to_string(), json!(listing));
+                }
+            }
+        } else if input.read_full_content {
             if let Ok(bytes) = tokio::fs::read(&canonical).await {
                 let mut content = String::from_utf8_lossy(&bytes).into_owned();
                 truncate_utf8(&mut content, FULL_CONTENT_MAX_BYTES);
@@ -440,7 +487,9 @@ impl Skill for FsReadAllowlisted {
             version: "1.0.0".to_string(),
             description: "Reads a local file or lists a directory only from under an \
                  allowlisted root (canonicalized path, no network). Default: hash + summary; \
-                 `read_full_content: true` also returns the content (max 64 KiB)."
+                 `read_full_content: true` also returns file content (max 64 KiB). For a \
+                 directory target the full entry-name listing (up to 64 names) is always \
+                 returned in `content` — it is metadata, not file content."
                 .to_string(),
             permissions: vec![SkillPermission::ReadFiles],
             risk: ActionRisk::ReadOnly,
@@ -848,6 +897,104 @@ mod tests {
             !res.status.is_success(),
             "empty allowlist must reject all paths"
         );
+        // The empty-allowlist denial has its OWN distinguishable message —
+        // not confusable with "outside allowlist" or "missing file".
+        assert!(
+            res.output_summary.contains("allowlist is empty"),
+            "empty-allowlist denial must say so: {}",
+            res.output_summary
+        );
+        // No raw path (private) or raw root path leaks into the denial text.
+        assert!(!res.output_summary.contains(&dir.to_string_lossy().to_string()));
+    }
+
+    /// ADVERSARIAL diagnostics: the denial for a path that canonicalizes but
+    /// lands outside every allowlisted root must (a) mention the root COUNT,
+    /// (b) be clearly distinguishable from the "missing file" denial, and
+    /// (c) never leak the raw requested path or the raw allowlisted root path.
+    #[tokio::test]
+    async fn outside_allowlist_denial_mentions_root_count_and_differs_from_missing_file() {
+        let allowed_a = temp_dir("diag_allowed_a");
+        let allowed_b = temp_dir("diag_allowed_b");
+        let other = temp_dir("diag_outside");
+        write_file(&other, "secret.txt", "outside");
+
+        let skill = FsReadAllowlisted::with_config(
+            FsReadConfig::new()
+                .allow_root(&allowed_a)
+                .allow_root(&allowed_b),
+        );
+
+        // Case 1: the path EXISTS but is outside every allowlisted root.
+        let outside_payload = serde_json::to_value(FsReadInput {
+            path: other.join("secret.txt").to_string_lossy().to_string(),
+            ..Default::default()
+        })
+        .expect("serialize");
+        let denial_outside = skill
+            .execute(ActionRequest::new(
+                ActionId::new(),
+                FsReadAllowlisted::skill_id(),
+                ActionTaskId::new(),
+                outside_payload,
+                at(1),
+            ))
+            .await
+            .expect("execute");
+        assert!(!denial_outside.status.is_success());
+        assert!(
+            denial_outside.output_summary.contains("2 allowlisted root"),
+            "denial must mention the configured root count: {}",
+            denial_outside.output_summary
+        );
+        assert!(
+            denial_outside.output_summary.contains("outside"),
+            "denial must clarify the path IS outside the allowlist: {}",
+            denial_outside.output_summary
+        );
+
+        // Case 2: the path does NOT exist at all (cannot canonicalize).
+        let missing = other.join("does_not_exist_at_all.txt");
+        let missing_payload = serde_json::to_value(FsReadInput {
+            path: missing.to_string_lossy().to_string(),
+            ..Default::default()
+        })
+        .expect("serialize");
+        let denial_missing = skill
+            .execute(ActionRequest::new(
+                ActionId::new(),
+                FsReadAllowlisted::skill_id(),
+                ActionTaskId::new(),
+                missing_payload,
+                at(1),
+            ))
+            .await
+            .expect("execute");
+        assert!(!denial_missing.status.is_success());
+        assert!(
+            denial_missing.output_summary.contains("does not exist"),
+            "denial for a nonexistent path must say so: {}",
+            denial_missing.output_summary
+        );
+
+        // The two denials must be textually distinguishable from each other.
+        assert_ne!(
+            denial_outside.output_summary, denial_missing.output_summary,
+            "outside-allowlist and missing-file denials must differ"
+        );
+        assert!(
+            !denial_missing.output_summary.contains("allowlisted root(s)"),
+            "missing-file denial must not read like the outside-allowlist denial"
+        );
+
+        // Redaction: neither denial leaks the raw requested path or the raw
+        // allowlisted root paths (only the path hash is ever carried, and
+        // only on success — these are both failures, so no hash either).
+        for summary in [&denial_outside.output_summary, &denial_missing.output_summary] {
+            assert!(!summary.contains(&other.to_string_lossy().to_string()));
+            assert!(!summary.contains(&allowed_a.to_string_lossy().to_string()));
+            assert!(!summary.contains(&allowed_b.to_string_lossy().to_string()));
+        }
     }
 
     #[tokio::test]
@@ -881,6 +1028,69 @@ mod tests {
         );
         assert!(summary.contains("a.txt"), "must include a.txt");
         assert!(summary.contains("sub/"), "must mark subdir with trailing /");
+        // The full listing is ALSO in `content` (same channel as
+        // `read_full_content` for files) — the agent can actually see it.
+        let content = res.raw_output_redacted["content"]
+            .as_str()
+            .expect("content present for directory listing");
+        assert!(content.contains("a.txt"));
+        assert!(content.contains("b.txt"));
+        assert!(content.contains("sub/"));
+    }
+
+    /// A directory with MORE than [`DIR_LIST_MAX_ENTRIES`] (64) entries: the
+    /// `content` field must carry the actual entry names plus a "… and N
+    /// more" truncation tail, while the proof `summary` stays within the
+    /// small [`SUMMARY_MAX_BYTES`] (120-byte) budget regardless of how many
+    /// entries exist.
+    #[tokio::test]
+    async fn large_directory_listing_has_content_with_truncation_tail_and_small_summary() {
+        const TOTAL: usize = 70;
+        let dir = temp_dir("dir_list_large");
+        for i in 0..TOTAL {
+            write_file(&dir, &format!("file_{i:03}.txt"), "x");
+        }
+
+        let skill = FsReadAllowlisted::with_config(FsReadConfig::new().allow_root(&dir));
+        let payload = serde_json::to_value(FsReadInput {
+            path: dir.to_string_lossy().to_string(),
+            ..Default::default()
+        })
+        .expect("serialize");
+        let req = ActionRequest::new(
+            ActionId::new(),
+            FsReadAllowlisted::skill_id(),
+            ActionTaskId::new(),
+            payload,
+            at(1),
+        );
+        let res = skill.execute(req).await.expect("execute");
+        assert!(res.status.is_success(), "large directory listing must succeed");
+
+        // The proof SUMMARY stays small — the load-bearing invariant.
+        let summary = res.raw_output_redacted["summary"]
+            .as_str()
+            .expect("summary");
+        assert!(
+            summary.len() <= SUMMARY_MAX_BYTES,
+            "proof summary must stay within the {SUMMARY_MAX_BYTES}-byte budget, got {} bytes",
+            summary.len()
+        );
+
+        // The CONTENT field carries the actual entry names (up to
+        // DIR_LIST_MAX_ENTRIES) plus a truncation tail for the rest.
+        let content = res.raw_output_redacted["content"]
+            .as_str()
+            .expect("content present for directory listing");
+        assert!(content.contains("file_000.txt"), "must list an early entry");
+        let expected_more = TOTAL - DIR_LIST_MAX_ENTRIES;
+        assert!(
+            content.contains(&format!("… and {expected_more} more")),
+            "must include the truncation tail: {content}"
+        );
+
+        // `size` reports the TOTAL entry count, not just the listed subset.
+        assert_eq!(res.raw_output_redacted["size"], json!(TOTAL as u64));
     }
 
     #[test]
