@@ -149,6 +149,17 @@ doctor: ok
 "One environment variable, and it's a clean pre-flight pass — that's the
 evaluation path, not the production path."
 
+Optional competitor beat (30–60s):
+
+```bash
+python bench-competitors/openclaw/crash_harness.py cycle --crash-point before_write --workdir /tmp/oc-bw
+# Expect side_effect_overcount: 1 — FamilyClaw stays 0 (`cargo run -p familyclaw-bench -- s1`)
+```
+
+Say: shaped OpenClaw/Hermes MEMORY.md models under a real process kill —
+not a claim we audited their latest binary. LangGraph is the pinned live
+framework (`bench-competitors/langgraph/`).
+
 ---
 
 ## Minute 14–15: Close — what happens next

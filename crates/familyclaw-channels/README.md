@@ -12,7 +12,8 @@ to the Resonance Bus.
   - `channel_id() -> &str` — a stable identifier for the channel instance
   - `kind() -> ChannelKind` — the channel technology
   - Dyn-compatible: `Box<dyn Channel>` works (without the `async-trait` macro).
-- **`ChannelKind`** — `Discord` / `Telegram` / `WhatsApp` / `Signal` / `Mock`.
+- **`ChannelKind`** — `Discord` / `Telegram` / `WhatsApp` / `Signal` / `Mock`
+  (enum variants exist for all; only Discord and Telegram have adapters).
 - **Message types** — `OutboundMessage`, `InboundMessage`, `InboundEnvelope`.
 - **`MockChannel`** — an in-memory test channel, no network or external SDKs.
 - **`pump_to`** — the integration seam: channel stream → Resonance Bus.
@@ -39,12 +40,12 @@ the bus happens in the agent layer, which depends on both crates.
 Real adapters pull in heavy channel SDKs, so they sit behind feature flags
 rather than being mandatory dependencies:
 
-| Feature | Purpose | Example SDK |
-|---------|-----------|---------------|
-| `discord` | Discord adapter | serenity |
-| `telegram` | Telegram adapter | teloxide |
-| `whatsapp` | WhatsApp adapter | — |
-| `signal` | Signal adapter | — |
+| Feature | Purpose | Status |
+|---------|---------|--------|
+| `discord` | Discord adapter | Implemented (serenity) |
+| `telegram` | Telegram adapter | Implemented (HTTP Bot API) |
+| `whatsapp` | WhatsApp adapter | **Reserved / not implemented** (empty feature flag) |
+| `signal` | Signal adapter | **Reserved / not implemented** (empty feature flag) |
 
 The default build (`default = []`) contains **only** the core + `MockChannel`,
 so the platform builds and tests without network access. Each adapter's SDK

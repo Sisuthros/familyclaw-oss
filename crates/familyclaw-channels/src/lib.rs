@@ -11,20 +11,24 @@
 //!   (`Box<dyn Channel>`).
 //! - [`InboundEnvelope`] — a canonicalized, origin-aware envelope.
 //! - [`ChannelKind`] — Discord / Telegram / `WhatsApp` / Signal / Mock.
+//!   **Implemented adapters:** Discord and Telegram (behind feature flags).
+//!   **`whatsapp` / `signal` features are reserved empty flags** — no adapter
+//!   source yet; enabling them does not add an implementation.
 //! - [`OutboundMessage`] / [`InboundMessage`] / [`InboundEnvelope`] —
 //!   message types and canonicalization (`inbound message → InboundEnvelope`).
 //! - [`MockChannel`] — an in-memory test channel with no external SDK.
 //! - [`pump_to`] — the integration seam: channel stream → Resonance Bus.
 //!
 //! ## Channel adapters are behind feature flags
-//! Real adapters (e.g. **serenity** for Discord, **teloxide** for Telegram)
+//! Real adapters (e.g. **serenity** for Discord, HTTP Bot API for Telegram)
 //! pull in heavy channel SDKs. That's why they sit behind the crate's
 //! feature flags (`discord`, `telegram`, `whatsapp`, `signal`) rather than
 //! being mandatory dependencies. The default build contains **only** the
 //! core + [`MockChannel`], so the platform builds and tests without
-//! network access or heavy SDKs. Each adapter's concrete SDK dependencies
-//! are added to that feature's `[dependencies]` section only once the
-//! adapter is implemented.
+//! network access or heavy SDKs. `whatsapp` and `signal` are **reserved /
+//! not implemented** (empty feature flags). Each adapter's concrete SDK
+//! dependencies are added to that feature's `[dependencies]` section only
+//! once the adapter is implemented.
 //!
 //! ## OSS boundary (Layer A)
 //! This crate does not hardcode channel tokens, Discord/Telegram

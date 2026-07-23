@@ -1,6 +1,8 @@
 # Architecture: Channels (Channel Abstraction)
 
-FamilyClaw uses a unified channel abstraction to connect the core system to various communication platforms, such as Discord. This keeps the system's internal behavior independent of external communication services.
+FamilyClaw uses a unified channel abstraction to connect the core system to various communication platforms. This keeps the system's internal behavior independent of external communication services.
+
+**Implemented adapters:** Discord and Telegram (behind the `discord` and `telegram` feature flags). **`whatsapp` and `signal` are reserved empty feature flags** — no adapter source yet; they are explicit non-goals for v1.0 (see [STATUS.md](../STATUS.md)).
 
 ## `Channel` trait and interface
 
@@ -22,10 +24,10 @@ The Discord adapter is implemented using the `serenity` library (version 0.12).
 The channels abstraction and its adapters are designed to strictly follow the **Layer A** principle:
 All configuration (such as bot tokens and channel IDs) is supplied at runtime. The code must not contain any hardcoded values, secrets, or project-specific identifiers. This ensures nothing sensitive ends up in the repo.
 
-## Feature gating (the `discord` flag)
+## Feature gating
 
-The Discord adapter and its dependencies are isolated behind the `discord` feature.
-**Why?** This isolation reduces build time and binary size for users who don't need Discord support, and allows other adapters to be developed and compiled independently in parallel.
+The Discord and Telegram adapters and their dependencies are isolated behind the `discord` and `telegram` features.
+**Why?** This isolation reduces build time and binary size for users who don't need those channels, and allows other adapters to be developed and compiled independently in parallel. Reserved `whatsapp` / `signal` flags stay empty until an adapter is implemented.
 
 ## Message flow (sequence diagram)
 

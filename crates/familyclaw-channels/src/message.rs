@@ -36,14 +36,14 @@ use serde::{Deserialize, Serialize};
 pub enum ChannelKind {
     /// Discord (adapter behind the `discord` feature, e.g. serenity).
     Discord,
-    /// Telegram (adapter behind the `telegram` feature, e.g. teloxide).
+    /// Telegram (adapter behind the `telegram` feature; HTTP Bot API).
     Telegram,
-    /// `WhatsApp` (adapter behind the `whatsapp` feature).
+    /// `WhatsApp` — enum variant only; `whatsapp` feature is reserved / not implemented.
     // Explicit rename so the serde form matches `as_str()`'s value
     // ("whatsapp"); `snake_case` would otherwise produce "whats_app".
     #[serde(rename = "whatsapp")]
     WhatsApp,
-    /// Signal (adapter behind the `signal` feature).
+    /// `Signal` — enum variant only; `signal` feature is reserved / not implemented.
     Signal,
     /// In-memory test channel ([`crate::MockChannel`]) — no external SDK.
     Mock,

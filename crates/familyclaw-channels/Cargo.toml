@@ -1,6 +1,6 @@
 [package]
 name = "familyclaw-channels"
-description = "Unified messaging channel abstraction with feature-gated adapters for Discord, Telegram, WhatsApp, and Signal"
+description = "Unified messaging channel abstraction; Discord and Telegram adapters implemented; WhatsApp/Signal features reserved (empty flags, not implemented)"
 version.workspace = true
 edition = "2021"
 license.workspace = true
@@ -24,15 +24,15 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 
-# Telegram adapter: HTTP REST (lightweight, no teloxide SDK) via Bot API
-# getUpdates/sendMessage. Discord webhook-interaktiot (discord_interactions.rs)
-# käyttävät reqwest + ed25519-dalek allekirjoitusten verifiointiin.
+# Telegram adapter: lightweight HTTP REST (no teloxide SDK) via Bot API
+# getUpdates/sendMessage. Discord webhook interactions (discord_interactions.rs)
+# use reqwest + ed25519-dalek for signature verification.
 reqwest = { workspace = true, optional = true }
 ed25519-dalek = { version = "2.2", optional = true }
 
-# Discord gateway -adapteri (discord.rs): serenity 0.12 gateway-yhteydellä.
-# default-features = false → kevein toimiva setti (ei cache/framework/utils);
-# rustls_backend välttää järjestelmän OpenSSL-riippuvuuden.
+# Discord gateway adapter (discord.rs): serenity 0.12 with gateway.
+# default-features = false → leanest working set (no cache/framework/utils);
+# rustls_backend avoids a system OpenSSL dependency.
 serenity = { version = "0.12", default-features = false, features = [
     "builder",
     "cache",
@@ -44,10 +44,11 @@ serenity = { version = "0.12", default-features = false, features = [
 ], optional = true }
 
 [features]
-# Default: runko + MockChannel only. Real adapters behind feature flags.
+# Default: core + MockChannel only. Real adapters behind feature flags.
 default = []
 discord = ["dep:reqwest", "dep:ed25519-dalek", "dep:serenity"]
 telegram = ["dep:reqwest"]
+# Reserved / not implemented — empty flags so the names are reserved; no adapter source yet.
 whatsapp = []
 signal = []
 

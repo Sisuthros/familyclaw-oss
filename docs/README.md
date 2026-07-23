@@ -11,9 +11,11 @@ here, it's most likely a dated planning/expo artifact — check
 |---|---|
 | [QUICKSTART.md](QUICKSTART.md) | Get FamilyClaw running in 5 minutes — build, run the demos, connect Discord. |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Full technical overview: Resonance Bus, durable substrate, memory, dreaming, latent telepathy. |
-| [architecture-channels.md](architecture-channels.md) | Channel adapter architecture (Discord/Telegram/WhatsApp/Signal). |
+| [architecture-channels.md](architecture-channels.md) | Channel adapter architecture (Discord/Telegram implemented; WhatsApp/Signal reserved). |
 | [MIGRATION.md](MIGRATION.md) | Migrating between FamilyClaw versions. |
-| [discord-setup.md](discord-setup.md) | Step-by-step Discord bot creation and configuration (the only channel setup guide, linked from the README Quick Start). |
+| [discord-setup.md](discord-setup.md) | Step-by-step Discord bot creation and configuration (linked from the README Quick Start). |
+| [telegram-setup.md](telegram-setup.md) | Step-by-step Telegram bot creation, long-poll config, and approval-flow notes. |
+| [MCP_WORKS_WITH.md](MCP_WORKS_WITH.md) | MCP bridge works-with catalog: tested vs contract-compatible server categories. |
 | [RUNBOOK_WINDOWS.md](RUNBOOK_WINDOWS.md) | Windows-specific setup, including optional Telegram/Discord wiring. |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Deploying the gateway. |
 | [USERS.md](USERS.md) | Adoption profiles and the "should you use this" gate. |
@@ -30,6 +32,12 @@ here, it's most likely a dated planning/expo artifact — check
 | [SECURITY_BENCH.md](SECURITY_BENCH.md) | Security benchmark methodology and results. |
 | [SECURITY_COMPARISON.md](SECURITY_COMPARISON.md) | Security posture compared against other frameworks. |
 | [CRASH_SAFE_DISPATCH_CASE_STUDY.md](CRASH_SAFE_DISPATCH_CASE_STUDY.md) | Case study on at-most-once external side-effect dispatch. |
+| [ENTERPRISE_AUTH.md](ENTERPRISE_AUTH.md) | Gateway token, OIDC-via-proxy, operator RBAC. |
+| [BUG_BOUNTY.md](BUG_BOUNTY.md) | Public bug-bounty program outline (interim reporting). |
+| [COMPLIANCE_SOC2_ROADMAP.md](COMPLIANCE_SOC2_ROADMAP.md) | SOC 2 Type I control mapping roadmap (not certified yet). |
+| [BACKUP_RESTORE.md](BACKUP_RESTORE.md) | Journal backup/restore + kill/restart verification. |
+| [DOCKER_KILL_RESTART.md](DOCKER_KILL_RESTART.md) | How to stamp Docker volume survival after SIGKILL. |
+| [OBSERVABILITY.md](OBSERVABILITY.md) | Metrics, audit, lightweight trace correlation. |
 
 ## Reference
 
@@ -57,17 +65,20 @@ here, it's most likely a dated planning/expo artifact — check
 | [PHASE1_PR_BODY.md](PHASE1_PR_BODY.md) | PR description used for the Phase 1 merge. |
 | [PHASE3_PARALLEL_PLAN.md](PHASE3_PARALLEL_PLAN.md) | Phase 3 parallel workstream plan. |
 | [PUBLISH_ORPHAN_PLAN.md](PUBLISH_ORPHAN_PLAN.md) | Plan for publishing an orphaned branch/history. |
-| [GIT_CONSOLIDATION.md](GIT_CONSOLIDATION.md) | Git history consolidation notes. |
 | [CODE_REVIEW_2026-06-04.md](CODE_REVIEW_2026-06-04.md) | Dated code review notes. |
-| [plans/](plans/) | Dated implementation plans (parity roadmap, vision/image spec, close-out plans). |
 | [source-blueprints/](source-blueprints/) | Source blueprint drafts referenced during early design. |
 
 ## Archive
 
 [`docs/archive/`](archive/) holds superseded planning documents. They are kept
-for evidentiary/historical value only — the active strategy document is
-[`MASTERPLAN.md`](../MASTERPLAN.md) at the repo root. Do not update files in
-`archive/`; update `MASTERPLAN.md` instead.
+for evidentiary/historical value only — the active status / roadmap summary is
+[`STATUS.md`](../STATUS.md) at the repo root. Do not update files in
+`archive/`; update `STATUS.md` (and living docs under `docs/`) instead.
+
+Dated implementation plans formerly under `docs/plans/`, plus notes such as
+`GIT_CONSOLIDATION.md` / `EXPO_VALIDATION_PROOF.md` / `MASTERPLAN.md`, are not
+kept as live index targets — check [`docs/archive/`](archive/) or `STATUS.md`
+instead of dangling links.
 
 ---
 

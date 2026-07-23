@@ -2,12 +2,13 @@
 
 ## Supported Versions
 
-FamilyClaw is currently **pre-1.0**. Security fixes apply to the `main` branch until the first tagged release.
+FamilyClaw is currently at **v1.2.0**. Security fixes apply to the `main`
+branch and the latest 1.x release.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| main    | ✅ Active development |
-| < 1.0   | ❌ Not applicable   |
+| 1.2.x / main | ✅ Supported |
+| < 1.0        | ❌ Unsupported |
 
 ## Reporting a Vulnerability
 
@@ -17,7 +18,8 @@ Report privately through:
 - GitHub Security Advisories (preferred): https://github.com/Sisuthros/familyclaw/security/advisories/new
 - Or contact a maintainer privately via GitHub (see the repository profile)
 
-We aim to acknowledge valid reports promptly.
+We aim to acknowledge valid reports promptly. See [docs/BUG_BOUNTY.md](docs/BUG_BOUNTY.md)
+for the public program outline and interim triage SLA.
 
 ## Scope
 
@@ -40,8 +42,8 @@ Security-sensitive areas include:
 ## Responsible Disclosure
 
 - We follow coordinated vulnerability disclosure.
-- Fixes will be released on `main` branch with a security advisory.
-- No CVE assignment planned until 1.0 release.
+- Fixes will be released on `main` (and reflected in the next patch/minor release) with a security advisory.
+- CVE assignment may be requested for confirmed issues affecting supported releases.
 
 ## Known Advisories (`cargo audit`)
 

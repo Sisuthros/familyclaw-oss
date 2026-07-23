@@ -112,10 +112,11 @@ pub use resource_budget::{AcquireOutcome, BudgetLimits, ResourceBudget, Resource
 #[allow(deprecated)]
 pub use skills::MockSkill;
 pub use skills::{
-    DiscordThreadSummaryMock, EmailTriageMock, FilePatchApply, FilePatchMock, FileWriteAllowlisted,
-    FileWriteConfig, FsReadAllowlisted, FsReadConfig, GithubIssueDraftMock, GithubIssueSkill,
-    MemoryRecord, Pipeline, PipelineOutcome, ResearchSkill, ShellExec, ShellExecConfig, ShellMode,
-    Skill, SpawnSubagentSkill, SubagentSpawner, WebSearchSkill,
+    DiscordThreadSummaryMock, EmailTriageLive, EmailTriageMock, FilePatchApply, FilePatchMock,
+    FileWriteAllowlisted, FileWriteConfig, FsReadAllowlisted, FsReadConfig, GithubIssueDraftMock,
+    GithubIssueSkill, MemoryRecord, Pipeline, PipelineOutcome, ResearchSkill, ShellExec,
+    ShellExecConfig, ShellMode, Skill, SpawnSubagentSkill, SubagentSpawner, WebSearchSkill,
+    EMAIL_TRIAGE_URL_ENV,
 };
 
 /// The crate's version at build time (`CARGO_PKG_VERSION`).

@@ -88,5 +88,6 @@ Hosted GitHub Actions runs on a zero-spend account and is **not** relied upon as
 the authoritative gate. The repo defines the CI gates — `fmt`, `clippy -D
 warnings`, `test`, `doc`, `--all-features`, the Layer B audit, MSRV, and a
 Windows build+test job — but the authoritative proof is the local, reproducible
-verification documented in [docs/EXPO_VALIDATION_PROOF.md](EXPO_VALIDATION_PROOF.md).
-That proof covers the full suite (~1680 tests) and the 8/8 continuity scorecard.
+verification documented in [STATUS.md](../STATUS.md) (local, reproducible
+gates). That proof covers the full suite (~1905 tests — see STATUS.md) and
+the 8/8 continuity scorecard.

@@ -27,15 +27,17 @@ a support ticket, or a compliance problem.
 ## What FamilyClaw does
 
 FamilyClaw is a Rust workspace (23 crates, MIT-licensed, `unsafe` forbidden
-workspace-wide) built specifically to make that failure mode impossible **by
-construction**, not just unlikely:
+workspace-wide) built specifically to close that failure class with tested
+crash-survival guarantees — **at-most-once dispatch under crash**, not a
+claim of universal exactly-once *completion*:
 
 - **At-most-once external side-effect dispatch under crash.** An
-  idempotency-keyed intent → effect → committed-outbox model. Benchmarked
-  head-to-head against a leading durable-execution framework's strongest
-  durability setting on one narrow, honest metric — how many money-touching
-  side effects re-execute after a process crash. FamilyClaw: zero, at every
-  tested crash point.
+  idempotency-keyed intent → effect → committed-outbox model. A crash in the
+  narrow intent-only window **fails closed** (zero or one execution; recovery
+  required) rather than blindly re-firing. Benchmarked head-to-head against a
+  leading durable-execution framework's strongest durability setting on one
+  narrow, honest metric — how many money-touching side effects re-execute
+  after a process crash. FamilyClaw: zero, at every tested crash point.
 - **Content-hash-bound approval gates.** Fail-closed and TOCTOU-safe — if
   the payload changes after a human approves it, dispatch is refused rather
   than silently acting on the new content.
@@ -68,8 +70,9 @@ claim and no production-scale claim.
 - **Runs with zero configuration for evaluation** (a channel-less demo
   mode), and against a real chat channel (Discord/Telegram documented) or a
   custom integration for production use.
-- **Private repository.** Demo access granted on request during
-  evaluation; no public listing.
+- **Private repository / demo access** granted on request during evaluation
+  (`docs/COMMERCIAL_OFFER.md` contact + `docs/commercial/FOUNDING_PILOTS.md`).
+- **Pilot SLA:** `docs/commercial/PILOT_SLA.md`.
 
 ## Commercial offers
 

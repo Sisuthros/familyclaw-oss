@@ -18,9 +18,11 @@
 //! schema, taint) with deterministic in-memory logic and generic placeholder
 //! data. They show the shape of a skill's interface — plug in your own
 //! provider (Gmail/GitHub/…) to the execution body when you want a live
-//! integration. Every skill provides its own [`SkillManifest`]
-//! ([`Skill::manifest`]) and implements the [`ActionExecutor`] interface for
-//! its execution logic.
+//! integration. [`EmailTriageLive`] is an optional HTTPS JSON fetch path
+//! (env-gated, SSRF-guarded) that reuses the mock classifier when
+//! `FAMILYCLAW_EMAIL_TRIAGE_URL` is set. Every skill provides its own
+//! [`SkillManifest`] ([`Skill::manifest`]) and implements the
+//! [`ActionExecutor`] interface for its execution logic.
 //!
 //! ## The pipeline ([`Pipeline`])
 //! [`Pipeline`] ties together the registry ([`SkillRegistry`]), the task
@@ -78,7 +80,7 @@ pub mod web_fetch;
 pub mod web_search;
 
 pub use discord_thread_summary::DiscordThreadSummaryMock;
-pub use email_triage::EmailTriageMock;
+pub use email_triage::{EmailTriageLive, EmailTriageMock, EMAIL_TRIAGE_URL_ENV};
 pub use file_patch::FilePatchMock;
 pub use file_patch_apply::FilePatchApply;
 pub use file_write::{FileWriteAllowlisted, FileWriteConfig};

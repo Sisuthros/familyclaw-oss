@@ -62,9 +62,16 @@ eternal thread remembers them across a process restart.
 **IS:** a reproducible, single-command artifact that proves durable crash replay (S1,
 across a genuine process boundary) + recall-across-restart. A skeptic can run the binary themselves.
 
-**NOT YET:** run against a live competitor. The next step is to wrap a real
-OpenClaw/Hermes runtime behind the same `Subject` interface (the seam is already designed
-exactly for this) → then the crash matrix kills a real competitor process.
+**SHAPED process harnesses (2026-07-23):** OpenClaw- and Hermes-*shaped*
+cross-process crash matrices live under
+[`bench-competitors/openclaw/`](../bench-competitors/openclaw/) and
+[`bench-competitors/hermes/`](../bench-competitors/hermes/) (same overcount
+metric as LangGraph). Reproduce with
+`scripts/run-competitor-crash-matrix.ps1` (or `.sh`). These prove the
+documented MEMORY.md / restart-re-run failure mode under a real process
+boundary — they are **not** yet a pinned live OpenClaw/Hermes product binary.
+Set `OPENCLAW_BIN` / `HERMES_BIN` to signal live intent; replace the shaped
+column in `RESULTS.md` only after a product Subject adapter is pinned.
 
 ## Bonus: gateway security regression closed
 

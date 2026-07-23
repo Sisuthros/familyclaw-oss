@@ -6,9 +6,9 @@
 //!   documented behavior of file-based `MEMORY.md` memory (pure in-process).
 //!   Makes the benchmark a head-to-head comparison.
 //!
-//! Further competitor adapters (Letta, OpenClaw, Hermes Agent) come in
-//! behind the same [`Subject`](crate::Subject) interface as new modules,
-//! without requiring a harness redesign.
+//! Further competitor adapters: process harnesses under
+//! `bench-competitors/{openclaw,hermes,langgraph}/`. In-process shaped
+//! baselines remain [`MarkdownFileSubject`].
 
 pub mod familyclaw;
 pub mod markdown_file;

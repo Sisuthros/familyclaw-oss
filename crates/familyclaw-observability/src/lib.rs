@@ -60,7 +60,9 @@
 
 pub mod event_recorder;
 pub mod metrics;
+pub mod operator_acl;
 pub mod rbac;
+pub mod trace;
 
 pub use event_recorder::EventRecorder;
 pub use metrics::{
@@ -70,7 +72,9 @@ pub use metrics::{
     COUNTER_TASKS_CREATED, COUNTER_TASK_HANDOFFS, COUNTER_TOOL_CALLS,
     COUNTER_WORKFLOW_STEPS_COMPLETED, GAUGE_AGENTS_ONLINE,
 };
+pub use operator_acl::{OperatorAcl, OperatorRole};
 pub use rbac::{RbacError, RbacPolicy};
+pub use trace::TraceContext;
 
 /// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]

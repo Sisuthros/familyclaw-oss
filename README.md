@@ -211,7 +211,7 @@ paths, and ships unit tests in-module.
 | [`familyclaw-security`](crates/familyclaw-security) | Identity anchors + human-correction veto. Identity lives in the memory substrate, not a hash. |
 | [`familyclaw-bridge`](crates/familyclaw-bridge) | Agent registry, task board, event bus — transport-independent Rust core. |
 | [`familyclaw-agent`](crates/familyclaw-agent) | **Agent runtime** — composes all above into a living being. Ships demo binaries. |
-| [`familyclaw-channels`](crates/familyclaw-channels) | Discord / Telegram / WhatsApp / Signal adapters bridged to the bus. Discord inbound gateway (Ed25519 verification, slash commands) is live. |
+| [`familyclaw-channels`](crates/familyclaw-channels) | Discord / Telegram adapters bridged to the bus (WhatsApp/Signal features are reserved empty flags — not implemented). Discord inbound gateway (Ed25519 verification, slash commands) is live. |
 | [`familyclaw-acp`](crates/familyclaw-acp) | **ACP client** — spawn and control CLI agents (Claude, Gemini, Qoder) over stdio. |
 | [`familyclaw-bench`](crates/familyclaw-bench) | **Continuity benchmark** — reproducible proof of crash-resume, retention and dreaming. |
 | [`familyclaw-gateway`](crates/familyclaw-gateway) | **Gateway binary** — long-running process: HTTP health/readiness + Resonance Bus bootstrap. |

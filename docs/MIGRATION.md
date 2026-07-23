@@ -10,6 +10,37 @@ representation and your skills safely **quarantined**.
 > memories never become trusted anchors. See
 > [Security guarantees](#security-guarantees) below.
 
+## Evaluator one-liner
+
+Import an OpenClaw or Hermes export into **quarantine + low-trust** artifacts:
+
+```bash
+familyclaw import --from openclaw --input ./openclaw-export.json --out ./migrated
+# or: familyclaw import --from hermes --input ./hermes-export.json --out ./migrated
+```
+
+Expected success shape (stdout Markdown report, counts vary with the export):
+
+```text
+# FamilyClaw import report
+
+- source: `openclaw`
+- memories imported: N
+- skills quarantined: N
+- config hints: N
+- warnings: N
+
+## Security guarantees
+- imported skills are QUARANTINED (never registered, never executed)
+- imported skills require sandbox validation + explicit operator approval before activation
+- imported memories carry low-trust external provenance (trust 0.2) — never admitted as trusted anchors
+```
+
+With `--out ./migrated` the tool also writes `import_report.md`,
+`imported_memories.json` (low-trust), and `quarantine_manifest.json` (skills
+never registered). Use `--json` for a machine-readable report instead of
+Markdown.
+
 ## One-command usage
 
 ```bash

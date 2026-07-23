@@ -71,7 +71,7 @@ Each item below is backed by tests and/or CI gates in this repo.
 | **Hearth persistence (SurrealDB backend)** | ✅ Fixed in v1.2.0 | `emotional_state` and `narrative_thread` (`set_thread`) SurrealDB persistence bugs fixed (`type::record` + `type::datetime`, batch UPSERT); round-trip tests added. `familyclaw-hearth`. |
 | **`--all-features` build/test/clippy/doc** | ✅ Green + CI-gated | v1.2.0 repaired the `surreal` feature and added an `all-features` CI job (test + doc + clippy `-D warnings`) to prevent regressions. |
 
-**Test surface:** ~1680 `#[test]` / `#[tokio::test]` functions across 23 crates.
+**Test surface:** ~1905 `#[test]` / `#[tokio::test]` functions across 23 crates (source of truth for public docs; recount with `cargo test --workspace --features discord`).
 **Continuity scorecard:** 8/8 scenarios PASS ([docs/SCORECARD.md](docs/SCORECARD.md)),
 regenerated deterministically by `cargo run -p familyclaw-bench --bin bench -- all`.
 

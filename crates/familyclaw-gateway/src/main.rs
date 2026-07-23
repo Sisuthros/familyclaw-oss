@@ -118,7 +118,9 @@ use familyclaw_channels::{
     RESPONSE_DEFERRED_CHANNEL_MESSAGE, RESPONSE_PONG,
 };
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
-use familyclaw_observability::{EventRecorder, MetricsRegistry};
+use familyclaw_observability::{
+    operator_acl::caps as operator_caps, EventRecorder, MetricsRegistry, OperatorAcl, OperatorRole,
+};
 use familyclaw_runtime::{build_family, AgentBuildSpec, FamilyRuntime};
 use familyclaw_scheduler::{AgencyConfig, ScheduledTaskId, SchedulerHandle};
 use tokio::net::TcpListener;
@@ -412,8 +414,34 @@ fn check_inject_auth(
     match presented {
         Some(tok) if constant_time_eq(tok.as_bytes(), expected.as_bytes()) => Ok(()),
         _ => {
-            tracing::warn!("inject: hylätty 401 — puuttuva tai väärä bearer-token");
+            tracing::warn!("inject: rejected 401 — missing or wrong bearer token");
             Err(StatusCode::UNAUTHORIZED)
+        }
+    }
+}
+
+/// Optional operator RBAC (`FAMILYCLAW_OPERATOR_ACL=1`) on top of bearer auth.
+///
+/// When disabled, returns `Ok(())`. When enabled, requires
+/// `X-FamilyClaw-Operator-Role: viewer|approver|admin` with a grant for
+/// `capability` (see `docs/ENTERPRISE_AUTH.md`).
+fn check_operator_capability(
+    headers: &HeaderMap,
+    capability: &str,
+) -> std::result::Result<(), StatusCode> {
+    let acl = OperatorAcl::from_env();
+    if !acl.is_enabled() {
+        return Ok(());
+    }
+    let role = headers
+        .get("x-familyclaw-operator-role")
+        .and_then(|v| v.to_str().ok())
+        .and_then(OperatorRole::parse);
+    match role {
+        Some(role) if acl.allows(role, capability) => Ok(()),
+        _ => {
+            tracing::warn!("operator acl: forbidden for capability {capability}");
+            Err(StatusCode::FORBIDDEN)
         }
     }
 }
@@ -609,6 +637,12 @@ async fn list_pending_approvals(
             Json(serde_json::json!({ "error": "unauthorized" })),
         );
     }
+    if check_operator_capability(&headers, operator_caps::APPROVALS_READ).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "forbidden" })),
+        );
+    }
     let Some(actions) = state.actions.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -718,6 +752,12 @@ async fn approve_pending(
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "unauthorized" })),
+        );
+    }
+    if check_operator_capability(&headers, operator_caps::APPROVALS_DECIDE).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "forbidden" })),
         );
     }
     let Some(actions) = state.actions.as_ref() else {
@@ -857,6 +897,12 @@ async fn deny_pending(
             Json(serde_json::json!({ "error": "unauthorized" })),
         );
     }
+    if check_operator_capability(&headers, operator_caps::APPROVALS_DECIDE).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "forbidden" })),
+        );
+    }
     let Some(actions) = state.actions.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -914,6 +960,12 @@ async fn set_task_enabled_route(
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "unauthorized" })),
+        );
+    }
+    if check_operator_capability(&headers, operator_caps::TASKS_CONTROL).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "forbidden" })),
         );
     }
     let Some(scheduler) = state.scheduler.as_ref() else {
@@ -1003,6 +1055,12 @@ async fn list_turn_audit(
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "unauthorized" })),
+        );
+    }
+    if check_operator_capability(&headers, operator_caps::AUDIT_READ).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "forbidden" })),
         );
     }
     let Some(audit) = state.turn_audit.as_ref() else {
@@ -1283,20 +1341,41 @@ impl Channel for SharedDiscordChannel {
 /// to it (→ `agents_online` gauge). The caller (serve) must already have
 /// subscribed to it with an [`EventRecorder`] before this call, so the event isn't lost.
 ///
-/// Resolves the `/inject` protection token from the configuration. An empty
-/// token = open loopback-only default (warning); a set token = mandatory
-/// bearer match. The value is never logged.
-fn resolve_inject_token(cfg: &FamilyConfig) -> Option<Arc<str>> {
+/// Returns true when the listen address is loopback-only (`127.0.0.0/8` or `::1`).
+///
+/// Binding `0.0.0.0` / `::` is **not** loopback — those expose the port on
+/// every interface and therefore require a gateway token (fail-closed).
+fn is_loopback_bind(addr: SocketAddr) -> bool {
+    addr.ip().is_loopback()
+}
+
+/// Resolves the `/inject` protection token from the configuration.
+///
+/// - Token set → mandatory bearer match (value never logged).
+/// - Token empty **and** loopback bind → open default with a warning
+///   (local eval / `cargo run` convenience).
+/// - Token empty **and** non-loopback bind → [`Err`] fail-closed (do not
+///   start serving operator routes on a remotely reachable socket without
+///   auth). Matches `OpenClaw`'s production expectation that a gateway token
+///   is required once the control plane leaves loopback.
+fn resolve_inject_token(cfg: &FamilyConfig, bind: SocketAddr) -> Result<Option<Arc<str>>> {
     let raw = cfg.gateway_token().trim();
     if raw.is_empty() {
+        if !is_loopback_bind(bind) {
+            return Err(FamilyClawError::config(format!(
+                "{GATEWAY_TOKEN_ENV} is required when binding non-loopback address {bind} \
+                 (refusing to expose /inject, /approvals, and /turns/audit without auth). \
+                 Set a bearer token or bind 127.0.0.1 / ::1 for local eval."
+            )));
+        }
         warn!(
-            "{GATEWAY_TOKEN_ENV} ei asetettu — POST /inject on suojaamaton \
-             (luota loopback-sidontaan). Aseta token tuotannossa."
+            "{GATEWAY_TOKEN_ENV} unset — POST /inject is open on loopback {bind}. \
+             Set a token before any non-loopback deploy."
         );
-        None
+        Ok(None)
     } else {
-        info!("POST /inject suojattu bearer-tokenilla ({GATEWAY_TOKEN_ENV})");
-        Some(Arc::from(raw))
+        info!("POST /inject protected by bearer token ({GATEWAY_TOKEN_ENV})");
+        Ok(Some(Arc::from(raw)))
     }
 }
 
@@ -1340,7 +1419,11 @@ async fn start_runtime(
     }
     let extra_agents = build_extra_agent_specs(&cfg, &model_cfg);
 
-    let inject_token: Option<Arc<str>> = resolve_inject_token(&cfg);
+    // Token resolution needs the eventual bind address. `start_runtime` is
+    // called from `serve` after `resolve_addr`; we re-read the same env here
+    // so channel-less / Discord / Telegram paths share one fail-closed gate.
+    let bind = resolve_addr()?;
+    let inject_token: Option<Arc<str>> = resolve_inject_token(&cfg, bind)?;
 
     // CHANNEL-LESS PUBLISH MODE (`FAMILYCLAW_CHANNEL_KIND=none`): start the
     // gateway WITHOUT any operator key, soul, or reply target. Assembles the
@@ -1351,7 +1434,7 @@ async fn start_runtime(
     // the platform works with an empty profile — Telegram/Discord are Layer B add-ons.
     if channel_kind == "none" {
         info!(
-            "kanavaton julkaisutila (FAMILYCLAW_CHANNEL_KIND=none) — MockChannel, ei perhe-avaimia"
+            "channel-less publish mode (FAMILYCLAW_CHANNEL_KIND=none) — MockChannel, no family keys"
         );
         let mock = familyclaw_channels::MockChannel::new("familyclaw-none")
             .map_err(FamilyClawError::from)?;
@@ -1952,13 +2035,27 @@ async fn doctor(fix: bool) -> Result<()> {
         println!("[WARN]    env       FAMILYCLAW_PROFILE_DIR unset — generic soul");
     }
 
-    // /inject protection: optional, so it doesn't fail doctor. Presence only —
-    // the token is a secret, the value is not printed. Missing = a warning about
-    // an open endpoint, not an error.
+    // /inject protection: empty token is OK only on loopback. Non-loopback
+    // without a token fails doctor (same rule as `serve` fail-closed).
+    let inject_bind = resolve_addr().ok().or_else(|| DEFAULT_ADDR.parse().ok());
     if cfg.gateway_token().trim().is_empty() {
-        println!(
-            "[WARN]    inject    {GATEWAY_TOKEN_ENV} unset — POST /inject open (loopback-only)"
-        );
+        match inject_bind {
+            Some(bind) if is_loopback_bind(bind) => {
+                println!(
+                    "[WARN]    inject    {GATEWAY_TOKEN_ENV} unset — POST /inject open (loopback-only)"
+                );
+            }
+            Some(bind) => {
+                println!(
+                    "[FAIL]    inject    {GATEWAY_TOKEN_ENV} unset while binding non-loopback {bind}"
+                );
+                ok = false;
+            }
+            None => {
+                println!("[FAIL]    inject    cannot resolve bind address for auth check");
+                ok = false;
+            }
+        }
     } else {
         println!("[OK]      inject    {GATEWAY_TOKEN_ENV} set — POST /inject requires bearer");
     }
@@ -2369,6 +2466,61 @@ mod tests {
         assert!(check_inject_auth(&state, &HeaderMap::new()).is_ok());
         // An extra header doesn't hurt when there's no protection.
         assert!(check_inject_auth(&state, &headers_with_auth("Bearer whatever")).is_ok());
+    }
+
+    #[test]
+    fn operator_acl_disabled_allows_without_role_header() {
+        std::env::remove_var("FAMILYCLAW_OPERATOR_ACL");
+        assert!(
+            check_operator_capability(&HeaderMap::new(), operator_caps::APPROVALS_DECIDE).is_ok()
+        );
+    }
+
+    #[test]
+    fn operator_acl_enabled_requires_role() {
+        std::env::set_var("FAMILYCLAW_OPERATOR_ACL", "1");
+        let denied = check_operator_capability(&HeaderMap::new(), operator_caps::APPROVALS_READ);
+        assert_eq!(denied, Err(StatusCode::FORBIDDEN));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-familyclaw-operator-role",
+            "viewer".parse().expect("header"),
+        );
+        assert!(check_operator_capability(&headers, operator_caps::APPROVALS_READ).is_ok());
+        assert_eq!(
+            check_operator_capability(&headers, operator_caps::APPROVALS_DECIDE),
+            Err(StatusCode::FORBIDDEN)
+        );
+        std::env::remove_var("FAMILYCLAW_OPERATOR_ACL");
+    }
+
+    #[test]
+    fn resolve_inject_token_allows_empty_on_loopback() {
+        let cfg = FamilyConfig::default();
+        assert!(cfg.gateway_token().trim().is_empty());
+        let loopback: SocketAddr = "127.0.0.1:8787".parse().expect("addr");
+        let token = resolve_inject_token(&cfg, loopback).expect("loopback open ok");
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn resolve_inject_token_rejects_empty_on_non_loopback() {
+        let cfg = FamilyConfig::default();
+        let remote: SocketAddr = "0.0.0.0:8787".parse().expect("addr");
+        let err = resolve_inject_token(&cfg, remote).expect_err("must fail-closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(GATEWAY_TOKEN_ENV) && msg.contains("non-loopback"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn is_loopback_bind_detects_wildcard_as_remote() {
+        let loopback: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let wildcard: SocketAddr = "0.0.0.0:1".parse().expect("addr");
+        assert!(is_loopback_bind(loopback));
+        assert!(!is_loopback_bind(wildcard));
     }
 
     #[test]

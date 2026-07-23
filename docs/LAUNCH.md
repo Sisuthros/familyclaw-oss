@@ -115,7 +115,7 @@ We shipped a Rust agent runtime focused on continuity under crash:
 - Journal-based deterministic replay (`familyclaw-durable`)
 - At-most-once external dispatch via idempotency-keyed outbox
 - Approval-gated action runtime (`familyclaw-actions`)
-- 23 crates, ~1680 tests, MSRV 1.88
+- 23 crates, ~1905 tests (see [STATUS.md](../STATUS.md)), MSRV 1.88
 
 The wedge is a reproducible benchmark suite (`cargo run -p familyclaw-bench --bin bench -- all`) including a subprocess crash matrix. We also pinned a comparison vs LangGraph's durable checkpointing on duplicate side effects after kill.
 

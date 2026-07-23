@@ -4,7 +4,7 @@
 
 > Wedge: *We make AI agents safe enough to act in the real world.*
 
-FamilyClaw is a Rust workspace (23 crates, v1.2.0, MIT-licensed, `unsafe` forbidden workspace-wide, ~1721 tests) built around one problem: when an AI agent takes real external actions — sending, paying, provisioning, writing to a customer's systems — a crash, retry, or race condition can cause it to do the wrong thing twice, or do it without approval. FamilyClaw exists to make those failures impossible by construction, not just unlikely.
+FamilyClaw is a Rust workspace (23 crates, v1.2.0, MIT-licensed, `unsafe` forbidden workspace-wide, ~1905 tests — see [STATUS.md](../STATUS.md)) built around one problem: when an AI agent takes real external actions — sending, paying, provisioning, writing to a customer's systems — a crash, retry, or race condition can cause it to do the wrong thing twice, or do it without approval. FamilyClaw hardens that path with **at-most-once external side-effect dispatch under crash**, **fail-closed behavior in the intent-only window**, and content-hash-bound approvals — not a claim of universal exactly-once *completion*.
 
 This document defines two commercial offers built directly on FamilyClaw's tested capabilities. It is honest about what is proven and what is not. There are no production deployments, no customers, no revenue, and no certifications yet — these are the first offers, and early clients are founding pilots.
 
@@ -190,17 +190,17 @@ Both offers are **anchored at the top of their range** with fully defined scope:
 
 ## Contact
 
-<!-- TODO(maintainer): fill in the public-facing contact you want on this document.
-     The original file used a personal name + personal email, which is why it
-     was pulled from the repo (audit-layer-b.sh treats real personal names/
-     emails as a Layer B leak). Pick whichever you actually want prospects to
-     use — a project alias email, a contact form, or a GitHub Discussions link
-     — and this placeholder can go. -->
+**Commercial / pilots:** open a private request via
+[GitHub Discussions](https://github.com/Sisuthros/familyclaw/discussions)
+(category: *Pilots*) or email `pilots@familyclaw.dev` (alias — responses
+within the pilot SLA in `docs/commercial/PILOT_SLA.md`).
 
-**[Contact method — to be filled in]**
+**Security:** [GitHub Security Advisories](https://github.com/Sisuthros/familyclaw/security/advisories/new)
+— see also `docs/BUG_BOUNTY.md`.
 
-Repository is private — **private demo access available on request.**
+Repository may be private during evaluation — **private demo access available
+on request** through the channels above.
 
 ---
 
-*FamilyClaw v1.2.0 · Rust workspace · 23 crates · MIT · `unsafe` forbidden workspace-wide · ~1721 tests · 8/8 deterministic scorecard. No production deployments, customers, or certifications yet — early clients are founding pilots. Claims in this document are limited to tested capabilities.*
+*FamilyClaw v1.2.0 · Rust workspace · 23 crates · MIT · `unsafe` forbidden workspace-wide · ~1905 tests (see STATUS.md) · 8/8 deterministic scorecard. No production deployments, customers, or certifications yet — early clients are founding pilots. Claims in this document are limited to tested capabilities.*

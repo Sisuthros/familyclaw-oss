@@ -14,7 +14,8 @@ taint tracing, tool approval, at-most-once dispatch).
 
 > This isn't "NemoClaw is bad". NVIDIA's release **validates the market** — a
 > major player said out loud that securing always-on agents is a real problem.
-> FamilyClaw solves the same problem more deeply and is production-ready.
+> FamilyClaw solves the same problem more deeply and is architecturally
+> production-oriented (no production deployments yet — see STATUS.md).
 
 ---
 
@@ -73,7 +74,7 @@ selection."*
 
 | | NemoClaw + OpenShell | FamilyClaw |
 |---|---|---|
-| **Status** | alpha / early-preview (NVIDIA's own words) | 1809 tests green, CI gates (fmt/clippy/scorecard) |
+| **Status** | alpha / early-preview (NVIDIA's own words) | ~1905 tests (see STATUS.md), CI gates (fmt/clippy/scorecard); architecturally production-oriented, no production deployments yet |
 | **"Breaking changes without notice"** | yes (documented) | stable API, versioned crates |
 | **Security model** | kernel isolation (Linux container) | 8 layers: isolation + agent-internal semantic security |
 | **3rd-party code** | full native binaries in sandbox | WASM-only (fuel + capability) |
@@ -89,8 +90,8 @@ selection."*
 > (Lasso Security) showed that its sandbox leaked credentials via three
 > separate paths. FamilyClaw fixes exactly those attack classes
 > *architecturally* — WASM eliminates binary misuse entirely, and we govern
-> what the agent does, not just where it connects. 1809 tests, production-ready,
-> today."**
+> what the agent does, not just where it connects. ~1905 tests (see STATUS.md),
+> architecturally production-oriented — no production deployments yet."**
 
 **Honest caveat:** alpha status is a time window, not a permanent advantage —
 NVIDIA can close the gaps. Use it now. And: before FamilyClaw markets itself

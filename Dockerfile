@@ -76,8 +76,10 @@ COPY --from=builder /build/target/release/familyclaw-gateway /usr/local/bin/fami
 
 # Bind on all interfaces inside the container's network namespace. The binary
 # default is 127.0.0.1:8787 (loopback), which would be unreachable from
-# outside the container; 0.0.0.0 makes the published port reachable. Override
-# at runtime if you need a different bind address/port.
+# outside the container; 0.0.0.0 makes the published port reachable.
+# SECURITY: non-loopback binds REQUIRE FAMILYCLAW_GATEWAY_TOKEN (serve
+# fail-closed). Pass it at `docker run -e` / compose — never bake it into
+# the image.
 ENV FAMILYCLAW_GATEWAY_ADDR=0.0.0.0:8787
 
 # Document the listening port (matches the default in FAMILYCLAW_GATEWAY_ADDR).

@@ -56,10 +56,12 @@ one workspace command.
 $ cargo test --workspace --features discord
 ```
 
-**Result, summed from the real run tonight: 1913 tests passed, 0 failed, 3
-ignored**, across unit tests, integration tests, and doc-tests in all 23
-crates. Zero compiler warnings in the test build. A representative tail of
-the output (doc-tests, the last suites to run):
+**Result, summed from a real local run: ~1905 tests passed** (see
+[STATUS.md](../../STATUS.md) as the source of truth; recount with
+`cargo test --workspace --features discord`), **0 failed**, across unit
+tests, integration tests, and doc-tests in all 23 crates. Zero compiler
+warnings in the test build. A representative tail of the output (doc-tests,
+the last suites to run):
 
 ```
    Doc-tests familyclaw_sandbox
@@ -79,13 +81,11 @@ test crates\familyclaw-security\src\lib.rs - (line 43) ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
 ```
 
-**Honesty note on the number:** other docs in this repo (`STATUS.md`,
-`docs/COMMERCIAL_OFFER.md`) cite "~1680" or "~1721" tests. Those counts were
-taken at a different point in time and/or without the `discord` feature
-flag. **1913 is the real count from tonight's run**, with `--features
-discord` enabled (matches the CI `check-build-test` job). The discrepancy is
-feature-flag and time-of-count, not a contradiction — treat this document's
-number as the freshest ground truth and the others as historical snapshots.
+**Honesty note on the number:** public docs unify on **~1905** tests with
+[STATUS.md](../../STATUS.md) as the source of truth. Exact counts drift as
+tests are added; recount with `cargo test --workspace --features discord`
+(matches the CI `check-build-test` job). Do not treat older snapshots
+(~1680 / ~1721 / ~1913) as current.
 
 ---
 

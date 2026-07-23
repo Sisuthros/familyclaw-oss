@@ -50,9 +50,9 @@ use crate::pending_store::{
 use crate::policy::{ActionRisk, SkillPermission};
 use crate::proof::ProofBundle;
 use crate::skills::{
-    DiscordThreadSummaryMock, EmailTriageMock, FilePatchApply, FileWriteAllowlisted,
-    FileWriteConfig, FsReadAllowlisted, FsReadConfig, GithubIssueDraftMock, Pipeline,
-    ResearchSkill, ScheduleTaskSkill, ShellExec, ShellExecConfig, Skill, WebFetchSkill,
+    DiscordThreadSummaryMock, EmailTriageLive, EmailTriageMock, FilePatchApply,
+    FileWriteAllowlisted, FileWriteConfig, FsReadAllowlisted, FsReadConfig, GithubIssueDraftMock,
+    Pipeline, ResearchSkill, ScheduleTaskSkill, ShellExec, ShellExecConfig, Skill, WebFetchSkill,
     WebSearchSkill,
 };
 use crate::task::{ActionTask, DurableTaskQueue, TaskQueue, TaskStatus};
@@ -650,6 +650,12 @@ impl ActionRuntime {
         shell_exec_config: Option<ShellExecConfig>,
     ) -> Result<()> {
         self.register_skill(EmailTriageMock::new())?;
+        // Optional live email triage: registered only when FAMILYCLAW_EMAIL_TRIAGE_URL
+        // is set to a public HTTPS endpoint (SSRF-guarded). Unset → mock only.
+        // Misconfigured/empty URL fails closed (registration error).
+        if let Some(live) = EmailTriageLive::try_from_env()? {
+            self.register_skill(live)?;
+        }
         // github_issue_draft is a real, credential-free skill: it produces a draft
         // and can save it to an allowlisted artifact (no network call). Same
         // Layer B allowlist as file_write; the write stays behind approval
