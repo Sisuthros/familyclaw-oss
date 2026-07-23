@@ -62,16 +62,20 @@ eternal thread remembers them across a process restart.
 **IS:** a reproducible, single-command artifact that proves durable crash replay (S1,
 across a genuine process boundary) + recall-across-restart. A skeptic can run the binary themselves.
 
-**SHAPED process harnesses (2026-07-23):** OpenClaw- and Hermes-*shaped*
-cross-process crash matrices live under
+**Cross-process competitor harnesses (2026-07-23):** OpenClaw- and
+Hermes-*shaped* crash matrices live under
 [`bench-competitors/openclaw/`](../bench-competitors/openclaw/) and
 [`bench-competitors/hermes/`](../bench-competitors/hermes/) (same overcount
 metric as LangGraph). Reproduce with
 `scripts/run-competitor-crash-matrix.ps1` (or `.sh`). These prove the
 documented MEMORY.md / restart-re-run failure mode under a real process
-boundary — they are **not** yet a pinned live OpenClaw/Hermes product binary.
-Set `OPENCLAW_BIN` / `HERMES_BIN` to signal live intent; replace the shaped
-column in `RESULTS.md` only after a product Subject adapter is pinned.
+boundary. By default they remain **shaped** baselines, but
+`OPENCLAW_BIN` / `HERMES_BIN` now activate a real live-pinned binary path when
+that binary implements the shared `run`/`restart` CLI contract; the cycle
+report records the pinned binary SHA-256 and `--version` output. The nightly
+GitHub Actions crash-matrix workflow keeps the shaped `0/1/2` expectations
+honest and regenerates `bench-competitors/MATRIX.md`. Replace the shaped column
+in `RESULTS.md` only after a live product adapter is pinned and reproduced.
 
 ## Bonus: gateway security regression closed
 

@@ -1,0 +1,62 @@
+name: Crash Matrix
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  nightly-crash-matrix:
+    name: Nightly competitor crash matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build continuity_daemon binary
+        run: cargo build -p familyclaw-agent --bin continuity_daemon
+
+      - name: Run competitor matrix
+        run: bash scripts/run-competitor-crash-matrix.sh
+
+      - name: Verify OpenClaw and Hermes expected overcounts
+        run: |
+          python bench-competitors/verify_matrix.py bench-competitors/openclaw/_runs/clean/cycle_report.json --expect 0
+          python bench-competitors/verify_matrix.py bench-competitors/openclaw/_runs/before_write/cycle_report.json --expect 1
+          python bench-competitors/verify_matrix.py bench-competitors/openclaw/_runs/mid_replay/cycle_report.json --expect 2
+          python bench-competitors/verify_matrix.py bench-competitors/hermes/_runs/clean/cycle_report.json --expect 0
+          python bench-competitors/verify_matrix.py bench-competitors/hermes/_runs/before_write/cycle_report.json --expect 1
+          python bench-competitors/verify_matrix.py bench-competitors/hermes/_runs/mid_replay/cycle_report.json --expect 2
+
+      - name: Check FamilyClaw scorecard pass
+        run: |
+          grep -F "## s1_crash_matrix — PASS" crates/familyclaw-bench/out/SCORECARD.md
+          grep -F "| side_effect_overcount | 0.0000 |" crates/familyclaw-bench/out/SCORECARD.md
+
+      - name: Publish matrix to job summary
+        run: |
+          cat bench-competitors/MATRIX.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n' >> "$GITHUB_STEP_SUMMARY"
+          cat crates/familyclaw-bench/out/SCORECARD.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload crash matrix artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-matrix
+          path: |
+            bench-competitors/**/_runs/**/*.json
+            bench-competitors/MATRIX.md
+            crates/familyclaw-bench/out/SCORECARD.md
+            crates/familyclaw-bench/out/scorecard.json

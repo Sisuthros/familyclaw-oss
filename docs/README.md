@@ -15,6 +15,7 @@ here, it's most likely a dated planning/expo artifact — check
 | [MIGRATION.md](MIGRATION.md) | Migrating between FamilyClaw versions. |
 | [discord-setup.md](discord-setup.md) | Step-by-step Discord bot creation and configuration (linked from the README Quick Start). |
 | [telegram-setup.md](telegram-setup.md) | Step-by-step Telegram bot creation, long-poll config, and approval-flow notes. |
+| [CONSOLE.md](CONSOLE.md) | Reliability Console: live redacted activity stream and one-click approval handling. |
 | [MCP_WORKS_WITH.md](MCP_WORKS_WITH.md) | MCP bridge works-with catalog: tested vs contract-compatible server categories. |
 | [RUNBOOK_WINDOWS.md](RUNBOOK_WINDOWS.md) | Windows-specific setup, including optional Telegram/Discord wiring. |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Deploying the gateway. |

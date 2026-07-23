@@ -5,10 +5,11 @@ file-memory + restart-re-run** failure mode on the same metric as
 [`../langgraph/`](../langgraph/): **how many external side effects re-execute
 after a process crash?** (target: 0).
 
-> **Honesty:** this is an OpenClaw-*shaped* process model (`MEMORY.md`
-> bootstrap budget, no idempotency-keyed dispatch), not a pinned live OpenClaw
-> binary. Set `OPENCLAW_BIN` to note live intent; the numeric matrix remains
-> this shaped model until a product-level Subject adapter lands. See
+> **Honesty:** the default path is still an OpenClaw-*shaped* process model
+> (`MEMORY.md` bootstrap budget, no idempotency-keyed dispatch). If you set
+> `OPENCLAW_BIN` to a real pinned binary that implements the harness contract,
+> `crash_harness.py` now runs that binary for `run`/`restart` phases and records
+> its SHA-256 plus `--version` output in `cycle_report.json`. See
 > [`RESULTS.md`](RESULTS.md).
 
 ## Reproduce
@@ -18,6 +19,10 @@ cd bench-competitors/openclaw
 python crash_harness.py cycle --crash-point clean        --workdir _runs/clean
 python crash_harness.py cycle --crash-point before_write --workdir _runs/before_write
 python crash_harness.py cycle --crash-point mid_replay   --workdir _runs/mid_replay
+
+# optional: real pinned binary, same CLI contract
+OPENCLAW_BIN=/path/to/openclaw \
+python crash_harness.py cycle --crash-point before_write --workdir _runs/live-before-write
 ```
 
 ## One-line result
@@ -30,3 +35,10 @@ python crash_harness.py cycle --crash-point mid_replay   --workdir _runs/mid_rep
 
 FamilyClaw side: `cargo test -p familyclaw-actions --test redteam_dispatch_exactly_once`
 and `cargo run -p familyclaw-bench -- s1`.
+
+## Nightly CI
+
+The repository's nightly crash-matrix workflow runs the shaped OpenClaw/Hermes
+matrix on GitHub Actions, verifies the expected overcounts (`0/1/2`), and
+regenerates [`../MATRIX.md`](../MATRIX.md). Live-pinned mode stays opt-in and
+local because it depends on a real pinned binary path.

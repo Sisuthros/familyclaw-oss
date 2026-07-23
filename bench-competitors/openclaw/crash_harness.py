@@ -22,8 +22,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import memory_md_agent as agent  # noqa: E402
+import live_subject  # noqa: E402
 
 THIS = str(Path(__file__).resolve())
 
@@ -35,10 +37,21 @@ CRASH_POINTS = {
 
 
 def _read_counter(counter_path: str) -> int:
-    try:
-        return int(Path(counter_path).read_text(encoding="utf-8").strip())
-    except (FileNotFoundError, ValueError):
-        return 0
+    return live_subject.read_counter(counter_path)
+
+
+def _resolve_live_binary() -> Path | None:
+    raw = os.environ.get("OPENCLAW_BIN", "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.is_file():
+        return path
+    print(
+        f"OPENCLAW_BIN is set but the binary is missing: {raw!r}",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 
 def phase_run(workdir: str, counter: str, crash_at: int) -> int:
@@ -66,15 +79,17 @@ def drive_cycle(crash_point: str, workdir: str) -> int:
         print(f"unknown crash-point {crash_point!r}", file=sys.stderr)
         return 2
 
-    live = os.environ.get("OPENCLAW_BIN", "").strip()
-    if live:
-        print(
-            f"LIVE_MODE note: OPENCLAW_BIN={live!r} is set. "
-            "Numeric matrix still uses the OpenClaw-shaped MEMORY.md model "
-            "(documented restart-re-run failure). Pin a live Subject adapter "
-            "when the product exposes an idempotency counter protocol.",
-            file=sys.stderr,
+    live = _resolve_live_binary()
+    if live is not None:
+        report = live_subject.drive_live_cycle(
+            subject="openclaw-live-pinned",
+            binary_path=live,
+            crash_point=crash_point,
+            workdir=workdir,
+            num_steps=agent.NUM_STEPS,
         )
+        print("CYCLE_REPORT " + json.dumps(report, indent=2))
+        return 0
 
     wd = Path(workdir)
     wd.mkdir(parents=True, exist_ok=True)
@@ -128,8 +143,9 @@ def drive_cycle(crash_point: str, workdir: str) -> int:
         "side_effect_count_final": counter_final,
         "side_effect_overcount": overcount,
         "exactly_once": overcount == 0,
-        "openclaw_bin_set": bool(live),
+        "openclaw_bin_set": False,
     }
+    live_subject.write_cycle_report(wd, report)
     print("CYCLE_REPORT " + json.dumps(report, indent=2))
     if run_proc.stdout.strip():
         print("--- run stdout ---\n" + run_proc.stdout.strip(), file=sys.stderr)

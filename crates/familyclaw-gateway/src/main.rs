@@ -110,6 +110,7 @@ use familyclaw_bridge::{
 use familyclaw_bus::{BeingId, BusHandle, BusMessage};
 use tokio::sync::Mutex;
 mod config;
+mod console;
 mod readiness;
 use config::FamilyConfig;
 use familyclaw_channels::{
@@ -340,6 +341,8 @@ struct PendingApprovalView {
     redacted_summary: String,
     /// Moment when the pending record was created (RFC 3339 timestamp).
     created_at: String,
+    /// Moment when the approval expires (RFC 3339 timestamp).
+    expires_at: String,
 }
 
 /// Liveness check: always responds `200 OK` when the process can serve
@@ -679,10 +682,14 @@ async fn list_pending_approvals(
             let created_at = rt
                 .pending_created_at_for(p.approval_id)
                 .map_or_else(String::new, |t| t.to_rfc3339());
+            let expires_at = rt
+                .pending_expiry_for(p.approval_id)
+                .map_or_else(String::new, |t| t.to_rfc3339());
             PendingApprovalView {
                 approval_id: p.approval_id.to_string(),
                 redacted_summary,
                 created_at,
+                expires_at,
             }
         })
         .collect();
@@ -1179,6 +1186,11 @@ fn build_router(state: Arc<GatewayState>) -> Router {
         // registered; when turn audit is not wired up ([`GatewayState::turn_audit`] =
         // `None`), the handler responds 503. Bearer protection is the same as /inject.
         .route("/turns/audit", get(list_turn_audit));
+    // Self-contained operator reliability console. Both routes expose
+    // only data already redacted by the approval and audit surfaces.
+    router = router
+        .route("/console", get(console::console_page))
+        .route("/console/events", get(console::console_events));
     if state.discord_public_key.is_some() && state.discord_channel.is_some() {
         router = router.route("/discord/interactions", post(handle_discord_interaction));
     }

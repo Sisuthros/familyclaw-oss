@@ -66,6 +66,7 @@ serde_json = { workspace = true }
 familyclaw-embeddings = { workspace = true }
 # Phase 4: kill-switch-reitti jäsentää ScheduledTaskId:n UUID-stringistä.
 uuid = { workspace = true }
+futures-util = "0.3"
 
 [dev-dependencies]
 # E2E suspend→approve→resume -testi rakentaa AIDON agentin skriptatulla LLM:llä
@@ -78,3 +79,4 @@ familyclaw-memory = { workspace = true }
 async-trait = { workspace = true }
 # Phase 4 kill-switch -reittitesti rakentaa ScheduledTaskin (interval = chrono::Duration).
 chrono = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
