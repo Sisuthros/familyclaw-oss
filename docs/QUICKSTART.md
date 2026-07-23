@@ -159,6 +159,24 @@ cargo test --workspace -- --test-threads=1
 ```
 (Some tests may need serial execution.)
 
+**Every turn returns "LLM-palveluihin ei saatu yhteyttä ... malli on mahdollisesti poistettu" (model retired upstream, HTTP 404)**
+- This means a configured model id (primary or a fallback) no longer exists
+  at the provider — the provider returned HTTP 404, or a 400 whose body says
+  the model/function id was not found (some OpenAI-compatible providers,
+  e.g. NVIDIA NIM, report a retired model this way instead of a real 404).
+  The failover chain treats this as **provider-dead**: it rotates to the
+  next configured provider/model immediately and puts the dead one on a long
+  cooldown (5 min/30 min/2 h/6 h — it will still retry it once in a while in
+  case the retirement was a false alarm).
+- Fix: check `FAMILYCLAW_PROVIDER_MODEL` (or your `ModelConfig`
+  `primary`/`fallbacks` list) against the provider's current model catalog,
+  and update it to a model id that still exists. If you have no configured
+  fallback, add one — a single-model chain has nowhere to fail over to.
+- Look for a `turn-provider:` log line (INFO level, one per turn) to see
+  which provider/model actually answered a given turn, how many failovers it
+  took, and the final error class if every provider failed — e.g.
+  `turn-provider: turn=42 model=none failovers=2 final_error_class=provider_not_found`.
+
 ---
 
 FamilyClaw: agents that remember, feel, dream, and think.

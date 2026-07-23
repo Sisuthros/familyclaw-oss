@@ -583,6 +583,15 @@ impl LlmClient {
     /// (for 429s), redacts the body on auth errors (401/403) to prevent
     /// key leaks, and delegates classification to the pure [`LlmError::from_status`],
     /// which is directly unit-testable without a network.
+    ///
+    /// **404 is redacted too, and never even read:** a retired-model 404
+    /// body has been observed (production incident) to embed an account
+    /// identifier. The status code alone is sufficient to classify
+    /// [`LlmError::NotFound`], so the body is never fetched for a 404 —
+    /// nothing to leak. A 400 body IS still read (needed to detect the
+    /// "model not found" phrasing some providers use instead of a real 404),
+    /// but its classification only ever surfaces the status code
+    /// downstream — see [`LlmError::redacted_status_line`].
     async fn error_from_response(response: reqwest::Response) -> LlmError {
         let status = response.status().as_u16();
         let retry_after = LlmError::parse_retry_after(
@@ -591,9 +600,10 @@ impl LlmClient {
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok()),
         );
-        // Redact body for auth errors to prevent API key leakage in logs.
-        let is_auth = status == 401 || status == 403;
-        let detail = if is_auth {
+        // Redact body for auth errors + 404 to prevent key/account-id leakage
+        // in logs (401/403: key leak; 404: observed account-id leak).
+        let is_sensitive = matches!(status, 401 | 403 | 404);
+        let detail = if is_sensitive {
             "[redacted]".to_string()
         } else {
             response.text().await.unwrap_or_default()
@@ -952,6 +962,19 @@ pub enum LlmError {
     /// wait with an escalating delay on the same provider instead of slamming
     /// through the whole chain. [Failover gap #1, step 1]
     Overloaded(String),
+    /// HTTP 404 — or a 400 whose body says the model/function id does not
+    /// exist upstream (some OpenAI-compatible providers, e.g. NVIDIA NIM,
+    /// return 400 instead of 404 for a retired model). **Provider-dead
+    /// signal, distinct from a transient outage:** the model itself has
+    /// been retired/renamed, so retrying the SAME model (even with a
+    /// different key) will never succeed. The failover layer
+    /// ([`crate::llm_chain::LlmFailover`]) rotates to the next entry
+    /// immediately (no key retry — the key isn't the problem) and cools
+    /// this entry down on the **long** (auth-style) ladder, since a retired
+    /// model will not come back within the short general ladder's 60s.
+    /// [Failover gap #1 — production incident: retired NIM model → 404 on
+    /// every call, chain did not rotate.]
+    NotFound(String),
     /// Response parsing failed
     Parse(String),
     /// No content in response
@@ -959,6 +982,53 @@ pub enum LlmError {
     /// A tool definition advertised to the model is malformed (bad name or
     /// non-object schema). Deterministic config error → **not** retryable.
     InvalidTool(String),
+}
+
+/// One-word, **non-sensitive** classification of an [`LlmError`] — safe to
+/// surface in a user-facing reply or a log line (never carries the raw
+/// provider response body, which can contain account identifiers — see the
+/// retired-model incident this exists for). Used both by the cooldown/
+/// rotation layer ([`crate::llm_chain::LlmFailover`]) and by the
+/// "why did this turn fail" messaging (`familyclaw_agent::agent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmFailureClass {
+    /// HTTP 429.
+    RateLimited,
+    /// HTTP 401/403.
+    AuthFailed,
+    /// HTTP 503/529.
+    Overloaded,
+    /// HTTP 404 (or a 400-shaped "model not found").
+    ProviderNotFound,
+    /// Request/connect timeout.
+    Timeout,
+    /// Generic HTTP/connection error.
+    Http,
+    /// The model produced no content/tool calls.
+    NoContent,
+    /// Response body failed to parse.
+    Parse,
+    /// A tool definition was malformed.
+    InvalidTool,
+}
+
+impl LlmFailureClass {
+    /// The one-word tag (stable — used both in logs and parsed back out of
+    /// the tagged error string in `familyclaw_agent::agent`).
+    #[must_use]
+    pub const fn as_word(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate_limited",
+            Self::AuthFailed => "auth_failed",
+            Self::Overloaded => "overloaded",
+            Self::ProviderNotFound => "provider_not_found",
+            Self::Timeout => "timeout",
+            Self::Http => "http_error",
+            Self::NoContent => "no_content",
+            Self::Parse => "parse_error",
+            Self::InvalidTool => "invalid_tool",
+        }
+    }
 }
 
 impl LlmError {
@@ -996,7 +1066,14 @@ impl LlmError {
             // still retryable so the chain proceeds (a cooldown layer comes later).
             | LlmError::RateLimited { .. }
             | LlmError::AuthFailed(_)
-            | LlmError::Overloaded(_) => true,
+            | LlmError::Overloaded(_)
+            // NotFound (provider-dead): retryable at the CHAIN level — a
+            // different model/provider entirely may still answer, and PASS 2
+            // (last resort) gives a transient false-404 one chance to
+            // self-heal. It is only "terminal" for THIS entry, which the
+            // cooldown layer expresses via a long cooldown, not via
+            // is_retryable.
+            | LlmError::NotFound(_) => true,
             // Parse + InvalidTool are deterministic: the same request would fail
             // identically, so do not grind the whole chain.
             LlmError::Parse(_) | LlmError::InvalidTool(_) => false,
@@ -1027,6 +1104,11 @@ impl LlmError {
             LlmError::Http(_)
             | LlmError::Timeout(_)
             | LlmError::AuthFailed(_)
+            // NotFound has no short "hint": the cooldown/rotation layer
+            // (llm_chain.rs) puts it straight on the long auth-style ladder
+            // instead of consulting this hint — a retired model won't come
+            // back in seconds.
+            | LlmError::NotFound(_)
             | LlmError::Parse(_)
             | LlmError::NoContent
             | LlmError::InvalidTool(_) => None,
@@ -1049,6 +1131,8 @@ impl LlmError {
     /// - 429 -> [`LlmError::RateLimited`] (with `retry_after`).
     /// - 401/403 -> [`LlmError::AuthFailed`] (key rotation signal).
     /// - 503/529 -> [`LlmError::Overloaded`] (provider overloaded).
+    /// - 404, or 400 whose body reads like "model not found" ->
+    ///   [`LlmError::NotFound`] (provider-dead signal — see its doc comment).
     /// - other -> [`LlmError::Http`].
     #[must_use]
     fn from_status(status: u16, detail: &str, retry_after: Option<u64>) -> Self {
@@ -1059,7 +1143,84 @@ impl LlmError {
             },
             401 | 403 => LlmError::AuthFailed(format!("HTTP {status}: {detail}")),
             503 | 529 => LlmError::Overloaded(format!("HTTP {status}: {detail}")),
+            404 => LlmError::NotFound(format!("HTTP 404: {detail}")),
+            400 if Self::looks_like_model_not_found(detail) => {
+                LlmError::NotFound(format!("HTTP 400: {detail}"))
+            }
             _ => LlmError::Http(format!("HTTP {status}: {detail}")),
+        }
+    }
+
+    /// Heuristic for the "model retired upstream" case some OpenAI-compatible
+    /// providers report as a 400 rather than a 404 (production incident:
+    /// NVIDIA NIM returns `400 {"...Function id ... not found..."}` for a
+    /// retired model id). Deliberately conservative — requires BOTH a
+    /// model/function-id mention AND a "not found"/"does not exist" phrase,
+    /// so an unrelated validation 400 (bad JSON, bad parameter) is not
+    /// misclassified as provider-dead.
+    #[must_use]
+    fn looks_like_model_not_found(detail: &str) -> bool {
+        let lower = detail.to_ascii_lowercase();
+        let mentions_model = lower.contains("model") || lower.contains("function id");
+        let mentions_missing = lower.contains("not found")
+            || lower.contains("not_found")
+            || lower.contains("does not exist")
+            || lower.contains("unknown model");
+        mentions_model && mentions_missing
+    }
+
+    /// Extracts the leading `HTTP <code>` prefix that this crate always puts
+    /// at the start of status-derived error messages (see [`Self::from_status`]).
+    /// `None` for error kinds that don't carry an HTTP status (e.g.
+    /// [`LlmError::Timeout`], [`LlmError::Parse`]) or whose message wasn't
+    /// built from `from_status` (e.g. [`LlmError::from_reqwest`]'s
+    /// non-"HTTP "-prefixed messages).
+    #[must_use]
+    fn http_status_code(&self) -> Option<u16> {
+        let msg: &str = match self {
+            LlmError::NotFound(m)
+            | LlmError::AuthFailed(m)
+            | LlmError::Overloaded(m)
+            | LlmError::Http(m) => m,
+            LlmError::RateLimited { message, .. } => message,
+            LlmError::Timeout(_)
+            | LlmError::Parse(_)
+            | LlmError::NoContent
+            | LlmError::InvalidTool(_) => return None,
+        };
+        let rest = msg.strip_prefix("HTTP ")?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    }
+
+    /// This [`LlmError`]'s [`LlmFailureClass`].
+    #[must_use]
+    pub const fn failure_class(&self) -> LlmFailureClass {
+        match self {
+            LlmError::RateLimited { .. } => LlmFailureClass::RateLimited,
+            LlmError::AuthFailed(_) => LlmFailureClass::AuthFailed,
+            LlmError::Overloaded(_) => LlmFailureClass::Overloaded,
+            LlmError::NotFound(_) => LlmFailureClass::ProviderNotFound,
+            LlmError::Timeout(_) => LlmFailureClass::Timeout,
+            LlmError::Http(_) => LlmFailureClass::Http,
+            LlmError::NoContent => LlmFailureClass::NoContent,
+            LlmError::Parse(_) => LlmFailureClass::Parse,
+            LlmError::InvalidTool(_) => LlmFailureClass::InvalidTool,
+        }
+    }
+
+    /// **Redacted status line** — `"HTTP <code>"` if the error carries a
+    /// status, otherwise the failure class's one word (e.g. `"timeout"`).
+    /// This is the ONLY representation of the error that a user-facing
+    /// message may include: it is built purely from the status code this
+    /// crate itself parsed off the wire, never from the provider's response
+    /// body (which can embed account identifiers — the incident this exists
+    /// for leaked one via a raw error body reaching a log/reply).
+    #[must_use]
+    pub fn redacted_status_line(&self) -> String {
+        match self.http_status_code() {
+            Some(code) => format!("HTTP {code}"),
+            None => self.failure_class().as_word().to_string(),
         }
     }
 
@@ -1103,6 +1264,7 @@ impl std::fmt::Display for LlmError {
             },
             LlmError::AuthFailed(msg) => write!(f, "Auth failed: {msg}"),
             LlmError::Overloaded(msg) => write!(f, "Provider overloaded: {msg}"),
+            LlmError::NotFound(msg) => write!(f, "Model/provider not found: {msg}"),
             LlmError::Parse(msg) => write!(f, "Parse error: {msg}"),
             LlmError::NoContent => write!(f, "No content in response"),
             LlmError::InvalidTool(msg) => write!(f, "Invalid tool definition: {msg}"),
@@ -1626,13 +1788,68 @@ mod tests {
 
     #[test]
     fn from_status_falls_back_to_http_for_other_codes() {
-        // 400/404/500 etc. do not belong to a specific class -> generic Http.
-        for code in [400_u16, 404, 418, 500, 502] {
+        // 400 (generic body, not "model not found")/418/500 etc. do not
+        // belong to a specific class -> generic Http. 404 is now its own
+        // class (NotFound) — see from_status_maps_404_to_not_found.
+        for code in [400_u16, 418, 500, 502] {
             assert!(
                 matches!(LlmError::from_status(code, "x", None), LlmError::Http(_)),
                 "status {code} should map to Http"
             );
         }
+    }
+
+    #[test]
+    fn from_status_maps_404_to_not_found() {
+        let e = LlmError::from_status(404, "[redacted]", None);
+        assert!(matches!(e, LlmError::NotFound(_)));
+        assert!(
+            e.is_retryable(),
+            "NotFound must stay retryable at chain level"
+        );
+        assert_eq!(e.failure_class(), LlmFailureClass::ProviderNotFound);
+        assert_eq!(e.redacted_status_line(), "HTTP 404");
+    }
+
+    #[test]
+    fn from_status_maps_400_model_not_found_body_to_not_found() {
+        // Production incident shape: NVIDIA NIM returns 400 with a body
+        // saying the function/model id is not found (not a real 404).
+        let e = LlmError::from_status(
+            400,
+            "Function id 'acct-abc123/retired-model' not found",
+            None,
+        );
+        assert!(matches!(e, LlmError::NotFound(_)));
+        assert_eq!(e.redacted_status_line(), "HTTP 400");
+    }
+
+    #[test]
+    fn from_status_400_without_not_found_wording_stays_generic_http() {
+        // An ordinary validation 400 (bad JSON, bad parameter) must NOT be
+        // misclassified as provider-dead.
+        let e = LlmError::from_status(400, "invalid request: max_tokens must be positive", None);
+        assert!(matches!(e, LlmError::Http(_)));
+    }
+
+    #[test]
+    fn redacted_status_line_never_contains_raw_body() {
+        // The whole point: even though the raw detail carries an
+        // account-shaped string, the redacted line only ever exposes the
+        // status code + class word.
+        let e = LlmError::from_status(404, "acct_9f8e7d6c5b4a leaked account id in body", None);
+        let line = e.redacted_status_line();
+        assert_eq!(line, "HTTP 404");
+        assert!(!line.contains("acct_9f8e7d6c5b4a"));
+    }
+
+    #[test]
+    fn redacted_status_line_falls_back_to_class_word_without_status() {
+        assert_eq!(
+            LlmError::Timeout("slow".into()).redacted_status_line(),
+            "timeout"
+        );
+        assert_eq!(LlmError::NoContent.redacted_status_line(), "no_content");
     }
 
     #[test]

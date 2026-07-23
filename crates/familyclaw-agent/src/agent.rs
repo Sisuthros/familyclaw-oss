@@ -48,7 +48,7 @@ use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::llm::{LlmConfig, LlmMessage, ToolCall, ToolDefinition};
+use crate::llm::{LlmConfig, LlmError, LlmFailureClass, LlmMessage, ToolCall, ToolDefinition};
 use crate::llm_chain::LlmFailover;
 use crate::resumable::{InMemoryResumableStore, ResumableTurn, ResumableTurnStore};
 use crate::soul::Soul;
@@ -1291,7 +1291,7 @@ impl Agent {
             return llm
                 .complete(messages)
                 .await
-                .map_err(|e| FamilyClawError::llm(e.to_string()));
+                .map_err(|e| FamilyClawError::llm(tag_llm_error(&e)));
         }
         let target = origin
             .map(familyclaw_bus::MessageOrigin::reply_target)
@@ -1299,7 +1299,7 @@ impl Agent {
         let mut stream = llm
             .complete_stream(messages)
             .await
-            .map_err(|e| FamilyClawError::llm(e.to_string()))?;
+            .map_err(|e| FamilyClawError::llm(tag_llm_error(&e)))?;
         let mut full = String::new();
         let emit_progress = should_emit_public_progress(origin);
         let mut last_progress = Instant::now();
@@ -1307,7 +1307,7 @@ impl Agent {
         let mut frame_idx = 0usize;
         let mut progress_gate = ProgressGate::new();
         while let Some(chunk) = stream.next().await {
-            let delta = chunk.map_err(|e| FamilyClawError::llm(e.to_string()))?;
+            let delta = chunk.map_err(|e| FamilyClawError::llm(tag_llm_error(&e)))?;
             full.push_str(&delta);
             if emit_progress
                 && last_progress.elapsed() >= PROGRESS_MIN_INTERVAL
@@ -1632,7 +1632,7 @@ impl Agent {
                     let result = llm
                         .complete_with_tools(&messages, &tools)
                         .await
-                        .map_err(|e| FamilyClawError::llm(e.to_string()))?;
+                        .map_err(|e| FamilyClawError::llm(tag_llm_error(&e)))?;
                     let mut content = result.content;
                     let mut tool_calls_opt = result.tool_calls;
                     let no_tools = tool_calls_opt.as_ref().is_none_or(Vec::is_empty);
@@ -1645,7 +1645,7 @@ impl Agent {
                         let retry = llm
                             .complete_with_tools_choice(&messages, &tools, Some("required"))
                             .await
-                            .map_err(|e| FamilyClawError::llm(e.to_string()))?;
+                            .map_err(|e| FamilyClawError::llm(tag_llm_error(&e)))?;
                         content = retry.content;
                         tool_calls_opt = retry.tool_calls;
                     }
@@ -2430,7 +2430,7 @@ impl Agent {
             let result = llm
                 .complete_with_tools(&messages, &tools)
                 .await
-                .map_err(|e| FamilyClawError::llm(e.to_string()))?;
+                .map_err(|e| FamilyClawError::llm(tag_llm_error(&e)))?;
 
             if !result.text().is_empty() {
                 last_text = result.text().to_string();
@@ -3320,7 +3320,7 @@ impl Agent {
                 Ok(pair) => pair,
                 Err(e) => {
                     warn!("think_actions_durable failed (non-fatal): {e}");
-                    (Some(recovery_fallback_reply()), None)
+                    (Some(recovery_fallback_reply_for_error(&e)), None)
                 }
             };
             suspend = susp;
@@ -3379,12 +3379,31 @@ impl Agent {
                 Ok(ThinkOutcome::NoReply) => None,
                 Err(e) => {
                     warn!("think failed (non-fatal): {e}");
-                    Some(recovery_fallback_reply())
+                    Some(recovery_fallback_reply_for_error(&e))
                 }
             }
         };
 
         self.clear_typing_heartbeat();
+
+        // Per-turn provider observability (deployment wishlist item, wired
+        // in alongside the failover gap #1 fix): one greppable INFO line per
+        // turn recording which provider/model produced the final answer (or
+        // "none" if the whole LLM chain failed), how many failovers it
+        // took, and the final error class on failure. Only emitted when this
+        // turn actually went through the LLM failover layer
+        // (`take_last_turn_summary` is `None` otherwise — e.g. a
+        // brief_ping/governor-filtered turn that never called an LLM).
+        if let Some(llm) = self.llm.as_ref() {
+            if let Some(summary) = llm.take_last_turn_summary() {
+                let model = summary.model.as_deref().unwrap_or("none");
+                let error_class = summary.final_error_class.unwrap_or("none");
+                info!(
+                    "turn-provider: turn={turn} model={model} failovers={} final_error_class={error_class}",
+                    summary.failovers
+                );
+            }
+        }
 
         // 5a½. Short-term memory: append the successful exchange (user → agent)
         //      to this conversation's history, so the NEXT turn sees the
@@ -3849,11 +3868,87 @@ fn session_tag_from_origin(origin: &MessageOrigin) -> String {
     format!("session:{}:{}", origin.channel_id, origin.conversation)
 }
 
-/// Generic user-visible fallback reply when the LLM/tool loop produces no text.
+/// Generic user-visible fallback reply when the LLM/tool loop produces no
+/// text. Kept for the **max-iterations** budget cutoff (the tool loop ran
+/// out of rounds without an answer — genuinely "the tool loop stopped", so
+/// this wording still applies there). For a **think-error** (the LLM chain
+/// itself failed), use [`recovery_fallback_reply_for_error`] instead — see
+/// its doc comment for why the two must not share one message.
 fn recovery_fallback_reply() -> String {
     "Anteeksi — en saanut vietyä pyyntöä loppuun (työkalu epäonnistui tai turvaraja täyttyi). \
      Yritä uudelleen tai kerro tarkemmin mitä tarvitset."
         .to_string()
+}
+
+/// Stable prefix marking a `FamilyClawError::Llm` message built by
+/// [`tag_llm_error`] — lets [`recovery_fallback_reply_for_error`] recover the
+/// LLM failure's REDACTED category (one-word class + status line) without
+/// carrying the original [`LlmError`] type across the several
+/// `Result<_, FamilyClawError>` call sites between the HTTP call and the
+/// think-error handler. Nothing after this prefix's two `|`-delimited fields
+/// is ever read by the user-facing path — only tracing/logs see the rest.
+const LLM_CLASS_TAG_PREFIX: &str = "llmclass:";
+
+/// Wraps an [`LlmError`] into the string carried by `FamilyClawError::Llm`:
+/// `"llmclass:<class>|<status line>|<full Display, for internal logs only>"`.
+/// The first two fields are built from [`LlmError::failure_class`] /
+/// [`LlmError::redacted_status_line`] — both REDACTED by construction (never
+/// the raw provider response body, which has been observed in production to
+/// leak an account identifier). The trailing `Display` is for
+/// `warn!("... failed (non-fatal): {e}")`-style internal logs, exactly as
+/// before this change; it is never surfaced to the user.
+fn tag_llm_error(e: &LlmError) -> String {
+    format!(
+        "{LLM_CLASS_TAG_PREFIX}{}|{}|{e}",
+        e.failure_class().as_word(),
+        e.redacted_status_line(),
+    )
+}
+
+/// Recovers `(class_word, redacted_status_line)` from a message built by
+/// [`tag_llm_error`]. `None` if `msg` wasn't tagged this way (e.g. an `Llm`
+/// error string built elsewhere, or a non-LLM error).
+fn parse_llm_class_tag(msg: &str) -> Option<(&str, &str)> {
+    let rest = msg.strip_prefix(LLM_CLASS_TAG_PREFIX)?;
+    let mut parts = rest.splitn(3, '|');
+    let class = parts.next()?;
+    let status_line = parts.next()?;
+    Some((class, status_line))
+}
+
+/// **Think-error** fallback reply (Failover gap #1 fix, item 2): the LLM
+/// chain itself failed this turn (every configured provider/model
+/// exhausted) — as opposed to [`recovery_fallback_reply`]'s max-iterations
+/// case (the tool loop ran the model successfully but hit its round budget).
+/// Previously BOTH cases returned the exact same generic
+/// "työkalu epäonnistui tai turvaraja täyttyi" string, which — during the
+/// incident this fixes (every NIM call 404ing) — told the operator "a tool
+/// failed / a safety limit was hit" when the true cause was "no LLM
+/// provider is reachable". This tells them which one it actually was.
+///
+/// **Redaction invariant:** the message below is built ONLY from the
+/// REDACTED `(class, status_line)` pair recovered via [`parse_llm_class_tag`]
+/// (itself sourced from [`LlmError::redacted_status_line`], which never
+/// reads the provider's response body) — never the raw error/body text. If
+/// `e` isn't a tagged LLM error (e.g. a bus/durable failure), this falls
+/// back to the generic [`recovery_fallback_reply`].
+fn recovery_fallback_reply_for_error(e: &FamilyClawError) -> String {
+    let FamilyClawError::Llm(msg) = e else {
+        return recovery_fallback_reply();
+    };
+    let Some((class, status_line)) = parse_llm_class_tag(msg) else {
+        return recovery_fallback_reply();
+    };
+    if class == LlmFailureClass::ProviderNotFound.as_word() {
+        return format!(
+            "LLM-palveluihin ei saatu yhteyttä (viimeisin virhe: {status_line} — malli on \
+             mahdollisesti poistettu). Tarkista FAMILYCLAW_PROVIDER_MODEL / provider-konfiguraatio."
+        );
+    }
+    format!(
+        "Anteeksi — en saanut vietyä pyyntöä loppuun (LLM-palveluvirhe: {status_line}). \
+         Yritä hetken kuluttua uudelleen tai tarkista provider-konfiguraatio."
+    )
 }
 
 /// Generic progress report derived from the tool name (OpenClaw/Hermes style).
@@ -5890,6 +5985,112 @@ mod tests {
             "max-iter ilman mallin tekstiä tuottaa varavastauksen, ei hiljaisuutta, sai: {out:?}"
         );
         bus.stop();
+    }
+
+    // ── Failover gap #1 fix, item 2: think-error messaging is split from
+    //    max-iterations, and never leaks a raw provider body/account id ────
+
+    /// (b) All providers 404 -> `recovery_fallback_reply_for_error` produces
+    /// a message that names the real cause (HTTP 404 / retired model) and
+    /// the config knob to check, but never the raw provider body — even
+    /// when that body contains something that looks like an account id
+    /// (the production incident this test guards against).
+    #[test]
+    fn provider_not_found_reply_names_cause_without_leaking_body() {
+        let raw = LlmError::NotFound(
+            "HTTP 404: {\"error\":\"Function id acct_9f8e7d6c5b4a not found\"}".to_string(),
+        );
+        let tagged = FamilyClawError::llm(tag_llm_error(&raw));
+
+        let reply = recovery_fallback_reply_for_error(&tagged);
+
+        assert!(
+            reply.contains("404"),
+            "reply should surface the status code: {reply}"
+        );
+        assert!(
+            reply.contains("FAMILYCLAW_PROVIDER_MODEL"),
+            "reply should point at the config knob: {reply}"
+        );
+        assert!(
+            !reply.contains("acct_9f8e7d6c5b4a"),
+            "reply must NEVER contain the raw provider body/account id: {reply}"
+        );
+        assert!(
+            !reply.contains("Function id"),
+            "reply must NEVER contain raw provider body text: {reply}"
+        );
+        assert_eq!(
+            reply,
+            "LLM-palveluihin ei saatu yhteyttä (viimeisin virhe: HTTP 404 — malli on \
+             mahdollisesti poistettu). Tarkista FAMILYCLAW_PROVIDER_MODEL / provider-konfiguraatio."
+        );
+    }
+
+    /// Think-error messaging must differ from the max-iterations message —
+    /// otherwise an LLM outage is still misreported as "a tool failed / a
+    /// safety limit was hit" (the exact bug this fix addresses).
+    #[test]
+    fn think_error_reply_differs_from_max_iterations_reply() {
+        let raw = LlmError::NotFound("HTTP 404: [redacted]".to_string());
+        let tagged = FamilyClawError::llm(tag_llm_error(&raw));
+        assert_ne!(
+            recovery_fallback_reply_for_error(&tagged),
+            recovery_fallback_reply()
+        );
+    }
+
+    /// Non-`ProviderNotFound` LLM failures (e.g. every provider timed out)
+    /// still get a distinguishable, redacted reply — never the raw body,
+    /// and never silently falling back to the max-iterations wording.
+    #[test]
+    fn other_llm_failure_classes_get_redacted_non_generic_reply() {
+        let raw = LlmError::Timeout("connect timed out after 10s to 10.0.0.5".to_string());
+        let tagged = FamilyClawError::llm(tag_llm_error(&raw));
+        let reply = recovery_fallback_reply_for_error(&tagged);
+        assert!(reply.contains("timeout"), "got: {reply}");
+        assert!(
+            !reply.contains("10.0.0.5"),
+            "reply must not leak raw error detail: {reply}"
+        );
+    }
+
+    /// A non-LLM `FamilyClawError` (e.g. a bus/durable failure) has no tag
+    /// to recover -> falls back to the existing generic reply rather than
+    /// panicking or fabricating a bogus LLM category.
+    #[test]
+    fn non_llm_error_falls_back_to_generic_reply() {
+        let e = FamilyClawError::bus("mailbox closed");
+        assert_eq!(
+            recovery_fallback_reply_for_error(&e),
+            recovery_fallback_reply()
+        );
+    }
+
+    /// `tag_llm_error` / `parse_llm_class_tag` round-trip for every
+    /// [`LlmFailureClass`] — the seam the think-error path depends on.
+    #[test]
+    fn llm_error_tag_round_trips_class_and_status_line() {
+        let cases: Vec<(LlmError, &str, &str)> = vec![
+            (
+                LlmError::NotFound("HTTP 404: x".into()),
+                "provider_not_found",
+                "HTTP 404",
+            ),
+            (
+                LlmError::AuthFailed("HTTP 401: [redacted]".into()),
+                "auth_failed",
+                "HTTP 401",
+            ),
+            (LlmError::Timeout("slow".into()), "timeout", "timeout"),
+            (LlmError::NoContent, "no_content", "no_content"),
+        ];
+        for (err, expected_class, expected_status_line) in cases {
+            let tagged = tag_llm_error(&err);
+            let (class, status_line) = parse_llm_class_tag(&tagged).expect("tagged message parses");
+            assert_eq!(class, expected_class);
+            assert_eq!(status_line, expected_status_line);
+        }
     }
 
     /// (f) **A tool requiring approval returns [`ThinkOutcome::Suspended`]

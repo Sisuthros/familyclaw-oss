@@ -40,7 +40,9 @@ use std::sync::{Arc, Mutex};
 use familyclaw_core::time::Timestamp;
 use familyclaw_core::{FamilyClawError, ModelConfig, Result};
 
-use crate::llm::{CompletionResult, LlmClient, LlmConfig, LlmError, LlmMessage, ToolDefinition};
+use crate::llm::{
+    CompletionResult, LlmClient, LlmConfig, LlmError, LlmFailureClass, LlmMessage, ToolDefinition,
+};
 
 /// Clock abstraction for failover decision logic (cooldown state machine, Layer B).
 ///
@@ -456,6 +458,30 @@ pub struct LlmFailover {
     /// Clock for decision logic (default [`SystemClock`]). Tests inject a
     /// fake clock via [`with_clock`](Self::with_clock).
     clock: Arc<dyn Clock>,
+    /// **Per-turn provider observability** (deployment wishlist item): the
+    /// outcome of the most recent `complete()`/`complete_with_tools_choice()`
+    /// call, consumed (cleared) by [`take_last_turn_summary`](Self::take_last_turn_summary)
+    /// so the agent boundary can log one "which provider actually answered
+    /// this turn" line without threading a new return type through every
+    /// caller. Safe under the same assumption the rest of this runtime
+    /// makes: one agent processes one turn at a time (actor model) — this is
+    /// not meant to attribute concurrent turns on the same chain.
+    last_turn: Mutex<Option<TurnProviderSummary>>,
+}
+
+/// Snapshot of "which provider/model produced the final answer this turn,
+/// and how many failovers it took" — see [`LlmFailover::last_turn`].
+#[derive(Debug, Clone, Default)]
+pub struct TurnProviderSummary {
+    /// `"provider/model"` that produced the final answer. `None` if every
+    /// chain entry failed this call.
+    pub model: Option<String>,
+    /// Number of failovers used (distinct chain entries tried BEYOND the
+    /// first one). `0` = the first entry tried answered directly.
+    pub failovers: usize,
+    /// One-word [`crate::llm::LlmFailureClass`] tag of the final error, if
+    /// every entry failed. `None` on success.
+    pub final_error_class: Option<&'static str>,
 }
 
 impl LlmFailover {
@@ -506,6 +532,7 @@ impl LlmFailover {
             }),
             primary,
             clock: Arc::new(SystemClock),
+            last_turn: Mutex::new(None),
         }
     }
 
@@ -645,6 +672,25 @@ impl LlmFailover {
                 Self::cool_provider(&mut state, &provider, now);
                 FailureStep::NextEntry(err)
             }
+        } else if matches!(err, LlmError::NotFound(_)) {
+            // Failover gap #1 fix (production incident: a retired NIM model
+            // returned 404 on every call, and the chain never rotated).
+            // HTTP 404 / "model not found" is a PROVIDER-DEAD signal, not an
+            // auth or transient-load signal: rotating the key would not
+            // help (the model id itself is gone upstream, not the
+            // credential), so move to the next entry IMMEDIATELY (no
+            // same-entry key retry) and put THIS entry on the LONG,
+            // auth-style ladder (5m/30m/2h/6h) — a retired model will not
+            // come back within the short general ladder's 60s starting rung.
+            // Reuses `auth_strike`/`AUTH_COOLDOWN_LADDER` (same escalation
+            // shape as the key-pool-exhausted case), but scoped to THIS
+            // entry only (unlike `cool_provider`, which cools every entry
+            // sharing the provider prefix): a 404 says the specific model id
+            // is gone, not necessarily every model behind that provider.
+            entry.health.auth_strike = entry.health.auth_strike.saturating_add(1);
+            let dur = Self::ladder_at(&Self::AUTH_COOLDOWN_LADDER, entry.health.auth_strike);
+            entry.health.cooled_until = Some(now + Self::chrono_dur(dur));
+            FailureStep::NextEntry(err)
         } else {
             // General retryable → escalating backoff for this entry.
             entry.health.strike = entry.health.strike.saturating_add(1);
@@ -700,6 +746,42 @@ impl LlmFailover {
         state.entries.get(idx).map(|e| e.client.clone())
     }
 
+    /// Records the outcome of a `complete()`/`complete_with_tools_choice()`
+    /// call for the per-turn observability line (see [`TurnProviderSummary`]
+    /// / [`Self::take_last_turn_summary`]). `success_idx` is the entry that
+    /// produced the final answer (`None` on total chain failure).
+    fn record_turn_summary(
+        &self,
+        success_idx: Option<usize>,
+        failovers: usize,
+        final_error_class: Option<&'static str>,
+    ) {
+        let model = success_idx.and_then(|idx| {
+            let state = self.state.lock().ok()?;
+            state
+                .entries
+                .get(idx)
+                .map(|e| format!("{}/{}", e.provider, e.template.model))
+        });
+        if let Ok(mut slot) = self.last_turn.lock() {
+            *slot = Some(TurnProviderSummary {
+                model,
+                failovers,
+                final_error_class,
+            });
+        }
+    }
+
+    /// Takes (clears) the most recent turn's provider summary — see
+    /// [`TurnProviderSummary`]. `None` if no `complete()`/
+    /// `complete_with_tools_choice()` call has completed since the last
+    /// read (or ever). Clearing on read prevents a stale summary from a
+    /// PREVIOUS turn being logged again if this turn made no LLM call.
+    #[must_use]
+    pub fn take_last_turn_summary(&self) -> Option<TurnProviderSummary> {
+        self.last_turn.lock().ok().and_then(|mut slot| slot.take())
+    }
+
     /// Tries `complete()` in a cooldown-aware way: PASS 1 healthy entries
     /// (entries cooling down are skipped), PASS 2 tries all entries as a last
     /// resort. Key rotation on an `AuthFailed` condition, escalating backoff
@@ -717,18 +799,25 @@ impl LlmFailover {
     /// empty.
     pub async fn complete(&self, messages: &[LlmMessage]) -> std::result::Result<String, LlmError> {
         let mut last_err: Option<LlmError> = None;
+        // Number of DISTINCT chain entries attempted so far this call — for
+        // the per-turn observability line ("failovers" = attempted - 1).
+        let mut attempted: usize = 0;
 
         // PASS 1: healthy entries (entries cooling down are skipped). The
         // snapshot is taken now; PASS 2's snapshot is taken only AFTER PASS 1
         // so it sees PASS 1's key switches.
         for (idx, mut client) in self.healthy_clients(self.clock.now()) {
+            attempted += 1;
             let mut tried_keys = std::collections::BTreeSet::new();
             loop {
                 match self
                     .try_entry_complete(idx, client, messages, &mut tried_keys)
                     .await
                 {
-                    Attempt::Ok(text) => return Ok(text),
+                    Attempt::Ok(text) => {
+                        self.record_turn_summary(Some(idx), attempted - 1, None);
+                        return Ok(text);
+                    }
                     Attempt::Failure(FailureStep::RetrySameEntry) => match self.client_at(idx) {
                         Some(c) => client = c,
                         None => break,
@@ -737,7 +826,14 @@ impl LlmFailover {
                         last_err = Some(e);
                         break;
                     }
-                    Attempt::Failure(FailureStep::Fatal(e)) => return Err(e),
+                    Attempt::Failure(FailureStep::Fatal(e)) => {
+                        self.record_turn_summary(
+                            None,
+                            attempted - 1,
+                            Some(e.failure_class().as_word()),
+                        );
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -746,13 +842,17 @@ impl LlmFailover {
         // the family never goes without an answer even if every entry cools
         // down.
         for (idx, mut client) in self.all_clients() {
+            attempted += 1;
             let mut tried_keys = std::collections::BTreeSet::new();
             loop {
                 match self
                     .try_entry_complete(idx, client, messages, &mut tried_keys)
                     .await
                 {
-                    Attempt::Ok(text) => return Ok(text),
+                    Attempt::Ok(text) => {
+                        self.record_turn_summary(Some(idx), attempted - 1, None);
+                        return Ok(text);
+                    }
                     Attempt::Failure(FailureStep::RetrySameEntry) => match self.client_at(idx) {
                         Some(c) => client = c,
                         None => break,
@@ -761,11 +861,24 @@ impl LlmFailover {
                         last_err = Some(e);
                         break;
                     }
-                    Attempt::Failure(FailureStep::Fatal(e)) => return Err(e),
+                    Attempt::Failure(FailureStep::Fatal(e)) => {
+                        self.record_turn_summary(
+                            None,
+                            attempted - 1,
+                            Some(e.failure_class().as_word()),
+                        );
+                        return Err(e);
+                    }
                 }
             }
         }
 
+        let final_class = last_err
+            .as_ref()
+            .map_or(LlmFailureClass::NoContent.as_word(), |e| {
+                e.failure_class().as_word()
+            });
+        self.record_turn_summary(None, attempted.saturating_sub(1), Some(final_class));
         Err(last_err.unwrap_or(LlmError::NoContent))
     }
 
@@ -834,9 +947,12 @@ impl LlmFailover {
         tool_choice: Option<&str>,
     ) -> std::result::Result<CompletionResult, LlmError> {
         let mut last_err: Option<LlmError> = None;
+        // See `complete()` — same per-turn observability bookkeeping.
+        let mut attempted: usize = 0;
 
         // PASS 1: healthy entries.
         for (idx, mut client) in self.healthy_clients(self.clock.now()) {
+            attempted += 1;
             let mut tried_keys = std::collections::BTreeSet::new();
             loop {
                 match self
@@ -850,7 +966,10 @@ impl LlmFailover {
                     )
                     .await
                 {
-                    Attempt::Ok(result) => return Ok(result),
+                    Attempt::Ok(result) => {
+                        self.record_turn_summary(Some(idx), attempted - 1, None);
+                        return Ok(result);
+                    }
                     Attempt::Failure(FailureStep::RetrySameEntry) => match self.client_at(idx) {
                         Some(c) => client = c,
                         None => break,
@@ -859,13 +978,21 @@ impl LlmFailover {
                         last_err = Some(e);
                         break;
                     }
-                    Attempt::Failure(FailureStep::Fatal(e)) => return Err(e),
+                    Attempt::Failure(FailureStep::Fatal(e)) => {
+                        self.record_turn_summary(
+                            None,
+                            attempted - 1,
+                            Some(e.failure_class().as_word()),
+                        );
+                        return Err(e);
+                    }
                 }
             }
         }
 
         // PASS 2 (last resort): all entries, ignoring cooldown.
         for (idx, mut client) in self.all_clients() {
+            attempted += 1;
             let mut tried_keys = std::collections::BTreeSet::new();
             loop {
                 match self
@@ -879,7 +1006,10 @@ impl LlmFailover {
                     )
                     .await
                 {
-                    Attempt::Ok(result) => return Ok(result),
+                    Attempt::Ok(result) => {
+                        self.record_turn_summary(Some(idx), attempted - 1, None);
+                        return Ok(result);
+                    }
                     Attempt::Failure(FailureStep::RetrySameEntry) => match self.client_at(idx) {
                         Some(c) => client = c,
                         None => break,
@@ -888,11 +1018,24 @@ impl LlmFailover {
                         last_err = Some(e);
                         break;
                     }
-                    Attempt::Failure(FailureStep::Fatal(e)) => return Err(e),
+                    Attempt::Failure(FailureStep::Fatal(e)) => {
+                        self.record_turn_summary(
+                            None,
+                            attempted - 1,
+                            Some(e.failure_class().as_word()),
+                        );
+                        return Err(e);
+                    }
                 }
             }
         }
 
+        let final_class = last_err
+            .as_ref()
+            .map_or(LlmFailureClass::NoContent.as_word(), |e| {
+                e.failure_class().as_word()
+            });
+        self.record_turn_summary(None, attempted.saturating_sub(1), Some(final_class));
         Err(last_err.unwrap_or(LlmError::NoContent))
     }
 
@@ -975,6 +1118,7 @@ pub fn build_llm_chain_with_clock(
         state: Mutex::new(FailoverState { entries }),
         primary,
         clock,
+        last_turn: Mutex::new(None),
     })
 }
 
@@ -1167,6 +1311,7 @@ mod tests {
             }),
             primary: String::new(),
             clock: Arc::new(SystemClock),
+            last_turn: Mutex::new(None),
         };
         assert!(failover.is_empty());
         let err = failover
@@ -1190,7 +1335,8 @@ mod cooldown_tests {
     use familyclaw_core::ModelConfig;
 
     use super::{
-        build_llm_chain_with_clock, Clock, EnvEndpointResolver, LlmError, LlmFailover, LlmMessage,
+        build_llm_chain_with_clock, Clock, EnvEndpointResolver, LlmError, LlmFailover,
+        LlmFailureClass, LlmMessage,
     };
 
     /// Controllable fake clock for determinism: time is stepped over the
@@ -1467,6 +1613,99 @@ mod cooldown_tests {
         assert_eq!(out, "a-ok");
         assert_eq!(a.total_calls(), 2, "a: PASS1 429 + PASS2 200");
         assert_eq!(b.total_calls(), 1, "b: PASS1 429 only (PASS2 stops at a)");
+    }
+
+    // ── Failover gap #1 fix: HTTP 404 / "model not found" = provider-dead ──
+
+    #[tokio::test]
+    async fn not_found_rotates_to_fallback_and_cools_long_not_short() {
+        // Failover gap #1 fix (production incident: a retired NIM model
+        // returned HTTP 404 on every call, and the chain never rotated —
+        // every retry hit the same dead model and the turn failed within
+        // seconds). A 404 must NOT behave like a 429 (60s general rung): it
+        // must rotate to the next provider IMMEDIATELY, and the dead entry
+        // must cool down on the LONG auth-style ladder (5 min first rung),
+        // so it stays skipped well past the 60s general-ladder window a
+        // retired model will never recover from.
+        let primary = MockLlm::spawn(vec![Reply::status(404)], None);
+        let fallback = MockLlm::spawn(vec![Reply::ok("from-fallback")], None);
+        let clock = FixedClock::at(1000);
+
+        let resolver = EnvEndpointResolver::new()
+            .with_provider("pa", primary.base_url.clone(), "K_UNSET_A")
+            .with_provider("pb", fallback.base_url.clone(), "K_UNSET_B");
+        let model = ModelConfig::new("pa/m").with_fallback("pb/m");
+        let failover =
+            build_llm_chain_with_clock(&model, &resolver, dyn_clock(&clock)).expect("builds");
+
+        let out = failover.complete(&msgs()).await.expect("fallback answers");
+        assert_eq!(out, "from-fallback");
+        // Exactly one rotation: primary tried once (404, no same-entry key
+        // retry — a 404 isn't a key problem), fallback tried once (200).
+        assert_eq!(
+            primary.total_calls(),
+            1,
+            "primary tried exactly once — no key-pool retry on a 404"
+        );
+        assert_eq!(fallback.total_calls(), 1);
+
+        // Per-turn observability (deployment wishlist item): one failover,
+        // the fallback's "provider/model" recorded, no error.
+        let summary = failover
+            .take_last_turn_summary()
+            .expect("summary recorded after complete()");
+        assert_eq!(
+            summary.failovers, 1,
+            "exactly one failover: primary -> fallback"
+        );
+        assert_eq!(summary.model.as_deref(), Some("pb/m"));
+        assert!(summary.final_error_class.is_none());
+
+        // Step the clock past the SHORT general ladder's first rung (60s)
+        // but still well within the LONG auth-style ladder's first rung
+        // (300s). If the primary had been (incorrectly) cooled on the short
+        // ladder, it would already be healthy again and PASS 1 would retry
+        // it here.
+        clock.advance(120);
+        let out2 = failover.complete(&msgs()).await;
+        assert!(out2.is_ok(), "fallback still answers");
+        assert_eq!(
+            primary.total_calls(),
+            1,
+            "primary must stay cooled past the short ladder's window (long ladder in effect)"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_providers_not_found_surfaces_provider_not_found_class() {
+        // (b) All providers return 404 -> the chain's final error is
+        // LlmError::NotFound / LlmFailureClass::ProviderNotFound (not a
+        // generic Http), and the turn summary reports it — this is what
+        // the agent-level user message (recovery_fallback_reply_for_error)
+        // keys off of.
+        let a = MockLlm::spawn(vec![Reply::status(404)], None);
+        let b = MockLlm::spawn(vec![Reply::status(404)], None);
+        let clock = FixedClock::at(1000);
+        let resolver = EnvEndpointResolver::new()
+            .with_provider("pa", a.base_url.clone(), "KA")
+            .with_provider("pb", b.base_url.clone(), "KB");
+        let model = ModelConfig::new("pa/m").with_fallback("pb/m");
+        let failover =
+            build_llm_chain_with_clock(&model, &resolver, dyn_clock(&clock)).expect("builds");
+
+        let err = failover
+            .complete(&msgs())
+            .await
+            .expect_err("all dead -> error, not hang");
+        assert!(matches!(err, LlmError::NotFound(_)));
+        assert_eq!(err.failure_class(), LlmFailureClass::ProviderNotFound);
+        assert_eq!(err.redacted_status_line(), "HTTP 404");
+
+        let summary = failover
+            .take_last_turn_summary()
+            .expect("summary recorded even on total failure");
+        assert!(summary.model.is_none());
+        assert_eq!(summary.final_error_class, Some("provider_not_found"));
     }
 
     // ── Key-pool rotation on AuthFailed ─────────────────────────────────────
