@@ -159,7 +159,7 @@ cargo test --workspace -- --test-threads=1
 ```
 (Some tests may need serial execution.)
 
-**Every turn returns "LLM-palveluihin ei saatu yhteyttä ... malli on mahdollisesti poistettu" (model retired upstream, HTTP 404)**
+**Every turn returns "LLM-palveluihin ei saatu yhteyttä ... malli on mahdollisesti poistettu" (EN: "could not connect to LLM services ... the model may have been removed") (model retired upstream, HTTP 404)**
 - This means a configured model id (primary or a fallback) no longer exists
   at the provider — the provider returned HTTP 404, or a 400 whose body says
   the model/function id was not found (some OpenAI-compatible providers,

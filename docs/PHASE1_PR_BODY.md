@@ -27,7 +27,7 @@ readiness sprint — it is hardening, tests, CI hygiene, and doc truth-correctio
 
 ## Recent release-readiness commits
 
-- `ce7d750` — `fix(discord): reititä lähtevä viesti message.target-snowflakeen`
+- `ce7d750` — `fix(discord): reititä lähtevä viesti message.target-snowflakeen` (EN: `fix(discord): route outbound message to the message.target snowflake`)
   (outbound `send()` uses `OutboundMessage.target` first so DM replies route to the
   DM channel instead of the guild channel; falls back to `target_channel_id` for
   webhook / bus-pump instances).
@@ -86,7 +86,7 @@ Failing jobs in that run:
 
 1. **`cargo audit`** — failing at step `Run cargo audit`.
 2. **`MSRV (1.85)`** — failing at step `cargo check --workspace`.
-3. **`Test (all features)`** — failing at step `cargo test (kaikki elävät featuret)`.
+3. **`Test (all features)`** — failing at step `cargo test (kaikki elävät featuret)` (EN: "cargo test (all live features)").
 
 Known triage context:
 
