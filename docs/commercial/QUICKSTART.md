@@ -266,6 +266,19 @@ operaattorin hyväksyntäpinta valmis — GET /approvals/pending, POST /approval
 gateway kuuntelee — /healthz ja /readyz valmiina bound=127.0.0.1:8787
 ```
 
+English translation of the log lines above (the gateway binary itself still
+emits these strings in Finnish today — this is a source-language item
+tracked in `crates/familyclaw-gateway`, not something this doc can fix):
+
+```
+familyclaw-gateway starting addr=127.0.0.1:8787
+channel-less publish mode (FAMILYCLAW_CHANNEL_KIND=none) — MockChannel, no family keys
+scheduled dream task active interval_secs=21600
+FamilyRuntime running (bus + agent + channel)
+operator approval surface ready — GET /approvals/pending, POST /approvals/{id}/approve
+gateway listening — /healthz and /readyz ready bound=127.0.0.1:8787
+```
+
 (Log lines are in Finnish — internal dev logging language; this is
 cosmetic, not a functional gap, and would be trivial to make configurable
 if a buyer asked. Noted here for full honesty rather than hidden.)

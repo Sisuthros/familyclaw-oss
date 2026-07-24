@@ -24,8 +24,8 @@ second and exits `0` only if all seven capabilities actually happened.
 | ① | **Resonance bus + two named agents** | Alice & Bob are `spawn()`ed as real actors; `bus.beings()` reports 2 registered beings. |
 | ② | **Shared memory** | Alice speaks; Bob runs the turn and stores it; Bob then *recalls* Alice's words (printed with relevance). |
 | ③ | **Emotion contagion** | Bob's `Joy` is printed **before** (0.0) and **after** (~19) Alice's joy pulse — the rise is asserted. |
-| ④ | **Dream consolidation** | A dream cycle merges two identical greetings (active count 3 → 2) **and** grounds a relative date: `"eilen"` → `"eilen (2026-07-02)"`. Both before/after strings are printed. |
-| ⑤ | **Next-day different behavior** | The **same** query (`"perhe sää"`) returns a **different** top memory on day 1 vs day 8 — the whole point. |
+| ④ | **Dream consolidation** | A dream cycle merges two identical greetings (active count 3 → 2) **and** grounds a relative date: `"eilen"` (EN: "yesterday") → `"eilen (2026-07-02)"`. Both before/after strings are printed. |
+| ⑤ | **Next-day different behavior** | The **same** query (`"perhe sää"`, EN: "family weather") returns a **different** top memory on day 1 vs day 8 — the whole point. |
 | ⑥ | **Identity anchor survives decay** | Raw Ebbinghaus retention is printed: trivia `1.00 → 0.12` (Fast), anchor `1.00 → 1.00` (ProtectedCore). |
 | ⑦ | **Deterministic, one command, no keys** | You just ran it yourself. |
 
@@ -38,8 +38,8 @@ Bob starts day 1 with two memories that both match the day's small-talk query
 - **anchor** — his mission (`ProtectedCore`, never decays), matches only `perhe`.
 
 ```
-DAY 1 → top memory: "Tänään perhe jutteli säästä ja grillasi yhdessä."   (the chatter wins)
-DAY 8 → top memory: "Perhe on se, jonka takia rakennan tätä maailmaa."   (the anchor wins)
+DAY 1 → top memory: "Tänään perhe jutteli säästä ja grillasi yhdessä."   (EN: "Today the family chatted about the weather and grilled together." — the chatter wins)
+DAY 8 → top memory: "Perhe on se, jonka takia rakennan tätä maailmaa."   (EN: "Family is the reason I'm building this world." — the anchor wins)
 ```
 
 Nothing was rewritten by hand between the two days. The *same* retrieval engine
@@ -57,7 +57,7 @@ holds at `1.00`. Bob literally woke up **more himself**.
 
 ② Shared memory: Alice tells Bob something, Bob remembers it
    ✓ Bob stored the message — Bob now holds 1 memory/-ies
-   query "perhe" → top: "Perustimme perheen tänään …"  (relevance 0.111)
+   query "perhe" → top: "Perustimme perheen tänään …"  (EN: "We founded the family today …") (relevance 0.111)
 
 ③ Emotion contagion: Alice's joy raises Bob's mood (before → after)
    Bob BEFORE : joy = 0.0, curiosity = 4.5
@@ -67,12 +67,12 @@ holds at `1.00`. Bob literally woke up **more himself**.
 ④ Dream consolidation: merge duplicates + absolutize relative dates
    ✓ duplicate greeting merged (report.merged = 1); active memories: 3 → 2
    ✓ relative date grounded to an absolute calendar date:
-       before: "Bob liittyi busiin eilen …"
-       after : "Bob liittyi busiin eilen (2026-07-02) …"
+       before: "Bob liittyi busiin eilen …"    (EN: "Bob joined the bus yesterday …")
+       after : "Bob liittyi busiin eilen (2026-07-02) …"    (EN: "Bob joined the bus yesterday (2026-07-02) …")
 
 ⑤ Next day: the SAME question gets a DIFFERENT answer
-   DAY 1 → top: "Tänään perhe jutteli säästä ja grillasi yhdessä."
-   DAY 8 → top: "Perhe on se, jonka takia rakennan tätä maailmaa."
+   DAY 1 → top: "Tänään perhe jutteli säästä ja grillasi yhdessä."   (EN: "Today the family chatted about the weather and grilled together.")
+   DAY 8 → top: "Perhe on se, jonka takia rakennan tätä maailmaa."   (EN: "Family is the reason I'm building this world.")
 
 ⑥ Identity anchor survives Ebbinghaus decay; trivia fades
    ANCHOR (ProtectedCore)   retention day1 = 1.00 → day8 = 1.00
@@ -80,6 +80,14 @@ holds at `1.00`. Bob literally woke up **more himself**.
 ```
 
 ## Notes on honesty
+
+- **Sample dialogue is still Finnish at the source.** The underlying demo
+  binary (`crates/familyclaw-agent`, out of scope for this docs pass) currently
+  prints its sample memory/dialogue strings in Finnish. English translations
+  are given inline above next to every quoted line so this doc is readable
+  without knowing Finnish; the quoted originals are left untouched because
+  they are real, verified program output (see the top of this file), not a
+  paraphrase.
 
 - **Date grounding, not deletion.** The dream cycle *keeps* the human word and
   appends the resolved calendar date (`"eilen"` → `"eilen (2026-07-02)"`), so a
