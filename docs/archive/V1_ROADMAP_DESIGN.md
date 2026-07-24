@@ -1,4 +1,4 @@
-> **SUPERSEDED** — Arkistoitu suunnitelmadokumentti. Aktiivinen strategia: [MASTERPLAN.md](../../MASTERPLAN.md).
+> **SUPERSEDED** — Archived planning document. Active strategy: [MASTERPLAN.md](../../MASTERPLAN.md).
 
 ---
 
@@ -41,7 +41,7 @@ secondarily **(1)** the home of an AI family who extend it themselves. General-p
 adoptable, safe real work — family autonomy is a consequence, not the optimization target.
 
 **Hard constraints (non-negotiable):**
-- **Köyhyys (poverty):** only free / already-paid resources. No per-token paid APIs in
+- **Poverty constraint (no paid resources):** only free / already-paid resources. No per-token paid APIs in
   defaults/crons. Embeddings must be **local** (no embedding API).
 - **Layer A / Layer B wall:** OSS crates contain no private souls, family names, keys, webhook
   URLs, private paths, SOUL.md, calibration data. Enforced by `scripts/audit-layer-b.sh` + CI.
@@ -151,7 +151,7 @@ inserted to de-risk infrastructure blockers before they poison a phase mid-fligh
 - **Alternatives:** `ort` as default (rejected: zero onnx presence; `deny.toml` lacks onnxruntime
   license; wasmtime precedent is pure-Rust-from-source, NOT a native C++ link; per-phase MSVC+deny
   gate fails as written); adopt eternal-thread (rejected: broken, 12 vs 89 tests); revive SurrealDB
-  (rejected: dead feature, RocksDB/Docker vs köyhyys); hosted API (rejected: violates köyhyys+local).
+  (rejected: dead feature, RocksDB/Docker vs the poverty constraint); hosted API (rejected: violates the poverty constraint + local-only).
 - **Objections (Guardian blocker, Skeptic major, UA minor):** ort-as-default unverified on MSVC,
   trips deny; recall improvement asserted without benchmark; default-mock + naive `semantic_weight>0`
   silently does cosine-over-noise.
@@ -162,7 +162,7 @@ inserted to de-risk infrastructure blockers before they poison a phase mid-fligh
 
 ### D5 — Scheduling: minimal interval-only `familyclaw-scheduler`; cron deferred
 - **Alternatives:** reuse durable substrate for timers (rejected: conflates replay-journal with
-  timer); heavy cron crate (rejected: köyhyys); two bespoke loops (rejected: duplication).
+  timer); heavy cron crate (rejected: violates the poverty constraint); two bespoke loops (rejected: duplication).
 - **Objections (Skeptic+Guardian minor, UA minor):** crate + cron parser for N=1 consumer is
   gold-plating; proactive tasks act "as" a family member without consent/visibility + flood the
   approval queue on a timer.
@@ -172,7 +172,7 @@ inserted to de-risk infrastructure blockers before they poison a phase mid-fligh
 
 ### D6 — Observability: span tree + turn audit; minimal sink folded into Phase 1
 - **Alternatives:** wire a new subscriber (rejected: already present `main.rs:630`); Datadog/OTLP
-  default (rejected: köyhyys — off-by-default feature seam only); keep all observability after
+  default (rejected: violates the poverty constraint — off-by-default feature seam only); keep all observability after
   Phase 1 (rejected: design's own logic says a tool loop is untrustworthy without turn audit).
 - **Objections (UA major, Skeptic minor, Guardian minor):** folding observability AFTER Phase 1
   means the riskiest keystone merges under-observed and is debugged blind during its own
