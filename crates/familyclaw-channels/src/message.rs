@@ -38,6 +38,8 @@ pub enum ChannelKind {
     Discord,
     /// Telegram (adapter behind the `telegram` feature; HTTP Bot API).
     Telegram,
+    /// Slack (adapter behind the `slack` feature; Web API `chat.postMessage` + inject).
+    Slack,
     /// `WhatsApp` — enum variant only; `whatsapp` feature is reserved / not implemented.
     // Explicit rename so the serde form matches `as_str()`'s value
     // ("whatsapp"); `snake_case` would otherwise produce "whats_app".
@@ -56,6 +58,7 @@ impl ChannelKind {
         match self {
             Self::Discord => "discord",
             Self::Telegram => "telegram",
+            Self::Slack => "slack",
             Self::WhatsApp => "whatsapp",
             Self::Signal => "signal",
             Self::Mock => "mock",
@@ -299,12 +302,14 @@ mod tests {
     fn channel_kind_str_and_sdk_flag() {
         assert_eq!(ChannelKind::Discord.as_str(), "discord");
         assert_eq!(ChannelKind::Telegram.as_str(), "telegram");
+        assert_eq!(ChannelKind::Slack.as_str(), "slack");
         assert_eq!(ChannelKind::WhatsApp.as_str(), "whatsapp");
         assert_eq!(ChannelKind::Signal.as_str(), "signal");
         assert_eq!(ChannelKind::Mock.as_str(), "mock");
         assert_eq!(ChannelKind::Discord.to_string(), "discord");
 
         assert!(ChannelKind::Discord.requires_external_sdk());
+        assert!(ChannelKind::Slack.requires_external_sdk());
         assert!(!ChannelKind::Mock.requires_external_sdk());
     }
 
@@ -323,6 +328,7 @@ mod tests {
         for kind in [
             ChannelKind::Discord,
             ChannelKind::Telegram,
+            ChannelKind::Slack,
             ChannelKind::WhatsApp,
             ChannelKind::Signal,
             ChannelKind::Mock,

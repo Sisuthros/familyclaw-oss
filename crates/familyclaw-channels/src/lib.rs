@@ -10,8 +10,8 @@
 //!   [`Channel::channel_id`], [`Channel::kind`]. Dyn-compatible
 //!   (`Box<dyn Channel>`).
 //! - [`InboundEnvelope`] — a canonicalized, origin-aware envelope.
-//! - [`ChannelKind`] — Discord / Telegram / `WhatsApp` / Signal / Mock.
-//!   **Implemented adapters:** Discord and Telegram (behind feature flags).
+//! - [`ChannelKind`] — Discord / Telegram / Slack / `WhatsApp` / Signal / Mock.
+//!   **Implemented adapters:** Discord, Telegram, and Slack (behind feature flags).
 //!   **`whatsapp` / `signal` features are reserved empty flags** — no adapter
 //!   source yet; enabling them does not add an implementation.
 //! - [`OutboundMessage`] / [`InboundMessage`] / [`InboundEnvelope`] —
@@ -22,13 +22,11 @@
 //! ## Channel adapters are behind feature flags
 //! Real adapters (e.g. **serenity** for Discord, HTTP Bot API for Telegram)
 //! pull in heavy channel SDKs. That's why they sit behind the crate's
-//! feature flags (`discord`, `telegram`, `whatsapp`, `signal`) rather than
-//! being mandatory dependencies. The default build contains **only** the
+//! feature flags (`discord`, `telegram`, `slack`, `whatsapp`, `signal`) rather
+//! than being mandatory dependencies. The default build contains **only** the
 //! core + [`MockChannel`], so the platform builds and tests without
 //! network access or heavy SDKs. `whatsapp` and `signal` are **reserved /
-//! not implemented** (empty feature flags). Each adapter's concrete SDK
-//! dependencies are added to that feature's `[dependencies]` section only
-//! once the adapter is implemented.
+//! not implemented** (empty feature flags).
 //!
 //! ## OSS boundary (Layer A)
 //! This crate does not hardcode channel tokens, Discord/Telegram
@@ -71,6 +69,9 @@ mod discord_interactions;
 #[cfg(feature = "telegram")]
 mod telegram;
 
+#[cfg(feature = "slack")]
+mod slack;
+
 pub use channel::{Channel, MessageStream, SendFuture};
 pub use error::{ChannelError, ChannelResult};
 pub use message::{ChannelKind, InboundEnvelope, InboundMessage, OutboundKind, OutboundMessage};
@@ -87,6 +88,9 @@ pub use discord_interactions::{
 
 #[cfg(feature = "telegram")]
 pub use telegram::TelegramChannel;
+
+#[cfg(feature = "slack")]
+pub use slack::{SlackChannel, TOKEN_ENV as SLACK_TOKEN_ENV};
 
 /// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]

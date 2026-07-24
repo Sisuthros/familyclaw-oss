@@ -1,6 +1,6 @@
 [package]
 name = "familyclaw-channels"
-description = "Unified messaging channel abstraction; Discord and Telegram adapters implemented; WhatsApp/Signal features reserved (empty flags, not implemented)"
+description = "Unified messaging channel abstraction; Discord, Telegram, and Slack adapters implemented; WhatsApp/Signal features reserved (empty flags)"
 version.workspace = true
 edition = "2021"
 license.workspace = true
@@ -48,6 +48,7 @@ serenity = { version = "0.12", default-features = false, features = [
 default = []
 discord = ["dep:reqwest", "dep:ed25519-dalek", "dep:serenity"]
 telegram = ["dep:reqwest"]
+slack = ["dep:reqwest"]
 # Reserved / not implemented — empty flags so the names are reserved; no adapter source yet.
 whatsapp = []
 signal = []
