@@ -16,7 +16,7 @@ use axum::response::{Html, IntoResponse, Response};
 use futures_util::stream;
 use serde::Deserialize;
 
-use crate::{constant_time_eq, GatewayState};
+use crate::{check_inject_auth, GatewayState};
 
 /// Query parameters accepted by the `EventSource` endpoint.
 #[derive(Deserialize)]
@@ -92,17 +92,15 @@ fn console_events_authorized(
     headers: &HeaderMap,
     query_token: Option<&str>,
 ) -> bool {
-    let Some(expected) = state.inject_token.as_deref() else {
-        return true;
-    };
-    let header_token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim);
-
-    header_token.is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
-        || query_token.is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+    let mut headers = headers.clone();
+    if headers.get(axum::http::header::AUTHORIZATION).is_none() {
+        if let Some(token) = query_token.filter(|t| !t.is_empty()) {
+            if let Ok(value) = format!("Bearer {token}").parse() {
+                headers.insert(axum::http::header::AUTHORIZATION, value);
+            }
+        }
+    }
+    check_inject_auth(state, &headers).is_ok()
 }
 
 #[cfg(test)]

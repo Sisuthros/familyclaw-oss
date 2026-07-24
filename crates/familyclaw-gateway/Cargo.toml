@@ -54,7 +54,7 @@ familyclaw-observability = { workspace = true }
 # wasmtime-featurea (vain NoopSandbox); gatewayn `wasmtime`-passthrough kytkee
 # oikean backendin tarvittaessa.
 familyclaw-sandbox = { workspace = true }
-familyclaw-channels = { workspace = true, features = ["telegram", "discord"] }
+familyclaw-channels = { workspace = true, features = ["telegram", "discord", "slack"] }
 tokio = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
@@ -67,6 +67,7 @@ familyclaw-embeddings = { workspace = true }
 # Phase 4: kill-switch-reitti jäsentää ScheduledTaskId:n UUID-stringistä.
 uuid = { workspace = true }
 futures-util = "0.3"
+jsonwebtoken = { version = "9.3", default-features = true, features = ["use_pem"] }
 
 [dev-dependencies]
 # E2E suspend→approve→resume -testi rakentaa AIDON agentin skriptatulla LLM:llä

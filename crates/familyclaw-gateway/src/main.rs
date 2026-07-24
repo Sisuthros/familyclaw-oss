@@ -111,11 +111,12 @@ use familyclaw_bus::{BeingId, BusHandle, BusMessage};
 use tokio::sync::Mutex;
 mod config;
 mod console;
+mod oidc;
 mod readiness;
 use config::FamilyConfig;
 use familyclaw_channels::{
     verify_signature, Channel, ChannelKind, ChannelResult, DiscordChannel, DiscordInteraction,
-    InboundMessage, MessageStream, OutboundMessage, SendFuture, TelegramChannel,
+    InboundMessage, MessageStream, OutboundMessage, SendFuture, SlackChannel, TelegramChannel,
     RESPONSE_DEFERRED_CHANNEL_MESSAGE, RESPONSE_PONG,
 };
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
@@ -400,27 +401,62 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 ///
 /// Note: the return type is `std::result::Result` explicitly, because
 /// within this crate's scope `Result` refers to the [`familyclaw_core::Result`] alias.
-fn check_inject_auth(
+/// Process-wide OIDC validator installed by [`serve`] (avoids threading the
+/// handle through every test `GatewayState` fixture).
+static OIDC_VALIDATOR: std::sync::Mutex<Option<std::sync::Arc<oidc::OidcValidator>>> =
+    std::sync::Mutex::new(None);
+
+fn install_oidc_validator(validator: Option<std::sync::Arc<oidc::OidcValidator>>) {
+    let mut guard = OIDC_VALIDATOR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = validator;
+}
+
+fn oidc_validator() -> Option<std::sync::Arc<oidc::OidcValidator>> {
+    OIDC_VALIDATOR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+pub(crate) fn check_inject_auth(
     state: &GatewayState,
     headers: &HeaderMap,
 ) -> std::result::Result<(), StatusCode> {
-    let Some(expected) = state.inject_token.as_deref() else {
-        // No token configured → open default (loopback-only).
-        return Ok(());
-    };
-    // Parse `Authorization: Bearer <token>` — missing/invalid header = 401.
     let presented = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(str::trim);
-    match presented {
-        Some(tok) if constant_time_eq(tok.as_bytes(), expected.as_bytes()) => Ok(()),
-        _ => {
-            tracing::warn!("inject: rejected 401 — missing or wrong bearer token");
-            Err(StatusCode::UNAUTHORIZED)
+
+    let static_token = state.inject_token.as_deref();
+    let oidc = oidc_validator();
+
+    // No static token and no OIDC → open loopback-only default.
+    if static_token.is_none() && oidc.is_none() {
+        return Ok(());
+    }
+
+    let Some(tok) = presented else {
+        tracing::warn!("inject: rejected 401 — missing bearer token");
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    if let Some(expected) = static_token {
+        if constant_time_eq(tok.as_bytes(), expected.as_bytes()) {
+            return Ok(());
         }
     }
+
+    if let Some(validator) = oidc.as_ref() {
+        if validator.validate_sync(tok).is_ok() {
+            return Ok(());
+        }
+    }
+
+    tracing::warn!("inject: rejected 401 — wrong bearer / jwt");
+    Err(StatusCode::UNAUTHORIZED)
 }
 
 /// Optional operator RBAC (`FAMILYCLAW_OPERATOR_ACL=1`) on top of bearer auth.
@@ -1510,7 +1546,7 @@ async fn start_runtime(
         let dc_arc = Arc::new(dc);
         let ch: Box<dyn Channel> = Box::new(SharedDiscordChannel(Arc::clone(&dc_arc)));
         (ch, Some(dc_arc))
-    } else {
+    } else if channel_kind == "telegram" {
         let token = cfg.telegram_token();
         if token.is_empty() {
             return Err(FamilyClawError::invalid_input(format!(
@@ -1527,6 +1563,28 @@ async fn start_runtime(
             .map_err(FamilyClawError::from)?;
         let ch: Box<dyn Channel> = Box::new(tc);
         (ch, None)
+    } else if channel_kind == "slack" {
+        let token = std::env::var("SLACK_BOT_TOKEN").unwrap_or_default();
+        if token.trim().is_empty() {
+            return Err(FamilyClawError::invalid_input(
+                "SLACK_BOT_TOKEN must be set when FAMILYCLAW_CHANNEL_KIND=slack",
+            ));
+        }
+        let ch_id = std::env::var("FAMILYCLAW_SLACK_CHANNEL_ID").unwrap_or_default();
+        if ch_id.trim().is_empty() {
+            return Err(FamilyClawError::invalid_input(
+                "FAMILYCLAW_SLACK_CHANNEL_ID must be set when FAMILYCLAW_CHANNEL_KIND=slack",
+            ));
+        }
+        let sc = SlackChannel::new(token, ch_id).map_err(FamilyClawError::from)?;
+        info!("Slack: Web API MVP (chat.postMessage + inject inbound)");
+        let ch: Box<dyn Channel> = Box::new(sc);
+        (ch, None)
+    } else {
+        return Err(FamilyClawError::invalid_input(format!(
+            "unsupported FAMILYCLAW_CHANNEL_KIND={channel_kind:?} \
+             (expected none|discord|telegram|slack)"
+        )));
     };
 
     let reply_target = cfg.reply_target();
@@ -1623,6 +1681,17 @@ async fn main() -> Result<()> {
 async fn serve() -> Result<()> {
     let addr = resolve_addr()?;
     info!(%addr, "familyclaw-gateway käynnistyy");
+
+    // Native OIDC (optional): fail-closed on half-config; prefetch JWKS when used.
+    match oidc::OidcConfig::from_env()? {
+        Some(cfg) => {
+            let validator = std::sync::Arc::new(oidc::OidcValidator::new(cfg));
+            validator.prefetch_jwks().await?;
+            install_oidc_validator(Some(validator));
+            info!("OIDC operator auth enabled (static gateway token still accepted when set)");
+        }
+        None => install_oidc_validator(None),
+    }
 
     // Prometheus metrics (GET /metrics): built with the fleet defaults, and
     // the SAME instance is shared with both the observability recorder
