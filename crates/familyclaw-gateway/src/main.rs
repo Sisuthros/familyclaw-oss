@@ -1652,12 +1652,27 @@ async fn start_runtime(
 #[tokio::main]
 async fn main() -> Result<()> {
     // Tracing: default level info, overridable with the RUST_LOG variable.
+    //
+    // STATUS (2026-07-25 fix): this used to write to stdout via the
+    // subscriber's default writer. Rust's `Stdout` is only flushed on each
+    // `\n` (LineWriter) and, depending on how the process is launched
+    // (service wrapper / scheduled task / detached child with a redirected
+    // but not-yet-inherited stdout handle), stdout can end up going nowhere
+    // even though the process is otherwise running fine -- producing a
+    // silently empty runtime log despite `> logfile 2>&1` redirection.
+    // `std::io::stderr` is unbuffered in Rust (every write is a direct
+    // syscall, not just newline-flushed), and is the conventional
+    // destination for a long-running service's logs (stdout stays free for
+    // any future machine-readable output). Explicitly targeting stderr here
+    // makes `serve`'s logs reliably reach the log file regardless of the
+    // launcher's stdio buffering behavior.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     // No subcommand = serve (backward compatibility).
