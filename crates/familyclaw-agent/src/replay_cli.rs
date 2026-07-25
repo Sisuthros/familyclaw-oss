@@ -31,6 +31,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use familyclaw_durable::{DryRunRecorder, DurableContext, FileJournal, Journal, TimeMachine};
 
@@ -396,31 +397,60 @@ pub fn run_diff(before: &Path, after: &Path, json: bool) -> Result<String, Repla
 /// [`ReplayError::Io`] if creating or cleaning up the temp/destination
 /// directory fails; [`ReplayError::Durable`] if reading/writing/forking the
 /// journal fails. Never panics.
-#[allow(clippy::too_many_lines)]
 pub fn run_demo(dir: Option<&Path>) -> Result<String, ReplayError> {
-    let (demo_dir, cleanup_on_exit) = if let Some(path) = dir {
+    run_demo_reporting_temp_dir(dir).map(|(narrative, _)| narrative)
+}
+
+/// Kuten [`run_demo`], mutta palauttaa lisäksi väliaikaishakemiston jonka
+/// **juuri tämä kutsu** loi (ja jonka se jo ehti siivota) kun `dir` on
+/// `None`. Palauttaa `None` kun kutsuja antoi oman hakemiston.
+///
+/// Tämä on olemassa testattavuuden vuoksi: siivouksen voi todentaa vain
+/// oman kutsun omaa polkua vasten. Saman testibinäärin useampi testi
+/// kutsuu `run_demo(None)` rinnakkain, ja hakemistonimet jakavat saman
+/// `process::id()`:n — siksi sisaruskutsun kesken oleva hakemisto ei
+/// erotu "vuodosta" pelkän nimiprefiksin perusteella.
+fn run_demo_reporting_temp_dir(
+    dir: Option<&Path>,
+) -> Result<(String, Option<PathBuf>), ReplayError> {
+    let (demo_dir, temp_dir) = if let Some(path) = dir {
         std::fs::create_dir_all(path)?;
-        (path.to_path_buf(), false)
+        (path.to_path_buf(), None)
     } else {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "familyclaw-replay-demo-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
+        let path = fresh_demo_temp_path();
         std::fs::create_dir_all(&path)?;
-        (path, true)
+        (path.clone(), Some(path))
     };
 
     let result = run_demo_in(&demo_dir);
 
-    if cleanup_on_exit {
-        let _ = std::fs::remove_dir_all(&demo_dir);
+    if let Some(path) = temp_dir.as_ref() {
+        let _ = std::fs::remove_dir_all(path);
     }
 
-    result
+    result.map(|narrative| (narrative, temp_dir))
+}
+
+/// Rakentaa uniikin väliaikaishakemistopolun oletuspolun demoajolle.
+///
+/// Uniikkius pitää päteä myös **prosessin sisällä**: `run_demo(None)` voi
+/// tulla useasta säikeestä yhtä aikaa, eikä kellon tarkkuus yksin riitä
+/// kaikilla alustoilla (Windowsin `SystemTime` liikkuu ~100 ns askelin).
+/// Atominen juokseva numero tekee törmäyksestä mahdottoman per prosessi.
+fn fresh_demo_temp_path() -> PathBuf {
+    static DEMO_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let seq = DEMO_SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "familyclaw-replay-demo-{}-{nanos}-{seq}",
+        std::process::id()
+    ));
+    path
 }
 
 /// Runs the showcase in the given (already existing) directory.
@@ -983,30 +1013,33 @@ mod tests {
 
     #[test]
     fn run_demo_default_path_leaves_no_temp_litter() {
-        let before: std::collections::HashSet<PathBuf> = std::fs::read_dir(std::env::temp_dir())
-            .expect("read temp dir")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
+        // Huom: väliaikaishakemistoa EI saa etsiä skannaamalla
+        // `std::env::temp_dir()` nimiprefiksillä — sisarustestit ajavat
+        // `run_demo(None)`:n rinnakkain samassa binäärissä ja jakavat saman
+        // `process::id()`:n, jolloin niiden kesken oleva hakemisto näyttäisi
+        // vuodolta. Todennetaan siksi täsmälleen tämän kutsun oma polku.
+        let (out, temp_dir) = run_demo_reporting_temp_dir(None).expect("demo");
+        assert!(out.contains("untouched: true"), "demo must run to the end");
 
-        run_demo(None).expect("demo");
-
-        let after: std::collections::HashSet<PathBuf> = std::fs::read_dir(std::env::temp_dir())
-            .expect("read temp dir")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
-
-        let leaked: Vec<&PathBuf> = after
-            .difference(&before)
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("familyclaw-replay-demo-"))
-            })
-            .collect();
+        let temp_dir = temp_dir.expect("default path must allocate a temp dir");
         assert!(
-            leaked.is_empty(),
-            "run_demo(None) must clean up its temp dir, leaked: {leaked:?}"
+            temp_dir.starts_with(std::env::temp_dir()),
+            "demo temp dir must live under the system temp dir, got {temp_dir:?}"
         );
+        assert!(
+            !temp_dir.exists(),
+            "run_demo(None) must clean up its temp dir, leaked: {temp_dir:?}"
+        );
+    }
+
+    #[test]
+    fn demo_temp_paths_are_unique_within_the_process() {
+        // Kello yksin ei riitä uniikkiuteen (Windowsilla ~100 ns askel):
+        // kaksi rinnakkaista `run_demo(None)`-kutsua saisi saman polun ja
+        // toisen siivous pyyhkisi toisen kesken ajon.
+        let a = fresh_demo_temp_path();
+        let b = fresh_demo_temp_path();
+        assert_ne!(a, b, "two demo temp paths must never collide");
     }
 
     #[test]
