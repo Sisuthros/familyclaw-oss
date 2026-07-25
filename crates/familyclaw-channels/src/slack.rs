@@ -2,8 +2,10 @@
 //!
 //! MVP capabilities:
 //! - **Outbound:** `chat.postMessage` via `SLACK_BOT_TOKEN`
-//! - **Inbound:** [`SlackChannel::inject`] (gateway `/inject` or Events API
-//!   handler can feed messages); Socket Mode is deferred
+//! - **Inbound:** **not wired.** [`SlackChannel::inject`] exists, but no HTTP
+//!   route reaches it — the gateway's `POST /inject` builds a Discord envelope
+//!   and requires a configured Discord channel, and Socket Mode / Events API is
+//!   not implemented. Inbound Slack messages do not reach the agent today.
 //! - **Approvals:** [`format_approval_prompt`] renders Approve/Deny instructions
 //!   with the gateway approval id for one-click follow-up in `/console`
 //!

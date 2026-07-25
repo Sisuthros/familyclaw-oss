@@ -64,8 +64,14 @@ bearer token (or OIDC JWT). Missing/invalid role → `403` when ACL is enabled.
 
 | Backend | Feature / env | Notes |
 |---|---|---|
-| `FileJournal` | default | Append-only JSONL + fsync |
-| `PostgresJournal` | `familyclaw-durable/postgres`, `DATABASE_URL` | Same `Journal` contract; single-tenant |
+| `FileJournal` | default | Append-only JSONL + fsync — **the only backend `serve` uses** |
+| `PostgresJournal` | `familyclaw-durable/postgres`, `DATABASE_URL` | Same `Journal` contract; single-tenant. **Library only** — see below |
+
+`PostgresJournal` is not yet selectable at runtime: nothing in the gateway or
+the agent runtime constructs it, so `serve` opens a `FileJournal` even when
+`DATABASE_URL` is set. Today it is usable only by embedding `familyclaw-durable`
+in your own binary. Wiring a `FAMILYCLAW_JOURNAL_BACKEND`-style switch is open
+work.
 
 ## 5. Trace export (OTLP scaffolding)
 

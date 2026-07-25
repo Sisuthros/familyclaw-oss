@@ -1577,7 +1577,7 @@ async fn start_runtime(
             ));
         }
         let sc = SlackChannel::new(token, ch_id).map_err(FamilyClawError::from)?;
-        info!("Slack: Web API MVP (chat.postMessage + inject inbound)");
+        info!("Slack: Web API MVP — outbound only (chat.postMessage); no inbound path wired");
         let ch: Box<dyn Channel> = Box::new(sc);
         (ch, None)
     } else {

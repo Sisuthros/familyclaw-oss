@@ -15,7 +15,7 @@ here, it's most likely a dated planning/expo artifact — check
 | [MIGRATION.md](MIGRATION.md) | Migrating between FamilyClaw versions. |
 | [discord-setup.md](discord-setup.md) | Step-by-step Discord bot creation and configuration (linked from the README Quick Start). |
 | [telegram-setup.md](telegram-setup.md) | Step-by-step Telegram bot creation, long-poll config, and approval-flow notes. |
-| [slack-setup.md](slack-setup.md) | Slack bot MVP: chat.postMessage, inject inbound, approval prompts. |
+| [slack-setup.md](slack-setup.md) | Slack bot MVP — **outbound only** (chat.postMessage, approval prompts); no inbound path yet. |
 | [CONSOLE.md](CONSOLE.md) | Reliability Console: live redacted activity stream and one-click approval handling. |
 | [MCP_WORKS_WITH.md](MCP_WORKS_WITH.md) | MCP bridge works-with catalog: tested vs contract-compatible server categories. |
 | [RUNBOOK_WINDOWS.md](RUNBOOK_WINDOWS.md) | Windows-specific setup, including optional Telegram/Discord wiring. |
@@ -35,7 +35,7 @@ here, it's most likely a dated planning/expo artifact — check
 | [SECURITY_BENCH.md](SECURITY_BENCH.md) | Security benchmark methodology and results. |
 | [SECURITY_COMPARISON.md](SECURITY_COMPARISON.md) | Security posture compared against other frameworks. |
 | [CRASH_SAFE_DISPATCH_CASE_STUDY.md](CRASH_SAFE_DISPATCH_CASE_STUDY.md) | Case study on at-most-once external side-effect dispatch. |
-| [ENTERPRISE_AUTH.md](ENTERPRISE_AUTH.md) | Gateway token, native OIDC JWT, Postgres journal, OTLP scaffolding, operator RBAC. |
+| [ENTERPRISE_AUTH.md](ENTERPRISE_AUTH.md) | Gateway token, native OIDC JWT, operator RBAC, plus the two not-yet-wired extras (library-only Postgres journal, OTLP scaffolding). |
 | [BUG_BOUNTY.md](BUG_BOUNTY.md) | Public bug-bounty program outline (interim reporting). |
 | [COMPLIANCE_SOC2_ROADMAP.md](COMPLIANCE_SOC2_ROADMAP.md) | SOC 2 Type I control mapping roadmap (not certified yet). |
 | [BACKUP_RESTORE.md](BACKUP_RESTORE.md) | Journal backup/restore + kill/restart verification. |
