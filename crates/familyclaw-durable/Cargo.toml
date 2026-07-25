@@ -14,6 +14,11 @@ categories = ["asynchronous", "development-tools"]
 [lints]
 workspace = true
 
+[features]
+default = []
+# Optional PostgreSQL journal backend ([`PostgresJournal`]).
+postgres = ["dep:postgres"]
+
 [dependencies]
 familyclaw-core = { workspace = true }
 tokio = { workspace = true }
@@ -23,6 +28,7 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
+postgres = { version = "0.19", optional = true, default-features = true, features = ["with-serde_json-1"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

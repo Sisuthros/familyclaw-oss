@@ -45,6 +45,7 @@
 //! ## Implementations
 //! - [`InMemoryJournal`] — non-durable, for testing/development.
 //! - [`FileJournal`] — crash-safe append-only JSONL (`flush` + `fsync`).
+//! - [`PostgresJournal`] (feature `postgres`) — same journal contract on `PostgreSQL`.
 //!
 //! ## OSS boundary (Layer A)
 //! This crate is generic platform code: it does not hardcode family
@@ -57,6 +58,8 @@ pub mod error;
 pub mod file;
 pub mod journal;
 pub mod memory;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod time_machine;
 
 pub use context::DurableContext;
@@ -65,6 +68,8 @@ pub use error::{DurableError, Result};
 pub use file::FileJournal;
 pub use journal::Journal;
 pub use memory::InMemoryJournal;
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresJournal;
 pub use time_machine::{
     DryRunRecorder, RecordedIntent, StepDiff, StepOutcome, TimeMachine, Timeline, TimelineDiff,
     TimelineStep, FORK_MARKER,
