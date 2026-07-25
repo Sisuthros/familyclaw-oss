@@ -138,7 +138,23 @@ if ($PSCmdlet.ShouldProcess($targetExe, "back up to $backupExe")) {
     Write-Step "-WhatIf: would back up $targetExe to $backupExe"
 }
 
-# --- 4) Copy the new exe into place ----------------------------------------
+# --- 4) Stop the running gateway BEFORE overwriting its exe ----------------
+# Windows locks a running executable's file. Copying the new build over it
+# while the old process is still up throws "the process cannot access the
+# file because it is being used by another process" (observed 2026-07-25,
+# first real run of this script). Stop here, before the copy, and start
+# fresh in step 6 -- that avoids the file-lock race entirely.
+if ($PSCmdlet.ShouldProcess('familyclaw-gateway process', 'stop before copying new exe')) {
+    Get-Process familyclaw-gateway -ErrorAction SilentlyContinue | ForEach-Object {
+        Write-Step "Stopping existing process PID $($_.Id)"
+        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 2
+} else {
+    Write-Step "-WhatIf: would stop the running gateway process before copying the new exe"
+}
+
+# --- 5) Copy the new exe into place ----------------------------------------
 if ($PSCmdlet.ShouldProcess($builtExe, "copy to $targetExe")) {
     if (-not (Test-Path $builtExe)) { Fail "$builtExe not found -- run without -WhatIf first, or check the build step." }
     Copy-Item -Path $builtExe -Destination $targetExe -Force
@@ -147,23 +163,18 @@ if ($PSCmdlet.ShouldProcess($builtExe, "copy to $targetExe")) {
     Write-Step "-WhatIf: would copy $builtExe to $targetExe"
 }
 
-# --- 5) Restart via the appliance's start script ---------------------------
+# --- 6) Restart via the appliance's start script ----------------------------
 $startScript = Join-Path $ApplianceDir $StartScriptName
 
-if ($PSCmdlet.ShouldProcess($startScript, 'stop old process and restart gateway')) {
-    Get-Process familyclaw-gateway -ErrorAction SilentlyContinue | ForEach-Object {
-        Write-Step "Stopping existing process PID $($_.Id)"
-        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
-    }
-    Start-Sleep -Seconds 2
+if ($PSCmdlet.ShouldProcess($startScript, 'start gateway')) {
     if (-not (Test-Path $startScript)) { Fail "$startScript not found -- check -ApplianceDir / -StartScriptName." }
     Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $startScript -WindowStyle Hidden
     Write-Step "Started $startScript"
 } else {
-    Write-Step "-WhatIf: would stop the running gateway process and restart it via $startScript"
+    Write-Step "-WhatIf: would start the gateway via $startScript"
 }
 
-# --- 6) Verify /healthz 200 + /readyz ready:true ---------------------------
+# --- 7) Verify /healthz 200 + /readyz ready:true ---------------------------
 if ($PSCmdlet.ShouldProcess($BaseUrl, 'wait for /healthz 200 and /readyz ready:true')) {
     $healthy = $false
     $deadline = (Get-Date).AddSeconds($HealthTimeoutSec)
