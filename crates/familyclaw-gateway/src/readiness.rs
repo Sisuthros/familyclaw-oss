@@ -105,9 +105,37 @@ pub async fn check_journal_writable(data_dir: &std::path::Path) -> CheckResult {
 const LLM_PING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 const LLM_TOOLS_PING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// Max output tokens for the plain [`check_llm_ping`] probe. A short "pong"
+/// needs only a couple of tokens (Fable 5 diagnosis 2026-07-09, see
+/// [`probe_resolver_from_env`]).
+const LLM_PING_MAX_TOKENS: u32 = 32;
+
+/// Max output tokens for [`check_llm_tools_ping`].
+///
+/// ROOT CAUSE (2026-07-25): this probe used to share [`LLM_PING_MAX_TOKENS`]
+/// (32) with the plain ping via a single hardcoded resolver. Reasoning
+/// models (NIM's `nvidia/llama-3.3-nemotron-super-49b-v1.5` and its
+/// predecessor `nemotron-3-ultra-550b`) emit a `reasoning_content` trace
+/// BEFORE the `tool_calls` payload -- measured 140-190 completion tokens for
+/// this probe's single-tool "call `fs_read_allowlisted`" turn against NVIDIA
+/// NIM directly. A 32-token cap truncates the response mid-reasoning: no
+/// `tool_calls` ever appears (`/readyz` reported
+/// `llm_tools_ping: "completion ok but no tool_calls"`), or the function-call
+/// JSON itself gets cut mid-argument and NIM's vLLM backend 400s with
+/// "Invalid JSON: EOF while parsing a value". A direct curl with a bigger
+/// budget returns real `tool_calls` for the SAME model, which is what
+/// pointed at the token budget rather than the model or the request shape
+/// (`tool_choice: "required"` was already serialized correctly, and
+/// `reasoning_content` is simply an extra field the response parser ignores
+/// -- it does not interfere with `tool_calls` parsing once the response
+/// isn't truncated). 512 leaves roughly 2.5x headway over the observed
+/// worst case while staying well under [`LLM_TOOLS_PING_DEADLINE`]'s 45s
+/// budget.
+const LLM_TOOLS_PING_MAX_TOKENS: u32 = 512;
+
 /// Lightweight LLM ping (one short completion) — uses the same provider resolver as serve.
 pub async fn check_llm_ping(model_cfg: &ModelConfig) -> CheckResult {
-    let resolver = probe_resolver_from_env();
+    let resolver = probe_resolver_from_env(LLM_PING_MAX_TOKENS);
     match build_llm_chain(model_cfg, &resolver) {
         Ok(chain) => {
             let messages = [LlmMessage::user("ping")];
@@ -145,7 +173,7 @@ pub async fn check_llm_ping(model_cfg: &ModelConfig) -> CheckResult {
 
 /// LLM tool-calling probe — verifies that the primary returns `tool_calls`.
 pub async fn check_llm_tools_ping(model_cfg: &ModelConfig) -> CheckResult {
-    let resolver = probe_resolver_from_env();
+    let resolver = probe_resolver_from_env(LLM_TOOLS_PING_MAX_TOKENS);
     match build_llm_chain(model_cfg, &resolver) {
         Ok(chain) => {
             let tools = [ToolDefinition {
@@ -378,16 +406,22 @@ pub fn build_probe(
 }
 
 /// Provider resolver for the readyz/canary probes ([`PROVIDERS_ENV`]).
-fn probe_resolver_from_env() -> EnvEndpointResolver {
-    // Probe tuning (Fable 5 diagnosis 2026-07-09): the ping only needs a couple
-    // of tokens. Without this, the probe inherits llm.rs's defaults (max_tokens
-    // DEFAULT_MAX_TOKENS = 4096, timeout 60s), so a reasoning model
-    // (v4-pro/nemotron) burns the whole token budget on thinking rambling for
-    // the "ping" message = 29-62s, blowing readyz's ~25s budget. Cap reasoning
-    // at 32 tokens and limit one attempt to 8s, so that even a full 4-model
+///
+/// `max_tokens` is caller-supplied because the two probes need very
+/// different budgets: [`check_llm_ping`]'s plain "ping" needs only a few
+/// tokens ([`LLM_PING_MAX_TOKENS`]), while [`check_llm_tools_ping`] must give a
+/// reasoning model enough room to emit its `reasoning_content` trace before
+/// the `tool_calls` payload ([`LLM_TOOLS_PING_MAX_TOKENS`]) -- see that
+/// constant's doc for the root-cause writeup.
+fn probe_resolver_from_env(max_tokens: u32) -> EnvEndpointResolver {
+    // Probe tuning (Fable 5 diagnosis 2026-07-09): without an explicit cap,
+    // the probe inherits llm.rs's defaults (max_tokens DEFAULT_MAX_TOKENS =
+    // 4096, timeout 60s), so a reasoning model (v4-pro/nemotron) can burn a
+    // large token budget on thinking rambling = 29-62s, blowing readyz's
+    // ~25s budget. Limit one attempt to 8s, so that even a full 4-model
     // fallback walk fits the budget.
     let mut resolver = EnvEndpointResolver::new()
-        .with_max_tokens(32)
+        .with_max_tokens(max_tokens)
         .with_request_timeout_ms(8_000)
         .with_connect_timeout_ms(3_000);
     let Ok(spec) = std::env::var(PROVIDERS_ENV) else {
@@ -532,5 +566,33 @@ mod tests {
         let result = check_journal_writable(&dir).await;
         assert!(result.ok, "{}", result.detail);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression guard for the `/readyz` `llm_tools_ping` root cause
+    /// (2026-07-25): the tool-calling probe must NOT reuse the plain ping's
+    /// tiny token budget. Reasoning models emit a `reasoning_content` trace
+    /// before `tool_calls`, so a 32-token cap truncates the response before
+    /// any tool call appears -- see [`LLM_TOOLS_PING_MAX_TOKENS`]'s doc for
+    /// the empirical evidence.
+    #[test]
+    fn probe_resolver_gives_tools_ping_a_reasoning_safe_token_budget() {
+        use familyclaw_agent::LlmEndpointResolver;
+
+        assert!(
+            LLM_TOOLS_PING_MAX_TOKENS > LLM_PING_MAX_TOKENS,
+            "the tool-calling probe must not share the plain ping's token budget"
+        );
+
+        let resolver = EnvEndpointResolver::new()
+            .with_max_tokens(LLM_TOOLS_PING_MAX_TOKENS)
+            .with_provider(
+                "nvidia",
+                "https://integrate.api.nvidia.com/v1",
+                "DUMMY_KEY_ENV",
+            );
+        let cfg = resolver
+            .resolve("nvidia/llama-3.3-nemotron-super-49b-v1.5")
+            .expect("resolve");
+        assert_eq!(cfg.max_tokens, LLM_TOOLS_PING_MAX_TOKENS);
     }
 }
