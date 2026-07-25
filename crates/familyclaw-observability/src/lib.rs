@@ -61,6 +61,8 @@
 pub mod event_recorder;
 pub mod metrics;
 pub mod operator_acl;
+#[cfg(feature = "otlp")]
+pub mod otlp;
 pub mod rbac;
 pub mod trace;
 
@@ -73,6 +75,8 @@ pub use metrics::{
     COUNTER_WORKFLOW_STEPS_COMPLETED, GAUGE_AGENTS_ONLINE,
 };
 pub use operator_acl::{OperatorAcl, OperatorRole};
+#[cfg(feature = "otlp")]
+pub use otlp::{otlp_endpoint_from_env, otlp_traces_url, OtlpSpanEnvelope, OTLP_ENDPOINT_ENV};
 pub use rbac::{RbacError, RbacPolicy};
 pub use trace::TraceContext;
 
