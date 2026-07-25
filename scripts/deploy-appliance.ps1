@@ -1,46 +1,65 @@
 ﻿<#
 .SYNOPSIS
-    Deploy gate for agent_delta's familyclaw-gateway.exe: refuses to run against
-    a dirty repo, builds a release binary, backs up the running exe with a
-    datestamp, replaces it, restarts via _assistant-run.bat, and verifies
-    /healthz + /readyz before declaring success.
+    Deploy gate for a familyclaw-gateway appliance install: refuses to run
+    against a dirty repo, builds a release binary, backs up the running
+    exe with a datestamp, replaces it, restarts the appliance, and
+    verifies /healthz + /readyz before declaring success.
 
 .DESCRIPTION
     This script is deliberately conservative. It will not run at all if
     `git status --porcelain` in the repo is non-empty -- an uncommitted,
-    unreviewed tree must never be what ends up running against agent_delta's
-    live gateway. Every destructive step (build, backup, copy, restart,
+    unreviewed tree must never be what ends up running against a live
+    appliance. Every destructive step (build, backup, copy, restart,
     health wait) is gated behind -WhatIf support via SupportsShouldProcess,
     so `-WhatIf` gives a full dry-run preview without touching anything.
 
     Deploys are deliberate, not automatic: this script does not run on a
     schedule and should only be invoked by a human who has just reviewed
-    what's on HEAD.
+    what's on HEAD. Appliance-specific paths (install directory, start
+    script name) are required parameters rather than hardcoded defaults,
+    since this script ships in the public repo and must not bake in any
+    single operator's local deployment layout.
 
 .PARAMETER RepoRoot
-    Path to the familyclaw workspace. Defaults to E:\Familyclaw.
+    Path to the familyclaw workspace. Defaults to the current directory.
 
-.PARAMETER agent_delta
-    Path to agent_delta's operational directory. Defaults to E:\agent_delta.
+.PARAMETER ApplianceDir
+    Path to the target appliance's operational directory (where its exe,
+    logs, and start script live). Required -- no default, since this
+    script is public and must not assume any particular operator's layout.
+
+.PARAMETER StartScriptName
+    Name of the batch/PowerShell script inside ApplianceDir that starts the
+    gateway (sets its env vars and launches the exe). Defaults to 'start.bat'.
+
+.PARAMETER ExeName
+    Name of the gateway executable inside ApplianceDir. Defaults to
+    'familyclaw-gateway.exe'.
+
+.PARAMETER BaseUrl
+    Base URL the appliance's gateway listens on, for the post-deploy
+    /healthz + /readyz check. Defaults to http://127.0.0.1:8787.
 
 .PARAMETER HealthTimeoutSec
     How long to wait for /healthz to return 200 after restart, in seconds.
 
 .EXAMPLE
-    powershell -File scripts\deploy-agent_delta.ps1 -WhatIf
+    powershell -File scripts\deploy-appliance.ps1 -ApplianceDir 'D:\my-appliance' -WhatIf
     Dry-run: shows exactly what would happen without building, backing up,
     copying, or restarting anything.
 
 .EXAMPLE
-    powershell -File scripts\deploy-agent_delta.ps1
+    powershell -File scripts\deploy-appliance.ps1 -ApplianceDir 'D:\my-appliance' -StartScriptName 'run.bat' -BaseUrl 'http://127.0.0.1:8789'
     Full deploy: build, backup, copy, restart, verify.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [string]$RepoRoot = 'E:\Familyclaw',
-    [string]$agent_delta = 'E:\agent_delta',
+    [string]$RepoRoot = (Get-Location).Path,
+    [Parameter(Mandatory = $true)]
+    [string]$ApplianceDir,
+    [string]$StartScriptName = 'start.bat',
     [string]$ExeName = 'familyclaw-gateway.exe',
-    [string]$BaseUrl = 'http://127.0.0.1:8789',
+    [string]$BaseUrl = 'http://127.0.0.1:8787',
     [int]$HealthTimeoutSec = 60
 )
 
@@ -87,7 +106,7 @@ Write-Step "Repo clean. Deploying commit $commitHash ($commitSubject)"
 
 # --- 2) Build release binary ----------------------------------------------
 $builtExe  = Join-Path $RepoRoot 'target\release\familyclaw-gateway.exe'
-$targetExe = Join-Path $agent_delta $ExeName
+$targetExe = Join-Path $ApplianceDir $ExeName
 
 if ($PSCmdlet.ShouldProcess($RepoRoot, 'cargo build --release -p familyclaw-gateway --features ollama')) {
     Push-Location $RepoRoot
@@ -106,7 +125,7 @@ if ($PSCmdlet.ShouldProcess($RepoRoot, 'cargo build --release -p familyclaw-gate
 
 # --- 3) Backup the currently-running exe with a datestamp -----------------
 $stamp     = Get-Date -Format 'yyyyMMdd-HHmmss'
-$backupExe = Join-Path $agent_delta "$ExeName.bak-$stamp"
+$backupExe = Join-Path $ApplianceDir "$ExeName.bak-$stamp"
 
 if ($PSCmdlet.ShouldProcess($targetExe, "back up to $backupExe")) {
     if (Test-Path $targetExe) {
@@ -128,8 +147,8 @@ if ($PSCmdlet.ShouldProcess($builtExe, "copy to $targetExe")) {
     Write-Step "-WhatIf: would copy $builtExe to $targetExe"
 }
 
-# --- 5) Restart via _assistant-run.bat -----------------------------------------
-$startScript = Join-Path $agent_delta '_assistant-run.bat'
+# --- 5) Restart via the appliance's start script ---------------------------
+$startScript = Join-Path $ApplianceDir $StartScriptName
 
 if ($PSCmdlet.ShouldProcess($startScript, 'stop old process and restart gateway')) {
     Get-Process familyclaw-gateway -ErrorAction SilentlyContinue | ForEach-Object {
@@ -137,6 +156,7 @@ if ($PSCmdlet.ShouldProcess($startScript, 'stop old process and restart gateway'
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
     }
     Start-Sleep -Seconds 2
+    if (-not (Test-Path $startScript)) { Fail "$startScript not found -- check -ApplianceDir / -StartScriptName." }
     Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $startScript -WindowStyle Hidden
     Write-Step "Started $startScript"
 } else {
