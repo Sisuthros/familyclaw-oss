@@ -1,0 +1,21 @@
+# Channel-less evaluation profile for the refund-guard pack.
+# Copy to a private config path (familyclaw.toml) — do not commit secrets.
+
+[agent]
+name = "agent_a"
+
+[channel]
+kind = "none"
+reply_target = "none"
+
+[provider]
+kind = "openai"
+model = "gpt-4o-mini"
+api_key = ""
+
+[memory]
+retention_hours = 168
+max_working_memories = 64
+
+[security]
+gateway_token = ""

@@ -24,5 +24,7 @@ Then open the Reliability Console while experimenting with a live gateway:
 http://127.0.0.1:8787/console
 ```
 
-Copy a pack's `familyclaw.toml` into your private config dir if you want that
-channel-less profile as a starting point — never commit Layer B secrets.
+Copy a pack's `familyclaw.toml.example` to `familyclaw.toml` in your private
+config dir if you want that channel-less profile as a starting point — never
+commit Layer B secrets. (`familyclaw.toml` is gitignored repo-wide; only the
+blanked `.example` files ship.)
