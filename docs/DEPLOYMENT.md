@@ -175,6 +175,14 @@ curl -fsS http://127.0.0.1:8787/healthz
 curl -fsS http://127.0.0.1:8787/readyz
 ```
 
+`/readyz` runs `llm_ping` + `llm_tools_ping` and returns `503` if the
+configured provider is unreachable — a production deploy without a working
+`FAMILYCLAW_PROVIDERS` entry is expected to fail this smoke test. The single
+exception is the keyless demo mode (`FAMILYCLAW_CHANNEL_KIND=none` *and* no
+`FAMILYCLAW_PROVIDERS`), where the LLM probes are skipped and reported in the
+response's `degraded` array instead; do not run production that way. Use
+`POST /canary` when you want an unconditional live-LLM assertion.
+
 If `/inject` is enabled, use a bearer token in production:
 
 ```bash

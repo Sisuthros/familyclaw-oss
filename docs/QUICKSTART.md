@@ -76,6 +76,33 @@ cargo run -p familyclaw-gateway -- status   # print effective config
 cargo run -p familyclaw-gateway -- doctor   # pre-flight checks
 ```
 
+#### Keyless first run (no channel tokens, no LLM key)
+
+`doctor` and `serve` default to the **telegram** channel, so on a clean machine
+they ask for `TELEGRAM_BOT_TOKEN` and friends. To try the runtime with zero
+credentials, opt into channel-less mode — on **both** commands:
+
+```bash
+FAMILYCLAW_CHANNEL_KIND=none cargo run -p familyclaw-gateway -- doctor   # -> "doctor: ok" (exit 0)
+FAMILYCLAW_CHANNEL_KIND=none cargo run -p familyclaw-gateway -- serve
+
+curl -i http://127.0.0.1:8787/healthz   # -> 200 OK
+curl -i http://127.0.0.1:8787/readyz    # -> 200 OK, ready:true
+```
+
+In this mode `/readyz` reports `ready:true` **and** lists the LLM probes under
+`degraded` — they are skipped, not passed, because no `FAMILYCLAW_PROVIDERS`
+table exists to reach a model. `doctor` prints the same fact as
+`[WARN] llm FAMILYCLAW_PROVIDERS unset — … agent runs MUTE`. The agent will
+run (bus, memory, emotion) but will not produce text replies until you
+configure a provider.
+
+The skip is intentionally narrow. As soon as `FAMILYCLAW_PROVIDERS` is set —
+or the channel kind is anything other than `none` — `/readyz` runs
+`llm_ping` + `llm_tools_ping` and returns `503` when they fail, which is the
+correct readiness signal for a real deployment. `POST /canary` always asserts a
+live LLM turn and returns `ok:false` without a working provider.
+
 Configuration is loaded from a TOML file (looked up in this order):
 
 1. `$FAMILYCLAW_CONFIG` (explicit path)

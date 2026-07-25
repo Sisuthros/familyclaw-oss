@@ -1766,9 +1766,17 @@ async fn serve() -> Result<()> {
             None
         }
     });
+    // Same config load feeds both the probe's model chain and its channel
+    // kind — the channel kind decides whether a missing LLM provider is an
+    // intentional keyless run or a fault (see `readiness::build_probe`).
+    // If the config cannot be loaded we pass an empty kind → fail-closed.
+    let readiness_cfg = FamilyConfig::load().ok();
     let readiness_probe = readiness::build_probe(
-        FamilyConfig::load().ok().map(|c| c.model_config()),
+        readiness_cfg.as_ref().map(FamilyConfig::model_config),
         discord_probe,
+        readiness_cfg
+            .as_ref()
+            .map_or("", FamilyConfig::channel_kind),
     );
     if let Some(ref dir) = readiness_probe.data_dir {
         if let Err(e) = readiness::cleanup_stale_approval_tasks(dir, 7).await {
@@ -2104,6 +2112,22 @@ async fn doctor(fix: bool) -> Result<()> {
         }
     }
 
+    // LLM provider table — presence + count only, never the keys themselves
+    // (MEMORY.md secret-leak rule). Never fails doctor: a mute gateway is a
+    // supported mode (the runtime warns and runs on), but the operator has to
+    // know which readiness semantic they are getting.
+    match readiness::configured_provider_count() {
+        0 if channel_kind == "none" => println!(
+            "[WARN]    llm       {PROVIDERS_ENV} unset — keyless demo mode: agent runs MUTE, \
+             /readyz reports platform readiness only (POST /canary asserts a live LLM turn)"
+        ),
+        0 => println!(
+            "[WARN]    llm       {PROVIDERS_ENV} unset — agent runs MUTE (no text replies) and \
+             /readyz stays 503 until a provider is configured"
+        ),
+        n => println!("[OK]      llm       {PROVIDERS_ENV} set ({n} provider(s))"),
+    }
+
     if std::env::var_os("FAMILYCLAW_DATA_DIR").is_some_and(|v| !v.is_empty()) {
         println!("[OK]      env       FAMILYCLAW_DATA_DIR set");
     } else {
@@ -2196,6 +2220,16 @@ async fn doctor(fix: bool) -> Result<()> {
         println!("doctor: ok");
         Ok(())
     } else {
+        // A newcomer's most common first failure is running doctor in the
+        // DEFAULT channel mode (telegram) while wanting the keyless guest
+        // path. Point at the one env var that fixes it instead of leaving
+        // three [MISSING] lines without a next step.
+        if channel_kind != "none" {
+            println!(
+                "hint: for the keyless guest path (no family keys) run: \
+                 FAMILYCLAW_CHANNEL_KIND=none familyclaw-gateway doctor"
+            );
+        }
         Err(FamilyClawError::invalid_input(
             "doctor: one or more checks failed",
         ))

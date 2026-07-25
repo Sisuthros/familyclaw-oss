@@ -321,6 +321,21 @@ honestly reports itself as not fully ready to handle turns until a real
 model key is wired in. A buyer supplying `FAMILYCLAW_PROVIDERS` would flip
 `llm_ping`/`llm_tools_ping` to `true`.
 
+> **Update 2026-07-25 — this exact output has changed for the keyless demo
+> mode.** The transcript above is preserved as the record of that evening's
+> run. Since then, `/readyz` distinguishes *"no provider was ever
+> configured"* from *"a configured provider is broken"*: in keyless demo
+> mode (`FAMILYCLAW_CHANNEL_KIND=none` **and** no `FAMILYCLAW_PROVIDERS`) the
+> LLM probes are skipped and listed under a new `degraded` array, so the run
+> above would now answer `200 {"ready":true,"degraded":["llm_ping/… skipped:
+> no LLM provider configured …"],…}`. Nothing is hidden — the skip is stated
+> in the response body, in the startup log, and in `doctor`'s
+> `[WARN] llm` line. The fail-closed behavior described above is UNCHANGED
+> for every real deployment: with a channel configured, or with
+> `FAMILYCLAW_PROVIDERS` set, an unreachable model still yields `503`, and
+> `POST /canary` still reports `ok:false` in every case where a live LLM turn
+> is impossible.
+
 Process was cleanly stopped after this check; no lingering state.
 
 ---

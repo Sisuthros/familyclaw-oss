@@ -24,6 +24,14 @@ pub struct ReadinessProbe {
     pub discord: Option<Arc<DiscordChannel>>,
     /// Writable directory for the durable journal.
     pub data_dir: Option<PathBuf>,
+    /// Set when the LLM checks are **intentionally** skipped: keyless demo
+    /// mode (`FAMILYCLAW_CHANNEL_KIND=none` + no `FAMILYCLAW_PROVIDERS`).
+    /// The reason is reported verbatim in `/readyz` under `degraded`, so a
+    /// skipped check is visible rather than silently dropped.
+    ///
+    /// `None` → the LLM checks run and gate readiness (fail-closed default
+    /// for every real deployment).
+    pub llm_skipped: Option<String>,
 }
 
 /// Result of a single check.
@@ -38,6 +46,12 @@ pub struct CheckResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReadyzResponse {
     pub ready: bool,
+    /// Checks that were intentionally skipped, with the reason. Empty (and
+    /// omitted from the JSON) in every normal deployment — a non-empty list
+    /// means the gateway is up but knowingly running with less than full
+    /// capability (e.g. keyless demo mode without an LLM provider).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
     pub checks: Vec<CheckResult>,
 }
 
@@ -208,15 +222,27 @@ pub async fn deep_readyz(
     probe: &ReadinessProbe,
 ) -> (StatusCode, Json<ReadyzResponse>) {
     let mut checks = Vec::new();
+    let mut degraded = Vec::new();
     checks.push(CheckResult {
         name: "resonance_bus",
         ok: bus_ok,
         detail: if bus_ok { "running" } else { "not running" }.into(),
     });
 
-    if let Some(model) = probe.model.as_ref() {
-        checks.push(check_llm_ping(model).await);
-        checks.push(check_llm_tools_ping(model).await);
+    // LLM checks: run by default (fail-closed — a deployment that HAS a
+    // provider table but cannot reach it is genuinely not ready). They are
+    // skipped ONLY in keyless demo mode, where no provider was ever asked
+    // for; skipping is then reported under `degraded` instead of being
+    // reported as a failed check, because nothing actually failed.
+    // `POST /canary` stays the strict "can this box do a real LLM turn?"
+    // surface and still hard-fails without a model (see `run_canary`).
+    match (probe.llm_skipped.as_ref(), probe.model.as_ref()) {
+        (Some(reason), _) => degraded.push(reason.clone()),
+        (None, Some(model)) => {
+            checks.push(check_llm_ping(model).await);
+            checks.push(check_llm_tools_ping(model).await);
+        }
+        (None, None) => {}
     }
 
     if let Some(dc) = &probe.discord {
@@ -233,7 +259,14 @@ pub async fn deep_readyz(
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(ReadyzResponse { ready, checks }))
+    (
+        status,
+        Json(ReadyzResponse {
+            ready,
+            degraded,
+            checks,
+        }),
+    )
 }
 
 /// Canary: synthetic LLM turn + infra checks.
@@ -271,22 +304,81 @@ pub async fn run_canary(probe: &ReadinessProbe) -> Result<Json<CanaryResponse>> 
     }))
 }
 
+/// Env var holding the probe's provider table (`prefix=base_url=KEY_ENV;…`).
+const PROVIDERS_ENV: &str = "FAMILYCLAW_PROVIDERS";
+
+/// Number of usable provider entries in [`PROVIDERS_ENV`].
+///
+/// This is the single source of truth for "is an LLM provider configured at
+/// all?" — the probes can ONLY reach an endpoint through this table (see
+/// [`probe_resolver_from_env`]), so `0` means no LLM was ever wired up, not
+/// that one broke. Uses the same parse rules as the resolver so the two can
+/// never disagree.
+#[must_use]
+pub fn configured_provider_count() -> usize {
+    let Ok(spec) = std::env::var(PROVIDERS_ENV) else {
+        return 0;
+    };
+    count_provider_entries(&spec)
+}
+
+/// Pure parse half of [`configured_provider_count`] (env-free → testable
+/// without mutating process-global state).
+fn count_provider_entries(spec: &str) -> usize {
+    spec.split(';')
+        .filter(|entry| !entry.trim().is_empty())
+        .filter(|entry| {
+            let parts: Vec<&str> = entry.splitn(3, '=').map(str::trim).collect();
+            match parts.as_slice() {
+                [prefix, base_url, key_field] => {
+                    !prefix.is_empty()
+                        && !base_url.is_empty()
+                        && key_field.split(',').any(|k| !k.trim().is_empty())
+                }
+                _ => false,
+            }
+        })
+        .count()
+}
+
 /// Builds the readiness probe at `serve()` startup.
+///
+/// `channel_kind` decides the readiness SEMANTIC when no provider table is
+/// configured:
+/// - `"none"` (keyless demo / guest path) → the LLM checks are skipped and
+///   reported under `degraded`; `/readyz` reports platform readiness. The
+///   operator explicitly asked for a keyless run, so a missing provider is
+///   an intentional state, not a fault.
+/// - anything else (telegram/discord/slack — a real deployment) → the LLM
+///   checks run and fail closed, so a forgotten key still shows up as 503
+///   and a load balancer will not route turns to a mute gateway.
 pub fn build_probe(
     model: Option<ModelConfig>,
     discord: Option<Arc<DiscordChannel>>,
+    channel_kind: &str,
 ) -> ReadinessProbe {
     let data_dir = std::env::var("FAMILYCLAW_DATA_DIR").ok().map(PathBuf::from);
+    let llm_skipped = if channel_kind == "none" && configured_provider_count() == 0 {
+        let reason = format!(
+            "llm_ping/llm_tools_ping skipped: no LLM provider configured ({PROVIDERS_ENV} unset) \
+             and channel kind is 'none' (keyless demo mode) — the agent runs MUTE (memory + \
+             emotion only, no text replies). POST /canary asserts a live LLM turn."
+        );
+        warn!("{reason}");
+        Some(reason)
+    } else {
+        None
+    };
     ReadinessProbe {
         model,
         discord,
         data_dir,
+        llm_skipped,
     }
 }
 
-/// Provider resolver for the readyz/canary probes (`FAMILYCLAW_PROVIDERS`).
+/// Provider resolver for the readyz/canary probes ([`PROVIDERS_ENV`]).
 fn probe_resolver_from_env() -> EnvEndpointResolver {
-    const PROVIDERS_ENV: &str = "FAMILYCLAW_PROVIDERS";
     // Probe tuning (Fable 5 diagnosis 2026-07-09): the ping only needs a couple
     // of tokens. Without this, the probe inherits llm.rs's defaults (max_tokens
     // DEFAULT_MAX_TOKENS = 4096, timeout 60s), so a reasoning model
@@ -369,6 +461,69 @@ pub async fn cleanup_stale_approval_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_entries_are_counted_like_the_resolver_parses_them() {
+        assert_eq!(count_provider_entries(""), 0);
+        assert_eq!(count_provider_entries(";  ;"), 0);
+        // Missing key-env field → the resolver skips it, so it does not count.
+        assert_eq!(
+            count_provider_entries("openai=https://api.openai.com/v1"),
+            0
+        );
+        assert_eq!(
+            count_provider_entries("openai=https://x/v1=OPENAI_API_KEY"),
+            1
+        );
+        assert_eq!(
+            count_provider_entries("a=https://x/v1=K1,K2;b=https://y/v1=K3"),
+            2
+        );
+    }
+
+    /// Keyless demo mode: the LLM checks are SKIPPED (not failed), so the
+    /// guest path gets an honest 200 — and the skip is visible in `degraded`.
+    #[tokio::test]
+    async fn readyz_is_ready_and_degraded_when_llm_is_intentionally_skipped() {
+        let probe = ReadinessProbe {
+            model: Some(ModelConfig::new("openai/gpt-4.1-mini")),
+            llm_skipped: Some("no provider configured".into()),
+            ..ReadinessProbe::default()
+        };
+        let (status, Json(body)) = deep_readyz(true, &probe).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.ready);
+        assert_eq!(body.degraded, vec!["no provider configured".to_string()]);
+        assert!(
+            !body.checks.iter().any(|c| c.name.starts_with("llm_")),
+            "llm checks must not run when skipped: {:?}",
+            body.checks
+        );
+    }
+
+    /// The bus is still a hard gate — skipping the LLM never fakes a 200.
+    #[tokio::test]
+    async fn readyz_still_fails_closed_when_the_bus_is_down() {
+        let probe = ReadinessProbe {
+            llm_skipped: Some("no provider configured".into()),
+            ..ReadinessProbe::default()
+        };
+        let (status, Json(body)) = deep_readyz(false, &probe).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!body.ready);
+    }
+
+    /// Nothing skipped + nothing degraded → the JSON is byte-identical to the
+    /// pre-change shape (`degraded` is omitted), so existing readiness
+    /// consumers (deploy-appliance.ps1, k8s probes) keep working.
+    #[tokio::test]
+    async fn readyz_json_omits_degraded_when_empty() {
+        let probe = ReadinessProbe::default();
+        let (status, Json(body)) = deep_readyz(true, &probe).await;
+        assert_eq!(status, StatusCode::OK);
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(!json.contains("degraded"), "{json}");
+    }
 
     #[tokio::test]
     async fn journal_writable_check_succeeds_in_tempdir() {

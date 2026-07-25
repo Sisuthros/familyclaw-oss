@@ -270,7 +270,9 @@ cd familyclaw
 cargo install --path crates/familyclaw-gateway
 
 # 2. Pre-flight checks (config resolution + effective settings, no network)
-familyclaw-gateway doctor
+#    Set the keyless mode HERE too — without it doctor checks the DEFAULT
+#    channel (telegram) and correctly fails on the missing bot token.
+FAMILYCLAW_CHANNEL_KIND=none familyclaw-gateway doctor   # -> "doctor: ok", exit 0
 
 # 3. Start it with NO family keys — keyless publish mode
 FAMILYCLAW_CHANNEL_KIND=none familyclaw-gateway serve
@@ -278,18 +280,37 @@ FAMILYCLAW_CHANNEL_KIND=none familyclaw-gateway serve
 
 # 4. In another terminal: confirm the HTTP surface is live
 curl -i http://127.0.0.1:8787/healthz   # -> 200 OK
-curl -i http://127.0.0.1:8787/readyz    # -> 200 OK (bus running)
+curl -i http://127.0.0.1:8787/readyz    # -> 200 OK, ready:true + a "degraded" note
 ```
 
 On Windows PowerShell, set the env var inline:
 
 ```powershell
+$env:FAMILYCLAW_CHANNEL_KIND = "none"; familyclaw-gateway doctor
 $env:FAMILYCLAW_CHANNEL_KIND = "none"; familyclaw-gateway serve
 ```
 
+`/readyz` on this path answers `200` **and tells you what it skipped** — the
+LLM probes are not run because you never configured a provider:
+
+```json
+{"ready":true,
+ "degraded":["llm_ping/llm_tools_ping skipped: no LLM provider configured (FAMILYCLAW_PROVIDERS unset) and channel kind is 'none' (keyless demo mode) — the agent runs MUTE (memory + emotion only, no text replies). POST /canary asserts a live LLM turn."],
+ "checks":[{"name":"resonance_bus","ok":true,"detail":"running"}]}
+```
+
+This skip is **narrow and opt-in**: it applies only to the keyless demo mode
+(`FAMILYCLAW_CHANNEL_KIND=none` *and* no `FAMILYCLAW_PROVIDERS`). Any real
+deployment — or this same demo mode once you set `FAMILYCLAW_PROVIDERS` — runs
+the LLM probes and fails closed with `503` if the provider is unreachable, so a
+forgotten key never hides behind a green readiness check. `POST /canary` is the
+strict surface: it reports `ok:false` whenever a live LLM turn is impossible,
+demo mode included.
+
 That is the whole guest loop: **install → doctor → serve → curl.** Once
 `/readyz` returns `200`, the platform (Layer A) is running on your box with zero
-private data. Wiring a real family (Layer B) is the next section.
+private data — with a mute agent until you wire a model. Wiring a real family
+(Layer B) is the next section.
 
 ### Full test suite
 ```bash
