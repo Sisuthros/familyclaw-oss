@@ -137,9 +137,19 @@ echo "2️⃣  Scanning committed diff content (git log -S, --all)…"
 CONTENT_HITS=0
 while IFS= read -r name; do
     [ -z "$name" ] && continue
-    n=$(git log --all --oneline -S"$name" --pickaxe-regex -i -- . \
-        ':(exclude)scripts/audit-layer-b.sh' \
-        ':(exclude)scripts/pre-publish-scan.sh' \
+    PICKAXE_EXCLUDES=(':(exclude)scripts/audit-layer-b.sh' ':(exclude)scripts/pre-publish-scan.sh')
+    # The maintainer's own name is legitimate, intentional copyright/maintainer
+    # attribution (LICENSE, GOVERNANCE.md, README.md) -- audit-layer-b.sh check
+    # #8 already exempts exactly this (path exception for LICENSE/GOVERNANCE.md
+    # plus a ©/copyright line filter that also covers README.md). git log -S
+    # cannot filter by line content, only by whole file, so mirror that
+    # exemption here -- scoped to ONLY the maintainer-name token, so every
+    # other forbidden name (real private agent personas) is still fully
+    # scanned in these files, same as everywhere else.
+    if [ "$name" = "$EXTRA_OP" ]; then
+        PICKAXE_EXCLUDES+=(':(exclude)LICENSE' ':(exclude)GOVERNANCE.md' ':(exclude)README.md')
+    fi
+    n=$(git log --all --oneline -S"$name" --pickaxe-regex -i -- . "${PICKAXE_EXCLUDES[@]}" \
         2>/dev/null | wc -l | tr -d ' ')
     if [ "$n" -gt 0 ]; then
         echo "   ❌ FAIL: '$name' present in $n commit(s) of history content"
