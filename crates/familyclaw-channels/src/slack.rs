@@ -2,10 +2,15 @@
 //!
 //! MVP capabilities:
 //! - **Outbound:** `chat.postMessage` via `SLACK_BOT_TOKEN`
-//! - **Inbound:** **not wired.** [`SlackChannel::inject`] exists, but no HTTP
-//!   route reaches it — the gateway's `POST /inject` builds a Discord envelope
-//!   and requires a configured Discord channel, and Socket Mode / Events API is
-//!   not implemented. Inbound Slack messages do not reach the agent today.
+//! - **Inbound:** wired via the **Events API**. The gateway mounts
+//!   `POST /slack/events` when `SLACK_SIGNING_SECRET` is set: it verifies
+//!   the HMAC-SHA256 request signature ([`crate::verify_slack_signature`]),
+//!   answers the one-time `url_verification` challenge, and turns
+//!   `event_callback` `message` events into [`SlackChannel::inject`] calls
+//!   ([`crate::parse_slack_message_event`]). `POST /inject` (the generic
+//!   operator/test injection route) also reaches this channel when Slack is
+//!   the configured `FAMILYCLAW_CHANNEL_KIND`. Socket Mode is not
+//!   implemented — Events API (HTTP) is the supported inbound transport.
 //! - **Approvals:** [`format_approval_prompt`] renders Approve/Deny instructions
 //!   with the gateway approval id for one-click follow-up in `/console`
 //!

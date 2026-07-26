@@ -115,9 +115,10 @@ mod oidc;
 mod readiness;
 use config::FamilyConfig;
 use familyclaw_channels::{
-    verify_signature, Channel, ChannelKind, ChannelResult, DiscordChannel, DiscordInteraction,
-    InboundMessage, MessageStream, OutboundMessage, SendFuture, SlackChannel, TelegramChannel,
-    RESPONSE_DEFERRED_CHANNEL_MESSAGE, RESPONSE_PONG,
+    parse_slack_message_event, verify_signature, verify_slack_signature, Channel, ChannelKind,
+    ChannelResult, DiscordChannel, DiscordInteraction, InboundMessage, MessageStream,
+    OutboundMessage, SendFuture, SlackChannel, TelegramChannel, RESPONSE_DEFERRED_CHANNEL_MESSAGE,
+    RESPONSE_PONG, SLACK_EVENT_TYPE_URL_VERIFICATION,
 };
 use familyclaw_core::{AgentConfig, FamilyClawError, ModelConfig, Result};
 use familyclaw_observability::{
@@ -145,6 +146,19 @@ const DISCORD_PUBLIC_KEY_ENV: &str = "DISCORD_PUBLIC_KEY";
 const DISCORD_CHANNEL_ID_ENV: &str = "DISCORD_CHANNEL_ID";
 const TELEGRAM_CHANNEL_ID_ENV: &str = "FAMILYCLAW_TELEGRAM_CHANNEL_ID";
 const REPLY_TARGET_ENV: &str = "FAMILYCLAW_REPLY_TARGET";
+/// Slack Events API signing secret (env). Required to mount `POST
+/// /slack/events` (inbound). Without it Slack stays outbound-only
+/// (`chat.postMessage`), same fail-closed posture as Discord's
+/// `DISCORD_PUBLIC_KEY` gate on `/discord/interactions`.
+const SLACK_SIGNING_SECRET_ENV: &str = "SLACK_SIGNING_SECRET";
+/// Slack bot token (env; also `familyclaw_channels::slack::TOKEN_ENV`).
+/// Named locally (rather than importing the channel crate's constant) so
+/// `doctor`'s env-presence check stays a plain string compare, matching the
+/// style of the other `*_ENV` consts in this file.
+const SLACK_BOT_TOKEN_ENV: &str = "SLACK_BOT_TOKEN";
+/// Slack channel id for outbound posting (env). Same var `start_runtime`'s
+/// slack branch reads directly.
+const SLACK_CHANNEL_ID_ENV: &str = "FAMILYCLAW_SLACK_CHANNEL_ID";
 
 /// Optional bearer token that protects `POST /inject` (env). Used only in
 /// error messages/documentation — the actual value is read via
@@ -232,6 +246,15 @@ struct GatewayState {
     bus: Option<BusHandle>,
     /// Discord channel for the inject handler. `Some` when the channel kind is "discord".
     discord_channel: Option<Arc<DiscordChannel>>,
+    /// Slack channel for the inject handler and `/slack/events` (Events API
+    /// inbound). `Some` when the channel kind is "slack".
+    slack_channel: Option<Arc<SlackChannel>>,
+    /// Slack Events API signing secret (`SLACK_SIGNING_SECRET`). `Some` →
+    /// `/slack/events` is registered and verifies the HMAC-SHA256 request
+    /// signature per Slack's spec; `None` → the route is not mounted (no
+    /// inbound Slack without a signing secret — fail closed, same posture
+    /// as Discord's `DISCORD_PUBLIC_KEY`).
+    slack_signing_secret: Option<Arc<str>>,
     /// Optional `POST /inject` bearer token. `Some` = the endpoint requires
     /// `Authorization: Bearer <token>`; `None` = open loopback-only default
     /// (compatible with prior behavior). Cf. `OpenClaw`'s
@@ -321,6 +344,8 @@ fn test_gateway_state() -> GatewayState {
     GatewayState {
         bus: None,
         discord_channel: None,
+        slack_channel: None,
+        slack_signing_secret: None,
         inject_token: None,
         discord_public_key: None,
         actions: None,
@@ -493,11 +518,19 @@ fn check_operator_capability(
     }
 }
 
-/// Injects an external message into the Discord channel.
+/// Injects an external message into the gateway's configured channel
+/// (Discord or Slack — whichever `FAMILYCLAW_CHANNEL_KIND` wired up).
 /// `POST /inject` — JSON: `{"sender": "...", "chat_id": "...", "body": "..."}`
 ///
 /// If [`GATEWAY_TOKEN_ENV`] is configured, the request requires the header
 /// `Authorization: Bearer <token>` (constant-time match), otherwise `401`.
+///
+/// Channel selection: exactly one channel kind is active per gateway
+/// process ([`GatewayState::discord_channel`] and
+/// [`GatewayState::slack_channel`] are never both `Some`), so this checks
+/// Discord first (backward-compatible with the original Discord-only
+/// handler), then Slack, then `503` when neither is configured (e.g.
+/// Telegram-only or channel-less mode, where `/inject` has no target).
 async fn inject_discord(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -506,12 +539,6 @@ async fn inject_discord(
     if let Err(code) = check_inject_auth(&state, &headers) {
         return (code, "unauthorized");
     }
-    let Some(ch) = &state.discord_channel else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "discord channel not configured",
-        );
-    };
     let sender = payload
         .get("sender")
         .and_then(|v| v.as_str())
@@ -531,14 +558,35 @@ async fn inject_discord(
             return (StatusCode::BAD_REQUEST, "invalid message");
         }
     };
-    let envelope = msg.into_envelope(ChannelKind::Discord, ch.channel_id());
-    match ch.inject(envelope) {
-        Ok(()) => (StatusCode::OK, "injected"),
-        Err(e) => {
-            tracing::warn!("discord inject failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "inject failed")
-        }
+
+    if let Some(ch) = &state.discord_channel {
+        let envelope = msg.into_envelope(ChannelKind::Discord, ch.channel_id());
+        return match ch.inject(envelope) {
+            Ok(()) => (StatusCode::OK, "injected"),
+            Err(e) => {
+                tracing::warn!("discord inject failed: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "inject failed")
+            }
+        };
     }
+
+    if let Some(ch) = &state.slack_channel {
+        // SlackChannel::inject takes the raw InboundMessage (it builds its
+        // own envelope with its channel_id) — unlike DiscordChannel::inject,
+        // which takes a pre-built InboundEnvelope.
+        return match ch.inject(msg) {
+            Ok(()) => (StatusCode::OK, "injected"),
+            Err(e) => {
+                tracing::warn!("slack inject failed: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "inject failed")
+            }
+        };
+    }
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no injectable channel configured (discord/slack)",
+    )
 }
 
 /// Discord Interactions endpoint — Ed25519 verify + inject + deferred response.
@@ -652,6 +700,110 @@ async fn handle_discord_interaction(
         StatusCode::OK,
         Json(serde_json::json!({"type": RESPONSE_DEFERRED_CHANNEL_MESSAGE})),
     )
+}
+
+/// Slack Events API endpoint — HMAC-SHA256 verify + `url_verification`
+/// handshake + `message` event → inject.
+///
+/// `POST /slack/events` is only mounted (see [`build_router`]) when
+/// [`GatewayState::slack_signing_secret`] is `Some` — same fail-closed
+/// posture as `/discord/interactions`' public-key gate. Slack's app
+/// configuration must point the Events API subscription at this URL.
+///
+/// Response contract: Slack retries delivery on any non-2xx, so once the
+/// signature is verified this always answers `200 OK` — including for
+/// event types this gateway doesn't act on (e.g. `reaction_added`) or
+/// loop-prevention skips (bot-authored messages, edits) — `parse_slack_message_event`
+/// returning `Ok(None)` is the expected, silent, common case.
+async fn handle_slack_events(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(signing_secret) = state.slack_signing_secret.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "slack events not configured"})),
+        );
+    };
+    let Some(ch) = state.slack_channel.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "slack channel not configured"})),
+        );
+    };
+
+    let timestamp = headers
+        .get("X-Slack-Request-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let signature = headers
+        .get("X-Slack-Signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if timestamp.is_empty() || signature.is_empty() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "missing signature headers"})),
+        );
+    }
+
+    if let Err(e) = verify_slack_signature(signing_secret, timestamp, signature, &body) {
+        tracing::warn!("slack events verify failed: {e}");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid signature"})),
+        );
+    }
+
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("slack events json parse failed: {e}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid payload"})),
+            );
+        }
+    };
+
+    // One-time handshake when the Events API subscription URL is (re-)saved
+    // in the Slack app config: echo the challenge back verbatim, no
+    // signature-covered side effects beyond the check already done above.
+    if payload.get("type").and_then(|v| v.as_str()) == Some(SLACK_EVENT_TYPE_URL_VERIFICATION) {
+        let challenge = payload
+            .get("challenge")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"challenge": challenge})),
+        );
+    }
+
+    match parse_slack_message_event(&payload) {
+        Ok(Some(inbound)) => {
+            if let Err(e) = ch.inject(inbound) {
+                tracing::warn!("slack event inject failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "inject failed"})),
+                );
+            }
+            (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+        }
+        // Not an actionable human message (bot echo, edit, non-message
+        // event, …) — 200 OK so Slack doesn't retry; nothing to inject.
+        Ok(None) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+        Err(e) => {
+            tracing::warn!("slack event payload malformed: {e}");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "malformed event"})),
+            )
+        }
+    }
 }
 
 /// `GET /approvals/pending` — lists for the operator, **redacted**, the turns
@@ -1238,6 +1390,9 @@ fn build_router(state: Arc<GatewayState>) -> Router {
     if state.discord_public_key.is_some() && state.discord_channel.is_some() {
         router = router.route("/discord/interactions", post(handle_discord_interaction));
     }
+    if state.slack_signing_secret.is_some() && state.slack_channel.is_some() {
+        router = router.route("/slack/events", post(handle_slack_events));
+    }
     router.with_state(state)
 }
 
@@ -1383,6 +1538,33 @@ impl Channel for SharedDiscordChannel {
     }
 }
 
+/// Shared-instance adapter for Slack — same rationale as
+/// [`SharedDiscordChannel`]: the [`SlackChannel`] is built exactly once
+/// (`Arc<SlackChannel>`), the bus pump gets this adapter, and the
+/// `/inject` + `/slack/events` handlers get the `Arc` handle directly. Both
+/// paths operate on the SAME `inbound_tx`/`inbound_rx` pair, so events
+/// posted to `/slack/events` reach the running agent instead of a
+/// never-consumed receiver.
+struct SharedSlackChannel(Arc<SlackChannel>);
+
+impl Channel for SharedSlackChannel {
+    fn channel_id(&self) -> &str {
+        self.0.channel_id()
+    }
+
+    fn kind(&self) -> ChannelKind {
+        self.0.kind()
+    }
+
+    fn send(&self, message: OutboundMessage) -> SendFuture<'_> {
+        self.0.send(message)
+    }
+
+    fn receive(&self) -> ChannelResult<MessageStream> {
+        self.0.receive()
+    }
+}
+
 /// Starts [`FamilyRuntime`] with configuration read from the environment
 /// (Layer B). Reads the agent's name, model, soul, Telegram channel, and
 /// reply target from env vars — nothing is hardcoded (Layer A).
@@ -1451,8 +1633,18 @@ fn build_extra_agent_specs(cfg: &FamilyConfig, model_cfg: &ModelConfig) -> Vec<A
         .collect()
 }
 
-/// Returns the runtime, the Discord channel (inject/interactions), the inject token, and the public key.
-// Three channel branches (none / discord / telegram), each assembling the
+/// The built outbound channel plus, per-kind, its `Arc`-shared handle for
+/// the gateway's inject/interactions/events routes (see [`start_runtime`]).
+type ChannelBuild = (
+    Box<dyn Channel>,
+    Option<Arc<DiscordChannel>>,
+    Option<Arc<SlackChannel>>,
+);
+
+/// Returns the runtime, the Discord channel (inject/interactions), the
+/// Slack channel (inject/events), the inject token, the Discord public key,
+/// and the Slack signing secret.
+// Four channel branches (none / discord / telegram / slack), each assembling the
 // runtime on its own path — long but linear; splitting it up would hurt readability.
 #[allow(clippy::too_many_lines)]
 async fn start_runtime(
@@ -1460,6 +1652,8 @@ async fn start_runtime(
 ) -> Result<(
     FamilyRuntime,
     Option<Arc<DiscordChannel>>,
+    Option<Arc<SlackChannel>>,
+    Option<Arc<str>>,
     Option<Arc<str>>,
     Option<Arc<str>>,
 )> {
@@ -1513,12 +1707,10 @@ async fn start_runtime(
             Some(bridge),
         )
         .await?;
-        return Ok((runtime, None, inject_token, None));
+        return Ok((runtime, None, None, inject_token, None, None));
     }
 
-    let (channel, discord_ch): (Box<dyn Channel>, Option<Arc<DiscordChannel>>) = if channel_kind
-        == "discord"
-    {
+    let (channel, discord_ch, slack_ch): ChannelBuild = if channel_kind == "discord" {
         let bot_token = cfg.discord_bot_token();
         let ch_id = cfg.discord_channel_id();
         // TWO-WAY bot mode if DISCORD_BOT_TOKEN is set: the serenity
@@ -1553,7 +1745,7 @@ async fn start_runtime(
         };
         let dc_arc = Arc::new(dc);
         let ch: Box<dyn Channel> = Box::new(SharedDiscordChannel(Arc::clone(&dc_arc)));
-        (ch, Some(dc_arc))
+        (ch, Some(dc_arc), None)
     } else if channel_kind == "telegram" {
         let token = cfg.telegram_token();
         if token.is_empty() {
@@ -1570,7 +1762,7 @@ async fn start_runtime(
         let tc = TelegramChannel::new(token.to_string(), ch_id.to_string())
             .map_err(FamilyClawError::from)?;
         let ch: Box<dyn Channel> = Box::new(tc);
-        (ch, None)
+        (ch, None, None)
     } else if channel_kind == "slack" {
         let token = std::env::var("SLACK_BOT_TOKEN").unwrap_or_default();
         if token.trim().is_empty() {
@@ -1584,10 +1776,16 @@ async fn start_runtime(
                 "FAMILYCLAW_SLACK_CHANNEL_ID must be set when FAMILYCLAW_CHANNEL_KIND=slack",
             ));
         }
+        // Build the SlackChannel EXACTLY ONCE and share the same instance
+        // (same dual-instance pitfall as Discord, see SharedDiscordChannel's
+        // documentation): the bus pump gets the SharedSlackChannel adapter,
+        // the inject/`/slack/events` paths get an `Arc` handle — both to the
+        // same `inbound_tx`/`inbound_rx` pair.
         let sc = SlackChannel::new(token, ch_id).map_err(FamilyClawError::from)?;
-        info!("Slack: Web API MVP — outbound only (chat.postMessage); no inbound path wired");
-        let ch: Box<dyn Channel> = Box::new(sc);
-        (ch, None)
+        let sc_arc = Arc::new(sc);
+        info!("Slack: Web API MVP — outbound (chat.postMessage) + inbound via POST /slack/events (SLACK_SIGNING_SECRET required)");
+        let ch: Box<dyn Channel> = Box::new(SharedSlackChannel(Arc::clone(&sc_arc)));
+        (ch, None, Some(sc_arc))
     } else {
         return Err(FamilyClawError::invalid_input(format!(
             "unsupported FAMILYCLAW_CHANNEL_KIND={channel_kind:?} \
@@ -1654,7 +1852,34 @@ async fn start_runtime(
         None
     };
 
-    Ok((runtime, discord_ch, inject_token, discord_public_key))
+    // Slack Events API inbound: fail-closed without a signing secret — no
+    // route is mounted, so `/slack/events` doesn't exist rather than
+    // existing-but-unverified (same posture as Discord's public key gate).
+    let slack_signing_secret: Option<Arc<str>> = if channel_kind == "slack" {
+        let secret = std::env::var(SLACK_SIGNING_SECRET_ENV).unwrap_or_default();
+        let secret = secret.trim();
+        if secret.is_empty() {
+            warn!(
+                "{SLACK_SIGNING_SECRET_ENV} puuttuu — POST /slack/events ei ole käytössä \
+                 (Slack pysyy vain-outbound-kanavana)"
+            );
+            None
+        } else {
+            info!("Slack Events API aktiivinen ({SLACK_SIGNING_SECRET_ENV} set)");
+            Some(Arc::from(secret))
+        }
+    } else {
+        None
+    };
+
+    Ok((
+        runtime,
+        discord_ch,
+        slack_ch,
+        inject_token,
+        discord_public_key,
+        slack_signing_secret,
+    ))
 }
 
 #[tokio::main]
@@ -1739,7 +1964,8 @@ async fn serve() -> Result<()> {
     // bus.stop() → runtime.shutdown()). The same `bridge` is passed into
     // the runtime, which publishes the agent registration to it
     // (EventRecorder already subscribed above).
-    let (runtime, discord_ch, inject_token, discord_public_key) = start_runtime(bridge).await?;
+    let (runtime, discord_ch, slack_ch, inject_token, discord_public_key, slack_signing_secret) =
+        start_runtime(bridge).await?;
     info!("FamilyRuntime käynnissä (bus + agentti + kanava)");
 
     // The operator approval surface shares the SAME Arc<Mutex<ActionRuntime>>
@@ -1795,6 +2021,8 @@ async fn serve() -> Result<()> {
     let state = Arc::new(GatewayState {
         bus: Some(runtime.bus().clone()),
         discord_channel: discord_ch,
+        slack_channel: slack_ch,
+        slack_signing_secret,
         inject_token,
         discord_public_key,
         actions,
@@ -2076,7 +2304,15 @@ async fn doctor(fix: bool) -> Result<()> {
         &[]
     } else if channel_kind == "discord" {
         &[DISCORD_CHANNEL_ID_ENV, REPLY_TARGET_ENV]
+    } else if channel_kind == "slack" {
+        // Slack does not go through `FamilyConfig` (see `start_runtime`'s
+        // slack branch) — these are read directly from the environment.
+        &[SLACK_BOT_TOKEN_ENV, SLACK_CHANNEL_ID_ENV, REPLY_TARGET_ENV]
     } else {
+        // Falls through for "telegram" and any unrecognized kind (the
+        // unrecognized case still fails at `start_runtime`/`serve` time with
+        // a clear "unsupported FAMILYCLAW_CHANNEL_KIND" error — doctor's job
+        // here is just to report the Telegram-shaped keys it would check).
         &[
             TELEGRAM_TOKEN_ENV,
             TELEGRAM_CHANNEL_ID_ENV,
@@ -2117,6 +2353,17 @@ async fn doctor(fix: bool) -> Result<()> {
         } else {
             println!(
                 "[WARN]    env       {DISCORD_PUBLIC_KEY_ENV} unset — /discord/interactions off"
+            );
+        }
+    }
+
+    if channel_kind == "slack" {
+        if std::env::var_os(SLACK_SIGNING_SECRET_ENV).is_some_and(|v| !v.is_empty()) {
+            println!("[OK]      env       {SLACK_SIGNING_SECRET_ENV} set (/slack/events inbound)");
+        } else {
+            println!(
+                "[WARN]    env       {SLACK_SIGNING_SECRET_ENV} unset — /slack/events off \
+                 (Slack stays outbound-only, no inbound path)"
             );
         }
     }
@@ -2433,6 +2680,8 @@ mod tests {
         let not_ready = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -2451,6 +2700,8 @@ mod tests {
         let ready = Arc::new(GatewayState {
             bus: Some(bus.clone()),
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -2472,6 +2723,8 @@ mod tests {
         let _ = build_router(Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -2596,6 +2849,8 @@ mod tests {
         let state = GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -2677,6 +2932,8 @@ mod tests {
         let state = GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: Some(Arc::from("s3cret-token")),
             discord_public_key: None,
             actions: None,
@@ -2696,6 +2953,8 @@ mod tests {
         let state = GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: Some(Arc::from("s3cret-token")),
             discord_public_key: None,
             actions: None,
@@ -2738,6 +2997,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: Some(Arc::clone(&actions)),
@@ -2804,6 +3065,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -2851,6 +3114,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: Some(Arc::from("s3cret-token")),
             discord_public_key: None,
             actions: mut_state.actions.clone(),
@@ -2907,6 +3172,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -2932,6 +3199,8 @@ mod tests {
         Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -2964,6 +3233,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -3012,6 +3283,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -3075,6 +3348,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -3175,6 +3450,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: Some(bus.clone()),
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: Some(Arc::clone(&actions)),
@@ -3237,6 +3514,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -3265,6 +3544,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -3314,6 +3595,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -3425,6 +3708,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -3841,6 +4126,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: Some(bus.clone()),
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: Some(Arc::clone(&actions)),
@@ -4107,6 +4394,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: Some(bus.clone()),
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: Some(Arc::clone(&actions)),
@@ -4185,6 +4474,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,
@@ -4331,6 +4622,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: Some(bus.clone()),
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: Some(Arc::clone(&actions)),
@@ -4485,6 +4778,8 @@ mod tests {
         let state = Arc::new(GatewayState {
             bus: None,
             discord_channel: None,
+            slack_channel: None,
+            slack_signing_secret: None,
             inject_token: None,
             discord_public_key: None,
             actions: None,

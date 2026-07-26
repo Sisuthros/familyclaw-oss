@@ -72,6 +72,9 @@ mod telegram;
 #[cfg(feature = "slack")]
 mod slack;
 
+#[cfg(feature = "slack")]
+mod slack_events;
+
 pub use channel::{Channel, MessageStream, SendFuture};
 pub use error::{ChannelError, ChannelResult};
 pub use message::{ChannelKind, InboundEnvelope, InboundMessage, OutboundKind, OutboundMessage};
@@ -91,6 +94,13 @@ pub use telegram::TelegramChannel;
 
 #[cfg(feature = "slack")]
 pub use slack::{SlackChannel, TOKEN_ENV as SLACK_TOKEN_ENV};
+
+#[cfg(feature = "slack")]
+pub use slack_events::{
+    parse_message_event as parse_slack_message_event, verify_slack_signature,
+    EVENT_TYPE_CALLBACK as SLACK_EVENT_TYPE_CALLBACK,
+    EVENT_TYPE_URL_VERIFICATION as SLACK_EVENT_TYPE_URL_VERIFICATION,
+};
 
 /// The crate's version at build time (`CARGO_PKG_VERSION`).
 #[must_use]

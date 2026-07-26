@@ -30,6 +30,11 @@ uuid = { workspace = true }
 reqwest = { workspace = true, optional = true }
 ed25519-dalek = { version = "2.2", optional = true }
 
+# Slack Events API request-signature verification (slack_events.rs): HMAC-SHA256
+# per Slack's documented signing scheme.
+hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
 # Discord gateway adapter (discord.rs): serenity 0.12 with gateway.
 # default-features = false → leanest working set (no cache/framework/utils);
 # rustls_backend avoids a system OpenSSL dependency.
@@ -48,7 +53,7 @@ serenity = { version = "0.12", default-features = false, features = [
 default = []
 discord = ["dep:reqwest", "dep:ed25519-dalek", "dep:serenity"]
 telegram = ["dep:reqwest"]
-slack = ["dep:reqwest"]
+slack = ["dep:reqwest", "dep:hmac", "dep:sha2"]
 # Reserved / not implemented — empty flags so the names are reserved; no adapter source yet.
 whatsapp = []
 signal = []
