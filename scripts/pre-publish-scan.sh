@@ -127,10 +127,20 @@ done <<< "$SCAN_NAMES"
 
 # ── 2. Commit HISTORY CONTENT (pickaxe over all diffs) ─────────────────────
 echo "2️⃣  Scanning committed diff content (git log -S, --all)…"
+# Excludes THIS script and audit-layer-b.sh's own diffs from the pickaxe
+# search: both legitimately carry the forbidden-name list itself (as real
+# names when the operator-local file exists, or as the tracked placeholder
+# fallback when it doesn't) -- either way that line's own history will
+# always self-match a search for its own words, structurally, no matter what
+# words are chosen. That is the denylist declaring itself, not a leak; a
+# real leak into any OTHER tracked file is still fully caught.
 CONTENT_HITS=0
 while IFS= read -r name; do
     [ -z "$name" ] && continue
-    n=$(git log --all --oneline -S"$name" --pickaxe-regex -i 2>/dev/null | wc -l | tr -d ' ')
+    n=$(git log --all --oneline -S"$name" --pickaxe-regex -i -- . \
+        ':(exclude)scripts/audit-layer-b.sh' \
+        ':(exclude)scripts/pre-publish-scan.sh' \
+        2>/dev/null | wc -l | tr -d ' ')
     if [ "$n" -gt 0 ]; then
         echo "   ❌ FAIL: '$name' present in $n commit(s) of history content"
         CONTENT_HITS=1

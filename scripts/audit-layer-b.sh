@@ -144,7 +144,12 @@ echo "8️⃣ Checking for real Layer B names in publishable content..."
 # them is safe.
 #
 # An explicit deny-list excludes legitimately-public files that mention agent
-# names only as escaped/example tokens (e.g. *.example).
+# names only as escaped/example tokens (e.g. *.example). scripts/pre-publish-scan.sh
+# is excluded for the same reason this file excludes itself below: it embeds
+# the SAME tracked placeholder fallback list this file does (both scripts
+# resolve real names from the same gitignored local file; without it, both
+# fall back to identical placeholder tokens), so it would otherwise always
+# self-match here -- not a leak, just the placeholder list declaring itself.
 # `|| true`: the trailing `grep -vE` exits 1 when EVERY tracked path is filtered
 # out (e.g. a repo whose only tracked files are .example + this script). Under
 # `set -e` an empty result would otherwise abort the whole audit — guard it so an
@@ -154,7 +159,8 @@ ALL_TRACKED=$(git ls-files 2>/dev/null \
     | grep -vE '(^|/)docs/archive/' \
     | grep -vE '(^|/)docs/GIT_CONSOLIDATION\.md$' \
     | grep -vE '\.example($|\.)' \
-    | grep -vE '(^|/)scripts/audit-layer-b\.sh$' || true)
+    | grep -vE '(^|/)scripts/audit-layer-b\.sh$' \
+    | grep -vE '(^|/)scripts/pre-publish-scan\.sh$' || true)
 # Keep only TEXT files (content-based, no extension guessing). Iterate safely
 # even with spaces/odd chars via a while-read loop on NUL-free, newline-listed
 # paths from git ls-files (git paths use forward slashes, no newlines).
@@ -186,17 +192,18 @@ for name in $FORBIDDEN_NAMES; do
     # Case-INSENSITIVE: real names leaked lowercase in a docs table slipped
     # past a case-sensitive scan. -i closes that gap.
     # -w (word boundary): required because one real forbidden name (an FI
-    # given name) is a substring of common Finnish word endings (e.g.
-    # "riville", "tehtaville" -- generic example words, not the real name)
-    # — substring matching would drown the audit in false positives.
+    # given name) is a substring of common Finnish inflected word forms
+    # (case endings attach directly to the stem, with no separator) —
+    # substring matching would drown the audit in false positives.
     MATCHES=$(echo "$SCAN_FILES" | xargs grep -ilw "$clean_name" 2>/dev/null \
         | xargs -r grep -Hniw "$clean_name" 2>/dev/null \
         | grep -v "\.example" \
         | grep -vi "agent_alpha\|agent_beta\|agent_gamma\|agent_delta\|agent_epsilon" || true)
     # grep -w treats non-ASCII letters (ä/ö) as word boundaries in the C locale,
-    # so Finnish word endings like "tehtaville"/"riville" false-positive on
-    # that FI given name. Drop lines where the name only appears embedded in
-    # a longer word (immediately preceded/followed by a letter incl. ä/ö/å).
+    # so Finnish inflected forms of that FI given name (case endings glued
+    # directly onto the stem) false-positive on it. Drop lines where the name
+    # only appears embedded in a longer word (immediately preceded/followed
+    # by a letter incl. ä/ö/å).
     if [ -n "$MATCHES" ]; then
         MATCHES=$(echo "$MATCHES" | grep -viE "[a-zA-ZäöåÄÖÅ]${clean_name}|${clean_name}[a-zA-ZäöåÄÖÅ]" || true)
     fi
