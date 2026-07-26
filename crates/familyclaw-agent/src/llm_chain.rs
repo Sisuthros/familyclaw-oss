@@ -1117,6 +1117,65 @@ impl LlmFailover {
         let state = self.state.lock().ok()?;
         state.entries.first().map(ChainEntry::effective_config)
     }
+
+    /// **Provider-health snapshot**: one [`ProviderHealthSnapshot`] per chain
+    /// entry, in `preference_order` (primary first), for a monitoring/status
+    /// surface (e.g. an operator-facing `/readyz`-style endpoint, a dashboard,
+    /// or a debug log line) to answer "which providers are currently healthy,
+    /// which are cooling down and until when, and how big/consumed is each
+    /// provider's key pool" — without reaching into the cooldown state
+    /// machine's private fields.
+    ///
+    /// Read-only: does NOT mutate any health state (unlike
+    /// [`complete`](Self::complete), which is the only thing that changes
+    /// cooldowns). Safe to poll on an interval.
+    #[must_use]
+    pub fn health_snapshot(&self) -> Vec<ProviderHealthSnapshot> {
+        let now = self.clock.now();
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        state
+            .entries
+            .iter()
+            .map(|e| ProviderHealthSnapshot {
+                provider: e.provider.clone(),
+                model: e.template.model.clone(),
+                healthy: !Self::is_cooled(now, &e.health),
+                cooled_until: e.health.cooled_until,
+                strike: e.health.strike,
+                auth_strike: e.health.auth_strike,
+                key_pool_size: e.keys.len(),
+                active_key_index: e.key_cursor,
+            })
+            .collect()
+    }
+}
+
+/// **Point-in-time health** of one chain entry (provider/model pair), as
+/// returned by [`LlmFailover::health_snapshot`]. Read-only — a snapshot does
+/// not track anything itself; it reflects the cooldown state machine's
+/// internal [`EntryHealth`] at the moment it was taken.
+#[derive(Debug, Clone)]
+pub struct ProviderHealthSnapshot {
+    /// Provider prefix (e.g. `"openai"`).
+    pub provider: String,
+    /// Model name (without the provider prefix), e.g. `"gpt-4o"`.
+    pub model: String,
+    /// `true` if the entry would be tried in PASS 1 right now (not cooling
+    /// down). `false` entries are still reachable via PASS 2 (last resort).
+    pub healthy: bool,
+    /// Timestamp until which the entry is cooling down. `None` if healthy or
+    /// never failed.
+    pub cooled_until: Option<Timestamp>,
+    /// General (non-auth) escalation counter (rate-limit/overload/http/timeout).
+    pub strike: u8,
+    /// Auth escalation counter (key-pool exhausted / 404 provider-dead).
+    pub auth_strike: u8,
+    /// Number of keys registered for this provider (key-pool size).
+    pub key_pool_size: usize,
+    /// Index of the currently active key within the pool (round-robin cursor).
+    pub active_key_index: usize,
 }
 
 /// Builds a failover chain from a [`ModelConfig`] using a resolver.
@@ -1972,6 +2031,75 @@ mod cooldown_tests {
         let err = failover.complete(&msgs()).await.expect_err("all fail");
         assert!(matches!(err, LlmError::Http(_)));
         assert_eq!(mock.total_calls(), 2);
+    }
+
+    // ── health_snapshot (provider-health tracking) ──────────────────────────
+
+    #[tokio::test]
+    async fn health_snapshot_reflects_cooldown_and_key_pool() {
+        // Primary: 429 -> cools down (general ladder). Fallback: never
+        // called, stays healthy. The snapshot must reflect BOTH without
+        // mutating anything (it's read-only).
+        let primary = MockLlm::spawn(vec![Reply::status(429), Reply::ok("late")], None);
+        let fallback = MockLlm::spawn(vec![Reply::ok("from-fallback")], None);
+        let clock = FixedClock::at(1000);
+        let resolver = EnvEndpointResolver::new()
+            .with_provider("pa", primary.base_url.clone(), "K_UNSET_A")
+            .with_provider_keys(
+                "pb",
+                fallback.base_url.clone(),
+                vec!["K_UNSET_B1".into(), "K_UNSET_B2".into()],
+            );
+        let model = ModelConfig::new("pa/m").with_fallback("pb/m");
+        let failover =
+            build_llm_chain_with_clock(&model, &resolver, dyn_clock(&clock)).expect("builds");
+
+        // Before any call: both entries healthy, no strikes.
+        let before = failover.health_snapshot();
+        assert_eq!(before.len(), 2);
+        assert!(before.iter().all(|s| s.healthy));
+        assert!(before.iter().all(|s| s.cooled_until.is_none()));
+        assert_eq!(before[0].provider, "pa");
+        assert_eq!(before[0].key_pool_size, 1);
+        assert_eq!(before[1].provider, "pb");
+        assert_eq!(before[1].key_pool_size, 2, "fallback registered 2 keys");
+
+        // PASS 1: primary 429 (cools down), fallback answers "from-fallback".
+        let out = failover.complete(&msgs()).await.expect("fallback answers");
+        assert_eq!(out, "from-fallback");
+
+        let after = failover.health_snapshot();
+        let pa = after.iter().find(|s| s.provider == "pa").expect("pa entry");
+        assert!(!pa.healthy, "primary must show unhealthy after a 429");
+        assert!(pa.cooled_until.is_some());
+        assert_eq!(pa.strike, 1);
+        let pb = after.iter().find(|s| s.provider == "pb").expect("pb entry");
+        assert!(pb.healthy, "fallback must stay healthy — it never failed");
+        assert!(pb.cooled_until.is_none());
+
+        // Advancing past the cooldown window (60s rung) restores health.
+        clock.advance(120);
+        let restored = failover.health_snapshot();
+        let pa2 = restored
+            .iter()
+            .find(|s| s.provider == "pa")
+            .expect("pa entry");
+        assert!(pa2.healthy, "primary must be healthy again once cooldown expires");
+        assert_eq!(pa2.strike, 1, "snapshot never resets strike — only complete() does");
+    }
+
+    #[test]
+    fn health_snapshot_is_empty_for_empty_chain() {
+        let clock = FixedClock::at(0);
+        let failover = LlmFailover {
+            state: Mutex::new(super::FailoverState {
+                entries: Vec::new(),
+            }),
+            primary: String::new(),
+            clock: dyn_clock(&clock),
+            last_turn: Mutex::new(None),
+        };
+        assert!(failover.health_snapshot().is_empty());
     }
 
     #[test]

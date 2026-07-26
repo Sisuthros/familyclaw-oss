@@ -88,7 +88,7 @@ pub use import_cli::{ImportCommand, ImportError, ImportSource, ImportedBundle};
 pub use live_executor::LiveTurnExecutor;
 pub use llm_chain::{
     build_llm_chain, primary_llm_config, EnvEndpointResolver, LlmEndpointResolver, LlmFailover,
-    TurnProviderSummary,
+    ProviderHealthSnapshot, TurnProviderSummary,
 };
 pub use replay_cli::{ReplayCommand, ReplayError};
 pub use resumable::{
