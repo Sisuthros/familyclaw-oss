@@ -58,6 +58,7 @@ familyclaw-runtime = { path = "crates/familyclaw-runtime" }
 familyclaw-sandbox = { path = "crates/familyclaw-sandbox" }
 familyclaw-scheduler = { path = "crates/familyclaw-scheduler" }
 familyclaw-security = { path = "crates/familyclaw-security" }
+familyclaw-tts = { path = "crates/familyclaw-tts" }
 ractor = "0.14"
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }

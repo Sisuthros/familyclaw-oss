@@ -1,0 +1,36 @@
+[package]
+name = "familyclaw-tts"
+description = "Text-to-speech abstraction for the agent platform: a provider-agnostic TtsProvider trait, an in-memory MockTts for offline dev/tests, and an OpenAI-compatible HTTP adapter (feature `openai`)"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["tts", "speech", "audio", "agent", "voice"]
+categories = ["asynchronous", "multimedia::audio"]
+
+[lints]
+workspace = true
+
+[dependencies]
+familyclaw-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# OpenAI-compatible `/audio/speech` HTTP adapter (openai.rs): the request/
+# response schema (model, input, voice, response_format, speed -> raw audio
+# bytes) is shared by OpenAI itself and several OpenAI-compatible gateways
+# (Groq, DeepInfra, ...), so one adapter + a configurable `api_base` covers
+# all of them. Only needs a bearer API key -- no exotic auth flow.
+reqwest = { workspace = true, optional = true }
+
+[features]
+# Default: core abstraction + MockTts only (no network, no API key needed).
+default = []
+openai = ["dep:reqwest"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
