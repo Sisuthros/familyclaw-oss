@@ -7,7 +7,7 @@ use familyclaw_actions::policy::SkillPermission;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::env::{McpServerConfig, McpTransportConfig};
+use crate::env::{McpServerConfig, McpServerTrust, McpTransportConfig};
 use crate::error::{McpError, Result};
 use crate::redact::redact_for_log;
 use crate::transport::Transport;
@@ -15,6 +15,7 @@ use crate::transport::Transport;
 /// An MCP server client (stdio or HTTP).
 pub struct McpClient {
     server_name: String,
+    trust: McpServerTrust,
     transport: Mutex<Transport>,
 }
 
@@ -26,10 +27,12 @@ impl McpClient {
     /// handshake fails.
     pub async fn connect(config: McpServerConfig) -> Result<SharedMcpClient> {
         let server_name = config.name.clone();
+        let trust = config.trust;
         let mut transport = Transport::connect(&config.transport, &server_name)?;
         transport.handshake().await?;
         Ok(Arc::new(Self {
             server_name,
+            trust,
             transport: Mutex::new(transport),
         }))
     }
@@ -38,6 +41,14 @@ impl McpClient {
     #[must_use]
     pub fn server_name(&self) -> &str {
         &self.server_name
+    }
+
+    /// The operator-declared trust class for this server (see
+    /// [`McpServerTrust`]), used by [`crate::bridge`] to classify the
+    /// bridged skills' risk/approval policy.
+    #[must_use]
+    pub fn server_trust(&self) -> McpServerTrust {
+        self.trust
     }
 
     /// Whether the configuration is for an HTTP transport.

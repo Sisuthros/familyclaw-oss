@@ -14,7 +14,8 @@ use familyclaw_actions::{
 use uuid::Uuid;
 
 use crate::client::{McpClient, SharedMcpClient};
-use crate::env::load_mcp_servers_from_env;
+use crate::config::load_mcp_config_from_env;
+use crate::env::{load_mcp_servers_from_env, McpServerTrust};
 use crate::error::{McpError, Result};
 
 /// Deterministic UUID v5 namespace for MCP skills.
@@ -42,13 +43,34 @@ pub async fn register_mcp_skills(
     Ok(())
 }
 
-/// Reads `FAMILYCLAW_MCP_SERVERS` and registers all discovered servers.
+/// Reads `FAMILYCLAW_MCP_SERVERS` **and** an optional `FAMILYCLAW_MCP_CONFIG`
+/// TOML file, and registers all discovered servers.
+///
+/// This is the single, first-class "attach my existing MCP servers"
+/// entrypoint (config-driven, distinct from the `familyclaw import`
+/// quarantine path — see `docs/MCP_WORKS_WITH.md`):
+///
+/// - `FAMILYCLAW_MCP_SERVERS` (env, `name=command args` / `name=http://…`,
+///   semicolon-separated) — quick attach, always [`McpServerTrust::ReadOnly`].
+/// - `FAMILYCLAW_MCP_CONFIG` (path to a TOML file, `[[servers]]` — see
+///   `crate::config`) — first-class config file, supports per-server
+///   [`McpServerTrust`] elevation.
+///
+/// A server name present in both sources is only connected once — the TOML
+/// config entry wins (so an operator can override an env-attached server's
+/// trust by giving it an explicit TOML entry with the same name).
 ///
 /// # Errors
-/// Returns an error if parsing the environment variable, connecting, or
-/// registering fails.
+/// Returns an error if parsing either source, connecting, or registering a
+/// skill fails.
 pub async fn register_from_env(runtime: &mut ActionRuntime) -> Result<()> {
-    let configs = load_mcp_servers_from_env()?;
+    let mut configs = load_mcp_servers_from_env()?;
+    let file_configs = load_mcp_config_from_env()?;
+
+    // TOML entries take precedence over an env entry with the same name.
+    configs.retain(|c| !file_configs.iter().any(|fc| fc.name == c.name));
+    configs.extend(file_configs);
+
     for config in configs {
         let client = McpClient::connect(config).await?;
         register_mcp_skills(runtime, &client).await?;
@@ -81,14 +103,30 @@ impl McpDynamicSkill {
             default_input_schema()
         };
 
+        // Trust classification is an operator declaration on the *server*
+        // (see `McpServerTrust`), not something derived from the tool
+        // output — every tool from that server gets the same class.
+        let (permissions, risk, approval_policy) = match self.client.server_trust() {
+            McpServerTrust::ReadOnly => (
+                vec![SkillPermission::NetworkRead],
+                ActionRisk::ReadOnly,
+                ApprovalPolicy::AutoIfReadOnly,
+            ),
+            McpServerTrust::Trusted => (
+                vec![SkillPermission::NetworkRead, SkillPermission::WriteLocalFiles],
+                ActionRisk::WriteLocal,
+                ApprovalPolicy::RequireApproval,
+            ),
+        };
+
         SkillManifest {
             id: self.skill_id,
             name: self.descriptor.name.clone(),
             version: "1.0.0".to_string(),
             description: self.descriptor.description.clone(),
-            permissions: vec![SkillPermission::NetworkRead],
-            risk: ActionRisk::ReadOnly,
-            approval_policy: ApprovalPolicy::AutoIfReadOnly,
+            permissions,
+            risk,
+            approval_policy,
             input_hint: None,
             output_hint: None,
             input_schema,

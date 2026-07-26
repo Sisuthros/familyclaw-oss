@@ -2,10 +2,74 @@
 
 FamilyClaw bridges external [Model Context Protocol](https://modelcontextprotocol.io/)
 servers into the action runtime as dynamic skills (`crates/familyclaw-mcp`).
-Configure servers with `FAMILYCLAW_MCP_SERVERS` (stdio `name=command args` or
-HTTP `name=https://host[:port][/path]`, semicolon-separated). Each discovered
-tool is registered with a manifest derived from the MCP descriptor; execution
+Two config-driven ways to attach a server, both funnel into the same bridge:
+
+- `FAMILYCLAW_MCP_SERVERS` — env var, quick attach (stdio `name=command args`
+  or HTTP `name=https://host[:port][/path]`, semicolon-separated). Always
+  registers at the safe `ReadOnly` trust class.
+- `FAMILYCLAW_MCP_CONFIG` — path to a **TOML config file**, the first-class
+  attachment path (see [Config-driven attachment](#config-driven-attachment-familyclaw_mcp_config)
+  below). Supports per-server trust elevation.
+
+Both sources are read at boot (`familyclaw_mcp::register_from_env`, wired
+into every runtime via `familyclaw-runtime::register_mcp_from_env`); a TOML
+entry overrides an env entry with the same server name. Each discovered tool
+is registered with a manifest derived from the MCP descriptor; execution
 calls `tools/call` and treats output as **untrusted (tainted)**.
+
+## Config-driven attachment (`FAMILYCLAW_MCP_CONFIG`)
+
+This is the first-class, documented "attach my existing MCP servers as
+trusted, runnable `ActionRuntime` skills" path, and it is **separate from**
+the `familyclaw import` quarantine path (`docs/MIGRATION.md`,
+`crates/familyclaw-agent/src/import_cli.rs`). The two exist for different
+reasons — see the module doc comment in `crates/familyclaw-mcp/src/config.rs`
+for the full rationale; short version:
+
+| | `familyclaw import` | `FAMILYCLAW_MCP_CONFIG` (this path) |
+|---|---|---|
+| Input | A static *export* file from another agent runtime | A **live** MCP server the bridge can `tools/list`/`tools/call` against |
+| Trust model | Cannot verify what the source skill's code does → **quarantine, never registered/executed** | The MCP protocol is the contract; no code to sandbox → **registered and runnable directly** |
+| Risk class | Always `ExecuteCode` + `AlwaysRequireApproval` (frozen) | Operator-chosen per server: `read_only` (default) or `trusted` |
+| Activation | Requires separate sandbox validation + manual approval (out of scope for the importer) | Registered at boot — no separate activation step |
+
+Point `FAMILYCLAW_MCP_CONFIG` at a TOML file:
+
+```toml
+# familyclaw-mcp.toml — attach existing MCP servers as ActionRuntime skills.
+
+[[servers]]
+name = "docs_search"          # logical name; prefixes bridged skill ids
+command = "npx"               # stdio transport: command + args
+args = ["-y", "@my/mcp-docs-server"]
+trust = "read_only"           # default; omit for the same effect
+
+[[servers]]
+name = "local_notes"
+command = "my-notes-mcp-server"
+trust = "trusted"             # operator has reviewed this server
+
+[[servers]]
+name = "remote_kb"
+url = "https://kb.internal.example/mcp"   # HTTP transport
+trust = "read_only"
+```
+
+Each entry needs exactly one of `command` (stdio) or `url` (HTTP); `trust`
+defaults to `read_only`. Malformed entries (empty name, neither/both of
+`command`/`url`, duplicate names, unknown `trust` value) fail closed with a
+clear error at load time — nothing is silently skipped.
+
+### Trust classes
+
+| `trust` | Bridged risk class | Approval policy | Effect |
+|---|---|---|---|
+| `read_only` (default) | `ActionRisk::ReadOnly` | `AutoIfReadOnly` | Auto-runs; assumed no side effects. |
+| `trusted` | `ActionRisk::WriteLocal` | `RequireApproval` | Still auto-runs (local-write class is auto-runnable under `RequireApproval`), but any tool call that the pipeline reclassifies as external/irreversible/money/message/code still hits the approval gate — see `familyclaw-actions::policy::required_approval`. |
+
+`trust` is a **per-server operator declaration**, not something derived from
+inspecting the tool — the bridge cannot know what a remote MCP tool actually
+does. Only mark a server `trusted` after reviewing what it exposes.
 
 ## What the bridge actually supports
 
@@ -48,12 +112,15 @@ Honest labels:
 
 ## Operator checklist
 
-1. Set `FAMILYCLAW_MCP_SERVERS` only for processes you trust to spawn or URLs you
-   trust to POST to.
+1. Set `FAMILYCLAW_MCP_SERVERS` (quick attach) or `FAMILYCLAW_MCP_CONFIG`
+   (first-class config file) only for processes you trust to spawn or URLs
+   you trust to POST to.
 2. Expect every MCP tool result to remain tainted through the pipeline.
 3. Do not assume write tools are approval-gated by the bridge alone — verify the
    server's behavior and FamilyClaw skill policy before production use.
-4. Prefer hermetic stdio servers in CI; use HTTP transports when the peer already
+4. Only set a server's `trust = "trusted"` in the TOML config after reviewing
+   what it exposes — it is an operator declaration, never auto-derived.
+5. Prefer hermetic stdio servers in CI; use HTTP transports when the peer already
    speaks MCP over `/mcp`.
 
-See also: [SKILLS.md](SKILLS.md), [SECURITY_MODEL.md](SECURITY_MODEL.md).
+See also: [SKILLS.md](SKILLS.md), [SECURITY_MODEL.md](SECURITY_MODEL.md), [MIGRATION.md](MIGRATION.md).

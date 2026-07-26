@@ -5,6 +5,32 @@
 
 use crate::error::{McpError, Result};
 
+/// How much an operator trusts an attached MCP server, and therefore what
+/// [`familyclaw_actions::policy::ActionRisk`] / [`familyclaw_actions::policy::ApprovalPolicy`]
+/// class its tools are bridged in as.
+///
+/// This is an **operator declaration**, not something derived from the MCP
+/// server's own claims — the bridge cannot inspect what a remote tool
+/// actually does, so trust is a per-server classification the operator opts
+/// into deliberately (see `docs/MCP_WORKS_WITH.md`).
+///
+/// - [`McpServerTrust::ReadOnly`] (default): tools are registered as
+///   read-only, auto-runnable, no side effects assumed. Safe default for any
+///   server the operator has not explicitly reviewed.
+/// - [`McpServerTrust::Trusted`]: tools are registered as local-write class
+///   (still fail-closed for anything beyond a local write — network/external
+///   side effects still require approval). Only use for servers the operator
+///   has reviewed and is willing to let run without a per-call approval gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerTrust {
+    /// Safe default: read-only, auto-runnable, no assumed side effects.
+    #[default]
+    ReadOnly,
+    /// Operator-reviewed: local-write class, still fail-closed beyond that.
+    Trusted,
+}
+
 /// Configuration for a single MCP server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
@@ -12,6 +38,8 @@ pub struct McpServerConfig {
     pub name: String,
     /// Transport type.
     pub transport: McpTransportConfig,
+    /// Operator-declared trust class (defaults to [`McpServerTrust::ReadOnly`]).
+    pub trust: McpServerTrust,
 }
 
 /// Stdio or HTTP transport.
@@ -91,6 +119,12 @@ fn parse_single_server(segment: &str) -> Result<McpServerConfig> {
     Ok(McpServerConfig {
         name: name.to_string(),
         transport,
+        // The `FAMILYCLAW_MCP_SERVERS` env grammar has no room for a trust
+        // marker without breaking the existing `name=value` format — servers
+        // attached this way always get the safe ReadOnly default. Trust
+        // elevation is a deliberate TOML-config-only opt-in (see `config.rs`
+        // / `docs/MCP_WORKS_WITH.md`).
+        trust: McpServerTrust::ReadOnly,
     })
 }
 

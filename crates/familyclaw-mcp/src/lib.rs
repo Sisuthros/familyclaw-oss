@@ -6,6 +6,7 @@
 
 pub mod bridge;
 pub mod client;
+pub mod config;
 pub mod env;
 pub mod error;
 pub mod redact;
@@ -13,7 +14,11 @@ pub mod transport;
 
 pub use bridge::{register_from_env, register_mcp_skills};
 pub use client::McpClient;
-pub use env::{load_mcp_servers_from_env, McpServerConfig, McpTransportConfig};
+pub use config::{
+    load_mcp_config_file, load_mcp_config_from_env, parse_mcp_config, McpFileConfig,
+    McpServerEntry,
+};
+pub use env::{load_mcp_servers_from_env, McpServerConfig, McpServerTrust, McpTransportConfig};
 pub use error::{McpError, Result};
 
 /// The crate's version at build time (`CARGO_PKG_VERSION`).
