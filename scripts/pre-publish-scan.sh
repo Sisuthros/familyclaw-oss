@@ -28,8 +28,11 @@
 # ── Why this file contains no plaintext family name ────────────────────────
 # This script is a tracked file scanned by audit-layer-b.sh check #8. Embedding
 # a real private name here would fail that audit. The forbidden-name list is
-# therefore DERIVED AT RUNTIME from audit-layer-b.sh's FORBIDDEN_NAMES, plus
-# history-only tokens reassembled at runtime (never present as whole words).
+# therefore READ AT RUNTIME from the same gitignored, operator-local file
+# audit-layer-b.sh uses (scripts/audit-layer-b.names.local -- Decision Point 2,
+# Option B, docs/PUBLISH_ORPHAN_PLAN.md), falling back to a tracked
+# placeholder list when that file is absent, plus history-only tokens
+# reassembled at runtime (never present as whole words).
 
 set -u
 
@@ -47,15 +50,21 @@ echo ""
 FAIL=0
 
 # ── Build the forbidden-name list without ever hardcoding one ──────────────
-# Source of truth: audit-layer-b.sh FORBIDDEN_NAMES. We keep only SINGLE-word
-# tokens (drop the quoted multi-word variant entries, whose embedded quotes and
-# spaces are not valid grep-word atoms and are already covered by the
-# corresponding single-word match anyway).
-RAW_NAMES=""
-if [ -f "$AUDIT_SCRIPT" ]; then
-    RAW_NAMES=$(grep -E '^FORBIDDEN_NAMES=' "$AUDIT_SCRIPT" \
-        | head -n1 \
-        | sed -E 's/^FORBIDDEN_NAMES="?//; s/".*$//')
+# Source of truth: the SAME gitignored, operator-local file audit-layer-b.sh
+# reads (docs/PUBLISH_ORPHAN_PLAN.md, Decision Point 2, Option B) -- not
+# audit-layer-b.sh's own source text, which (as of that fix) no longer
+# contains any real name to parse out. Falls back to the same tracked
+# placeholder list when the local file is absent, so this gate still runs
+# (with reduced real-world coverage) for contributors / CI on the public
+# repo. We keep only SINGLE-word tokens (drop the quoted multi-word variant
+# entries, whose embedded quotes and spaces are not valid grep-word atoms and
+# are already covered by the corresponding single-word match anyway).
+NAMES_LOCAL_FILE="$SCRIPT_DIR/audit-layer-b.names.local"
+NAMES_PLACEHOLDER="PlaceholderAgentOne PlaceholderAgentTwo PlaceholderAgentThree PlaceholderPersonFour PlaceholderPersonFive"
+if [ -f "$NAMES_LOCAL_FILE" ]; then
+    RAW_NAMES="$(cat "$NAMES_LOCAL_FILE")"
+else
+    RAW_NAMES="$NAMES_PLACEHOLDER"
 fi
 
 # History-only tokens absent from audit-layer-b.sh's working-tree list but

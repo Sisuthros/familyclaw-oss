@@ -13,15 +13,31 @@ echo ""
 
 FAIL=0
 
-# Forbidden real Layer B names (must never appear in publishable content)
-# Nova/Vega: private sibling-persona names (Nova = operator's agent persona,
-# Vega = sibling persona) found leaked into identity.rs canned replies and
-# roleplay-noise filter fixtures. Both are common English/astronomy words
-# ("nova", "vega" the star), so the existing -w word-boundary match plus the
-# embedded-word post-filter below (which already drops e.g. "innovation") is
-# what keeps this from drowning in false positives — no additional filtering
-# needed beyond what checks already do for every other forbidden name.
-FORBIDDEN_NAMES="agent_alpha agent_beta agent_delta agent_gamma agent_epsilon assistant \"agent_gamma Jr\" \"agent_gamma\" \"agent_gamma-jr\" The FamilyClaw Authors viltsu Nova Vega"
+# Forbidden real Layer B names (must never appear in publishable content).
+#
+# This file is itself published (Layer A), so the real private names are
+# NEVER hardcoded here (docs/PUBLISH_ORPHAN_PLAN.md, Decision Point 2,
+# Option B) — doing so would fail this very audit's own check #8, and would
+# make any single-commit orphan-publish snapshot structurally unable to pass
+# scripts/pre-publish-scan.sh's diff-content scan (the denylist string itself
+# would always be the leak). The real list lives in a gitignored,
+# operator-local file that this script sources when present; without it, a
+# placeholder list keeps every check below exercised (still useful for
+# contributors / CI on the public repo), just without real-world coverage.
+# See scripts/audit-layer-b.names.local.example for the format.
+#
+# Two of the real entries happen to be common English/astronomy words, so the
+# existing -w word-boundary match plus the embedded-word post-filter below
+# (which already drops e.g. "innovation") is what keeps this from drowning in
+# false positives — no additional filtering needed beyond what checks
+# already do for every other forbidden name.
+FORBIDDEN_NAMES_PLACEHOLDER="PlaceholderAgentOne PlaceholderAgentTwo PlaceholderAgentThree PlaceholderPersonFour PlaceholderPersonFive"
+FORBIDDEN_NAMES_LOCAL_FILE="scripts/audit-layer-b.names.local"
+if [ -f "$FORBIDDEN_NAMES_LOCAL_FILE" ]; then
+    FORBIDDEN_NAMES="$(cat "$FORBIDDEN_NAMES_LOCAL_FILE")"
+else
+    FORBIDDEN_NAMES="$FORBIDDEN_NAMES_PLACEHOLDER"
+fi
 
 # Explicit allowlist for the email-address check (§9). Empty by default —
 # populate only with specific, deliberately-public addresses that would
@@ -167,19 +183,20 @@ for name in $FORBIDDEN_NAMES; do
     # Remove quotes for grep
     clean_name=$(echo "$name" | sed 's/"//g')
     [ -z "$SCAN_FILES" ] && continue
-    # Case-INSENSITIVE: real names leaked lowercase (agent_epsilon/agent_beta/agent_gamma in a
-    # docs table) slipped past a case-sensitive scan. -i closes that gap.
-    # -w (word boundary): required because e.g. "the operator" is a substring of common
-    # Finnish word endings ("riville", "tehtäthe operator") — substring matching would
-    # drown the audit in false positives.
+    # Case-INSENSITIVE: real names leaked lowercase in a docs table slipped
+    # past a case-sensitive scan. -i closes that gap.
+    # -w (word boundary): required because one real forbidden name (an FI
+    # given name) is a substring of common Finnish word endings (e.g.
+    # "riville", "tehtaville" -- generic example words, not the real name)
+    # — substring matching would drown the audit in false positives.
     MATCHES=$(echo "$SCAN_FILES" | xargs grep -ilw "$clean_name" 2>/dev/null \
         | xargs -r grep -Hniw "$clean_name" 2>/dev/null \
         | grep -v "\.example" \
         | grep -vi "agent_alpha\|agent_beta\|agent_gamma\|agent_delta\|agent_epsilon" || true)
     # grep -w treats non-ASCII letters (ä/ö) as word boundaries in the C locale,
-    # so Finnish word endings like "tehtäthe operator"/"riville" false-positive on
-    # "the operator". Drop lines where the name only appears embedded in a longer word
-    # (immediately preceded/followed by a letter incl. ä/ö/å).
+    # so Finnish word endings like "tehtaville"/"riville" false-positive on
+    # that FI given name. Drop lines where the name only appears embedded in
+    # a longer word (immediately preceded/followed by a letter incl. ä/ö/å).
     if [ -n "$MATCHES" ]; then
         MATCHES=$(echo "$MATCHES" | grep -viE "[a-zA-ZäöåÄÖÅ]${clean_name}|${clean_name}[a-zA-ZäöåÄÖÅ]" || true)
     fi
@@ -236,9 +253,14 @@ fi
 
 # 10. Check example agent names specifically (must be agent_a, agent_b, example_family)
 echo "🔟 Checking example agent names..."
-EXAMPLE_REAL_NAMES="agent_alpha agent_beta agent_delta agent_gamma agent_epsilon the operator"
+# Reuses $FORBIDDEN_NAMES (already resolved above from the gitignored local
+# file, or the tracked placeholder list) instead of a second hardcoded name
+# list -- one fewer place a real name could ever be typed into this
+# published file.
 EXAMPLE_NAME_FOUND=0
-for name in $EXAMPLE_REAL_NAMES; do
+for name in $FORBIDDEN_NAMES; do
+    name=$(echo "$name" | sed 's/"//g')
+    [ -z "$name" ] && continue
     if grep -r "$name" --include="*.rs" examples/ 2>/dev/null | grep -q .; then
         echo "   ❌ FAIL: Real agent name '$name' found in examples/"
         grep -r "$name" --include="*.rs" examples/
@@ -254,8 +276,8 @@ if [ $EXAMPLE_NAME_FOUND -eq 0 ]; then
 fi
 
 # 11. No private home-drive path patterns (persona home paths are Layer B
-# regardless of what name is used — a leak like `E:\Nova\home\research\...`
-# is disqualifying even if "Nova" itself were renamed to something innocuous,
+# regardless of what name is used — a leak like `E:\SomeName\home\research\...`
+# is disqualifying even if the name itself were renamed to something innocuous,
 # because the drive-letter + `\home\` shape itself reveals a private local
 # deployment layout). Scan tracked *.rs/*.md/*.toml (source + docs + config),
 # excluding docs/archive/ (quarantined historical content, same rationale as

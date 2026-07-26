@@ -1,0 +1,23 @@
+# audit-layer-b.names.local.example
+#
+# Template for scripts/audit-layer-b.names.local — the real, operator-local
+# Layer B denylist for scripts/audit-layer-b.sh and scripts/pre-publish-scan.sh
+# (docs/PUBLISH_ORPHAN_PLAN.md, Decision Point 2, Option B).
+#
+# The two audit scripts ship with a placeholder denylist so the checks stay
+# exercised in the published tree without embedding any real private name.
+# To run the FULL check locally:
+#
+#   1. cp scripts/audit-layer-b.names.local.example scripts/audit-layer-b.names.local
+#   2. Edit the copy: one forbidden name/token per line. Multi-word names
+#      need double quotes, exactly as they'd appear in a shell word list,
+#      e.g.  "Multi Word Name"
+#   3. scripts/audit-layer-b.names.local is gitignored — it never gets
+#      committed or published. Verify with:
+#        git check-ignore -v scripts/audit-layer-b.names.local
+#
+# Example content (replace with your own real names):
+PrivateAgentNameOne
+PrivateAgentNameTwo
+"Multi Word Private Name"
+operator-real-name

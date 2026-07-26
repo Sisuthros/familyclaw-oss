@@ -139,6 +139,11 @@ agentit/
 core/
 ops/
 scripts/*.bak-*
+# Real Layer B denylist for audit-layer-b.sh / pre-publish-scan.sh (Decision
+# Point 2, Option B in docs/PUBLISH_ORPHAN_PLAN.md): the tracked scripts only
+# ship placeholder tokens; the real private names live here, operator-local
+# only. See scripts/audit-layer-b.names.local.example for the format.
+scripts/audit-layer-b.names.local
 plans/
 research/
 _stray-backup/
