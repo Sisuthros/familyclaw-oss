@@ -33,7 +33,9 @@ pub use ractor::{Actor, ActorProcessingErr, ActorRef};
 pub use tokio::sync::Mutex;
 pub use tracing::{debug, info, warn};
 
-pub use crate::llm::{LlmConfig, LlmError, LlmFailureClass, LlmMessage, ToolCall, ToolDefinition};
+pub use crate::llm::{
+    LlmConfig, LlmError, LlmFailureClass, LlmImageRef, LlmMessage, ToolCall, ToolDefinition,
+};
 pub use crate::llm_chain::LlmFailover;
 pub use crate::resumable::{InMemoryResumableStore, ResumableTurn, ResumableTurnStore};
 pub use crate::soul::Soul;

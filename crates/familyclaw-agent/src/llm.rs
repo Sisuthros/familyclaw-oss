@@ -317,24 +317,73 @@ pub enum LlmRole {
     Tool,
 }
 
+/// A reference to an image attached to an [`LlmMessage`] — the `image_url`
+/// part of the `OpenAI`-compatible multimodal `content` array
+/// (<https://platform.openai.com/docs/guides/vision>).
+///
+/// `url` holds either a normal `https://...` URL or a base64 **data URI**
+/// (`data:{mime};base64,{data}`) — the wire shape is identical either way,
+/// `OpenAI`-compatible providers dereference/decode based on the scheme.
+/// [`Self::from_base64`] builds the data-URI form for callers that only have
+/// raw image bytes (e.g. a screenshot or an upload) rather than a hosted URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmImageRef {
+    /// `https://...` URL or `data:{mime};base64,{data}` data URI.
+    pub url: String,
+}
+
+impl LlmImageRef {
+    /// Builds an image reference from a hosted URL.
+    #[must_use]
+    pub fn from_url(url: impl Into<String>) -> Self {
+        Self { url: url.into() }
+    }
+
+    /// Builds an image reference from raw base64-encoded image bytes and its
+    /// MIME type (e.g. `"image/png"`, `"image/jpeg"`), producing a `data:`
+    /// URI. The caller is responsible for base64-encoding the bytes first
+    /// (this crate does not depend on a base64 codec).
+    #[must_use]
+    pub fn from_base64(mime_type: &str, base64_data: impl AsRef<str>) -> Self {
+        Self {
+            url: format!("data:{mime_type};base64,{}", base64_data.as_ref()),
+        }
+    }
+}
+
 /// A message for the LLM chat completions API.
 ///
 /// `PartialEq` (not `Eq`) because [`ToolCall::arguments`] is a
 /// `serde_json::Value`, which is only `PartialEq` (it may contain floats).
 /// This lets the resumable-turn state ([`crate::resumable::ResumableTurn`]) and
 /// the tool-loop control type compare message stacks in tests.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// **Wire shape vs. in-memory shape (images):** in memory, text and images
+/// are separate fields (`content: String`, `images: Option<Vec<LlmImageRef>>`)
+/// — simple for callers to build and for [`GeminiGenerateContentRequest`] (which
+/// only reads `content`) to keep ignoring. On the wire (`OpenAI`-compatible
+/// `chat/completions`), [`LlmMessage`] has a **hand-written** `Serialize`/
+/// `Deserialize` (not derived) that collapses the two into the standard
+/// multimodal `content` shape: a plain **string** when `images` is empty
+/// (byte-identical to every request before image support existed), or an
+/// **array** of `{"type":"text",...}` / `{"type":"image_url",...}` parts when
+/// images are attached. This same bridge is used for the resumable-turn
+/// journal (`crate::resumable`), so an image-bearing message persisted to
+/// disk and reloaded round-trips correctly.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LlmMessage {
     /// Role of the message sender
     pub role: LlmRole,
-    /// Message content
+    /// Text content
     pub content: String,
     /// Optional tool call ID (for tool role messages)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     /// Optional tool calls (for assistant role)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Images attached to this message (vision-capable models only). `None`/
+    /// empty means a plain text message — see the struct docs for the wire
+    /// shape this produces.
+    pub images: Option<Vec<LlmImageRef>>,
 }
 
 impl LlmMessage {
@@ -346,6 +395,7 @@ impl LlmMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: None,
+            images: None,
         }
     }
 
@@ -357,6 +407,7 @@ impl LlmMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: None,
+            images: None,
         }
     }
 
@@ -368,6 +419,7 @@ impl LlmMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: None,
+            images: None,
         }
     }
 
@@ -379,6 +431,7 @@ impl LlmMessage {
             content: content.into(),
             tool_call_id: Some(id.into()),
             tool_calls: None,
+            images: None,
         }
     }
 
@@ -389,10 +442,161 @@ impl LlmMessage {
         self
     }
 
+    /// Attaches images to this message (vision-capable models only — see
+    /// module docs on wire-format support). A no-op (`images` stays `None`)
+    /// if `images` is empty, so a caller that always passes a (possibly
+    /// empty) `Vec` still gets the byte-identical text-only wire shape.
+    #[must_use]
+    pub fn with_images(mut self, images: Vec<LlmImageRef>) -> Self {
+        self.images = if images.is_empty() {
+            None
+        } else {
+            Some(images)
+        };
+        self
+    }
+
     /// Returns true if this message has tool calls.
     #[must_use]
     pub fn has_tool_calls(&self) -> bool {
         self.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
+    }
+
+    /// Returns true if this message has one or more images attached.
+    #[must_use]
+    pub fn has_images(&self) -> bool {
+        self.images.as_ref().is_some_and(|i| !i.is_empty())
+    }
+}
+
+// ── LlmMessage wire bridge (multimodal `content`) ───────────────────────────
+//
+// See the [`LlmMessage`] doc comment for the string-vs-array rule. Mirrors
+// the [`ToolCall`] bridge pattern above: a private wire struct + hand-written
+// Serialize/Deserialize on the public type.
+
+/// One part of a multimodal `content` array — the `OpenAI` vision wire shape.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentPartWire<T> {
+    /// `{"type":"text","text":"..."}`
+    Text {
+        /// The text of this part.
+        text: T,
+    },
+    /// `{"type":"image_url","image_url":{"url":"..."}}`
+    ImageUrl {
+        /// The image reference of this part.
+        image_url: ImageUrlWire<T>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct ImageUrlWire<T> {
+    url: T,
+}
+
+/// Borrowed (serialize-only) content wire shape: a plain string when no
+/// images are attached, an array of parts otherwise.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ContentWireRef<'a> {
+    Text(&'a str),
+    Parts(Vec<ContentPartWire<&'a str>>),
+}
+
+/// Owned (deserialize-only) mirror of [`ContentWireRef`].
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ContentWireOwned {
+    Text(String),
+    Parts(Vec<ContentPartWire<String>>),
+}
+
+#[derive(Serialize)]
+struct LlmMessageWireRef<'a> {
+    role: &'a LlmRole,
+    content: ContentWireRef<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<&'a [ToolCall]>,
+}
+
+#[derive(Deserialize)]
+struct LlmMessageWireOwned {
+    role: LlmRole,
+    content: ContentWireOwned,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+}
+
+impl Serialize for LlmMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let content = match self.images.as_deref() {
+            Some(images) if !images.is_empty() => {
+                let mut parts = Vec::with_capacity(images.len() + 1);
+                // Only emit a text part when there is text — an image-only
+                // user turn (no caption) should not send an empty text part.
+                if !self.content.is_empty() {
+                    parts.push(ContentPartWire::Text {
+                        text: self.content.as_str(),
+                    });
+                }
+                parts.extend(images.iter().map(|img| ContentPartWire::ImageUrl {
+                    image_url: ImageUrlWire {
+                        url: img.url.as_str(),
+                    },
+                }));
+                ContentWireRef::Parts(parts)
+            }
+            _ => ContentWireRef::Text(&self.content),
+        };
+        LlmMessageWireRef {
+            role: &self.role,
+            content,
+            tool_call_id: self.tool_call_id.as_deref(),
+            tool_calls: self.tool_calls.as_deref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LlmMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = LlmMessageWireOwned::deserialize(deserializer)?;
+        let (content, images) = match wire.content {
+            ContentWireOwned::Text(s) => (s, None),
+            ContentWireOwned::Parts(parts) => {
+                let mut text = String::new();
+                let mut images: Vec<LlmImageRef> = Vec::new();
+                for part in parts {
+                    match part {
+                        ContentPartWire::Text { text: t } => text.push_str(&t),
+                        ContentPartWire::ImageUrl { image_url } => {
+                            images.push(LlmImageRef { url: image_url.url });
+                        }
+                    }
+                }
+                (
+                    text,
+                    if images.is_empty() {
+                        None
+                    } else {
+                        Some(images)
+                    },
+                )
+            }
+        };
+        Ok(Self {
+            role: wire.role,
+            content,
+            tool_call_id: wire.tool_call_id,
+            tool_calls: wire.tool_calls,
+            images,
+        })
     }
 }
 
@@ -1927,6 +2131,104 @@ mod tests {
             json,
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":100}"#
         );
+    }
+
+    // ── Vision / image input (multimodal `content`) ─────────────────────────
+
+    #[test]
+    fn test_message_without_images_serializes_content_as_plain_string() {
+        // Byte-identical invariant for the image path too: a message built
+        // without images must serialize exactly as before images existed.
+        let msg = LlmMessage::user("hi");
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(json, r#"{"role":"user","content":"hi"}"#);
+    }
+
+    #[test]
+    fn test_message_with_images_serializes_openai_multimodal_array() {
+        let msg = LlmMessage::user("what is in this image?").with_images(vec![
+            LlmImageRef::from_url("https://example.com/cat.png"),
+        ]);
+        let json = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(json["role"], "user");
+        assert_eq!(json["content"][0]["type"], "text");
+        assert_eq!(json["content"][0]["text"], "what is in this image?");
+        assert_eq!(json["content"][1]["type"], "image_url");
+        assert_eq!(
+            json["content"][1]["image_url"]["url"],
+            "https://example.com/cat.png"
+        );
+    }
+
+    #[test]
+    fn test_message_with_multiple_images_and_base64() {
+        let msg = LlmMessage::user("compare these").with_images(vec![
+            LlmImageRef::from_url("https://example.com/a.png"),
+            LlmImageRef::from_base64("image/png", "QUJD"),
+        ]);
+        let json = serde_json::to_value(&msg).expect("serialize");
+        let content = json["content"].as_array().expect("array content");
+        // 1 text part + 2 image parts.
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[2]["image_url"]["url"], "data:image/png;base64,QUJD");
+    }
+
+    #[test]
+    fn test_image_only_message_omits_empty_text_part() {
+        // An image-only turn (no caption) must not send a stray empty text part.
+        let msg = LlmMessage {
+            role: LlmRole::User,
+            content: String::new(),
+            tool_call_id: None,
+            tool_calls: None,
+            images: Some(vec![LlmImageRef::from_url("https://example.com/a.png")]),
+        };
+        let json = serde_json::to_value(&msg).expect("serialize");
+        let content = json["content"].as_array().expect("array content");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn test_message_with_images_roundtrips_through_json() {
+        let msg = LlmMessage::user("caption").with_images(vec![LlmImageRef::from_url(
+            "https://example.com/x.png",
+        )]);
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: LlmMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.role, LlmRole::User);
+        assert_eq!(back.content, "caption");
+        assert_eq!(
+            back.images,
+            Some(vec![LlmImageRef::from_url("https://example.com/x.png")])
+        );
+    }
+
+    #[test]
+    fn test_with_images_empty_vec_is_noop() {
+        let msg = LlmMessage::user("hi").with_images(Vec::new());
+        assert!(msg.images.is_none());
+        assert!(!msg.has_images());
+    }
+
+    #[test]
+    fn test_request_with_image_message_uses_multimodal_shape() {
+        // End-to-end: an image-bearing message inside a full request body
+        // still produces the standard OpenAI shape (not a sibling `images` key).
+        let messages = vec![
+            LlmMessage::user("describe this")
+                .with_images(vec![LlmImageRef::from_url("https://example.com/a.png")]),
+        ];
+        let req = ChatCompletionsRequest {
+            model: "m",
+            messages: &messages,
+            max_tokens: 100,
+            tools: Vec::new(),
+            tool_choice: None,
+        };
+        let json = serde_json::to_value(&req).expect("serialize");
+        assert!(json["messages"][0].get("images").is_none());
+        assert_eq!(json["messages"][0]["content"][1]["type"], "image_url");
     }
 
     #[test]
