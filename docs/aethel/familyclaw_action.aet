@@ -1,0 +1,51 @@
+// FamilyClaw x Aethel -- PoC (PASSING model)
+//
+// An agent-produced action Claim MUST be verified by an approval policy
+// before the executor can be reached. This models the concrete
+// familyclaw-actions API:
+//   - ActionRequest              (crates/familyclaw-actions/src/executor.rs)
+//   - ApprovalPolicy + approval  (policy.rs + approval.rs: TTL + nonce +
+//                                 payload-hash binding, single-use)
+//   - ActionExecutor::execute    (executor.rs:192-199 -- the effect boundary)
+//
+// Runnable:  aethel-cli check docs/aethel/familyclaw_action.aet   -> exit 0
+
+struct ActionRequest {
+    action_id: string,
+    skill_id: string,
+    payload: string,
+    risk: string,
+}
+
+struct ActionResult {
+    action_id: string,
+    status: string,
+    output_summary: string,
+}
+
+// Models familyclaw-actions ApprovalPolicy + approval.rs. A high-risk action
+// (SendMessage / SpendMoney / Irreversible -- always RequireApproval per
+// policy.rs required_approval()) may only cross the effect boundary once a
+// payload-bound, single-use human approval has minted it.
+policy HumanApproval {
+    ActionRequest: ActionRequest {
+        evidence HumanReview "Payload-bound single-use approval grant (nonce + payload hash + TTL)"
+    }
+}
+
+// Models the ActionExecutor trait -- the effect boundary. execute() accepts
+// ONLY a Verified<ActionRequest, HumanApproval>; a raw agent Claim cannot be
+// passed here. This is the compile-time analogue of "a raw agent request can
+// never reach an executor".
+effect ActionRuntime {
+    fn execute(request: Verified<ActionRequest, HumanApproval>) -> ActionResult
+}
+
+// VALID path: the agent emits an untrusted Claim; the pipeline verifies it
+// (approval) BEFORE dispatch. Compiles clean -- no AE-EPISTEMIC-001.
+fn dispatch_send_message(claim: Claim<ActionRequest>) -> ActionResult
+uses ActionRuntime:
+    {
+        let approved = verify(claim, HumanApproval);
+        return action_runtime.execute(approved);
+    }

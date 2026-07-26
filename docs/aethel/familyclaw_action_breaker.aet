@@ -1,0 +1,40 @@
+// FamilyClaw x Aethel -- PoC (BREAKER model)
+//
+// Proves the gate fires: an agent-produced Claim dispatched to the executor
+// WITHOUT verify() is a compile-time error (AE-EPISTEMIC-001). This is the
+// failure mode the integration is designed to make impossible.
+//
+// Runnable:  aethel-cli check docs/aethel/familyclaw_action_breaker.aet
+//            -> exit 1, prints AE-EPISTEMIC-001
+
+struct ActionRequest {
+    action_id: string,
+    skill_id: string,
+    payload: string,
+    risk: string,
+}
+
+struct ActionResult {
+    action_id: string,
+    status: string,
+    output_summary: string,
+}
+
+policy HumanApproval {
+    ActionRequest: ActionRequest {
+        evidence HumanReview "Payload-bound single-use approval grant (nonce + payload hash + TTL)"
+    }
+}
+
+effect ActionRuntime {
+    fn execute(request: Verified<ActionRequest, HumanApproval>) -> ActionResult
+}
+
+// INVALID: the agent's raw Claim is dispatched with no verify() step.
+// The type checker rejects it -- Claim<ActionRequest> is not
+// Verified<ActionRequest, HumanApproval>.
+fn dispatch_unverified(claim: Claim<ActionRequest>) -> ActionResult
+uses ActionRuntime:
+    {
+        return action_runtime.execute(claim);
+    }
