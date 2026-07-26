@@ -1822,6 +1822,7 @@ version = "1.2.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
+ "base64",
  "chrono",
  "clap",
  "familyclaw-actions",
@@ -1839,7 +1840,9 @@ dependencies = [
  "familyclaw-scheduler",
  "futures-util",
  "jsonwebtoken 9.3.1",
+ "rand 0.8.6",
  "reqwest 0.12.28",
+ "rsa",
  "serde",
  "serde_json",
  "tokio",

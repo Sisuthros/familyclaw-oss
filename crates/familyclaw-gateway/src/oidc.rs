@@ -333,13 +333,36 @@ mod tests {
         assert_eq!(id.role, Some(OperatorRole::Approver));
     }
 
+    /// Generates a fresh RSA test keypair at test-runtime instead of
+    /// embedding a fixed PEM in source. A hardcoded PEM, even one clearly
+    /// self-documented as a benign, test-only, never-reused fixture, still
+    /// matches secret-scanner heuristics (both this repo's own
+    /// `pre-publish-scan.sh` and GitHub's) and was removed to keep the
+    /// published tree scanner-quiet. Returns `(pkcs1_pem, n_b64url)`: the
+    /// PEM signs the token below, `n_b64url` (the RSA modulus, base64url
+    /// no-pad, matching JWKS's `n` field) populates the mocked JWKS
+    /// response so `validate_sync` can verify the signature against it.
+    fn generate_rsa_test_keypair() -> (String, String) {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        use rsa::traits::PublicKeyParts;
+        use rsa::{RsaPrivateKey, RsaPublicKey};
+
+        let mut rng = rand::thread_rng();
+        let priv_key = RsaPrivateKey::new(&mut rng, 2048).expect("generate rsa test key");
+        let pub_key = RsaPublicKey::from(&priv_key);
+        let priv_pem = priv_key
+            .to_pkcs1_pem(Default::default())
+            .expect("encode rsa test key to pkcs1 pem")
+            .to_string();
+        let n_b64 = URL_SAFE_NO_PAD.encode(pub_key.n().to_bytes_be());
+        (priv_pem, n_b64)
+    }
+
     #[test]
     fn rs256_jwks_token_validates() {
-        // Fixed 2048-bit RSA test keypair (generated locally for this test
-        // only -- not used anywhere else, not a production key).
-        const PRIV_PEM: &str = "[throwaway OIDC test key removed from history 2026-07-30; generated at test runtime, see crates/familyclaw-gateway/src/oidc.rs]
-";
-        const N_B64: &str = "iqiegbSQp73FHXmEvMOA7SaLK5t5hcI2QCwwRcENQ_Ey5zL85DprDPl1oiYBCy5lKHf5aeOs_na54qwBBY73OJUeFky1BWK8-D77thNkuSPQos_3Z5K4KqGJglFZIL8w54RAJajZIfePVix5223rQ1-pXCq8yzARL8ZVNcwELgV1dtkcD4JJsDW3M8HnVbz-_K9-zZd2WLmYPO6cPAyzEyCJURN2aEuqm1mhi5cnJkfVyRs5LFN9vlC_nUrVew46vpJFi77XprIvsXnHTv1Fibu_YYIm7_Y1zs9rT5dnqkfP6G5VyAqF9PaHT1Nf1Cfi_jylsWcqvYn1eaWeaNJ1RQ";
+        let (priv_pem, n_b64) = generate_rsa_test_keypair();
 
         let cfg = OidcConfig {
             issuer: "https://idp.example".into(),
@@ -349,7 +372,7 @@ mod tests {
         };
         let validator = OidcValidator::new(cfg);
         let jwks = serde_json::json!({
-            "keys": [{"kid": "test-1", "kty": "RSA", "n": N_B64, "e": "AQAB"}]
+            "keys": [{"kid": "test-1", "kty": "RSA", "n": n_b64, "e": "AQAB"}]
         })
         .to_string();
         *validator.jwks_cache.lock().expect("lock") =
@@ -370,7 +393,7 @@ mod tests {
         };
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("test-1".to_string());
-        let key = EncodingKey::from_rsa_pem(PRIV_PEM.as_bytes()).expect("rsa key");
+        let key = EncodingKey::from_rsa_pem(priv_pem.as_bytes()).expect("rsa key");
         let token = encode(&header, &claims, &key).expect("encode");
 
         let id = validator

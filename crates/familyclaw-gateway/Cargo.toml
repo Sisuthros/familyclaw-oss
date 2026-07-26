@@ -81,3 +81,12 @@ async-trait = { workspace = true }
 # Phase 4 kill-switch -reittitesti rakentaa ScheduledTaskin (interval = chrono::Duration).
 chrono = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+# oidc.rs's rs256_jwks_token_validates test generates a fresh RSA test
+# keypair at test-runtime instead of embedding a fixed PEM in source (a
+# hardcoded PEM, even a self-documented benign test-only one, still trips
+# secret-scanner heuristics). rand pinned to 0.8 because rsa 0.9's
+# CryptoRngCore bound is satisfied by rand_core 0.6, which rand 0.8 (not
+# 0.9/0.10) implements.
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
+base64 = { workspace = true }
