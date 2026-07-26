@@ -1,0 +1,39 @@
+[package]
+name = "familyclaw-stt"
+description = "Speech-to-text abstraction for the agent platform: a provider-agnostic SttProvider trait, an in-memory MockStt for offline dev/tests, and an OpenAI-compatible Whisper HTTP adapter (feature `openai`)"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["stt", "speech", "transcription", "agent", "whisper"]
+categories = ["asynchronous", "multimedia::audio"]
+
+[lints]
+workspace = true
+
+[dependencies]
+familyclaw-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# OpenAI-compatible `/audio/transcriptions` HTTP adapter (openai.rs): the
+# request is a multipart upload (file, model, language, prompt,
+# response_format), the response is JSON `{"text": "..."}` (or richer with
+# `verbose_json`). Shared by OpenAI itself and several OpenAI-compatible
+# gateways (Groq's Whisper endpoint, DeepInfra, ...), so one adapter + a
+# configurable `api_base` covers all of them. Only needs a bearer API key --
+# no exotic auth flow. Needs the `multipart` feature on top of the
+# workspace's default `json` feature.
+reqwest = { workspace = true, optional = true, features = ["multipart"] }
+
+[features]
+# Default: core abstraction + MockStt only (no network, no API key needed).
+default = []
+openai = ["dep:reqwest"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
