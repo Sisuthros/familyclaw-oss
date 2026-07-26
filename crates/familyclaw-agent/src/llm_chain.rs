@@ -41,7 +41,8 @@ use familyclaw_core::time::Timestamp;
 use familyclaw_core::{FamilyClawError, ModelConfig, Result};
 
 use crate::llm::{
-    CompletionResult, LlmClient, LlmConfig, LlmError, LlmFailureClass, LlmMessage, ToolDefinition,
+    CompletionResult, LlmClient, LlmConfig, LlmError, LlmFailureClass, LlmMessage, LlmWireFormat,
+    ToolDefinition,
 };
 
 /// Clock abstraction for failover decision logic (cooldown state machine, Layer B).
@@ -142,13 +143,20 @@ pub struct ResolvedEntry {
 /// whole string is used as both the provider key and the model name.
 #[derive(Debug, Clone, Default)]
 pub struct EnvEndpointResolver {
-    /// provider prefix → (`api_base`, env variable names).
+    /// provider prefix → (`api_base`, env variable names, wire format).
     ///
     /// The key-env list enables a **key pool** per provider: multiple keys
     /// are rotated round-robin on an `AuthFailed` condition
     /// (`ChainEntry`). The single-key [`with_provider`](Self::with_provider)
     /// pushes one element onto the list (backwards-compatible).
-    providers: HashMap<String, (String, Vec<String>)>,
+    ///
+    /// The wire format (ANY-AI provider support, ties into
+    /// [`crate::llm::LlmWireFormat`]) defaults to `OpenAiChat` via
+    /// [`with_provider`](Self::with_provider)/[`with_provider_keys`](Self::with_provider_keys);
+    /// [`with_provider_format`](Self::with_provider_format)/[`with_provider_keys_format`](Self::with_provider_keys_format)
+    /// register a provider that speaks a different wire format (e.g.
+    /// native Gemini).
+    providers: HashMap<String, (String, Vec<String>, LlmWireFormat)>,
     /// Max tokens per response (passed to every [`LlmConfig`]).
     max_tokens: Option<u32>,
     /// Request timeout (ms) set on every resolved [`LlmConfig`] (F1, Layer B
@@ -168,20 +176,49 @@ impl EnvEndpointResolver {
     }
 
     /// Registers a provider prefix: endpoint + the env variable the key is
-    /// read from at runtime (builder-style).
+    /// read from at runtime (builder-style). Wire format defaults to
+    /// [`LlmWireFormat::OpenAiChat`] — use
+    /// [`with_provider_format`](Self::with_provider_format) for a provider
+    /// that speaks a different wire format (ANY-AI provider support).
     ///
     /// - `prefix` — the model name's `provider/` part, e.g. `"openai"`.
     /// - `api_base` — OpenAI-compatible base URL.
     /// - `key_env` — environment variable, e.g. `"OPENAI_API_KEY"`.
     #[must_use]
     pub fn with_provider(
-        mut self,
+        self,
         prefix: impl Into<String>,
         api_base: impl Into<String>,
         key_env: impl Into<String>,
     ) -> Self {
-        self.providers
-            .insert(prefix.into(), (api_base.into(), vec![key_env.into()]));
+        self.with_provider_format(prefix, api_base, key_env, LlmWireFormat::OpenAiChat)
+    }
+
+    /// Like [`with_provider`](Self::with_provider), but registers an explicit
+    /// [`LlmWireFormat`] — the ANY-AI provider seam. E.g. a native Gemini
+    /// entry:
+    /// ```
+    /// use familyclaw_agent::llm::LlmWireFormat;
+    /// use familyclaw_agent::llm_chain::EnvEndpointResolver;
+    /// let resolver = EnvEndpointResolver::new().with_provider_format(
+    ///     "gemini",
+    ///     "https://generativelanguage.googleapis.com/v1beta",
+    ///     "GEMINI_API_KEY",
+    ///     LlmWireFormat::GeminiGenerate,
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_provider_format(
+        mut self,
+        prefix: impl Into<String>,
+        api_base: impl Into<String>,
+        key_env: impl Into<String>,
+        wire_format: LlmWireFormat,
+    ) -> Self {
+        self.providers.insert(
+            prefix.into(),
+            (api_base.into(), vec![key_env.into()], wire_format),
+        );
         self
     }
 
@@ -190,7 +227,10 @@ impl EnvEndpointResolver {
     /// cooldown layer rotates the pool's keys round-robin before the whole
     /// provider is cooled down (Layer B). An empty `key_envs` falls back to
     /// the "no key" behavior (one empty key), so the resolver never produces
-    /// an empty pool.
+    /// an empty pool. Wire format defaults to [`LlmWireFormat::OpenAiChat`]
+    /// — use
+    /// [`with_provider_keys_format`](Self::with_provider_keys_format) for a
+    /// non-OpenAI-compatible provider.
     ///
     /// - `prefix` — the model name's `provider/` part, e.g. `"openai"`.
     /// - `api_base` — OpenAI-compatible base URL.
@@ -198,10 +238,23 @@ impl EnvEndpointResolver {
     ///   `["OPENAI_API_KEY_1", "OPENAI_API_KEY_2"]`.
     #[must_use]
     pub fn with_provider_keys(
+        self,
+        prefix: impl Into<String>,
+        api_base: impl Into<String>,
+        key_envs: Vec<String>,
+    ) -> Self {
+        self.with_provider_keys_format(prefix, api_base, key_envs, LlmWireFormat::OpenAiChat)
+    }
+
+    /// Like [`with_provider_keys`](Self::with_provider_keys), but registers an
+    /// explicit [`LlmWireFormat`] (ANY-AI provider seam, key-pool variant).
+    #[must_use]
+    pub fn with_provider_keys_format(
         mut self,
         prefix: impl Into<String>,
         api_base: impl Into<String>,
         key_envs: Vec<String>,
+        wire_format: LlmWireFormat,
     ) -> Self {
         let key_envs = if key_envs.is_empty() {
             vec![String::new()]
@@ -209,7 +262,7 @@ impl EnvEndpointResolver {
             key_envs
         };
         self.providers
-            .insert(prefix.into(), (api_base.into(), key_envs));
+            .insert(prefix.into(), (api_base.into(), key_envs, wire_format));
         self
     }
 
@@ -266,7 +319,7 @@ impl EnvEndpointResolver {
 impl LlmEndpointResolver for EnvEndpointResolver {
     fn resolve(&self, model_name: &str) -> Result<LlmConfig> {
         let (provider, model) = Self::split(model_name);
-        let (api_base, key_envs) = self.providers.get(provider).ok_or_else(|| {
+        let (api_base, key_envs, wire_format) = self.providers.get(provider).ok_or_else(|| {
             FamilyClawError::config(format!("unknown provider prefix for model '{model_name}'"))
         })?;
         // The key is read from env at runtime. A missing key does not block
@@ -279,13 +332,14 @@ impl LlmEndpointResolver for EnvEndpointResolver {
             .first()
             .map(|e| std::env::var(e).unwrap_or_default())
             .unwrap_or_default();
-        let cfg = LlmConfig::new(api_base.clone(), api_key, model.to_string());
+        let cfg = LlmConfig::new(api_base.clone(), api_key, model.to_string())
+            .with_wire_format(*wire_format);
         Ok(self.apply_tunings(cfg))
     }
 
     fn resolve_entry(&self, model_name: &str) -> Result<ResolvedEntry> {
         let (provider, model) = Self::split(model_name);
-        let (api_base, key_envs) = self.providers.get(provider).ok_or_else(|| {
+        let (api_base, key_envs, wire_format) = self.providers.get(provider).ok_or_else(|| {
             FamilyClawError::config(format!("unknown provider prefix for model '{model_name}'"))
         })?;
         // Read the whole key pool from env at runtime. An empty env → an
@@ -296,11 +350,10 @@ impl LlmEndpointResolver for EnvEndpointResolver {
             .iter()
             .map(|e| std::env::var(e).unwrap_or_default())
             .collect();
-        let template = self.apply_tunings(LlmConfig::new(
-            api_base.clone(),
-            String::new(),
-            model.to_string(),
-        ));
+        let template = self.apply_tunings(
+            LlmConfig::new(api_base.clone(), String::new(), model.to_string())
+                .with_wire_format(*wire_format),
+        );
         Ok(ResolvedEntry {
             provider: provider.to_string(),
             template,
@@ -1179,6 +1232,75 @@ mod tests {
         let cfg = r.resolve("deepseek/deepseek-v4-pro").expect("resolves");
         assert_eq!(cfg.api_base, "https://api.deepseek.com/v1");
         assert_eq!(cfg.model, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn resolver_defaults_wire_format_to_openai_chat() {
+        // Providers registered via with_provider (no explicit wire format)
+        // must resolve to OpenAiChat — backward compatibility for every
+        // resolver built before LlmWireFormat existed.
+        let r = test_resolver();
+        let cfg = r.resolve("openai/gpt-4o").expect("resolves");
+        assert_eq!(cfg.wire_format, LlmWireFormat::OpenAiChat);
+        let entry = r.resolve_entry("openai/gpt-4o").expect("resolves");
+        assert_eq!(entry.template.wire_format, LlmWireFormat::OpenAiChat);
+    }
+
+    #[test]
+    fn resolver_maps_provider_wire_format_via_with_provider_format() {
+        // ANY-AI provider support: a provider registered with an explicit
+        // wire format resolves a LlmConfig carrying that format, so the
+        // failover chain can mix a Gemini entry with OpenAI-compatible ones.
+        let r = EnvEndpointResolver::new().with_provider_format(
+            "gemini",
+            "https://generativelanguage.googleapis.com/v1beta",
+            "GEMINI_API_KEY",
+            LlmWireFormat::GeminiGenerate,
+        );
+        let cfg = r.resolve("gemini/gemini-2.5-pro").expect("resolves");
+        assert_eq!(cfg.wire_format, LlmWireFormat::GeminiGenerate);
+        assert_eq!(
+            cfg.api_base,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(cfg.model, "gemini-2.5-pro");
+
+        // resolve_entry (the cooldown/key-pool path build_llm_chain actually
+        // uses) must carry the same wire format through its template.
+        let entry = r.resolve_entry("gemini/gemini-2.5-pro").expect("resolves");
+        assert_eq!(entry.template.wire_format, LlmWireFormat::GeminiGenerate);
+    }
+
+    #[test]
+    fn resolver_maps_provider_wire_format_via_with_provider_keys_format() {
+        let r = EnvEndpointResolver::new().with_provider_keys_format(
+            "gemini",
+            "https://generativelanguage.googleapis.com/v1beta",
+            vec!["GEMINI_API_KEY_1".to_string(), "GEMINI_API_KEY_2".to_string()],
+            LlmWireFormat::GeminiGenerate,
+        );
+        let entry = r.resolve_entry("gemini/gemini-2.5-flash").expect("resolves");
+        assert_eq!(entry.template.wire_format, LlmWireFormat::GeminiGenerate);
+        assert_eq!(entry.keys.len(), 2);
+    }
+
+    #[test]
+    fn build_llm_chain_wires_gemini_entry_end_to_end() {
+        // The full config -> chain path (ModelConfig -> build_llm_chain ->
+        // LlmFailover) carries the wire format through, so a Gemini entry
+        // built this way is ready to dispatch through LlmClient::complete's
+        // GeminiGenerate branch (verified at the HTTP level in llm.rs's
+        // gemini_wire_format_completes_end_to_end_via_mock_server).
+        let r = EnvEndpointResolver::new().with_provider_format(
+            "gemini",
+            "https://generativelanguage.googleapis.com/v1beta",
+            "GEMINI_API_KEY",
+            LlmWireFormat::GeminiGenerate,
+        );
+        let model = ModelConfig::new("gemini/gemini-2.5-pro");
+        let chain = build_llm_chain(&model, &r).expect("chain builds");
+        let cfg = chain.primary_config().expect("primary config");
+        assert_eq!(cfg.wire_format, LlmWireFormat::GeminiGenerate);
     }
 
     #[test]

@@ -1,9 +1,31 @@
-//! LLM HTTP client — OpenAI-compatible chat completions API.
+//! LLM HTTP client — multi-provider wire-format layer.
 //!
-//! Generic client that calls any OpenAI-compatible endpoint (e.g., `OpenAI`,
-//! local LLM servers). Configuration is loaded at runtime — never hardcoded.
+//! Generic client that calls any provider endpoint reachable through one of
+//! the wire formats in [`LlmWireFormat`]. Configuration is loaded at runtime
+//! — never hardcoded.
 //!
 //! **Layer A only:** No family-specific names, souls, or private data.
+//!
+//! ## Wire formats (ANY-AI provider support)
+//!
+//! [`LlmConfig::wire_format`] selects the request/response shape used to talk
+//! to the configured `api_base`:
+//!
+//! - [`LlmWireFormat::OpenAiChat`] (default) — `POST {api_base}/chat/completions`,
+//!   the original and most complete path: text, streaming, and tool calling.
+//! - [`LlmWireFormat::GeminiGenerate`] — native Google Gemini
+//!   `POST {api_base}/models/{model}:generateContent?key={api_key}`. **Verified
+//!   minimal slice:** plain text completion ([`LlmClient::complete`]) is fully
+//!   implemented and tested. Tool calling and streaming are NOT yet
+//!   implemented for this wire format — calling
+//!   [`LlmClient::complete_with_tools`] with a non-empty tool list, or
+//!   [`LlmClient::complete_stream`], returns [`LlmError::Http`] with a message
+//!   pointing at `docs/design/multi-provider-wire-formats.md`.
+//! - [`LlmWireFormat::AnthropicMessages`] / [`LlmWireFormat::Bedrock`] —
+//!   **design-doc only, not implemented.** Selecting either returns
+//!   [`LlmError::Http`] immediately, pointing at the same design doc. See
+//!   `docs/design/multi-provider-wire-formats.md` for the planned wire shape
+//!   and the SigV4-signing plan for Bedrock.
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -120,6 +142,64 @@ impl FinishReason {
     pub const fn is_length(&self) -> bool {
         matches!(self, FinishReason::Length)
     }
+
+    /// Maps Gemini's `candidates[].finishReason` string (or its absence) to a
+    /// [`FinishReason`]. Gemini's vocabulary differs from `OpenAI`'s
+    /// (`"STOP"`/`"MAX_TOKENS"` vs. `"stop"`/`"length"`), so this is a
+    /// separate mapping rather than reusing [`Self::from_wire`].
+    /// `None`/unrecognized -> [`FinishReason::Stop`] (same safe default as
+    /// [`Self::from_wire`]).
+    fn from_gemini_wire(raw: Option<&str>) -> Self {
+        match raw {
+            Some("STOP") | None => FinishReason::Stop,
+            Some("MAX_TOKENS") => FinishReason::Length,
+            Some(other) => FinishReason::Other(other.to_string()),
+        }
+    }
+}
+
+/// Which wire format [`LlmClient`] uses to talk to [`LlmConfig::api_base`].
+///
+/// This is the ANY-AI provider layer: the request/response shape a provider
+/// speaks is independent of the failover/resolver machinery in
+/// [`crate::llm_chain`], so a Gemini or Anthropic entry can sit in the same
+/// [`crate::llm_chain::LlmFailover`] chain as an OpenAI-compatible one. See
+/// the module docs above and `docs/design/multi-provider-wire-formats.md`
+/// for the status of each variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmWireFormat {
+    /// `POST {api_base}/chat/completions` — `OpenAI`-compatible chat
+    /// completions (the original, fully-featured wire format: text,
+    /// streaming, tool calling). Default for backward compatibility — every
+    /// [`LlmConfig`] built before this enum existed behaves identically.
+    #[default]
+    OpenAiChat,
+    /// `POST {api_base}/models/{model}:generateContent?key={api_key}` —
+    /// native Google Gemini `generateContent`. Verified minimal slice: text
+    /// completion only (see module docs).
+    GeminiGenerate,
+    /// Anthropic `POST {api_base}/v1/messages`. **Not implemented** —
+    /// selecting this returns [`LlmError::Http`] at call time. Design:
+    /// `docs/design/multi-provider-wire-formats.md`.
+    AnthropicMessages,
+    /// AWS Bedrock `InvokeModel`/`Converse`, SigV4-signed. **Not
+    /// implemented** — selecting this returns [`LlmError::Http`] at call
+    /// time. Design: `docs/design/multi-provider-wire-formats.md`.
+    Bedrock,
+}
+
+impl LlmWireFormat {
+    /// One-word tag for logs/errors (stable).
+    #[must_use]
+    pub const fn as_word(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "openai_chat",
+            Self::GeminiGenerate => "gemini_generate",
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::Bedrock => "bedrock",
+        }
+    }
 }
 
 /// LLM configuration — loaded at runtime from env/file (never hardcoded).
@@ -133,6 +213,11 @@ pub struct LlmConfig {
     pub model: String,
     /// Maximum tokens in response
     pub max_tokens: u32,
+    /// Wire format used to talk to `api_base` (ANY-AI provider support).
+    /// `#[serde(default)]` → configs serialized before this field existed
+    /// deserialize as [`LlmWireFormat::OpenAiChat`], unchanged behavior.
+    #[serde(default)]
+    pub wire_format: LlmWireFormat,
     /// Timeout for the whole request (request + reading the response) in
     /// milliseconds. `None` → [`DEFAULT_REQUEST_TIMEOUT_MS`]. Layer B can tune
     /// this per provider (e.g. tighter for a fast endpoint, looser for a slow
@@ -161,6 +246,7 @@ impl LlmConfig {
             api_key: api_key.into(),
             model: model.into(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            wire_format: LlmWireFormat::OpenAiChat,
             request_timeout_ms: None,
             connect_timeout_ms: None,
         }
@@ -170,6 +256,15 @@ impl LlmConfig {
     #[must_use]
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Sets the wire format (ANY-AI provider support). Default
+    /// [`LlmWireFormat::OpenAiChat`]. See the module docs for which formats
+    /// are fully implemented vs. design-doc-only.
+    #[must_use]
+    pub fn with_wire_format(mut self, wire_format: LlmWireFormat) -> Self {
+        self.wire_format = wire_format;
         self
     }
 
@@ -676,13 +771,50 @@ impl LlmClient {
         Ok(text)
     }
 
-    /// One raw chat-completions call: sends `messages` (no tools) and
-    /// returns the response text plus its [`FinishReason`]. Shared by
-    /// [`Self::complete`]'s first call and each of its continuation rounds.
+    /// One raw completion call: sends `messages` (no tools) and returns the
+    /// response text plus its [`FinishReason`]. Shared by [`Self::complete`]'s
+    /// first call and each of its continuation rounds.
+    ///
+    /// Dispatches on [`LlmConfig::wire_format`] — this is the ANY-AI provider
+    /// seam. [`LlmWireFormat::AnthropicMessages`] / [`LlmWireFormat::Bedrock`]
+    /// are not implemented yet (design-doc only): calling either returns
+    /// [`LlmError::Http`] instead of silently talking `OpenAI`-shaped wire to
+    /// an incompatible endpoint.
     ///
     /// # Errors
-    /// Returns an error if the HTTP request fails or the response is invalid.
+    /// Returns an error if the HTTP request fails, the response is invalid,
+    /// or the wire format is not implemented.
     async fn complete_once(
+        &self,
+        messages: &[LlmMessage],
+    ) -> Result<(String, FinishReason), LlmError> {
+        match self.config.wire_format {
+            LlmWireFormat::OpenAiChat => self.complete_once_openai(messages).await,
+            LlmWireFormat::GeminiGenerate => self.complete_once_gemini(messages).await,
+            LlmWireFormat::AnthropicMessages | LlmWireFormat::Bedrock => {
+                Err(Self::unimplemented_wire_format_error(self.config.wire_format))
+            }
+        }
+    }
+
+    /// The error returned for a [`LlmWireFormat`] that has no implementation
+    /// yet ([`LlmWireFormat::AnthropicMessages`], [`LlmWireFormat::Bedrock`],
+    /// and — outside [`Self::complete`] — [`LlmWireFormat::GeminiGenerate`]
+    /// with tools/streaming). Classified as [`LlmError::Http`]: it is a
+    /// deterministic config error for THIS entry, but (unlike
+    /// [`LlmError::Parse`]/[`LlmError::InvalidTool`]) still retryable at the
+    /// chain level, since a different chain entry may use a wire format that
+    /// IS implemented.
+    fn unimplemented_wire_format_error(format: LlmWireFormat) -> LlmError {
+        LlmError::Http(format!(
+            "wire format '{}' is not implemented yet — see docs/design/multi-provider-wire-formats.md",
+            format.as_word()
+        ))
+    }
+
+    /// `OpenAI`-compatible chat-completions call (the original implementation,
+    /// unchanged in behavior). See [`Self::complete_once`].
+    async fn complete_once_openai(
         &self,
         messages: &[LlmMessage],
     ) -> Result<(String, FinishReason), LlmError> {
@@ -737,14 +869,94 @@ impl LlmClient {
         Ok((content, finish_reason))
     }
 
-    /// Opens an SSE stream (`stream: true`) and returns a stream of text chunks.
+    /// Builds the Gemini `generateContent` endpoint URL (without the `key`
+    /// query parameter — that is attached separately via `.query(...)` so
+    /// `reqwest` handles URL-encoding of the API key, rather than
+    /// hand-formatting it into the URL string).
+    ///
+    /// `api_base` is expected to be the Gemini API root (e.g.
+    /// `https://generativelanguage.googleapis.com/v1beta`), analogous to how
+    /// [`Self::build_endpoint`] expects an `OpenAI`-compatible root.
+    #[must_use]
+    fn gemini_endpoint(api_base: &str, model: &str) -> String {
+        format!(
+            "{}/models/{model}:generateContent",
+            api_base.trim_end_matches('/')
+        )
+    }
+
+    /// Native Google Gemini `generateContent` call (verified minimal slice of
+    /// the ANY-AI wire-format layer — see module docs). Sends `messages` with
+    /// no tools/functions attached and returns the response text plus its
+    /// [`FinishReason`] (mapped through [`FinishReason::from_gemini_wire`]).
     ///
     /// # Errors
-    /// Returns an error if the HTTP request fails before the stream is opened.
+    /// Returns an error if the HTTP request fails or the response is invalid.
+    async fn complete_once_gemini(
+        &self,
+        messages: &[LlmMessage],
+    ) -> Result<(String, FinishReason), LlmError> {
+        let endpoint = Self::gemini_endpoint(&self.config.api_base, &self.config.model);
+        let request_body = GeminiGenerateContentRequest::from_messages(messages, self.config.max_tokens);
+
+        let response = self
+            .client
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .query(&[("key", self.config.api_key.as_str())])
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| LlmError::from_reqwest("request failed", &e))?;
+
+        if !response.status().is_success() {
+            return Err(Self::error_from_response(response).await);
+        }
+
+        let gemini_response: GeminiGenerateContentResponse = response.json().await.map_err(|e| {
+            if e.is_timeout() {
+                LlmError::Timeout(format!("response read timed out: {e}"))
+            } else {
+                LlmError::Parse(format!("response parse error: {e}"))
+            }
+        })?;
+
+        // Empty candidates = the model produced nothing this turn — RETRYABLE
+        // (another model in the chain may produce content), same invariant as
+        // the OpenAI path's empty `choices` (see complete_once_openai).
+        let candidate = gemini_response
+            .candidates
+            .into_iter()
+            .next()
+            .ok_or(LlmError::NoContent)?;
+
+        let finish_reason = FinishReason::from_gemini_wire(candidate.finish_reason.as_deref());
+        let content = candidate
+            .content
+            .map(|c| c.parts.into_iter().filter_map(|p| p.text).collect::<String>())
+            .filter(|s| !s.is_empty())
+            .ok_or(LlmError::NoContent)?;
+
+        Ok((content, finish_reason))
+    }
+
+    /// Opens an SSE stream (`stream: true`) and returns a stream of text chunks.
+    ///
+    /// **Wire format:** only [`LlmWireFormat::OpenAiChat`] is implemented.
+    /// Every other wire format returns [`LlmError::Http`] immediately (see
+    /// module docs) rather than silently sending `OpenAI`-shaped streaming
+    /// requests to an incompatible endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the HTTP request fails before the stream is
+    /// opened, or the wire format does not support streaming.
     pub async fn complete_stream(
         &self,
         messages: &[LlmMessage],
     ) -> std::result::Result<LlmChunkStream, LlmError> {
+        if self.config.wire_format != LlmWireFormat::OpenAiChat {
+            return Err(Self::unimplemented_wire_format_error(self.config.wire_format));
+        }
         let endpoint = Self::build_endpoint(&self.config.api_base);
         let request_body = ChatCompletionsStreamRequest {
             model: &self.config.model,
@@ -814,6 +1026,19 @@ impl LlmClient {
     }
 
     /// Like [`Self::complete_with_tools`] with explicit `OpenAI` `tool_choice`.
+    ///
+    /// **Wire format:** [`LlmWireFormat::OpenAiChat`] is fully implemented
+    /// (text + tool calls). [`LlmWireFormat::GeminiGenerate`] supports the
+    /// **tool-less** path only (`tools` empty) — it delegates to
+    /// [`Self::complete_once_gemini`] and wraps the text into a
+    /// [`CompletionResult`] with no tool calls; a non-empty `tools` list
+    /// returns [`LlmError::Http`] (Gemini function calling is not
+    /// implemented in this slice — see module docs). Every other wire format
+    /// always returns [`LlmError::Http`].
+    ///
+    /// # Errors
+    /// Returns an error if the HTTP request fails, the response is invalid,
+    /// or the wire format/tool combination is not implemented.
     pub async fn complete_with_tools_choice(
         &self,
         messages: &[LlmMessage],
@@ -826,6 +1051,31 @@ impl LlmClient {
             tool.validate()?;
         }
 
+        match self.config.wire_format {
+            LlmWireFormat::OpenAiChat => {
+                self.complete_with_tools_choice_openai(messages, tools, tool_choice)
+                    .await
+            }
+            LlmWireFormat::GeminiGenerate if tools.is_empty() => {
+                let (text, _finish_reason) = self.complete_once_gemini(messages).await?;
+                Ok(CompletionResult {
+                    content: Some(text),
+                    tool_calls: None,
+                })
+            }
+            other => Err(Self::unimplemented_wire_format_error(other)),
+        }
+    }
+
+    /// `OpenAI`-compatible tool-calling completion (the original
+    /// implementation, unchanged in behavior). See
+    /// [`Self::complete_with_tools_choice`].
+    async fn complete_with_tools_choice_openai(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[ToolDefinition],
+        tool_choice: Option<&str>,
+    ) -> Result<CompletionResult, LlmError> {
         let endpoint = Self::build_endpoint(&self.config.api_base);
 
         let request_body = ChatCompletionsRequest {
@@ -1351,6 +1601,126 @@ fn parse_sse_delta_line(line: &str) -> Option<String> {
         .next()
         .and_then(|c| c.delta.content)
         .filter(|s| !s.is_empty())
+}
+
+// ── Gemini `generateContent` wire shapes (ANY-AI provider support) ─────────
+//
+// Native Google Gemini wire format, distinct from the OpenAI-compatible
+// shape above. Field names follow Gemini's `camelCase` convention
+// (`generationConfig`, `maxOutputTokens`, `systemInstruction`,
+// `finishReason`) via `#[serde(rename_all = "camelCase")]`.
+
+/// `POST {api_base}/models/{model}:generateContent` request body.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct GeminiGenerateContentRequest {
+    contents: Vec<GeminiContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<GeminiSystemInstruction>,
+    generation_config: GeminiGenerationConfig,
+}
+
+impl GeminiGenerateContentRequest {
+    /// Converts the provider-agnostic [`LlmMessage`] list into Gemini's
+    /// `contents` + `systemInstruction` shape.
+    ///
+    /// - [`LlmRole::System`] messages are extracted and concatenated (joined
+    ///   by a blank line) into `systemInstruction` — Gemini has no
+    ///   `"system"` role inside `contents`.
+    /// - [`LlmRole::User`] and [`LlmRole::Tool`] map to Gemini's `"user"`
+    ///   role — Gemini's native tool-result shape
+    ///   (`functionResponse`/`functionCall`) is NOT implemented in this
+    ///   slice (this wire format only handles the tool-less path — see
+    ///   [`LlmClient::complete_with_tools_choice`]), so a [`LlmRole::Tool`]
+    ///   message (which cannot occur on that path today) still degrades
+    ///   safely to a plain text turn rather than being dropped or panicking.
+    /// - [`LlmRole::Assistant`] maps to Gemini's `"model"` role.
+    fn from_messages(messages: &[LlmMessage], max_tokens: u32) -> Self {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut contents = Vec::with_capacity(messages.len());
+        for m in messages {
+            match m.role {
+                LlmRole::System => {
+                    if !m.content.is_empty() {
+                        system_parts.push(&m.content);
+                    }
+                }
+                LlmRole::User | LlmRole::Tool => contents.push(GeminiContent {
+                    role: "user".to_string(),
+                    parts: vec![GeminiPart {
+                        text: Some(m.content.clone()),
+                    }],
+                }),
+                LlmRole::Assistant => contents.push(GeminiContent {
+                    role: "model".to_string(),
+                    parts: vec![GeminiPart {
+                        text: Some(m.content.clone()),
+                    }],
+                }),
+            }
+        }
+        let system_instruction = if system_parts.is_empty() {
+            None
+        } else {
+            Some(GeminiSystemInstruction {
+                parts: vec![GeminiPart {
+                    text: Some(system_parts.join("\n\n")),
+                }],
+            })
+        };
+        Self {
+            contents,
+            system_instruction,
+            generation_config: GeminiGenerationConfig {
+                max_output_tokens: max_tokens,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct GeminiSystemInstruction {
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct GeminiGenerationConfig {
+    max_output_tokens: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct GeminiContent {
+    role: String,
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct GeminiPart {
+    /// `#[serde(default)]`: a part with no `text` (e.g. an inline-data /
+    /// function-call part this slice doesn't model) still decodes instead
+    /// of failing the whole response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+}
+
+/// `generateContent` response body.
+#[derive(Debug, Deserialize)]
+struct GeminiGenerateContentResponse {
+    #[serde(default)]
+    candidates: Vec<GeminiCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiCandidate {
+    #[serde(default)]
+    content: Option<GeminiContent>,
+    /// `"STOP" | "MAX_TOKENS" | ...`. `#[serde(default)]` tolerates
+    /// responses that omit it (-> `None` -> [`FinishReason::Stop`] via
+    /// [`FinishReason::from_gemini_wire`]).
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[cfg(test)]
@@ -2374,5 +2744,271 @@ mod tests {
             text, "partial-only",
             "a failed continuation call must not lose the already-accumulated partial text"
         );
+    }
+
+    // ── Gemini wire format (ANY-AI provider support) ────────────────────────
+
+    #[test]
+    fn gemini_wire_format_is_default_openai_chat() {
+        // Backward compatibility: every LlmConfig built before this field
+        // existed must behave identically — default is OpenAiChat.
+        let cfg = LlmConfig::new("https://api.openai.com/v1", "k", "m");
+        assert_eq!(cfg.wire_format, LlmWireFormat::OpenAiChat);
+    }
+
+    #[test]
+    fn gemini_wire_format_serde_defaults_on_missing_field() {
+        // A config serialized before `wire_format` existed (no field in the
+        // JSON at all) must still deserialize -> OpenAiChat, not fail.
+        let json = r#"{"api_base":"https://api.openai.com/v1","api_key":"k","model":"gpt-4o","max_tokens":4096}"#;
+        let cfg: LlmConfig = serde_json::from_str(json).expect("old-shape config must decode");
+        assert_eq!(cfg.wire_format, LlmWireFormat::OpenAiChat);
+    }
+
+    #[test]
+    fn gemini_wire_format_roundtrips_through_serde() {
+        let cfg = LlmConfig::new("https://generativelanguage.googleapis.com/v1beta", "k", "gemini-2.5-pro")
+            .with_wire_format(LlmWireFormat::GeminiGenerate);
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        assert!(json.contains("\"gemini_generate\""), "got: {json}");
+        let back: LlmConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.wire_format, LlmWireFormat::GeminiGenerate);
+    }
+
+    #[test]
+    fn gemini_endpoint_builds_generate_content_path() {
+        let url = LlmClient::gemini_endpoint(
+            "https://generativelanguage.googleapis.com/v1beta",
+            "gemini-2.5-pro",
+        );
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+        );
+        // Trailing slash on api_base must not produce a double slash.
+        let url2 = LlmClient::gemini_endpoint(
+            "https://generativelanguage.googleapis.com/v1beta/",
+            "gemini-2.5-pro",
+        );
+        assert_eq!(url2, url);
+    }
+
+    #[test]
+    fn gemini_request_maps_system_user_assistant_roles() {
+        let messages = vec![
+            LlmMessage::system("You are a helpful sibling."),
+            LlmMessage::user("hei"),
+            LlmMessage::assistant("hei sisko"),
+            LlmMessage::user("mitä kuuluu?"),
+        ];
+        let req = GeminiGenerateContentRequest::from_messages(&messages, 2048);
+
+        // System messages are extracted into systemInstruction, not `contents`.
+        let sys = req
+            .system_instruction
+            .as_ref()
+            .expect("system instruction present");
+        assert_eq!(sys.parts[0].text.as_deref(), Some("You are a helpful sibling."));
+
+        assert_eq!(req.contents.len(), 3, "system message excluded from contents");
+        assert_eq!(req.contents[0].role, "user");
+        assert_eq!(req.contents[0].parts[0].text.as_deref(), Some("hei"));
+        assert_eq!(req.contents[1].role, "model", "assistant -> Gemini's 'model' role");
+        assert_eq!(req.contents[1].parts[0].text.as_deref(), Some("hei sisko"));
+        assert_eq!(req.contents[2].role, "user");
+
+        assert_eq!(req.generation_config.max_output_tokens, 2048);
+    }
+
+    #[test]
+    fn gemini_request_omits_system_instruction_when_no_system_messages() {
+        let messages = vec![LlmMessage::user("hei")];
+        let req = GeminiGenerateContentRequest::from_messages(&messages, 4096);
+        assert!(req.system_instruction.is_none());
+    }
+
+    #[test]
+    fn gemini_request_serializes_camel_case_field_names() {
+        let messages = vec![LlmMessage::system("be nice"), LlmMessage::user("hei")];
+        let req = GeminiGenerateContentRequest::from_messages(&messages, 1024);
+        let v = serde_json::to_value(&req).expect("serialize");
+        assert!(v.get("contents").is_some());
+        assert!(v.get("systemInstruction").is_some(), "camelCase field, got: {v}");
+        assert_eq!(v["generationConfig"]["maxOutputTokens"], 1024);
+    }
+
+    #[test]
+    fn gemini_response_parses_text_and_stop_finish_reason() {
+        let body = r#"{
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hei sisko"}]},
+                "finishReason": "STOP"
+            }]
+        }"#;
+        let resp: GeminiGenerateContentResponse =
+            serde_json::from_str(body).expect("gemini response must decode");
+        let candidate = resp.candidates.into_iter().next().expect("one candidate");
+        assert_eq!(
+            candidate.content.expect("content").parts[0].text.as_deref(),
+            Some("hei sisko")
+        );
+        assert_eq!(
+            FinishReason::from_gemini_wire(candidate.finish_reason.as_deref()),
+            FinishReason::Stop
+        );
+    }
+
+    #[test]
+    fn gemini_response_maps_max_tokens_to_length_finish_reason() {
+        assert_eq!(
+            FinishReason::from_gemini_wire(Some("MAX_TOKENS")),
+            FinishReason::Length
+        );
+        assert!(FinishReason::from_gemini_wire(Some("MAX_TOKENS")).is_length());
+        assert_eq!(FinishReason::from_gemini_wire(None), FinishReason::Stop);
+        assert_eq!(
+            FinishReason::from_gemini_wire(Some("SAFETY")),
+            FinishReason::Other("SAFETY".to_string())
+        );
+    }
+
+    #[test]
+    fn gemini_response_multi_part_text_is_concatenated() {
+        // Gemini can split one candidate's text across multiple `parts`.
+        let body = r#"{
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hei "}, {"text": "sisko"}]},
+                "finishReason": "STOP"
+            }]
+        }"#;
+        let resp: GeminiGenerateContentResponse =
+            serde_json::from_str(body).expect("decode");
+        let candidate = resp.candidates.into_iter().next().expect("candidate");
+        let joined: String = candidate
+            .content
+            .expect("content")
+            .parts
+            .into_iter()
+            .filter_map(|p| p.text)
+            .collect();
+        assert_eq!(joined, "hei sisko");
+    }
+
+    /// End-to-end: the Gemini wire format actually talks to the network
+    /// through [`LlmClient::complete`] (the SAME public entry point the
+    /// OpenAI wire format uses), proving the dispatch in
+    /// [`LlmClient::complete_once`] is real, not just parsed in isolation.
+    /// Reuses the [`spawn_scripted_mock`] harness above (canned HTTP/1.1
+    /// responses over a raw TCP listener, no mocking crate dependency).
+    #[tokio::test]
+    async fn gemini_wire_format_completes_end_to_end_via_mock_server() {
+        let body = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"hei sisko!"}]},"finishReason":"STOP"}]}"#.to_string();
+        let (addr, calls) = spawn_scripted_mock(vec![body]);
+
+        let cfg = LlmConfig::new(format!("http://{addr}/v1beta"), "test-key", "gemini-2.5-pro")
+            .with_wire_format(LlmWireFormat::GeminiGenerate)
+            .with_request_timeout_ms(2000)
+            .with_connect_timeout_ms(2000);
+        let client = LlmClient::new(cfg);
+
+        let text = client
+            .complete(&[
+                LlmMessage::system("be nice"),
+                LlmMessage::user("hei"),
+            ])
+            .await
+            .expect("gemini wire format must complete via the same public entry point");
+        assert_eq!(text, "hei sisko!");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gemini_wire_format_complete_with_tools_empty_delegates_to_text_path() {
+        let body = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"no tools needed"}]},"finishReason":"STOP"}]}"#.to_string();
+        let (addr, _calls) = spawn_scripted_mock(vec![body]);
+
+        let cfg = LlmConfig::new(format!("http://{addr}/v1beta"), "k", "gemini-2.5-pro")
+            .with_wire_format(LlmWireFormat::GeminiGenerate)
+            .with_request_timeout_ms(2000)
+            .with_connect_timeout_ms(2000);
+        let client = LlmClient::new(cfg);
+
+        let result = client
+            .complete_with_tools(&[LlmMessage::user("hei")], &[])
+            .await
+            .expect("empty tools list must delegate to the tool-less Gemini path");
+        assert_eq!(result.text(), "no tools needed");
+        assert!(!result.has_tool_calls());
+    }
+
+    #[tokio::test]
+    async fn gemini_wire_format_complete_with_tools_nonempty_is_unimplemented() {
+        // No network call should even happen — the tools-non-empty case is
+        // rejected before building a request (see complete_with_tools_choice).
+        let cfg = LlmConfig::new("http://127.0.0.1:1", "k", "gemini-2.5-pro")
+            .with_wire_format(LlmWireFormat::GeminiGenerate);
+        let client = LlmClient::new(cfg);
+
+        let tool = ToolDefinition {
+            name: "ping".into(),
+            description: "ping".into(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        };
+        let err = client
+            .complete_with_tools(&[LlmMessage::user("hei")], &[tool])
+            .await
+            .expect_err("Gemini function calling must not be silently attempted");
+        assert!(
+            matches!(err, LlmError::Http(_)),
+            "expected a clear Http error, got {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("gemini_generate"),
+            "error should name the unimplemented wire format, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_wire_format_streaming_is_unimplemented() {
+        let cfg = LlmConfig::new("http://127.0.0.1:1", "k", "gemini-2.5-pro")
+            .with_wire_format(LlmWireFormat::GeminiGenerate);
+        let client = LlmClient::new(cfg);
+
+        // `LlmChunkStream`'s Ok variant isn't Debug, so match manually
+        // instead of `expect_err` (which requires Debug on the Ok type).
+        match client.complete_stream(&[LlmMessage::user("hei")]).await {
+            Ok(_) => panic!("Gemini streaming must not be silently attempted as OpenAI SSE"),
+            Err(err) => assert!(matches!(err, LlmError::Http(_))),
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_and_bedrock_wire_formats_error_before_any_network_call() {
+        // Both are design-doc-only (not implemented). Point at a
+        // guaranteed-unroutable address (port 1, no listener) to prove the
+        // error comes from the dispatch guard, not a real connection
+        // failure that happened to also produce an Http error.
+        for format in [LlmWireFormat::AnthropicMessages, LlmWireFormat::Bedrock] {
+            let cfg = LlmConfig::new("http://127.0.0.1:1", "k", "m").with_wire_format(format);
+            let client = LlmClient::new(cfg);
+            let err = client
+                .complete(&[LlmMessage::user("hei")])
+                .await
+                .expect_err("unimplemented wire format must error, not silently fall back");
+            assert!(matches!(err, LlmError::Http(_)));
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("multi-provider-wire-formats.md"),
+                "error should point at the design doc, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn llm_wire_format_as_word_is_stable() {
+        assert_eq!(LlmWireFormat::OpenAiChat.as_word(), "openai_chat");
+        assert_eq!(LlmWireFormat::GeminiGenerate.as_word(), "gemini_generate");
+        assert_eq!(LlmWireFormat::AnthropicMessages.as_word(), "anthropic_messages");
+        assert_eq!(LlmWireFormat::Bedrock.as_word(), "bedrock");
     }
 }
