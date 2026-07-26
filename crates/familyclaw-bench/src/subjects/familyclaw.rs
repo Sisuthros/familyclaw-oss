@@ -150,10 +150,17 @@ impl FamilyClawSubject {
     }
 
     /// Removes any prior journal + store files (a fresh starting state).
+    ///
+    /// Uses [`remove_file_retry`] rather than a bare `remove_file`: on Windows
+    /// a just-reaped `continuity_daemon` child can leave the OS holding its
+    /// file handle for a few milliseconds after exit, so a plain removal
+    /// intermittently fails with `ERROR_ACCESS_DENIED` (os error 5). The
+    /// bounded backoff clears that transient lock deterministically; on other
+    /// platforms the first attempt always succeeds.
     fn reset_state(&self) -> Result<()> {
         for p in [&self.journal, &self.store] {
             if p.exists() {
-                std::fs::remove_file(p)?;
+                remove_file_retry(p)?;
             }
         }
         Ok(())
@@ -396,8 +403,61 @@ impl Subject for FamilyClawSubject {
 
 impl Drop for FamilyClawSubject {
     fn drop(&mut self) {
-        // Clean up the temporary directory. Errors are ignored (best-effort).
-        let _ = std::fs::remove_dir_all(&self.tempdir);
+        // Clean up the temporary directory. Errors are ignored (best-effort),
+        // but the retry wrapper first rides out any transient Windows file
+        // lock the just-exited daemon child may still hold (ERROR_ACCESS_DENIED
+        // / ERROR_SHARING_VIOLATION) so the tempdir is actually removed instead
+        // of being leaked on the first ACCESS_DENIED.
+        let _ = remove_dir_all_retry(&self.tempdir);
+    }
+}
+
+/// Maximum number of removal retries when Windows briefly keeps a just-exited
+/// child's file handle open. On non-Windows platforms the transient error
+/// codes never occur, so the first attempt succeeds and this loop is a no-op.
+const REMOVE_RETRIES: u32 = 10;
+
+/// `true` when an OS error is a **transient** Windows file lock that a short
+/// backoff can clear: `ERROR_ACCESS_DENIED` (os error 5) or
+/// `ERROR_SHARING_VIOLATION` (os error 32), raised while the reaped daemon
+/// child's handle has not yet been released by the kernel.
+fn is_transient_lock(err: &std::io::Error) -> bool {
+    matches!(err.kind(), std::io::ErrorKind::PermissionDenied)
+        || matches!(err.raw_os_error(), Some(5 | 32))
+}
+
+/// [`std::fs::remove_file`] with a bounded backoff over transient Windows file
+/// locks. Returns the final error if every attempt fails (so a genuine,
+/// non-transient failure still surfaces).
+fn remove_file_retry(path: &std::path::Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if attempt < REMOVE_RETRIES && is_transient_lock(&e) => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20 * u64::from(attempt)));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// [`std::fs::remove_dir_all`] with the same bounded backoff as
+/// [`remove_file_retry`]. A missing directory is treated as success.
+fn remove_dir_all_retry(path: &std::path::Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if attempt < REMOVE_RETRIES && is_transient_lock(&e) => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20 * u64::from(attempt)));
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 

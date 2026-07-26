@@ -593,7 +593,7 @@ impl MemoryStore for LocalJsonStore {
 ///
 /// This trait separates vector storage and nearest-neighbor search from the
 /// [`MemoryStore`] base interface, so a semantic tier can be implemented
-/// (e.g. embedded LanceDB) in a separate crate without changing the
+/// (e.g. embedded `LanceDB`) in a separate crate without changing the
 /// `MemoryStore` foundation. Used only when the `vector-store` feature is
 /// enabled; the default build is byte-identical with and without this extension.
 ///

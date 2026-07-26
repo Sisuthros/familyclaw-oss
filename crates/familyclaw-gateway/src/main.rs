@@ -298,6 +298,13 @@ struct GatewayState {
     /// numeric values, no payload). `None` only in states where the
     /// registry is not wired up (e.g. some tests).
     metrics: Option<MetricsRegistry>,
+    /// **Operator RBAC policy**, resolved **once** at gateway construction
+    /// (`OperatorAcl::from_env()` in [`serve`]). Request handlers read this
+    /// snapshot instead of the `FAMILYCLAW_OPERATOR_ACL` process-global env at
+    /// request time, so the control-plane authorization decision is
+    /// deterministic and independent of any concurrent `set_var`/`remove_var`
+    /// (the source of a former parallel-test flake).
+    operator_acl: OperatorAcl,
     /// Deep readyz / canary: LLM model, Discord, journal path.
     readiness: readiness::ReadinessProbe,
 }
@@ -321,6 +328,7 @@ fn test_gateway_state() -> GatewayState {
         scheduler: None,
         agency_config_path: None,
         metrics: None,
+        operator_acl: OperatorAcl::disabled(),
         readiness: readiness::ReadinessProbe::default(),
     }
 }
@@ -465,10 +473,10 @@ pub(crate) fn check_inject_auth(
 /// `X-FamilyClaw-Operator-Role: viewer|approver|admin` with a grant for
 /// `capability` (see `docs/ENTERPRISE_AUTH.md`).
 fn check_operator_capability(
+    acl: &OperatorAcl,
     headers: &HeaderMap,
     capability: &str,
 ) -> std::result::Result<(), StatusCode> {
-    let acl = OperatorAcl::from_env();
     if !acl.is_enabled() {
         return Ok(());
     }
@@ -676,7 +684,7 @@ async fn list_pending_approvals(
             Json(serde_json::json!({ "error": "unauthorized" })),
         );
     }
-    if check_operator_capability(&headers, operator_caps::APPROVALS_READ).is_err() {
+    if check_operator_capability(&state.operator_acl, &headers, operator_caps::APPROVALS_READ).is_err() {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "forbidden" })),
@@ -797,7 +805,7 @@ async fn approve_pending(
             Json(serde_json::json!({ "error": "unauthorized" })),
         );
     }
-    if check_operator_capability(&headers, operator_caps::APPROVALS_DECIDE).is_err() {
+    if check_operator_capability(&state.operator_acl, &headers, operator_caps::APPROVALS_DECIDE).is_err() {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "forbidden" })),
@@ -940,7 +948,7 @@ async fn deny_pending(
             Json(serde_json::json!({ "error": "unauthorized" })),
         );
     }
-    if check_operator_capability(&headers, operator_caps::APPROVALS_DECIDE).is_err() {
+    if check_operator_capability(&state.operator_acl, &headers, operator_caps::APPROVALS_DECIDE).is_err() {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "forbidden" })),
@@ -1005,7 +1013,7 @@ async fn set_task_enabled_route(
             Json(serde_json::json!({ "error": "unauthorized" })),
         );
     }
-    if check_operator_capability(&headers, operator_caps::TASKS_CONTROL).is_err() {
+    if check_operator_capability(&state.operator_acl, &headers, operator_caps::TASKS_CONTROL).is_err() {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "forbidden" })),
@@ -1100,7 +1108,7 @@ async fn list_turn_audit(
             Json(serde_json::json!({ "error": "unauthorized" })),
         );
     }
-    if check_operator_capability(&headers, operator_caps::AUDIT_READ).is_err() {
+    if check_operator_capability(&state.operator_acl, &headers, operator_caps::AUDIT_READ).is_err() {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "forbidden" })),
@@ -1794,6 +1802,7 @@ async fn serve() -> Result<()> {
         scheduler,
         agency_config_path,
         metrics: Some(metrics),
+        operator_acl: OperatorAcl::from_env(),
         readiness: readiness_probe,
     });
     info!("operaattorin hyväksyntäpinta valmis — GET /approvals/pending, POST /approvals/{{id}}/approve");
@@ -2431,6 +2440,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let (status, _) = readyz(State(not_ready)).await;
@@ -2448,6 +2458,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let (status, _) = readyz(State(ready)).await;
@@ -2468,6 +2479,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         }));
     }
@@ -2591,6 +2603,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         };
         assert!(check_inject_auth(&state, &HeaderMap::new()).is_ok());
@@ -2600,28 +2613,33 @@ mod tests {
 
     #[test]
     fn operator_acl_disabled_allows_without_role_header() {
-        std::env::remove_var("FAMILYCLAW_OPERATOR_ACL");
-        assert!(
-            check_operator_capability(&HeaderMap::new(), operator_caps::APPROVALS_DECIDE).is_ok()
-        );
+        // Pass the resolved policy explicitly — no process-global env, so this
+        // test can never race another test's `set_var`/`remove_var`.
+        let acl = OperatorAcl::disabled();
+        assert!(check_operator_capability(
+            &acl,
+            &HeaderMap::new(),
+            operator_caps::APPROVALS_DECIDE
+        )
+        .is_ok());
     }
 
     #[test]
     fn operator_acl_enabled_requires_role() {
-        std::env::set_var("FAMILYCLAW_OPERATOR_ACL", "1");
-        let denied = check_operator_capability(&HeaderMap::new(), operator_caps::APPROVALS_READ);
+        let acl = OperatorAcl::enabled();
+        let denied =
+            check_operator_capability(&acl, &HeaderMap::new(), operator_caps::APPROVALS_READ);
         assert_eq!(denied, Err(StatusCode::FORBIDDEN));
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-familyclaw-operator-role",
             "viewer".parse().expect("header"),
         );
-        assert!(check_operator_capability(&headers, operator_caps::APPROVALS_READ).is_ok());
+        assert!(check_operator_capability(&acl, &headers, operator_caps::APPROVALS_READ).is_ok());
         assert_eq!(
-            check_operator_capability(&headers, operator_caps::APPROVALS_DECIDE),
+            check_operator_capability(&acl, &headers, operator_caps::APPROVALS_DECIDE),
             Err(StatusCode::FORBIDDEN)
         );
-        std::env::remove_var("FAMILYCLAW_OPERATOR_ACL");
     }
 
     #[test]
@@ -2666,6 +2684,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         };
         assert!(check_inject_auth(&state, &headers_with_auth("Bearer s3cret-token")).is_ok());
@@ -2684,6 +2703,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         };
         // Wrong token.
@@ -2725,6 +2745,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         (state, actions)
@@ -2790,6 +2811,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let (status, _) = list_pending_approvals(State(state), HeaderMap::new()).await;
@@ -2836,6 +2858,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let (status, _) = list_pending_approvals(State(state), HeaderMap::new()).await;
@@ -2891,6 +2914,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let (status, _) = approve_pending(
@@ -2915,6 +2939,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         })
     }
@@ -2946,6 +2971,7 @@ mod tests {
             scheduler: Some(sched),
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         // Invalid UUID -> 400.
@@ -2993,6 +3019,7 @@ mod tests {
             scheduler: Some(Arc::clone(&sched)),
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
 
@@ -3055,6 +3082,7 @@ mod tests {
             scheduler: Some(Arc::clone(&sched)),
             agency_config_path: Some(path.clone()),
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
 
@@ -3154,6 +3182,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let id = submit_pending(&actions).await;
@@ -3215,6 +3244,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let (status, headers, body) = metrics_handler(State(state)).await;
@@ -3242,6 +3272,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: Some(registry),
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
 
@@ -3290,6 +3321,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: Some(registry),
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let app = build_router(state);
@@ -3400,6 +3432,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: Some(metrics),
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let (status, _headers, body) = metrics_handler(State(state)).await;
@@ -3815,6 +3848,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let app = build_router(state);
@@ -4080,6 +4114,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let app = build_router(state);
@@ -4157,6 +4192,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let app = build_router(state);
@@ -4302,6 +4338,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let app = build_router(state);
@@ -4455,6 +4492,7 @@ mod tests {
             scheduler: None,
             agency_config_path: None,
             metrics: None,
+            operator_acl: OperatorAcl::disabled(),
             readiness: readiness::ReadinessProbe::default(),
         });
         let app = build_router(state);

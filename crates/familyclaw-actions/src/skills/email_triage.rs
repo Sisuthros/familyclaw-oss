@@ -607,25 +607,27 @@ mod tests {
     }
 
     #[test]
-    fn live_try_from_env_none_when_unset() {
-        // Ensure the var is absent for this process for the duration of the assertion.
-        // SAFETY: test-only; we restore afterward.
+    fn live_try_from_env_var_behavior() {
+        // COMBINED test: [`EMAIL_TRIAGE_URL_ENV`] is a PROCESS-WIDE environment
+        // variable. Two separate test functions (one `remove_var`, one
+        // `set_var`) would race under parallel execution and stomp each other's
+        // value mid-assertion — the empty-case test could observe the var
+        // already removed and see `Ok(None)` instead of the expected
+        // `PolicyDenied`. Running both cases sequentially in ONE test keeps them
+        // deterministic. (Same pattern as the gateway `PLAN_ENV` combined test.)
+        // SAFETY: test-only; we restore the original value afterward.
         let previous = std::env::var_os(EMAIL_TRIAGE_URL_ENV);
+
+        // (a) unset -> Ok(None)
         std::env::remove_var(EMAIL_TRIAGE_URL_ENV);
         let got = EmailTriageLive::try_from_env().expect("unset is ok");
         assert!(got.is_none());
-        match previous {
-            Some(v) => std::env::set_var(EMAIL_TRIAGE_URL_ENV, v),
-            None => std::env::remove_var(EMAIL_TRIAGE_URL_ENV),
-        }
-    }
 
-    #[test]
-    fn live_try_from_env_fail_closed_on_empty() {
-        let previous = std::env::var_os(EMAIL_TRIAGE_URL_ENV);
+        // (b) whitespace-only -> fail closed (PolicyDenied)
         std::env::set_var(EMAIL_TRIAGE_URL_ENV, "   ");
         let err = EmailTriageLive::try_from_env().expect_err("empty must fail closed");
         assert!(matches!(err, ActionError::PolicyDenied(_)));
+
         match previous {
             Some(v) => std::env::set_var(EMAIL_TRIAGE_URL_ENV, v),
             None => std::env::remove_var(EMAIL_TRIAGE_URL_ENV),
