@@ -12,10 +12,10 @@ use crate::session::MessageOrigin as SessionOrigin;
 use super::helpers::*;
 use super::prelude::*;
 use super::{
-    history_max_chars_per_msg, new_reply_channel, Agent, AgentActor, ErasedJournal,
-    ErasedMemoryStore, MetricEvent, MetricEventSink, ReplySink, ThinkOutcome, ToolLoopConfig,
-    ToolLoopOutcome, TurnOutcome, HISTORY_MAX_CHARS_MIN, HISTORY_MAX_CHARS_PER_MSG,
-    HISTORY_MAX_MESSAGES, METRIC_SINK_CAPACITY,
+    compact_history, history_max_chars_per_msg, new_reply_channel, Agent, AgentActor,
+    CompactionConfig, CompactionSummarizer, ErasedJournal, ErasedMemoryStore, MetricEvent,
+    MetricEventSink, ReplySink, ThinkOutcome, ToolLoopConfig, ToolLoopOutcome, TurnOutcome,
+    HISTORY_MAX_CHARS_MIN, HISTORY_MAX_CHARS_PER_MSG, HISTORY_MAX_MESSAGES, METRIC_SINK_CAPACITY,
 };
 
 /// Helper: builds a test agent with fresh in-memory state, attached to
@@ -3699,6 +3699,176 @@ async fn append_history_skips_empty_messages() {
     assert!(agent.history_for(key).is_empty(), "tyhjiä ei tallenneta");
     agent.append_history(key, "kysymys", "vastaus");
     assert_eq!(agent.history_for(key).len(), 2);
+    bus.stop();
+}
+
+// ---- CompactionConfig / compact_history (configurable context compaction) ----
+
+fn msg(i: usize) -> LlmMessage {
+    LlmMessage::user(format!("m{i}"))
+}
+
+fn window(n: usize) -> VecDeque<LlmMessage> {
+    (0..n).map(msg).collect()
+}
+
+#[test]
+fn compact_history_default_matches_old_drop_oldest_window() {
+    // CompactionConfig::default() must reproduce the pre-existing
+    // hardcoded sliding-window behavior exactly (backward compatibility).
+    let config = CompactionConfig::default();
+    let mut dq = window(HISTORY_MAX_MESSAGES + 5);
+    compact_history(&mut dq, &config);
+    assert_eq!(dq.len(), HISTORY_MAX_MESSAGES);
+    // Oldest-first eviction: the survivors are the newest messages.
+    assert_eq!(dq.front().unwrap().content, format!("m{}", 5));
+    assert_eq!(
+        dq.back().unwrap().content,
+        format!("m{}", HISTORY_MAX_MESSAGES + 4)
+    );
+}
+
+#[test]
+fn compact_history_zero_threshold_disables_compaction() {
+    let config = CompactionConfig {
+        max_messages: 0,
+        ..CompactionConfig::default()
+    };
+    let mut dq = window(50);
+    compact_history(&mut dq, &config);
+    assert_eq!(dq.len(), 50, "max_messages = 0 must disable compaction");
+}
+
+#[test]
+fn compact_history_protects_first_n_even_over_threshold() {
+    // protect_first_n pins the opening messages; protect_last_n = 0 so the
+    // whole non-protected tail is evictable one at a time.
+    let config = CompactionConfig {
+        max_messages: 5,
+        protect_first_n: 3,
+        protect_last_n: 0,
+        summarizer: None,
+    };
+    let mut dq = window(10);
+    compact_history(&mut dq, &config);
+    assert_eq!(dq.len(), 5);
+    // The first 3 (protected head) survive unevicted, in original order.
+    assert_eq!(dq[0].content, "m0");
+    assert_eq!(dq[1].content, "m1");
+    assert_eq!(dq[2].content, "m2");
+}
+
+#[test]
+fn compact_history_stops_when_protections_cover_whole_window() {
+    // protect_first_n + protect_last_n >= the window's own length -> nothing
+    // evictable; the window is allowed to stay over max_messages rather
+    // than evict a "protected" message.
+    let config = CompactionConfig {
+        max_messages: 4,
+        protect_first_n: 3,
+        protect_last_n: 3,
+        summarizer: None,
+    };
+    let mut dq = window(6); // protect_first_n(3) + protect_last_n(3) == len(6)
+    compact_history(&mut dq, &config);
+    assert_eq!(
+        dq.len(),
+        6,
+        "fully protected window must not be evicted despite exceeding max_messages"
+    );
+}
+
+#[test]
+fn compact_history_summarizer_collapses_the_evictable_middle_zone() {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_inner = calls.clone();
+    let summarizer: CompactionSummarizer = Arc::new(move |evicted: &[LlmMessage]| {
+        calls_inner.fetch_add(1, AtomicOrdering::SeqCst);
+        Some(LlmMessage::assistant(format!(
+            "summary of {} messages",
+            evicted.len()
+        )))
+    });
+    let config = CompactionConfig {
+        max_messages: 5,
+        protect_first_n: 0,
+        protect_last_n: 3,
+        summarizer: Some(summarizer),
+    };
+    let mut dq = window(10);
+    compact_history(&mut dq, &config);
+    // The evictable middle (7 messages: m0..=m6) collapses to ONE summary
+    // message, leaving: [summary, m7, m8, m9] = 4 messages (<= max_messages).
+    assert_eq!(dq.len(), 4);
+    assert_eq!(dq.front().unwrap().content, "summary of 7 messages");
+    assert_eq!(dq.back().unwrap().content, "m9");
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 1, "summarizer called once");
+}
+
+#[test]
+fn compact_history_summarizer_none_falls_back_to_plain_eviction() {
+    // A summarizer that always declines (`None`) must not stall compaction
+    // — the plain oldest-first path takes over.
+    let summarizer: CompactionSummarizer = Arc::new(|_evicted: &[LlmMessage]| None);
+    let config = CompactionConfig {
+        max_messages: 5,
+        protect_first_n: 0,
+        protect_last_n: 3,
+        summarizer: Some(summarizer),
+    };
+    let mut dq = window(10);
+    compact_history(&mut dq, &config);
+    assert_eq!(dq.len(), 5);
+    assert_eq!(dq.back().unwrap().content, "m9");
+}
+
+#[test]
+fn compaction_config_from_env_reads_overrides_and_defaults() {
+    const MAX: &str = "FAMILYCLAW_COMPACTION_MAX_MESSAGES";
+    const FIRST: &str = "FAMILYCLAW_COMPACTION_PROTECT_FIRST_N";
+    const LAST: &str = "FAMILYCLAW_COMPACTION_PROTECT_LAST_N";
+    let _lock = history_env_test_lock();
+    std::env::remove_var(MAX);
+    std::env::remove_var(FIRST);
+    std::env::remove_var(LAST);
+
+    // Unset -> defaults matching the old hardcoded window.
+    let cfg = CompactionConfig::from_env();
+    assert_eq!(cfg.max_messages, CompactionConfig::DEFAULT_MAX_MESSAGES);
+    assert_eq!(cfg.protect_first_n, 0);
+    assert_eq!(cfg.protect_last_n, CompactionConfig::DEFAULT_MAX_MESSAGES);
+    assert!(cfg.summarizer.is_none());
+
+    // Set -> overrides are read.
+    {
+        let _g1 = HistoryEnvVarGuard::set(MAX, "8");
+        let _g2 = HistoryEnvVarGuard::set(FIRST, "2");
+        let _g3 = HistoryEnvVarGuard::set(LAST, "4");
+        let cfg = CompactionConfig::from_env();
+        assert_eq!(cfg.max_messages, 8);
+        assert_eq!(cfg.protect_first_n, 2);
+        assert_eq!(cfg.protect_last_n, 4);
+    }
+}
+
+#[tokio::test]
+async fn agent_with_compaction_overrides_the_default_policy() {
+    let bus = ResonanceBus::start(None).await.expect("bus");
+    let config = CompactionConfig {
+        max_messages: 4,
+        protect_first_n: 0,
+        protect_last_n: 4,
+        summarizer: None,
+    };
+    let mut agent = test_agent("agent_a", bus.clone()).with_compaction(config);
+    assert_eq!(agent.compaction().max_messages, 4);
+    let key = "discord-main:general";
+    for i in 0..10 {
+        agent.append_history(key, &format!("kysymys {i}"), &format!("vastaus {i}"));
+    }
+    // 10 turns * 2 messages = 20, but max_messages = 4 caps the window.
+    assert_eq!(agent.history_for(key).len(), 4);
     bus.stop();
 }
 

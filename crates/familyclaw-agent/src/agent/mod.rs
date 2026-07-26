@@ -160,6 +160,169 @@ pub(crate) fn history_max_chars_per_msg() -> usize {
         .unwrap_or(HISTORY_MAX_CHARS_PER_MSG)
 }
 
+/// Type of an optional **summarizer model hook** for
+/// [`CompactionConfig`]: given the messages about to be evicted
+/// (oldest→newest, already excluding the protected head/tail), returns
+/// either a single synthetic [`LlmMessage`] that replaces the whole
+/// evicted zone (`Some`), or `None` to decline and fall back to plain
+/// oldest-first eviction for this round. Synchronous and side-effect-free
+/// by contract — [`compact_history`] calls it inline while holding the
+/// history lock; a real summarizer implementation should keep its own
+/// (e.g. blocking-LLM-call) work fast or pre-computed, the same
+/// constraint [`familyclaw_actions::redact_free_text`] callers already
+/// live under.
+pub type CompactionSummarizer = Arc<dyn Fn(&[LlmMessage]) -> Option<LlmMessage> + Send + Sync>;
+
+/// **Configurable context-compaction policy** (Hermes-style context
+/// management) for [`Agent::append_history`] / [`compact_history`].
+///
+/// Generalizes the old hardcoded "drop the oldest message once the window
+/// exceeds [`HISTORY_MAX_MESSAGES`]" rule into three independent knobs:
+/// - [`max_messages`](Self::max_messages) — the threshold that triggers
+///   compaction (was the hardcoded [`HISTORY_MAX_MESSAGES`]).
+/// - [`protect_first_n`](Self::protect_first_n) — pins the conversation's
+///   opening N messages (e.g. a scene-setting first exchange) so
+///   compaction never evicts them, no matter how long the conversation
+///   grows. `0` (default) = no protected head, matching the old behavior.
+/// - [`protect_last_n`](Self::protect_last_n) — pins the most recent N
+///   messages. Defaults to [`Self::DEFAULT_MAX_MESSAGES`], which
+///   reproduces the old plain sliding window (everything old enough to be
+///   evicted is exactly the single oldest message).
+/// - [`summarizer`](Self::summarizer) — optional hook: when there is a
+///   non-trivial "middle" zone to evict (between the protected head and
+///   tail), the WHOLE zone is handed to the summarizer at once. Returning
+///   `Some(message)` collapses it into one synthetic message instead of
+///   dropping it outright; `None` (the default, and also what the
+///   summarizer may return to decline) falls back to plain eviction.
+///
+/// Not `Debug`/`PartialEq`/`Copy` — [`summarizer`](Self::summarizer) is a
+/// closure trait object, unlike [`ToolLoopConfig`].
+#[derive(Clone)]
+pub struct CompactionConfig {
+    /// Compact once the history exceeds this many messages
+    /// (user+assistant together). `0` disables compaction entirely (the
+    /// window then grows without bound — manual/external management
+    /// only, mirrors `pending_store`'s `factor = 0` convention).
+    pub max_messages: usize,
+    /// How many of the OLDEST messages are pinned and never evicted.
+    pub protect_first_n: usize,
+    /// How many of the MOST RECENT messages are pinned and never evicted.
+    pub protect_last_n: usize,
+    /// Optional summarizer model hook — see [`CompactionSummarizer`].
+    pub summarizer: Option<CompactionSummarizer>,
+}
+
+impl std::fmt::Debug for CompactionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompactionConfig")
+            .field("max_messages", &self.max_messages)
+            .field("protect_first_n", &self.protect_first_n)
+            .field("protect_last_n", &self.protect_last_n)
+            .field("summarizer", &self.summarizer.is_some())
+            .finish()
+    }
+}
+
+impl CompactionConfig {
+    /// Default message-count threshold — identical to the previous
+    /// hardcoded [`HISTORY_MAX_MESSAGES`], so [`CompactionConfig::default`]
+    /// reproduces the old behavior exactly.
+    pub const DEFAULT_MAX_MESSAGES: usize = HISTORY_MAX_MESSAGES;
+
+    /// Reads `FAMILYCLAW_COMPACTION_MAX_MESSAGES`,
+    /// `FAMILYCLAW_COMPACTION_PROTECT_FIRST_N`, and
+    /// `FAMILYCLAW_COMPACTION_PROTECT_LAST_N` (each optional, same
+    /// "parse or default" shape as [`history_max_chars_per_msg`]). No env
+    /// var carries a summarizer — install one via
+    /// [`Agent::with_compaction`] instead. Called once by [`Agent::new`],
+    /// so the threshold/protection knobs are configurable without a code
+    /// change while staying fully backward-compatible when unset.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let max_messages = std::env::var("FAMILYCLAW_COMPACTION_MAX_MESSAGES")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(Self::DEFAULT_MAX_MESSAGES);
+        let protect_first_n = std::env::var("FAMILYCLAW_COMPACTION_PROTECT_FIRST_N")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let protect_last_n = std::env::var("FAMILYCLAW_COMPACTION_PROTECT_LAST_N")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(Self::DEFAULT_MAX_MESSAGES);
+        Self {
+            max_messages,
+            protect_first_n,
+            protect_last_n,
+            summarizer: None,
+        }
+    }
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            max_messages: Self::DEFAULT_MAX_MESSAGES,
+            protect_first_n: 0,
+            protect_last_n: Self::DEFAULT_MAX_MESSAGES,
+            summarizer: None,
+        }
+    }
+}
+
+/// Applies `config` to `dq` in place: while the window exceeds
+/// `config.max_messages`, evicts from the "middle" zone (between the
+/// protected head [`CompactionConfig::protect_first_n`] and the protected
+/// tail [`CompactionConfig::protect_last_n`]) — oldest evictable message
+/// first, or (when a summarizer is installed and the middle zone has more
+/// than one message) collapses the WHOLE middle zone into a single
+/// synthetic message via the summarizer hook.
+///
+/// If the protected head + tail already cover the whole window, nothing
+/// is evictable — the loop stops even if the window is still over
+/// `max_messages` (protection wins over the threshold; this is a
+/// deliberate trade-off, not a bug — a misconfigured
+/// `protect_first_n + protect_last_n >= max_messages` just disables
+/// compaction instead of evicting a "protected" message).
+pub(crate) fn compact_history(dq: &mut VecDeque<LlmMessage>, config: &CompactionConfig) {
+    if config.max_messages == 0 {
+        return;
+    }
+    while dq.len() > config.max_messages {
+        let len = dq.len();
+        let middle_start = config.protect_first_n.min(len);
+        let middle_end = len.saturating_sub(config.protect_last_n).max(middle_start);
+        if middle_start >= middle_end {
+            // Nothing evictable without violating a protected zone — stop.
+            break;
+        }
+        // Only worth handing to the summarizer when it can actually shrink
+        // the window (a 1-message "zone" summarized into 1 message would
+        // spin forever); a single evictable message always takes the plain
+        // path below.
+        if middle_end - middle_start > 1 {
+            if let Some(summarizer) = &config.summarizer {
+                let middle: Vec<LlmMessage> = dq
+                    .iter()
+                    .skip(middle_start)
+                    .take(middle_end - middle_start)
+                    .cloned()
+                    .collect();
+                if let Some(summary) = summarizer(&middle) {
+                    for _ in middle_start..middle_end {
+                        dq.remove(middle_start);
+                    }
+                    dq.insert(middle_start, summary);
+                    continue;
+                }
+                // Summarizer declined (`None`) → fall through to plain eviction.
+            }
+        }
+        dq.remove(middle_start);
+    }
+}
+
 /// Memory layer tag for a user's chat message (session-scoped hydration).
 pub(super) const CHAT_USER_TAG: &str = "chat:user";
 
@@ -385,6 +548,18 @@ pub struct Agent {
     /// after a crash it is rebuilt from future turns, which is acceptable
     /// for short-term memory (long-term memory lives in [`Agent::memory`]).
     history: HashMap<String, VecDeque<LlmMessage>>,
+    /// **Context-compaction policy** applied to every conversation's
+    /// [`history`](Self::history) window by
+    /// [`compact_history`]/[`Agent::append_history`] (Hermes-style context
+    /// management). Default [`CompactionConfig::default`] — reproduces the
+    /// old fixed-size sliding window exactly (backward-compatible, no env
+    /// read at construction so building an agent is deterministic
+    /// regardless of the process environment). Callers that want the
+    /// env-tunable knobs opt in explicitly with
+    /// `with_compaction(CompactionConfig::from_env())`; a custom policy
+    /// (protected zones + a summarizer hook) can be installed the same way
+    /// via [`Agent::with_compaction`].
+    compaction: CompactionConfig,
     /// LLM failover chain for thinking (optional, so tests work without an
     /// LLM). [`Agent::new`] wraps a single [`LlmConfig`] into a 1-length
     /// chain ([`LlmFailover::single`]); the full fallback chain is wired via
@@ -557,6 +732,7 @@ impl Agent {
             turn_reply_suppressed: AtomicBool::new(false),
             typing_abort: std::sync::Mutex::new(None),
             history: HashMap::new(),
+            compaction: CompactionConfig::default(),
             llm,
             sandbox,
             reply_sink: None,
@@ -809,6 +985,24 @@ impl Agent {
     #[must_use]
     pub const fn tool_loop(&self) -> ToolLoopConfig {
         self.tool_loop
+    }
+
+    /// Installs a custom **context-compaction policy** ([`CompactionConfig`])
+    /// for the per-conversation history window, replacing the
+    /// [`CompactionConfig::from_env`] default set by [`Agent::new`]. Returns
+    /// `self` for chaining. This is the seam for wiring protected
+    /// zones (`protect_first_n`/`protect_last_n`) and a real summarizer
+    /// model hook.
+    #[must_use]
+    pub fn with_compaction(mut self, config: CompactionConfig) -> Self {
+        self.compaction = config;
+        self
+    }
+
+    /// The agent's current context-compaction policy (read).
+    #[must_use]
+    pub fn compaction(&self) -> &CompactionConfig {
+        &self.compaction
     }
 
     /// Install the **storage surface for resumable turns** (suspend/resume

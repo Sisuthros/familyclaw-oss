@@ -7,9 +7,9 @@ use super::prelude::*;
 use super::helpers::*;
 
 use super::{
-    Agent, ErasedJournal, MetricEvent, MetricEventSink, ReplySink, ThinkOutcome, ToolLoopOutcome,
-    TurnOutcome, CHAT_ASSISTANT_TAG, CHAT_HISTORY_SOURCE, CHAT_USER_TAG, HISTORY_HYDRATE_LIMIT,
-    HISTORY_MAX_MESSAGES, RESUMABLE_DEFAULT_TTL_MINUTES,
+    compact_history, Agent, ErasedJournal, MetricEvent, MetricEventSink, ReplySink, ThinkOutcome,
+    ToolLoopOutcome, TurnOutcome, CHAT_ASSISTANT_TAG, CHAT_HISTORY_SOURCE, CHAT_USER_TAG,
+    HISTORY_HYDRATE_LIMIT, RESUMABLE_DEFAULT_TTL_MINUTES,
 };
 
 impl Agent {
@@ -413,8 +413,10 @@ impl Agent {
 
     /// Appends a successful turn (user message + agent reply) to the
     /// conversation's short-term memory as a sliding window. Truncates each
-    /// message to [`HISTORY_MAX_CHARS_PER_MSG`] and drops the oldest once
-    /// the count exceeds [`HISTORY_MAX_MESSAGES`].
+    /// message to [`HISTORY_MAX_CHARS_PER_MSG`] and applies the agent's
+    /// [`CompactionConfig`](super::CompactionConfig) via
+    /// [`compact_history`] once the count exceeds
+    /// [`CompactionConfig::max_messages`](super::CompactionConfig::max_messages).
     ///
     /// **Call ONLY on a fresh turn** (`!self.durable.is_replaying()`) â€”
     /// otherwise replay would double-record. Empty messages are not saved.
@@ -427,9 +429,7 @@ impl Agent {
         let dq = self.history.entry(conv_key.to_string()).or_default();
         dq.push_back(LlmMessage::user(truncate_for_history(user_text)));
         dq.push_back(LlmMessage::assistant(truncate_for_history(assistant_text)));
-        while dq.len() > HISTORY_MAX_MESSAGES {
-            dq.pop_front();
-        }
+        compact_history(dq, &self.compaction);
     }
 
     /// Builds [`think`](Agent::think)'s shared context: RAG recall +
