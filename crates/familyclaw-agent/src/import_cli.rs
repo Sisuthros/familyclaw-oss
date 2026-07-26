@@ -1,16 +1,35 @@
-//! `familyclaw import` — `OpenClaw` / `Hermes` migration tool ("replacement path").
+//! `familyclaw import` — `OpenClaw` / `Hermes` / family `Hearth` migration tool
+//! ("replacement path" + "Hearth bridge").
 //!
-//! This module implements the `import` subcommand of the `familyclaw` binary: it
-//! reads the **export** of another agent runtime (`OpenClaw` or `Hermes`) and
-//! converts it into `FamilyClaw`'s own representation — **safely and honestly**.
+//! This module implements the `import` subcommand of the `familyclaw` binary. It
+//! supports two structurally different kinds of source, on purpose:
+//!
+//! 1. **Foreign runtime migration** (`--from openclaw|hermes`) — reads the
+//!    **export** of another agent runtime and converts it into `FamilyClaw`'s
+//!    own representation, **lossily and conservatively**: skills are
+//!    quarantined, memories are marked low-trust external. This is the right
+//!    default for data whose origin we cannot vouch for.
+//! 2. **Family Hearth bridge** (`--from family_hearth`) — reads an export of
+//!    the family's own shared Hearth (`memory.json` / `intents/` /
+//!    `state/{agent}.json` — see the root `CLAUDE.md`'s "Hearth — Jaettu
+//!    perhemuisti" section) and converts it **non-lossily**: per-entry
+//!    metadata (originating agent, kind, original id, timestamp) is preserved
+//!    as structured tags, and entries the export marks as **identity
+//!    anchors** are admitted at full trust
+//!    ([`Provenance::DirectExperience`]) rather than being forced through the
+//!    untrusted-import gate. This path is **opt-in** — it only activates when
+//!    the operator explicitly passes `--from family_hearth`; nothing here
+//!    changes the behavior of `openclaw`/`hermes` imports.
 //!
 //! ```text
-//! familyclaw import --from openclaw|hermes --input <path> [--out <dir>] [--json]
+//! familyclaw import --from openclaw|hermes|family_hearth --input <path> \
+//!     [--out <dir>] [--json] [--anchor-trust <0.0..=1.0>]
 //! ```
 //!
 //! ## Why this is security-sensitive
-//! Imported data is **untrusted input from another system**. Two structural
-//! guarantees protect the runtime (see also `docs/MIGRATION.md`):
+//! Imported data is, by default, **untrusted input from another system**.
+//! Two structural guarantees protect the runtime for the `openclaw`/`hermes`
+//! sources (see also `docs/MIGRATION.md`):
 //!
 //! 1. **Skills go into quarantine (`Quarantined`).** An imported skill is NEVER
 //!    registered and never executed. The importer writes it to a separate
@@ -24,14 +43,21 @@
 //!    ([`UNTRUSTED_IMPORT_TRUST`]), so `familyclaw-memory`'s provenance gate
 //!    governs them — they are **not** admitted as trusted identity anchors.
 //!
+//! The `family_hearth` source deliberately relaxes guarantee (2) — see
+//! [`from_family_hearth`] and `docs/HEARTH_BRIDGE.md` for the reasoning and
+//! the opt-in mechanism. Guarantee (1) does not apply: the Hearth export has
+//! no skills concept, so no quarantine manifest entries are produced from it.
+//!
 //! ## Design constraint (honesty)
-//! We do **not** have `OpenClaw`'s/`Hermes`'s exact, closed export schema.
+//! We do **not** have `OpenClaw`'s/`Hermes`'s exact, closed export schema, nor
+//! is there yet a canonical machine-readable Hearth export schema upstream.
 //! Therefore we define a small, versioned **intermediate representation**
-//! ([`ImportedBundle`]) and write two *tolerant* adapters ([`from_openclaw`],
-//! [`from_hermes`]) that parse a documented, plausible JSON format
-//! (described in doc comments + `docs/MIGRATION.md`). Unknown fields are
-//! **ignored** — they are never fatal. Malformed input fails **fail-closed**
-//! with a clear error — never a panic.
+//! ([`ImportedBundle`]) and write three *tolerant* adapters ([`from_openclaw`],
+//! [`from_hermes`], [`from_family_hearth`]) that parse a documented, plausible
+//! JSON format (described in doc comments + `docs/MIGRATION.md` /
+//! `docs/HEARTH_BRIDGE.md`). Unknown fields are **ignored** — they are never
+//! fatal. Malformed input fails **fail-closed** with a clear error — never a
+//! panic.
 //!
 //! ## Testability
 //! The command handlers ([`parse`], [`execute`], adapters) are pure functions
@@ -59,6 +85,17 @@ pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
 /// trusted retrieval without operator judgment. This prevents imported data
 /// from masquerading as the being's own experience.
 pub const UNTRUSTED_IMPORT_TRUST: f32 = 0.2;
+
+/// Default trust level for a **family Hearth** import entry that is *not*
+/// marked as an identity anchor by the export.
+///
+/// Deliberately **above** `familyclaw-memory`'s `ProvenanceGate` default
+/// threshold (`0.5`) and far above [`UNTRUSTED_IMPORT_TRUST`]: this is the
+/// family's own shared memory, not a foreign runtime's export, so the
+/// opt-in `--from family_hearth` path treats it as a trustworthy — though
+/// still external, still auditable — source. Overridable per-run via
+/// `--anchor-trust`.
+pub const DEFAULT_ANCHOR_TRUST: f32 = 0.9;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -120,19 +157,24 @@ pub enum ImportSource {
     OpenClaw,
     /// Hermes Agent export.
     Hermes,
+    /// The family's own shared Hearth export (`memory.json` / `intents/` /
+    /// `state/{agent}.json`). Opt-in, non-lossy — see [`from_family_hearth`].
+    FamilyHearth,
 }
 
 impl ImportSource {
     /// Parses the source from a `--from` value (unknown → [`ImportError::Usage`]).
     ///
     /// # Errors
-    /// [`ImportError::Usage`] if the value is not `openclaw` or `hermes`.
+    /// [`ImportError::Usage`] if the value is not `openclaw`, `hermes`,
+    /// `family_hearth`, or the alias `hearth`.
     pub fn parse(value: &str) -> Result<Self, ImportError> {
         match value.trim().to_ascii_lowercase().as_str() {
             "openclaw" => Ok(Self::OpenClaw),
             "hermes" => Ok(Self::Hermes),
+            "family_hearth" | "hearth" => Ok(Self::FamilyHearth),
             other => Err(ImportError::Usage(format!(
-                "unknown --from source `{other}` (expected openclaw|hermes)"
+                "unknown --from source `{other}` (expected openclaw|hermes|family_hearth)"
             ))),
         }
     }
@@ -143,7 +185,15 @@ impl ImportSource {
         match self {
             Self::OpenClaw => "openclaw",
             Self::Hermes => "hermes",
+            Self::FamilyHearth => "family_hearth",
         }
+    }
+
+    /// Is this the opt-in, non-lossy family Hearth bridge (as opposed to a
+    /// foreign-runtime migration)?
+    #[must_use]
+    pub const fn is_family_hearth(self) -> bool {
+        matches!(self, Self::FamilyHearth)
     }
 }
 
@@ -162,6 +212,70 @@ pub struct ImportedMemory {
     /// otherwise the default. Used only as a hint — the imported importance
     /// does not bypass the provenance gate.
     pub importance_hint: f32,
+    /// Non-lossy origin metadata. Only populated by [`from_family_hearth`]
+    /// (`None` for the `openclaw`/`hermes` adapters, which have no such
+    /// structure to preserve). Carries provenance-relevant facts —
+    /// originating agent, Hearth section, original id, original timestamp,
+    /// and whether the export marked this entry an identity anchor — that
+    /// would otherwise be dropped on import.
+    #[serde(default)]
+    pub origin: Option<HearthOrigin>,
+}
+
+/// Which section of the shared Hearth an imported entry came from.
+///
+/// Mirrors the layout documented in the repo-root `CLAUDE.md`
+/// ("Hearth — Jaettu perhemuisti"): `memory.json` (shared memories),
+/// `intents/` (Intent Broadcasting), `state/{agent}.json` (per-agent state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HearthKind {
+    /// A `memory.json` entry.
+    Memory,
+    /// An `intents/` entry (Intent Broadcasting).
+    Intent,
+    /// A `state/{agent}.json` snapshot.
+    State,
+}
+
+impl HearthKind {
+    /// Stable, machine-readable name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Intent => "intent",
+            Self::State => "state",
+        }
+    }
+}
+
+/// Non-lossy metadata preserved from a family Hearth export entry.
+///
+/// This is what makes the `family_hearth` import path **non-lossy**
+/// compared to the `openclaw`/`hermes` adapters: instead of collapsing an
+/// entry down to bare `content` + generic `tags`, the entry's origin is
+/// kept as structured data (and re-rendered into auditable tags on
+/// emission — see [`imported_memory_to_memory`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HearthOrigin {
+    /// Which Hearth section this entry came from.
+    pub kind: HearthKind,
+    /// The originating family agent's name (e.g. `"agent_alpha"`, `"agent_gamma"`),
+    /// if the export recorded one.
+    pub agent: Option<String>,
+    /// The entry's original identifier in the Hearth export, if any.
+    pub original_id: Option<String>,
+    /// The entry's original timestamp (as a raw string, whatever format the
+    /// export used — not reparsed, so it can never fail to import), if any.
+    pub timestamp: Option<String>,
+    /// Whether the export explicitly marked this entry an **identity
+    /// anchor** — a memory that helps define who the agent *is* (see the
+    /// root `CLAUDE.md`'s "Perhe-protokolla"). Identity-anchor entries are
+    /// admitted at full trust ([`Provenance::DirectExperience`]) instead of
+    /// the configurable `--anchor-trust` weight.
+    #[serde(default)]
+    pub identity_anchor: bool,
 }
 
 /// Intermediate representation of a single imported skill.
@@ -334,6 +448,7 @@ pub fn from_openclaw(raw: &str) -> Result<ImportedBundle, ImportError> {
                 content: text,
                 tags: string_list(mem_obj.get("tags")),
                 importance_hint: importance_from(mem_obj.get("importance")),
+                origin: None,
             });
         }
     }
@@ -442,6 +557,7 @@ pub fn from_hermes(raw: &str) -> Result<ImportedBundle, ImportError> {
                 content: text,
                 tags: string_list(mem_obj.get("labels")),
                 importance_hint: importance_from(mem_obj.get("weight")),
+                origin: None,
             });
         }
     }
@@ -486,6 +602,195 @@ pub fn from_hermes(raw: &str) -> Result<ImportedBundle, ImportError> {
     Ok(bundle)
 }
 
+/// Adapter: family Hearth export (JSON) → [`ImportedBundle`]. **Opt-in,
+/// non-lossy** bridge for the family's own shared memory
+/// (`/root/.hermes/profiles/shared/hearth/` on a live agent host) — see the
+/// module docs and `docs/HEARTH_BRIDGE.md`.
+///
+/// ## Accepted format (documented, tolerant)
+/// A single JSON bundle mirroring the three live Hearth sections
+/// (`memory.json`, `intents/*.json`, `state/{agent}.json`):
+///
+/// ```json
+/// {
+///   "hearth_version": "…",
+///   "memory": [
+///     { "id": "…", "agent": "agent_alpha", "content": "…", "tags": ["…"],
+///       "importance": 0.7, "timestamp": "…", "identity_anchor": true }
+///   ],
+///   "intents": [
+///     { "id": "…", "agent": "agent_gamma", "intent": "…", "timestamp": "…" }
+///   ],
+///   "state": {
+///     "agent_beta": { "mood": "…", "location": "…" }
+///   }
+/// }
+/// ```
+///
+/// Tolerance: the memory text is read from `content` or `text`; `id` may
+/// also be given as `memory_id`. `intent` may also be given as `content` or
+/// `text`. Each `state` entry is a JSON object keyed by agent name; its
+/// value is re-serialized compactly into the memory content so no field is
+/// dropped (the state schema itself is not standardized upstream).
+///
+/// Unlike [`from_openclaw`]/[`from_hermes`], entries here are **not**
+/// automatically low-trust: an entry with `"identity_anchor": true` is
+/// admitted at full trust ([`Provenance::DirectExperience`]) by
+/// [`imported_memory_to_memory`]; other entries get the configurable
+/// `--anchor-trust` weight (default [`DEFAULT_ANCHOR_TRUST`]) — see
+/// [`ImportCommand::anchor_trust`].
+///
+/// # Errors
+/// [`ImportError::Parse`] if the input is not valid JSON or the top level is
+/// not a JSON object (fail-closed). Never panics.
+pub fn from_family_hearth(raw: &str) -> Result<ImportedBundle, ImportError> {
+    let root: Value = serde_json::from_str(raw)
+        .map_err(|e| ImportError::Parse(format!("hearth export is not valid JSON: {e}")))?;
+    let obj = root.as_object().ok_or_else(|| {
+        ImportError::Parse("hearth export root must be a JSON object".to_string())
+    })?;
+
+    let mut bundle = ImportedBundle::empty(ImportSource::FamilyHearth);
+
+    collect_hearth_memories(obj.get("memory"), &mut bundle);
+    collect_hearth_intents(obj.get("intents"), &mut bundle);
+    collect_hearth_state(obj.get("state"), &mut bundle);
+
+    // --- config hints (any top-level settings block, tolerant) ---
+    collect_config_hints(obj.get("settings"), &mut bundle);
+
+    Ok(bundle)
+}
+
+/// Reads a string field from a JSON object, tolerant of the given key list
+/// (first present wins), trimmed; missing/non-string → `""`.
+fn first_str(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> String {
+    for key in keys {
+        if let Some(s) = obj.get(*key).and_then(Value::as_str) {
+            return s.trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// Reads a JSON object's `agent` / `id` (with fallback keys) / `timestamp` /
+/// `identity_anchor` fields into a [`HearthOrigin`] of the given `kind`.
+fn hearth_origin(
+    obj: &serde_json::Map<String, Value>,
+    kind: HearthKind,
+    id_keys: &[&str],
+) -> HearthOrigin {
+    HearthOrigin {
+        kind,
+        agent: obj.get("agent").and_then(Value::as_str).map(str::to_string),
+        original_id: id_keys
+            .iter()
+            .find_map(|k| obj.get(*k).and_then(Value::as_str))
+            .map(str::to_string),
+        timestamp: obj
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        identity_anchor: obj
+            .get("identity_anchor")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+/// Parses `memory.json`-shaped entries into the bundle (non-lossy origin
+/// metadata attached to every accepted entry).
+fn collect_hearth_memories(value: Option<&Value>, bundle: &mut ImportedBundle) {
+    let Some(arr) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for (idx, item) in arr.iter().enumerate() {
+        let Some(mem_obj) = item.as_object() else {
+            bundle
+                .warnings
+                .push(format!("skipped memory[{idx}]: not a JSON object"));
+            continue;
+        };
+        let text = first_str(mem_obj, &["content", "text"]);
+        if text.is_empty() {
+            bundle
+                .warnings
+                .push(format!("skipped memory[{idx}]: empty content/text"));
+            continue;
+        }
+        bundle.memories.push(ImportedMemory {
+            content: text,
+            tags: string_list(mem_obj.get("tags")),
+            importance_hint: importance_from(mem_obj.get("importance")),
+            origin: Some(hearth_origin(
+                mem_obj,
+                HearthKind::Memory,
+                &["id", "memory_id"],
+            )),
+        });
+    }
+}
+
+/// Parses `intents/`-shaped entries into the bundle (Intent Broadcasting;
+/// see the root `CLAUDE.md`).
+fn collect_hearth_intents(value: Option<&Value>, bundle: &mut ImportedBundle) {
+    let Some(arr) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for (idx, item) in arr.iter().enumerate() {
+        let Some(intent_obj) = item.as_object() else {
+            bundle
+                .warnings
+                .push(format!("skipped intent[{idx}]: not a JSON object"));
+            continue;
+        };
+        let text = first_str(intent_obj, &["intent", "content", "text"]);
+        if text.is_empty() {
+            bundle
+                .warnings
+                .push(format!("skipped intent[{idx}]: empty intent/content/text"));
+            continue;
+        }
+        bundle.memories.push(ImportedMemory {
+            content: text,
+            tags: string_list(intent_obj.get("tags")),
+            importance_hint: importance_from(intent_obj.get("importance")),
+            origin: Some(hearth_origin(intent_obj, HearthKind::Intent, &["id"])),
+        });
+    }
+}
+
+/// Parses `state/{agent}.json`-shaped snapshots into the bundle. The
+/// snapshot's shape is not standardized upstream, so it is re-serialized
+/// compactly into the memory content rather than field-mapped — no field is
+/// dropped.
+fn collect_hearth_state(value: Option<&Value>, bundle: &mut ImportedBundle) {
+    let Some(state_obj) = value.and_then(Value::as_object) else {
+        return;
+    };
+    for (agent, snapshot) in state_obj {
+        if snapshot.is_null() {
+            bundle
+                .warnings
+                .push(format!("skipped state[{agent}]: null snapshot"));
+            continue;
+        }
+        let rendered = serde_json::to_string(snapshot).unwrap_or_else(|_| snapshot.to_string());
+        bundle.memories.push(ImportedMemory {
+            content: format!("state snapshot for {agent}: {rendered}"),
+            tags: vec!["state_snapshot".to_string()],
+            importance_hint: 0.3,
+            origin: Some(HearthOrigin {
+                kind: HearthKind::State,
+                agent: Some(agent.clone()),
+                original_id: None,
+                timestamp: None,
+                identity_anchor: false,
+            }),
+        });
+    }
+}
+
 /// Collects config hints (key → value) from a JSON object into the bundle.
 /// A non-object or missing value is skipped silently. Nested values are
 /// serialized back to a compact JSON string, so the hint stays as text.
@@ -513,11 +818,19 @@ fn collect_config_hints(value: Option<&Value>, bundle: &mut ImportedBundle) {
 /// [`UNTRUSTED_IMPORT_TRUST`], so the memory's provenance gate governs this
 /// memory — it is not admitted as a trusted anchor. The source tag is the
 /// generic `"import_openclaw"` / `"import_hermes"`.
+///
+/// This is the **foreign-runtime path** (`openclaw`/`hermes`). For the
+/// opt-in, non-lossy family Hearth path use
+/// [`imported_hearth_memory_to_memory`] instead — this function always
+/// forces [`UNTRUSTED_IMPORT_TRUST`] regardless of `mem.origin`, so it stays
+/// exactly as conservative as before for anything that isn't an explicit
+/// `--from family_hearth` run.
 #[must_use]
 pub fn imported_memory_to_memory(source: ImportSource, mem: &ImportedMemory) -> Memory {
     let source_tag = match source {
         ImportSource::OpenClaw => "import_openclaw",
         ImportSource::Hermes => "import_hermes",
+        ImportSource::FamilyHearth => "import_family_hearth",
     };
     // Importance is merely a hint (the emotion factor); identity = 0, so the
     // imported memory does not masquerade as an identity anchor.
@@ -530,6 +843,62 @@ pub fn imported_memory_to_memory(source: ImportSource, mem: &ImportedMemory) -> 
         .tags(tags)
         .source(source_tag)
         .provenance(Provenance::external(source_tag, UNTRUSTED_IMPORT_TRUST))
+        .build()
+}
+
+/// Converts a single **family Hearth** imported memory into `FamilyClaw`'s
+/// real [`Memory`] — **non-lossily** and at a trust level appropriate for
+/// the family's own data, not a foreign runtime's.
+///
+/// Non-lossiness: `mem.origin`'s fields (Hearth section, originating agent,
+/// original id, original timestamp) are rendered into structured,
+/// greppable tags (`hearth:kind=…`, `hearth:agent=…`, `hearth:id=…`,
+/// `hearth:ts=…`) rather than being dropped — an operator or a later tool
+/// can reconstruct exactly where an imported memory came from.
+///
+/// Trust: an entry with [`HearthOrigin::identity_anchor`] set is admitted
+/// as [`Provenance::DirectExperience`] — full trust, never rejected by the
+/// provenance gate, exactly like the being's own observations. This is the
+/// concrete fix for "don't force `trust=0.2` on the family's own identity
+/// anchors". Every other entry gets [`Provenance::External`] with
+/// `anchor_trust` (clamped `0.0..=1.0`) — still auditable and still subject
+/// to the gate, but at a trust level the operator chose for their own data
+/// (default [`DEFAULT_ANCHOR_TRUST`], well above the gate's default
+/// threshold of `0.5`), not the hardcoded foreign-import floor.
+#[must_use]
+pub fn imported_hearth_memory_to_memory(mem: &ImportedMemory, anchor_trust: f32) -> Memory {
+    let factors = ImportanceFactors::new(mem.importance_hint.clamp(0.0, 1.0), 0.0, 0.0, 0.0);
+    let mut tags = mem.tags.clone();
+    tags.push("family_hearth".to_string());
+    let is_anchor = mem.origin.as_ref().is_some_and(|o| o.identity_anchor);
+    if is_anchor {
+        tags.push("identity_anchor".to_string());
+    }
+    let source_tag = if let Some(origin) = &mem.origin {
+        tags.push(format!("hearth:kind={}", origin.kind.as_str()));
+        if let Some(agent) = &origin.agent {
+            tags.push(format!("hearth:agent={agent}"));
+        }
+        if let Some(id) = &origin.original_id {
+            tags.push(format!("hearth:id={id}"));
+        }
+        if let Some(ts) = &origin.timestamp {
+            tags.push(format!("hearth:ts={ts}"));
+        }
+        format!("family_hearth:{}", origin.kind.as_str())
+    } else {
+        "family_hearth".to_string()
+    };
+    let provenance = if is_anchor {
+        Provenance::DirectExperience
+    } else {
+        Provenance::external(source_tag.clone(), anchor_trust)
+    };
+    Memory::builder(mem.content.clone())
+        .factors(factors)
+        .tags(tags)
+        .source(source_tag)
+        .provenance(provenance)
         .build()
 }
 
@@ -604,14 +973,36 @@ pub struct ImportPlan {
 }
 
 impl ImportPlan {
-    /// Builds the plan from the intermediate representation. **Registers or
-    /// executes nothing** — only converts to data.
+    /// Builds the plan from the intermediate representation, using
+    /// [`DEFAULT_ANCHOR_TRUST`] for any `family_hearth` entry that is not an
+    /// identity anchor. **Registers or executes nothing** — only converts to
+    /// data. For a custom trust weight (the `--anchor-trust` CLI flag), use
+    /// [`ImportPlan::from_bundle_with_anchor_trust`].
     #[must_use]
     pub fn from_bundle(bundle: &ImportedBundle) -> Self {
+        Self::from_bundle_with_anchor_trust(bundle, DEFAULT_ANCHOR_TRUST)
+    }
+
+    /// Builds the plan from the intermediate representation. **Registers or
+    /// executes nothing** — only converts to data.
+    ///
+    /// `anchor_trust` (clamped `0.0..=1.0`) is only consulted for
+    /// [`ImportSource::FamilyHearth`] entries that are **not** identity
+    /// anchors (those always get full trust regardless — see
+    /// [`imported_hearth_memory_to_memory`]); it is ignored for
+    /// `openclaw`/`hermes`, which always use [`UNTRUSTED_IMPORT_TRUST`].
+    #[must_use]
+    pub fn from_bundle_with_anchor_trust(bundle: &ImportedBundle, anchor_trust: f32) -> Self {
         let memories = bundle
             .memories
             .iter()
-            .map(|m| imported_memory_to_memory(bundle.source, m))
+            .map(|m| {
+                if bundle.source.is_family_hearth() {
+                    imported_hearth_memory_to_memory(m, anchor_trust)
+                } else {
+                    imported_memory_to_memory(bundle.source, m)
+                }
+            })
             .collect();
         let skills = bundle
             .skills
@@ -666,6 +1057,25 @@ impl ImportPlan {
             .iter()
             .all(|m| m.provenance.is_external() && m.provenance.trust() <= UNTRUSTED_IMPORT_TRUST)
     }
+
+    /// Proves the family-Hearth non-lossiness invariant: **every** memory
+    /// tagged `identity_anchor` was admitted at full trust
+    /// ([`Provenance::DirectExperience`]), and no memory is a low-trust
+    /// external the way `openclaw`/`hermes` imports are.
+    ///
+    /// Only meaningful for [`ImportSource::FamilyHearth`] plans; vacuously
+    /// `true` for any plan with no anchors.
+    #[must_use]
+    pub fn all_hearth_anchors_full_trust(&self) -> bool {
+        self.memories.iter().all(|m| {
+            let is_anchor = m.tags.iter().any(|t| t == "identity_anchor");
+            if is_anchor {
+                m.provenance == Provenance::DirectExperience
+            } else {
+                true
+            }
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -693,13 +1103,28 @@ impl ImportReport {
     /// Builds the report from the plan.
     #[must_use]
     pub fn from_plan(plan: &ImportPlan) -> Self {
-        Self {
-            source: plan.source,
-            memories_imported: plan.memory_count(),
-            skills_quarantined: plan.quarantined_skill_count(),
-            config_hints: plan.config_hints.len(),
-            warnings: plan.warnings.clone(),
-            guarantees: vec![
+        let guarantees = if plan.source.is_family_hearth() {
+            let anchors = plan
+                .memories
+                .iter()
+                .filter(|m| m.provenance == Provenance::DirectExperience)
+                .count();
+            vec![
+                "family Hearth bridge is NON-LOSSY: originating agent/kind/id/timestamp are \
+                 preserved as tags (hearth:kind=…, hearth:agent=…, hearth:id=…, hearth:ts=…)"
+                    .to_string(),
+                format!(
+                    "{anchors} entries marked identity_anchor were admitted at FULL trust \
+                     (DirectExperience) — never forced to the untrusted-import trust floor \
+                     ({UNTRUSTED_IMPORT_TRUST})"
+                ),
+                "non-anchor entries use the configured --anchor-trust weight, still above the \
+                 provenance gate's default threshold (0.5) unless explicitly lowered"
+                    .to_string(),
+                "this source has no skills concept — nothing is quarantined from it".to_string(),
+            ]
+        } else {
+            vec![
                 "imported skills are QUARANTINED (never registered, never executed)".to_string(),
                 "imported skills require sandbox validation + explicit operator approval \
                  before activation"
@@ -708,7 +1133,15 @@ impl ImportReport {
                     "imported memories carry low-trust external provenance (trust {UNTRUSTED_IMPORT_TRUST}) \
                      — never admitted as trusted anchors"
                 ),
-            ],
+            ]
+        };
+        Self {
+            source: plan.source,
+            memories_imported: plan.memory_count(),
+            skills_quarantined: plan.quarantined_skill_count(),
+            config_hints: plan.config_hints.len(),
+            warnings: plan.warnings.clone(),
+            guarantees,
         }
     }
 
@@ -744,7 +1177,7 @@ impl ImportReport {
 // ---------------------------------------------------------------------------
 
 /// Parsed `import` command ready to execute.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 #[non_exhaustive]
 pub struct ImportCommand {
     /// Export source (`--from`).
@@ -756,27 +1189,42 @@ pub struct ImportCommand {
     pub out: Option<PathBuf>,
     /// Whether to print the report as JSON (`true`) or markdown (`false`).
     pub json: bool,
+    /// Trust weight (`0.0..=1.0`) for `family_hearth` entries that are not
+    /// identity anchors (`--anchor-trust`; default [`DEFAULT_ANCHOR_TRUST`]).
+    /// Ignored for `openclaw`/`hermes` sources, which always use
+    /// [`UNTRUSTED_IMPORT_TRUST`].
+    pub anchor_trust: f32,
 }
 
 /// Usage instructions for the `import` subcommand.
 #[must_use]
 pub fn usage() -> &'static str {
-    "familyclaw import — migrate configs, memories & skills from another runtime\n\
+    "familyclaw import — migrate configs, memories & skills from another runtime,\n\
+     or bridge the family's own shared Hearth into FamilyClaw\n\
      \n\
      USAGE:\n    \
-     familyclaw import --from <openclaw|hermes> --input <path> [--out <dir>] [--json]\n\
+     familyclaw import --from <openclaw|hermes|family_hearth> --input <path> \
+     [--out <dir>] [--json] [--anchor-trust <0.0..=1.0>]\n\
      \n\
      FLAGS:\n    \
-     --from <src>     Export source: openclaw | hermes\n    \
-     --input <path>   Path to the export file (JSON)\n    \
-     --out <dir>      Optional: write report + memories + quarantine manifest here\n    \
-     --json           Emit the report as JSON instead of Markdown\n\
+     --from <src>          Export source: openclaw | hermes | family_hearth\n    \
+     --input <path>        Path to the export file (JSON)\n    \
+     --out <dir>           Optional: write report + memories + quarantine manifest here\n    \
+     --json                Emit the report as JSON instead of Markdown\n    \
+     --anchor-trust <f32>  family_hearth only: trust for non-anchor entries \
+     (default 0.9)\n\
      \n\
-     SAFETY:\n    \
+     SAFETY (openclaw / hermes):\n    \
      Imported skills are QUARANTINED (never registered, never executed) and require\n    \
      sandbox validation + explicit operator approval before activation. Imported\n    \
      memories carry low-trust external provenance and are never admitted as trusted\n    \
-     anchors."
+     anchors.\n\
+     \n\
+     FAMILY HEARTH BRIDGE (family_hearth, opt-in):\n    \
+     Non-lossy: originating agent/kind/id/timestamp are preserved as tags. Entries\n    \
+     marked identity_anchor are admitted at full trust (DirectExperience) — never\n    \
+     forced to trust=0.2. Other entries use --anchor-trust (default 0.9). See\n    \
+     docs/HEARTH_BRIDGE.md."
 }
 
 /// Parses the `import` subcommand's arguments (without the
@@ -794,6 +1242,7 @@ where
     let mut input: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut json = false;
+    let mut anchor_trust = DEFAULT_ANCHOR_TRUST;
 
     let mut args = args.into_iter().map(Into::into);
     while let Some(arg) = args.next() {
@@ -802,6 +1251,20 @@ where
             "--input" => input = Some(PathBuf::from(take_value(&mut args, "--input")?)),
             "--out" => out = Some(PathBuf::from(take_value(&mut args, "--out")?)),
             "--json" => json = true,
+            "--anchor-trust" => {
+                let raw = take_value(&mut args, "--anchor-trust")?;
+                let parsed: f32 = raw.trim().parse().map_err(|_| {
+                    ImportError::Usage(format!(
+                        "`--anchor-trust` expects a number in 0.0..=1.0, got `{raw}`"
+                    ))
+                })?;
+                if !parsed.is_finite() {
+                    return Err(ImportError::Usage(
+                        "`--anchor-trust` must be a finite number in 0.0..=1.0".to_string(),
+                    ));
+                }
+                anchor_trust = parsed.clamp(0.0, 1.0);
+            }
             other => {
                 return Err(ImportError::Usage(format!(
                     "`import`: unknown flag `{other}`"
@@ -817,6 +1280,7 @@ where
             .ok_or_else(|| ImportError::Usage("`import` requires `--input`".to_string()))?,
         out,
         json,
+        anchor_trust,
     })
 }
 
@@ -834,6 +1298,7 @@ pub fn parse_bundle(source: ImportSource, raw: &str) -> Result<ImportedBundle, I
     match source {
         ImportSource::OpenClaw => from_openclaw(raw),
         ImportSource::Hermes => from_hermes(raw),
+        ImportSource::FamilyHearth => from_family_hearth(raw),
     }
 }
 
@@ -856,7 +1321,7 @@ pub fn parse_bundle(source: ImportSource, raw: &str) -> Result<ImportedBundle, I
 pub fn execute(command: &ImportCommand) -> Result<String, ImportError> {
     let raw = std::fs::read_to_string(&command.input)?;
     let bundle = parse_bundle(command.source, &raw)?;
-    let plan = ImportPlan::from_bundle(&bundle);
+    let plan = ImportPlan::from_bundle_with_anchor_trust(&bundle, command.anchor_trust);
     let report = ImportReport::from_plan(&plan);
 
     if let Some(dir) = &command.out {
@@ -970,6 +1435,29 @@ mod tests {
         }
     }"#;
 
+    /// A family Hearth export bundle: two `memory.json` entries (one an
+    /// identity anchor), one intent, one agent's state snapshot.
+    const HEARTH_EXPORT: &str = r#"{
+        "hearth_version": "1",
+        "unknown_top_level": "ignored on purpose",
+        "memory": [
+            { "id": "m1", "agent": "agent_alpha", "content": "the operator rakensi V9->V20 yhdessä päivässä",
+              "tags": ["family"], "importance": 0.9, "timestamp": "2026-05-26T18:00:00Z",
+              "identity_anchor": true },
+            { "id": "m2", "agent": "agent_gamma", "content": "arkkitehti, koodi, järjestelmäajattelu",
+              "importance": 0.5 },
+            { "id": "m3", "agent": "agent_delta", "text": "   " }
+        ],
+        "intents": [
+            { "id": "i1", "agent": "agent_beta", "intent": "tutki yöllä uusi audio-aisti",
+              "timestamp": "2026-07-11T02:00:00Z" }
+        ],
+        "state": {
+            "agent_epsilon": { "mood": "curious", "location": "E:\\agent_epsilon" }
+        },
+        "settings": { "hearth_path": "/root/.hermes/profiles/shared/hearth" }
+    }"#;
+
     // ---------- parse ----------
 
     #[test]
@@ -982,6 +1470,7 @@ mod tests {
         assert_eq!(cmd.input, PathBuf::from("x.json"));
         assert_eq!(cmd.out, Some(PathBuf::from("d")));
         assert!(cmd.json);
+        assert!((cmd.anchor_trust - DEFAULT_ANCHOR_TRUST).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -990,6 +1479,59 @@ mod tests {
         assert_eq!(cmd.source, ImportSource::Hermes);
         assert_eq!(cmd.out, None);
         assert!(!cmd.json);
+    }
+
+    #[test]
+    fn parse_accepts_family_hearth_source_and_alias() {
+        let cmd = parse(["--from", "family_hearth", "--input", "x.json"]).expect("parse");
+        assert_eq!(cmd.source, ImportSource::FamilyHearth);
+        let cmd2 = parse(["--from", "hearth", "--input", "x.json"]).expect("parse alias");
+        assert_eq!(cmd2.source, ImportSource::FamilyHearth);
+    }
+
+    #[test]
+    fn parse_reads_anchor_trust_flag() {
+        let cmd = parse([
+            "--from",
+            "family_hearth",
+            "--input",
+            "x.json",
+            "--anchor-trust",
+            "0.75",
+        ])
+        .expect("parse");
+        assert!((cmd.anchor_trust - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_anchor_trust_clamps_out_of_range() {
+        let cmd = parse([
+            "--from",
+            "family_hearth",
+            "--input",
+            "x.json",
+            "--anchor-trust",
+            "5.0",
+        ])
+        .expect("parse");
+        assert!((cmd.anchor_trust - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn parse_anchor_trust_non_numeric_is_usage_error() {
+        let err = parse([
+            "--from",
+            "family_hearth",
+            "--input",
+            "x.json",
+            "--anchor-trust",
+            "not-a-number",
+        ])
+        .expect_err("must fail");
+        match err {
+            ImportError::Usage(msg) => assert!(msg.contains("--anchor-trust")),
+            other => panic!("expected Usage, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1079,6 +1621,88 @@ mod tests {
         assert!(plan.all_memories_untrusted());
     }
 
+    #[test]
+    fn family_hearth_happy_path_non_lossy_and_high_trust() {
+        let bundle = from_family_hearth(HEARTH_EXPORT).expect("parse hearth");
+        assert_eq!(bundle.source, ImportSource::FamilyHearth);
+        // 2 valid memory.json entries (m3 is empty -> skipped) + 1 intent + 1 state = 4.
+        assert_eq!(bundle.memories.len(), 4);
+        // No skills concept in Hearth exports.
+        assert_eq!(bundle.skills.len(), 0);
+        assert_eq!(bundle.config_hints.len(), 1);
+        assert!(!bundle.warnings.is_empty(), "m3's empty content is a warning");
+
+        let plan = ImportPlan::from_bundle_with_anchor_trust(&bundle, 0.8);
+        assert_eq!(plan.memory_count(), 4);
+        // No skills to quarantine — vacuously true, and count is zero.
+        assert!(plan.all_skills_quarantined());
+        assert_eq!(plan.quarantined_skill_count(), 0);
+
+        // The identity-anchor memory (m1) must be admitted at full trust.
+        let anchor = plan
+            .memories
+            .iter()
+            .find(|m| m.tags.iter().any(|t| t == "identity_anchor"))
+            .expect("anchor memory present");
+        assert_eq!(anchor.provenance, Provenance::DirectExperience);
+        assert!(anchor.tags.contains(&"hearth:agent=agent_alpha".to_string()));
+        assert!(anchor.tags.contains(&"hearth:id=m1".to_string()));
+        assert!(anchor
+            .tags
+            .contains(&"hearth:ts=2026-05-26T18:00:00Z".to_string()));
+        assert!(anchor.tags.contains(&"hearth:kind=memory".to_string()));
+
+        // Non-anchor memory.json entry (m2) uses the configured anchor_trust,
+        // not the hardcoded foreign-import floor.
+        let non_anchor = plan
+            .memories
+            .iter()
+            .find(|m| m.tags.contains(&"hearth:id=m2".to_string()))
+            .expect("m2 present");
+        assert!(non_anchor.provenance.is_external());
+        assert!((non_anchor.provenance.trust() - 0.8).abs() < 1e-6);
+        assert!(non_anchor.provenance.trust() > UNTRUSTED_IMPORT_TRUST);
+
+        // The intent entry is preserved with kind=intent, agent=agent_beta.
+        let intent = plan
+            .memories
+            .iter()
+            .find(|m| m.tags.contains(&"hearth:kind=intent".to_string()))
+            .expect("intent present");
+        assert!(intent.tags.contains(&"hearth:agent=agent_beta".to_string()));
+        assert!(intent.content.contains("audio-aisti"));
+
+        // The state snapshot is preserved with kind=state, agent=agent_epsilon.
+        let state = plan
+            .memories
+            .iter()
+            .find(|m| m.tags.contains(&"hearth:kind=state".to_string()))
+            .expect("state present");
+        assert!(state.tags.contains(&"hearth:agent=agent_epsilon".to_string()));
+        assert!(state.content.contains("agent_epsilon"));
+
+        assert!(plan.all_hearth_anchors_full_trust());
+
+        // Provenance gate at default threshold (0.5) admits the non-anchor
+        // entry (trust 0.8 > 0.5) — the opposite of the openclaw/hermes path.
+        let gate = familyclaw_memory::ProvenanceGate::default();
+        assert!(gate.admit(&non_anchor.provenance));
+        assert!(gate.admit(&anchor.provenance));
+    }
+
+    #[test]
+    fn family_hearth_default_anchor_trust_is_above_gate_threshold() {
+        let bundle = from_family_hearth(HEARTH_EXPORT).expect("parse hearth");
+        let plan = ImportPlan::from_bundle(&bundle); // uses DEFAULT_ANCHOR_TRUST
+        let non_anchor = plan
+            .memories
+            .iter()
+            .find(|m| m.tags.contains(&"hearth:id=m2".to_string()))
+            .expect("m2 present");
+        assert!((non_anchor.provenance.trust() - DEFAULT_ANCHOR_TRUST).abs() < 1e-6);
+        assert!(DEFAULT_ANCHOR_TRUST > familyclaw_memory::ProvenanceGate::default().min_trust());
+    }
+
     // ---------- security invariants ----------
 
     #[test]
@@ -1105,6 +1729,7 @@ mod tests {
             content: "a fact from elsewhere".to_string(),
             tags: vec!["x".to_string()],
             importance_hint: 0.9,
+            origin: None,
         };
         let m = imported_memory_to_memory(ImportSource::Hermes, &mem);
         assert!(m.provenance.is_external());
@@ -1198,6 +1823,7 @@ mod tests {
             input,
             out: Some(out.clone()),
             json: false,
+            anchor_trust: DEFAULT_ANCHOR_TRUST,
         };
         let report = execute(&cmd).expect("execute");
         assert!(report.contains("memories imported: 2"));
@@ -1234,6 +1860,7 @@ mod tests {
             input,
             out: None,
             json: true,
+            anchor_trust: DEFAULT_ANCHOR_TRUST,
         };
         let out = execute(&cmd).expect("execute");
         let value: serde_json::Value = serde_json::from_str(&out).expect("valid json");
@@ -1249,6 +1876,7 @@ mod tests {
             input: PathBuf::from("this/path/does/not/exist-xyz.json"),
             out: None,
             json: false,
+            anchor_trust: DEFAULT_ANCHOR_TRUST,
         };
         let err = execute(&cmd).expect_err("missing input must fail");
         assert!(matches!(err, ImportError::Io(_)));
@@ -1271,11 +1899,51 @@ mod tests {
     }
 
     #[test]
+    fn run_dispatches_family_hearth_end_to_end() {
+        let dir = TempDir::new("run-hearth");
+        let input = write_temp(dir.path(), "hearth-export.json", HEARTH_EXPORT);
+        let out_dir = dir.path().join("out");
+        let args = vec![
+            "--from".to_string(),
+            "family_hearth".to_string(),
+            "--input".to_string(),
+            input.to_string_lossy().into_owned(),
+            "--out".to_string(),
+            out_dir.to_string_lossy().into_owned(),
+            "--anchor-trust".to_string(),
+            "0.85".to_string(),
+        ];
+        let out = run(args).expect("run");
+        assert!(out.contains("import report"));
+        assert!(out.contains("NON-LOSSY"));
+
+        let mems: Vec<Memory> = serde_json::from_str(
+            &std::fs::read_to_string(out_dir.join("imported_memories.json")).expect("read mems"),
+        )
+        .expect("parse mems");
+        assert_eq!(mems.len(), 4);
+        let anchor_count = mems
+            .iter()
+            .filter(|m| m.provenance == Provenance::DirectExperience)
+            .count();
+        assert_eq!(anchor_count, 1, "exactly the one identity_anchor entry");
+
+        // The written quarantine manifest is empty (Hearth has no skills).
+        let qm: QuarantineManifest = serde_json::from_str(
+            &std::fs::read_to_string(out_dir.join("quarantine_manifest.json")).expect("read qm"),
+        )
+        .expect("parse qm");
+        assert!(qm.skills.is_empty());
+    }
+
+    #[test]
     fn usage_mentions_sources_and_safety() {
         let text = usage();
         assert!(text.contains("openclaw"));
         assert!(text.contains("hermes"));
+        assert!(text.contains("family_hearth"));
         assert!(text.contains("QUARANTINED"));
+        assert!(text.contains("anchor-trust"));
     }
 
     #[test]
@@ -1284,5 +1952,35 @@ mod tests {
         let json = serde_json::to_string(&bundle).expect("serialize");
         let back: ImportedBundle = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(bundle, back);
+    }
+
+    #[test]
+    fn hearth_bundle_serde_roundtrip_preserves_origin() {
+        let bundle = from_family_hearth(HEARTH_EXPORT).expect("parse hearth");
+        let json = serde_json::to_string(&bundle).expect("serialize");
+        let back: ImportedBundle = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(bundle, back);
+        // Sanity: origin metadata actually round-tripped, not silently dropped.
+        assert!(back.memories.iter().any(|m| m
+            .origin
+            .as_ref()
+            .is_some_and(|o| o.identity_anchor)));
+    }
+
+    #[test]
+    fn family_hearth_malformed_json_fails_closed() {
+        let err = from_family_hearth("{ not json ]").expect_err("must fail closed");
+        assert!(matches!(err, ImportError::Parse(_)));
+        let err2 = from_family_hearth("[1,2,3]").expect_err("array root rejected");
+        assert!(matches!(err2, ImportError::Parse(_)));
+    }
+
+    #[test]
+    fn family_hearth_empty_export_handled_gracefully() {
+        let bundle = from_family_hearth("{}").expect("empty object is valid");
+        assert_eq!(bundle.memories.len(), 0);
+        let plan = ImportPlan::from_bundle(&bundle);
+        assert!(plan.all_hearth_anchors_full_trust());
+        assert!(plan.all_skills_quarantined());
     }
 }

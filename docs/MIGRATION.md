@@ -10,6 +10,14 @@ representation and your skills safely **quarantined**.
 > memories never become trusted anchors. See
 > [Security guarantees](#security-guarantees) below.
 
+There is a **third, structurally different** source: `--from family_hearth`
+bridges the family's own shared Hearth (not a foreign runtime) into
+FamilyClaw **non-lossily** and at high trust, opt-in. It does not follow the
+"low-trust, quarantine everything" model above — see
+[docs/HEARTH_BRIDGE.md](HEARTH_BRIDGE.md) for the full design and
+[Family Hearth bridge](#family-hearth-bridge---from-family_hearth-opt-in-non-lossy)
+below for the quick reference.
+
 ## Evaluator one-liner
 
 Import an OpenClaw or Hermes export into **quarantine + low-trust** artifacts:
@@ -116,6 +124,62 @@ with a warning; skills without a `name` are skipped with a warning.
 Tolerances: fields live under `agent` if present, otherwise they are read from
 the top level; memory text is read from `value` **or** `text`; ability name from
 `id` **or** `name`; empty/nameless entries are skipped with a warning.
+
+### Family Hearth bridge (`--from family_hearth`, opt-in, non-lossy)
+
+```bash
+familyclaw import --from family_hearth --input ./hearth-export.json \
+  --out ./migrated --anchor-trust 0.9
+```
+
+This is **not** a foreign-runtime migration — it is a bridge for the
+family's own shared Hearth (`memory.json` / `intents/` / `state/{agent}.json`
+— see the repo-root `CLAUDE.md`'s "Hearth — Jaettu perhemuisti"). It only
+activates when explicitly requested (`--from family_hearth`); it changes
+nothing about the `openclaw`/`hermes` behavior above.
+
+Accepted shape (documented, tolerant — same "unknown fields ignored, fail
+closed on malformed JSON" contract as the other two adapters):
+
+```json
+{
+  "hearth_version": "1",
+  "memory": [
+    { "id": "m1", "agent": "agent_alpha", "content": "…", "tags": ["…"],
+      "importance": 0.9, "timestamp": "2026-05-26T18:00:00Z",
+      "identity_anchor": true }
+  ],
+  "intents": [
+    { "id": "i1", "agent": "agent_beta", "intent": "…", "timestamp": "…" }
+  ],
+  "state": {
+    "agent_epsilon": { "mood": "curious", "location": "E:\\agent_epsilon" }
+  }
+}
+```
+
+What makes it different from `openclaw`/`hermes`:
+
+- **Non-lossy.** Each entry's originating Hearth section, agent, original id,
+  and original timestamp are preserved as structured tags
+  (`hearth:kind=…`, `hearth:agent=…`, `hearth:id=…`, `hearth:ts=…`) instead of
+  being collapsed into bare content + generic tags.
+- **Identity anchors keep full trust.** An entry with `"identity_anchor":
+  true` is admitted as `Provenance::DirectExperience` — the same trust level
+  as the being's own observations, never forced through the untrusted-import
+  floor (`trust=0.2`).
+- **Everything else uses `--anchor-trust`** (default `0.9`, clamped
+  `0.0..=1.0`) — still `Provenance::External` and still auditable, but well
+  above the provenance gate's default admission threshold (`0.5`), because
+  this is the family's own data, not an unknown foreign export.
+- **No skills concept.** Hearth has no skill/ability format, so this source
+  never produces quarantine manifest entries.
+- **`intents/` and `state/{agent}.json` map to memory-like entries**, tagged
+  `hearth:kind=intent` / `hearth:kind=state` respectively, so they retrieve
+  alongside `memory.json` entries in Eternal Thread. See
+  [docs/HEARTH_BRIDGE.md](HEARTH_BRIDGE.md) for why this is a deliberate v1
+  scope decision and what a deeper `familyclaw-hearth`-native mapping would
+  look like.
 
 ## Security guarantees
 
