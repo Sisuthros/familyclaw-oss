@@ -1,0 +1,30 @@
+{
+  "//": "FamilyClaw family manifest (Layer B) — copy outside the repo, fill paths, never commit secrets. One file drives familyclaw-family-launcher.ps1, which supervises every listed agent from ONE command instead of 5 hand-registered Scheduled Tasks.",
+  "agents": [
+    {
+      "name": "agent_alpha",
+      "envFile": "%USERPROFILE%\\.config\\familyclaw\\agent_alpha.env",
+      "healthCheck": true
+    },
+    {
+      "name": "agent_beta",
+      "envFile": "%USERPROFILE%\\.config\\familyclaw\\agent_beta.env",
+      "healthCheck": true
+    },
+    {
+      "name": "agent_epsilon",
+      "envFile": "%USERPROFILE%\\.config\\familyclaw\\agent_epsilon.env",
+      "healthCheck": true
+    },
+    {
+      "name": "agent_gamma",
+      "envFile": "%USERPROFILE%\\.config\\familyclaw\\agent_gamma.env",
+      "healthCheck": true
+    },
+    {
+      "name": "agent_delta",
+      "envFile": "%USERPROFILE%\\.config\\familyclaw\\agent_delta.env",
+      "healthCheck": true
+    }
+  ]
+}
