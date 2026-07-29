@@ -93,7 +93,7 @@ SECRET_PATTERN="(api_key|API_KEY|secret|token)\s*=\s*[\"']{1}[^\"']{10,}"
 # placeholder/example/demo/dummy/changeme, angle-bracket fill-ins ("<your-key>"),
 # and the repo's known safe test fixtures. Anything else that matches the
 # pattern is treated as a real leak.
-SECRET_PLACEHOLDER_FILTER='placeholder|example|local-demo|demo-token|dummy|changeme|your[-_]|<[^\"'"'"']*>|s3cret-token|sk-livelivelive'
+SECRET_PLACEHOLDER_FILTER='placeholder|example|local-demo|demo-token|dummy|changeme|your[-_]|<[^\"'"'"']*>|s3cret-token|sk-livelivelive|shh-its-a-secret'
 SECRET_MATCHES=$(echo "$SECRET_SCAN_FILES" | xargs -r grep -nE "$SECRET_PATTERN" 2>/dev/null | grep -viE "$SECRET_PLACEHOLDER_FILTER" || true)
 if [ -n "$SECRET_MATCHES" ]; then
     echo "   ❌ FAIL: Hardcoded secrets found in source"

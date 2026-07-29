@@ -26,13 +26,21 @@ fi
 PASS=0
 FAIL=0
 
-# Derive a real forbidden private name from the audit's OWN list at runtime, so
-# this test file never contains one in plaintext. Pull the first token of the
-# FORBIDDEN_NAMES="..." assignment and strip any quoting.
+# Derive the forbidden fixture name from the audit's OWN list at runtime, so
+# this test file never contains a real private name in plaintext.
+#
+# The source is deliberately FORBIDDEN_NAMES_PLACEHOLDER, not FORBIDDEN_NAMES:
+# the audit resolves FORBIDDEN_NAMES at run time from the gitignored
+# operator-local file `scripts/audit-layer-b.names.local` when it exists, and
+# falls back to the placeholder list when it does not. `run_audit_with_fixture`
+# only copies the audit SCRIPT into its sandbox — never the local names file —
+# so inside every sandbox the effective list is always the placeholder list.
+# Deriving from the placeholder therefore matches what the sandboxed audit
+# actually scans for, and keeps this file free of real names by construction.
 forbidden_name() {
-    grep -E '^FORBIDDEN_NAMES=' "$AUDIT_SCRIPT" \
+    grep -E '^[[:space:]]*FORBIDDEN_NAMES_PLACEHOLDER=' "$AUDIT_SCRIPT" \
         | head -n1 \
-        | sed -E 's/^FORBIDDEN_NAMES="?//; s/".*$//' \
+        | sed -E 's/^[[:space:]]*FORBIDDEN_NAMES_PLACEHOLDER="?//; s/".*$//' \
         | tr -d '"' \
         | awk '{print $1}'
 }
