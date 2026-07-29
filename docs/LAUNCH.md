@@ -143,7 +143,8 @@ When the first row is filled, Horisontti 2 is won.
 ## Commercial follow-up (Horisontti 3)
 
 After technical credibility: [COMMERCIAL_OFFER.md](COMMERCIAL_OFFER.md) (Reliability Review / Sprint).
-[EXPO_FOLLOW_UP_TEMPLATES.md](EXPO_FOLLOW_UP_TEMPLATES.md) for lead email patterns.
+See [`commercial/EVALUATOR_DEMO_SCRIPT.md`](commercial/EVALUATOR_DEMO_SCRIPT.md)
+for the evaluation-call script.
 
 ---
 

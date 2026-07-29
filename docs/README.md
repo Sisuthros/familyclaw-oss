@@ -66,10 +66,11 @@ here, it's most likely a dated planning/expo artifact — check
 | Document | What it covers |
 |---|---|
 | [PHASE1_PR_BODY.md](PHASE1_PR_BODY.md) | PR description used for the Phase 1 merge. |
-| [PHASE3_PARALLEL_PLAN.md](PHASE3_PARALLEL_PLAN.md) | Phase 3 parallel workstream plan. |
-| [PUBLISH_ORPHAN_PLAN.md](PUBLISH_ORPHAN_PLAN.md) | Plan for publishing an orphaned branch/history. |
 | [CODE_REVIEW_2026-06-04.md](CODE_REVIEW_2026-06-04.md) | Dated code review notes. |
-| [source-blueprints/](source-blueprints/) | Source blueprint drafts referenced during early design. |
+
+Internal planning documents (`PHASE3_PARALLEL_PLAN.md`, `PUBLISH_ORPHAN_PLAN.md`,
+`source-blueprints/`) were moved out of the public tree and are deliberately not
+shipped — see `STATUS.md` for the living status they used to describe.
 
 ## Archive
 

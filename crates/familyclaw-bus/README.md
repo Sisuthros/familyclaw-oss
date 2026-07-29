@@ -1,7 +1,7 @@
 # familyclaw-bus
 
 **Resonance Bus** — FamilyClaw v2's *affective nervous system*
-([design §2.2](../../docs/plans/2026-06-03-familyclaw-v2-design.md)).
+(architecture: [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md)).
 Layer A / OSS (MIT).
 
 The bus is a [Ractor](https://docs.rs/ractor)-based actor model over which

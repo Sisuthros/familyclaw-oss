@@ -40,5 +40,7 @@ and `cargo run -p familyclaw-bench -- s1`.
 
 The repository's nightly crash-matrix workflow runs the shaped OpenClaw/Hermes
 matrix on GitHub Actions, verifies the expected overcounts (`0/1/2`), and
-regenerates [`../MATRIX.md`](../MATRIX.md). Live-pinned mode stays opt-in and
+regenerates `bench-competitors/MATRIX.md`. That file is a build product, not
+committed — run `scripts/run-competitor-crash-matrix.sh` to generate it
+locally. Live-pinned mode stays opt-in and
 local because it depends on a real pinned binary path.
