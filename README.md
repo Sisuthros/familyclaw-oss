@@ -215,8 +215,13 @@ paths, and ships unit tests in-module.
 | [`familyclaw-acp`](crates/familyclaw-acp) | **ACP client** — spawn and control CLI agents (Claude, Gemini, Qoder) over stdio. |
 | [`familyclaw-bench`](crates/familyclaw-bench) | **Continuity benchmark** — reproducible proof of crash-resume, retention and dreaming. |
 | [`familyclaw-gateway`](crates/familyclaw-gateway) | **Gateway binary** — long-running process: HTTP health/readiness + Resonance Bus bootstrap. |
-| [`familyclaw-gemu`](crates/familyclaw-gemu) | **Gemu CLI** — Gemini interface to FamilyClaw runtime. |
 | [`familyclaw-hearth`](crates/familyclaw-hearth) | **The Hearth** — shared family memory, narratives, emotional state and anchors. |
+| [`familyclaw-embeddings`](crates/familyclaw-embeddings) | **Embedding providers** — deterministic zero-dependency default, optional Ollama-backed semantic embedding behind a feature flag. |
+| [`familyclaw-growth`](crates/familyclaw-growth) | **Growth loop proposal stack** — records and tracks self-improvement proposals; approval-gated, never applies anything automatically. |
+| [`familyclaw-mcp`](crates/familyclaw-mcp) | **MCP client** — Model Context Protocol over stdio and HTTP, bridging MCP tools into the action runtime. |
+| [`familyclaw-scheduler`](crates/familyclaw-scheduler) | **Scheduler** — minimal interval-based dispatch of proactive tool tasks through an idempotent submission path. |
+| [`familyclaw-stt`](crates/familyclaw-stt) | **Speech-to-text** — provider-agnostic `SttProvider`, offline `MockStt`, OpenAI-compatible Whisper adapter (feature `openai`). |
+| [`familyclaw-tts`](crates/familyclaw-tts) | **Text-to-speech** — provider-agnostic `TtsProvider`, offline `MockTts`, OpenAI-compatible adapter (feature `openai`). |
 | [`familyclaw-observability`](crates/familyclaw-observability) | **Observability** — metrics, event recording and per-role RBAC for the multi-agent fleet. |
 | [`familyclaw-runtime`](crates/familyclaw-runtime) | **Runtime assembly** — wires bus + agents + channels + reply pump (`build_family`). |
 | [`familyclaw-actions`](crates/familyclaw-actions) | **Action/Skill Runtime** — observe → plan → approve → execute → verify → persist proof → remember → report. Generic skill registry, capability policy, approval gate, redacting proof bundles and audit log. Ships **two real reference skills** (`fs_read`, `web_fetch`) plus example skill patterns that show the skill contract — no private providers or keys. See [Skills](#skills-two-real-reference-skills--example-patterns). |
