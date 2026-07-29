@@ -53,7 +53,7 @@ Also available: a crash-proof memory demonstration showing FileJournal + LocalJs
 
 ```bash
 # Two-process mode (true process boundary)
-cargo run -p familyclaw-agent --bin crash_replay -- --reset
+cargo run -p familyclaw-agent --bin crash_replay -- reset
 cargo run -p familyclaw-agent --bin crash_replay -- write
 cargo run -p familyclaw-agent --bin crash_replay -- verify
 

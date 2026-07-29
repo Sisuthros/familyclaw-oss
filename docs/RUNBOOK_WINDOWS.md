@@ -21,7 +21,7 @@ cargo run -p minimal-gateway -- --duration 10
 
 ## Prerequisites (Layer B)
 
-- Rust 1.85+ ([`rustup`](https://rustup.rs/))
+- Rust 1.88+ ([`rustup`](https://rustup.rs/)) — 1.88 is the workspace MSRV (`Cargo.toml`, `rust-version`)
 - Git
 - PowerShell 5.1+ or PowerShell 7
 - Repo cloned, e.g. `E:\Familyclaw`
@@ -29,7 +29,7 @@ cargo run -p minimal-gateway -- --duration 10
 Check Rust:
 
 ```powershell
-rustc --version   # 1.85 or newer
+rustc --version   # 1.88 or newer
 ```
 
 ## Directory structure (Layer B)

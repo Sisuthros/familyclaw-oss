@@ -89,7 +89,7 @@ Notes:
 | --- | --- | --- |
 | `FAMILYCLAW_CHANNEL_KIND=telegram` | Required for Telegram mode | Selects Telegram channel mode. |
 | `TELEGRAM_BOT_TOKEN` | Required | Telegram bot token. Treat as secret. |
-| `TELEGRAM_CHANNEL_ID` | Required | Target Telegram chat/channel. |
+| `FAMILYCLAW_TELEGRAM_CHANNEL_ID` | Required | Target Telegram chat/channel. |
 
 ## Private runtime directory
 
