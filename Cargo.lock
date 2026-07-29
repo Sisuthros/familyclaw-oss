@@ -1639,6 +1639,7 @@ dependencies = [
  "familyclaw-bridge",
  "familyclaw-core",
  "familyclaw-durable",
+ "familyclaw-harness",
  "familyclaw-security",
  "reqwest 0.12.28",
  "serde",
@@ -1866,6 +1867,14 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "uuid",
+]
+
+[[package]]
+name = "familyclaw-harness"
+version = "1.2.0"
+dependencies = [
+ "familyclaw-core",
+ "serde",
 ]
 
 [[package]]

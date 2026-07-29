@@ -57,6 +57,8 @@ impl Agent {
     ///
     /// # Errors
     /// - [`FamilyClawError::Llm`] if the LLM call fails.
+    /// - [`FamilyClawError::Bus`] if an approval continuation cannot be
+    ///   persisted durably; the orphan approval is rolled back first.
     pub async fn think(&self, current_message: &BusMessage) -> Result<ThinkOutcome> {
         self.think_with_origin(current_message, None).await
     }
@@ -84,6 +86,8 @@ impl Agent {
     ///
     /// # Errors
     /// - [`FamilyClawError::Llm`] if the LLM call fails.
+    /// - [`FamilyClawError::Bus`] if an approval continuation cannot be
+    ///   persisted durably; the orphan approval is rolled back first.
     // A turn is one unified sequence (context â†’ tool loop â†’ result â†’
     // turn audit). TURN-AUDIT records (start/answered/suspend/max-iter)
     // pushed the line count slightly over the cap; splitting it would break
@@ -189,15 +193,17 @@ impl Agent {
                         )
                         .with_policy_snapshot(format!("tool '{tool}' requires human approval"))
                         .with_durable_position(self.turn_counter, 0);
-                        if let Err(e) = self.resumable.put(resumable) {
-                            // A persistence failure must not crash the turn,
-                            // but resume then won't succeed â†’ log as a warning.
-                            warn!(
-                                agent = self.config.name,
-                                %approval_id,
-                                error = %e,
-                                "resumable turn persist failed â€” resume will not be possible for this approval"
+                        if let Err(persist_error) = self.resumable.put(resumable) {
+                            let cleanup_error = self
+                                .rollback_non_durable_suspend(actions, approval_id, now)
+                                .await;
+                            let cleanup = cleanup_error.map_or_else(
+                                || "orphan approval rolled back".to_string(),
+                                |error| format!("rollback also failed: {error}"),
                             );
+                            return Err(FamilyClawError::bus(format!(
+                                "resumable persist failed: {persist_error}; {cleanup}"
+                            )));
                         }
                         debug!(
                             agent = self.config.name,
@@ -1214,13 +1220,17 @@ impl Agent {
                     )
                     .with_policy_snapshot(format!("tool '{tool}' requires human approval"))
                     .with_durable_position(turn, 0);
-                    if let Err(e) = self.resumable.put(resumable) {
-                        warn!(
-                            agent = agent_name,
-                            %approval_id,
-                            error = %e,
-                            "resumable turn persist failed â€” resume will not be possible for this approval"
+                    if let Err(persist_error) = self.resumable.put(resumable) {
+                        let cleanup_error = self
+                            .rollback_non_durable_suspend(&actions, approval_id, now)
+                            .await;
+                        let cleanup = cleanup_error.map_or_else(
+                            || "orphan approval rolled back".to_string(),
+                            |error| format!("rollback also failed: {error}"),
                         );
+                        return Err(FamilyClawError::bus(format!(
+                            "resumable persist failed: {persist_error}; {cleanup}"
+                        )));
                     }
                 }
                 record_turn_audit_into(
@@ -1619,6 +1629,33 @@ impl Agent {
         rt.pending_expiry_for(approval_id)
     }
 
+    /// Best-effort compensation for an approval that was created before its
+    /// resumable continuation could be made durable.
+    ///
+    /// The approval is denied first, closing the side-effect permission. Only
+    /// then is any possibly-partial resumable record removed. A cleanup error
+    /// is returned as redacted operational context for the original persist
+    /// failure; it never converts the failed suspend into success.
+    async fn rollback_non_durable_suspend(
+        &self,
+        actions: &Arc<Mutex<ActionRuntime>>,
+        approval_id: ApprovalId,
+        now: Timestamp,
+    ) -> Option<String> {
+        let deny_result = {
+            let mut runtime = actions.lock().await;
+            runtime.deny_pending(approval_id, now).await
+        };
+        if let Err(error) = deny_result {
+            return Some(format!("approval rollback failed: {error}"));
+        }
+
+        self.resumable
+            .remove(approval_id)
+            .err()
+            .map(|error| format!("resumable cleanup failed: {error}"))
+    }
+
     /// **Resumes a suspended turn once approval has been granted** (suspend/resume
     /// bridge, roadmap Â§6 â€” resume side).
     ///
@@ -1675,6 +1712,8 @@ impl Agent {
     ///   or consuming the approval ([`ActionRuntime::approve`]) fails (e.g.
     ///   payload mismatch) â€” all fail-closed, no panic.
     /// - [`FamilyClawError::Llm`] if the continued LLM call fails.
+    /// - [`FamilyClawError::Bus`] if a chained approval continuation cannot
+    ///   be persisted durably; the orphan approval is rolled back first.
     // Resume is a coherent sequence (load â†’ consume approval â†’ inject result
     // â†’ turn-audit resumed â†’ continue tool loop â†’ map outcome + stop_reason).
     // The TURN-AUDIT records pushed the line count over the ceiling; splitting
@@ -1857,13 +1896,17 @@ impl Agent {
                 )
                 .with_policy_snapshot(format!("tool '{tool}' requires human approval"))
                 .with_durable_position(self.turn_counter, 0);
-                if let Err(e) = self.resumable.put(next_turn) {
-                    warn!(
-                        agent = self.config.name,
-                        approval_id = %next_id,
-                        error = %e,
-                        "chained resumable turn persist failed â€” further resume not possible"
+                if let Err(persist_error) = self.resumable.put(next_turn) {
+                    let cleanup_error = self
+                        .rollback_non_durable_suspend(actions, next_id, now)
+                        .await;
+                    let cleanup = cleanup_error.map_or_else(
+                        || "orphan approval rolled back".to_string(),
+                        |error| format!("rollback also failed: {error}"),
                     );
+                    return Err(FamilyClawError::bus(format!(
+                        "resumable persist failed: {persist_error}; {cleanup}"
+                    )));
                 }
                 // stop_reason = suspended (chained new approval).
                 self.record_turn_audit(

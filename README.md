@@ -12,6 +12,8 @@ and private runtime profiles that never enter the repository.
 
 > 📍 **[STATUS.md](STATUS.md)** — what works today, what is deferred, release (`v1.2.0`).
 > Start with STATUS for technical truth.
+>
+> 🛡️ **[Dependability Harness](docs/DEPENDABILITY_HARNESS.md)** — accepted model-agnostic receipt/gate architecture and its explicitly tracked implementation status.
 
 ## How FamilyClaw compares
 

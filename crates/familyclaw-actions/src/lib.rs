@@ -69,6 +69,7 @@
 
 pub mod approval;
 pub mod audit;
+pub mod dependability;
 pub mod dispatch_outbox;
 pub mod error;
 pub mod evals;
@@ -87,6 +88,9 @@ pub mod task;
 
 pub use audit::{
     ActionAuditEvent, AuditAction, AuditCollector, AuditKind, AuditLog, ExecAuditEvent,
+};
+pub use dependability::{
+    action_dependability_receipt, critical_action_policy, read_only_action_policy,
 };
 pub use dispatch_outbox::{
     DispatchLookup, DispatchOutboxStore, DispatchedOutcome, InMemoryDispatchOutbox,
