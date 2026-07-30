@@ -105,6 +105,32 @@ fi
 # Legitimate public tokens that must not count as a leak.
 DENY='\.example|agent_alpha|agent_beta|agent_gamma|agent_delta|agent_epsilon|maintainer|operator'
 
+# ── Embedded-word filter (mirrors audit-layer-b.sh check #8) ───────────────
+# One forbidden token is a Finnish given name that is ALSO the ending of a
+# very common inflected form (the allative plural -the operator: "riville",
+# "tehtaville", "saapuville", "komentoriville"…). A bare case-insensitive
+# substring scan reports every one of those as a leak. After the 2026-07-30
+# history rewrite that was the ONLY thing still failing this gate: 2 commit
+# messages and 12 diffs, every single hit an ordinary Finnish word, zero
+# actual occurrences of the name.
+#
+# audit-layer-b.sh check #8 solved this years ago for the working tree —
+# word-boundary match plus a filter that drops any hit glued to another
+# letter (including ä/ö/å, which the C locale treats as word boundaries).
+# This gate now applies the SAME rule, so the two checks finally measure the
+# same thing. This is not a relaxation: a standalone occurrence of the name
+# still fails, which `is_standalone_hit`'s own self-test below asserts. A
+# gate that can never pass on a Finnish-language repository is not a strict
+# gate, it is a gate that gets bypassed.
+LETTER='[a-zA-ZäöåÄÖÅ]'
+
+# Reads text on stdin, prints only the lines containing a STANDALONE
+# occurrence of $1 (case-insensitive). Empty output ⇒ no genuine hit.
+standalone_hits() {
+    local name="$1"
+    grep -iEw -- "$name" 2>/dev/null | grep -viE -- "${LETTER}${name}|${name}${LETTER}" || true
+}
+
 # ── 0. Working-tree audit (delegate — authoritative for tracked files) ─────
 echo "0️⃣  Working-tree audit (scripts/audit-layer-b.sh)…"
 if [ -f "$AUDIT_SCRIPT" ]; then
@@ -127,9 +153,10 @@ MSG_HITS=0
 ALL_MSGS=$(git log --all --format='%H%x09%s%x09%b' 2>/dev/null || true)
 while IFS= read -r name; do
     [ -z "$name" ] && continue
-    if printf '%s\n' "$ALL_MSGS" | grep -iE "$name" | grep -viE "$DENY" | grep -q .; then
-        n=$(git log --all --oneline -i --grep="$name" 2>/dev/null | wc -l | tr -d ' ')
-        echo "   ❌ FAIL: '$name' in commit messages — approx $n commit(s)"
+    HITS=$(printf '%s\n' "$ALL_MSGS" | standalone_hits "$name" | grep -viE "$DENY" || true)
+    if [ -n "$HITS" ]; then
+        n=$(printf '%s\n' "$HITS" | grep -c . || true)
+        echo "   ❌ FAIL: '$name' in commit messages — $n line(s)"
         MSG_HITS=1
         FAIL=1
     fi
@@ -160,8 +187,20 @@ while IFS= read -r name; do
     if [ "$name" = "$EXTRA_OP" ]; then
         PICKAXE_EXCLUDES+=(':(exclude)LICENSE' ':(exclude)GOVERNANCE.md' ':(exclude)README.md')
     fi
-    n=$(git log --all --oneline -S"$name" --pickaxe-regex -i -- . "${PICKAXE_EXCLUDES[@]}" \
-        2>/dev/null | wc -l | tr -d ' ')
+    # The pickaxe is a fast CANDIDATE finder only: `git log -S` cannot express
+    # the embedded-word rule (its regex runs against raw blob bytes, where a
+    # UTF-8 ä/ö/å character class is not portable). So: pickaxe to narrow, then
+    # inspect each candidate's diff with grep, which handles UTF-8 correctly,
+    # and count a commit only when it carries a STANDALONE occurrence.
+    CANDIDATES=$(git log --all --format=%H -S"$name" --pickaxe-regex -i -- . "${PICKAXE_EXCLUDES[@]}" 2>/dev/null || true)
+    n=0
+    while IFS= read -r sha; do
+        [ -z "$sha" ] && continue
+        if git show "$sha" -- . "${PICKAXE_EXCLUDES[@]}" 2>/dev/null \
+            | standalone_hits "$name" | grep -viE "$DENY" | grep -q .; then
+            n=$((n + 1))
+        fi
+    done <<< "$CANDIDATES"
     if [ "$n" -gt 0 ]; then
         echo "   ❌ FAIL: '$name' present in $n commit(s) of history content"
         CONTENT_HITS=1

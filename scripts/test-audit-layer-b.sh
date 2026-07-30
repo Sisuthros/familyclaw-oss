@@ -137,6 +137,42 @@ run_audit_without_name_list() {
     )
 }
 
+# Run the PUBLISH gate in a sandbox whose HISTORY (commit message + a deleted
+# file's diff) carries caller-supplied text, with a real one-name deny list.
+# Used to prove the embedded-word filter added on 2026-07-30 did not blunt the
+# gate: a standalone name must still FAIL, while the same letters glued inside
+# a longer word must PASS.
+run_prepublish_with_history_text() {
+    # $1 = forbidden name for the sandbox deny list, $2 = text to bury in history
+    local deny_name="$1"
+    local text="$2"
+    local sandbox
+    sandbox="$(mktemp -d)"
+    (
+        cd "$sandbox" || exit 99
+        git init -q
+        git config user.name "audit-test"
+        git config user.email "test@example.com"
+        mkdir -p scripts
+        cp "$AUDIT_SCRIPT" scripts/audit-layer-b.sh
+        cp "$PREPUBLISH_SCRIPT" scripts/pre-publish-scan.sh
+        printf '%s\n' "$deny_name" > scripts/audit-layer-b.names.local
+        printf 'scripts/audit-layer-b.names.local\n' > .gitignore
+
+        # The text goes into history only: committed, then deleted. The working
+        # tree therefore ends CLEAN, so a failure can only come from the
+        # history/message checks under test, never from check #0.
+        printf '%s\n' "$text" > buried.txt
+        git add -A
+        git -c commit.gpgsign=false commit -q -m "chore: add $text" >/dev/null 2>&1
+        git rm -q buried.txt
+        git -c commit.gpgsign=false commit -q -m "chore: remove buried file" >/dev/null 2>&1
+
+        bash scripts/pre-publish-scan.sh >/dev/null 2>&1
+        echo $?
+    )
+}
+
 # Run the PUBLISH gate in a sandbox with no names file. It must refuse
 # unconditionally — it has no placeholder mode, even with the opt-out set.
 run_prepublish_without_name_list() {
@@ -320,6 +356,33 @@ if [ "$code" = "2" ]; then
     PASS=$((PASS + 1))
 else
     echo "  ❌ FAIL: publish gate accepted a missing name list (exit=$code, expected 2)"
+    FAIL=$((FAIL + 1))
+fi
+
+# ── Embedded-word filter must not blunt the publish gate ───────────────────
+# The filter added on 2026-07-30 stops ordinary words that merely END with a
+# forbidden name's letters from being reported as leaks. These two cases pin
+# both sides of that line: it must still catch the name, and it must stop
+# crying wolf on the word. Without the first assertion the filter would be
+# indistinguishable from simply deleting the check.
+echo ""
+echo "  ── publish gate: embedded-word filter keeps its teeth ──"
+
+code="$(run_prepublish_with_history_text "Tester" "note from Tester about the build")"
+if [ "$code" != "0" ]; then
+    echo "  ✅ PASS: standalone forbidden name in history still FAILS (exit=$code)"
+    PASS=$((PASS + 1))
+else
+    echo "  ❌ FAIL: standalone forbidden name in history was not caught"
+    FAIL=$((FAIL + 1))
+fi
+
+code="$(run_prepublish_with_history_text "Tester" "the protester filed a report")"
+if [ "$code" = "0" ]; then
+    echo "  ✅ PASS: name embedded in a longer word does NOT false-positive"
+    PASS=$((PASS + 1))
+else
+    echo "  ❌ FAIL: embedded-word false positive still fails the gate (exit=$code)"
     FAIL=$((FAIL + 1))
 fi
 
