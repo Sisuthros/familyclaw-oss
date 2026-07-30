@@ -8,7 +8,7 @@
 
 | Role | Responsibility | Current |
 |------|----------------|---------|
-| **Maintainer** | Merge rights, release tagging, security triage | the operator (Creator) |
+| **Maintainer** | Merge rights, release tagging, security triage | `@Sisuthros` (creator) |
 | **Core Contributor** | Review + approve PRs, benchmark stewardship | — *(open)* |
 | **Contributor** | PRs, issues, discussions, docs | Anyone |
 
@@ -133,7 +133,7 @@
 
 | Name | GitHub | Since | Focus Areas |
 |------|--------|-------|-------------|
-| The FamilyClaw Authors | `@Sisuthros` | 2026-06 | Architecture, benchmarks, Layer boundary |
+| Maintainer of record | `@Sisuthros` | 2026-06 | Architecture, benchmarks, Layer boundary |
 
 ---
 
