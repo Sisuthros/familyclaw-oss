@@ -20,6 +20,7 @@ here, it's most likely a dated planning/expo artifact — check
 | [MCP_WORKS_WITH.md](MCP_WORKS_WITH.md) | MCP bridge works-with catalog: tested vs contract-compatible server categories. |
 | [RUNBOOK_WINDOWS.md](RUNBOOK_WINDOWS.md) | Windows-specific setup, including optional Telegram/Discord wiring. |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Deploying the gateway. |
+| [PRODUCTION_AGENT_RUNBOOK.md](PRODUCTION_AGENT_RUNBOOK.md) | Strict production gate: build, private config, offline + live truth check (`scripts/production-agent-doctor.ps1`), acceptance sequence, failure map. |
 | [USERS.md](USERS.md) | Adoption profiles and the "should you use this" gate. |
 | [CRASH_REPLAY.md](CRASH_REPLAY.md) | How durable replay and crash-safe dispatch work, and how to reproduce the proof. |
 | [Workflow packs](../packs/README.md) | Evaluation templates (refund, infra teardown, migration) — 30-minute local proofs, no production credentials. |
