@@ -105,8 +105,12 @@ pub enum EntryKind {
     },
 
     /// Session state persistence — a marker record that stores the
-    /// message's origin (`MessageOrigin`) so the session can be restored
-    /// during replay/startup.
+    /// message's origin (`MessageOrigin`) plus an optional sliding-window
+    /// transcript so the session can be restored during replay/startup.
+    ///
+    /// `messages` defaults to empty for rows written before transcript
+    /// persistence landed (`#[serde(default)]`); old journals remain
+    /// readable without migration.
     SessionState {
         /// The channel instance identifier.
         channel_id: String,
@@ -114,7 +118,35 @@ pub enum EntryKind {
         conversation: String,
         /// The channel-specific sender identifier (for auditing).
         sender: String,
+        /// Sliding-window transcript (`role` + `content`), oldest→newest.
+        /// Empty for legacy rows and for origin-only checkpoints.
+        #[serde(default)]
+        messages: Vec<SessionTurnRecord>,
     },
+}
+
+/// One turn message persisted inside [`EntryKind::SessionState`].
+///
+/// Kept as plain strings so `familyclaw-durable` does not depend on the
+/// agent crate's LLM types. Roles are the lowercase OpenAI-style names
+/// (`user`, `assistant`, `system`, `tool`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTurnRecord {
+    /// Message role (`user` / `assistant` / …).
+    pub role: String,
+    /// Message text content (already truncated by the writer).
+    pub content: String,
+}
+
+impl SessionTurnRecord {
+    /// Builds a transcript record.
+    #[must_use]
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
 }
 
 impl EntryKind {
@@ -242,11 +274,12 @@ impl JournalEntry {
         )
     }
 
-    /// Builds a session-state persistence row.
+    /// Builds a session-state persistence row (origin only, empty transcript).
     ///
     /// `SessionState` is a marker record (not a workflow step) so it does not
-    /// interfere with the replay cursor. Stores the `MessageOrigin` data so the
-    /// session can be restored at startup or during replay.
+    /// interfere with the replay cursor. Prefer
+    /// [`Self::session_transcript_entry`] when the sliding-window history
+    /// should survive a process restart.
     #[must_use]
     pub fn session_state_entry(
         step_id: StepId,
@@ -254,12 +287,26 @@ impl JournalEntry {
         conversation: impl Into<String>,
         sender: impl Into<String>,
     ) -> Self {
+        Self::session_transcript_entry(step_id, channel_id, conversation, sender, Vec::new())
+    }
+
+    /// Builds a session-state row that carries origin **and** the current
+    /// sliding-window transcript. Last-wins per session key on restore.
+    #[must_use]
+    pub fn session_transcript_entry(
+        step_id: StepId,
+        channel_id: impl Into<String>,
+        conversation: impl Into<String>,
+        sender: impl Into<String>,
+        messages: Vec<SessionTurnRecord>,
+    ) -> Self {
         Self::new(
             step_id,
             EntryKind::SessionState {
                 channel_id: channel_id.into(),
                 conversation: conversation.into(),
                 sender: sender.into(),
+                messages,
             },
         )
     }
@@ -270,7 +317,8 @@ impl JournalEntry {
         self.kind.step_name()
     }
 
-    /// Retrieves the `SessionState` if the row's kind is `SessionState`.
+    /// Retrieves the `SessionState` origin triple if the row's kind is
+    /// `SessionState`. Transcript is available via [`Self::session_transcript`].
     #[must_use]
     pub fn session_state(&self) -> Option<(&str, &str, &str)> {
         match &self.kind {
@@ -278,7 +326,18 @@ impl JournalEntry {
                 channel_id,
                 conversation,
                 sender,
+                ..
             } => Some((channel_id, conversation, sender)),
+            _ => None,
+        }
+    }
+
+    /// Retrieves the persisted transcript for a `SessionState` row
+    /// (empty slice for legacy/origin-only rows).
+    #[must_use]
+    pub fn session_transcript(&self) -> Option<&[SessionTurnRecord]> {
+        match &self.kind {
+            EntryKind::SessionState { messages, .. } => Some(messages.as_slice()),
             _ => None,
         }
     }

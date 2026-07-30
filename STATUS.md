@@ -6,7 +6,7 @@
 > documents are archived in [docs/archive/](docs/archive/) (see
 > [Detailed design docs](#detailed-design-docs)).
 
-- **Version:** `v1.2.0` (workspace `Cargo.toml` `version = "1.2.0"`)
+- **Version:** `v1.3.0` (workspace `Cargo.toml` `version = "1.3.0"`) — Public Preview
 - **License:** MIT
 - **Language:** Rust 2021, MSRV 1.88, `unsafe` forbidden workspace-wide
 - **Workspace:** 23 public crates (`crates/*`) + `examples/minimal-gateway`
@@ -123,7 +123,12 @@ claimed as working today.
 
 ## (c) Version & CI status
 
-- **Current release:** `v1.2.0`. Headline of v1.2.0: Hearth SurrealDB persistence
+- **Current release:** `v1.3.0` (Public Preview). Headline of v1.3.0: the first
+  release with a one-command crash proof in the README, `/readyz` fail-closed on
+  broken workspace scopes, a model-agnostic dependability harness, a production
+  runbook plus offline/live doctor gate, and a Layer B history rewrite that makes
+  the repository publishable at all.
+- **Previous release:** `v1.2.0`. Headline of v1.2.0: Hearth SurrealDB persistence
   bugs fixed (`emotional_state` + `narrative_thread`), `--all-features` made green
   with a dedicated CI gate, HTTP error-path tests for Telegram/Discord adapters,
   channel-less serve mode, and a pre-publish leak gate.

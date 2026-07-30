@@ -7,8 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Covers everything landed since `v1.2.0` (2026-07-02). No version has been
-tagged for these changes yet.
+Nothing yet.
+
+## [1.3.0] - 2026-07-30 — Public Preview
+
+Covers everything landed since `v1.2.0` (2026-07-02), consolidated onto one
+canonical branch and published from a rewritten, Layer-B-clean history.
+
+### Added (in 1.3.0, beyond the list below)
+- **`scripts/crash-proof.sh`** — one command, no API keys, no network: runs the
+  existing black box across two crash windows over a real process boundary and
+  prints `side_effect_overcount`, `approval_payload_match` and a
+  commit-SHA-bound receipt. A negative control on the pre-fix path double-fires,
+  so the proof measures behaviour rather than a constant. The README now opens
+  with it.
+- **Model-agnostic dependability harness** (`familyclaw-harness`,
+  `familyclaw-actions::dependability`) with receipts and a gate test —
+  `docs/DEPENDABILITY_HARNESS.md`.
+- **Production agent runbook + one-command truth gate** —
+  `docs/PRODUCTION_AGENT_RUNBOOK.md` and `scripts/production-agent-doctor.ps1`
+  (offline and live modes, secret-safe output). The doctor now also prints
+  everything `/readyz` reported under `degraded`, so a knowingly
+  reduced-capability deployment cannot pass unnoticed.
+- **`.env.example` now documents the capability boundary** — workspace scopes,
+  shell mode, sandbox, MCP servers, embeddings, fallback chain and request
+  timeout were entirely undocumented. Every variable was verified against the
+  code before being written down.
+
+### Changed
+- **`/readyz` checks workspace tool scopes on every request, with no opt-in
+  flag.** A configured scope whose root does not exist is now a hard `503` —
+  that is a skill which denies everything while nothing alerts. An empty scope
+  is reported under `degraded` instead: a locked-down deployment is legitimate,
+  but it must stay visible. Paths are never echoed back, only counts.
+- **Copyright is attributed to "The FamilyClaw Authors"** (LICENSE, README
+  footer, GOVERNANCE) — the standard form, which also removes the three
+  name-specific audit exceptions that existed solely for those three lines.
+
+### Fixed (release-blocking, in 1.3.0)
+- **The Layer B audit could report a false PASS.** Both gates read the real
+  deny list from a gitignored file and fell back *silently* to placeholder
+  names when it was absent — reporting "no real names found" after searching
+  for strings like `PlaceholderAgentOne`. That output had been cited as publish
+  clearance. `scripts/audit-layer-b.sh` now requires either the real list or an
+  explicit, loudly-announced `FAMILYCLAW_AUDIT_ALLOW_PLACEHOLDER_NAMES=1`, and
+  exits 2 otherwise; `scripts/pre-publish-scan.sh` has no placeholder mode at
+  all.
+- **Neither gate inspected commit author/committer metadata.** Private
+  identities were literal git commit authors — data that appears in no diff and
+  no commit message, and would have been published on every commit page and in
+  the contributors graph. New checks scan `%an/%ae/%cn/%ce` across all refs.
+- **The audit skipped every `*.example*` path**, where a complete real agent
+  roster had been sitting in `scripts/family.manifest.example.json`. Example
+  files are now scanned like everything else; sample identifiers are allowed by
+  content, not by filename.
+- **The publish gate could never pass on a Finnish-language repository** — a
+  substring scan reported every ordinary word ending in a forbidden name's
+  letters as a leak. It now uses the same word-boundary rule the working-tree
+  check has always used, with tests pinning both sides of that line.
+
+### Security (in 1.3.0)
+- **History rewritten** to remove private agent/operator names, a personal
+  email address, a build-machine hostname and a throwaway OIDC RSA test key
+  from every commit's content, message and identity metadata. 366 commits
+  rewritten; the published tree is byte-identical to the audited one.
+
+---
+
+The remainder of this section is the work that landed between `v1.2.0` and
+`v1.3.0`.
 
 ### Added
 - **Reliability Console** (`GET /console`) — live operator surface: a "Now"
