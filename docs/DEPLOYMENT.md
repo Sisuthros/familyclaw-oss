@@ -55,7 +55,7 @@ curl http://127.0.0.1:8787/readyz
 | `FAMILYCLAW_GATEWAY_ADDR` | Recommended | Socket address. Default is local-only. Use `0.0.0.0:PORT` inside containers when required by the platform. |
 | `FAMILYCLAW_CONFIG` | Recommended | Absolute path to private `familyclaw.toml`. |
 | `FAMILYCLAW_PROFILE_DIR` | Optional but expected for private agents | Private profile root. Must live outside the repository. |
-| `FAMILYCLAW_DATA_DIR` | Recommended | Persistent runtime data directory for journals and stores. Mount this as durable storage. |
+| `FAMILYCLAW_DATA_DIR` | Recommended | Persistent runtime data directory for journals and stores. Mount this as durable storage. **The directory must already exist** — see the note below. |
 | `FAMILYCLAW_PROVIDERS` | Required for text replies | Provider map in `prefix=base_url=KEY_ENV` form. Endpoints must be OpenAI-compatible chat-completions endpoints unless a native adapter exists. |
 | `FAMILYCLAW_REPLY_TARGET` | Required for static fallback routing | Fallback outbound target when per-message origin is unavailable. |
 | `FAMILYCLAW_GATEWAY_TOKEN` | Required in production | Bearer token for `/inject`. Empty token is acceptable only for local loopback development. |
@@ -67,6 +67,35 @@ FAMILYCLAW_PROVIDERS="openai=https://api.openai.com/v1=OPENAI_API_KEY;local=http
 ```
 
 The value after the second `=` is the name of another environment variable. Do not put the API key itself inside `FAMILYCLAW_PROVIDERS`.
+
+### `FAMILYCLAW_DATA_DIR` must exist before first start
+
+The gateway does **not** create the data directory for you. It opens the durable
+journals fail-closed, so pointing `FAMILYCLAW_DATA_DIR` at a path that does not
+exist yet makes both `doctor` and `serve` abort with a raw OS error rather than a
+readable message:
+
+```text
+Error: Config("durable action stores open failed: proof error:
+open pending journal failed: journal io error: <OS 'path not found' error>")
+```
+
+Create it first:
+
+```bash
+mkdir -p /absolute/private/data          # Linux / macOS
+```
+
+```powershell
+powershell -File scripts/init-familyclaw-data.ps1   # Windows (also seeds the store files)
+```
+
+Verified behaviour: with the directory missing, `doctor` exits `1`; with the
+directory present, `doctor` reports
+`durability persistent (data_dir set); dispatch_outbox=journal; pending_store=journal`
+and exits `0`. Leaving `FAMILYCLAW_DATA_DIR` unset is also fine for evaluation —
+`doctor` then exits `0` but warns that durability is in-memory and the
+at-most-once-under-crash guarantee does **not** hold.
 
 ## Discord variables
 
