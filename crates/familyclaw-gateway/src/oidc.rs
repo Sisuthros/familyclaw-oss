@@ -345,7 +345,7 @@ mod tests {
     fn generate_rsa_test_keypair() -> (String, String) {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine as _;
-        use rsa::pkcs1::EncodeRsaPrivateKey;
+        use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
         use rsa::traits::PublicKeyParts;
         use rsa::{RsaPrivateKey, RsaPublicKey};
 
@@ -353,7 +353,7 @@ mod tests {
         let priv_key = RsaPrivateKey::new(&mut rng, 2048).expect("generate rsa test key");
         let pub_key = RsaPublicKey::from(&priv_key);
         let priv_pem = priv_key
-            .to_pkcs1_pem(Default::default())
+            .to_pkcs1_pem(LineEnding::default())
             .expect("encode rsa test key to pkcs1 pem")
             .to_string();
         let n_b64 = URL_SAFE_NO_PAD.encode(pub_key.n().to_bytes_be());
@@ -362,6 +362,15 @@ mod tests {
 
     #[test]
     fn rs256_jwks_token_validates() {
+        // Declared before any statement: clippy::items_after_statements.
+        #[derive(Serialize)]
+        struct RsClaims<'a> {
+            iss: &'a str,
+            aud: &'a str,
+            exp: i64,
+            role: &'a str,
+        }
+
         let (priv_pem, n_b64) = generate_rsa_test_keypair();
 
         let cfg = OidcConfig {
@@ -378,13 +387,6 @@ mod tests {
         *validator.jwks_cache.lock().expect("lock") =
             Some((Instant::now(), Arc::from(jwks.as_str())));
 
-        #[derive(Serialize)]
-        struct RsClaims<'a> {
-            iss: &'a str,
-            aud: &'a str,
-            exp: i64,
-            role: &'a str,
-        }
         let claims = RsClaims {
             iss: "https://idp.example",
             aud: "familyclaw",

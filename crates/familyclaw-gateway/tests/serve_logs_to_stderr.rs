@@ -1,7 +1,7 @@
 //! Regression test for a "runtime log stays 0 bytes" class of bug: gateway
 //! logs must land on **stderr** (not stdout), and must be flushed promptly
 //! even for a short-lived process -- not silently swallowed by launcher-
-//! dependent stdout buffering. See main.rs's tracing_subscriber::fmt() init
+//! dependent stdout buffering. See main.rs's `tracing_subscriber::fmt()` init
 //! (2026-07-25 STATUS note) for the fix this guards.
 
 use std::io::Read;

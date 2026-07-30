@@ -3219,7 +3219,7 @@ mod tests {
 
     /// End-to-end: the Gemini wire format actually talks to the network
     /// through [`LlmClient::complete`] (the SAME public entry point the
-    /// OpenAI wire format uses), proving the dispatch in
+    /// `OpenAI` wire format uses), proving the dispatch in
     /// [`LlmClient::complete_once`] is real, not just parsed in isolation.
     /// Reuses the [`spawn_scripted_mock`] harness above (canned HTTP/1.1
     /// responses over a raw TCP listener, no mocking crate dependency).

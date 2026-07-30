@@ -578,10 +578,12 @@ mod tests {
     fn probe_resolver_gives_tools_ping_a_reasoning_safe_token_budget() {
         use familyclaw_agent::LlmEndpointResolver;
 
-        assert!(
-            LLM_TOOLS_PING_MAX_TOKENS > LLM_PING_MAX_TOKENS,
-            "the tool-calling probe must not share the plain ping's token budget"
-        );
+        const {
+            assert!(
+                LLM_TOOLS_PING_MAX_TOKENS > LLM_PING_MAX_TOKENS,
+                "the tool-calling probe must not share the plain ping's token budget"
+            );
+        }
 
         let resolver = EnvEndpointResolver::new()
             .with_max_tokens(LLM_TOOLS_PING_MAX_TOKENS)
