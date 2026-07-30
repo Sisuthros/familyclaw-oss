@@ -2481,6 +2481,70 @@ async fn durable_turn_does_not_advertise_unpersisted_approval() {
     bus.stop();
 }
 
+/// A failed production suspend must not leave durable think/suspend markers.
+/// Those markers would advance the replay cursor on restart and let a later
+/// run advertise Suspended without a recoverable continuation.
+#[tokio::test]
+async fn durable_turn_persist_failure_leaves_no_false_suspend_journal_markers() {
+    let dir = TempDir::new("false-suspend-journal");
+    let journal_path = dir.0.join("agent.journal.jsonl");
+    let mem_path = dir.0.join("memory.json");
+    let memory: ErasedMemoryStore =
+        Arc::new(LocalJsonStore::open(&mem_path).await.expect("open mem"));
+    let bus = ResonanceBus::start(None).await.expect("bus");
+    let api = spawn_scripted_llm(vec![body_tool_call(
+        "call_approve",
+        "approval_skill",
+        &serde_json::json!({ "q": "do-it" }),
+    )])
+    .await;
+    let store: StdArc<dyn ResumableTurnStore> = StdArc::new(FailingPutResumableStore);
+    let runtime = approval_runtime();
+    let (sink, mut rx) = new_reply_channel();
+    let mut agent = agent_over_file_journal("agent_a", bus.clone(), &api, &journal_path, memory)
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(store)
+        .with_reply_sink(sink)
+        .with_reply_target("test:dependability");
+
+    let outcome = agent
+        .handle_turn(BeingId::new(), &BusMessage::text("aja hyväksyntä-työkalu"))
+        .await
+        .expect("turn stays operational");
+
+    assert!(
+        !outcome.summary.contains("suspended(approval="),
+        "non-durable approval must not be recorded as suspended: {}",
+        outcome.summary
+    );
+    let reply = rx.try_recv().expect("fail-closed recovery reply");
+    assert!(
+        !reply.body.contains("APPROVE") && !reply.body.contains("/approvals/"),
+        "operator must not receive an unusable approval command: {}",
+        reply.body
+    );
+    assert!(
+        runtime
+            .lock()
+            .await
+            .try_pending_approvals()
+            .expect("pending list")
+            .is_empty(),
+        "production persist failure must roll back the orphan approval"
+    );
+
+    let journal_text = std::fs::read_to_string(&journal_path).expect("read journal");
+    assert!(
+        !journal_text.contains("turn-0-think"),
+        "failed suspend must not journal empty think before durable continuation: {journal_text}"
+    );
+    assert!(
+        !journal_text.contains("turn-0-suspend"),
+        "failed suspend must not journal a suspend marker: {journal_text}"
+    );
+    bus.stop();
+}
+
 /// A chained approval created during resume has the same durability contract
 /// as the initial suspend. The already-approved side effect may have run, but
 /// the continuation must not claim `Suspended` when its new resume state was
@@ -3799,6 +3863,7 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
 
     let dir = TempDir::new("crash-replay");
     let journal_path = dir.0.join("agent.journal.jsonl");
+    let resumable_path = dir.0.join("resumable.jsonl");
     // Shared memory on disk, so turn_key dedup also works across a rebuild.
     let mem_path = dir.0.join("memory.json");
     let memory: ErasedMemoryStore =
@@ -3830,6 +3895,8 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
             StdArc::clone(&auto_count),
             StdArc::clone(&approval_count),
         );
+        let resumable: StdArc<dyn ResumableTurnStore> =
+            StdArc::new(JournalResumableStore::open(&resumable_path).expect("resumable 1"));
         let mut agent = agent_over_file_journal(
             "agent_a",
             bus.clone(),
@@ -3837,7 +3904,8 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
             &journal_path,
             StdArc::clone(&memory),
         )
-        .with_actions(StdArc::clone(&runtime));
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(StdArc::clone(&resumable));
 
         let outcome = agent
             .handle_turn(BeingId::new(), &BusMessage::text("aja kaksi työkalua"))
@@ -3868,6 +3936,13 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
         // Also capture the journaled DispatchRecord of the first dispatch.
         dispatch0_record_orig = extract_dispatch_record(&journal_text, "turn-0-dispatch-0")
             .expect("turn-0-dispatch-0 record present in journal");
+        assert!(
+            resumable
+                .get(approval_id_orig)
+                .expect("get resumable")
+                .is_some(),
+            "production-shaped replay requires a durable continuation surface"
+        );
 
         bus.stop();
         // agent/runtime/bus are DROPPED = "the process crashes".
@@ -3888,6 +3963,8 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
             StdArc::clone(&auto_count),
             StdArc::clone(&approval_count),
         );
+        let resumable: StdArc<dyn ResumableTurnStore> =
+            StdArc::new(JournalResumableStore::open(&resumable_path).expect("resumable 2"));
         let mut agent = agent_over_file_journal(
             "agent_a",
             bus.clone(),
@@ -3895,11 +3972,19 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
             &journal_path,
             StdArc::clone(&memory),
         )
-        .with_actions(StdArc::clone(&runtime));
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(StdArc::clone(&resumable));
         // The context is in replay mode (the log has the earlier turn's steps).
         assert!(
             agent.durable.is_replaying(),
             "rebuild näkee aiemman vuoron askeleet → replay-tila"
+        );
+        assert!(
+            resumable
+                .get(approval_id_orig)
+                .expect("get resumable after restart")
+                .is_some(),
+            "durable continuation must survive restart for honest Suspended replay"
         );
 
         let outcome = agent
@@ -3968,6 +4053,8 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
             StdArc::clone(&auto_count),
             StdArc::clone(&approval_count),
         );
+        let resumable: StdArc<dyn ResumableTurnStore> =
+            StdArc::new(JournalResumableStore::open(&resumable_path).expect("resumable 3"));
         let mut agent = agent_over_file_journal(
             "agent_a",
             bus.clone(),
@@ -3975,7 +4062,8 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
             &journal_path,
             StdArc::clone(&memory),
         )
-        .with_actions(StdArc::clone(&runtime));
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(StdArc::clone(&resumable));
         assert!(
             agent.durable.is_replaying(),
             "katkaistu journal → replay-tila"

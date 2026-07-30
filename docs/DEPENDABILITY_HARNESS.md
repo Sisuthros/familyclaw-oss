@@ -245,6 +245,7 @@ Each case must assert both positive behavior and the **absence** of forbidden si
 - tests proving invalid identity plus missing, weak and failed evidence block,
 - approval consumption order is fixed: pending check + resumable write share the `ActionRuntime` lock, and chat approval loads durable continuation state before consuming the single-use approval,
 - regression: non-durable approval suspend fails closed; rollback writes a dispatch-outbox quarantine before pending cleanup, so even a tombstone failure cannot execute the orphan approval.
+- production durable path journals empty `-think` / `-suspend` only after the continuation is present in the resumable store, so restart cannot advertise Suspended from a think marker alone.
 
 ### P1 — Action adapter (**baseline implemented; enforcement pending**)
 

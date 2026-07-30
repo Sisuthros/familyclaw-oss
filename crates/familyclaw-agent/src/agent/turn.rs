@@ -1183,16 +1183,17 @@ impl Agent {
                 tool_call_id,
                 arguments,
             } => {
-                // Close `-think` as empty, so the replay cursor stays aligned
-                // (suspend produces a separate `-suspend` entry below).
-                let _ = self
-                    .durable
-                    .step(&think_step, || Ok(String::new()))
-                    .map_err(|e| FamilyClawError::bus(format!("durable think step failed: {e}")))?;
-
-                // Persist the resumable turn (resume bridge) â€” only on a fresh
-                // run (on replay it was already persisted in the original run).
-                if !self.durable.is_replaying() {
+                // Continuation durability is the gate for advertising suspend.
+                // Do NOT journal `-think` first: an empty think row would advance
+                // the replay cursor past this point on restart, skip the put, and
+                // let a later run claim Suspended for an approval that was never
+                // made recoverable (or was already quarantined).
+                let already_persisted = self
+                    .resumable
+                    .get(approval_id)
+                    .map_err(|e| FamilyClawError::bus(format!("resumable lookup failed: {e}")))?
+                    .is_some();
+                if !already_persisted {
                     let expires_at = self
                         .pending_expiry_for(&actions, approval_id)
                         .await
@@ -1217,6 +1218,14 @@ impl Agent {
                     self.persist_resumable_or_abort_pending(&actions, approval_id, resumable, now)
                         .await?;
                 }
+
+                // Close `-think` as empty only after the continuation is durable,
+                // so the replay cursor stays aligned with a real suspend.
+                let _ = self
+                    .durable
+                    .step(&think_step, || Ok(String::new()))
+                    .map_err(|e| FamilyClawError::bus(format!("durable think step failed: {e}")))?;
+
                 record_turn_audit_into(
                     audit,
                     turn_id,
@@ -1225,7 +1234,7 @@ impl Agent {
                     format!("suspended awaiting approval {approval_id}: {redacted_summary}"),
                 );
                 // `-suspend` entry (same format as the single-shot path):
-                // "<approval_id>|<redacted_summary>" â€” no raw payload.
+                // "<approval_id>|<redacted_summary>" — no raw payload.
                 let suspend_step = format!("turn-{turn}-suspend");
                 let payload = format!("{approval_id}|{redacted_summary}");
                 if let Err(e) = self.durable.step(&suspend_step, {
