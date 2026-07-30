@@ -1,5 +1,55 @@
 # FamilyClaw
 
+## Kill the agent. Restart it. Count the side effects.
+
+**FamilyClaw is a crash-safe Rust runtime for AI agents that perform real
+external actions.**
+
+**The failure it prevents.** An agent charges a card, sends the email, deletes
+the bucket — and *then* the process dies before it records that it did. On
+restart the agent replays, sees no record, and does it again. The customer is
+refunded twice. Most agent frameworks checkpoint *state*; a checkpoint written
+after the effect cannot undo an effect that already happened.
+
+**What the demo proves.** Kill the runtime inside exactly that window — after
+the external effect has fired, before the durable commit record is written —
+then restart it and count the effects in a deterministic sink. The count must
+stay at 1.
+
+**Run the 60-second proof** (no API keys, no network):
+
+```bash
+bash scripts/crash-proof.sh
+```
+
+Decisive output on success:
+
+```text
+side_effect_overcount = 0
+approval_payload_match = PASS
+proof_receipt = <id>
+overall = PASS
+```
+
+It exits non-zero if any invariant is violated. It drives two real crash
+windows across a genuine process boundary (the crashing process exits 137),
+and a fresh process replays durable state. The same harness run against the
+pre-fix code path (`--mode old`) double-fires — counter 2 — so the proof
+measures something real rather than a constant.
+
+**What this does NOT claim.**
+
+- **Not universal exactly-once.** The honest claim is **at-most-once external
+  dispatch across the tested crash and replay windows**. Exactly-once across
+  arbitrary failure modes is not achievable and is not promised.
+- Not a guarantee for effects your own skill code performs outside the
+  approval-gated dispatch path.
+- Not a distributed-systems product: single-process runtime, local durable
+  journal.
+- No production customer, certification, or revenue claims.
+
+---
+
 ![Crash replay demo: write memory, kill the process, restart, memory survives](docs/demo-crash-replay.gif)
 
 **A Rust agent runtime where in-flight work survives a crash — at-most-once external side effects, durable memory, contract-checked coordination.**
