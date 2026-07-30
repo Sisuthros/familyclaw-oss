@@ -1441,19 +1441,19 @@ mod tests {
         "hearth_version": "1",
         "unknown_top_level": "ignored on purpose",
         "memory": [
-            { "id": "m1", "agent": "agent_alpha", "content": "the operator rakensi V9->V20 yhdessä päivässä",
+            { "id": "m1", "agent": "agent_alpha", "content": "operator note recorded during onboarding",
               "tags": ["family"], "importance": 0.9, "timestamp": "2026-05-26T18:00:00Z",
               "identity_anchor": true },
-            { "id": "m2", "agent": "agent_gamma", "content": "arkkitehti, koodi, järjestelmäajattelu",
+            { "id": "m2", "agent": "agent_gamma", "content": "architecture, code, systems thinking",
               "importance": 0.5 },
             { "id": "m3", "agent": "agent_delta", "text": "   " }
         ],
         "intents": [
-            { "id": "i1", "agent": "agent_beta", "intent": "tutki yöllä uusi audio-aisti",
+            { "id": "i1", "agent": "agent_beta", "intent": "research the new audio sense tonight",
               "timestamp": "2026-07-11T02:00:00Z" }
         ],
         "state": {
-            "agent_epsilon": { "mood": "curious", "location": "E:\\agent_epsilon" }
+            "agent_epsilon": { "mood": "curious", "location": "/srv/agents/agent_epsilon" }
         },
         "settings": { "hearth_path": "/root/.hermes/profiles/shared/hearth" }
     }"#;
@@ -1648,7 +1648,9 @@ mod tests {
             .find(|m| m.tags.iter().any(|t| t == "identity_anchor"))
             .expect("anchor memory present");
         assert_eq!(anchor.provenance, Provenance::DirectExperience);
-        assert!(anchor.tags.contains(&"hearth:agent=agent_alpha".to_string()));
+        assert!(anchor
+            .tags
+            .contains(&"hearth:agent=agent_alpha".to_string()));
         assert!(anchor.tags.contains(&"hearth:id=m1".to_string()));
         assert!(anchor
             .tags
@@ -1673,7 +1675,7 @@ mod tests {
             .find(|m| m.tags.contains(&"hearth:kind=intent".to_string()))
             .expect("intent present");
         assert!(intent.tags.contains(&"hearth:agent=agent_beta".to_string()));
-        assert!(intent.content.contains("audio-aisti"));
+        assert!(intent.content.contains("audio sense"));
 
         // The state snapshot is preserved with kind=state, agent=agent_epsilon.
         let state = plan
@@ -1681,7 +1683,9 @@ mod tests {
             .iter()
             .find(|m| m.tags.contains(&"hearth:kind=state".to_string()))
             .expect("state present");
-        assert!(state.tags.contains(&"hearth:agent=agent_epsilon".to_string()));
+        assert!(state
+            .tags
+            .contains(&"hearth:agent=agent_epsilon".to_string()));
         assert!(state.content.contains("agent_epsilon"));
 
         assert!(plan.all_hearth_anchors_full_trust());

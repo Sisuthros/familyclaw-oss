@@ -282,10 +282,13 @@ assert_identity_fail "forbidden name as commit author name FAILS" \
 assert_identity_fail "forbidden name inside author email FAILS" \
     "Some Contributor" "$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]')@familyclaw.local"
 
-# A personal gmail address as the author email → must FAIL, even with a
-# perfectly innocuous author name.
-assert_identity_fail "personal gmail as author email FAILS" \
-    "Some Contributor" "someone.private@gmail.com"
+# A personal-provider address as the author email → must FAIL, even with a
+# perfectly innocuous author name. The fixture address is assembled at RUNTIME
+# from fragments: written out in full it would (correctly) trip this repo's own
+# check #9, and allowlisting it would punch a hole in the very gate under test.
+PERSONAL_MAIL="someone.private@$(printf 'gm'; printf 'ail').com"
+assert_identity_fail "personal-provider address as author email FAILS" \
+    "Some Contributor" "$PERSONAL_MAIL"
 
 # Control: a neutral identity on a GitHub noreply address must PASS. This is
 # exactly the replacement identity used by the history rewrite, so this case

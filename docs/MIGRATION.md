@@ -153,7 +153,7 @@ closed on malformed JSON" contract as the other two adapters):
     { "id": "i1", "agent": "agent_beta", "intent": "…", "timestamp": "…" }
   ],
   "state": {
-    "agent_epsilon": { "mood": "curious", "location": "E:\\agent_epsilon" }
+    "agent_epsilon": { "mood": "curious", "location": "/srv/agents/agent_epsilon" }
   }
 }
 ```

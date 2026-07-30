@@ -69,14 +69,14 @@
 
 .EXAMPLE
     # Validate the manifest without touching any process (no secrets needed):
-    powershell -ExecutionPolicy Bypass -File E:\Familyclaw\scripts\familyclaw-family-launcher.ps1 `
-        -Manifest E:\Familyclaw\scripts\family.manifest.example.json -DryRun
+    powershell -ExecutionPolicy Bypass -File .\scripts\familyclaw-family-launcher.ps1 `
+        -Manifest .\scripts\family.manifest.example.json -DryRun
 
 .EXAMPLE
     # Launch the whole family from one real manifest:
-    powershell -ExecutionPolicy Bypass -File E:\Familyclaw\scripts\familyclaw-family-launcher.ps1 `
-        -Manifest C:\Users\operator\.config\familyclaw\family.manifest.json `
-        -SuperviseScript E:\Familyclaw\ops\familyclaw-supervise.ps1
+    powershell -ExecutionPolicy Bypass -File .\scripts\familyclaw-family-launcher.ps1 `
+        -Manifest "$env:USERPROFILE\.config\familyclaw\family.manifest.json" `
+        -SuperviseScript .\ops\familyclaw-supervise.ps1
 
 .EXAMPLE
     # Launch only two members:

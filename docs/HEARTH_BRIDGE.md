@@ -21,7 +21,7 @@ It is the **wrong** default for the family's own shared Hearth
 quarantine-flavored pipeline as an unknown OpenClaw/Hermes export is lossy
 (it drops which agent said what, when, and whether it was foundational) and
 mistrustful of data that has already earned trust by construction (it is
-the operator's own family, `mcp__family-bridge__family_memory_ingest`d over time —
+the operator's own agent set, ingested over time —
 not scraped from an external system).
 
 ## What was built (v1 — memories, non-lossy, opt-in)

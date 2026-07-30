@@ -25,9 +25,9 @@ branches once on `channel_kind` (`"none" | "discord" | "telegram"`) and
 builds exactly one `Box<dyn Channel>` for the whole process. So today:
 
 - Multiple agents, **one** channel kind, one process: works.
-- Multiple **channel kinds** (e.g. agent_alpha on Discord + agent_alpha on Telegram) in
+- Multiple **channel kinds** (e.g. one agent on Discord + the same agent on Telegram) in
   one process: not supported — the gateway binds one channel per process.
-- Different family members each wanting a *different* channel (agent_beta on
+- Different agents each wanting a *different* channel (agent_beta on
   Telegram, agent_gamma on Discord) from **one** process: not supported for the
   same reason — `ChannelCfg` is a singleton, not a list.
 
@@ -90,14 +90,14 @@ between agents, and observability — see below.
   (`familyclaw_agent="agent_beta"`) so "the whole family is healthy" doesn't
   collapse into one boolean that hides a single dead member.
 - **Blast radius.** One process crash currently takes down one
-  channel/agent pair. Unify five members into one process and a single
+  channel/agent pair. Unify several agents into one process and a single
   panic (unwrap on a bad payload from any one channel) takes down the
   whole family at once — the exact "silent death" failure mode
   `ops/AUTOSTART.md` / the per-agent watcher script were built to catch,
   reintroduced at a bigger blast radius. This needs either
   `catch_unwind` isolation per channel task or an explicit acceptance
   that process unification trades isolation for operational simplicity —
-  a decision for the operator/the family, not an implementation detail.
+  a decision for the operator, not an implementation detail.
 
 ## Recommended path (not started)
 

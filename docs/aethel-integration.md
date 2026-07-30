@@ -9,7 +9,7 @@ payment, self-modification) unless a policy has verified it first.
 
 ## 1. The two systems, in one sentence each
 
-- **Aethel** (`C:\Users\operator\aethel`, v0.3 alpha) is a deterministic,
+- **Aethel** (`<AETHEL_HOME>`, v0.3 alpha) is a deterministic,
   compile-time policy/type DSL. Its one invariant: a `Claim<T>` (untrusted,
   model-produced value) cannot be passed where an effect requires
   `Verified<T, Policy>`. `Verified` has **no public constructor** — it can only
@@ -17,13 +17,13 @@ payment, self-modification) unless a policy has verified it first.
   the exact verified type they accept
   (`fn execute(a: Verified<UserAction, RiskPolicy>)`), and a function must
   declare `uses EffectName` to call it (G2).
-- **FamilyClaw** (`E:\Familyclaw`, `crates/familyclaw-actions`) is the mature
+- **FamilyClaw** (this repository, `crates/familyclaw-actions`) is the mature
   ~11.8k-LOC runtime that actually executes work durably and exactly once
   (`observe → plan → approve → execute → verify → proof → remember → report`).
 
 Aethel's own README states the intended stack explicitly:
 
-> *agent_alpha OS chooses **why** work is done / Aethel decides **what may be done and
+> *The orchestrating agent OS chooses **why** work is done / Aethel decides **what may be done and
 > what proof is required** / FamilyClaw **executes** approved work durably and
 > exactly once.*
 
@@ -196,7 +196,7 @@ HumanApproval>)`, an agent `Claim<ActionRequest>`, and a `HumanApproval` policy
 whose evidence mirrors `approval.rs` (payload-bound, single-use, TTL).
 
 ```sh
-AETHEL_CLI=/c/Users/operator/aethel/target/release/aethel-cli.exe
+AETHEL_CLI="$AETHEL_HOME/target/release/aethel-cli"   # .exe on Windows
 
 $AETHEL_CLI check docs/aethel/familyclaw_action.aet
 # ✓ docs/aethel/familyclaw_action.aet type checks            (exit 0)

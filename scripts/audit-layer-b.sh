@@ -181,8 +181,18 @@ echo "8️⃣ Checking for real Layer B names in publishable content..."
 # scanned by default. Empty files match nothing and carry no content, so skipping
 # them is safe.
 #
-# An explicit deny-list excludes legitimately-public files that mention agent
-# names only as escaped/example tokens (e.g. *.example). scripts/pre-publish-scan.sh
+# ── 2026-07-30: the blanket `*.example*` exclusion is GONE ─────────────────
+# This list used to drop EVERY path matching `\.example($|\.)` on the theory
+# that example files mention agent names only as harmless sample tokens. It
+# did not hold: `scripts/family.manifest.example.json` sat in that blind spot
+# carrying the operator's complete real agent roster, tracked and publishable,
+# invisible to this audit for its entire existence. Example files are now
+# scanned like everything else. Genuine sample identifiers are still allowed —
+# but by CONTENT (`agent_alpha`…`agent_epsilon` below), which is a claim the
+# audit can actually check, rather than by filename, which is a promise it
+# cannot.
+#
+# An explicit deny-list excludes legitimately-public files. scripts/pre-publish-scan.sh
 # is excluded for the same reason this file excludes itself below: it embeds
 # the SAME tracked placeholder fallback list this file does (both scripts
 # resolve real names from the same gitignored local file; without it, both
@@ -196,7 +206,6 @@ ALL_TRACKED=$(git ls-files 2>/dev/null \
     | grep -vE '(^|/)(target)/' \
     | grep -vE '(^|/)docs/archive/' \
     | grep -vE '(^|/)docs/GIT_CONSOLIDATION\.md$' \
-    | grep -vE '\.example($|\.)' \
     | grep -vE '(^|/)scripts/audit-layer-b\.sh$' \
     | grep -vE '(^|/)scripts/pre-publish-scan\.sh$' || true)
 # Keep only TEXT files (content-based, no extension guessing). Iterate safely

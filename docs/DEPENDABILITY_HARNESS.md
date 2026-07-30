@@ -2,7 +2,7 @@
 
 **Status:** Accepted architecture / implementation in progress
 **Branch:** `feat/dependability-harness-v1`
-**Owner:** agent_alpha + FamilyClaw
+**Owner:** FamilyClaw maintainers
 **Scope:** Layer A, model- and provider-agnostic
 
 ## 1. Product decision

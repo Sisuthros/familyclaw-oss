@@ -19,7 +19,7 @@ config (e.g. `gpt-4o`, `gpt-4o-mini`, most modern OpenAI-compatible vision
 endpoints) could never actually receive an image through this crate, even
 though the wire format (`chat/completions`) has supported multimodal
 `content` for a long time. Agents that can *see* a screenshot, a photo sent
-in a channel, or a generated image are a real family use case (agent_alpha's
+in a channel, or a generated image are a real deployment use case (the agent's
 vision/computer-use work, `skills/vision-action`) but the LLM client itself
 was text-only.
 
@@ -159,7 +159,7 @@ Slack photo message, a WhatsApp image) into an `LlmImageRef`. The
 the `agent`/`live_executor` turn-building code
 (`live_executor.rs::build_messages`, `agent/mod.rs`) would need to read it
 and call `LlmMessage::user(text).with_images(...)`. This is the piece that
-actually makes "someone sends agent_alpha a photo" work end-to-end; today only
+actually makes "someone sends the agent a photo" work end-to-end; today only
 the LLM-client layer understands images, nothing upstream produces them.
 
 ### 4. Size / count limits and cost guardrails
