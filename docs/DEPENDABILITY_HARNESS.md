@@ -243,7 +243,8 @@ Each case must assert both positive behavior and the **absence** of forbidden si
 - canonical architecture and policy,
 - neutral receipt/gate crate,
 - tests proving invalid identity plus missing, weak and failed evidence block,
-- regression: non-durable approval suspend fails closed **and rolls back the orphan approval**.
+- approval consumption order is fixed: pending check + resumable write share the `ActionRuntime` lock, and chat approval loads durable continuation state before consuming the single-use approval,
+- regression: non-durable approval suspend fails closed; rollback writes a dispatch-outbox quarantine before pending cleanup, so even a tombstone failure cannot execute the orphan approval.
 
 ### P1 — Action adapter (**baseline implemented; enforcement pending**)
 
@@ -271,7 +272,7 @@ Remaining:
 
 - durable receipt journal with integrity chain,
 - receipt replay/read-back,
-- suspend/resume persistence becomes fail-closed,
+- attach existing fail-closed suspend/resume outcomes and quarantine evidence to recovery receipts,
 - crash-boundary evals emit receipts.
 
 ### P4 — Operator surface
