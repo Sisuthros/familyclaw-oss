@@ -1925,7 +1925,10 @@ async fn tool_loop_config_default_and_override() {
 // ---- 1C suspend/resume bridge (roadmap §6) -----------------------------
 
 use crate::resumable::{InMemoryResumableStore, JournalResumableStore, ResumableTurnStore};
-use familyclaw_actions::{DangerousToolRateLimiter, JournalPendingStore, PendingApprovalStore};
+use familyclaw_actions::{
+    DangerousToolRateLimiter, InMemoryPendingStore, JournalPendingStore, PendingApprovalStore,
+    PendingRecord,
+};
 
 /// RAII temp directory for durable-surface writes (no external crates).
 /// Provides two file paths: the pending and resumable journals.
@@ -1993,6 +1996,619 @@ fn counting_runtime_with_pending(
     rt.register_skill(CountingApprovalSkill::new(count))
         .expect("register counting approval_skill");
     StdArc::new(TokioMutex::new(rt))
+}
+
+/// Resumable store that deterministically rejects writes. Read-side methods
+/// stay healthy so a test failure can only come from the durability boundary.
+#[derive(Debug, Default)]
+struct FailingPutResumableStore;
+
+impl ResumableTurnStore for FailingPutResumableStore {
+    fn put(&self, _turn: ResumableTurn) -> crate::resumable::Result<()> {
+        Err(crate::resumable::ResumableError::Journal(
+            "injected put failure".to_string(),
+        ))
+    }
+
+    fn get(&self, _approval_id: ApprovalId) -> crate::resumable::Result<Option<ResumableTurn>> {
+        Ok(None)
+    }
+
+    fn remove(&self, _approval_id: ApprovalId) -> crate::resumable::Result<Option<ResumableTurn>> {
+        Ok(None)
+    }
+
+    fn len(&self) -> crate::resumable::Result<usize> {
+        Ok(0)
+    }
+
+    fn evict_expired(&self, _now: Timestamp) -> crate::resumable::Result<usize> {
+        Ok(0)
+    }
+}
+
+/// Store that accepts the initial suspend and rejects the next chained
+/// suspend. This isolates the continuation durability boundary.
+#[derive(Debug, Default)]
+struct FailOnSecondPutResumableStore {
+    inner: InMemoryResumableStore,
+    puts: std::sync::atomic::AtomicUsize,
+}
+
+impl ResumableTurnStore for FailOnSecondPutResumableStore {
+    fn put(&self, turn: ResumableTurn) -> crate::resumable::Result<()> {
+        let call = self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if call == 2 {
+            return Err(crate::resumable::ResumableError::Journal(
+                "injected second put failure".to_string(),
+            ));
+        }
+        self.inner.put(turn)
+    }
+
+    fn get(&self, approval_id: ApprovalId) -> crate::resumable::Result<Option<ResumableTurn>> {
+        self.inner.get(approval_id)
+    }
+
+    fn remove(&self, approval_id: ApprovalId) -> crate::resumable::Result<Option<ResumableTurn>> {
+        self.inner.remove(approval_id)
+    }
+
+    fn len(&self) -> crate::resumable::Result<usize> {
+        self.inner.len()
+    }
+
+    fn evict_expired(&self, now: Timestamp) -> crate::resumable::Result<usize> {
+        self.inner.evict_expired(now)
+    }
+}
+
+/// Pending store that keeps the record live when removal fails. This models
+/// a durable tombstone write failure: rollback must still prevent the live
+/// record from authorizing a side effect through another approval surface.
+#[derive(Debug, Default)]
+struct FailingRemovePendingStore {
+    inner: InMemoryPendingStore,
+}
+
+impl PendingApprovalStore for FailingRemovePendingStore {
+    fn insert(&self, record: PendingRecord) -> familyclaw_actions::Result<()> {
+        self.inner.insert(record)
+    }
+
+    fn get(&self, approval_id: ApprovalId) -> familyclaw_actions::Result<Option<PendingRecord>> {
+        self.inner.get(approval_id)
+    }
+
+    fn remove(
+        &self,
+        _approval_id: ApprovalId,
+    ) -> familyclaw_actions::Result<Option<PendingRecord>> {
+        Err(familyclaw_actions::ActionError::Proof(
+            "injected pending tombstone failure".to_string(),
+        ))
+    }
+
+    fn len(&self) -> familyclaw_actions::Result<usize> {
+        self.inner.len()
+    }
+
+    fn list(&self) -> familyclaw_actions::Result<Vec<PendingRecord>> {
+        self.inner.list()
+    }
+
+    fn evict_expired(&self, now: Timestamp) -> familyclaw_actions::Result<usize> {
+        self.inner.evict_expired(now)
+    }
+}
+
+/// Resumable store that writes the record, announces its id, and then blocks
+/// until the test releases it. This exposes the exact check/put/approve
+/// interleaving without sleeps inside production code.
+#[derive(Debug)]
+struct BlockingPutResumableStore {
+    inner: InMemoryResumableStore,
+    entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<ApprovalId>>>,
+    release: StdArc<AtomicBool>,
+}
+
+impl BlockingPutResumableStore {
+    fn new(entered: std::sync::mpsc::Sender<ApprovalId>, release: StdArc<AtomicBool>) -> Self {
+        Self {
+            inner: InMemoryResumableStore::new(),
+            entered: std::sync::Mutex::new(Some(entered)),
+            release,
+        }
+    }
+}
+
+impl ResumableTurnStore for BlockingPutResumableStore {
+    fn put(&self, turn: crate::resumable::ResumableTurn) -> crate::resumable::Result<()> {
+        let approval_id = turn.approval_id;
+        self.inner.put(turn)?;
+        if let Some(sender) = self
+            .entered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = sender.send(approval_id);
+        }
+        while !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
+    fn get(
+        &self,
+        approval_id: ApprovalId,
+    ) -> crate::resumable::Result<Option<crate::resumable::ResumableTurn>> {
+        self.inner.get(approval_id)
+    }
+
+    fn remove(
+        &self,
+        approval_id: ApprovalId,
+    ) -> crate::resumable::Result<Option<crate::resumable::ResumableTurn>> {
+        self.inner.remove(approval_id)
+    }
+
+    fn len(&self) -> crate::resumable::Result<usize> {
+        self.inner.len()
+    }
+
+    fn evict_expired(&self, now: Timestamp) -> crate::resumable::Result<usize> {
+        self.inner.evict_expired(now)
+    }
+}
+
+/// A turn must not report a recoverable suspension if its resume state never
+/// became durable. Returning `Suspended` here would create a false-success
+/// control state: the operator could approve it, but no continuation exists.
+#[tokio::test]
+async fn suspend_fails_closed_when_resumable_state_cannot_be_persisted() {
+    let bus = ResonanceBus::start(None).await.expect("bus");
+    let api = spawn_scripted_llm(vec![body_tool_call(
+        "call_approve",
+        "approval_skill",
+        &serde_json::json!({ "q": "do-it" }),
+    )])
+    .await;
+    let store: StdArc<dyn ResumableTurnStore> = StdArc::new(FailingPutResumableStore);
+    let runtime = approval_runtime();
+    let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(store);
+
+    let err = agent
+        .think(&BusMessage::text("aja hyväksyntä-työkalu"))
+        .await
+        .expect_err("non-durable suspension must fail closed");
+
+    assert!(
+        err.to_string().contains("resumable persist failed"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        runtime
+            .lock()
+            .await
+            .try_pending_approvals()
+            .expect("pending list")
+            .is_empty(),
+        "failed persistence must roll back the orphan approval"
+    );
+    bus.stop();
+}
+
+/// The pending check and resumable write share the same ActionRuntime lock as
+/// approval consumption. A direct approval attempt cannot execute while the
+/// durable write is still in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_waits_until_resumable_write_finishes() {
+    struct ReleaseOnDrop(StdArc<AtomicBool>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    let bus = ResonanceBus::start(None).await.expect("bus");
+    let api = spawn_scripted_llm(vec![body_tool_call(
+        "call_approve",
+        "approval_skill",
+        &serde_json::json!({ "q": "do-it" }),
+    )])
+    .await;
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let release = StdArc::new(AtomicBool::new(false));
+    let _release_guard = ReleaseOnDrop(StdArc::clone(&release));
+    let store: StdArc<dyn ResumableTurnStore> = StdArc::new(BlockingPutResumableStore::new(
+        entered_tx,
+        StdArc::clone(&release),
+    ));
+    let count = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runtime =
+        counting_runtime_with_pending(Box::new(InMemoryPendingStore::new()), StdArc::clone(&count));
+    let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(StdArc::clone(&store));
+
+    let think_task = tokio::spawn(async move {
+        agent
+            .think(&BusMessage::text("aja hyväksyntä-työkalu"))
+            .await
+    });
+    let approval_id = tokio::task::spawn_blocking(move || {
+        entered_rx.recv_timeout(std::time::Duration::from_secs(2))
+    })
+    .await
+    .expect("put entry observer joins")
+    .expect("resumable put entered");
+
+    let approve_runtime = StdArc::clone(&runtime);
+    let mut approve_task = tokio::spawn(async move {
+        approve_runtime
+            .lock()
+            .await
+            .approve(approval_id, time::now())
+            .await
+    });
+    let early = tokio::time::timeout(std::time::Duration::from_millis(75), &mut approve_task).await;
+    let approve_was_blocked = early.is_err();
+    let count_while_write_blocked = count.load(std::sync::atomic::Ordering::SeqCst);
+
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+    let suspended = think_task
+        .await
+        .expect("think task joins")
+        .expect("suspend succeeds after write release");
+    let approve_result = match early {
+        Ok(joined) => joined,
+        Err(_) => approve_task.await,
+    }
+    .expect("approval task joins");
+    approve_result.expect("approval executes after durable write");
+
+    assert!(
+        approve_was_blocked,
+        "approval must wait for the resumable write to release the runtime lock"
+    );
+    assert_eq!(
+        count_while_write_blocked, 0,
+        "side effect must not run while continuation persistence is in flight"
+    );
+    assert!(
+        matches!(
+            suspended,
+            ThinkOutcome::Suspended {
+                approval_id: id,
+                ..
+            } if id == approval_id
+        ),
+        "turn must suspend with the persisted approval id"
+    );
+    assert!(
+        store.get(approval_id).expect("get resumable").is_some(),
+        "continuation must exist before approval execution is released"
+    );
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "approval executes exactly once after durable write completion"
+    );
+    bus.stop();
+}
+
+/// Rollback is idempotent when an operator denial wins the race after the
+/// pending approval was created but before persistence compensation runs.
+/// A missing pending record means the permission is already closed; any
+/// partial resumable record must still be tombstoned.
+#[tokio::test]
+async fn rollback_cleans_resumable_when_operator_denied_first() {
+    let bus = ResonanceBus::start(None).await.expect("bus");
+    let api = spawn_scripted_llm(vec![body_tool_call(
+        "call_approve",
+        "approval_skill",
+        &serde_json::json!({ "q": "do-it" }),
+    )])
+    .await;
+    let store: StdArc<dyn ResumableTurnStore> = StdArc::new(InMemoryResumableStore::new());
+    let runtime = approval_runtime();
+    let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(StdArc::clone(&store));
+
+    let suspended = agent
+        .think(&BusMessage::text("aja hyväksyntä-työkalu"))
+        .await
+        .expect("suspend persists");
+    let approval_id = match suspended {
+        ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+        other => panic!("expected suspension, got: {other:?}"),
+    };
+    assert!(
+        store.get(approval_id).expect("get resumable").is_some(),
+        "fixture must contain the resumable record"
+    );
+
+    let now = time::now();
+    runtime
+        .lock()
+        .await
+        .deny_pending(approval_id, now)
+        .await
+        .expect("operator denial closes permission first");
+
+    let cleanup_error = agent
+        .rollback_non_durable_suspend(&runtime, approval_id, now)
+        .await;
+
+    assert!(
+        cleanup_error.is_none(),
+        "already-denied approval is an idempotent rollback success: {cleanup_error:?}"
+    );
+    assert!(
+        store
+            .get(approval_id)
+            .expect("get after rollback")
+            .is_none(),
+        "rollback must remove a possibly-partial resumable even when approval was already closed"
+    );
+    bus.stop();
+}
+
+/// Even if the pending-store tombstone cannot be written, compensation must
+/// quarantine the approval before returning. A direct approval attempt must
+/// fail closed and the executor must remain untouched.
+#[tokio::test]
+async fn rollback_blocks_side_effect_when_pending_remove_fails() {
+    let bus = ResonanceBus::start(None).await.expect("bus");
+    let api = spawn_scripted_llm(vec![body_tool_call(
+        "call_approve",
+        "approval_skill",
+        &serde_json::json!({ "q": "do-it" }),
+    )])
+    .await;
+    let store: StdArc<dyn ResumableTurnStore> = StdArc::new(InMemoryResumableStore::new());
+    let count = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runtime = counting_runtime_with_pending(
+        Box::new(FailingRemovePendingStore::default()),
+        StdArc::clone(&count),
+    );
+    let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(StdArc::clone(&store));
+
+    let suspended = agent
+        .think(&BusMessage::text("aja hyväksyntä-työkalu"))
+        .await
+        .expect("suspend persists");
+    let approval_id = match suspended {
+        ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+        other => panic!("expected suspension, got: {other:?}"),
+    };
+
+    let now = time::now();
+    let cleanup_error = agent
+        .rollback_non_durable_suspend(&runtime, approval_id, now)
+        .await;
+    assert!(
+        cleanup_error
+            .as_deref()
+            .is_some_and(|error| error.contains("approval rollback failed")),
+        "tombstone failure must stay visible: {cleanup_error:?}"
+    );
+    assert!(
+        store
+            .get(approval_id)
+            .expect("get after rollback")
+            .is_none(),
+        "resumable cleanup must still be attempted"
+    );
+
+    let approve_error = runtime
+        .lock()
+        .await
+        .approve(approval_id, now)
+        .await
+        .expect_err("quarantined approval must not execute");
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "rollback failure must never authorize a side effect"
+    );
+    assert!(
+        matches!(
+            approve_error,
+            familyclaw_actions::ActionError::PolicyDenied(_)
+                | familyclaw_actions::ActionError::ExecutionFailed(_)
+                | familyclaw_actions::ActionError::Proof(_)
+        ),
+        "unexpected approval error: {approve_error}"
+    );
+    bus.stop();
+}
+
+/// The production turn path uses the durable tool loop rather than
+/// `think()` directly. It must not expose an approval command, record a
+/// suspended outcome, or leave a pending approval when the matching
+/// continuation was never persisted.
+#[tokio::test]
+async fn durable_turn_does_not_advertise_unpersisted_approval() {
+    let bus = ResonanceBus::start(None).await.expect("bus");
+    let api = spawn_scripted_llm(vec![body_tool_call(
+        "call_approve",
+        "approval_skill",
+        &serde_json::json!({ "q": "do-it" }),
+    )])
+    .await;
+    let store: StdArc<dyn ResumableTurnStore> = StdArc::new(FailingPutResumableStore);
+    let runtime = approval_runtime();
+    let (sink, mut rx) = new_reply_channel();
+    let mut agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(store)
+        .with_reply_sink(sink)
+        .with_reply_target("test:dependability");
+
+    let outcome = agent
+        .handle_turn(BeingId::new(), &BusMessage::text("aja hyväksyntä-työkalu"))
+        .await
+        .expect("turn contains the failure and stays operational");
+
+    assert!(
+        !outcome.summary.contains("suspended(approval="),
+        "non-durable approval must not be recorded as suspended: {}",
+        outcome.summary
+    );
+    let reply = rx.try_recv().expect("fail-closed recovery reply");
+    assert!(
+        !reply.body.contains("APPROVE") && !reply.body.contains("/approvals/"),
+        "operator must not receive an unusable approval command: {}",
+        reply.body
+    );
+    assert!(
+        runtime
+            .lock()
+            .await
+            .try_pending_approvals()
+            .expect("pending list")
+            .is_empty(),
+        "production persist failure must roll back the orphan approval"
+    );
+    bus.stop();
+}
+
+/// A failed production suspend must not leave durable think/suspend markers.
+/// Those markers would advance the replay cursor on restart and let a later
+/// run advertise Suspended without a recoverable continuation.
+#[tokio::test]
+async fn durable_turn_persist_failure_leaves_no_false_suspend_journal_markers() {
+    let dir = TempDir::new("false-suspend-journal");
+    let journal_path = dir.0.join("agent.journal.jsonl");
+    let mem_path = dir.0.join("memory.json");
+    let memory: ErasedMemoryStore =
+        Arc::new(LocalJsonStore::open(&mem_path).await.expect("open mem"));
+    let bus = ResonanceBus::start(None).await.expect("bus");
+    let api = spawn_scripted_llm(vec![body_tool_call(
+        "call_approve",
+        "approval_skill",
+        &serde_json::json!({ "q": "do-it" }),
+    )])
+    .await;
+    let store: StdArc<dyn ResumableTurnStore> = StdArc::new(FailingPutResumableStore);
+    let runtime = approval_runtime();
+    let (sink, mut rx) = new_reply_channel();
+    let mut agent = agent_over_file_journal("agent_a", bus.clone(), &api, &journal_path, memory)
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(store)
+        .with_reply_sink(sink)
+        .with_reply_target("test:dependability");
+
+    let outcome = agent
+        .handle_turn(BeingId::new(), &BusMessage::text("aja hyväksyntä-työkalu"))
+        .await
+        .expect("turn stays operational");
+
+    assert!(
+        !outcome.summary.contains("suspended(approval="),
+        "non-durable approval must not be recorded as suspended: {}",
+        outcome.summary
+    );
+    let reply = rx.try_recv().expect("fail-closed recovery reply");
+    assert!(
+        !reply.body.contains("APPROVE") && !reply.body.contains("/approvals/"),
+        "operator must not receive an unusable approval command: {}",
+        reply.body
+    );
+    assert!(
+        runtime
+            .lock()
+            .await
+            .try_pending_approvals()
+            .expect("pending list")
+            .is_empty(),
+        "production persist failure must roll back the orphan approval"
+    );
+
+    let journal_text = std::fs::read_to_string(&journal_path).expect("read journal");
+    assert!(
+        !journal_text.contains("turn-0-think"),
+        "failed suspend must not journal empty think before durable continuation: {journal_text}"
+    );
+    assert!(
+        !journal_text.contains("turn-0-suspend"),
+        "failed suspend must not journal a suspend marker: {journal_text}"
+    );
+    bus.stop();
+}
+
+/// A chained approval created during resume has the same durability contract
+/// as the initial suspend. The already-approved side effect may have run, but
+/// the continuation must not claim `Suspended` when its new resume state was
+/// not persisted.
+#[tokio::test]
+async fn chained_suspend_fails_closed_when_resumable_state_cannot_be_persisted() {
+    let bus = ResonanceBus::start(None).await.expect("bus");
+    let api = spawn_scripted_llm(vec![
+        body_tool_call(
+            "call_approve_1",
+            "approval_skill",
+            &serde_json::json!({ "q": "first" }),
+        ),
+        body_tool_call(
+            "call_approve_2",
+            "approval_skill",
+            &serde_json::json!({ "q": "second" }),
+        ),
+    ])
+    .await;
+    let store: StdArc<dyn ResumableTurnStore> =
+        StdArc::new(FailOnSecondPutResumableStore::default());
+    let count = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runtime = counting_runtime_with_pending(
+        Box::new(familyclaw_actions::InMemoryPendingStore::new()),
+        StdArc::clone(&count),
+    );
+    let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(store);
+
+    let initial = agent
+        .think(&BusMessage::text("aloita kaksivaiheinen hyväksyntä"))
+        .await
+        .expect("initial suspend persists");
+    let first_approval = match initial {
+        ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+        other => panic!("expected initial suspension, got: {other:?}"),
+    };
+
+    let err = agent
+        .resume_approved(first_approval, time::now())
+        .await
+        .expect_err("non-durable chained suspension must fail closed");
+
+    assert!(
+        err.to_string().contains("resumable persist failed"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the first approved action executes exactly once"
+    );
+    assert!(
+        runtime
+            .lock()
+            .await
+            .try_pending_approvals()
+            .expect("pending list")
+            .is_empty(),
+        "failed chained persistence must roll back the orphan approval"
+    );
+    bus.stop();
 }
 
 /// (a) **Suspend persists the resumable turn.** When the tool loop
@@ -2270,6 +2886,81 @@ async fn resume_signal_routes_to_reply_sink() {
     assert!(
         store.get(approval_id).expect("get").is_none(),
         "resumable turn consumed after resume signal"
+    );
+    bus.stop();
+}
+
+/// The chat-level APPROVE command must delegate to the resumable bridge
+/// instead of consuming the approval first. Pre-consuming would execute the
+/// action but make `resume_approved` reject the same single-use approval,
+/// leaving the continuation stranded without its final reply.
+#[tokio::test]
+async fn operator_approve_command_consumes_once_and_resumes() {
+    const OWNER_ENV: &str = "FAMILYCLAW_OWNER_ID";
+    let bus = ResonanceBus::start(None).await.expect("bus");
+    let api = spawn_scripted_llm(vec![
+        body_tool_call(
+            "call_approve",
+            "approval_skill",
+            &serde_json::json!({ "q": "ship" }),
+        ),
+        body_text("hyväksytty toiminto valmis"),
+    ])
+    .await;
+    let store: StdArc<dyn ResumableTurnStore> = StdArc::new(InMemoryResumableStore::new());
+    let count = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runtime =
+        counting_runtime_with_pending(Box::new(InMemoryPendingStore::new()), StdArc::clone(&count));
+    let (sink, mut rx) = new_reply_channel();
+    let origin = familyclaw_bus::MessageOrigin::new("discord-main", "general-8", "42");
+    let mut agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(StdArc::clone(&store))
+        .with_reply_sink(sink);
+
+    let suspended = agent
+        .think_with_origin(&BusMessage::text("ship it"), Some(&origin))
+        .await
+        .expect("suspend ok");
+    let approval_id = match suspended {
+        ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+        other => panic!("expected suspension, got: {other:?}"),
+    };
+
+    let command = BusMessage::text(format!("APPROVE {approval_id}"));
+    let command_outcome = {
+        let _owner = HistoryEnvVarGuard::set(OWNER_ENV, "42");
+        agent
+            .handle_turn_with_origin(BeingId::new(), &command, Some(&origin))
+            .await
+            .expect("approval command handled")
+    };
+
+    assert!(command_outcome.summary.contains("APPROVE OK"));
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the approved side effect executes exactly once"
+    );
+    let first = rx.try_recv().expect("continuation reply routed");
+    let second = rx.try_recv().expect("approval acknowledgement routed");
+    assert_eq!(first.target, "general-8");
+    assert_eq!(second.target, "general-8");
+    let bodies = [first.body.as_str(), second.body.as_str()];
+    assert!(bodies.contains(&"hyväksytty toiminto valmis"));
+    assert!(bodies.iter().any(|body| body.contains("APPROVE OK")));
+    assert!(
+        store.get(approval_id).expect("get").is_none(),
+        "resumable state is consumed after successful continuation"
+    );
+    assert!(
+        runtime
+            .lock()
+            .await
+            .try_pending_approvals()
+            .expect("pending approvals readable")
+            .is_empty(),
+        "approval is consumed exactly once"
     );
     bus.stop();
 }
@@ -3172,6 +3863,7 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
 
     let dir = TempDir::new("crash-replay");
     let journal_path = dir.0.join("agent.journal.jsonl");
+    let resumable_path = dir.0.join("resumable.jsonl");
     // Shared memory on disk, so turn_key dedup also works across a rebuild.
     let mem_path = dir.0.join("memory.json");
     let memory: ErasedMemoryStore =
@@ -3203,6 +3895,8 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
             StdArc::clone(&auto_count),
             StdArc::clone(&approval_count),
         );
+        let resumable: StdArc<dyn ResumableTurnStore> =
+            StdArc::new(JournalResumableStore::open(&resumable_path).expect("resumable 1"));
         let mut agent = agent_over_file_journal(
             "agent_a",
             bus.clone(),
@@ -3210,7 +3904,8 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
             &journal_path,
             StdArc::clone(&memory),
         )
-        .with_actions(StdArc::clone(&runtime));
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(StdArc::clone(&resumable));
 
         let outcome = agent
             .handle_turn(BeingId::new(), &BusMessage::text("aja kaksi työkalua"))
@@ -3241,6 +3936,13 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
         // Also capture the journaled DispatchRecord of the first dispatch.
         dispatch0_record_orig = extract_dispatch_record(&journal_text, "turn-0-dispatch-0")
             .expect("turn-0-dispatch-0 record present in journal");
+        assert!(
+            resumable
+                .get(approval_id_orig)
+                .expect("get resumable")
+                .is_some(),
+            "production-shaped replay requires a durable continuation surface"
+        );
 
         bus.stop();
         // agent/runtime/bus are DROPPED = "the process crashes".
@@ -3261,6 +3963,8 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
             StdArc::clone(&auto_count),
             StdArc::clone(&approval_count),
         );
+        let resumable: StdArc<dyn ResumableTurnStore> =
+            StdArc::new(JournalResumableStore::open(&resumable_path).expect("resumable 2"));
         let mut agent = agent_over_file_journal(
             "agent_a",
             bus.clone(),
@@ -3268,11 +3972,19 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
             &journal_path,
             StdArc::clone(&memory),
         )
-        .with_actions(StdArc::clone(&runtime));
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(StdArc::clone(&resumable));
         // The context is in replay mode (the log has the earlier turn's steps).
         assert!(
             agent.durable.is_replaying(),
             "rebuild näkee aiemman vuoron askeleet → replay-tila"
+        );
+        assert!(
+            resumable
+                .get(approval_id_orig)
+                .expect("get resumable after restart")
+                .is_some(),
+            "durable continuation must survive restart for honest Suspended replay"
         );
 
         let outcome = agent
@@ -3341,6 +4053,8 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
             StdArc::clone(&auto_count),
             StdArc::clone(&approval_count),
         );
+        let resumable: StdArc<dyn ResumableTurnStore> =
+            StdArc::new(JournalResumableStore::open(&resumable_path).expect("resumable 3"));
         let mut agent = agent_over_file_journal(
             "agent_a",
             bus.clone(),
@@ -3348,7 +4062,8 @@ async fn crash_replay_tool_loop_is_deterministic_and_crash_safe() {
             &journal_path,
             StdArc::clone(&memory),
         )
-        .with_actions(StdArc::clone(&runtime));
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(StdArc::clone(&resumable));
         assert!(
             agent.durable.is_replaying(),
             "katkaistu journal → replay-tila"

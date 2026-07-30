@@ -1220,6 +1220,93 @@ impl ActionRuntime {
         Ok(())
     }
 
+    /// Quarantines an approval whose agent continuation could not be made
+    /// durable, then best-effort removes the pending record and cancels its
+    /// task.
+    ///
+    /// The quarantine is written to the approval dispatch outbox **before**
+    /// touching the pending store. Therefore a pending tombstone failure
+    /// cannot leave an executable approval: every later [`approve`](Self::approve)
+    /// observes either an in-progress or committed-error outbox record and
+    /// stops before the executor. With durable stores this fail-closed marker
+    /// survives restart.
+    ///
+    /// Missing pending state is idempotent success. Cleanup errors are
+    /// combined after all independent steps have been attempted.
+    ///
+    /// # Errors
+    /// Returns a fail-closed [`ActionError`] when an outbox, pending-store,
+    /// task-transition, or snapshot operation fails. A returned error never
+    /// authorizes the action.
+    pub async fn abort_pending_after_continuation_failure(
+        &mut self,
+        approval_id: ApprovalId,
+        now: Timestamp,
+    ) -> Result<()> {
+        const QUARANTINE_REASON: &str =
+            "approval blocked: matching continuation was not persisted durably";
+        let key = Self::approval_dispatch_key(approval_id);
+        let mut errors = Vec::new();
+
+        match self.dispatch_outbox.lookup(&key) {
+            Ok(DispatchLookup::NotStarted) => {
+                if let Err(error) = self.dispatch_outbox.record_intent(&key) {
+                    errors.push(format!("approval quarantine intent failed: {error}"));
+                } else if let Err(error) = self
+                    .dispatch_outbox
+                    .record_committed(&key, &DispatchedOutcome::from_error(QUARANTINE_REASON))
+                {
+                    // Intent-only is still fail-closed in `approve`; retain the
+                    // error so operators know the durable terminal marker failed.
+                    errors.push(format!("approval quarantine commit failed: {error}"));
+                }
+            }
+            Ok(DispatchLookup::InProgress) => {
+                // Already fail-closed. This may be a prior quarantine whose
+                // terminal marker failed; never overwrite it with permission.
+            }
+            Ok(DispatchLookup::Committed(outcome)) => {
+                if outcome.error.as_deref() != Some(QUARANTINE_REASON) {
+                    errors.push(
+                        "approval dispatch was already committed before rollback".to_string(),
+                    );
+                }
+            }
+            Err(error) => errors.push(format!("approval quarantine lookup failed: {error}")),
+        }
+
+        let entry = match self.pending.get(approval_id) {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(format!("pending approval lookup failed: {error}"));
+                None
+            }
+        };
+        if let Some(entry) = entry {
+            match self.pending.remove(approval_id) {
+                Ok(_) => {
+                    if let Err(error) = self
+                        .pipeline
+                        .queue()
+                        .transition(entry.task_id, TaskStatus::Cancelled, now)
+                        .await
+                    {
+                        errors.push(format!("pending task cancel failed: {error}"));
+                    } else if let Err(error) = self.snapshot_task_if_durable(entry.task_id).await {
+                        errors.push(format!("pending task snapshot failed: {error}"));
+                    }
+                }
+                Err(error) => errors.push(format!("pending approval tombstone failed: {error}")),
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ActionError::PolicyDenied(errors.join("; ")))
+        }
+    }
+
     /// Returns the task's status by id; `None` if the task is not in the queue.
     pub async fn status(&self, task_id: ActionTaskId) -> Option<TaskStatus> {
         self.pipeline.queue().get(task_id).await.map(|t| t.status)

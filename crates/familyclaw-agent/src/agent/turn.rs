@@ -57,6 +57,8 @@ impl Agent {
     ///
     /// # Errors
     /// - [`FamilyClawError::Llm`] if the LLM call fails.
+    /// - [`FamilyClawError::Bus`] if an approval continuation cannot be
+    ///   persisted durably; the orphan approval is rolled back first.
     pub async fn think(&self, current_message: &BusMessage) -> Result<ThinkOutcome> {
         self.think_with_origin(current_message, None).await
     }
@@ -84,6 +86,8 @@ impl Agent {
     ///
     /// # Errors
     /// - [`FamilyClawError::Llm`] if the LLM call fails.
+    /// - [`FamilyClawError::Bus`] if an approval continuation cannot be
+    ///   persisted durably; the orphan approval is rolled back first.
     // A turn is one unified sequence (context â†’ tool loop â†’ result â†’
     // turn audit). TURN-AUDIT records (start/answered/suspend/max-iter)
     // pushed the line count slightly over the cap; splitting it would break
@@ -189,16 +193,13 @@ impl Agent {
                         )
                         .with_policy_snapshot(format!("tool '{tool}' requires human approval"))
                         .with_durable_position(self.turn_counter, 0);
-                        if let Err(e) = self.resumable.put(resumable) {
-                            // A persistence failure must not crash the turn,
-                            // but resume then won't succeed â†’ log as a warning.
-                            warn!(
-                                agent = self.config.name,
-                                %approval_id,
-                                error = %e,
-                                "resumable turn persist failed â€” resume will not be possible for this approval"
-                            );
-                        }
+                        self.persist_resumable_or_abort_pending(
+                            actions,
+                            approval_id,
+                            resumable,
+                            now,
+                        )
+                        .await?;
                         debug!(
                             agent = self.config.name,
                             tool = tool.as_str(),
@@ -929,12 +930,11 @@ impl Agent {
                 let id: ApprovalId = id_str.parse().map_err(|_| {
                     FamilyClawError::config(format!("invalid approval id: {id_str}"))
                 })?;
-                {
-                    let mut rt = actions.lock().await;
-                    rt.approve(id, now)
-                        .await
-                        .map_err(|e| FamilyClawError::bus(e.to_string()))?;
-                }
+                // `resume_approved` owns the only valid approval-consumption
+                // order: load durable resume state first, then consume and
+                // execute the single-use approval. Pre-consuming here would
+                // strand the continuation and could execute an orphaned
+                // approval that has no resumable state.
                 self.handle_resume_signal(&id.to_string(), now).await?;
                 Ok(Some(format!(
                     "APPROVE OK: {id} â€” resume signaali lÃ¤hetetty."
@@ -1183,16 +1183,17 @@ impl Agent {
                 tool_call_id,
                 arguments,
             } => {
-                // Close `-think` as empty, so the replay cursor stays aligned
-                // (suspend produces a separate `-suspend` entry below).
-                let _ = self
-                    .durable
-                    .step(&think_step, || Ok(String::new()))
-                    .map_err(|e| FamilyClawError::bus(format!("durable think step failed: {e}")))?;
-
-                // Persist the resumable turn (resume bridge) â€” only on a fresh
-                // run (on replay it was already persisted in the original run).
-                if !self.durable.is_replaying() {
+                // Continuation durability is the gate for advertising suspend.
+                // Do NOT journal `-think` first: an empty think row would advance
+                // the replay cursor past this point on restart, skip the put, and
+                // let a later run claim Suspended for an approval that was never
+                // made recoverable (or was already quarantined).
+                let already_persisted = self
+                    .resumable
+                    .get(approval_id)
+                    .map_err(|e| FamilyClawError::bus(format!("resumable lookup failed: {e}")))?
+                    .is_some();
+                if !already_persisted {
                     let expires_at = self
                         .pending_expiry_for(&actions, approval_id)
                         .await
@@ -1214,15 +1215,17 @@ impl Agent {
                     )
                     .with_policy_snapshot(format!("tool '{tool}' requires human approval"))
                     .with_durable_position(turn, 0);
-                    if let Err(e) = self.resumable.put(resumable) {
-                        warn!(
-                            agent = agent_name,
-                            %approval_id,
-                            error = %e,
-                            "resumable turn persist failed â€” resume will not be possible for this approval"
-                        );
-                    }
+                    self.persist_resumable_or_abort_pending(&actions, approval_id, resumable, now)
+                        .await?;
                 }
+
+                // Close `-think` as empty only after the continuation is durable,
+                // so the replay cursor stays aligned with a real suspend.
+                let _ = self
+                    .durable
+                    .step(&think_step, || Ok(String::new()))
+                    .map_err(|e| FamilyClawError::bus(format!("durable think step failed: {e}")))?;
+
                 record_turn_audit_into(
                     audit,
                     turn_id,
@@ -1231,7 +1234,7 @@ impl Agent {
                     format!("suspended awaiting approval {approval_id}: {redacted_summary}"),
                 );
                 // `-suspend` entry (same format as the single-shot path):
-                // "<approval_id>|<redacted_summary>" â€” no raw payload.
+                // "<approval_id>|<redacted_summary>" — no raw payload.
                 let suspend_step = format!("turn-{turn}-suspend");
                 let payload = format!("{approval_id}|{redacted_summary}");
                 if let Err(e) = self.durable.step(&suspend_step, {
@@ -1619,6 +1622,113 @@ impl Agent {
         rt.pending_expiry_for(approval_id)
     }
 
+    /// Best-effort compensation while the caller already owns the action
+    /// runtime lock. The durable outbox quarantine is written before pending
+    /// cleanup, then any possibly-partial resumable record is removed.
+    async fn rollback_non_durable_suspend_locked(
+        &self,
+        runtime: &mut ActionRuntime,
+        approval_id: ApprovalId,
+        now: Timestamp,
+    ) -> Option<String> {
+        let approval_error = runtime
+            .abort_pending_after_continuation_failure(approval_id, now)
+            .await
+            .err()
+            .map(|error| format!("approval rollback failed: {error}"));
+        let resumable_error = self
+            .resumable
+            .remove(approval_id)
+            .err()
+            .map(|error| format!("resumable cleanup failed: {error}"));
+
+        match (approval_error, resumable_error) {
+            (None, None) => None,
+            (Some(error), None) | (None, Some(error)) => Some(error),
+            (Some(approval), Some(resumable)) => Some(format!("{approval}; {resumable}")),
+        }
+    }
+
+    /// Best-effort compensation for an approval that was created before its
+    /// resumable continuation could be made durable.
+    ///
+    /// The approval is quarantined first, closing the side-effect permission
+    /// even if the pending tombstone fails. Any possibly-partial resumable
+    /// record is then removed. A cleanup error is returned as redacted
+    /// operational context; it never converts the failed suspend into success.
+    #[cfg(test)]
+    pub(super) async fn rollback_non_durable_suspend(
+        &self,
+        actions: &Arc<Mutex<ActionRuntime>>,
+        approval_id: ApprovalId,
+        now: Timestamp,
+    ) -> Option<String> {
+        let mut runtime = actions.lock().await;
+        self.rollback_non_durable_suspend_locked(&mut runtime, approval_id, now)
+            .await
+    }
+
+    /// Persists a continuation while holding the same runtime lock that guards
+    /// approval consumption. A pending approval can therefore neither be
+    /// consumed nor denied between the pending check and the resumable write.
+    ///
+    /// Check or write failure triggers the crash-durable outbox quarantine and
+    /// best-effort cleanup before the error is returned.
+    async fn persist_resumable_or_abort_pending(
+        &self,
+        actions: &Arc<Mutex<ActionRuntime>>,
+        approval_id: ApprovalId,
+        resumable: ResumableTurn,
+        now: Timestamp,
+    ) -> Result<()> {
+        let mut runtime = actions.lock().await;
+        let pending_exists = match runtime.try_pending_approvals() {
+            Ok(pending) => pending
+                .iter()
+                .any(|record| record.approval_id == approval_id),
+            Err(check_error) => {
+                let cleanup_error = self
+                    .rollback_non_durable_suspend_locked(&mut runtime, approval_id, now)
+                    .await;
+                let cleanup = cleanup_error.map_or_else(
+                    || "approval quarantined".to_string(),
+                    |error| format!("rollback also failed: {error}"),
+                );
+                return Err(FamilyClawError::bus(format!(
+                    "pending approval check failed: {check_error}; {cleanup}"
+                )));
+            }
+        };
+
+        if !pending_exists {
+            let cleanup_error = self
+                .rollback_non_durable_suspend_locked(&mut runtime, approval_id, now)
+                .await;
+            let cleanup = cleanup_error.map_or_else(
+                || "approval already closed and continuation cleaned".to_string(),
+                |error| format!("rollback also failed: {error}"),
+            );
+            return Err(FamilyClawError::bus(format!(
+                "resumable persist refused: approval {approval_id} is no longer pending; {cleanup}"
+            )));
+        }
+
+        if let Err(persist_error) = self.resumable.put(resumable) {
+            let cleanup_error = self
+                .rollback_non_durable_suspend_locked(&mut runtime, approval_id, now)
+                .await;
+            let cleanup = cleanup_error.map_or_else(
+                || "orphan approval quarantined and cleaned".to_string(),
+                |error| format!("rollback also failed: {error}"),
+            );
+            return Err(FamilyClawError::bus(format!(
+                "resumable persist failed: {persist_error}; {cleanup}"
+            )));
+        }
+
+        Ok(())
+    }
+
     /// **Resumes a suspended turn once approval has been granted** (suspend/resume
     /// bridge, roadmap Â§6 â€” resume side).
     ///
@@ -1675,6 +1785,8 @@ impl Agent {
     ///   or consuming the approval ([`ActionRuntime::approve`]) fails (e.g.
     ///   payload mismatch) â€” all fail-closed, no panic.
     /// - [`FamilyClawError::Llm`] if the continued LLM call fails.
+    /// - [`FamilyClawError::Bus`] if a chained approval continuation cannot
+    ///   be persisted durably; the orphan approval is rolled back first.
     // Resume is a coherent sequence (load â†’ consume approval â†’ inject result
     // â†’ turn-audit resumed â†’ continue tool loop â†’ map outcome + stop_reason).
     // The TURN-AUDIT records pushed the line count over the ceiling; splitting
@@ -1857,14 +1969,8 @@ impl Agent {
                 )
                 .with_policy_snapshot(format!("tool '{tool}' requires human approval"))
                 .with_durable_position(self.turn_counter, 0);
-                if let Err(e) = self.resumable.put(next_turn) {
-                    warn!(
-                        agent = self.config.name,
-                        approval_id = %next_id,
-                        error = %e,
-                        "chained resumable turn persist failed â€” further resume not possible"
-                    );
-                }
+                self.persist_resumable_or_abort_pending(actions, next_id, next_turn, now)
+                    .await?;
                 // stop_reason = suspended (chained new approval).
                 self.record_turn_audit(
                     turn_id,
