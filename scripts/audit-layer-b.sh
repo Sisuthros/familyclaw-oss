@@ -31,13 +31,51 @@ FAIL=0
 # (which already drops e.g. "innovation") is what keeps this from drowning in
 # false positives — no additional filtering needed beyond what checks
 # already do for every other forbidden name.
+#
+# ── 2026-07-30: the silent fallback is GONE ────────────────────────────────
+# This block used to fall back to the placeholder list WITHOUT SAYING SO when
+# the operator-local file was absent. That produced a real false PASS: the
+# audit reported "✅ No real Layer B names" while scanning for strings like
+# `PlaceholderAgentOne` that of course appear nowhere. The gate was not green,
+# it was blind — and it was cited as publish clearance.
+#
+# There is now no implicit path. Exactly one of these must hold:
+#   a) scripts/audit-layer-b.names.local exists  → REAL mode (full coverage);
+#   b) FAMILYCLAW_AUDIT_ALLOW_PLACEHOLDER_NAMES=1 is set explicitly
+#      → PLACEHOLDER mode, announced loudly in the output and in the final
+#        banner. Intended ONLY for CI on the public repo, where the real list
+#        cannot exist. A placeholder run must never be cited as clearance.
+#   c) neither → HARD FAIL, exit 2. Silence is no longer an option.
 FORBIDDEN_NAMES_PLACEHOLDER="PlaceholderAgentOne PlaceholderAgentTwo PlaceholderAgentThree PlaceholderPersonFour PlaceholderPersonFive"
 FORBIDDEN_NAMES_LOCAL_FILE="scripts/audit-layer-b.names.local"
 if [ -f "$FORBIDDEN_NAMES_LOCAL_FILE" ]; then
     FORBIDDEN_NAMES="$(cat "$FORBIDDEN_NAMES_LOCAL_FILE")"
-else
+    NAMES_MODE="real"
+    echo "   ℹ️  Name list: $FORBIDDEN_NAMES_LOCAL_FILE (REAL mode, full coverage)"
+elif [ "${FAMILYCLAW_AUDIT_ALLOW_PLACEHOLDER_NAMES:-0}" = "1" ]; then
     FORBIDDEN_NAMES="$FORBIDDEN_NAMES_PLACEHOLDER"
+    NAMES_MODE="placeholder"
+    echo "   ⚠️  PLACEHOLDER MODE — reduced coverage."
+    echo "      $FORBIDDEN_NAMES_LOCAL_FILE is absent and"
+    echo "      FAMILYCLAW_AUDIT_ALLOW_PLACEHOLDER_NAMES=1 was set explicitly."
+    echo "      This run exercises the checks but CANNOT prove the absence of"
+    echo "      real private names. DO NOT cite it as publish clearance."
+else
+    echo ""
+    echo "   ❌ FATAL: forbidden-name list not found and no explicit opt-out."
+    echo "      Expected: $FORBIDDEN_NAMES_LOCAL_FILE"
+    echo "      Create it from scripts/audit-layer-b.names.local.example (it is"
+    echo "      gitignored), or — only for CI on the public repo — set"
+    echo "      FAMILYCLAW_AUDIT_ALLOW_PLACEHOLDER_NAMES=1 to accept reduced"
+    echo "      coverage knowingly."
+    echo ""
+    echo "      Refusing to run: an audit with no real name list reports PASS"
+    echo "      while scanning for nothing. That false PASS is worse than no"
+    echo "      audit at all, because it gets quoted as evidence."
+    echo "═══════════════════════════════════════════════════════════"
+    exit 2
 fi
+echo ""
 
 # Explicit allowlist for the email-address check (§9). Empty by default —
 # populate only with specific, deliberately-public addresses that would
@@ -307,11 +345,65 @@ else
     echo "   ✅ PASS: No private home-drive path patterns in publishable content"
 fi
 
+# 12. Commit AUTHOR / COMMITTER metadata across the full history.
+#
+# The blind spot that made this necessary (2026-07-30): three private agent
+# identities were literal git commit AUTHORS. Neither this script nor
+# pre-publish-scan.sh looked at %an/%ae/%cn/%ce at all — they scanned file
+# contents and commit messages only. Author metadata is not in any diff and
+# not in any message, so both gates reported clean while every commit page and
+# the contributors graph would have published the names on day one.
+#
+# Scanned: author name, author email, committer name, committer email, over
+# ALL refs. Deliberately NOT limited to the working tree: unlike every check
+# above, this metadata ships with the repository itself and cannot be fixed by
+# editing a file — only by rewriting history.
+echo "1️⃣2️⃣ Checking commit author/committer metadata (full history)…"
+IDENTITY_FOUND=0
+ALL_IDENTITIES=$(git log --all --format='%H%x09%an%x09%ae%x09%cn%x09%ce' 2>/dev/null || true)
+if [ -z "$ALL_IDENTITIES" ]; then
+    echo "   ⚠️  SKIP: no git history reachable (not a repo, or no commits)"
+else
+    for name in $FORBIDDEN_NAMES; do
+        clean_name=$(echo "$name" | sed 's/"//g')
+        [ -z "$clean_name" ] && continue
+        HITS=$(printf '%s\n' "$ALL_IDENTITIES" | grep -icw "$clean_name" || true)
+        if [ "$HITS" -gt 0 ]; then
+            echo "   ❌ FAIL: '$clean_name' appears in author/committer metadata of $HITS commit(s)"
+            IDENTITY_FOUND=1
+            FAIL=1
+        fi
+    done
+    # Personal email providers in author/committer email, same rule as §9.
+    MAIL_HITS=$(printf '%s\n' "$ALL_IDENTITIES" \
+        | grep -oEi '[A-Za-z0-9._%+-]+@(gmail|hotmail|outlook|proton|icloud)\.[A-Za-z.]+' \
+        | grep -viE 'noreply@|users\.noreply|example\.com' \
+        | sort -u || true)
+    if [ -n "$MAIL_HITS" ]; then
+        COUNT=$(printf '%s\n' "$MAIL_HITS" | grep -c . || true)
+        echo "   ❌ FAIL: personal email address in author/committer metadata ($COUNT distinct)"
+        # Redacted: prove the finding without republishing the address.
+        printf '%s\n' "$MAIL_HITS" | sed -E 's/^(.{2}).*@(.{2}).*$/      \1…@\2…[REDACTED]/'
+        IDENTITY_FOUND=1
+        FAIL=1
+    fi
+    if [ $IDENTITY_FOUND -eq 0 ]; then
+        TOTAL=$(printf '%s\n' "$ALL_IDENTITIES" | grep -c . || true)
+        echo "   ✅ PASS: no private identity in author/committer metadata ($TOTAL commits scanned)"
+    fi
+fi
+
 echo ""
 echo "═══════════════════════════════════════════════════════════"
 if [ $FAIL -eq 0 ]; then
-    echo "  ✅ LAYER B AUDIT PASSED"
-    echo "  No private souls, keys, or profiles leaked to Layer A."
+    if [ "$NAMES_MODE" = "placeholder" ]; then
+        echo "  ⚠️  LAYER B AUDIT PASSED — PLACEHOLDER MODE (reduced coverage)"
+        echo "  Checks were exercised, but the real name list was NOT present."
+        echo "  This result is NOT publish clearance."
+    else
+        echo "  ✅ LAYER B AUDIT PASSED  (real name list, full coverage)"
+        echo "  No private souls, keys, profiles or identities leaked to Layer A."
+    fi
     echo "═══════════════════════════════════════════════════════════"
     exit 0
 else

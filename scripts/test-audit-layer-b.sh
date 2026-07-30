@@ -17,9 +17,14 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AUDIT_SCRIPT="$REPO_ROOT/scripts/audit-layer-b.sh"
+PREPUBLISH_SCRIPT="$REPO_ROOT/scripts/pre-publish-scan.sh"
 
 if [ ! -f "$AUDIT_SCRIPT" ]; then
     echo "FATAL: audit script not found at $AUDIT_SCRIPT" >&2
+    exit 2
+fi
+if [ ! -f "$PREPUBLISH_SCRIPT" ]; then
+    echo "FATAL: pre-publish gate not found at $PREPUBLISH_SCRIPT" >&2
     exit 2
 fi
 
@@ -74,7 +79,83 @@ run_audit_with_fixture() {
         fi
 
         git add -A
-        bash scripts/audit-layer-b.sh >/dev/null 2>&1
+        # The sandbox never carries the operator-local names file, so it runs
+        # in the explicit placeholder mode the audit now requires. Without this
+        # the audit correctly refuses to run at all (exit 2) — which is the
+        # behaviour asserted separately by the meta-tests at the bottom.
+        FAMILYCLAW_AUDIT_ALLOW_PLACEHOLDER_NAMES=1 \
+            bash scripts/audit-layer-b.sh >/dev/null 2>&1
+        echo $?
+    )
+}
+
+# Build a sandbox whose COMMITS carry a caller-chosen author/committer identity,
+# then run the audit. Used to prove check #12 (author metadata) actually fires —
+# the blind spot that let private identities through as commit authors.
+run_audit_with_commit_identity() {
+    # $1 = author/committer name, $2 = author/committer email
+    local ident_name="$1"
+    local ident_mail="$2"
+    local sandbox
+    sandbox="$(mktemp -d)"
+
+    (
+        cd "$sandbox" || exit 99
+        git init -q
+        git config user.name "$ident_name"
+        git config user.email "$ident_mail"
+        mkdir -p scripts
+        cp "$AUDIT_SCRIPT" scripts/audit-layer-b.sh
+        printf 'clean content, nothing forbidden here\n' > NOTES.txt
+        git add -A
+        # Content and message are deliberately CLEAN. The only Layer B material
+        # is the identity — exactly the case both gates used to miss.
+        git -c commit.gpgsign=false commit -q -m "chore: add notes" >/dev/null 2>&1
+        FAMILYCLAW_AUDIT_ALLOW_PLACEHOLDER_NAMES=1 \
+            bash scripts/audit-layer-b.sh >/dev/null 2>&1
+        echo $?
+    )
+}
+
+# Run the audit in a sandbox with NO names file and NO opt-out env var.
+# Must refuse to run (exit 2) rather than silently passing on placeholders.
+run_audit_without_name_list() {
+    local sandbox
+    sandbox="$(mktemp -d)"
+    (
+        cd "$sandbox" || exit 99
+        git init -q
+        git config user.email "test@example.com"
+        git config user.name "audit-test"
+        mkdir -p scripts
+        cp "$AUDIT_SCRIPT" scripts/audit-layer-b.sh
+        printf 'hello\n' > NOTES.txt
+        git add -A
+        env -u FAMILYCLAW_AUDIT_ALLOW_PLACEHOLDER_NAMES \
+            bash scripts/audit-layer-b.sh >/dev/null 2>&1
+        echo $?
+    )
+}
+
+# Run the PUBLISH gate in a sandbox with no names file. It must refuse
+# unconditionally — it has no placeholder mode, even with the opt-out set.
+run_prepublish_without_name_list() {
+    local sandbox
+    sandbox="$(mktemp -d)"
+    (
+        cd "$sandbox" || exit 99
+        git init -q
+        git config user.email "test@example.com"
+        git config user.name "audit-test"
+        mkdir -p scripts
+        cp "$AUDIT_SCRIPT" scripts/audit-layer-b.sh
+        cp "$PREPUBLISH_SCRIPT" scripts/pre-publish-scan.sh
+        printf 'hello\n' > NOTES.txt
+        git add -A
+        git -c commit.gpgsign=false commit -q -m "chore: init" >/dev/null 2>&1
+        # Opt-out DELIBERATELY set: the publish gate must ignore it.
+        FAMILYCLAW_AUDIT_ALLOW_PLACEHOLDER_NAMES=1 \
+            bash scripts/pre-publish-scan.sh >/dev/null 2>&1
         echo $?
     )
 }
@@ -159,6 +240,85 @@ assert_pass "clean .example file is exempt and passes" "familyclaw.toml.example"
 
 # Control: a clean text file with no forbidden name must PASS (no false positive).
 assert_pass "clean .txt with no forbidden name passes" "notes/clean.txt" "hello world, agent_alpha here"
+
+# ── Check #12: commit AUTHOR / COMMITTER metadata ──────────────────────────
+# These prove the gap found on 2026-07-30 is closed. In each case the working
+# tree and the commit message are CLEAN — the only Layer B material is the
+# commit identity. Before check #12 existed, every one of these passed.
+echo ""
+echo "  ── author/committer metadata (check #12) ──"
+
+assert_identity_fail() {
+    local desc="$1" ident_name="$2" ident_mail="$3"
+    local code
+    code="$(run_audit_with_commit_identity "$ident_name" "$ident_mail")"
+    if [ "$code" != "0" ]; then
+        echo "  ✅ PASS: $desc (audit failed as required, exit=$code)"
+        PASS=$((PASS + 1))
+    else
+        echo "  ❌ FAIL: $desc (audit PASSED but should have FAILED)"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+assert_identity_pass() {
+    local desc="$1" ident_name="$2" ident_mail="$3"
+    local code
+    code="$(run_audit_with_commit_identity "$ident_name" "$ident_mail")"
+    if [ "$code" = "0" ]; then
+        echo "  ✅ PASS: $desc (audit passed as required)"
+        PASS=$((PASS + 1))
+    else
+        echo "  ❌ FAIL: $desc (audit FAILED but should have PASSED, exit=$code)"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+# Forbidden name as the commit AUTHOR NAME → must FAIL.
+assert_identity_fail "forbidden name as commit author name FAILS" \
+    "$NAME" "$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]')@example.com"
+
+# Forbidden name only inside the author EMAIL local part → must FAIL.
+assert_identity_fail "forbidden name inside author email FAILS" \
+    "Some Contributor" "$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]')@familyclaw.local"
+
+# A personal gmail address as the author email → must FAIL, even with a
+# perfectly innocuous author name.
+assert_identity_fail "personal gmail as author email FAILS" \
+    "Some Contributor" "someone.private@gmail.com"
+
+# Control: a neutral identity on a GitHub noreply address must PASS. This is
+# exactly the replacement identity used by the history rewrite, so this case
+# doubles as a regression guard against the rewrite being undone.
+assert_identity_pass "neutral noreply identity passes" \
+    "FamilyClaw Contributor" "noreply@users.noreply.github.com"
+
+# ── Missing name list must be a HARD FAIL, never a silent PASS ─────────────
+# The false-PASS bug in full: with no operator-local list the audit quietly
+# scanned for placeholder strings, found none, and printed
+# "✅ No real Layer B names in publishable content". That output was then
+# cited as publish clearance for a repo that was leaking seven name
+# categories. Both gates must now refuse rather than reassure.
+echo ""
+echo "  ── missing name list must fail closed ──"
+
+code="$(run_audit_without_name_list)"
+if [ "$code" = "2" ]; then
+    echo "  ✅ PASS: audit refuses to run without a name list (exit=2)"
+    PASS=$((PASS + 1))
+else
+    echo "  ❌ FAIL: audit ran without a name list (exit=$code, expected 2)"
+    FAIL=$((FAIL + 1))
+fi
+
+code="$(run_prepublish_without_name_list)"
+if [ "$code" = "2" ]; then
+    echo "  ✅ PASS: publish gate refuses placeholder mode outright (exit=2)"
+    PASS=$((PASS + 1))
+else
+    echo "  ❌ FAIL: publish gate accepted a missing name list (exit=$code, expected 2)"
+    FAIL=$((FAIL + 1))
+fi
 
 echo ""
 echo "═══════════════════════════════════════════════════════════"

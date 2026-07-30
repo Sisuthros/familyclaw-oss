@@ -59,13 +59,24 @@ FAIL=0
 # repo. We keep only SINGLE-word tokens (drop the quoted multi-word variant
 # entries, whose embedded quotes and spaces are not valid grep-word atoms and
 # are already covered by the corresponding single-word match anyway).
+#
+# ── 2026-07-30: no placeholder fallback in the PUBLISH gate, at all ────────
+# audit-layer-b.sh keeps an explicit, loudly-announced placeholder mode so the
+# checks stay exercised in public CI. This script does not, and must not: it
+# exists to answer exactly one question — "is it safe to make this history
+# public?" — and that question cannot be answered by scanning for
+# `PlaceholderAgentOne`. A run without the real list is not a weaker answer,
+# it is no answer. Missing list ⇒ exit 2, fail-closed, no opt-out.
 NAMES_LOCAL_FILE="$SCRIPT_DIR/audit-layer-b.names.local"
-NAMES_PLACEHOLDER="PlaceholderAgentOne PlaceholderAgentTwo PlaceholderAgentThree PlaceholderPersonFour PlaceholderPersonFive"
-if [ -f "$NAMES_LOCAL_FILE" ]; then
-    RAW_NAMES="$(cat "$NAMES_LOCAL_FILE")"
-else
-    RAW_NAMES="$NAMES_PLACEHOLDER"
+if [ ! -f "$NAMES_LOCAL_FILE" ]; then
+    echo "   ❌ FATAL: forbidden-name list not found: $NAMES_LOCAL_FILE" >&2
+    echo "      Create it from scripts/audit-layer-b.names.local.example." >&2
+    echo "      This gate has NO placeholder mode: a publish decision made" >&2
+    echo "      against placeholder names is a false clearance, not a" >&2
+    echo "      reduced-coverage one." >&2
+    exit 2
 fi
+RAW_NAMES="$(cat "$NAMES_LOCAL_FILE")"
 
 # History-only tokens absent from audit-layer-b.sh's working-tree list but
 # present in old FI commit messages / recon-doc diffs. Built at runtime from
@@ -158,6 +169,42 @@ while IFS= read -r name; do
     fi
 done <<< "$SCAN_NAMES"
 [ $CONTENT_HITS -eq 0 ] && echo "   ✅ PASS: no private names in any committed diff"
+
+# ── 2b. Commit AUTHOR / COMMITTER metadata across all refs ─────────────────
+# The gap that made this check necessary: private agent identities were git
+# commit AUTHORS. That metadata is in neither the diff content (#2) nor the
+# commit messages (#1), so both existing checks reported clean — while every
+# commit page and the contributors graph would have published the names the
+# moment the repo went public. Author/committer identity survives every
+# working-tree cleanup; only a history rewrite removes it.
+echo "2️⃣b Scanning commit author/committer metadata (--all)…"
+IDENT_HITS=0
+ALL_IDENTS=$(git log --all --format='%H%x09%an%x09%ae%x09%cn%x09%ce' 2>/dev/null || true)
+if [ -z "$ALL_IDENTS" ]; then
+    echo "   ⚠️  SKIP: no history reachable"
+else
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        n=$(printf '%s\n' "$ALL_IDENTS" | grep -icw "$name" || true)
+        if [ "$n" -gt 0 ]; then
+            echo "   ❌ FAIL: '$name' in author/committer metadata of $n commit(s)"
+            IDENT_HITS=1
+            FAIL=1
+        fi
+    done <<< "$SCAN_NAMES"
+    IDENT_MAILS=$(printf '%s\n' "$ALL_IDENTS" \
+        | grep -oEi '[A-Za-z0-9._%+-]+@(gmail|hotmail|outlook|proton|icloud)\.[A-Za-z.]+' \
+        | grep -viE 'noreply@|users\.noreply|example\.com' \
+        | sort -u || true)
+    if [ -n "$IDENT_MAILS" ]; then
+        c=$(printf '%s\n' "$IDENT_MAILS" | grep -c . || true)
+        echo "   ❌ FAIL: personal email in author/committer metadata ($c distinct)"
+        printf '%s\n' "$IDENT_MAILS" | sed -E 's/^(.{2}).*@(.{2}).*$/      \1…@\2…[REDACTED]/'
+        IDENT_HITS=1
+        FAIL=1
+    fi
+    [ $IDENT_HITS -eq 0 ] && echo "   ✅ PASS: no private identity in author/committer metadata"
+fi
 
 # ── 3. High-entropy secrets ever committed to history ──────────────────────
 echo "3️⃣  Scanning full history for secret patterns…"

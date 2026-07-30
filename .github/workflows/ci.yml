@@ -13,8 +13,23 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # Full history: audit check #12 scans commit author/committer
+          # metadata across all refs. The default shallow clone (depth 1)
+          # would make that check inspect exactly one commit and report a
+          # meaningless PASS.
+          fetch-depth: 0
 
       - name: Run Layer B leak audit
+        # The operator-local real name list cannot exist on a public runner,
+        # so placeholder mode is opted into EXPLICITLY here. Without this the
+        # audit refuses to run (exit 2) rather than silently scanning for
+        # placeholder strings and reporting a false PASS -- which is exactly
+        # what it used to do. A CI pass in this mode is a contributor guard,
+        # NOT publish clearance; scripts/pre-publish-scan.sh has no such mode
+        # and must be run locally with the real list before going public.
+        env:
+          FAMILYCLAW_AUDIT_ALLOW_PLACEHOLDER_NAMES: "1"
         run: bash scripts/audit-layer-b.sh
 
       - name: Run Layer B audit regression tests
