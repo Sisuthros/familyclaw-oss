@@ -1335,10 +1335,15 @@ mod tests {
         let r = EnvEndpointResolver::new().with_provider_keys_format(
             "gemini",
             "https://generativelanguage.googleapis.com/v1beta",
-            vec!["GEMINI_API_KEY_1".to_string(), "GEMINI_API_KEY_2".to_string()],
+            vec![
+                "GEMINI_API_KEY_1".to_string(),
+                "GEMINI_API_KEY_2".to_string(),
+            ],
             LlmWireFormat::GeminiGenerate,
         );
-        let entry = r.resolve_entry("gemini/gemini-2.5-flash").expect("resolves");
+        let entry = r
+            .resolve_entry("gemini/gemini-2.5-flash")
+            .expect("resolves");
         assert_eq!(entry.template.wire_format, LlmWireFormat::GeminiGenerate);
         assert_eq!(entry.keys.len(), 2);
     }
@@ -2084,8 +2089,14 @@ mod cooldown_tests {
             .iter()
             .find(|s| s.provider == "pa")
             .expect("pa entry");
-        assert!(pa2.healthy, "primary must be healthy again once cooldown expires");
-        assert_eq!(pa2.strike, 1, "snapshot never resets strike — only complete() does");
+        assert!(
+            pa2.healthy,
+            "primary must be healthy again once cooldown expires"
+        );
+        assert_eq!(
+            pa2.strike, 1,
+            "snapshot never resets strike — only complete() does"
+        );
     }
 
     #[test]

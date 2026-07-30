@@ -113,7 +113,10 @@ impl McpDynamicSkill {
                 ApprovalPolicy::AutoIfReadOnly,
             ),
             McpServerTrust::Trusted => (
-                vec![SkillPermission::NetworkRead, SkillPermission::WriteLocalFiles],
+                vec![
+                    SkillPermission::NetworkRead,
+                    SkillPermission::WriteLocalFiles,
+                ],
                 ActionRisk::WriteLocal,
                 ApprovalPolicy::RequireApproval,
             ),

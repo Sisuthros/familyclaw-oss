@@ -836,7 +836,9 @@ async fn list_pending_approvals(
             Json(serde_json::json!({ "error": "unauthorized" })),
         );
     }
-    if check_operator_capability(&state.operator_acl, &headers, operator_caps::APPROVALS_READ).is_err() {
+    if check_operator_capability(&state.operator_acl, &headers, operator_caps::APPROVALS_READ)
+        .is_err()
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "forbidden" })),
@@ -957,7 +959,13 @@ async fn approve_pending(
             Json(serde_json::json!({ "error": "unauthorized" })),
         );
     }
-    if check_operator_capability(&state.operator_acl, &headers, operator_caps::APPROVALS_DECIDE).is_err() {
+    if check_operator_capability(
+        &state.operator_acl,
+        &headers,
+        operator_caps::APPROVALS_DECIDE,
+    )
+    .is_err()
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "forbidden" })),
@@ -1100,7 +1108,13 @@ async fn deny_pending(
             Json(serde_json::json!({ "error": "unauthorized" })),
         );
     }
-    if check_operator_capability(&state.operator_acl, &headers, operator_caps::APPROVALS_DECIDE).is_err() {
+    if check_operator_capability(
+        &state.operator_acl,
+        &headers,
+        operator_caps::APPROVALS_DECIDE,
+    )
+    .is_err()
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "forbidden" })),
@@ -1165,7 +1179,9 @@ async fn set_task_enabled_route(
             Json(serde_json::json!({ "error": "unauthorized" })),
         );
     }
-    if check_operator_capability(&state.operator_acl, &headers, operator_caps::TASKS_CONTROL).is_err() {
+    if check_operator_capability(&state.operator_acl, &headers, operator_caps::TASKS_CONTROL)
+        .is_err()
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "forbidden" })),
@@ -1260,7 +1276,8 @@ async fn list_turn_audit(
             Json(serde_json::json!({ "error": "unauthorized" })),
         );
     }
-    if check_operator_capability(&state.operator_acl, &headers, operator_caps::AUDIT_READ).is_err() {
+    if check_operator_capability(&state.operator_acl, &headers, operator_caps::AUDIT_READ).is_err()
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "forbidden" })),

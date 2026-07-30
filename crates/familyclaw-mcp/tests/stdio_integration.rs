@@ -87,7 +87,11 @@ async fn trusted_server_registers_write_local_risk_skills() {
         .into_iter()
         .find(|s| s.name == "mcp_mock_echo")
         .expect("skill registered");
-    assert_eq!(skill.risk, ActionRisk::WriteLocal, "trusted server -> WriteLocal risk class");
+    assert_eq!(
+        skill.risk,
+        ActionRisk::WriteLocal,
+        "trusted server -> WriteLocal risk class"
+    );
     assert!(
         !skill.requires_approval,
         "WriteLocal + RequireApproval policy still auto-runs (only external/irreversible/... actions require approval)"

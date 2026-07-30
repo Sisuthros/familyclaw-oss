@@ -129,8 +129,8 @@ impl McpServerEntry {
             }
             (None, None) => {
                 return Err(McpError::EnvParse(format!(
-                    "mcp config: server '{name}' needs exactly one of `command` or `url` (got neither)"
-                )))
+                "mcp config: server '{name}' needs exactly one of `command` or `url` (got neither)"
+            )))
             }
             (Some(_), Some(_)) => {
                 return Err(McpError::EnvParse(format!(

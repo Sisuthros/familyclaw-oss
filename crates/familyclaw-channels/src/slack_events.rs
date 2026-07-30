@@ -194,10 +194,9 @@ mod tests {
 
     #[test]
     fn url_verification_challenge_roundtrip() {
-        let payload: serde_json::Value = serde_json::from_str(
-            r#"{"type":"url_verification","challenge":"abc123","token":"x"}"#,
-        )
-        .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(r#"{"type":"url_verification","challenge":"abc123","token":"x"}"#)
+                .unwrap();
         assert_eq!(payload["type"], EVENT_TYPE_URL_VERIFICATION);
         assert_eq!(payload["challenge"], "abc123");
     }
@@ -208,7 +207,9 @@ mod tests {
             r#"{"type":"event_callback","event":{"type":"message","user":"U1","channel":"C1","text":"hello"}}"#,
         )
         .unwrap();
-        let msg = parse_message_event(&payload).unwrap().expect("some message");
+        let msg = parse_message_event(&payload)
+            .unwrap()
+            .expect("some message");
         assert_eq!(msg.sender, "U1");
         assert_eq!(msg.conversation, "C1");
         assert_eq!(msg.body, "hello");

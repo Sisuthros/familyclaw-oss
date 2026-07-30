@@ -1630,7 +1630,10 @@ mod tests {
         // No skills concept in Hearth exports.
         assert_eq!(bundle.skills.len(), 0);
         assert_eq!(bundle.config_hints.len(), 1);
-        assert!(!bundle.warnings.is_empty(), "m3's empty content is a warning");
+        assert!(
+            !bundle.warnings.is_empty(),
+            "m3's empty content is a warning"
+        );
 
         let plan = ImportPlan::from_bundle_with_anchor_trust(&bundle, 0.8);
         assert_eq!(plan.memory_count(), 4);
@@ -1961,10 +1964,10 @@ mod tests {
         let back: ImportedBundle = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(bundle, back);
         // Sanity: origin metadata actually round-tripped, not silently dropped.
-        assert!(back.memories.iter().any(|m| m
-            .origin
-            .as_ref()
-            .is_some_and(|o| o.identity_anchor)));
+        assert!(back
+            .memories
+            .iter()
+            .any(|m| m.origin.as_ref().is_some_and(|o| o.identity_anchor)));
     }
 
     #[test]

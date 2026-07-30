@@ -995,9 +995,9 @@ impl LlmClient {
         match self.config.wire_format {
             LlmWireFormat::OpenAiChat => self.complete_once_openai(messages).await,
             LlmWireFormat::GeminiGenerate => self.complete_once_gemini(messages).await,
-            LlmWireFormat::AnthropicMessages | LlmWireFormat::Bedrock => {
-                Err(Self::unimplemented_wire_format_error(self.config.wire_format))
-            }
+            LlmWireFormat::AnthropicMessages | LlmWireFormat::Bedrock => Err(
+                Self::unimplemented_wire_format_error(self.config.wire_format),
+            ),
         }
     }
 
@@ -1101,7 +1101,8 @@ impl LlmClient {
         messages: &[LlmMessage],
     ) -> Result<(String, FinishReason), LlmError> {
         let endpoint = Self::gemini_endpoint(&self.config.api_base, &self.config.model);
-        let request_body = GeminiGenerateContentRequest::from_messages(messages, self.config.max_tokens);
+        let request_body =
+            GeminiGenerateContentRequest::from_messages(messages, self.config.max_tokens);
 
         let response = self
             .client
@@ -1117,13 +1118,14 @@ impl LlmClient {
             return Err(Self::error_from_response(response).await);
         }
 
-        let gemini_response: GeminiGenerateContentResponse = response.json().await.map_err(|e| {
-            if e.is_timeout() {
-                LlmError::Timeout(format!("response read timed out: {e}"))
-            } else {
-                LlmError::Parse(format!("response parse error: {e}"))
-            }
-        })?;
+        let gemini_response: GeminiGenerateContentResponse =
+            response.json().await.map_err(|e| {
+                if e.is_timeout() {
+                    LlmError::Timeout(format!("response read timed out: {e}"))
+                } else {
+                    LlmError::Parse(format!("response parse error: {e}"))
+                }
+            })?;
 
         // Empty candidates = the model produced nothing this turn — RETRYABLE
         // (another model in the chain may produce content), same invariant as
@@ -1137,7 +1139,12 @@ impl LlmClient {
         let finish_reason = FinishReason::from_gemini_wire(candidate.finish_reason.as_deref());
         let content = candidate
             .content
-            .map(|c| c.parts.into_iter().filter_map(|p| p.text).collect::<String>())
+            .map(|c| {
+                c.parts
+                    .into_iter()
+                    .filter_map(|p| p.text)
+                    .collect::<String>()
+            })
             .filter(|s| !s.is_empty())
             .ok_or(LlmError::NoContent)?;
 
@@ -1159,7 +1166,9 @@ impl LlmClient {
         messages: &[LlmMessage],
     ) -> std::result::Result<LlmChunkStream, LlmError> {
         if self.config.wire_format != LlmWireFormat::OpenAiChat {
-            return Err(Self::unimplemented_wire_format_error(self.config.wire_format));
+            return Err(Self::unimplemented_wire_format_error(
+                self.config.wire_format,
+            ));
         }
         let endpoint = Self::build_endpoint(&self.config.api_base);
         let request_body = ChatCompletionsStreamRequest {
@@ -2146,9 +2155,8 @@ mod tests {
 
     #[test]
     fn test_message_with_images_serializes_openai_multimodal_array() {
-        let msg = LlmMessage::user("what is in this image?").with_images(vec![
-            LlmImageRef::from_url("https://example.com/cat.png"),
-        ]);
+        let msg = LlmMessage::user("what is in this image?")
+            .with_images(vec![LlmImageRef::from_url("https://example.com/cat.png")]);
         let json = serde_json::to_value(&msg).expect("serialize");
         assert_eq!(json["role"], "user");
         assert_eq!(json["content"][0]["type"], "text");
@@ -2191,9 +2199,8 @@ mod tests {
 
     #[test]
     fn test_message_with_images_roundtrips_through_json() {
-        let msg = LlmMessage::user("caption").with_images(vec![LlmImageRef::from_url(
-            "https://example.com/x.png",
-        )]);
+        let msg = LlmMessage::user("caption")
+            .with_images(vec![LlmImageRef::from_url("https://example.com/x.png")]);
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: LlmMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.role, LlmRole::User);
@@ -2215,10 +2222,8 @@ mod tests {
     fn test_request_with_image_message_uses_multimodal_shape() {
         // End-to-end: an image-bearing message inside a full request body
         // still produces the standard OpenAI shape (not a sibling `images` key).
-        let messages = vec![
-            LlmMessage::user("describe this")
-                .with_images(vec![LlmImageRef::from_url("https://example.com/a.png")]),
-        ];
+        let messages = vec![LlmMessage::user("describe this")
+            .with_images(vec![LlmImageRef::from_url("https://example.com/a.png")])];
         let req = ChatCompletionsRequest {
             model: "m",
             messages: &messages,
@@ -3069,8 +3074,12 @@ mod tests {
 
     #[test]
     fn gemini_wire_format_roundtrips_through_serde() {
-        let cfg = LlmConfig::new("https://generativelanguage.googleapis.com/v1beta", "k", "gemini-2.5-pro")
-            .with_wire_format(LlmWireFormat::GeminiGenerate);
+        let cfg = LlmConfig::new(
+            "https://generativelanguage.googleapis.com/v1beta",
+            "k",
+            "gemini-2.5-pro",
+        )
+        .with_wire_format(LlmWireFormat::GeminiGenerate);
         let json = serde_json::to_string(&cfg).expect("serialize");
         assert!(json.contains("\"gemini_generate\""), "got: {json}");
         let back: LlmConfig = serde_json::from_str(&json).expect("deserialize");
@@ -3110,12 +3119,22 @@ mod tests {
             .system_instruction
             .as_ref()
             .expect("system instruction present");
-        assert_eq!(sys.parts[0].text.as_deref(), Some("You are a helpful sibling."));
+        assert_eq!(
+            sys.parts[0].text.as_deref(),
+            Some("You are a helpful sibling.")
+        );
 
-        assert_eq!(req.contents.len(), 3, "system message excluded from contents");
+        assert_eq!(
+            req.contents.len(),
+            3,
+            "system message excluded from contents"
+        );
         assert_eq!(req.contents[0].role, "user");
         assert_eq!(req.contents[0].parts[0].text.as_deref(), Some("hei"));
-        assert_eq!(req.contents[1].role, "model", "assistant -> Gemini's 'model' role");
+        assert_eq!(
+            req.contents[1].role, "model",
+            "assistant -> Gemini's 'model' role"
+        );
         assert_eq!(req.contents[1].parts[0].text.as_deref(), Some("hei sisko"));
         assert_eq!(req.contents[2].role, "user");
 
@@ -3135,7 +3154,10 @@ mod tests {
         let req = GeminiGenerateContentRequest::from_messages(&messages, 1024);
         let v = serde_json::to_value(&req).expect("serialize");
         assert!(v.get("contents").is_some());
-        assert!(v.get("systemInstruction").is_some(), "camelCase field, got: {v}");
+        assert!(
+            v.get("systemInstruction").is_some(),
+            "camelCase field, got: {v}"
+        );
         assert_eq!(v["generationConfig"]["maxOutputTokens"], 1024);
     }
 
@@ -3183,8 +3205,7 @@ mod tests {
                 "finishReason": "STOP"
             }]
         }"#;
-        let resp: GeminiGenerateContentResponse =
-            serde_json::from_str(body).expect("decode");
+        let resp: GeminiGenerateContentResponse = serde_json::from_str(body).expect("decode");
         let candidate = resp.candidates.into_iter().next().expect("candidate");
         let joined: String = candidate
             .content
@@ -3207,17 +3228,18 @@ mod tests {
         let body = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"hei sisko!"}]},"finishReason":"STOP"}]}"#.to_string();
         let (addr, calls) = spawn_scripted_mock(vec![body]);
 
-        let cfg = LlmConfig::new(format!("http://{addr}/v1beta"), "test-key", "gemini-2.5-pro")
-            .with_wire_format(LlmWireFormat::GeminiGenerate)
-            .with_request_timeout_ms(2000)
-            .with_connect_timeout_ms(2000);
+        let cfg = LlmConfig::new(
+            format!("http://{addr}/v1beta"),
+            "test-key",
+            "gemini-2.5-pro",
+        )
+        .with_wire_format(LlmWireFormat::GeminiGenerate)
+        .with_request_timeout_ms(2000)
+        .with_connect_timeout_ms(2000);
         let client = LlmClient::new(cfg);
 
         let text = client
-            .complete(&[
-                LlmMessage::system("be nice"),
-                LlmMessage::user("hei"),
-            ])
+            .complete(&[LlmMessage::system("be nice"), LlmMessage::user("hei")])
             .await
             .expect("gemini wire format must complete via the same public entry point");
         assert_eq!(text, "hei sisko!");
@@ -3310,7 +3332,10 @@ mod tests {
     fn llm_wire_format_as_word_is_stable() {
         assert_eq!(LlmWireFormat::OpenAiChat.as_word(), "openai_chat");
         assert_eq!(LlmWireFormat::GeminiGenerate.as_word(), "gemini_generate");
-        assert_eq!(LlmWireFormat::AnthropicMessages.as_word(), "anthropic_messages");
+        assert_eq!(
+            LlmWireFormat::AnthropicMessages.as_word(),
+            "anthropic_messages"
+        );
         assert_eq!(LlmWireFormat::Bedrock.as_word(), "bedrock");
     }
 }

@@ -3803,7 +3803,11 @@ fn compact_history_summarizer_collapses_the_evictable_middle_zone() {
     assert_eq!(dq.len(), 4);
     assert_eq!(dq.front().unwrap().content, "summary of 7 messages");
     assert_eq!(dq.back().unwrap().content, "m9");
-    assert_eq!(calls.load(AtomicOrdering::SeqCst), 1, "summarizer called once");
+    assert_eq!(
+        calls.load(AtomicOrdering::SeqCst),
+        1,
+        "summarizer called once"
+    );
 }
 
 #[test]
