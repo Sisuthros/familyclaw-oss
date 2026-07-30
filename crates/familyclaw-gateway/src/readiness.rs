@@ -244,7 +244,65 @@ pub async fn check_discord(dc: &DiscordChannel) -> CheckResult {
     }
 }
 
-/// Deep readyz: bus + LLM + Discord + journal.
+/// Työtilajuurien tila ilman polkujen paljastamista: (konfiguroidut, olemassa).
+///
+/// Palauttaa vain lukumäärät — `/readyz` on julkinen pinta, eikä sinne saa
+/// vuotaa koneen hakemistorakennetta.
+fn workspace_scope_status(variable: &str) -> (usize, usize) {
+    let roots: Vec<PathBuf> = std::env::var_os(variable)
+        .map(|raw| {
+            std::env::split_paths(&raw)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let existing = roots.iter().filter(|path| path.is_dir()).count();
+    (roots.len(), existing)
+}
+
+/// Tulos työtilajuurien tarkistuksesta.
+///
+/// Kolme tilaa, ei kahta:
+/// - **konfiguroitu ja ehjä** → `Ok`-tarkistus, `/readyz` pysyy vihreänä;
+/// - **konfiguroitu mutta rikki** (juuri puuttuu levyltä) → **kaatuva
+///   tarkistus**. Tämä on se hiljainen tuotantovika jota kukaan ei huomaa:
+///   allowlist on olemassa, mutta osoittaa hakemistoon jota ei ole, joten
+///   taito kieltää kaiken ilman että mikään hälyttää;
+/// - **tyhjä** → ei tarkistusta vaan `degraded`-merkintä. Tyhjä allowlist ei
+///   ole virhe: taito on silloin oikein lukittu (fail-closed), mutta sen
+///   pitää näkyä eikä kadota hiljaisuuteen.
+///
+/// Ero PR #58:aan: siellä nämä ajettiin vain jos
+/// `FAMILYCLAW_REQUIRE_WORKSPACE_TOOLS=1` oli asetettu — eli oletuksena ei
+/// koskaan. Täällä ne ajetaan aina, ilman lippua.
+fn workspace_scope_check(
+    name: &'static str,
+    variable: &str,
+) -> std::result::Result<CheckResult, String> {
+    let (configured, existing) = workspace_scope_status(variable);
+    if configured == 0 {
+        return Err(format!(
+            "{name}: {variable} is empty; the skill is fail-closed (no allowed roots)"
+        ));
+    }
+    Ok(CheckResult {
+        name,
+        ok: configured == existing,
+        detail: if existing == configured {
+            format!("{configured} scoped root(s) configured")
+        } else {
+            format!("{existing}/{configured} configured roots exist on disk")
+        },
+    })
+}
+
+/// Työtilajuuret jotka `/readyz` tarkistaa. `(tarkistuksen nimi, env-muuttuja)`.
+const WORKSPACE_SCOPES: [(&str, &str); 2] = [
+    ("fs_read_scope", "FAMILYCLAW_FS_READ_ALLOW"),
+    ("file_write_scope", "FAMILYCLAW_FILE_WRITE_ALLOW"),
+];
+
+/// Deep readyz: bus + LLM + Discord + journal + työtilajuuret.
 pub async fn deep_readyz(
     bus_ok: bool,
     probe: &ReadinessProbe,
@@ -279,6 +337,15 @@ pub async fn deep_readyz(
 
     if let Some(dir) = &probe.data_dir {
         checks.push(check_journal_writable(dir).await);
+    }
+
+    // Työtilan kykyrajat: aina, ei lipun takana. Rikkinäinen allowlist on
+    // kaatava tarkistus, tyhjä allowlist on näkyvä `degraded`-merkintä.
+    for (name, variable) in WORKSPACE_SCOPES {
+        match workspace_scope_check(name, variable) {
+            Ok(check) => checks.push(check),
+            Err(reason) => degraded.push(reason),
+        }
     }
 
     let ready = checks.iter().all(|c| c.ok);
@@ -495,6 +562,38 @@ pub async fn cleanup_stale_approval_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::Mutex;
+
+    /// `std::env` on prosessinlaajuinen ja cargo ajaa testit säikeissä.
+    /// Jokainen env-muuttujia koskeva testi ottaa tämän lukon ensin.
+    /// Async-tietoinen mutex (ei `std::sync`), jotta lukkoa ei pidetä
+    /// blokkaavana `.await`-pisteiden yli (PR #58, commit `5ec33cf`).
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Asettaa molemmat työtila-allowlistit olemassa olevaan hakemistoon ja
+    /// palauttaa aiemmat arvot palautettavaksi.
+    fn scope_env_set_to_existing_dir() -> (Vec<(&'static str, Option<std::ffi::OsString>)>, PathBuf)
+    {
+        let dir = std::env::temp_dir().join(format!("familyclaw-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let previous = WORKSPACE_SCOPES
+            .iter()
+            .map(|(_, variable)| (*variable, std::env::var_os(variable)))
+            .collect();
+        for (_, variable) in WORKSPACE_SCOPES {
+            std::env::set_var(variable, &dir);
+        }
+        (previous, dir)
+    }
+
+    fn scope_env_restore(previous: Vec<(&'static str, Option<std::ffi::OsString>)>) {
+        for (variable, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(variable, value),
+                None => std::env::remove_var(variable),
+            }
+        }
+    }
 
     #[test]
     fn provider_entries_are_counted_like_the_resolver_parses_them() {
@@ -519,6 +618,9 @@ mod tests {
     /// guest path gets an honest 200 — and the skip is visible in `degraded`.
     #[tokio::test]
     async fn readyz_is_ready_and_degraded_when_llm_is_intentionally_skipped() {
+        let _lock = ENV_TEST_LOCK.lock().await;
+        let (previous, dir) = scope_env_set_to_existing_dir();
+
         let probe = ReadinessProbe {
             model: Some(ModelConfig::new("openai/gpt-4.1-mini")),
             llm_skipped: Some("no provider configured".into()),
@@ -533,6 +635,9 @@ mod tests {
             "llm checks must not run when skipped: {:?}",
             body.checks
         );
+
+        scope_env_restore(previous);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The bus is still a hard gate — skipping the LLM never fakes a 200.
@@ -552,11 +657,79 @@ mod tests {
     /// consumers (deploy-appliance.ps1, k8s probes) keep working.
     #[tokio::test]
     async fn readyz_json_omits_degraded_when_empty() {
+        let _lock = ENV_TEST_LOCK.lock().await;
+        let (previous, dir) = scope_env_set_to_existing_dir();
+
         let probe = ReadinessProbe::default();
         let (status, Json(body)) = deep_readyz(true, &probe).await;
         assert_eq!(status, StatusCode::OK);
         let json = serde_json::to_string(&body).expect("serialize");
         assert!(!json.contains("degraded"), "{json}");
+
+        scope_env_restore(previous);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PR #58:sta siirretty, ilman opt-in-lippua: tyhjä allowlist tuottaa
+    /// näkyvän `fail-closed`-merkinnän eikä paljasta yhtään polkua.
+    #[tokio::test]
+    async fn empty_workspace_scope_is_reported_fail_closed_and_redacted() {
+        let _lock = ENV_TEST_LOCK.lock().await;
+        let previous: Vec<_> = WORKSPACE_SCOPES
+            .iter()
+            .map(|(_, variable)| (*variable, std::env::var_os(variable)))
+            .collect();
+        for (_, variable) in WORKSPACE_SCOPES {
+            std::env::remove_var(variable);
+        }
+
+        let reason = workspace_scope_check("fs_read_scope", "FAMILYCLAW_FS_READ_ALLOW")
+            .expect_err("empty allowlist must not produce a check");
+        assert!(reason.contains("fail-closed"), "{reason}");
+        assert!(reason.contains("FAMILYCLAW_FS_READ_ALLOW"), "{reason}");
+
+        let (status, Json(body)) = deep_readyz(true, &ReadinessProbe::default()).await;
+        assert_eq!(status, StatusCode::OK, "empty allowlist is not a failure");
+        assert_eq!(body.degraded.len(), 2, "{:?}", body.degraded);
+
+        scope_env_restore(previous);
+    }
+
+    /// Tämä on se vika jonka PR #58 jätti oletuksena löytymättä: allowlist on
+    /// konfiguroitu mutta osoittaa hakemistoon jota ei ole. Taito kieltää
+    /// kaiken, mutta mikään ei hälytä. Nyt `/readyz` kaatuu — 503, ei 200.
+    #[tokio::test]
+    async fn readyz_fails_closed_when_a_configured_workspace_root_is_missing() {
+        let _lock = ENV_TEST_LOCK.lock().await;
+        let previous: Vec<_> = WORKSPACE_SCOPES
+            .iter()
+            .map(|(_, variable)| (*variable, std::env::var_os(variable)))
+            .collect();
+        let missing =
+            std::env::temp_dir().join(format!("familyclaw-absent-{}", uuid::Uuid::new_v4()));
+        assert!(!missing.is_dir(), "fixture must not exist");
+        for (_, variable) in WORKSPACE_SCOPES {
+            std::env::set_var(variable, &missing);
+        }
+
+        let (status, Json(body)) = deep_readyz(true, &ReadinessProbe::default()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!body.ready);
+        for (name, _) in WORKSPACE_SCOPES {
+            let check = body
+                .checks
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("missing check {name}: {:?}", body.checks));
+            assert!(!check.ok, "{name} must fail: {}", check.detail);
+            assert!(
+                !check.detail.contains(&missing.display().to_string()),
+                "the path must never be echoed back: {}",
+                check.detail
+            );
+        }
+
+        scope_env_restore(previous);
     }
 
     #[tokio::test]
