@@ -1925,7 +1925,10 @@ async fn tool_loop_config_default_and_override() {
 // ---- 1C suspend/resume bridge (roadmap §6) -----------------------------
 
 use crate::resumable::{InMemoryResumableStore, JournalResumableStore, ResumableTurnStore};
-use familyclaw_actions::{DangerousToolRateLimiter, JournalPendingStore, PendingApprovalStore};
+use familyclaw_actions::{
+    DangerousToolRateLimiter, InMemoryPendingStore, JournalPendingStore, PendingApprovalStore,
+    PendingRecord,
+};
 
 /// RAII temp directory for durable-surface writes (no external crates).
 /// Provides two file paths: the pending and resumable journals.
@@ -2060,6 +2063,45 @@ impl ResumableTurnStore for FailOnSecondPutResumableStore {
     }
 }
 
+/// Pending store that keeps the record live when removal fails. This models
+/// a durable tombstone write failure: rollback must still prevent the live
+/// record from authorizing a side effect through another approval surface.
+#[derive(Debug, Default)]
+struct FailingRemovePendingStore {
+    inner: InMemoryPendingStore,
+}
+
+impl PendingApprovalStore for FailingRemovePendingStore {
+    fn insert(&self, record: PendingRecord) -> familyclaw_actions::Result<()> {
+        self.inner.insert(record)
+    }
+
+    fn get(&self, approval_id: ApprovalId) -> familyclaw_actions::Result<Option<PendingRecord>> {
+        self.inner.get(approval_id)
+    }
+
+    fn remove(
+        &self,
+        _approval_id: ApprovalId,
+    ) -> familyclaw_actions::Result<Option<PendingRecord>> {
+        Err(familyclaw_actions::ActionError::Proof(
+            "injected pending tombstone failure".to_string(),
+        ))
+    }
+
+    fn len(&self) -> familyclaw_actions::Result<usize> {
+        self.inner.len()
+    }
+
+    fn list(&self) -> familyclaw_actions::Result<Vec<PendingRecord>> {
+        self.inner.list()
+    }
+
+    fn evict_expired(&self, now: Timestamp) -> familyclaw_actions::Result<usize> {
+        self.inner.evict_expired(now)
+    }
+}
+
 /// A turn must not report a recoverable suspension if its resume state never
 /// became durable. Returning `Suspended` here would create a false-success
 /// control state: the operator could approve it, but no continuation exists.
@@ -2095,6 +2137,136 @@ async fn suspend_fails_closed_when_resumable_state_cannot_be_persisted() {
             .expect("pending list")
             .is_empty(),
         "failed persistence must roll back the orphan approval"
+    );
+    bus.stop();
+}
+
+/// Rollback is idempotent when an operator denial wins the race after the
+/// pending approval was created but before persistence compensation runs.
+/// A missing pending record means the permission is already closed; any
+/// partial resumable record must still be tombstoned.
+#[tokio::test]
+async fn rollback_cleans_resumable_when_operator_denied_first() {
+    let bus = ResonanceBus::start(None).await.expect("bus");
+    let api = spawn_scripted_llm(vec![body_tool_call(
+        "call_approve",
+        "approval_skill",
+        &serde_json::json!({ "q": "do-it" }),
+    )])
+    .await;
+    let store: StdArc<dyn ResumableTurnStore> = StdArc::new(InMemoryResumableStore::new());
+    let runtime = approval_runtime();
+    let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(StdArc::clone(&store));
+
+    let suspended = agent
+        .think(&BusMessage::text("aja hyväksyntä-työkalu"))
+        .await
+        .expect("suspend persists");
+    let approval_id = match suspended {
+        ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+        other => panic!("expected suspension, got: {other:?}"),
+    };
+    assert!(
+        store.get(approval_id).expect("get resumable").is_some(),
+        "fixture must contain the resumable record"
+    );
+
+    let now = time::now();
+    runtime
+        .lock()
+        .await
+        .deny_pending(approval_id, now)
+        .await
+        .expect("operator denial closes permission first");
+
+    let cleanup_error = agent
+        .rollback_non_durable_suspend(&runtime, approval_id, now)
+        .await;
+
+    assert!(
+        cleanup_error.is_none(),
+        "already-denied approval is an idempotent rollback success: {cleanup_error:?}"
+    );
+    assert!(
+        store
+            .get(approval_id)
+            .expect("get after rollback")
+            .is_none(),
+        "rollback must remove a possibly-partial resumable even when approval was already closed"
+    );
+    bus.stop();
+}
+
+/// Even if the pending-store tombstone cannot be written, compensation must
+/// quarantine the approval before returning. A direct approval attempt must
+/// fail closed and the executor must remain untouched.
+#[tokio::test]
+async fn rollback_blocks_side_effect_when_pending_remove_fails() {
+    let bus = ResonanceBus::start(None).await.expect("bus");
+    let api = spawn_scripted_llm(vec![body_tool_call(
+        "call_approve",
+        "approval_skill",
+        &serde_json::json!({ "q": "do-it" }),
+    )])
+    .await;
+    let store: StdArc<dyn ResumableTurnStore> = StdArc::new(InMemoryResumableStore::new());
+    let count = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runtime = counting_runtime_with_pending(
+        Box::new(FailingRemovePendingStore::default()),
+        StdArc::clone(&count),
+    );
+    let agent = agent_with_scripted_llm("agent_a", bus.clone(), &api)
+        .with_actions(StdArc::clone(&runtime))
+        .with_resumable_store(StdArc::clone(&store));
+
+    let suspended = agent
+        .think(&BusMessage::text("aja hyväksyntä-työkalu"))
+        .await
+        .expect("suspend persists");
+    let approval_id = match suspended {
+        ThinkOutcome::Suspended { approval_id, .. } => approval_id,
+        other => panic!("expected suspension, got: {other:?}"),
+    };
+
+    let now = time::now();
+    let cleanup_error = agent
+        .rollback_non_durable_suspend(&runtime, approval_id, now)
+        .await;
+    assert!(
+        cleanup_error
+            .as_deref()
+            .is_some_and(|error| error.contains("approval rollback failed")),
+        "tombstone failure must stay visible: {cleanup_error:?}"
+    );
+    assert!(
+        store
+            .get(approval_id)
+            .expect("get after rollback")
+            .is_none(),
+        "resumable cleanup must still be attempted"
+    );
+
+    let approve_error = runtime
+        .lock()
+        .await
+        .approve(approval_id, now)
+        .await
+        .expect_err("quarantined approval must not execute");
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "rollback failure must never authorize a side effect"
+    );
+    assert!(
+        matches!(
+            approve_error,
+            familyclaw_actions::ActionError::PolicyDenied(_)
+                | familyclaw_actions::ActionError::ExecutionFailed(_)
+                | familyclaw_actions::ActionError::Proof(_)
+        ),
+        "unexpected approval error: {approve_error}"
     );
     bus.stop();
 }

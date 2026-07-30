@@ -1636,24 +1636,31 @@ impl Agent {
     /// then is any possibly-partial resumable record removed. A cleanup error
     /// is returned as redacted operational context for the original persist
     /// failure; it never converts the failed suspend into success.
-    async fn rollback_non_durable_suspend(
+    pub(super) async fn rollback_non_durable_suspend(
         &self,
         actions: &Arc<Mutex<ActionRuntime>>,
         approval_id: ApprovalId,
         now: Timestamp,
     ) -> Option<String> {
-        let deny_result = {
+        let approval_error = {
             let mut runtime = actions.lock().await;
-            runtime.deny_pending(approval_id, now).await
+            runtime
+                .abort_pending_after_continuation_failure(approval_id, now)
+                .await
+                .err()
+                .map(|error| format!("approval rollback failed: {error}"))
         };
-        if let Err(error) = deny_result {
-            return Some(format!("approval rollback failed: {error}"));
-        }
-
-        self.resumable
+        let resumable_error = self
+            .resumable
             .remove(approval_id)
             .err()
-            .map(|error| format!("resumable cleanup failed: {error}"))
+            .map(|error| format!("resumable cleanup failed: {error}"));
+
+        match (approval_error, resumable_error) {
+            (None, None) => None,
+            (Some(error), None) | (None, Some(error)) => Some(error),
+            (Some(deny), Some(resumable)) => Some(format!("{deny}; {resumable}")),
+        }
     }
 
     /// **Resumes a suspended turn once approval has been granted** (suspend/resume
