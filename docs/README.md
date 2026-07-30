@@ -32,6 +32,7 @@ here, it's most likely a dated planning/expo artifact — check
 |---|---|
 | [SECURITY_MODEL.md](SECURITY_MODEL.md) | The eight defense layers (allowlists, approvals, taint tracing, redaction, identity anchors, sandbox, at-most-once dispatch, Layer A/B isolation). |
 | [LAYER_BOUNDARY.md](LAYER_BOUNDARY.md) | The Layer A / Layer B split in detail — what may never enter the public repo. |
+| [HISTORY_REWRITE.md](HISTORY_REWRITE.md) | The one-time 2026-07-30 history rewrite: what was removed, how it was verified, and why pre-2026-07-30 clones no longer share commit IDs. |
 | [SECURITY_SCORECARD.md](SECURITY_SCORECARD.md) | Security scorecard results. |
 | [SECURITY_BENCH.md](SECURITY_BENCH.md) | Security benchmark methodology and results. |
 | [SECURITY_COMPARISON.md](SECURITY_COMPARISON.md) | Security posture compared against other frameworks. |

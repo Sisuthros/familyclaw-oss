@@ -63,7 +63,7 @@ pub mod postgres;
 pub mod time_machine;
 
 pub use context::DurableContext;
-pub use entry::{EntryKind, JournalEntry, StepId};
+pub use entry::{EntryKind, JournalEntry, SessionTurnRecord, StepId};
 pub use error::{DurableError, Result};
 pub use file::FileJournal;
 pub use journal::Journal;
