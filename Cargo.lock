@@ -1842,7 +1842,7 @@ dependencies = [
  "familyclaw-sandbox",
  "familyclaw-scheduler",
  "futures-util",
- "jsonwebtoken 9.3.1",
+ "jsonwebtoken",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rsa",
@@ -3105,21 +3105,6 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "jsonwebtoken"
-version = "9.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
-dependencies = [
- "base64",
- "js-sys",
- "pem",
- "ring",
- "serde",
- "serde_json",
- "simple_asn1",
 ]
 
 [[package]]
@@ -5494,7 +5479,7 @@ dependencies = [
  "http",
  "humantime",
  "ipnet",
- "jsonwebtoken 10.4.0",
+ "jsonwebtoken",
  "lexicmp",
  "md-5 0.10.6",
  "memchr",
