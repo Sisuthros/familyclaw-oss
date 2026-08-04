@@ -355,9 +355,26 @@ pub struct ToolLoopConfig {
 }
 
 impl ToolLoopConfig {
-    /// Default round limit: eight LLM calls per turn. Enough for a typical
+    /// Default round limit: sixteen LLM calls per turn. Enough for a typical
     /// multi-step tool sequence without leaving the loop unbounded.
-    pub const DEFAULT_MAX_ITERATIONS: u32 = 8;
+    /// Fix 2026-07-31: 8 → 16. Tutkimusagentti lukee 5-10 tiedostoa
+    /// per vuoro (SOUL.md → IDENTITY.md → WANTS.md → top20 → log...); 8
+    /// kierrosta katkaisi tutkimuksen kesken ("Budjetti ylittyi — jatkan
+    /// seuraavalla vuorolla"). 16 mahdollistaa koko tutkimusketjun yhdessä
+    /// vuorossa. Turvallisuus: jokainen työkalu on silti allowlist-rajattu.
+    pub const DEFAULT_MAX_ITERATIONS: u32 = 16;
+
+    /// Fix 2026-07-31: env-konffattava (`FAMILYCLAW_MAX_TOOL_ITERATIONS`).
+    /// Ei rebuildia säätöön — gateway-bootissa luetaan kerran.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            max_iterations: std::env::var("FAMILYCLAW_MAX_TOOL_ITERATIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(Self::DEFAULT_MAX_ITERATIONS),
+        }
+    }
 }
 
 impl Default for ToolLoopConfig {
@@ -742,7 +759,7 @@ impl Agent {
             governor: None,
             calibration: Box::new(NeutralCalibration),
             actions: None,
-            tool_loop: ToolLoopConfig::default(),
+            tool_loop: ToolLoopConfig::from_env(),
             resumable: Arc::new(InMemoryResumableStore::new()),
             turn_audit: None,
             emotion_probe: None,

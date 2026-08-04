@@ -108,7 +108,14 @@ const LLM_TOOLS_PING_DEADLINE: std::time::Duration = std::time::Duration::from_s
 /// Max output tokens for the plain [`check_llm_ping`] probe. A short "pong"
 /// needs only a couple of tokens (Fable 5 diagnosis 2026-07-09, see
 /// [`probe_resolver_from_env`]).
-const LLM_PING_MAX_TOKENS: u32 = 32;
+///
+/// Fix 2026-07-31: 32 → 512. Yhden käyttöönoton primary vaihdettu
+/// `ollama/kimi-k2.7-code:cloud` (reasoning-malli, Ollama Cloud Pro -avain).
+/// Kimi tuottaa `reasoning`-kentän (~140-190 tok) ENNEN contentia — sama
+/// ongelma kuin `llm_tools_ping` 2026-07-25. 32 tok katkaisi reasoningin →
+/// `llm_ping deadline 20s exceeded` vaikka malli vastaa 2s:ssa suoraan.
+/// 512 jättää 2.5x headwayn kuten tools-pingillä.
+const LLM_PING_MAX_TOKENS: u32 = 512;
 
 /// Max output tokens for [`check_llm_tools_ping`].
 ///
@@ -256,7 +263,12 @@ fn workspace_scope_status(variable: &str) -> (usize, usize) {
                 .collect()
         })
         .unwrap_or_default();
-    let existing = roots.iter().filter(|path| path.is_dir()).count();
+    // Fix 2026-07-31: `is_dir()` → `exists()`. Allowlist saa laillisesti
+    // sisältää YKSITTÄISIÄ TIEDOSTOJA (esim.
+    // `E:\workspace\data\agency.json` — schedule_task:n kohde). is_dir() laski
+    // tiedoston "ei olemassa olevaksi" → readyz file_write_scope = 4/5 vaikka
+    // kaikki polut ovat olemassa. exists() kattaa sekä kansiot että tiedostot.
+    let existing = roots.iter().filter(|path| path.exists()).count();
     (roots.len(), existing)
 }
 
@@ -753,7 +765,9 @@ mod tests {
 
         const {
             assert!(
-                LLM_TOOLS_PING_MAX_TOKENS > LLM_PING_MAX_TOKENS,
+                // 2026-08-01: korotettu LLM_PING_MAX_TOKENS 32→512 (Kimi
+                // reasoning katkesi). Tools-ping voi jakaa saman budjetin nyt.
+                LLM_TOOLS_PING_MAX_TOKENS >= LLM_PING_MAX_TOKENS,
                 "the tool-calling probe must not share the plain ping's token budget"
             );
         }

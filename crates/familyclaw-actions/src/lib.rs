@@ -75,6 +75,7 @@ pub mod error;
 pub mod evals;
 pub mod executor;
 pub mod facade;
+pub mod idempotency;
 pub mod ids;
 pub mod manifest;
 pub mod mcp;

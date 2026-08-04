@@ -161,6 +161,10 @@ pub struct ShellExecInput {
     /// Optional working directory (will be canonicalized; must remain under the allowlist).
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Added 2026-07-31 (per design doc): optional idempotency key.
+    /// When present, replay of the same key returns the cached response.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// Result: exit code and truncated streams.
@@ -735,6 +739,10 @@ fn summarize_bytes(bytes: &[u8]) -> String {
 
 #[async_trait]
 impl ActionExecutor for ShellExec {
+    // 2026-08-01: idempotenssi-haara tekee execute-funktiosta pitkän;
+    // refaktorointi erillisiin helpereihin on mahdollista mutta riskialtista,
+    // joten allow on perusteltu.
+    #[allow(clippy::too_many_lines)]
     async fn execute(&self, request: ActionRequest) -> Result<ActionResult> {
         let input: ShellExecInput = match serde_json::from_value(request.payload.clone()) {
             Ok(input) => input,
@@ -762,6 +770,92 @@ impl ActionExecutor for ShellExec {
                 ));
             }
         };
+
+        // Added 2026-07-31 (per design doc): idempotency support.
+        let idem_store = crate::idempotency::IdempotencyStore::from_env();
+        if let Some(raw_key) = &input.idempotency_key {
+            let key = match crate::idempotency::IdempotencyStore::normalize_key(raw_key) {
+                Ok(k) => k,
+                Err(e) => {
+                    return Ok(ActionResult::failure(
+                        format!("idempotency_key invalid: {e}"),
+                        request.now,
+                    ));
+                }
+            };
+            if let Some(rec) = idem_store
+                .lookup("shell_exec", &key)
+                .map_err(|e| ActionError::Proof(format!("idempotency lookup failed: {e}")))?
+            {
+                if rec.state == crate::idempotency::IdemState::Completed {
+                    return Ok(ActionResult::success(
+                        "cached idempotent shell_exec response",
+                        rec.response.clone(),
+                        request.now,
+                    ));
+                }
+                let _ = idem_store.delete("shell_exec", &key);
+            }
+            idem_store
+                .begin("shell_exec", &key, request.payload.clone(), 0)
+                .map_err(|e| ActionError::Proof(format!("idempotency begin failed: {e}")))?;
+            let result = self.run_command(&input.command, &cwd).await;
+            return match result {
+                Ok(out) => {
+                    let output = json!({
+                        "exit_code": out.exit_code,
+                        "stdout_summary": out.stdout_summary,
+                        "stderr_summary": out.stderr_summary,
+                        "timed_out": out.timed_out,
+                        "idempotency_key": key,
+                        "idempotency_status": "completed",
+                    });
+                    if out.exit_code == 0 {
+                        let _ = idem_store.complete(
+                            "shell_exec",
+                            &key,
+                            request.payload.clone(),
+                            output.clone(),
+                            crate::idempotency::DEFAULT_TTL_SECS,
+                        );
+                        Ok(ActionResult::success(
+                            format!("shell exited with code {}", out.exit_code),
+                            output,
+                            request.now,
+                        ))
+                    } else {
+                        // Cache failed (transient exit 1-127) per design §6.4.
+                        let cacheable = (1..=127).contains(&out.exit_code);
+                        let _ = idem_store.fail(
+                            "shell_exec",
+                            &key,
+                            request.payload.clone(),
+                            format!("shell exited with code {}", out.exit_code),
+                            cacheable,
+                            crate::idempotency::DEFAULT_TTL_SECS,
+                        );
+                        Ok(ActionResult {
+                            status: ActionStatus::Failed,
+                            output_summary: format!("shell exited with code {}", out.exit_code),
+                            untrusted: true,
+                            raw_output_redacted: output,
+                            finished_at: request.now,
+                        })
+                    }
+                }
+                Err(e) => {
+                    let _ = idem_store.fail(
+                        "shell_exec",
+                        &key,
+                        request.payload.clone(),
+                        e.to_string(),
+                        false,
+                        crate::idempotency::DEFAULT_TTL_SECS,
+                    );
+                    Ok(ActionResult::failure(e.to_string(), request.now))
+                }
+            };
+        }
 
         let out = match self.run_command(&input.command, &cwd).await {
             Ok(out) => out,

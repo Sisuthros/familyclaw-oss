@@ -37,6 +37,7 @@ pub mod dream_skill;
 pub mod subagent;
 
 use dream_skill::DreamSkill;
+use familyclaw_actions::skills::{FsReadAllowlisted, ShellExec};
 use familyclaw_actions::{
     ActionRuntime, AuditCollector, FileWriteConfig, FsReadConfig, ShellExecConfig,
 };
@@ -824,12 +825,24 @@ pub async fn build_family(
                 .unwrap_or(6 * 3600);
 
             // The scheduler's own action runtime: only DreamSkill.
+            // Fix 2026-07-31: lisätty fs_read + shell_exec. Aiemmin
+            // vain DreamSkill → skedulöidyt schedule_task-tehtävät jotka viittasivat
+            // shell_exec:hen (bbbbbbbb) epäonnistuivat "unknown skill" — scheduler
+            // ei tuntenut kuin DreamSkillin. Nyt ajastetut fs_read (tutkimus-
+            // muistutukset) ja shell_exec (skriptiajot smart-tilassa) toimivat.
             let mut sched_runtime = ActionRuntime::new();
             let dream_skill = DreamSkill::new(Arc::clone(&dream_store), Arc::clone(&dream_journal));
             if let Err(e) = sched_runtime.register_skill(dream_skill) {
                 tracing::warn!(target: "familyclaw::dream", error = %e, "failed to register dream skill — scheduled dream disabled");
                 (None, None)
             } else {
+                // Ajastetut työkalut (turvalliset, allowlist-rajatut).
+                if let Some(fs_cfg) = resolve_fs_read_config() {
+                    let _ = sched_runtime.register_skill(FsReadAllowlisted::with_config(fs_cfg));
+                }
+                if let Some(sh_cfg) = resolve_shell_exec_config() {
+                    let _ = sched_runtime.register_skill(ShellExec::with_config(sh_cfg));
+                }
                 let mut scheduler = Scheduler::new();
                 // Stable task id (with_id) -> the idempotency key stays
                 // stable across processes.

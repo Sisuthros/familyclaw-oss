@@ -83,6 +83,10 @@ pub struct FileWriteInput {
     /// Write mode (`overwrite`/`append`). Default `overwrite`.
     #[serde(default)]
     pub mode: WriteMode,
+    /// Added 2026-07-31 (per design doc): optional idempotency key.
+    /// When present, replay of the same key returns the cached response.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// Skill result: the proof bundle's core (hash + byte count + mode).
@@ -335,6 +339,10 @@ fn hash_path(path: &Path) -> String {
 
 #[async_trait]
 impl ActionExecutor for FileWriteAllowlisted {
+    // 2026-08-01: idempotenssi-haara tekee execute-funktiosta pitkän;
+    // refaktorointi erillisiin helpereihin on mahdollista mutta riskialtista,
+    // joten allow on perusteltu.
+    #[allow(clippy::too_many_lines)]
     async fn execute(&self, request: ActionRequest) -> Result<ActionResult> {
         let input: FileWriteInput = match serde_json::from_value(request.payload.clone()) {
             Ok(input) => input,
@@ -358,31 +366,110 @@ impl ActionExecutor for FileWriteAllowlisted {
             }
         };
 
-        let out = match self
-            .write_proof(&canonical, input.content.as_bytes(), input.mode)
-            .await
-        {
-            Ok(out) => out,
-            Err(e) => {
-                return Ok(ActionResult::failure(e.to_string(), request.now));
+        // Added 2026-07-31 (per design doc §4-6): idempotency support.
+        // If a key is supplied and a completed record exists, return the
+        // cached response instead of re-writing.
+        let idem_store = crate::idempotency::IdempotencyStore::from_env();
+        if let Some(raw_key) = &input.idempotency_key {
+            let key = match crate::idempotency::IdempotencyStore::normalize_key(raw_key) {
+                Ok(k) => k,
+                Err(e) => {
+                    return Ok(ActionResult::failure(
+                        format!("idempotency_key invalid: {e}"),
+                        request.now,
+                    ));
+                }
+            };
+            if let Some(rec) = idem_store
+                .lookup("file_write_allowlisted", &key)
+                .map_err(|e| ActionError::Proof(format!("idempotency lookup failed: {e}")))?
+            {
+                if rec.state == crate::idempotency::IdemState::Completed {
+                    let mut env = rec.response.clone();
+                    if let Some(obj) = env.as_object_mut() {
+                        obj.insert("idempotency_key".to_string(), json!(key));
+                        obj.insert("idempotency_status".to_string(), json!("cached"));
+                    }
+                    return Ok(ActionResult::success(
+                        "cached idempotent file_write response",
+                        env,
+                        request.now,
+                    ));
+                }
+                // in_flight or failed: treat as new (single-node, no lock wait).
+                let _ = idem_store.delete("file_write_allowlisted", &key);
             }
-        };
+            idem_store
+                .begin("file_write_allowlisted", &key, request.payload.clone(), 0)
+                .map_err(|e| ActionError::Proof(format!("idempotency begin failed: {e}")))?;
+            let result = self
+                .write_proof(&canonical, input.content.as_bytes(), input.mode)
+                .await;
+            match result {
+                Ok(out) => {
+                    let output: Value = json!({
+                        "path_hash": out.path_hash,
+                        "bytes_written": out.bytes_written,
+                        "mode": out.mode,
+                        "idempotency_key": key,
+                        "idempotency_status": "completed",
+                    });
+                    let _ = idem_store.complete(
+                        "file_write_allowlisted",
+                        &key,
+                        request.payload.clone(),
+                        output.clone(),
+                        crate::idempotency::DEFAULT_TTL_SECS,
+                    );
+                    Ok(ActionResult::success(
+                        format!(
+                            "wrote {} byte(s) to allowlisted path ({})",
+                            out.bytes_written, out.mode
+                        ),
+                        output,
+                        request.now,
+                    ))
+                }
+                Err(e) => {
+                    let _ = idem_store.fail(
+                        "file_write_allowlisted",
+                        &key,
+                        request.payload.clone(),
+                        e.to_string(),
+                        false,
+                        crate::idempotency::DEFAULT_TTL_SECS,
+                    );
+                    Ok(ActionResult::failure(e.to_string(), request.now))
+                }
+            }
+        } else {
+            // No idempotency key: normal path (unchanged).
+            let out = match self
+                .write_proof(&canonical, input.content.as_bytes(), input.mode)
+                .await
+            {
+                Ok(out) => out,
+                Err(e) => {
+                    return Ok(ActionResult::failure(e.to_string(), request.now));
+                }
+            };
 
-        let output: Value = json!({
-            "path_hash": out.path_hash,
-            "bytes_written": out.bytes_written,
-            "mode": out.mode,
-        });
+            let output: Value = json!({
+                "path_hash": out.path_hash,
+                "bytes_written": out.bytes_written,
+                "mode": out.mode,
+            });
 
-        // The write's result stays untrusted by default (no .trusted()).
-        Ok(ActionResult::success(
-            format!(
-                "wrote {} byte(s) to allowlisted path ({})",
-                out.bytes_written, out.mode
-            ),
-            output,
-            request.now,
-        ))
+            // The write's result stays untrusted by default (no .trusted()).
+            Ok(ActionResult::success(
+                format!(
+                    "wrote {} byte(s) to allowlisted path ({})",
+                    out.bytes_written, out.mode
+                ),
+                output,
+                request.now,
+            ))
+        }
     }
 }
 
@@ -504,6 +591,7 @@ mod tests {
             path: target.to_string_lossy().to_string(),
             content: "hello disk".to_string(),
             mode: WriteMode::Overwrite,
+            idempotency_key: None,
         })
         .expect("serialize");
         let res = skill
@@ -530,6 +618,7 @@ mod tests {
             path: target.to_string_lossy().to_string(),
             content: "nested".to_string(),
             mode: WriteMode::Overwrite,
+            idempotency_key: None,
         })
         .expect("serialize");
         let res = skill
@@ -558,6 +647,7 @@ mod tests {
             path: target.to_string_lossy().to_string(),
             content: "should not be written".to_string(),
             mode: WriteMode::Overwrite,
+            idempotency_key: None,
         })
         .expect("serialize");
         let res = skill
@@ -588,6 +678,7 @@ mod tests {
             path: traversal.to_string_lossy().to_string(),
             content: "escape".to_string(),
             mode: WriteMode::Overwrite,
+            idempotency_key: None,
         })
         .expect("serialize");
         let res = skill
@@ -622,6 +713,7 @@ mod tests {
             path: target.to_string_lossy().to_string(),
             content: "leak me".to_string(),
             mode: WriteMode::Overwrite,
+            idempotency_key: None,
         })
         .expect("serialize");
         let res = skill
@@ -649,6 +741,7 @@ mod tests {
             path: target.to_string_lossy().to_string(),
             content: "line1\n".to_string(),
             mode: WriteMode::Overwrite,
+            idempotency_key: None,
         })
         .expect("serialize");
         let res1 = skill
@@ -662,6 +755,7 @@ mod tests {
             path: target.to_string_lossy().to_string(),
             content: "line2\n".to_string(),
             mode: WriteMode::Append,
+            idempotency_key: None,
         })
         .expect("serialize");
         let res2 = skill
@@ -686,6 +780,7 @@ mod tests {
             path: target.to_string_lossy().to_string(),
             content: "data".to_string(),
             mode: WriteMode::Overwrite,
+            idempotency_key: None,
         })
         .expect("serialize");
         let res = skill
@@ -709,6 +804,7 @@ mod tests {
             path: target.to_string_lossy().to_string(),
             content: content.to_string(),
             mode: WriteMode::Overwrite,
+            idempotency_key: None,
         })
         .expect("serialize");
         let res = skill

@@ -656,8 +656,8 @@ impl Agent {
                 if is_fs_read {
                     fs_read_count += 1;
                 }
-                if *per_tool > TOOL_BUDGET_PER_NAME
-                    || (is_fs_read && fs_read_count > TOOL_BUDGET_FS_READ)
+                if *per_tool > tool_budget_per_name()
+                    || (is_fs_read && fs_read_count > tool_budget_fs_read())
                 {
                     emit_tool(durable.is_replaying());
                     record_turn_audit_into(

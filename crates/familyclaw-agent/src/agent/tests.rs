@@ -2202,7 +2202,7 @@ async fn suspend_fails_closed_when_resumable_state_cannot_be_persisted() {
     bus.stop();
 }
 
-/// The pending check and resumable write share the same ActionRuntime lock as
+/// The pending check and resumable write share the same `ActionRuntime` lock as
 /// approval consumption. A direct approval attempt cannot execute while the
 /// durable write is still in flight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

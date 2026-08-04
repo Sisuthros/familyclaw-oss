@@ -137,8 +137,32 @@ pub(crate) fn should_emit_public_progress(origin: Option<&MessageOrigin>) -> boo
 
 pub(crate) const MAX_PROGRESS_PER_TURN: u32 = 5;
 pub(crate) const PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(4);
-pub(crate) const TOOL_BUDGET_PER_NAME: u32 = 3;
-pub(crate) const TOOL_BUDGET_FS_READ: u32 = 8;
+pub(crate) const TOOL_BUDGET_PER_NAME: u32 = 8;
+pub(crate) const TOOL_BUDGET_FS_READ: u32 = 16;
+
+/// Fix 2026-07-31: budjetit env-konffattaviksi (ei rebuildia säätöön).
+/// `FAMILYCLAW_TOOL_BUDGET_PER_NAME` ja `FAMILYCLAW_TOOL_BUDGET_FS_READ`.
+/// [`std::sync::OnceLock`] = luetaan kerran prosessin eliniässä (gateway-bootissa).
+static TOOL_BUDGET_PER_NAME_ENV: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+static TOOL_BUDGET_FS_READ_ENV: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+pub(crate) fn tool_budget_per_name() -> u32 {
+    *TOOL_BUDGET_PER_NAME_ENV.get_or_init(|| {
+        std::env::var("FAMILYCLAW_TOOL_BUDGET_PER_NAME")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(TOOL_BUDGET_PER_NAME)
+    })
+}
+
+pub(crate) fn tool_budget_fs_read() -> u32 {
+    *TOOL_BUDGET_FS_READ_ENV.get_or_init(|| {
+        std::env::var("FAMILYCLAW_TOOL_BUDGET_FS_READ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(TOOL_BUDGET_FS_READ)
+    })
+}
 
 pub(crate) struct ProgressGate {
     sent: u32,

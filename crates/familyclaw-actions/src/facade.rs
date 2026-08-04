@@ -649,23 +649,38 @@ impl ActionRuntime {
         file_write_config: Option<FileWriteConfig>,
         shell_exec_config: Option<ShellExecConfig>,
     ) -> Result<()> {
-        self.register_skill(EmailTriageMock::new())?;
+        // Fix 2026-07-31: mock-skillien disablointi tuotannossa.
+        // `FAMILYCLAW_DISABLE_MOCK_SKILLS=1` poistaa fake-dataa palauttavat
+        // esimerkkitoteutukset rekisteristä — tutkimusagentti ei
+        // voi vahingossa käyttää niitä oikeaan työhön. Oletus: mockit
+        // rekisteröidään (backwards-compatible, testit käyttävät niitä).
+        let disable_mocks = std::env::var("FAMILYCLAW_DISABLE_MOCK_SKILLS")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+
+        if disable_mocks {
+            eprintln!(
+                "[familyclaw::actions] mock skills DISABLED (FAMILYCLAW_DISABLE_MOCK_SKILLS=1)"
+            );
+        } else {
+            self.register_skill(EmailTriageMock::new())?;
+            // github_issue_draft is a real, credential-free skill: it produces a draft
+            // and can save it to an allowlisted artifact (no network call). Same
+            // Layer B allowlist as file_write; the write stays behind approval
+            // (WriteExternal + RequireApproval).
+            let issue_draft = match file_write_config.clone() {
+                Some(config) => GithubIssueDraftMock::with_config(config),
+                None => GithubIssueDraftMock::new(),
+            };
+            self.register_skill(issue_draft)?;
+            self.register_skill(DiscordThreadSummaryMock::new())?;
+        }
         // Optional live email triage: registered only when FAMILYCLAW_EMAIL_TRIAGE_URL
         // is set to a public HTTPS endpoint (SSRF-guarded). Unset → mock only.
         // Misconfigured/empty URL fails closed (registration error).
         if let Some(live) = EmailTriageLive::try_from_env()? {
             self.register_skill(live)?;
         }
-        // github_issue_draft is a real, credential-free skill: it produces a draft
-        // and can save it to an allowlisted artifact (no network call). Same
-        // Layer B allowlist as file_write; the write stays behind approval
-        // (WriteExternal + RequireApproval).
-        let issue_draft = match file_write_config.clone() {
-            Some(config) => GithubIssueDraftMock::with_config(config),
-            None => GithubIssueDraftMock::new(),
-        };
-        self.register_skill(issue_draft)?;
-        self.register_skill(DiscordThreadSummaryMock::new())?;
         let file_patch = match file_write_config.clone() {
             Some(config) => FilePatchApply::with_config(config),
             None => FilePatchApply::new(),

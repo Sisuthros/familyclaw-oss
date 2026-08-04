@@ -14,12 +14,51 @@
 
 use std::collections::HashMap;
 
+use familyclaw_actions::skills::{FileWriteAllowlisted, ShellExec};
 use familyclaw_actions::{ActionRuntime, Result, SkillId, SubmitOutcome};
 use familyclaw_core::time::Timestamp;
 use serde_json::Value;
 
 use crate::decision::{decide, due_tasks};
 use crate::task::{ScheduledTask, ScheduledTaskId};
+
+/// Whether a skill honours a **tool-level** `idempotency_key` in its payload.
+///
+/// Only the two side-effecting skills that read that field
+/// ([`FileWriteAllowlisted`], [`ShellExec`]) qualify; every other skill gets
+/// its payload passed through untouched.
+fn supports_tool_idempotency(skill_id: SkillId) -> bool {
+    skill_id == FileWriteAllowlisted::skill_id() || skill_id == ShellExec::skill_id()
+}
+
+/// Derives the **tool-level** idempotency key from the scheduler firing key.
+///
+/// The firing key is `schedule-{task_id}-{bucket}`
+/// ([`crate::decision::firing_key`]); the tool-level store expects
+/// `<scope>:<stable-id>`, so the same firing becomes
+/// `schedule:{task_id}:{bucket}`. Derived from the *existing* key, so both
+/// levels dedup on exactly the same window — the scheduler-level key itself
+/// is left unchanged.
+fn tool_idempotency_key(task_id: ScheduledTaskId, firing_key: &str) -> String {
+    let bucket = firing_key.rsplit('-').next().unwrap_or(firing_key);
+    format!("schedule:{task_id}:{bucket}")
+}
+
+/// Inserts `idempotency_key` into a payload object, wrapping a non-object
+/// payload first (shouldn't happen for the skills above, which require an
+/// object payload).
+fn inject_idempotency_key(payload: Value, key: String) -> Value {
+    let mut object = match payload {
+        Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("payload".to_string(), other);
+            map
+        }
+    };
+    object.insert("idempotency_key".to_string(), Value::String(key));
+    Value::Object(object)
+}
 
 /// Dispatch summary for a single tick.
 ///
@@ -211,12 +250,20 @@ impl Scheduler {
             let Some(task) = self.tasks.iter().find(|t| t.id == decision.task_id) else {
                 continue;
             };
+            // Side-effecting skills also dedup at the tool level: hand them
+            // the same firing window as an `idempotency_key` in the payload.
+            let payload = if supports_tool_idempotency(task.skill_id) {
+                let tool_key = tool_idempotency_key(task.id, &key);
+                inject_idempotency_key(task.payload.clone(), tool_key)
+            } else {
+                task.payload.clone()
+            };
             out.push(DueDispatch {
                 task_id: task.id,
                 key,
                 being_id: task.being_id.clone(),
                 skill_id: task.skill_id,
-                payload: task.payload.clone(),
+                payload,
             });
         }
         out
@@ -530,6 +577,64 @@ mod tests {
         assert_eq!(sched.last_fired(id), Some(at(0)));
         let s = sched.tick(&mut rt, at(30)).await.expect("tick");
         assert_eq!(s.fired_count(), 0);
+    }
+
+    #[test]
+    fn shell_exec_dispatch_carries_tool_level_idempotency_key() {
+        use familyclaw_actions::idempotency::IdempotencyStore;
+        use familyclaw_actions::skills::ShellExec;
+
+        let mut sched = Scheduler::new();
+        let id = ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(55));
+        sched.register(ScheduledTask::with_id(
+            id,
+            ShellExec::skill_id(),
+            json!({"command": "echo hi"}),
+            Duration::seconds(60),
+            "being",
+        ));
+
+        // Window [120, 180) -> bucket 2.
+        let due = sched.collect_due(at(150));
+        assert_eq!(due.len(), 1);
+        let dispatch = &due[0];
+
+        // The scheduler-level key is untouched.
+        assert_eq!(dispatch.key, format!("schedule-{id}-2"));
+
+        // The payload gained the tool-level key for the same window.
+        let injected = dispatch.payload["idempotency_key"]
+            .as_str()
+            .expect("idempotency_key injected");
+        assert_eq!(injected, format!("schedule:{id}:2"));
+        assert!(injected.starts_with("schedule:"));
+        assert!(injected.contains(':'));
+
+        // ...and it survives the tool-level store's normalization unchanged.
+        assert_eq!(
+            IdempotencyStore::normalize_key(injected).expect("valid tool-level key"),
+            injected
+        );
+
+        // Original payload fields are preserved.
+        assert_eq!(dispatch.payload["command"], "echo hi");
+    }
+
+    #[test]
+    fn other_skills_payload_is_not_rewritten() {
+        let mut sched = Scheduler::new();
+        let id = ScheduledTaskId::from_uuid(uuid::Uuid::from_u128(56));
+        sched.register(ScheduledTask::with_id(
+            id,
+            FsReadAllowlisted::skill_id(),
+            json!({"path": "/nonexistent"}),
+            Duration::seconds(60),
+            "being",
+        ));
+
+        let due = sched.collect_due(at(0));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].payload, json!({"path": "/nonexistent"}));
     }
 
     #[test]
