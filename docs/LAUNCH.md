@@ -40,7 +40,7 @@ powershell -File scripts/expo-demo.ps1
 ## One-command proof (put this in every post)
 
 ```bash
-git clone https://github.com/Sisuthros/familyclaw
+git clone https://github.com/Sisuthros/familyclaw-oss
 cd familyclaw
 cargo build -p familyclaw-agent --bin continuity_daemon
 cargo run -p familyclaw-bench --bin bench -- all
@@ -84,7 +84,7 @@ every crash point we test; LangGraph re-fired in the `before_write` and
 Reproduce:
 
 ```bash
-git clone https://github.com/Sisuthros/familyclaw
+git clone https://github.com/Sisuthros/familyclaw-oss
 cd familyclaw
 cargo build -p familyclaw-agent --bin continuity_daemon
 cargo run -p familyclaw-bench --bin bench -- all

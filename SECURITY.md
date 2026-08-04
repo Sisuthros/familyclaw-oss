@@ -15,7 +15,7 @@ branch and the latest 1.x release.
 **Please do not open a public issue for security vulnerabilities.**
 
 Report privately through:
-- GitHub Security Advisories (preferred): https://github.com/Sisuthros/familyclaw/security/advisories/new
+- GitHub Security Advisories (preferred): https://github.com/Sisuthros/familyclaw-oss/security/advisories/new
 - Or contact a maintainer privately via GitHub (see the repository profile)
 
 We aim to acknowledge valid reports promptly. See [docs/BUG_BOUNTY.md](docs/BUG_BOUNTY.md)

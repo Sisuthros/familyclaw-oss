@@ -17,7 +17,7 @@ rustc --version  # Should show 1.88 or higher
 **Public demo first (Layer A — no keys):**
 
 ```bash
-git clone https://github.com/Sisuthros/familyclaw.git
+git clone https://github.com/Sisuthros/familyclaw-oss.git
 cd familyclaw
 cargo run -p minimal-gateway -- --duration 10
 ```

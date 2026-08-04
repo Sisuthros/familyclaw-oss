@@ -191,11 +191,11 @@ Both offers are **anchored at the top of their range** with fully defined scope:
 ## Contact
 
 **Commercial / pilots:** open a private request via
-[GitHub Discussions](https://github.com/Sisuthros/familyclaw/discussions)
+[GitHub Discussions](https://github.com/Sisuthros/familyclaw-oss/discussions)
 (category: *Pilots*) or email `pilots@familyclaw.dev` (alias — responses
 within the pilot SLA in `docs/commercial/PILOT_SLA.md`).
 
-**Security:** [GitHub Security Advisories](https://github.com/Sisuthros/familyclaw/security/advisories/new)
+**Security:** [GitHub Security Advisories](https://github.com/Sisuthros/familyclaw-oss/security/advisories/new)
 — see also `docs/BUG_BOUNTY.md`.
 
 Repository may be private during evaluation — **private demo access available

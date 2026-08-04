@@ -37,7 +37,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$RepoUrl  = "https://github.com/Sisuthros/familyclaw.git"
+$RepoUrl  = "https://github.com/Sisuthros/familyclaw-oss.git"
 $RepoDir  = "$env:LOCALAPPDATA\familyclaw-source"
 $BinName  = "familyclaw-gateway.exe"
 $BinDir   = Join-Path $Prefix "bin"
@@ -157,7 +157,7 @@ function Write-Summary {
     Write-Host "  3. Verify:  Invoke-WebRequest http://127.0.0.1:8789/healthz   # -> ok"
     Write-Host "              $BinDir\$BinName doctor"
     Write-Host ""
-    Write-Host "Docs: https://github.com/Sisuthros/familyclaw"
+    Write-Host "Docs: https://github.com/Sisuthros/familyclaw-oss"
 }
 
 # ── Main ────────────────────────────────────────────────────────────

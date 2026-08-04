@@ -88,7 +88,7 @@ That last point matters: this is honest **at-most-once dispatch**, not magical
 exactly-once *completion*. A crash in the intent-only window means 0-or-1
 executions and a loud stop — never 2.
 
-I implemented this in [FamilyClaw](https://github.com/Sisuthros/familyclaw), a
+I implemented this in [FamilyClaw](https://github.com/Sisuthros/familyclaw-oss), a
 Rust agent runtime (MIT, `unsafe` forbidden workspace-wide). Same harness
 shape, same metric:
 
@@ -110,7 +110,7 @@ Everything is pinned; no LLM runs in either harness, so every run is
 byte-reproducible:
 
 ```bash
-git clone https://github.com/Sisuthros/familyclaw
+git clone https://github.com/Sisuthros/familyclaw-oss
 cd familyclaw
 
 # FamilyClaw side (Rust):
@@ -142,6 +142,6 @@ work.
 
 ---
 
-*Discussion: [GitHub](https://github.com/Sisuthros/familyclaw) — I'm looking
+*Discussion: [GitHub](https://github.com/Sisuthros/familyclaw-oss) — I'm looking
 for the first external person to run `familyclaw serve` in their own
 environment and report back. That report is worth more to me than stars.*

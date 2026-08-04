@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────
-REPO_URL="https://github.com/Sisuthros/familyclaw.git"
+REPO_URL="https://github.com/Sisuthros/familyclaw-oss.git"
 REPO_DIR="${HOME}/.local/share/familyclaw-source"
 BINARY_NAME="familyclaw-gateway"
 DEFAULT_PREFIX="/usr/local"
@@ -218,7 +218,7 @@ print_summary() {
     echo "  curl http://127.0.0.1:8787/healthz  # -> ok"
     echo "  curl http://127.0.0.1:8787/readyz   # -> ready (when bus is up)"
     echo
-    echo "Docs: https://github.com/Sisuthros/familyclaw"
+    echo "Docs: https://github.com/Sisuthros/familyclaw-oss"
 }
 
 # ── Main ──────────────────────────────────────────────────────────

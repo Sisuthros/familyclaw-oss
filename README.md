@@ -162,16 +162,18 @@ See also [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) (layer 7: at-most-once
 > **Next proofs:** deeper WASM sandbox safety scenarios, a broader action/skill
 > runtime surface, and additional channel adapters.
 
-[![CI](https://github.com/Sisuthros/familyclaw/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Sisuthros/familyclaw/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/Sisuthros/familyclaw-oss?label=release)](https://github.com/Sisuthros/familyclaw-oss/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Rust 2021](https://img.shields.io/badge/Rust-2021%20edition-orange.svg)
 ![unsafe: forbidden](https://img.shields.io/badge/unsafe-forbid-green.svg)
 ![Continuity scorecard](https://img.shields.io/badge/continuity%20scorecard-8%2F8%20PASS-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-2140%20passing-brightgreen.svg)
 
-> **Verify without cloning:** every `main` CI run regenerates the 8-scenario
-> continuity scorecard and publishes it in the run's **Summary** tab
-> ([latest runs](https://github.com/Sisuthros/familyclaw/actions/workflows/ci.yml?query=branch%3Amain)) —
-> including `side_effect_overcount = 0` for the crash matrix.
+> **Verify it yourself, locally.** The gates this release was cut from are
+> reproducible on your machine without any hosted CI: `bash
+> scripts/crash-proof.sh` regenerates the crash matrix including
+> `side_effect_overcount = 0`, and `cargo test --workspace --all-features`
+> runs the full 2140-test suite.
 
 ---
 
@@ -282,13 +284,32 @@ paths, and ships unit tests in-module.
 
 ## Quick start
 
+### Download a prebuilt binary (no Rust toolchain needed)
+
+```bash
+# Linux x86_64
+curl -sSL -o familyclaw-gateway \
+  https://github.com/Sisuthros/familyclaw-oss/releases/latest/download/familyclaw-gateway-linux-x86_64
+chmod +x familyclaw-gateway
+
+# Start it with no keys, no channels, no config
+FAMILYCLAW_CHANNEL_KIND=none ./familyclaw-gateway serve
+curl -i http://127.0.0.1:8787/healthz    # -> 200 OK
+```
+
+Windows: download
+[`familyclaw-gateway-windows-x86_64.exe`](https://github.com/Sisuthros/familyclaw-oss/releases/latest)
+from the same release.
+
+Building from source instead? Read on.
+
 **Prerequisites:** Rust 1.88+ (edition 2021). No external services required for
 the demo — it runs entirely in-memory.
 
 ### FamilyClaw in 60 seconds ⚡
 
 ```bash
-git clone https://github.com/Sisuthros/familyclaw
+git clone https://github.com/Sisuthros/familyclaw-oss
 cd familyclaw
 
 # One command: builds + runs 1 agent + Resonance Bus + MockChannel
@@ -320,7 +341,7 @@ keys, no channel tokens — just the HTTP surface (`/healthz`, `/readyz`,
 newcomer to confirm the runtime is alive on their machine.
 
 ```bash
-git clone https://github.com/Sisuthros/familyclaw
+git clone https://github.com/Sisuthros/familyclaw-oss
 cd familyclaw
 
 # 1. Install the gateway binary (name: familyclaw-gateway)

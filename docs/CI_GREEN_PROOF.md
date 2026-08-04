@@ -68,7 +68,7 @@ pipeline shows `failure` within a few seconds (no build actually runs).
 
 **Verification that this is billing, not code/workflow:**
 
-- `gh api repos/Sisuthros/familyclaw/actions/permissions`
+- `gh api repos/Sisuthros/familyclaw-oss/actions/permissions`
   → `{"enabled":true,"allowed_actions":"all", …}` (Actions are enabled).
 - `gh run view <id>` annotation is the billing message above, on the
   `layer-b-audit` job, run duration ~2s (it never gets to checkout work).

@@ -13,7 +13,7 @@ version = "1.3.0"
 edition = "2021"
 license = "MIT"
 authors = ["The FamilyClaw contributors"]
-repository = "https://github.com/Sisuthros/familyclaw"
+repository = "https://github.com/Sisuthros/familyclaw-oss"
 rust-version = "1.88"
 
 
