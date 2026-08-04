@@ -173,3 +173,6 @@ docs/GIT_CONSOLIDATION.md
 MASTERPLAN.md
 # Internal dev tool — MASTERPLAN §7: not part of the publishable workspace
 crates/familyclaw-gemu/
+
+# Release artifacts — published as GitHub release assets, never committed
+dist/
