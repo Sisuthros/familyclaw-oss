@@ -12,7 +12,7 @@ contract.
 
 **Business hours:** Mon–Fri 09:00–17:00 Europe/Helsinki (excl. Finnish public holidays).
 
-**Escalation:** Sev-1 → `pilots@familyclaw.dev` with subject `SEV1` + GitHub
+**Escalation:** Sev-1 → a GitHub issue labelled `SEV1` with subject `SEV1` + GitHub
 Security Advisory if the issue is a vulnerability.
 
 **Out of scope:** LLM provider outages, customer Layer B misconfiguration,

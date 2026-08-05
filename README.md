@@ -282,6 +282,18 @@ paths, and ships unit tests in-module.
 
 ---
 
+## Using this where it matters?
+
+If you are running agents or background jobs that touch money, customer data or
+infrastructure, and the crash window described above is a real risk for you, I
+do paid pilots and integration work: **[Commercial offer](docs/COMMERCIAL_OFFER.md)**.
+
+Open an issue with the label `pilot`. There are no production deployments and
+no customers yet — early clients are
+founding pilots, and the offer document says so plainly.
+
+---
+
 ## Quick start
 
 ### Download a prebuilt binary (no Rust toolchain needed)
