@@ -208,6 +208,30 @@ ALL_TRACKED=$(git ls-files 2>/dev/null \
     | grep -vE '(^|/)docs/GIT_CONSOLIDATION\.md$' \
     | grep -vE '(^|/)scripts/audit-layer-b\.sh$' \
     | grep -vE '(^|/)scripts/pre-publish-scan\.sh$' || true)
+# ── PLACEHOLDER MODE ONLY: the release history quotes the placeholder tokens ──
+# CHANGELOG.md and docs/RELEASE_NOTES_*.md describe THIS audit, and to do so they
+# quote a placeholder token by name (`PlaceholderAgentOne`) inside backticks.
+# In placeholder mode the forbidden list IS those tokens, so the audit matched
+# its own release notes and failed — the same self-match this file already
+# excludes scripts/pre-publish-scan.sh for, three comment-lines above.
+#
+# Measured on the public repo (2026-08-29): 11/12 checks PASS, including
+# "no private identity in author/committer metadata (374 commits scanned)";
+# the only failure was CHANGELOG.md:51 and docs/RELEASE_NOTES_v1.3.0.md:26.
+# Because check 8 runs first, that one false positive skipped all 8 test jobs,
+# so the public CI has been red on every run and no test suite has ever
+# executed publicly.
+#
+# The exclusion is deliberately conditional. In REAL mode the forbidden list
+# contains real names, the release notes cannot self-match, and these files are
+# scanned exactly as before — real-name coverage is unchanged. A placeholder run
+# is already documented as reduced coverage that "must never be cited as
+# clearance", so narrowing it further here costs nothing that was being relied on.
+if [ "$NAMES_MODE" = "placeholder" ]; then
+    ALL_TRACKED=$(printf '%s\n' "$ALL_TRACKED" \
+        | grep -vE '(^|/)CHANGELOG\.md$' \
+        | grep -vE '(^|/)docs/RELEASE_NOTES_[^/]*\.md$' || true)
+fi
 # Keep only TEXT files (content-based, no extension guessing). Iterate safely
 # even with spaces/odd chars via a while-read loop on NUL-free, newline-listed
 # paths from git ls-files (git paths use forward slashes, no newlines).

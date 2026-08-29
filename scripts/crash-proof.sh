@@ -49,6 +49,25 @@ note "  FamilyClaw — crash proof (at-most-once external dispatch)"
 note "═══════════════════════════════════════════════════════════"
 note ""
 
+# ── Interpreter check, before anything else ────────────────────────────────
+# A missing interpreter must never be able to look like a product failure.
+# Resolve it once, loudly, and exit 2 (environment) rather than 1 (invariant
+# violated) so the two are never confused.
+FC_PYTHON="${PYTHON:-}"
+if [ -z "$FC_PYTHON" ]; then
+    if command -v python3 >/dev/null 2>&1; then FC_PYTHON=python3
+    elif command -v python >/dev/null 2>&1; then FC_PYTHON=python
+    fi
+fi
+if [ -z "$FC_PYTHON" ] || ! "$FC_PYTHON" -c 'import json,sys' >/dev/null 2>&1; then
+    printf 'ENVIRONMENT: python3 is required to read the harness JSON output.\n'
+    printf '  Install it (Debian/Ubuntu: apt install python3, macOS: brew install python)\n'
+    printf '  or point this script at one: PYTHON=/path/to/python bash scripts/crash-proof.sh\n'
+    printf 'overall = NOT RUN (environment)\n'
+    exit 2
+fi
+note "    python: $FC_PYTHON"
+
 # ── Build the black box ────────────────────────────────────────────────────
 note ">>> Building dispatch_redteam ..."
 if ! cargo build -q -p familyclaw-actions --bin dispatch_redteam 2>&1; then
@@ -73,8 +92,22 @@ note ""
 result_line() { sed -n 's/^RESULT //p' "$1" | tail -n1; }
 
 # Reads a scalar field out of the RESULT json without needing jq.
+#
+# Interpreter is resolved once, at startup, and the failure is loud.
+#
+# This used to call a bare `python` with `2>/dev/null`. On stock Ubuntu 24.04,
+# Debian and macOS 13+ only `python3` exists — `python` needs the separate
+# python-is-python3 package. With stderr swallowed, a missing interpreter did
+# not fail: json_field returned an EMPTY string, and the invariant checks below
+# compared that empty value against the expected one and printed
+#
+#     FAIL: side effect count after replay = , expected 1 (DUPLICATE DISPATCH)
+#
+# i.e. the flagship proof reported the exact bug this product exists to prevent,
+# on a reviewer's machine, because of a missing package. CI never caught it:
+# crash-matrix.yml uses actions/setup-python@v5, which creates a `python` shim.
 json_field() {
-    python -c "
+    "$FC_PYTHON" -c "
 import json,sys
 try:
     d=json.loads(sys.argv[1])
@@ -82,7 +115,7 @@ except Exception:
     print('__PARSE_ERROR__'); sys.exit(0)
 v=d.get(sys.argv[2])
 print('' if v is None else (str(v).lower() if isinstance(v,bool) else str(v)))
-" "$1" "$2" 2>/dev/null
+" "$1" "$2"
 }
 
 read_counter() {
