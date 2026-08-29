@@ -322,7 +322,7 @@ the demo — it runs entirely in-memory.
 
 ```bash
 git clone https://github.com/Sisuthros/familyclaw-oss
-cd familyclaw
+cd familyclaw-oss
 
 # One command: builds + runs 1 agent + Resonance Bus + MockChannel
 cargo run -p minimal-gateway -- --duration 10
@@ -354,7 +354,7 @@ newcomer to confirm the runtime is alive on their machine.
 
 ```bash
 git clone https://github.com/Sisuthros/familyclaw-oss
-cd familyclaw
+cd familyclaw-oss
 
 # 1. Install the gateway binary (name: familyclaw-gateway)
 cargo install --path crates/familyclaw-gateway

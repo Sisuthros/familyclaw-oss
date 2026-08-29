@@ -655,8 +655,7 @@ impl ActionRuntime {
         // voi vahingossa käyttää niitä oikeaan työhön. Oletus: mockit
         // rekisteröidään (backwards-compatible, testit käyttävät niitä).
         let disable_mocks = std::env::var("FAMILYCLAW_DISABLE_MOCK_SKILLS")
-            .ok()
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
         if disable_mocks {
             eprintln!(
