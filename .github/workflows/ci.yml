@@ -284,20 +284,11 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Run cargo audit
-        # cargo-audit does NOT read deny.toml -> ignores must be repeated here.
-        # Keep in sync with deny.toml's [advisories].ignore list.
-        # Rationale: rsa Marvin (no fix), rustls-webpki (discord chain,
-        # no fixed serenity version), atomic-polyfill+number_prefix
-        # (unmaintained, not a vulnerability). wasmtime advisories fixed 35->45.
-        run: |
-          cargo audit \
-            --ignore RUSTSEC-2023-0071 \
-            --ignore RUSTSEC-2026-0049 \
-            --ignore RUSTSEC-2026-0098 \
-            --ignore RUSTSEC-2026-0099 \
-            --ignore RUSTSEC-2026-0104 \
-            --ignore RUSTSEC-2023-0089 \
-            --ignore RUSTSEC-2025-0119
+        # Suppressions live in .cargo/audit.toml, which cargo-audit reads from
+        # the repository root. Do NOT repeat them as --ignore flags: keeping the
+        # same list in three places (deny.toml, .cargo/audit.toml, this file) is
+        # what let two suppressions go stale unnoticed until 2026-08-29.
+        run: cargo audit
 
   cargo-deny:
     name: cargo deny

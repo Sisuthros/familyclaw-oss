@@ -23,16 +23,12 @@ ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
-    # rkyv 0.7.46 — arkiston puutteellinen validointi voi aiheuttaa
-    # rajan yli lukemisen Rc/Arc-arkistoissa. Korjaus vaatii rkyv >=0.8.17,
-    # mutta rkyv tulee ketjusta surrealdb 3 → surrealdb-core → rust_decimal,
-    # joka pinnaa yhä rkyv 0.7:n; korjaavaa upstream-versiota ei ole.
-    # Koodipolku on lisäksi valinnaisen `surreal`-featuren takana
-    # (familyclaw-hearth: `surrealdb = { optional = true }`), joka on
-    # oletuksena POIS. FamilyClaw ei pura ulkopuolelta tulevia
-    # rkyv-arkistoja. Poistuu kun rust_decimal siirtyy rkyv 0.8:aan.
-    "RUSTSEC-2026-0235",
 ]
+# HUOM: RUSTSEC-2026-0235 (rkyv 0.7.46) ei ole tässä listassa tarkoituksella.
+# cargo-deny tarkastelee oletusfeature-graafia, jossa rkyv:tä ei ole lainkaan —
+# se tulee valinnaisen `surreal`-featuren takaa. Vaimennus täällä tuottaisi
+# `advisory-not-detected`-varoituksen. Perustelu ja vaimennus ovat
+# `.cargo/audit.toml`:ssa, jonka työkalu näkee koko Cargo.lockin.
 
 [bans]
 multiple-versions = "warn"
