@@ -67,7 +67,7 @@ familyclaw-embeddings = { workspace = true }
 # Phase 4: kill-switch-reitti jäsentää ScheduledTaskId:n UUID-stringistä.
 uuid = { workspace = true }
 futures-util = "0.3"
-jsonwebtoken = { version = "9.3", default-features = true, features = ["use_pem"] }
+jsonwebtoken = { version = "10.4", default-features = true, features = ["use_pem"] }
 
 [dev-dependencies]
 # E2E suspend→approve→resume -testi rakentaa AIDON agentin skriptatulla LLM:llä
