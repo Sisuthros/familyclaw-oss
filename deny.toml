@@ -5,7 +5,10 @@
 version = 2
 # Perustellut poikkeukset (kukin: ei korjaavaa upstream-versiota TAI ei
 # FamilyClawn laukaisemaa koodipolkua). Bumpattavat advisoryt EI kuulu tänne —
-# ne korjattiin (esim. wasmtime 35→45 poisti 16 advisorya 2026-06-14).
+# ne korjataan (wasmtime 35→45 poisti 16 advisorya 2026-06-14; 2026-08-29
+# ammonia 4.1.3→4.1.4, h2 0.4.14→0.4.19 ja wasmtime 45→46 poistivat kolme
+# lisää). Jos vaimennus ei enää osu mihinkään, cargo-deny varoittaa
+# `advisory-not-detected` — poista se silloin, älä jätä roikkumaan.
 ignore = [
     # rsa Marvin Attack — RSA-PKCS1v15-purun ajoituskanava. Ei korjaavaa
     # upstream-versiota (transitiivinen jsonwebtoken-ketjusta). FamilyClaw ei
@@ -20,11 +23,15 @@ ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
-    # atomic-polyfill — unmaintained (ei haavoittuvuus). Transitiivinen.
-    "RUSTSEC-2023-0089",
-    # number_prefix — unmaintained (ei haavoittuvuus). Transitiivinen
-    # (indicatif-ketju). Pieni, vakaa muotoilukirjasto.
-    "RUSTSEC-2025-0119",
+    # rkyv 0.7.46 — arkiston puutteellinen validointi voi aiheuttaa
+    # rajan yli lukemisen Rc/Arc-arkistoissa. Korjaus vaatii rkyv >=0.8.17,
+    # mutta rkyv tulee ketjusta surrealdb 3 → surrealdb-core → rust_decimal,
+    # joka pinnaa yhä rkyv 0.7:n; korjaavaa upstream-versiota ei ole.
+    # Koodipolku on lisäksi valinnaisen `surreal`-featuren takana
+    # (familyclaw-hearth: `surrealdb = { optional = true }`), joka on
+    # oletuksena POIS. FamilyClaw ei pura ulkopuolelta tulevia
+    # rkyv-arkistoja. Poistuu kun rust_decimal siirtyy rkyv 0.8:aan.
+    "RUSTSEC-2026-0235",
 ]
 
 [bans]
