@@ -1,6 +1,6 @@
 aiosqlite==0.22.1
 annotated-types==0.7.0
-anyio==4.14.0
+anyio==4.14.2
 certifi==2026.6.17
 charset-normalizer==3.4.7
 h11==0.16.0
