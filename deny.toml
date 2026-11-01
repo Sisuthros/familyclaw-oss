@@ -23,6 +23,12 @@ ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0382",
+    # rustls 0.22.4 — same serenity chain (serenity 0.12.5 -> tokio-tungstenite 0.21 ->
+    # rustls 0.22); the fix (>=0.23.46) needs a serenity release on rustls 0.23. rustls 0.23
+    # itself is already upgraded. Remove together with the entries above.
+    "RUSTSEC-2026-0346",
+    "RUSTSEC-2026-0349",
 ]
 # HUOM: RUSTSEC-2026-0235 (rkyv 0.7.46) ei ole tässä listassa tarkoituksella.
 # cargo-deny tarkastelee oletusfeature-graafia, jossa rkyv:tä ei ole lainkaan —

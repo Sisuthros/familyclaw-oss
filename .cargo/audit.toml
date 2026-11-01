@@ -23,6 +23,19 @@ ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0382",
+    # rustls 0.22.4 — same serenity chain (serenity 0.12.5 -> tokio-tungstenite 0.21 ->
+    # rustls 0.22); no serenity release moves to rustls 0.23 yet, which is where the fix
+    # (>=0.23.46) lives. rustls 0.23 itself is already upgraded in Cargo.lock. Reachable only
+    # through the Discord websocket client. Remove together with the entries above.
+    "RUSTSEC-2026-0346",
+    "RUSTSEC-2026-0349",
+    # crypto-bigint 0.5.5 — timing variability in operations meant to be constant-time. Comes
+    # from jsonwebtoken 9 -> p256/p384 -> elliptic-curve 0.13, which pins crypto-bigint 0.5;
+    # the fix (>=0.7.6) is a breaking bump no elliptic-curve 0.13 release accepts. Not
+    # reachable with secrets: the gateway only verifies JWTs (public keys, oidc.rs), signing
+    # keys exist only in tests (HS256/RS256).
+    "RUSTSEC-2026-0387",
     # rkyv 0.7.46 — arkiston puutteellinen validointi voi aiheuttaa rajan yli
     # lukemisen Rc/Arc-arkistoissa (RUSTSEC-2026-0235). Korjaus vaatii
     # rkyv >=0.8.17, mutta rkyv tulee ketjusta surrealdb 3 → surrealdb-core →
