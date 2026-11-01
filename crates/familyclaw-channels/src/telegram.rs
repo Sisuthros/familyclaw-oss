@@ -569,7 +569,7 @@ mod tests {
     fn parse_empty_result_keeps_previous_offset() {
         let body = r#"{ "ok": true, "result": [] }"#;
         let outcome = parse_get_updates(body, Some(42)).expect("parse ok");
-        assert!(outcome.messages.is_empty());
+        assert_eq!(outcome.messages, []);
         // No new updates → the previous offset is kept.
         assert_eq!(outcome.next_offset, Some(42));
     }
@@ -585,7 +585,7 @@ mod tests {
             ]
         }"#;
         let outcome = parse_get_updates(body, None).expect("parse ok");
-        assert!(outcome.messages.is_empty());
+        assert_eq!(outcome.messages, []);
         assert_eq!(outcome.next_offset, Some(201));
     }
 
@@ -613,7 +613,7 @@ mod tests {
             ]
         }"#;
         let outcome = parse_get_updates(body, None).expect("parse ok");
-        assert!(outcome.messages.is_empty());
+        assert_eq!(outcome.messages, []);
         // update_id is still acknowledged (so an empty message doesn't loop forever).
         assert_eq!(outcome.next_offset, Some(4));
     }

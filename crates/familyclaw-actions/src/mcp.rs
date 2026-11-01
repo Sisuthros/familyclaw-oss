@@ -150,6 +150,8 @@ impl McpToolResult {
 /// An implementation publishes a set of tools ([`McpToolProvider::describe`])
 /// and runs a single tool call ([`McpToolProvider::call`]). Layer A
 /// implementations are **mocks** — no real network calls.
+// The `#[must_use]` that `async_trait` puts on the boxed future triggers this lint.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait McpToolProvider: Send + Sync {
     /// Returns all tool descriptors the provider publishes.

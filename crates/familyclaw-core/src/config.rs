@@ -418,7 +418,7 @@ mod tests {
         assert_eq!(family.agents.len(), 1);
         let agent = &family.agents[0];
         assert_eq!(agent.name, "agent_a");
-        assert!(agent.model.fallbacks.is_empty());
+        assert_eq!(agent.model.fallbacks, [] as [String; 0]);
         // Defaults were filled in: id not nil, no profile.
         assert!(!agent.id.is_nil());
         assert!(agent.profile_dir.is_none());

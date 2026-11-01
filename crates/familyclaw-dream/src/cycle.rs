@@ -854,7 +854,7 @@ mod tests {
         let report = cycle.run_without_journal(at()).await.expect("run");
         assert_eq!(report.scanned, 0);
         assert!(!report.made_changes());
-        assert!(report.reflections.is_empty());
+        assert_eq!(report.reflections, []);
         assert!(report.ran_at.is_some());
     }
 

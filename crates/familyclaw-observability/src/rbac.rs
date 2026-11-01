@@ -246,7 +246,7 @@ mod tests {
             vec!["alpha", "mu", "zeta"]
         );
         // A role with no grants -> empty.
-        assert!(policy.capabilities_for(AgentRole::Scout).is_empty());
+        assert_eq!(policy.capabilities_for(AgentRole::Scout), [] as [String; 0]);
     }
 
     // --- Edge cases ---

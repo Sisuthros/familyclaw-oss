@@ -162,7 +162,7 @@ mod tests {
         assert!(chunks.len() > 1);
         for chunk in &chunks {
             assert!(chunk.chars().count() <= 200);
-            assert!(!chunk.is_empty());
+            assert_ne!(chunk, "");
         }
         roundtrip(&body, 200, NL_UNLIMITED);
     }
@@ -191,9 +191,12 @@ mod tests {
 
     #[test]
     fn empty_and_whitespace_return_empty_vec() {
-        assert!(split_message("", 2000, NL_UNLIMITED).is_empty());
-        assert!(split_message("   ", 2000, NL_UNLIMITED).is_empty());
-        assert!(split_message("\n\t  \n", 2000, NL_UNLIMITED).is_empty());
+        assert_eq!(split_message("", 2000, NL_UNLIMITED), [] as [String; 0]);
+        assert_eq!(split_message("   ", 2000, NL_UNLIMITED), [] as [String; 0]);
+        assert_eq!(
+            split_message("\n\t  \n", 2000, NL_UNLIMITED),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -250,7 +253,7 @@ mod tests {
                 chunk.matches('\n').count() <= 5,
                 "chunk exceeds newline budget: {chunk:?}"
             );
-            assert!(!chunk.is_empty());
+            assert_ne!(chunk, "");
         }
         roundtrip(&body, 2000, 5);
     }

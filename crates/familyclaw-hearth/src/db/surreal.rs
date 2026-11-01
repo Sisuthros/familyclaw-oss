@@ -661,7 +661,7 @@ mod tests {
             .await
             .expect("empty batch");
         let agents = store.list_agents_with_emotion().await.expect("list");
-        assert!(agents.is_empty());
+        assert_eq!(agents, [] as [String; 0]);
     }
 
     /// Edge case: 1 agent in the batch.

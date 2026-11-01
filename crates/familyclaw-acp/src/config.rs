@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn new_defaults_args_empty_and_working_dir_none() {
         let config = AcpAgentConfig::new("agent_a");
-        assert!(config.args.is_empty());
+        assert_eq!(config.args, [] as [String; 0]);
         assert!(config.working_dir.is_none());
     }
 

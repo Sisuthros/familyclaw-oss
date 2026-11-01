@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn neutral_state_has_no_blends() {
         let s = EmotionState::neutral();
-        assert!(detect_blends(&s).is_empty());
+        assert_eq!(detect_blends(&s), Vec::new());
         assert!(primary_blend(&s).is_none());
     }
 

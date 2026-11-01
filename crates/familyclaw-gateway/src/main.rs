@@ -2917,7 +2917,7 @@ mod tests {
     #[test]
     fn resolve_inject_token_allows_empty_on_loopback() {
         let cfg = FamilyConfig::default();
-        assert!(cfg.gateway_token().trim().is_empty());
+        assert_eq!(cfg.gateway_token().trim(), "");
         let loopback: SocketAddr = "127.0.0.1:8787".parse().expect("addr");
         let token = resolve_inject_token(&cfg, loopback).expect("loopback open ok");
         assert!(token.is_none());

@@ -324,7 +324,7 @@ fn helpers_smoke() {
         drop(j);
     }
     let bytes = read_bytes(tmp.path());
-    assert!(!bytes.is_empty());
+    assert_ne!(bytes, [] as [u8; 0]);
     let mut f = File::open(tmp.path()).expect("open");
     f.seek(SeekFrom::Start(0)).expect("seek");
 }

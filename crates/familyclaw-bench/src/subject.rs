@@ -144,6 +144,8 @@ pub struct DreamSummary {
 /// FamilyClaw is the first implementation; competitors come in behind the
 /// same interface (design §2.1). Every operation that needs time receives
 /// a [`Timestamp`] injected — the system clock is never read.
+// The `#[must_use]` that `async_trait` puts on the boxed future triggers this lint.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Subject: Send {
     /// Starts a task and returns a handle for targeting a crash.

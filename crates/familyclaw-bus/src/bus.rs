@@ -138,6 +138,8 @@ impl BusState {
 /// an empty being registry.
 pub struct ResonanceBus;
 
+// ractor's `Actor` trait declares these callbacks as async; synchronous bodies are fine.
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for ResonanceBus {
     type Msg = BusOp;
     type State = BusState;
@@ -428,7 +430,7 @@ mod tests {
     async fn beings_list_is_not_empty_after_join() {
         let bus = ResonanceBus::start(None).await.expect("start bus");
         assert_eq!(bus.count().await.expect("count"), 0);
-        assert!(bus.beings().await.expect("beings").is_empty());
+        assert_eq!(bus.beings().await.expect("beings"), []);
 
         let (id_a, _a, _la) = join_being(&bus, "agent_a").await;
         let (id_b, _b, _lb) = join_being(&bus, "agent_b").await;

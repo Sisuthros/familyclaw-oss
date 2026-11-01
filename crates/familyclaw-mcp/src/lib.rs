@@ -2,7 +2,7 @@
 //!
 //! An MCP client for the `FamilyClaw` platform (Layer A, OSS): stdio and
 //! HTTP transport, tool listing/invocation, and a bridge to
-//! [`ActionRuntime`] skills.
+//! `ActionRuntime` skills.
 
 pub mod bridge;
 pub mod client;
@@ -32,6 +32,6 @@ mod tests {
 
     #[test]
     fn version_is_nonempty() {
-        assert!(!version().is_empty());
+        assert_ne!(version(), "");
     }
 }

@@ -26,7 +26,7 @@
 //!
 //! For that reason, evidence is kept in a **parallel structure**
 //! ([`EvidenceLedger`]), keyed by the proposal's
-//! [`ProposalId`](crate::ProposalId). This keeps the core untouched and
+//! [`ProposalId`]. This keeps the core untouched and
 //! structurally free of any apply path.
 //!
 //! ## Fail-closed
@@ -34,7 +34,7 @@
 //! [`evaluate_for_approval`] NEVER approves anything — it **only states**
 //! whether the evidence requirements are met. Missing evidence, a regression
 //! (`improved == false`), or an empty comparison →
-//! [`EvidenceVerdict::insufficient`]. This does not replace the human/
+//! `EvidenceVerdict::insufficient`. This does not replace the human/
 //! operator approval gate ([`crate::ProposalStore::approve`]); it complements
 //! it: the evidence requirement is a *precondition* for approval, not the
 //! approval itself.

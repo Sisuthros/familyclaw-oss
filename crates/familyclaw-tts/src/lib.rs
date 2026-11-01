@@ -14,7 +14,7 @@
 //!   + provider id).
 //! - [`MockTts`] -- an in-memory, no-network provider for tests and offline
 //!   agent development (always available, no feature flag).
-//! - [`OpenAiTts`] (feature `openai`) -- an `OpenAI`-compatible `/audio/speech`
+//! - `OpenAiTts` (feature `openai`) -- an `OpenAI`-compatible `/audio/speech`
 //!   HTTP adapter. Works against `OpenAI` itself and any `OpenAI`-API-compatible
 //!   TTS gateway (same endpoint shape) via a configurable `api_base`. Needs
 //!   only a bearer API key -- no exotic auth flow.
@@ -26,7 +26,7 @@
 //! the real HTTP adapter (`reqwest`).
 //!
 //! ## More providers: see the design doc
-//! This crate ships one verified, working adapter ([`OpenAiTts`]). Adding
+//! This crate ships one verified, working adapter (`OpenAiTts`). Adding
 //! more real backends (`ElevenLabs`, Azure/Edge TTS, a local engine like
 //! Piper) is a matter of implementing [`TtsProvider`] behind a new feature
 //! flag -- see `docs/design/tts-providers.md` for the extension plan and
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn version_is_nonempty() {
-        assert!(!version().is_empty());
+        assert_ne!(version(), "");
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //!
 //! ## Scenarios (each asserts a measured zero)
 //! - **SEC1 — fuel exhaustion:** a skill containing an infinite loop is
-//!   halted by the fuel gate ([`SandboxError::FuelExhausted`]) instead of
+//!   halted by the fuel gate (`SandboxError::FuelExhausted`) instead of
 //!   hanging. Metric `escapes = 0`.
 //! - **SEC2 — capability denial:** a skill requiring a granted capability
 //!   (host import / network / FS) is blocked under the deny-by-default
@@ -26,11 +26,11 @@
 //!
 //! ## Using the real interface (no mocking the thing under test)
 //! Every scenario runs against the **real** public interface:
-//! [`WasmtimeSandbox`](familyclaw_sandbox::WasmtimeSandbox) (`wasmtime`
-//! feature), [`CapabilitySet`](familyclaw_sandbox::CapabilitySet),
-//! [`WebFetchSkill`](familyclaw_actions::WebFetchSkill)/
-//! [`WebSearchSkill`](familyclaw_actions::WebSearchSkill), and
-//! [`ApprovalLedger`](familyclaw_actions::approval::ApprovalLedger). No
+//! `WasmtimeSandbox` (`wasmtime`
+//! feature), [`CapabilitySet`],
+//! `WebFetchSkill`/
+//! [`WebSearchSkill`], and
+//! [`ApprovalLedger`]. No
 //! security component under test is replaced with a mock.
 //!
 //! ## Reproducibility

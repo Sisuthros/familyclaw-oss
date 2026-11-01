@@ -11,7 +11,7 @@
 //! `familyclaw import` converts an *export* from another agent runtime
 //! (`OpenClaw`/Hermes) into `FamilyClaw`'s representation, and is deliberately
 //! **lossy and paranoid**: imported skills are quarantined
-//! ([`ActionRisk::ExecuteCode`] + [`ApprovalPolicy::AlwaysRequireApproval`],
+//! (`ActionRisk::ExecuteCode` + `ApprovalPolicy::AlwaysRequireApproval`,
 //! never registered, never executed) because the importer cannot verify what
 //! the source skill's code actually does.
 //!
@@ -254,8 +254,8 @@ trust = "read_only"
 
     #[test]
     fn empty_file_is_empty_list() {
-        assert!(parse_mcp_config("").expect("parse").is_empty());
-        assert!(parse_mcp_config("servers = []").expect("parse").is_empty());
+        assert_eq!(parse_mcp_config("").expect("parse"), []);
+        assert_eq!(parse_mcp_config("servers = []").expect("parse"), []);
     }
 
     #[test]

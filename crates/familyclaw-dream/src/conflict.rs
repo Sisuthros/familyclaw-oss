@@ -357,14 +357,14 @@ mod tests {
 
     #[test]
     fn detect_conflicts_empty_input_is_empty() {
-        assert!(detect_conflicts(&[], 0.5, at()).is_empty());
+        assert_eq!(detect_conflicts(&[], 0.5, at()), []);
     }
 
     #[test]
     fn detect_conflicts_no_near_dups_is_empty() {
         // Completely disjoint word sets → no pairs.
         let mems = [mem("alpha beta gamma"), mem("delta epsilon zeta")];
-        assert!(detect_conflicts(&mems, 0.5, at()).is_empty());
+        assert_eq!(detect_conflicts(&mems, 0.5, at()), []);
     }
 
     #[test]
@@ -408,7 +408,7 @@ mod tests {
 
         // At the 0.5 threshold the pair qualifies, at 0.6 it does not.
         assert_eq!(detect_conflicts(&mems, 0.5, at()).len(), 1);
-        assert!(detect_conflicts(&mems, 0.6, at()).is_empty());
+        assert_eq!(detect_conflicts(&mems, 0.6, at()), []);
     }
 
     #[test]

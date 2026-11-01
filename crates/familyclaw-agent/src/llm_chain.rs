@@ -523,7 +523,7 @@ pub struct LlmFailover {
 }
 
 /// Snapshot of "which provider/model produced the final answer this turn,
-/// and how many failovers it took" — see [`LlmFailover::last_turn`].
+/// and how many failovers it took" — see `LlmFailover::last_turn`.
 #[derive(Debug, Clone, Default)]
 pub struct TurnProviderSummary {
     /// `"provider/model"` that produced the final answer. `None` if every
@@ -1155,7 +1155,7 @@ impl LlmFailover {
 /// **Point-in-time health** of one chain entry (provider/model pair), as
 /// returned by [`LlmFailover::health_snapshot`]. Read-only — a snapshot does
 /// not track anything itself; it reflects the cooldown state machine's
-/// internal [`EntryHealth`] at the moment it was taken.
+/// internal `EntryHealth` at the moment it was taken.
 #[derive(Debug, Clone)]
 pub struct ProviderHealthSnapshot {
     /// Provider prefix (e.g. `"openai"`).

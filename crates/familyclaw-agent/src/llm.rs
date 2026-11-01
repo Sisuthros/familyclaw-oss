@@ -360,7 +360,7 @@ impl LlmImageRef {
 ///
 /// **Wire shape vs. in-memory shape (images):** in memory, text and images
 /// are separate fields (`content: String`, `images: Option<Vec<LlmImageRef>>`)
-/// — simple for callers to build and for [`GeminiGenerateContentRequest`] (which
+/// — simple for callers to build and for `GeminiGenerateContentRequest` (which
 /// only reads `content`) to keep ignoring. On the wire (`OpenAI`-compatible
 /// `chat/completions`), [`LlmMessage`] has a **hand-written** `Serialize`/
 /// `Deserialize` (not derived) that collapses the two into the standard
@@ -915,7 +915,7 @@ impl LlmClient {
     /// **Auto-continuation on `finish_reason == "length"`:** a single
     /// completion call can be cut off mid-sentence by the `max_tokens` limit.
     /// When that happens, this appends the partial reply plus a "continue"
-    /// nudge ([`CONTINUATION_NUDGE`]) and calls again, concatenating the
+    /// nudge (`CONTINUATION_NUDGE`) and calls again, concatenating the
     /// result — bounded by [`max_continuations`] rounds (env
     /// `FAMILYCLAW_MAX_CONTINUATIONS`, default [`DEFAULT_MAX_CONTINUATIONS`],
     /// `0` disables) and by [`MAX_CONTINUATION_OUTPUT_CHARS`] total
@@ -1243,7 +1243,7 @@ impl LlmClient {
     /// **Wire format:** [`LlmWireFormat::OpenAiChat`] is fully implemented
     /// (text + tool calls). [`LlmWireFormat::GeminiGenerate`] supports the
     /// **tool-less** path only (`tools` empty) — it delegates to
-    /// [`Self::complete_once_gemini`] and wraps the text into a
+    /// `Self::complete_once_gemini` and wraps the text into a
     /// [`CompletionResult`] with no tool calls; a non-empty `tools` list
     /// returns [`LlmError::Http`] (Gemini function calling is not
     /// implemented in this slice — see module docs). Every other wire format

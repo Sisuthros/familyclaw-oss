@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn parse_results_empty_on_no_matches() {
         let results = parse_results("<html><body>no results here</body></html>", 5);
-        assert!(results.is_empty());
+        assert_eq!(results, []);
     }
 
     #[test]

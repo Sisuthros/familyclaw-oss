@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn version_is_nonempty() {
-        assert!(!version().is_empty());
+        assert_ne!(version(), "");
     }
 
     #[test]

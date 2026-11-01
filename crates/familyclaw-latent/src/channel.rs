@@ -532,7 +532,7 @@ mod tests {
             FallbackReason::NoLatentAvailable,
         ];
         for (i, a) in reasons.iter().enumerate() {
-            assert!(!a.as_str().is_empty());
+            assert_ne!(a.as_str(), "");
             for b in &reasons[i + 1..] {
                 assert_ne!(a.as_str(), b.as_str());
             }

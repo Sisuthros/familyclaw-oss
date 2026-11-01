@@ -67,6 +67,8 @@ impl ScenarioResult {
 ///
 /// Each scenario (S1 Crash Matrix, S2 Retention Curve, S3 Dream Quality)
 /// implements this interface and returns a typed [`ScenarioResult`].
+// The `#[must_use]` that `async_trait` puts on the boxed future triggers this lint.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Scenario: Send + Sync {
     /// The scenario's stable ID (e.g. `"s1_crash_matrix"`).

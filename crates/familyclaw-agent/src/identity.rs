@@ -503,7 +503,7 @@ mod tests {
         assert!(filtered[0].contains("normal"));
         assert!(identity_guard_prompt(Some(&origin)).contains("OPERATOR IDENTITY GUARD"));
         let other = MessageOrigin::new("c", "conv", "1");
-        assert!(identity_guard_prompt(Some(&other)).is_empty());
+        assert_eq!(identity_guard_prompt(Some(&other)), "");
         match prior {
             Some(v) => std::env::set_var(ENV, v),
             None => std::env::remove_var(ENV),
@@ -557,7 +557,10 @@ mod tests {
         let plan =
             operator_top20_bootstrap_plan(Path::new(r"E:\agent_home"), "2026-07-14T12:00:00Z");
         assert_eq!(plan.len(), 2);
-        assert!(plan[0].1.get("mode").and_then(|v| v.as_str()) == Some("append"));
+        assert_eq!(
+            plan[0].1.get("mode").and_then(|v| v.as_str()),
+            Some("append")
+        );
         let how = operator_diagnostic_reply(
             &BusMessage::text("Miten sinusta saadaan kunnolla toimiva!"),
             Some(&origin),

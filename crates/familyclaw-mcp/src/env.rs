@@ -186,6 +186,6 @@ mod tests {
 
     #[test]
     fn empty_env_segment_list_is_empty() {
-        assert!(parse_mcp_servers("").expect("parse").is_empty());
+        assert_eq!(parse_mcp_servers("").expect("parse"), []);
     }
 }

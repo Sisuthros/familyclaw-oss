@@ -86,7 +86,7 @@ pub struct FsReadOutput {
     /// Whether the content is a trusted project file (affects taint state).
     pub trusted: bool,
     /// For a directory target: the full entry-name listing (up to
-    /// [`DIR_LIST_MAX_ENTRIES`] names, with a truncation tail). This is
+    /// `DIR_LIST_MAX_ENTRIES` names, with a truncation tail). This is
     /// metadata (file names), NOT file content — it is surfaced in the
     /// tool-result `content` field (same channel as `read_full_content`)
     /// so the agent can actually see the listing, while the `summary`

@@ -507,7 +507,7 @@ mod tests {
         let agents = HearthStore::list_agents_with_emotion(&store)
             .await
             .expect("list");
-        assert!(agents.is_empty());
+        assert_eq!(agents, [] as [String; 0]);
     }
 
     /// Edge case: 1 agent.

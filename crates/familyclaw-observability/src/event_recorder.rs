@@ -115,7 +115,7 @@ impl EventRecorder {
     /// to be added later without an API change.
     ///
     /// [`run`]: EventRecorder::run
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn drain_once(&mut self) -> usize {
         let mut processed = 0usize;
         // `try_recv` returns `Ok(Some)` as long as there are events queued.

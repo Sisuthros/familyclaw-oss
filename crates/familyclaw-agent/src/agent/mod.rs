@@ -166,7 +166,7 @@ pub(crate) fn history_max_chars_per_msg() -> usize {
 /// either a single synthetic [`LlmMessage`] that replaces the whole
 /// evicted zone (`Some`), or `None` to decline and fall back to plain
 /// oldest-first eviction for this round. Synchronous and side-effect-free
-/// by contract — [`compact_history`] calls it inline while holding the
+/// by contract — `compact_history` calls it inline while holding the
 /// history lock; a real summarizer implementation should keep its own
 /// (e.g. blocking-LLM-call) work fast or pre-computed, the same
 /// constraint [`familyclaw_actions::redact_free_text`] callers already
@@ -174,12 +174,12 @@ pub(crate) fn history_max_chars_per_msg() -> usize {
 pub type CompactionSummarizer = Arc<dyn Fn(&[LlmMessage]) -> Option<LlmMessage> + Send + Sync>;
 
 /// **Configurable context-compaction policy** (Hermes-style context
-/// management) for [`Agent::append_history`] / [`compact_history`].
+/// management) for `Agent::append_history` / `compact_history`.
 ///
 /// Generalizes the old hardcoded "drop the oldest message once the window
-/// exceeds [`HISTORY_MAX_MESSAGES`]" rule into three independent knobs:
+/// exceeds `HISTORY_MAX_MESSAGES`" rule into three independent knobs:
 /// - [`max_messages`](Self::max_messages) — the threshold that triggers
-///   compaction (was the hardcoded [`HISTORY_MAX_MESSAGES`]).
+///   compaction (was the hardcoded `HISTORY_MAX_MESSAGES`).
 /// - [`protect_first_n`](Self::protect_first_n) — pins the conversation's
 ///   opening N messages (e.g. a scene-setting first exchange) so
 ///   compaction never evicts them, no matter how long the conversation
@@ -225,14 +225,14 @@ impl std::fmt::Debug for CompactionConfig {
 
 impl CompactionConfig {
     /// Default message-count threshold — identical to the previous
-    /// hardcoded [`HISTORY_MAX_MESSAGES`], so [`CompactionConfig::default`]
+    /// hardcoded `HISTORY_MAX_MESSAGES`, so [`CompactionConfig::default`]
     /// reproduces the old behavior exactly.
     pub const DEFAULT_MAX_MESSAGES: usize = HISTORY_MAX_MESSAGES;
 
     /// Reads `FAMILYCLAW_COMPACTION_MAX_MESSAGES`,
     /// `FAMILYCLAW_COMPACTION_PROTECT_FIRST_N`, and
     /// `FAMILYCLAW_COMPACTION_PROTECT_LAST_N` (each optional, same
-    /// "parse or default" shape as [`history_max_chars_per_msg`]). No env
+    /// "parse or default" shape as `history_max_chars_per_msg`). No env
     /// var carries a summarizer — install one via
     /// [`Agent::with_compaction`] instead. Called once by [`Agent::new`],
     /// so the threshold/protection knobs are configurable without a code

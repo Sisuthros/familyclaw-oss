@@ -641,7 +641,7 @@ req_seconds_count 3
     #[test]
     fn prometheus_export_empty_registry_is_empty_string() {
         let reg = MetricsRegistry::new();
-        assert!(reg.prometheus_export().is_empty());
+        assert_eq!(reg.prometheus_export(), "");
         assert!(reg.is_empty());
     }
 

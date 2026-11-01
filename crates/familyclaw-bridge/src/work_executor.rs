@@ -69,6 +69,8 @@ impl WorkOutcome {
 ///
 /// Layer B supplies the live executor; Layer A only knows this trait and the
 /// deterministic [`DefaultSimulatingExecutor`] default.
+// The `#[must_use]` that `async_trait` puts on the boxed future triggers this lint.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait WorkExecutor: Send + Sync {
     /// Executes a single task and produces the outcome.

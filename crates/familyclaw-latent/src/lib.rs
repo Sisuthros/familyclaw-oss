@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn version_is_nonempty() {
-        assert!(!version().is_empty());
+        assert_ne!(version(), "");
     }
 
     #[test]
@@ -131,7 +131,7 @@ mod tests {
         assert_eq!(projected.strategy, ProjectionStrategy::Resize);
 
         assert!(TransmissionMode::Text.is_text());
-        assert!(!FallbackReason::NoLink.as_str().is_empty());
+        assert_ne!(FallbackReason::NoLink.as_str(), "");
 
         let err: FamilyClawError = FamilyClawError::bus("x");
         assert!(err.to_string().starts_with("bus error"));

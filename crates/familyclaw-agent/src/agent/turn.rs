@@ -28,7 +28,7 @@ impl Agent {
     /// - **`actions = Some(rt)`:** an internal `run_tool_loop` runs the loop: the LLM
     ///   is given the tools published by the runtime, and its chosen tool
     ///   calls are routed back to the runtime until the model replies
-    ///   without tool calls (a stop) or the [`ToolLoopConfig`] limit is reached.
+    ///   without tool calls (a stop) or the `ToolLoopConfig` limit is reached.
     ///
     /// Returns a [`ThinkOutcome`] (1C, roadmap amendment 3): suspend is a
     /// STATE, not a string. The earlier `Option<Result<String>>` return has
@@ -244,8 +244,7 @@ impl Agent {
     /// `FAMILYCLAW_STREAMING=1` â†’ the LLM response is streamed and progress is updated every ~2s.
     fn llm_streaming_enabled() -> bool {
         std::env::var("FAMILYCLAW_STREAMING")
-            .ok()
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     }
 
     /// One LLM call; with streaming, sends [`OutboundKind::Progress`] updates.

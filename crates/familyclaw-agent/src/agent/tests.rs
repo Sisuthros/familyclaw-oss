@@ -1903,7 +1903,7 @@ async fn turn_audit_absent_is_noop() {
         .await
         .expect("loop ok");
     // Without a collector there is no id → empty trace.
-    assert!(agent.turn_audit_for(ActionId::new()).is_empty());
+    assert_eq!(agent.turn_audit_for(ActionId::new()), []);
     bus.stop();
 }
 

@@ -188,6 +188,8 @@ impl ActionResult {
 ///
 /// The implementation runs an approved action and returns an
 /// [`ActionResult`]. Layer A implementations are **mocks** — no real network calls.
+// The `#[must_use]` that `async_trait` puts on the boxed future triggers this lint.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ActionExecutor: Send + Sync {
     /// Executes the action and returns the result.

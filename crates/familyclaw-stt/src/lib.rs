@@ -14,7 +14,7 @@
 //!   language + provider id).
 //! - [`MockStt`] -- an in-memory, no-network provider for tests and offline
 //!   agent development (always available, no feature flag).
-//! - [`OpenAiWhisper`] (feature `openai`) -- an `OpenAI`-compatible
+//! - `OpenAiWhisper` (feature `openai`) -- an `OpenAI`-compatible
 //!   `/audio/transcriptions` (Whisper) HTTP adapter. Works against `OpenAI`
 //!   itself and any `OpenAI`-API-compatible transcription gateway (same
 //!   endpoint shape) via a configurable `api_base`. Needs only a bearer API
@@ -28,7 +28,7 @@
 //! `multipart` feature for the file upload).
 //!
 //! ## More providers: see the design doc
-//! This crate ships one verified, working adapter ([`OpenAiWhisper`]).
+//! This crate ships one verified, working adapter (`OpenAiWhisper`).
 //! Adding more real backends (a local engine like `whisper.cpp`, Azure
 //! Speech, Google Speech-to-Text) is a matter of implementing
 //! [`SttProvider`] behind a new feature flag -- see
@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn version_is_nonempty() {
-        assert!(!version().is_empty());
+        assert_ne!(version(), "");
     }
 
     #[test]

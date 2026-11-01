@@ -205,8 +205,8 @@ mod tests {
         assert_eq!(report.total, 0);
         assert_eq!(report.consolidated, 0);
         assert_eq!(report.conflicted, 0);
-        assert!(report.top_memories.is_empty());
-        assert!(report.conflicts.is_empty());
+        assert_eq!(report.top_memories, []);
+        assert_eq!(report.conflicts, []);
         assert_eq!(report.generated_at, Some(at()));
         assert!(!report.has_content());
     }

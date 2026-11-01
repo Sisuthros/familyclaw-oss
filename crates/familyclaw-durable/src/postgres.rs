@@ -1,6 +1,6 @@
 //! [`PostgresJournal`] — append-only journal on `PostgreSQL` (feature `postgres`).
 //!
-//! Same [`Journal`](crate::Journal) contract as [`crate::FileJournal`]: sync
+//! Same [`Journal`] contract as [`crate::FileJournal`]: sync
 //! append with durable commit before return. Still a **single-tenant**
 //! appliance backend — not a multi-node consensus log.
 //!
@@ -158,7 +158,7 @@ mod tests {
     fn filter_from_empty_when_all_before_index() {
         let e0 = JournalEntry::completed(StepId::new(0), "a", serde_json::json!({}));
         let filtered = filter_from(vec![e0], StepId::new(5));
-        assert!(filtered.is_empty());
+        assert_eq!(filtered, []);
     }
 
     /// Integration: set `DATABASE_URL` to a real Postgres to exercise round-trip.

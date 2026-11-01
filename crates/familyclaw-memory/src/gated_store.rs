@@ -314,7 +314,7 @@ mod tests {
 
         let ctx = RetrievalContext::new("rust memory");
         let hits = store.retrieve(&ctx, time::now()).await.expect("retrieve");
-        assert!(!hits.is_empty());
+        assert_ne!(hits, []);
 
         let report = store
             .run_decay(DecayThresholds::default(), time::now())

@@ -118,6 +118,8 @@ pub struct CollectorState {
     pub log: CollectedLog,
 }
 
+// ractor's `Actor` trait declares these callbacks as async; synchronous bodies are fine.
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for CollectorBeing {
     type Msg = ResonanceMessage;
     type State = CollectorState;
@@ -215,6 +217,8 @@ pub struct AffectiveArgs {
     pub transition: EmotionTransition,
 }
 
+// ractor's `Actor` trait declares these callbacks as async; synchronous bodies are fine.
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for AffectiveBeing {
     type Msg = ResonanceMessage;
     type State = AffectiveState;

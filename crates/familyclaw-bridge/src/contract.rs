@@ -1002,7 +1002,7 @@ mod tests {
     #[test]
     fn schema_check_passes_valid_object() {
         let schema = Schema::new(vec![Field::required("a", FieldType::Str)]);
-        assert!(schema.check(&json!({ "a": "x" })).is_empty());
+        assert_eq!(schema.check(&json!({ "a": "x" })), []);
     }
 
     #[test]
@@ -1024,9 +1024,9 @@ mod tests {
     #[test]
     fn schema_check_optional_absent_ok_but_present_typechecked() {
         let schema = Schema::new(vec![Field::optional("o", FieldType::Bool)]);
-        assert!(schema.check(&json!({})).is_empty());
-        assert!(!schema.check(&json!({ "o": "x" })).is_empty());
-        assert!(schema.check(&json!({ "o": true })).is_empty());
+        assert_eq!(schema.check(&json!({})), []);
+        assert_ne!(schema.check(&json!({ "o": "x" })), []);
+        assert_eq!(schema.check(&json!({ "o": true })), []);
     }
 
     #[test]
@@ -1361,7 +1361,7 @@ mod tests {
             Some("render_video".into())
         );
         assert_eq!(reg.find_by_name("render_video").await.len(), 1);
-        assert!(reg.find_by_name("nope").await.is_empty());
+        assert_eq!(reg.find_by_name("nope").await, []);
     }
 
     #[tokio::test]

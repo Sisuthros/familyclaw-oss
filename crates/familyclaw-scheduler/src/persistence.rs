@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn default_is_empty() {
-        assert!(AgencyConfig::default().disabled.is_empty());
+        assert_eq!(AgencyConfig::default().disabled, [] as [String; 0]);
     }
 
     #[test]
@@ -219,10 +219,10 @@ mod tests {
         // Re-enabling removes it.
         cfg.set(id(1), true);
         assert!(!cfg.is_disabled(id(1)));
-        assert!(cfg.disabled.is_empty());
+        assert_eq!(cfg.disabled, [] as [String; 0]);
         // Re-enabling an unknown id -> no-op.
         cfg.set(id(2), true);
-        assert!(cfg.disabled.is_empty());
+        assert_eq!(cfg.disabled, [] as [String; 0]);
     }
 
     #[test]
@@ -230,7 +230,7 @@ mod tests {
         let path = std::env::temp_dir().join("familyclaw-agency-does-not-exist-xyz.json");
         let _ = std::fs::remove_file(&path);
         let cfg = AgencyConfig::load(&path).expect("missing file → default");
-        assert!(cfg.disabled.is_empty());
+        assert_eq!(cfg.disabled, [] as [String; 0]);
     }
 
     #[test]

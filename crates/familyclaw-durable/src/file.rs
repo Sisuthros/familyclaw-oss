@@ -787,7 +787,7 @@ mod tests {
     fn empty_file_replays_empty() {
         let tmp = TempPath::new("empty");
         let j = FileJournal::open(tmp.path()).expect("open");
-        assert!(j.replay_all().expect("replay").is_empty());
+        assert_eq!(j.replay_all().expect("replay"), []);
         assert_eq!(j.len().expect("len"), 0);
     }
 
@@ -882,7 +882,7 @@ mod tests {
         j.append(JournalEntry::completed(StepId::ZERO, "a", json!(1)))
             .expect("append");
         j.rewrite(&[]).expect("rewrite empty");
-        assert!(j.replay_all().expect("replay").is_empty());
+        assert_eq!(j.replay_all().expect("replay"), []);
         assert_eq!(std::fs::read_to_string(j.path()).expect("read").len(), 0);
     }
 
@@ -1147,7 +1147,7 @@ mod tests {
             })
             .expect("compact_with");
         assert_eq!(dropped, 0);
-        assert!(j.replay_all().expect("replay").is_empty());
+        assert_eq!(j.replay_all().expect("replay"), []);
         assert_eq!(std::fs::read_to_string(j.path()).expect("read").len(), 0);
     }
 

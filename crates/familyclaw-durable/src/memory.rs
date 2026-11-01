@@ -93,7 +93,7 @@ mod tests {
     fn new_journal_is_empty() {
         let j = InMemoryJournal::new();
         assert!(j.is_empty().expect("is_empty"));
-        assert!(j.entries().is_empty());
+        assert_eq!(j.entries(), []);
     }
 
     #[test]

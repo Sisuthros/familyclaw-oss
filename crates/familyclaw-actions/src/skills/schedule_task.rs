@@ -1,7 +1,7 @@
 //! Scheduled task in agency config (Layer A).
 //!
 //! [`ScheduleTaskSkill`] lets an agent register a cron-based scheduled task in
-//! the persisted [`AgencyConfig`] file (`agency.json`). The skill writes a
+//! the persisted `AgencyConfig` file (`agency.json`). The skill writes a
 //! generic entry (cron expression + `skill_id` + payload) — no hardcoded
 //! paths and no personal identifiers.
 //!

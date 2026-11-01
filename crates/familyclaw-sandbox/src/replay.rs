@@ -330,7 +330,7 @@ mod tests {
         let outcome = replay(&trace).expect("replay ok");
         assert!(!outcome.success);
         assert_eq!(outcome.fuel_consumed, 3);
-        assert!(outcome.output.is_empty());
+        assert_eq!(outcome.output, [] as [u8; 0]);
     }
 
     #[test]

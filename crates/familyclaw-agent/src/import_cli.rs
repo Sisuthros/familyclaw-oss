@@ -1592,7 +1592,7 @@ mod tests {
         // config hints (model, temperature).
         assert_eq!(bundle.config_hints.len(), 2);
         // warning for the empty memory.
-        assert!(!bundle.warnings.is_empty());
+        assert_ne!(bundle.warnings, [] as [String; 0]);
 
         let plan = ImportPlan::from_bundle(&bundle);
         assert_eq!(plan.memory_count(), 2);
@@ -1940,7 +1940,7 @@ mod tests {
             &std::fs::read_to_string(out_dir.join("quarantine_manifest.json")).expect("read qm"),
         )
         .expect("parse qm");
-        assert!(qm.skills.is_empty());
+        assert_eq!(qm.skills, []);
     }
 
     #[test]

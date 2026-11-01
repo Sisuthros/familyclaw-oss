@@ -711,7 +711,7 @@ mod tests {
         store.add(mem("python web framework")).await.expect("a2");
         let ctx = RetrievalContext::new("rust memory");
         let results = store.retrieve(&ctx, time::now()).await.expect("retrieve");
-        assert!(!results.is_empty());
+        assert_ne!(results, []);
         assert!(results[0].memory.content.contains("rust"));
     }
 

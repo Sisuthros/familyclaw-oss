@@ -226,7 +226,7 @@ mod tests {
             let back: ContractMessage = serde_json::from_str(&text).expect("deserialize");
             assert_eq!(msg, back);
             assert_eq!(back.contract_id(), id);
-            assert!(!back.op().is_empty());
+            assert_ne!(back.op(), "");
         }
     }
 

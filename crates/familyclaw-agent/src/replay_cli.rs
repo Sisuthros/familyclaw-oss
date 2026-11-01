@@ -1,10 +1,10 @@
 //! `familyclaw replay` — Time Machine CLI for inspecting durable journals.
 //!
 //! This module provides the `replay` subcommand of the `familyclaw` binary:
-//! an existing [`FileJournal`](familyclaw_durable::FileJournal) is opened
+//! an existing [`FileJournal`] is opened
 //! **read-only** and its timeline is rendered as human-readable markdown
 //! or machine-readable JSON. The implementation is built on top of the
-//! [`TimeMachine`](familyclaw_durable::TimeMachine) facade, so the source
+//! [`TimeMachine`] facade, so the source
 //! journal never changes (the append-only invariant is preserved).
 //!
 //! Four subcommands:

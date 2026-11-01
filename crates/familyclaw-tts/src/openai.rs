@@ -119,7 +119,7 @@ impl OpenAiTts {
         })
     }
 
-    /// Overrides the TTS model (default: [`DEFAULT_MODEL`]).
+    /// Overrides the TTS model (default: `DEFAULT_MODEL`).
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
@@ -127,7 +127,7 @@ impl OpenAiTts {
     }
 
     /// Overrides the default voice used when a [`TtsRequest`] doesn't
-    /// specify one (default: [`DEFAULT_VOICE`]).
+    /// specify one (default: `DEFAULT_VOICE`).
     #[must_use]
     pub fn with_default_voice(mut self, voice: impl Into<String>) -> Self {
         self.default_voice = voice.into();

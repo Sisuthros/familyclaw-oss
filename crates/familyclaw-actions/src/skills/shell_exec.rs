@@ -12,7 +12,7 @@
 //!   [`ApprovalPolicy::AutoIfReadOnly`]); others are rejected or require approval.
 //! - **off**: rejects all commands (the skill is registered but does not execute).
 //!
-//! The working directory is restricted via [`ShellExecConfig::cwd_allowlist`]
+//! The working directory is restricted via `ShellExecConfig::cwd_allowlist`
 //! (`FAMILYCLAW_SHELL_CWD_ALLOWLIST`, semicolon-separated). An empty allowlist =
 //! fail-closed.
 

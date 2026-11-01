@@ -77,12 +77,12 @@ pub struct ScheduledTask {
     /// non-positive interval is treated as "always due"
     /// (see [`crate::decision`]).
     ///
-    /// Ignored when [`cron_expression`] is set — in that case, due-checking
+    /// Ignored when `cron_expression` is set — in that case, due-checking
     /// is derived from the cron expression instead.
     pub interval: Duration,
     /// Optional cron expression (e.g. `"0 * * * *"`). When set, the task
     /// fires according to the cron schedule ([`crate::decision`]); otherwise
-    /// [`interval`] is used (backward-compatible default).
+    /// `interval` is used (backward-compatible default).
     pub cron_expression: Option<String>,
     /// Generic identifier of the being on whose behalf dispatch happens
     /// (used for rate-limit accounting in the action stack).

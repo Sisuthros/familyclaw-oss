@@ -116,6 +116,8 @@ impl OrchestratedTurn {
 ///
 /// Implementations must be [`Send`] + [`Sync`] so they can be shared across
 /// tasks (`Arc<dyn TurnExecutor>`).
+// The `#[must_use]` that `async_trait` puts on the boxed future triggers this lint.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TurnExecutor: Send + Sync {
     /// Executes the given turn and returns the deliverable.
@@ -372,7 +374,10 @@ mod tests {
         assert!(payload.get("sections").and_then(Value::as_array).is_some());
         assert!(payload.get("cta").and_then(Value::as_str).is_some());
         // Sections is not empty.
-        assert!(!payload["sections"].as_array().expect("array").is_empty());
+        assert_ne!(
+            payload["sections"].as_array().expect("array"),
+            &Vec::<Value>::new()
+        );
     }
 
     #[tokio::test]

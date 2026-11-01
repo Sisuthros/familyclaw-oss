@@ -78,7 +78,7 @@ fn all_required_dimensions_with_sufficient_evidence_pass() {
         DependabilityReceipt::evaluate("task-2", "trace-2", at(1_700_000_001), checks, &policy);
 
     assert_eq!(receipt.status(), GateStatus::Passed);
-    assert!(receipt.failures().is_empty());
+    assert_eq!(receipt.failures(), []);
     assert_eq!(receipt.schema_version(), 1);
 }
 

@@ -671,7 +671,7 @@ mod tests {
             "mem-b" => Some("soul b".to_string()),
             _ => None,
         });
-        assert!(result.is_empty());
+        assert_eq!(result, []);
     }
 
     #[test]

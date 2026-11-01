@@ -813,8 +813,7 @@ pub async fn build_family(
         Option<SchedulerHandle>,
     ) = if let Some(dream_journal) = dream_journal {
         let dream_disabled = env::var("FAMILYCLAW_DREAM_DISABLED")
-            .ok()
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         if dream_disabled {
             tracing::info!(target: "familyclaw::dream", "scheduled dream task disabled (FAMILYCLAW_DREAM_DISABLED)");
             (None, None)
@@ -1010,8 +1009,7 @@ fn resolve_embedder() -> Arc<dyn EmbeddingProvider + Send + Sync> {
 /// compiled in.
 fn resolve_sandbox_skills() -> Option<Arc<dyn CodeSandbox>> {
     let enabled = env::var("FAMILYCLAW_SANDBOX_SKILLS")
-        .ok()
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
     if !enabled {
         return None;
     }
@@ -1157,8 +1155,7 @@ fn resolve_shell_exec_config() -> Option<ShellExecConfig> {
         .ok()
         .filter(|s| !s.trim().is_empty());
     let cwd_nonempty = env::var("FAMILYCLAW_SHELL_CWD_ALLOWLIST")
-        .ok()
-        .is_some_and(|raw| raw.split(';').any(|p| !p.trim().is_empty()));
+        .is_ok_and(|raw| raw.split(';').any(|p| !p.trim().is_empty()));
 
     if mode_explicit.is_none() && !cwd_nonempty {
         return None;
@@ -1292,7 +1289,7 @@ mod tests {
 
     #[test]
     fn version_is_nonempty() {
-        assert!(!version().is_empty());
+        assert_ne!(version(), "");
     }
 
     /// FIX 2 (`build_family` seam): [`ensure_identity_anchor`] persists the

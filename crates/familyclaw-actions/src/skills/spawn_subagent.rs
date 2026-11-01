@@ -30,6 +30,8 @@ pub struct SpawnSubagentInput {
 
 /// Interface for a temporary helper agent. Implemented in the runtime layer
 /// (no cyclic dependency on `familyclaw-agent`).
+// The `#[must_use]` that `async_trait` puts on the boxed future triggers this lint.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait SubagentSpawner: Send + Sync {
     /// Runs the task with the helper agent and returns the response.

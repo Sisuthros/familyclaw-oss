@@ -424,7 +424,7 @@ mod tests {
         assert!(a_events.iter().all(|e| e.action_id == turn_a));
         assert_eq!(collector.events_for(turn_b).len(), 1);
         // Unknown identifier → empty.
-        assert!(collector.events_for(ActionId::new()).is_empty());
+        assert_eq!(collector.events_for(ActionId::new()), []);
     }
 
     #[test]

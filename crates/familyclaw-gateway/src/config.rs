@@ -311,7 +311,7 @@ impl FamilyConfig {
             })
             .unwrap_or_default()
     }
-    /// Primary + fallback models as a runnable [`ModelConfig`] (same as the serve path).
+    /// Primary + fallback models as a runnable `ModelConfig` (same as the serve path).
     pub fn model_config(&self) -> familyclaw_core::ModelConfig {
         let mut cfg = familyclaw_core::ModelConfig::new(self.model().to_string());
         for fb in self.fallback_models() {

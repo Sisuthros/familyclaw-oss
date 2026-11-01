@@ -719,7 +719,7 @@ mod tests {
         let pool = vec![mem("totally unrelated text")];
         let ctx = RetrievalContext::new("quantum chromodynamics").with_min_relevance(0.9);
         let results = retrieve_now(&pool, &ctx);
-        assert!(results.is_empty());
+        assert_eq!(results, []);
     }
 
     #[test]

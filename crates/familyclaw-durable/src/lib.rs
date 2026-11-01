@@ -45,7 +45,7 @@
 //! ## Implementations
 //! - [`InMemoryJournal`] — non-durable, for testing/development.
 //! - [`FileJournal`] — crash-safe append-only JSONL (`flush` + `fsync`).
-//! - [`PostgresJournal`] (feature `postgres`) — same journal contract on `PostgreSQL`.
+//! - `PostgresJournal` (feature `postgres`) — same journal contract on `PostgreSQL`.
 //!
 //! ## OSS boundary (Layer A)
 //! This crate is generic platform code: it does not hardcode family
@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn version_is_nonempty() {
-        assert!(!version().is_empty());
+        assert_ne!(version(), "");
     }
 
     #[test]

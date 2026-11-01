@@ -536,7 +536,7 @@ impl ActionRuntime {
     /// Creates a runtime with all five Layer A skills already registered.
     ///
     /// This is the operator's default configuration: [`EmailTriageMock`],
-    /// [`GithubIssueDraftMock`], [`DiscordThreadSummaryMock`], [`FilePatchMock`]
+    /// [`GithubIssueDraftMock`], [`DiscordThreadSummaryMock`], `FilePatchMock`
     /// and the flagship [`FsReadAllowlisted`].
     ///
     /// [`FsReadAllowlisted`] is registered with an **empty allowlist**
@@ -570,11 +570,11 @@ impl ActionRuntime {
     ///
     /// These default skills are built-in Layer A references (plain Rust, no
     /// signature). **Third-party skills** should be run in
-    /// [`familyclaw-sandbox`]'s Wasmtime sandbox (fuel cap, host-import
+    /// `familyclaw-sandbox`'s Wasmtime sandbox (fuel cap, host-import
     /// block, capability grants) — see
     /// [`docs/SECURITY_MODEL.md`](../../docs/SECURITY_MODEL.md) layer 6.
     ///
-    /// The runtime assembler [`build_family`] (`familyclaw-runtime`) wires
+    /// The runtime assembler `build_family` (`familyclaw-runtime`) wires
     /// the sandbox into the agent when `FAMILYCLAW_SANDBOX_SKILLS=1` and
     /// `familyclaw-sandbox::default_sandbox()` is available. External
     /// manifests additionally require an Ed25519 signature
@@ -1743,7 +1743,7 @@ mod tests {
                 "schema root must be a JSON object for LLM parameters"
             );
             assert!(!tool.trusted, "skill-derived tools default to untrusted");
-            assert!(!tool.description.is_empty());
+            assert_ne!(tool.description, "");
         }
 
         // No secrets in the output.
@@ -1882,7 +1882,7 @@ mod tests {
         assert_eq!(approved.status, TaskStatus::Done);
 
         // Approval consumed → no longer pending.
-        assert!(runtime.pending_approvals().is_empty());
+        assert_eq!(runtime.pending_approvals(), []);
         // The proof is now retrievable.
         assert!(runtime.proof(submitted.task_id).is_some());
         assert_eq!(
@@ -2046,7 +2046,7 @@ mod tests {
             assert!(!outcome.awaiting_approval());
         }
         // None was left waiting for approval.
-        assert!(runtime.pending_approvals().is_empty());
+        assert_eq!(runtime.pending_approvals(), []);
     }
 
     #[tokio::test]

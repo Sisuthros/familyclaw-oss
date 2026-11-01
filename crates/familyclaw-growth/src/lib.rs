@@ -629,7 +629,7 @@ mod tests {
             store.get(id).expect("present").status,
             ProposalStatus::Pending
         );
-        assert!(store.approval_history(id).is_empty());
+        assert_eq!(store.approval_history(id), [] as [&ApprovalRecord; 0]);
     }
 
     #[test]
@@ -755,7 +755,7 @@ mod tests {
         assert_eq!(p.status, ProposalStatus::Approved);
         // proof_sources + eval remain unchanged (auditability).
         assert_eq!(p.proof_sources, vec!["proof-1", "proof-2"]);
-        assert!(!p.eval.description.is_empty());
+        assert_ne!(p.eval.description, "");
     }
 
     #[test]

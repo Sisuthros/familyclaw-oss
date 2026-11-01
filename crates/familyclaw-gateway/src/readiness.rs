@@ -97,7 +97,7 @@ pub async fn check_journal_writable(data_dir: &std::path::Path) -> CheckResult {
 
 /// Overall deadline for the entire `llm_ping` probe. The per-attempt timeout is 8s
 /// (`probe_resolver_from_env`), but without an OVERALL deadline, failover can walk
-/// 4 models x 2 passes = worst case 8x8s = 64s (audit finding [1]: measured 3.5-19.7s).
+/// 4 models x 2 passes = worst case 8x8s = 64s (audit finding \[1\]: measured 3.5-19.7s).
 /// 20s cuts off a failover stall WHILE still letting a single slow LLM ping through
 /// (canary measurement 3.9-8s on the NIM route). watchdog.ps1's readyz timeout is 60s,
 /// so 20s stays safely under it without cutting off valid pings (10s was too

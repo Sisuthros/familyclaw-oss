@@ -28,6 +28,8 @@ impl AgentActor {
     }
 }
 
+// ractor's `Actor` trait declares these callbacks as async; synchronous bodies are fine.
+#[allow(clippy::unused_async_trait_impl)]
 impl Actor for AgentActor {
     type Msg = ResonanceMessage;
     type State = ErasedAgent;

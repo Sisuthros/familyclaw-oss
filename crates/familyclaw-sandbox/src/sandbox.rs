@@ -204,7 +204,7 @@ mod tests {
         let out = SandboxOutput::new(vec![0xff, 0xfe], 10);
         // Does not panic, replaces invalid bytes.
         let s = out.output_string_lossy();
-        assert!(!s.is_empty());
+        assert_ne!(s, "");
     }
 
     #[test]
