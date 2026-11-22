@@ -4,7 +4,7 @@
 > complete or superseded by [STATUS.md](../STATUS.md).
 
 > **What this is:** a tight, spoken, minute-by-minute script for running the
-> FamilyClaw booth demo at the Cyprus AI Expo (2026-07-05) with **zero
+> FamilyClaw booth demo at an AI expo (2026-07-05) with **zero
 > dependency on the live network or the family being up.** Everything here runs
 > from local, self-asserting binaries.
 >

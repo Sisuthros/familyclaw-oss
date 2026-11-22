@@ -82,7 +82,7 @@ selection."*
 
 ---
 
-## Sales pitch (AI Expo, Cyprus)
+## Sales pitch (AI Expo)
 
 > **"We're not claiming anything NVIDIA hasn't admitted itself.** NemoClaw is
 > valuable — it proves that agent security is a real, big problem. But by
